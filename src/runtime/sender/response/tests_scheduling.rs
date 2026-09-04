@@ -153,6 +153,89 @@ fn t04a_response_completion_counts_dequeued_writer_charge_once() {
 }
 
 #[test]
+fn t04b_response_product_headroom_is_not_revoked_by_adverse_completion_inference() {
+    let payload_bytes = 64 * 1024;
+    let lower_bytes = 8 * 1024 * 1024_u64;
+    let mut owner = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        80.0,
+        lower_bytes,
+        16 * 1024 * 1024,
+        true,
+    );
+    block_data_queue(&mut owner);
+    let mut favorable = response_target(1, UnderlayProtocol::Udp, 20.0, 0, 16 * 1024 * 1024, false);
+    favorable.observation.snapshot.delivery_rate_bps = 500_000_000.0;
+    favorable.observation.snapshot.pacing_rate_bps = 500_000_000.0;
+    favorable.observation.snapshot.jitter_ms = 1.0;
+    favorable.observation.snapshot.loss_rate = 0.0;
+    favorable.observation.snapshot.confidence = 1.0;
+    favorable.observation.snapshot.active_flows = 1;
+
+    let mut adverse = favorable.clone();
+    adverse.observation.snapshot.srtt_ms = 800.0;
+    adverse.observation.snapshot.delivery_rate_bps = 1_000_000.0;
+    adverse.observation.snapshot.pacing_rate_bps = 1_000_000.0;
+    adverse.observation.snapshot.jitter_ms = 200.0;
+    adverse.observation.snapshot.loss_rate = 0.20;
+    adverse.observation.snapshot.confidence = 0.05;
+    adverse.observation.snapshot.active_flows = 64;
+
+    assert_eq!(
+        (
+            adverse.product_admission_active,
+            adverse.observation.stale_for_original_data,
+            adverse.command_queue.can_enqueue_stream_ordered_frame(),
+            adverse.observation.snapshot.data_level_limit_bytes,
+            adverse.observation.original_data_in_flight_bytes,
+            adverse.observation.snapshot.data_level_bytes_in_flight,
+            adverse.observation.product_assignment_qualified,
+            adverse.observation.has_bulk_rate_evidence,
+            adverse.observation.snapshot.carrier_inflight_limit_bytes,
+        ),
+        (
+            favorable.product_admission_active,
+            favorable.observation.stale_for_original_data,
+            favorable.command_queue.can_enqueue_stream_ordered_frame(),
+            favorable.observation.snapshot.data_level_limit_bytes,
+            favorable.observation.original_data_in_flight_bytes,
+            favorable.observation.snapshot.data_level_bytes_in_flight,
+            favorable.observation.product_assignment_qualified,
+            favorable.observation.has_bulk_rate_evidence,
+            favorable.observation.snapshot.carrier_inflight_limit_bytes,
+        ),
+        "the variants share lifecycle, queue admission, Product P/debt/evidence, and configured carrier limits",
+    );
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: lower_bytes,
+    }];
+    let select_candidate = |candidate: ResponseSenderPathTarget| {
+        select_response_data_path(
+            &[owner.clone(), candidate],
+            TrafficClass::Throughput,
+            payload_bytes,
+            MuxLimits::default(),
+            &lower,
+            lower_bytes as usize,
+        )
+        .map(|selected| selected.observation.key)
+    };
+
+    assert_eq!(
+        select_candidate(favorable.clone()),
+        Some(favorable.observation.key)
+    );
+    assert_eq!(
+        select_candidate(adverse),
+        Some(favorable.observation.key),
+        "adverse rate/RTT/jitter/loss/confidence/flow inference may rank this sole enqueueable path last, but cannot revoke unchanged Product and resource headroom",
+    );
+}
+
+#[test]
 fn response_data_queue_readiness_follows_its_traffic_class() {
     let mut target = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 16 * 1024 * 1024, true);
     block_data_queue(&mut target);
@@ -284,7 +367,7 @@ fn latency_response_still_requires_exact_product_headroom() {
             0,
         )
         .is_none(),
-        "latency bypasses ECF and hysteresis, not exact Product O < P authority",
+        "latency ranking cannot bypass exact Product O < P authority",
     );
 }
 
@@ -2047,7 +2130,7 @@ fn shared_reorder_envelope_allows_metric_selection_within_the_limit() {
 }
 
 #[test]
-fn modeled_pipe_limit_stops_offsets_before_the_configured_reorder_ceiling() {
+fn inferred_pipe_does_not_stop_offsets_inside_configured_product_resources() {
     let payload = 64 * 1024;
     let owner = response_target(
         0,
@@ -2087,8 +2170,8 @@ fn modeled_pipe_limit_stops_offsets_before_the_configured_reorder_ceiling() {
             &lower,
             17 * 1024 * 1024,
         )
-        .is_none(),
-        "the negotiated 64 MiB safety ceiling must not replace the measured BDP/in-flight boundary",
+        .is_some(),
+        "inferred BDP may affect ordering but cannot replace configured W/P admission",
     );
 }
 

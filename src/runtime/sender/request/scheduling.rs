@@ -13,8 +13,9 @@ use crate::model::ack_clock::{
 use crate::model::admission::bulk_completion_horizon_ms_with_ordering_debt;
 use crate::model::admission::{
     BulkAdmissionCheck, BulkAdmissionEvidence, BulkCandidatePosition, BulkPathCandidate,
-    ReliableDataAckFrontierState, bulk_candidate_admission_suppression_with_completion_backlog,
-    bulk_candidate_admission_suppression_with_ordering_debt, bulk_scheduling_horizon_bytes,
+    BulkProductResourceCheck, ReliableDataAckFrontierState,
+    bulk_measurement_start_suppression_with_completion_backlog,
+    bulk_product_candidate_resource_suppression, bulk_scheduling_horizon_bytes,
     bulk_striping_admitted_candidates, original_data_assignment_has_product_headroom,
 };
 use crate::model::capacity::reliable_product_feedback_window_bytes;
@@ -507,7 +508,7 @@ fn request_ack_clock_measurement_start_suppression(
     )?;
     let ordering_debt = flights.ordering_debt_bytes_before_offset(candidate_path.key(), offset);
     let completion_backlog = flights.original_transmission_bytes_before_offset(offset);
-    bulk_candidate_admission_suppression_with_completion_backlog(
+    bulk_measurement_start_suppression_with_completion_backlog(
         BulkAdmissionCheck {
             best_snapshot: reference_snapshot,
             best_eta_ms: reference_eta_ms,
@@ -1191,9 +1192,9 @@ fn log_request_flow_local_admission_shadow(
     );
 }
 
-/// Re-runs ordinary bulk ECF after a target-local apply race. Avoided exact
-/// instances remain excluded, but the decision retains ordinary Product,
-/// ordering, and hysteresis semantics rather than becoming a repair choice.
+/// Re-runs ordinary bulk selection after a target-local apply race. Avoided
+/// exact instances remain excluded, but the decision retains ordinary Product
+/// resource admission, ordering, and hysteresis rather than becoming repair.
 pub(super) fn choose_ordinary_bulk_relay_path_avoiding(
     request: BulkRelayFrameRequest<'_>,
 ) -> BulkRelayPathChoice {
@@ -1402,10 +1403,8 @@ fn choose_bulk_relay_path_for_extent_with_mode(
         return BulkRelayPathChoice::Blocked;
     }
     let lead_key = lead.map(|lead| lead.key);
+    #[cfg(feature = "lab-diagnostics")]
     let lead_baseline = lead.map(|lead| (lead.snapshot, lead.eta_ms));
-    let completion_backlog_bytes = path_flights
-        .map(|flights| flights.original_transmission_bytes_before_offset(offset))
-        .unwrap_or(0);
     let mut best: Option<(usize, f64, usize, PathSnapshot)> = None;
     let mut old_lead_candidate: Option<(usize, f64, PathSnapshot)> = None;
     #[cfg(feature = "lab-diagnostics")]
@@ -1694,13 +1693,13 @@ fn choose_bulk_relay_path_for_extent_with_mode(
                     BulkCandidatePosition::FirstPath
                 };
             let admission_ordering_debt = cross_path_ordering_debt;
-            let (best_snapshot, best_eta_ms) = if owns_lower_frontier {
-                (snapshot, score.eta_ms)
-            } else {
-                lead_baseline.unwrap_or((snapshot, score.eta_ms))
-            };
             #[cfg(feature = "lab-diagnostics")]
             {
+                let (best_snapshot, best_eta_ms) = if owns_lower_frontier {
+                    (snapshot, score.eta_ms)
+                } else {
+                    lead_baseline.unwrap_or((snapshot, score.eta_ms))
+                };
                 let completion_horizon_ms = bulk_completion_horizon_ms_with_ordering_debt(
                     best_snapshot,
                     best_eta_ms,
@@ -1725,32 +1724,17 @@ fn choose_bulk_relay_path_for_extent_with_mode(
                     snapshot: Some(snapshot),
                 });
             }
-            let admission_check = BulkAdmissionCheck {
-                best_snapshot,
-                best_eta_ms,
+            let admission_check = BulkProductResourceCheck {
                 candidate_snapshot: snapshot,
-                candidate_eta_ms: score.eta_ms,
                 payload_bytes,
                 mux_limits,
                 position,
                 stream_ordering_debt_bytes: admission_ordering_debt,
+                product_assignment_qualified: request_state.is_some_and(|request| {
+                    request.product_assignment_qualified(path.instance(), observation.observed_at)
+                }),
             };
-            let ordering_suppression = bulk_candidate_admission_suppression_with_completion_backlog(
-                admission_check,
-                completion_backlog_bytes,
-                BulkAdmissionEvidence {
-                    product_assignment_qualified: request_state.is_some_and(|request| {
-                        request
-                            .product_assignment_qualified(path.instance(), observation.observed_at)
-                    }),
-                    fresh_completion_rate: request_snapshot_has_fresh_completion_rate(
-                        path,
-                        snapshot,
-                        request_state,
-                        observation.observed_at,
-                    ),
-                },
-            );
+            let ordering_suppression = bulk_product_candidate_resource_suppression(admission_check);
             if let Some(reason) = ordering_suppression {
                 #[cfg(feature = "lab-diagnostics")]
                 if let Some(diagnostics) = candidate_diagnostics {
@@ -2039,15 +2023,16 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
                 0
             };
             let suppression =
-                bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-                    best_snapshot: snapshot,
-                    best_eta_ms: eta_ms,
+                bulk_product_candidate_resource_suppression(BulkProductResourceCheck {
                     candidate_snapshot: snapshot,
-                    candidate_eta_ms: eta_ms,
                     payload_bytes,
                     mux_limits: observation.mux_limits,
                     position: BulkCandidatePosition::FirstPath,
                     stream_ordering_debt_bytes,
+                    product_assignment_qualified: request_state.is_some_and(|request| {
+                        request
+                            .product_assignment_qualified(path.instance(), observation.observed_at)
+                    }),
                 });
             // The oldest DSN owner remains the completion baseline while its
             // path drains. Its own admission gate decides whether it may send

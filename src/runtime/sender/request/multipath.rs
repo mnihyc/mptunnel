@@ -520,7 +520,8 @@ impl RequestMultipathPlan {
 
     /// Records one target-local apply failure for a finite same-quantum
     /// ordinary replan. This owns no scheduling order: the next attempt is
-    /// selected again by ordinary ECF with this exact incarnation excluded.
+    /// selected again by ordinary finite ranking with this exact incarnation
+    /// excluded.
     pub(super) fn reject_failed_bulk_original_target(
         &self,
         lane: TrafficClass,
@@ -2074,8 +2075,8 @@ impl RequestMultipathController {
     }
 
     /// Keeps the ReceiptMode ACK-clock transaction subordinate to ordinary
-    /// placement. The ordinary ECF decision owns the target; this function may
-    /// only annotate that same target's useful Product commit with measurement
+    /// placement. Ordinary Product selection owns the target; this function
+    /// may only annotate that same target's useful commit with measurement
     /// authority.
     fn ordinary_request_product_mutation(
         &self,

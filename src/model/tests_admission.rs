@@ -152,7 +152,7 @@ fn validated_quic_path_remains_available_beside_active_unmeasured_work() {
 }
 
 #[test]
-fn bulk_admission_allows_same_underlay_candidate_that_beats_lead_next_quantum() {
+fn global_discovery_keeps_second_same_underlay_structural_candidate() {
     let admitted = bulk_striping_admitted_paths(
         vec![
             candidate(0, 1000.0, 250.0, 100.0),
@@ -189,7 +189,7 @@ fn same_underlay_candidate_with_sub_quantum_debt_still_gets_one_service_quantum(
 }
 
 #[test]
-fn global_discovery_defers_ecf_for_every_underlay() {
+fn global_discovery_keeps_optional_measurement_completion_policy_separate() {
     let mut best = candidate(0, 1000.0, 250.0, 300.0);
     best.snapshot.confidence = 1.0;
     let mut cross_underlay = candidate(1, 5000.0, 260.0, 250.0);
@@ -201,7 +201,7 @@ fn global_discovery_defers_ecf_for_every_underlay() {
 
     assert_eq!(admitted.len(), 2);
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
+        bulk_measurement_start_suppression_with_completion_backlog(
             BulkAdmissionCheck {
                 best_snapshot: best.snapshot,
                 best_eta_ms: best.eta_ms,
@@ -216,7 +216,7 @@ fn global_discovery_defers_ecf_for_every_underlay() {
             bulk_evidence(true),
         ),
         Some("ecf_no_completion_gain"),
-        "the directional sender applies ECF with its exact completion backlog",
+        "the optional measurement owner may still decline an inferred-late annotation",
     );
 }
 
@@ -904,14 +904,7 @@ fn active_service_same_path_backlog_is_not_reorder_debt() {
     active.app_limited = true;
 
     assert!(
-        bulk_candidate_within_reorder_budget(
-            active,
-            payload,
-            mux_limits,
-            BulkCandidatePosition::FirstPath,
-            0,
-            true,
-        ),
+        bulk_candidate_within_stream_product_resource(active, payload, mux_limits, 0),
         "same-path queued bytes are feed/backpressure debt, not cross-path reorder debt"
     );
     assert_ne!(
@@ -957,11 +950,7 @@ fn active_tcp_service_with_clear_frontier_uses_product_envelope_for_reorder_budg
     };
 
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
-            check,
-            0,
-            bulk_evidence(false),
-        ),
+        bulk_measurement_start_suppression_with_completion_backlog(check, 0, bulk_evidence(false),),
         None,
         "a clear-frontier owner without a window-qualified sample retains bounded acquisition credit"
     );
@@ -1236,7 +1225,7 @@ fn qualified_product_p_is_independent_of_delivery_and_pacing_rates() {
 }
 
 #[test]
-fn global_same_underlay_eligibility_defers_completion_to_the_stream_scheduler() {
+fn ordinary_same_underlay_admission_keeps_completion_in_ranking() {
     let mut best = candidate(0, 2958.0, 80.0, 180.0);
     let mut alternate = candidate(1, 3202.0, 180.0, 220.0);
     best.snapshot.confidence = 1.0;
@@ -1256,8 +1245,8 @@ fn global_same_underlay_eligibility_defers_completion_to_the_stream_scheduler() 
             position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 0,
         }),
-        Some("ecf_no_completion_gain"),
-        "the sender still applies ECF once it owns the exact stream backlog",
+        None,
+        "completion inference may rank the candidate last but cannot revoke its Product resources",
     );
 }
 
@@ -1277,7 +1266,7 @@ fn bulk_admission_does_not_treat_native_packet_flight_as_product_debt() {
 }
 
 #[test]
-fn additional_path_uses_a_measured_reorder_allowance_inside_the_stream_envelope() {
+fn additional_path_uses_the_configured_stream_product_envelope() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut extra = candidate(1, 100.0, 50.0, 50.0);
     extra.snapshot.confidence = 0.1;
@@ -1295,7 +1284,7 @@ fn additional_path_uses_a_measured_reorder_allowance_inside_the_stream_envelope(
             BulkCandidatePosition::AdditionalPath,
         ),
         None,
-        "a bounded additional-path flight fits its measured reordering allowance",
+        "bounded additional-path Product debt fits configured W",
     );
 }
 
@@ -1363,17 +1352,21 @@ fn stale_tcp_send_window_cannot_mint_additional_path_exploration_credit() {
     active.snapshot.product_progress_rate_bps = None;
 
     assert_eq!(
-        bulk_candidate_admission_suppression(
-            best.snapshot,
-            best.eta_ms,
-            active.snapshot,
-            active.eta_ms,
-            64 * 1024,
-            MuxLimits::default(),
-            BulkCandidatePosition::AdditionalPath,
+        bulk_product_candidate_resource_suppression(
+            BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: active.snapshot,
+                candidate_eta_ms: active.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                position: BulkCandidatePosition::AdditionalPath,
+                stream_ordering_debt_bytes: 0,
+            }
+            .product_resource_check(false),
         ),
         Some("inflight_limit"),
-        "stale native telemetry may rank a path but cannot authorize additional unique Data Sequence bytes"
+        "an unqualified additional output cannot exceed its exact E authority"
     );
 }
 
@@ -1557,7 +1550,7 @@ fn tcp_active_service_app_limited_progress_does_not_shrink_below_startup_headroo
 }
 
 #[test]
-fn tcp_active_path_with_ordering_debt_obeys_model_based_product_flight_budget() {
+fn tcp_active_path_with_ordering_debt_uses_configured_product_resources() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut active = candidate(0, 100.0, 50.0, 50.0);
     active.snapshot.underlay = UnderlayProtocol::Tcp;
@@ -1577,12 +1570,13 @@ fn tcp_active_path_with_ordering_debt_obeys_model_based_product_flight_budget() 
             position: BulkCandidatePosition::FirstPath,
             stream_ordering_debt_bytes: 1024 * 1024,
         }),
-        Some("reorder_budget")
+        None,
+        "inferred BDP cannot shrink configured W/P while the exact debt fits"
     );
 }
 
 #[test]
-fn lagging_active_path_must_not_expand_cross_path_stream_hole() {
+fn lagging_active_path_remains_admissible_inside_configured_stream_window() {
     let best = candidate(1, 100.0, 170.0, 180.0);
     let mut lagging_active = candidate(0, 1900.0, 1800.0, 1.0);
     lagging_active.snapshot.underlay = UnderlayProtocol::Tcp;
@@ -1601,7 +1595,8 @@ fn lagging_active_path_must_not_expand_cross_path_stream_hole() {
             position: BulkCandidatePosition::FirstPath,
             stream_ordering_debt_bytes: 15 * 1024 * 1024,
         },),
-        Some("reorder_budget")
+        None,
+        "a low inferred BDP changes rank, not configured stream authority"
     );
 }
 
@@ -1627,7 +1622,7 @@ fn best_active_path_can_continue_across_small_existing_hole() {
 }
 
 #[test]
-fn active_lower_frontier_owner_uses_adaptive_reorder_budget() {
+fn active_lower_frontier_owner_uses_configured_stream_product_window() {
     let active = candidate(0, 100.0, 170.0, 500.0);
     let payload = 64 * 1024;
     let mux_limits = MuxLimits::default();
@@ -1645,12 +1640,12 @@ fn active_lower_frontier_owner_uses_adaptive_reorder_budget() {
             stream_ordering_debt_bytes: service_horizon.saturating_add(payload as u64),
         },),
         None,
-        "bulk-only lower-frontier progress should use the adaptive BDP budget instead of stalling at the geometric leading path horizon"
+        "inferred BDP cannot shrink the configured stream Product window"
     );
 }
 
 #[test]
-fn other_latency_flow_does_not_shrink_lower_frontier_reorder_budget() {
+fn other_latency_flow_does_not_shrink_configured_lower_frontier_resources() {
     let mut active = candidate(0, 100.0, 170.0, 500.0);
     active.snapshot.active_latency_sensitive_flows = 1;
     let payload = 64 * 1024;
@@ -1669,13 +1664,15 @@ fn other_latency_flow_does_not_shrink_lower_frontier_reorder_budget() {
             stream_ordering_debt_bytes: service_horizon.saturating_add(payload as u64),
         },),
         None,
-        "cross-stream latency demand is not receive-hole authority; the ordinary adaptive reorder budget remains in force"
+        "cross-stream latency demand cannot rewrite configured Product resources"
     );
 }
 
 #[test]
-fn lead_path_with_large_cross_path_hole_uses_reorder_budget() {
+fn lead_path_cannot_exceed_configured_stream_resource_window() {
     let lead = candidate(0, 100.0, 170.0, 180.0);
+    let mux_limits = MuxLimits::default();
+    let stream_limit = reliable_bulk_product_windows(mux_limits).stream_resource_limit_bytes;
 
     assert_eq!(
         bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -1684,11 +1681,12 @@ fn lead_path_with_large_cross_path_hole_uses_reorder_budget() {
             candidate_snapshot: lead.snapshot,
             candidate_eta_ms: lead.eta_ms,
             payload_bytes: 16 * 1024,
-            mux_limits: MuxLimits::default(),
+            mux_limits,
             position: BulkCandidatePosition::FirstPath,
-            stream_ordering_debt_bytes: 32 * 1024 * 1024,
+            stream_ordering_debt_bytes: stream_limit,
         },),
-        Some("reorder_budget")
+        Some("reorder_budget"),
+        "the complete next quantum must fit configured W"
     );
 }
 
@@ -1702,7 +1700,7 @@ fn unproven_product_inflight_limit_is_modeled_limit_capped_by_configured_ceiling
     constrained.snapshot.data_level_bytes_in_flight = 1024 * 1024;
 
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
+        bulk_measurement_start_suppression_with_completion_backlog(
             BulkAdmissionCheck {
                 best_snapshot: best.snapshot,
                 best_eta_ms: best.eta_ms,
@@ -1875,7 +1873,7 @@ fn udp_active_path_without_carrier_limit_uses_modeled_credit() {
 }
 
 #[test]
-fn additional_path_reorder_allowance_does_not_depend_on_probe_confidence() {
+fn additional_path_product_resources_do_not_depend_on_probe_confidence() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut extra = candidate(1, 50.0, 50.0, 50.0);
     extra.snapshot.confidence = 0.1;
@@ -1892,7 +1890,7 @@ fn additional_path_reorder_allowance_does_not_depend_on_probe_confidence() {
             BulkCandidatePosition::AdditionalPath,
         ),
         None,
-        "confidence affects completion evidence, not the measured reordering allowance",
+        "confidence affects completion ranking, not configured Product resources",
     );
 }
 
@@ -1917,12 +1915,12 @@ fn exact_low_product_p_caps_unqualified_and_qualified_assignment() {
     };
 
     assert_eq!(
-        bulk_candidate_resource_suppression(check, false),
+        bulk_product_candidate_resource_suppression(check.product_resource_check(false)),
         Some("inflight_limit"),
         "E cannot exceed the exact published Product P"
     );
     assert_eq!(
-        bulk_candidate_resource_suppression(check, true),
+        bulk_product_candidate_resource_suppression(check.product_resource_check(true)),
         Some("inflight_limit"),
         "qualification cannot replace an exact low Product P"
     );
@@ -1949,21 +1947,13 @@ fn unqualified_path_can_fill_native_window_without_completion_authority() {
     };
 
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
-            check,
-            0,
-            bulk_evidence(false),
-        ),
+        bulk_measurement_start_suppression_with_completion_backlog(check, 0, bulk_evidence(false),),
         None,
         "an unqualified path may use native congestion credit to finish measuring its pipe"
     );
     check.candidate_snapshot.data_level_bytes_in_flight = 2 * 1024 * 1024 + 64 * 1024;
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
-            check,
-            0,
-            bulk_evidence(false),
-        ),
+        bulk_measurement_start_suppression_with_completion_backlog(check, 0, bulk_evidence(false),),
         Some("inflight_limit"),
         "native acquisition credit remains a bounded product flight window"
     );
@@ -1981,7 +1971,7 @@ fn app_limited_rate_does_not_reclamp_the_product_service_window() {
     extra.snapshot.data_level_bytes_in_flight = 1024 * 1024;
 
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
+        bulk_measurement_start_suppression_with_completion_backlog(
             BulkAdmissionCheck {
                 best_snapshot: lead.snapshot,
                 best_eta_ms: lead.eta_ms,
@@ -2001,7 +1991,7 @@ fn app_limited_rate_does_not_reclamp_the_product_service_window() {
 }
 
 #[test]
-fn app_limited_native_path_retains_qualified_completion_authority() {
+fn optional_measurement_uses_retained_completion_evidence_when_app_limited() {
     let lead = candidate(0, 400.0, 40.0, 400.0);
     let mut extra = candidate(1, 800.0, 180.0, 20.0);
     extra.snapshot.confidence = 1.0;
@@ -2019,18 +2009,14 @@ fn app_limited_native_path_retains_qualified_completion_authority() {
     };
 
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
-            check,
-            0,
-            bulk_evidence(false),
-        ),
+        bulk_measurement_start_suppression_with_completion_backlog(check, 0, bulk_evidence(false),),
         None,
         "an immature rate sample must leave bounded acquisition available"
     );
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, bulk_evidence(true),),
+        bulk_measurement_start_suppression_with_completion_backlog(check, 0, bulk_evidence(true),),
         Some("ecf_no_completion_gain"),
-        "a later app-limited poll cannot revoke retained completion evidence"
+        "retained completion evidence may decline a later inferred-late optional annotation"
     );
 
     let mut latency_check = check;
@@ -2039,13 +2025,13 @@ fn app_limited_native_path_retains_qualified_completion_authority() {
         .candidate_snapshot
         .active_latency_sensitive_flows = 1;
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
+        bulk_measurement_start_suppression_with_completion_backlog(
             latency_check,
             0,
             bulk_evidence(true),
         ),
         Some("ecf_no_completion_gain"),
-        "an idle carrier sharing latency traffic retains the conservative ECF boundary"
+        "latency demand does not erase the optional measurement completion boundary"
     );
 }
 
@@ -2071,36 +2057,24 @@ fn unqualified_native_acquisition_cannot_reuse_a_larger_product_window() {
     };
 
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
-            check,
-            0,
-            bulk_evidence(false),
-        ),
+        bulk_measurement_start_suppression_with_completion_backlog(check, 0, bulk_evidence(false),),
         None,
         "an output without qualified completion evidence may fill current native credit"
     );
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, bulk_evidence(true),),
+        bulk_measurement_start_suppression_with_completion_backlog(check, 0, bulk_evidence(true),),
         Some("ecf_no_completion_gain"),
         "current app-limited state cannot revoke retained completion evidence"
     );
     check.candidate_snapshot.data_level_bytes_in_flight = 4 * 1024 * 1024 + 64 * 1024;
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
-            check,
-            0,
-            bulk_evidence(false),
-        ),
+        bulk_measurement_start_suppression_with_completion_backlog(check, 0, bulk_evidence(false),),
         Some("inflight_limit"),
         "an older Product service window cannot enlarge native acquisition credit"
     );
     check.candidate_snapshot.app_limited = false;
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
-            check,
-            0,
-            bulk_evidence(false),
-        ),
+        bulk_measurement_start_suppression_with_completion_backlog(check, 0, bulk_evidence(false),),
         Some("inflight_limit"),
         "current non-app-limited state is not rate qualification and cannot revive the old Product window",
     );
@@ -2135,7 +2109,7 @@ fn tcp_path_uses_product_service_and_connection_reorder_windows() {
             stream_ordering_debt_bytes: 40 * 1024 * 1024,
         }),
         None,
-        "foreign lower-path debt must not consume this path's independent measured allowance"
+        "candidate and foreign Product debt together remain inside configured W"
     );
 
     assert_eq!(
@@ -2150,7 +2124,7 @@ fn tcp_path_uses_product_service_and_connection_reorder_windows() {
             stream_ordering_debt_bytes: 4 * 1024 * 1024,
         }),
         None,
-        "an additional TCP path still receives enough measured reorder credit to aggregate"
+        "a smaller exact Product debt remains inside configured W"
     );
 
     extra.snapshot.data_level_bytes_in_flight = 24 * 1024 * 1024;
@@ -2165,40 +2139,45 @@ fn tcp_path_uses_product_service_and_connection_reorder_windows() {
             position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 0,
         }),
-        Some("inflight_limit"),
-        "the independent candidate-local BDP gate must still bound its own pipe"
+        None,
+        "qualified candidate-local Product debt remains inside the exact published P"
     );
 
     extra.snapshot.data_level_limit_bytes = 64 * 1024 * 1024;
     assert_eq!(
-        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-            best_snapshot: best.snapshot,
-            best_eta_ms: best.eta_ms,
-            candidate_snapshot: extra.snapshot,
-            candidate_eta_ms: extra.eta_ms,
-            payload_bytes,
-            mux_limits,
-            position: BulkCandidatePosition::AdditionalPath,
-            stream_ordering_debt_bytes: 0,
-        }),
+        bulk_product_candidate_resource_suppression(
+            BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes,
+                mux_limits,
+                position: BulkCandidatePosition::AdditionalPath,
+                stream_ordering_debt_bytes: 0,
+            }
+            .product_resource_check(false),
+        ),
         Some("inflight_limit"),
-        "an unqualified additional TCP output cannot reuse an older Product window, regardless of app-limited state"
+        "an unqualified additional TCP output cannot use P in place of E"
     );
 
-    extra.snapshot.confidence = 1.0;
     assert_eq!(
-        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-            best_snapshot: best.snapshot,
-            best_eta_ms: best.eta_ms,
-            candidate_snapshot: extra.snapshot,
-            candidate_eta_ms: extra.eta_ms,
-            payload_bytes,
-            mux_limits,
-            position: BulkCandidatePosition::AdditionalPath,
-            stream_ordering_debt_bytes: 0,
-        }),
+        bulk_product_candidate_resource_suppression(
+            BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes,
+                mux_limits,
+                position: BulkCandidatePosition::AdditionalPath,
+                stream_ordering_debt_bytes: 0,
+            }
+            .product_resource_check(true),
+        ),
         None,
-        "fresh qualified completion evidence may use the already-modeled Product window"
+        "exact Product qualification selects the published P independently of confidence"
     );
 
     extra.snapshot.data_level_bytes_in_flight = 1024 * 1024;
@@ -2246,7 +2225,7 @@ fn cold_tcp_same_underlay_candidate_uses_bounded_startup_flight_with_an_existing
 }
 
 #[test]
-fn app_limited_tcp_path_does_not_expand_a_large_existing_hole() {
+fn app_limited_tcp_path_uses_configured_stream_authority_not_completion_eta() {
     let mut lead = candidate(0, 1_061.5, 180.0, 192.5);
     let mut extra = candidate(1, 1_094.8, 180.0, 23.0);
     lead.snapshot.underlay = UnderlayProtocol::Tcp;
@@ -2268,8 +2247,8 @@ fn app_limited_tcp_path_does_not_expand_a_large_existing_hole() {
             position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 28 * 1024 * 1024,
         }),
-        Some("ecf_no_completion_gain"),
-        "completion ranking cannot authorize tens of megabytes of later data behind a lower-offset owner",
+        None,
+        "completion ranking cannot deny Product debt that remains inside configured W/P",
     );
 }
 
@@ -2348,7 +2327,7 @@ fn same_underlay_low_confidence_sender_samples_remain_startup_admissible() {
 }
 
 #[test]
-fn same_underlay_clear_frontier_still_requires_completion_gain_after_bulk_proof() {
+fn same_underlay_clear_frontier_keeps_completion_gain_advisory_after_bulk_proof() {
     let mut lead = candidate(0, 98_000.0, 80.0, 500.0);
     let mut extra = candidate(1, 1_500_000.0, 80.0, 500.0);
     lead.snapshot.confidence = 1.0;
@@ -2366,7 +2345,7 @@ fn same_underlay_clear_frontier_still_requires_completion_gain_after_bulk_proof(
             position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 0,
         }),
-        Some("ecf_no_completion_gain")
+        None
     );
     assert_eq!(
         bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -2379,12 +2358,12 @@ fn same_underlay_clear_frontier_still_requires_completion_gain_after_bulk_proof(
             position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 512 * 1024,
         }),
-        Some("ecf_no_completion_gain")
+        None
     );
 }
 
 #[test]
-fn request_ordering_debt_does_not_mint_service_completion_backlog() {
+fn request_ordering_debt_does_not_turn_completion_prediction_into_admission() {
     let mut lead = candidate(0, 400.0, 360.0, 400.0);
     let mut extra = candidate(1, 410.0, 360.0, 200.0);
     lead.snapshot.confidence = 1.0;
@@ -2402,13 +2381,13 @@ fn request_ordering_debt_does_not_mint_service_completion_backlog() {
     };
     assert_eq!(
         bulk_candidate_admission_suppression_with_ordering_debt(check),
-        Some("ecf_no_completion_gain"),
-        "a lower receive hole cannot extend leading path's completion deadline and authorize more later-offset request work"
+        None,
+        "the configured Product envelope bounds the hole while completion remains advisory"
     );
 }
 
 #[test]
-fn bulk_rate_proven_same_underlay_path_must_beat_lead_next_quantum() {
+fn bulk_rate_proven_same_underlay_path_remains_structurally_admissible() {
     let mut lead = candidate(0, 100_000_000.0, 50.0, 100.0);
     let mut extra = candidate(1, 500_000_000.0, 700.0, 500.0);
     lead.snapshot.confidence = 1.0;
@@ -2426,12 +2405,12 @@ fn bulk_rate_proven_same_underlay_path_must_beat_lead_next_quantum() {
             position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 0,
         }),
-        Some("ecf_no_completion_gain")
+        None
     );
 }
 
 #[test]
-fn bulk_backlog_admits_same_underlay_path_that_finishes_before_service_tail() {
+fn optional_measurement_admits_path_that_finishes_before_service_tail() {
     let mut lead = candidate(0, 400.0, 360.0, 400.0);
     let mut extra = candidate(1, 800.0, 360.0, 200.0);
     lead.snapshot.confidence = 1.0;
@@ -2439,7 +2418,7 @@ fn bulk_backlog_admits_same_underlay_path_that_finishes_before_service_tail() {
     extra.snapshot.app_limited = false;
 
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
+        bulk_measurement_start_suppression_with_completion_backlog(
             BulkAdmissionCheck {
                 best_snapshot: lead.snapshot,
                 best_eta_ms: lead.eta_ms,
@@ -2459,7 +2438,7 @@ fn bulk_backlog_admits_same_underlay_path_that_finishes_before_service_tail() {
 }
 
 #[test]
-fn bulk_backlog_does_not_double_count_service_carrier_flight() {
+fn optional_measurement_does_not_double_count_service_carrier_flight() {
     let mut lead = candidate(0, 735.0, 360.0, 400.0);
     let mut extra = candidate(1, 1_100.0, 360.0, 200.0);
     lead.snapshot.confidence = 1.0;
@@ -2468,7 +2447,7 @@ fn bulk_backlog_does_not_double_count_service_carrier_flight() {
     extra.snapshot.app_limited = false;
 
     assert_eq!(
-        bulk_candidate_admission_suppression_with_completion_backlog(
+        bulk_measurement_start_suppression_with_completion_backlog(
             BulkAdmissionCheck {
                 best_snapshot: lead.snapshot,
                 best_eta_ms: lead.eta_ms,
@@ -2488,7 +2467,7 @@ fn bulk_backlog_does_not_double_count_service_carrier_flight() {
 }
 
 #[test]
-fn cross_underlay_path_can_join_only_when_it_beats_lead_next_quantum() {
+fn cross_underlay_path_inside_product_resources_is_admissible_with_favorable_eta() {
     let best = candidate(0, 500.0, 50.0, 500.0);
     let mut extra = candidate(1, 504.0, 250.0, 500.0);
     extra.snapshot.confidence = 1.0;
@@ -2510,7 +2489,7 @@ fn cross_underlay_path_can_join_only_when_it_beats_lead_next_quantum() {
 }
 
 #[test]
-fn cross_underlay_path_is_rejected_when_it_cannot_beat_lead_next_quantum() {
+fn cross_underlay_path_inside_product_resources_is_not_rejected_by_eta() {
     let mut best = candidate(0, 500.0, 50.0, 500.0);
     best.snapshot.confidence = 1.0;
     let mut extra = candidate(1, 620.0, 250.0, 500.0);
@@ -2526,12 +2505,12 @@ fn cross_underlay_path_is_rejected_when_it_cannot_beat_lead_next_quantum() {
             MuxLimits::default(),
             BulkCandidatePosition::AdditionalPath,
         ),
-        Some("ecf_no_completion_gain")
+        None
     );
 }
 
 #[test]
-fn bounded_stream_ordering_debt_uses_completion_and_reorder_limits() {
+fn bounded_stream_ordering_debt_uses_configured_product_window() {
     let best = candidate(0, 80.0, 50.0, 500.0);
     let mut extra = candidate(1, 80.5, 50.0, 500.0);
     extra.snapshot.confidence = 1.0;
@@ -2548,29 +2527,6 @@ fn bounded_stream_ordering_debt_uses_completion_and_reorder_limits() {
             stream_ordering_debt_bytes: 4 * 1024 * 1024,
         },),
         None
-    );
-}
-
-#[test]
-fn active_path_with_ordering_debt_must_still_beat_lead_completion_horizon() {
-    let mut best = candidate(0, 10.0, 10.0, 1000.0);
-    let mut active_with_debt = candidate(1, 100.0, 10.0, 1000.0);
-    best.snapshot.confidence = 1.0;
-    active_with_debt.snapshot.confidence = 1.0;
-    let payload = 32 * 1024;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-            best_snapshot: best.snapshot,
-            best_eta_ms: best.eta_ms,
-            candidate_snapshot: active_with_debt.snapshot,
-            candidate_eta_ms: active_with_debt.eta_ms,
-            payload_bytes: payload,
-            mux_limits: MuxLimits::default(),
-            position: BulkCandidatePosition::FirstPath,
-            stream_ordering_debt_bytes: 16 * 1024,
-        }),
-        Some("completion_horizon")
     );
 }
 

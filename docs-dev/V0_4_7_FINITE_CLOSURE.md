@@ -304,6 +304,25 @@ symbolic owner proof and exact evidence are recorded in
 `T04A_RESPONSE_QUEUE_ACCOUNTING.md`; this result does not waive T04b or any
 runtime acceptance cell.
 
+T04b is now focused GREEN. Two reachable owner-level falsifiers changed only
+inferred completion inputs while holding exact/configured Product authority
+constant: response selection changed from its sole enqueueable output to no
+output through `ecf_no_completion_gain`, and request selection changed from
+its live contiguous owner to `Blocked` through an inferred-BDP
+`reorder_budget`. Ordinary request and response admission now consume only
+exact `W/P/E` resource state; ETA remains advisory rank/hysteresis, and the
+request ACK-clock completion check remains an optional annotation that falls
+through to ordinary Data. The separate `completion_horizon` branch was proved
+unreachable from production constructors and removed rather than credited as
+a runtime fix. Exact focused suites are GREEN; the proof is recorded in
+`T04B_STRUCTURAL_PRODUCT_ADMISSION.md`.
+
+A broad audit exposed one parent-tree response reinjection failure, not a T04b
+regression: untouched `88957df` and the corrected tree both queue the proper
+fallback target and then reject it at Apply. That exact-target recovery issue
+belongs to the already-foreseen P1 transaction and cannot be bundled into
+ordinary Product admission.
+
 ### P1 — Lowest-frontier temporal service
 
 Observed symptom: QUIC impairment can pin a 64-MiB Product window and cause

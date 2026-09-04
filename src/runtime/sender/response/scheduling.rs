@@ -7,9 +7,9 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
-    BulkAdmissionCheck, BulkAdmissionEvidence, BulkCandidatePosition, ReliableDataAckFrontierState,
-    bulk_candidate_admission_suppression_with_completion_backlog,
-    bulk_contiguous_frontier_can_accept_enqueue, original_data_assignment_has_product_headroom,
+    BulkCandidatePosition, BulkProductResourceCheck, ReliableDataAckFrontierState,
+    bulk_contiguous_frontier_can_accept_enqueue, bulk_product_candidate_resource_suppression,
+    original_data_assignment_has_product_headroom,
 };
 use crate::model::capacity::reliable_unproven_path_startup_flight_limit_bytes;
 use crate::model::path::carrier_path_key_order;
@@ -153,9 +153,10 @@ pub(super) fn select_response_data_path_with_payload(
                 ))
             })
             .collect::<Vec<_>>();
-        // Queue readiness decides where the next frame may be published, but it
-        // does not change which live path owns the lower Data Sequence range.
-        // Keep that owner as the ECF reference while its carrier queue drains.
+        // Queue readiness decides where the next frame may be published, but
+        // it does not change which live path owns the lower Data Sequence
+        // range. Keep that owner as the advisory completion reference while
+        // its carrier queue drains.
         let lower_owner_reference = lower_owner
             .and_then(|(owner_key, owner_incarnation)| {
                 targets.iter().find(|target| {
@@ -182,12 +183,8 @@ pub(super) fn select_response_data_path_with_payload(
                 .map(|candidate| (candidate.0, candidate.1, candidate.2))
         })?;
         let lead_key = lead.0.observation.key;
-        let lead_snapshot = lead.1;
+        #[cfg(feature = "lab-diagnostics")]
         let lead_eta_ms = lead.2;
-        // ECF may credit only work the lead path will actually complete. The
-        // rest of the Data-ACK tail is cross-path ordering debt, not additional
-        // lead-path backlog.
-        let lead_completion_backlog_bytes = lead.0.observation.original_data_in_flight_bytes;
         let admitted = candidates
             .into_iter()
             .filter_map(|(target, snapshot, eta_ms, external_flight, target_payload_bytes)| {
@@ -203,11 +200,6 @@ pub(super) fn select_response_data_path_with_payload(
                 } else {
                     BulkCandidatePosition::AdditionalPath
                 };
-                let (best_snapshot, best_eta_ms) = if owns_lower_frontier {
-                    (snapshot, eta_ms)
-                } else {
-                    (lead_snapshot, lead_eta_ms)
-                };
                 // Every unproven additional path may own only one bounded
                 // startup flight until exact Data ACKs prove progress. A live
                 // contiguous owner may enter admission directly, but still
@@ -220,24 +212,24 @@ pub(super) fn select_response_data_path_with_payload(
                         .original_data_in_flight_bytes
                         .saturating_add(target_payload_bytes as u64)
                         <= reliable_unproven_path_startup_flight_limit_bytes(mux_limits);
-                // ECF and Product service windows govern bulk placement. A
-                // sole enqueueable contiguous output may use a work-conserving
-                // gate that still checks Product/native authority. If an absent
-                // output still owns lower bytes, this candidate remains an
-                // additional path and must not extend that receive hole
-                // without bound. Once latency work is ready, deferring it
-                // cannot move it ahead of bytes already handed to an ordered
-                // carrier; publish it into the carrier's priority queue at the
-                // earliest opportunity.
-                let admission_check = BulkAdmissionCheck {
-                    best_snapshot,
-                    best_eta_ms,
+                // Exact Product resources govern admission; ETA is used only
+                // by the finite order below. A sole enqueueable contiguous
+                // output may use a work-conserving gate that still checks
+                // Product/native authority. If an absent output still owns
+                // lower bytes, this candidate remains an additional path and
+                // must fit the configured stream envelope. Once latency work
+                // is ready, deferring it cannot move it ahead of bytes already
+                // handed to an ordered carrier; publish it into the carrier's
+                // priority queue at the earliest opportunity.
+                let admission_check = BulkProductResourceCheck {
                     candidate_snapshot: snapshot,
-                    candidate_eta_ms: eta_ms,
                     payload_bytes: target_payload_bytes,
                     mux_limits,
                     position,
                     stream_ordering_debt_bytes: external_flight,
+                    product_assignment_qualified: target
+                        .observation
+                        .product_assignment_qualified,
                 };
                 let uses_contiguous_work_conserving_gate = single_live_path
                     && position != BulkCandidatePosition::AdditionalPath
@@ -256,18 +248,7 @@ pub(super) fn select_response_data_path_with_payload(
                 } else {
                     may_attempt_product_admission
                         .then(|| {
-                            bulk_candidate_admission_suppression_with_completion_backlog(
-                                admission_check,
-                                lead_completion_backlog_bytes,
-                                BulkAdmissionEvidence {
-                                    product_assignment_qualified: target
-                                        .observation
-                                        .product_assignment_qualified,
-                                    fresh_completion_rate: target
-                                        .observation
-                                        .has_bulk_rate_evidence,
-                                },
-                            )
+                            bulk_product_candidate_resource_suppression(admission_check)
                         })
                     .flatten()
                     .or((!may_attempt_product_admission).then_some("startup_flight_limit"))
@@ -323,10 +304,10 @@ pub(super) fn select_response_data_path_with_payload(
         // The startup-flight bound limits acquisition resources; it does not
         // grant placement priority over a lower-completion qualified output.
         // Retain the exact lower-range owner only while its completion remains
-        // inside measured timing and one-quantum queue uncertainty. This is
-        // the same transport-neutral ECF stability rule used for requests:
-        // it avoids changing ownership on measurement noise, but a blocked or
-        // materially slower owner immediately yields to the best candidate.
+        // inside measured timing and one-quantum queue uncertainty. This
+        // advisory hysteresis avoids changing ownership on measurement noise,
+        // but a blocked or materially slower owner immediately yields to the
+        // best structurally admitted candidate.
         let best = admitted.iter().min_by(|left, right| {
             left.2
                 .total_cmp(&right.2)

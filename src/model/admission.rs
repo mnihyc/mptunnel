@@ -205,6 +205,37 @@ pub(crate) struct BulkAdmissionCheck {
     pub(crate) stream_ordering_debt_bytes: u64,
 }
 
+/// Exact/configured inputs allowed to decide ordinary Product admission.
+///
+/// Completion estimates are absent by construction. `candidate_snapshot` is
+/// retained because the current published `P/E` authority is projected there;
+/// this predicate reads only its Product resource fields.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BulkProductResourceCheck {
+    pub(crate) candidate_snapshot: PathSnapshot,
+    pub(crate) payload_bytes: usize,
+    pub(crate) mux_limits: MuxLimits,
+    pub(crate) position: BulkCandidatePosition,
+    pub(crate) stream_ordering_debt_bytes: u64,
+    pub(crate) product_assignment_qualified: bool,
+}
+
+impl BulkAdmissionCheck {
+    fn product_resource_check(
+        self,
+        product_assignment_qualified: bool,
+    ) -> BulkProductResourceCheck {
+        BulkProductResourceCheck {
+            candidate_snapshot: self.candidate_snapshot,
+            payload_bytes: self.payload_bytes,
+            mux_limits: self.mux_limits,
+            position: self.position,
+            stream_ordering_debt_bytes: self.stream_ordering_debt_bytes,
+            product_assignment_qualified,
+        }
+    }
+}
+
 pub(crate) fn bulk_striping_admitted_paths(
     candidates: impl IntoIterator<Item = BulkPathCandidate>,
     payload_bytes: usize,
@@ -221,22 +252,21 @@ pub(crate) fn bulk_striping_admitted_paths(
         } else {
             BulkCandidatePosition::AdditionalPath
         };
-        let check = BulkAdmissionCheck {
-            best_snapshot: best.snapshot,
-            best_eta_ms: best.eta_ms,
+        let check = BulkProductResourceCheck {
             candidate_snapshot: candidate.snapshot,
-            candidate_eta_ms: candidate.eta_ms,
             payload_bytes,
             mux_limits,
             position,
             stream_ordering_debt_bytes: 0,
+            product_assignment_qualified: false,
         };
-        // Global discovery has no stream backlog. Defer ECF to the directional
-        // sender, which owns the exact lower-offset tail for every carrier.
+        // Global discovery has no exact stream backlog. The directional
+        // sender rechecks this resource predicate with its exact lower-offset
+        // ownership ledger before committing Product work.
         // Global discovery has no exact flow-local Product evidence. It may
         // rank a measured carrier, but cannot promote an additional output
         // from acquisition `E` to Product assignment `P`.
-        let suppression = bulk_candidate_resource_suppression(check, false);
+        let suppression = bulk_product_candidate_resource_suppression(check);
         if suppression.is_none() {
             selected.push(candidate);
         } else {
@@ -277,12 +307,7 @@ pub(crate) fn bulk_striping_admitted_paths(
                     ),
                     bulk_scheduler_inflight_debt_bytes(candidate.snapshot, position),
                     candidate.snapshot.queue_bytes,
-                    bulk_admission_reorder_budget_bytes(
-                        candidate.snapshot,
-                        payload_bytes,
-                        mux_limits,
-                        position,
-                    ),
+                    reliable_bulk_product_windows(mux_limits).stream_resource_limit_bytes,
                     reason,
                 ),
             );
@@ -343,27 +368,27 @@ pub(crate) fn bulk_candidate_admission_suppression(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn bulk_candidate_admission_suppression_with_ordering_debt(
     check: BulkAdmissionCheck,
 ) -> Option<&'static str> {
-    bulk_candidate_admission_suppression_with_completion_backlog(
-        check,
-        0,
-        BulkAdmissionEvidence {
-            product_assignment_qualified: true,
-            fresh_completion_rate: true,
-        },
-    )
+    bulk_product_candidate_resource_suppression(check.product_resource_check(true))
 }
 
-pub(crate) fn bulk_candidate_admission_suppression_with_completion_backlog(
+/// Optional ACK-clock measurement-start policy.
+///
+/// Unlike ordinary Product admission, an optional measurement may decline to
+/// annotate the already-selected data quantum when its inferred completion
+/// would extend the current lower tail. The caller must retain the ordinary
+/// Product action when this returns a reason.
+pub(crate) fn bulk_measurement_start_suppression_with_completion_backlog(
     check: BulkAdmissionCheck,
     completion_backlog_bytes: u64,
     evidence: BulkAdmissionEvidence,
 ) -> Option<&'static str> {
-    if let Some(reason) =
-        bulk_candidate_resource_suppression(check, evidence.product_assignment_qualified)
-    {
+    if let Some(reason) = bulk_product_candidate_resource_suppression(
+        check.product_resource_check(evidence.product_assignment_qualified),
+    ) {
         return Some(reason);
     }
     // Ordering debt bounds receive-hole resources; it does not prove that the
@@ -379,54 +404,37 @@ pub(crate) fn bulk_candidate_admission_suppression_with_completion_backlog(
     None
 }
 
-fn bulk_candidate_within_stream_reorder_envelope(
+fn bulk_candidate_within_stream_product_resource(
     candidate: PathSnapshot,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-    position: BulkCandidatePosition,
     stream_ordering_debt_bytes: u64,
 ) -> bool {
-    let candidate_product_debt = bulk_product_reorder_debt_bytes(candidate);
-    bulk_quantum_granular_limit_allows(
-        candidate_product_debt.saturating_add(stream_ordering_debt_bytes),
-        payload_bytes,
-        bulk_stream_reorder_envelope_bytes(payload_bytes, mux_limits),
-        position,
-    )
+    let committed = bulk_product_reorder_debt_bytes(candidate)
+        .checked_add(stream_ordering_debt_bytes)
+        .and_then(|debt| debt.checked_add(payload_bytes as u64));
+    committed.is_some_and(|committed| {
+        committed <= reliable_bulk_product_windows(mux_limits).stream_resource_limit_bytes
+    })
 }
 
-fn bulk_candidate_resource_suppression(
-    check: BulkAdmissionCheck,
-    product_assignment_qualified: bool,
+/// Structural/configured resource admission for one ordinary Product action.
+///
+/// Numeric completion inference is deliberately absent. It may rank this
+/// action, but only exact `W/P/E` authority may reject its Product extent.
+pub(crate) fn bulk_product_candidate_resource_suppression(
+    check: BulkProductResourceCheck,
 ) -> Option<&'static str> {
-    if !bulk_candidate_within_original_data_assignment_windows(check, product_assignment_qualified)
-    {
+    if !bulk_candidate_within_original_data_assignment_windows(check) {
         return Some("inflight_limit");
     }
-    if !bulk_candidate_within_reorder_budget(
+    if !bulk_candidate_within_stream_product_resource(
         check.candidate_snapshot,
         check.payload_bytes,
         check.mux_limits,
-        check.position,
         check.stream_ordering_debt_bytes,
-        product_assignment_qualified,
     ) {
         return Some("reorder_budget");
-    }
-    // Once another path owns lower sequence bytes, ECF protects that frontier:
-    // path exploration is not authority to extend an ordered receive hole.
-    if bulk_completion_horizon_applies(check)
-        && check.candidate_eta_ms
-            > bulk_completion_horizon_ms_with_ordering_debt(
-                check.best_snapshot,
-                check.best_eta_ms,
-                check.candidate_snapshot,
-                check.payload_bytes,
-                check.mux_limits,
-                check.stream_ordering_debt_bytes,
-            )
-    {
-        return Some("completion_horizon");
     }
     None
 }
@@ -466,12 +474,6 @@ fn bulk_additional_path_completion_suppression(
     None
 }
 
-fn bulk_completion_horizon_applies(check: BulkAdmissionCheck) -> bool {
-    // Additional carriers already use ECF against the sender-owned completion
-    // backlog. Only the leading owner can need a separate lower-offset horizon.
-    check.position != BulkCandidatePosition::AdditionalPath && check.stream_ordering_debt_bytes > 0
-}
-
 #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
 pub(crate) fn bulk_completion_horizon_ms(
     best_snapshot: PathSnapshot,
@@ -509,16 +511,13 @@ pub(crate) fn bulk_completion_horizon_ms_with_ordering_debt(
     best_eta_ms.max(0.0) + best_payload_tx_ms + absorption_ms
 }
 
-fn bulk_candidate_within_original_data_assignment_windows(
-    check: BulkAdmissionCheck,
-    product_assignment_qualified: bool,
-) -> bool {
+fn bulk_candidate_within_original_data_assignment_windows(check: BulkProductResourceCheck) -> bool {
     let authority = bulk_original_data_assignment_authority(
         check.candidate_snapshot,
         check.payload_bytes,
         check.mux_limits,
         check.position,
-        product_assignment_qualified,
+        check.product_assignment_qualified,
     );
     authority.has_headroom(bulk_scheduler_inflight_debt_bytes(
         check.candidate_snapshot,
@@ -549,22 +548,7 @@ pub(crate) fn bulk_contiguous_frontier_can_accept_enqueue(
     original_data_assignment_has_product_headroom(candidate)
 }
 
-fn bulk_quantum_granular_limit_allows(
-    committed: u64,
-    payload_bytes: usize,
-    limit: u64,
-    position: BulkCandidatePosition,
-) -> bool {
-    if limit == 0 {
-        return true;
-    }
-    let payload_bytes = payload_bytes as u64;
-    if committed.saturating_add(payload_bytes) <= limit {
-        return true;
-    }
-    position == BulkCandidatePosition::AdditionalPath && committed < limit
-}
-
+#[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
 fn bulk_product_inflight_limit_bytes(
     candidate: PathSnapshot,
     payload_bytes: usize,
@@ -580,69 +564,6 @@ fn bulk_product_inflight_limit_bytes(
         product_assignment_qualified,
     )
     .assignment_limit_bytes
-}
-
-fn bulk_candidate_within_reorder_budget(
-    candidate: PathSnapshot,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    position: BulkCandidatePosition,
-    stream_ordering_debt_bytes: u64,
-    product_assignment_qualified: bool,
-) -> bool {
-    if position == BulkCandidatePosition::AdditionalPath {
-        // Native carrier congestion windows bound each path below MPP. The
-        // product service window may be larger than an app-limited rate BDP;
-        // clamping it again here would prevent TCP/QUIC from growing that pipe.
-        // The connection-wide envelope still bounds the complete receive hole.
-        let candidate_product_debt = bulk_product_reorder_debt_bytes(candidate);
-        let measured_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
-        let authority = bulk_original_data_assignment_authority(
-            candidate,
-            payload_bytes,
-            mux_limits,
-            position,
-            product_assignment_qualified,
-        );
-        let acquisition_budget = if !product_assignment_qualified {
-            // App-limited state is not qualification. Every unqualified
-            // additional output remains at `E`.
-            authority.exploration_limit_bytes
-        } else {
-            authority.product_limit_bytes
-        };
-        let path_budget = measured_budget
-            .max(acquisition_budget)
-            .min(mux_limits.max_path_flight_bytes as u64)
-            .max(payload_bytes as u64);
-        let within_path_budget = bulk_quantum_granular_limit_allows(
-            candidate_product_debt,
-            payload_bytes,
-            path_budget,
-            position,
-        );
-        let within_stream_envelope = bulk_candidate_within_stream_reorder_envelope(
-            candidate,
-            payload_bytes,
-            mux_limits,
-            position,
-            stream_ordering_debt_bytes,
-        );
-        return within_path_budget && within_stream_envelope;
-    }
-    let admission_budget = bulk_admission_reorder_budget_bytes_for_ordering_debt(
-        candidate,
-        payload_bytes,
-        mux_limits,
-        position,
-        stream_ordering_debt_bytes,
-    );
-    bulk_quantum_granular_limit_allows(
-        bulk_total_reorder_debt_bytes(candidate, position, stream_ordering_debt_bytes),
-        payload_bytes,
-        admission_budget,
-        position,
-    )
 }
 
 fn bulk_reorder_absorption_ms(
@@ -710,50 +631,6 @@ fn bulk_effective_rate_bps(snapshot: PathSnapshot) -> f64 {
         .delivery_rate_bps
         .max(snapshot.product_progress_rate_bps.unwrap_or(0.0))
         .max(1.0)
-}
-
-#[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-fn bulk_admission_reorder_budget_bytes(
-    candidate: PathSnapshot,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    position: BulkCandidatePosition,
-) -> u64 {
-    bulk_admission_reorder_budget_bytes_for_ordering_debt(
-        candidate,
-        payload_bytes,
-        mux_limits,
-        position,
-        0,
-    )
-}
-
-fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
-    candidate: PathSnapshot,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    position: BulkCandidatePosition,
-    stream_ordering_debt_bytes: u64,
-) -> u64 {
-    match position {
-        BulkCandidatePosition::FirstPath | BulkCandidatePosition::ContiguousFrontier
-            if stream_ordering_debt_bytes == 0 =>
-        {
-            bulk_reorder_window_bytes(payload_bytes, mux_limits) as u64
-        }
-        BulkCandidatePosition::FirstPath | BulkCandidatePosition::ContiguousFrontier => {
-            bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
-        }
-        BulkCandidatePosition::AdditionalPath => {
-            bulk_stream_reorder_envelope_bytes(payload_bytes, mux_limits)
-        }
-    }
-}
-
-fn bulk_stream_reorder_envelope_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> u64 {
-    (mux_limits.max_reorder_bytes as u64)
-        .min(mux_limits.max_stream_window_bytes)
-        .max(payload_bytes as u64)
 }
 
 fn bulk_effective_reorder_budget_bytes(

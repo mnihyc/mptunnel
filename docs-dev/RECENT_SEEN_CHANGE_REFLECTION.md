@@ -157,8 +157,15 @@ receive-hole and reorder exposure. The current model now has explicit Product
 window/headroom and configured queue/session resource contracts for that
 safety. A numeric ETA comparison is ranking evidence, not resource ownership;
 using it to reject otherwise lifecycle-valid Product work crosses that layer
-boundary. Each reachable branch still needs an exact RED before production is
-changed.
+boundary. T04b supplied those exact owner-level REDs: adverse completion
+inference revoked the only response action through `ecf_no_completion_gain`,
+and inferred BDP revoked a live request owner through `reorder_budget` while
+`W/P/E` were unchanged. Ordinary request and response admission now use only
+those structural resources; ETA still orders admitted actions. The separate
+`completion_horizon` denial was unreachable from production constructors and
+was removed without claiming it caused runtime behavior. The optional request
+ACK-clock completion check remains subordinate annotation policy rather than
+ordinary Product authority.
 
 The optional percentage gate was introduced to stop duplicate wire
 amplification, and the pre-change flood proves that goal necessary. Its defect

@@ -441,6 +441,101 @@ fn ordinary_data_scores_unowned_path_with_joining_flow_projection() {
 }
 
 #[test]
+fn t04b_request_contiguous_product_headroom_is_not_reclamped_by_inferred_bdp() {
+    let owner = instance(UnderlayProtocol::Udp, 0, 201);
+    let sibling = instance(UnderlayProtocol::Tcp, 0, 202);
+    let mut favorable = observed_path(owner, 20.0, 500_000_000.0);
+    favorable.has_fresh_native_carrier_rate_evidence = true;
+    favorable
+        .shared_snapshot
+        .as_mut()
+        .expect("owner snapshot")
+        .carrier_delivery_rate_bps = Some(500_000_000.0);
+    let mut adverse = favorable;
+    let adverse_snapshot = adverse.shared_snapshot.as_mut().expect("owner snapshot");
+    adverse_snapshot.delivery_rate_bps = 1_000_000.0;
+    adverse_snapshot.pacing_rate_bps = 1_000_000.0;
+    adverse_snapshot.carrier_delivery_rate_bps = Some(1_000_000.0);
+
+    let mut blocked_sibling = observed_path(sibling, 20.0, 500_000_000.0);
+    blocked_sibling.can_enqueue_frame = false;
+    let favorable_snapshot = favorable.shared_snapshot.expect("owner snapshot");
+    let adverse_snapshot = adverse.shared_snapshot.expect("owner snapshot");
+    assert_eq!(
+        (
+            adverse.can_enqueue_frame,
+            adverse.can_enqueue_stream_lane,
+            adverse.load_owned,
+            adverse.has_bulk_model_evidence,
+            adverse.has_fresh_native_carrier_rate_evidence,
+            adverse.fresh_proof,
+            adverse_snapshot.state,
+            adverse_snapshot.policy,
+            adverse_snapshot.queue_bytes,
+            adverse_snapshot.bytes_in_flight,
+            adverse_snapshot.carrier_inflight_limit_bytes,
+        ),
+        (
+            favorable.can_enqueue_frame,
+            favorable.can_enqueue_stream_lane,
+            favorable.load_owned,
+            favorable.has_bulk_model_evidence,
+            favorable.has_fresh_native_carrier_rate_evidence,
+            favorable.fresh_proof,
+            favorable_snapshot.state,
+            favorable_snapshot.policy,
+            favorable_snapshot.queue_bytes,
+            favorable_snapshot.bytes_in_flight,
+            favorable_snapshot.carrier_inflight_limit_bytes,
+        ),
+        "the variants share lifecycle, queue admission, evidence, and configured carrier limits",
+    );
+    assert_eq!(
+        (
+            adverse_snapshot.data_level_queue_bytes,
+            adverse_snapshot.data_level_bytes_in_flight,
+            adverse_snapshot.data_level_limit_bytes,
+        ),
+        (
+            favorable_snapshot.data_level_queue_bytes,
+            favorable_snapshot.data_level_bytes_in_flight,
+            favorable_snapshot.data_level_limit_bytes,
+        ),
+        "the variants share Product P and exact debt",
+    );
+
+    let mut flights = RequestFlightLedger::default();
+    flights.record_original_frame_instance(owner, &data_frame(0, PAYLOAD_BYTES));
+    flights
+        .record_original_frame_instance(sibling, &data_frame(PAYLOAD_BYTES as u64, PAYLOAD_BYTES));
+    let evidence = RequestEvidence::default().prove_rate([owner, sibling]);
+    let choose_owner = |owner_path| {
+        let observation = scheduling_observation([owner_path, blocked_sibling]);
+        choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
+            observation: &observation,
+            lane: TrafficClass::Throughput,
+            offset: (2 * PAYLOAD_BYTES) as u64,
+            payload_bytes: PAYLOAD_BYTES,
+            cursor: 0,
+            avoid_instances: &[],
+            path_flights: Some(&flights),
+            request_state: Some(evidence.state()),
+            frontier_state: ReliableDataAckFrontierState::Live,
+        })
+    };
+
+    assert_eq!(
+        choose_owner(favorable),
+        BulkRelayPathChoice::Selected(owner)
+    );
+    assert_eq!(
+        choose_owner(adverse),
+        BulkRelayPathChoice::Selected(owner),
+        "an inferred low-rate BDP may rank the only enqueueable contiguous owner poorly, but cannot shrink unchanged Product/resource authority below its exact cross-path debt",
+    );
+}
+
+#[test]
 fn repair_selection_ignores_native_unused_credit_acquisition() {
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
         let fast_underlay = match underlay {
@@ -1410,7 +1505,7 @@ fn data_level_full_frontier_owner_remains_the_baseline_while_another_path_sends(
     assert_eq!(
         choose_bulk(&observation, &flights, Some(&evidence)),
         BulkRelayPathChoice::Selected(candidate),
-        "a product-window-full DSN owner remains the ECF baseline instead of blocking every path",
+        "a product-window-full DSN owner remains the completion reference while another structurally admitted path proceeds",
     );
 }
 
@@ -1564,7 +1659,7 @@ fn tcp_product_ack_clock_is_only_a_native_capacity_fallback() {
 }
 
 #[test]
-fn unmeasured_tcp_startup_prior_cannot_trigger_ecf_suppression() {
+fn unmeasured_tcp_startup_prior_cannot_suppress_optional_measurement() {
     let reference = instance(UnderlayProtocol::Udp, 0, 164);
     let candidate = instance(UnderlayProtocol::Tcp, 0, 165);
     let reference_path = observed_path(reference, 20.0, 500_000_000.0);
@@ -1614,7 +1709,7 @@ fn unmeasured_tcp_startup_prior_cannot_trigger_ecf_suppression() {
 
     assert!(
         entry_preempts,
-        "an unmeasured TCP startup prior is not achieved completion evidence and cannot invoke ECF suppression",
+        "an unmeasured TCP startup prior is not achieved completion evidence and cannot suppress optional ACK-clock measurement",
     );
     assert!(
         continuation_preempts,

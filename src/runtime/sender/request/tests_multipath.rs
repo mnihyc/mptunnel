@@ -532,12 +532,12 @@ async fn request_product_acquisition_does_not_preempt_ordinary_completion_order(
     assert_eq!(
         planned.target().1,
         ordinary_target,
-        "qualification may bound Product eligibility, but cannot preempt ordinary ECF plus owner hysteresis",
+        "qualification may bound Product eligibility, but cannot preempt ordinary rank plus owner hysteresis",
     );
 }
 
 #[tokio::test]
-async fn request_ack_clock_annotation_cannot_retarget_the_ordinary_ecf_choice() {
+async fn request_ack_clock_annotation_cannot_retarget_the_ordinary_product_choice() {
     let stream_id = StreamId(379);
     let context = client_test_context_with_paths(&[
         "quic://127.0.0.1:10381?initial-srtt-s=0.02&initial-rate-mbps=100",
@@ -777,8 +777,8 @@ async fn request_ordinary_writer_failure_replans_around_a_and_commits_same_tier_
     }
 
     // Keep the established owner structurally Regular but transiently unable
-    // to accept this quantum. Ordinary ECF must therefore choose between the
-    // two independently writable additional outputs.
+    // to accept this quantum. Ordinary ranking must therefore choose between
+    // the two independently writable additional outputs.
     owner_commands
         .try_enqueue_admitted_frame(
             data_frame(StreamId(1377), 0, 4096),
@@ -799,13 +799,13 @@ async fn request_ordinary_writer_failure_replans_around_a_and_commits_same_tier_
             RelaySendCause::StreamData,
             &[],
         )
-        .expect("ordinary ECF selects the first legal additional output");
+        .expect("ordinary ranking selects the first legal additional output");
     assert_eq!(plan_a.target().1, a);
 
     // Another producer fills A's shared carrier writer after observation. The
     // real reservation now fails. The retry records only exact A as locally
-    // rejected and runs ordinary ECF again; it owns no persistent acquisition
-    // turn and cannot change the relative order of the remaining candidates.
+    // rejected and runs ordinary ranking again; it owns no persistent
+    // acquisition turn and cannot change the remaining candidates' order.
     a_commands
         .try_enqueue_admitted_frame(
             data_frame(StreamId(1378), 0, 4096),
@@ -830,7 +830,7 @@ async fn request_ordinary_writer_failure_replans_around_a_and_commits_same_tier_
             RelaySendCause::StreamData,
             &rejected,
         )
-        .expect("ordinary ECF remains work-conserving after exact A fails");
+        .expect("ordinary ranking remains work-conserving after exact A fails");
     assert_eq!(plan_b.target().1, b);
     let command_b = b_commands
         .try_reserve_admitted_frame(pending.clone(), TrafficClass::Throughput)

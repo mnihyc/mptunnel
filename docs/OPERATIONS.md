@@ -1146,14 +1146,17 @@ recovery byte remains charged to exact recovery-work accounting.
 
 A target-bound ranked quantum covers only the maximal lowest prefix with one
 live exact owner and an unchanged exact copy-avoidance set; cache chunking alone
-does not change its rank. A suffix may fill only the same bounded structural
-target service window. Target-unbound work retains a bounded unassigned prefix
-and is revalidated against the exact target at dispatch. Product-queue insertion
-alone grants no final publication authority: actual writer Apply reserves the
-native command, atomically revalidates exact target headroom, incarnation, and
-stable-slot vacancy, records the range/slot publication, and then commits.
-Exact terminal path failure is immediate but bypasses none of those structural
-or resource checks.
+does not change its rank. While the OriginalData owner remains live, Apply may
+shrink that quantum for exact target capacity but cannot append a suffix from
+the larger target service window. Exact terminal failure may use the full
+cause-specific, structurally bounded service extent because no live owner
+remains. Target-unbound work retains only its bounded ranked unassigned quantum
+and is revalidated against the exact target at dispatch. Product-queue
+insertion alone grants no final publication authority: actual writer Apply
+reserves the native command, atomically revalidates exact target headroom,
+incarnation, and stable-slot vacancy, records the range/slot publication, and
+then commits. Exact terminal path failure is immediate but bypasses none of
+those structural or resource checks.
 
 The current timers are cause-specific. Exact path-instance failure permits an
 immediate bounded copy, preferring measured survivors but using any eligible

@@ -3125,17 +3125,22 @@ F_t^r = min(L(s,r,t), A_t^r, M_s)
 ```
 
 Apply may therefore shrink the ranked frontier for exact target capacity but
-may never enlarge or skip it. The complete bound service prefix remains
-capped by `I_s` and `L(s,r,t)`. Target-unbound repair has no independent
-Product-capacity grant. Before target binding, its queued extent is bounded by
-the retained lowest frontier, captured common repair quantum, retained repair
-debt, and configured repair and path-flight envelopes. Queued target-unbound
-ReinjectedData `U_s` is conservatively included in `R_t` for every eligible
-target. At dispatch, after reserving the actual writer command, Apply
-recomputes that exact target's `K_t` while excluding only the current front
-intent and commits the complete frame only when its payload fits; otherwise it
-cancels the reservation and reevaluates. Queueing unbound work neither creates
-nor preserves target service authority.
+may never enlarge or skip it. When the exact OriginalData owner remains live,
+`F_t^r` is the complete accepted extent of this evaluation; target headroom up
+to `L(s,r,t)` grants no suffix beyond the ranked frontier quantum. Exact
+terminal carrier failure is separate: because no live owner remains, it may
+service the complete cause-specific retained prefix up to `L(s,r,t)`, subject
+to every range, slot, Product-capacity, queue, and native bound below.
+Target-unbound repair has no independent Product-capacity grant. Before target
+binding, its queued extent is bounded by the retained lowest frontier, captured
+common repair quantum, retained repair debt, and configured repair and
+path-flight envelopes. Queued target-unbound ReinjectedData `U_s` is
+conservatively included in `R_t` for every eligible target. At dispatch, after
+reserving the actual writer command, Apply recomputes that exact target's `K_t`
+while excluding only the current front intent and commits the complete frame
+only when its payload fits; otherwise it cancels the reservation and
+reevaluates. Queueing unbound work neither creates nor preserves target service
+authority.
 
 For every OriginalData assignment span `j` intersecting `M_s`, retain its
 immutable assignment time `a_j` and applicable owner recovery interval
@@ -3147,13 +3152,13 @@ authority begins only after every byte in the ranked prefix has matured.
 No earlier than `loss_at` and before `fallback_at`, a permitted speculative
 authoritative-gap attempt uses the same `A(s,r,t)` and `L(s,r,t)` expressions.
 At or after `fallback_at`, the owner-completion comparison is no longer needed,
-but every other term remains unchanged. A suffix after `F_t^r` may extend only
-to `L(s,r,t)`. Every suffix slice MUST remain retained and unacknowledged, keep
-the same exact identity sets, exclude frozen target `t`, and pass fresh exact
-Product and native admission; the first overlap, rejection, or identity change
-ends the prefix without skipping ahead. Exact terminal carrier failure uses
-its separate cause-bounded timing path, but the same exact range/slot,
-Product-capacity, queue, and native bounds apply. All accepted bytes remain in
+but every other term remains unchanged. While the owner remains live, neither
+side of `fallback_at` permits an accepted suffix beyond `F_t^r`. Exact terminal
+carrier failure uses its separate cause-bounded timing and full-service path;
+each slice up to `L(s,r,t)` MUST remain retained and unacknowledged, keep the
+same exact identity sets, exclude target `t`, and pass fresh exact Product and
+native admission. The first overlap, rejection, or identity change ends that
+failure prefix without skipping ahead. All accepted bytes remain in
 directional Product recovery-work accounting.
 
 Product-queue insertion is provisional: it neither consumes final slot
@@ -3211,8 +3216,9 @@ erasing that fallback.
 Recovery target ranking and commitment MUST refer to the same lowest-missing,
 identity-uniform frontier. Decide ranks candidate targets using the common
 captured payload `M_s`; after selection, Apply may shrink the ranked frontier
-only to exact `F_t^r`. A suffix may extend total service to `L(s,r,t)` only
-under the same exact structural and admission rules.
+only to exact `F_t^r`. For a live owner, Apply MUST NOT extend total service
+beyond `F_t^r`; `L(s,r,t)` remains a capacity bound, not authority to append an
+unranked suffix.
 The first committed repair frame has the same lowest offset, normalized
 frontier identity, output incarnation, and writer-capacity generation used by
 the current owner's frozen advisory target order, and its payload MUST NOT
@@ -3220,11 +3226,9 @@ exceed `M_s`.
 If that frame
 cannot be committed because it overlaps queued or recent
 repair work, the evaluation MUST stop without publishing later omitted ranges.
-After the frontier quantum is committed, the sender may fill the remainder of
-the same bounded effective target service window `L(s,r,t)` behind it only while
-the frozen target remains absent from the unchanged `A_s(x)` set. A larger
-coalesced batch or whole-window throughput estimate MUST NOT replace the exact
-frontier-quantum carrier rank as the primary target objective.
+A larger coalesced batch or whole-window throughput estimate MUST NOT replace
+the exact frontier-quantum carrier rank or enlarge the resulting live-owner
+commit.
 
 Let `G_s` be the directional live-owner frontier-floor successor epoch. When a
 target-bound live-owner gap or speculative-tail repair batch is accepted into
@@ -3233,7 +3237,7 @@ the successor value is fixed from the selected alternate's observed MPP
 recovery interval. An accepted target-unbound tail instead uses the then-
 observed original-owner tail interval. If one serialized batch admits frames
 with different exact targets or owners, the interval is the maximum of every
-actually admitted frame's applicable interval; rejected or overlapping suffixes
+actually admitted frame's applicable interval; rejected or overlapping frames
 contribute nothing. Further accepted work while `G_s` is in the future does not
 renew it. Contiguous unique Data-ACK frontier progress may extend `G_s` by one
 retained recovery interval; sparse suffix ACK release, polling, target changes,
@@ -3246,10 +3250,10 @@ service window. ACK receipt, recovery deadlines, carrier-capacity release, and
 output-model publication all return through the same stream-owner evaluation.
 
 A contiguous live tail without an authoritative gap uses the same structural
-authority and immutable repeat-delay model. After the owner boundary its first
-ranked quantum and any suffix are bounded by `F_t^r` and `L(s,r,t)`;
-target-unbound native dispatch revalidates exact `K_t`, slot vacancy, and the
-writer reservation. The accounting percentage changes none of these outcomes.
+authority and immutable repeat-delay model. After the owner boundary, its
+complete accepted extent is the ranked quantum `F_t^r`; target-unbound native
+dispatch revalidates exact `K_t`, slot vacancy, and the writer reservation. The
+accounting percentage changes none of these outcomes.
 
 For the finite-drain rule below, MPP Data ACK progress means newly
 acknowledged unique Product bytes. Receipt or republication of an unchanged or
@@ -3263,8 +3267,8 @@ one bounded frontier quantum of that range on a distinct output
 when both outputs have current carrier service evidence and the current
 ordinary advisory retention rule favors the alternate. A future Section 10.2
 consumer may use its `S/U` comparison only after the sustained allocator is
-specified. A suffix may extend only to `L(s,r,t)` and remains bounded by the
-same exact-target, configured-slot, and identity-uniform-prefix rules above.
+specified. Because the OriginalData owner remains live, Apply cannot extend
+this finite-drain attempt beyond its ranked frontier quantum `F_t^r`.
 Partial Data
 ACK progress shrinks the retained range but does not rewrite any remaining
 original Product flight's assignment time.
@@ -3596,12 +3600,15 @@ restart a surviving clock. Attachment staleness remains stream-local; only
 exact carrier-instance failure is session-wide.
 
 Exact terminal carrier failure, persistent live-owner gaps, and live tails use
-their respective cause clocks and the same structural Product authority. The
-directional accounting target cannot deadlock or reduce their bounded service.
-Every accepted recovery byte remains charged to exact Product recovery-work
-accounting. Exact retained ranges, configured-slot publication vacancy, queue,
-flight, distinct-output, target-capacity, and repeat-delay bounds continue to
-apply.
+their respective cause clocks and the same structural Product authority, but
+not the same service extent. Exact terminal failure may use the full
+cause-specific extent `L(s,r,t)`; a persistent gap or tail whose OriginalData
+owner remains live is limited to its exact ranked frontier quantum `F_t^r`.
+The directional accounting target cannot deadlock or reduce either bounded
+service. Every accepted recovery byte remains charged to exact Product
+recovery-work accounting. Exact retained ranges, configured-slot publication
+vacancy, queue, flight, distinct-output, target-capacity, and repeat-delay
+bounds continue to apply.
 
 ### 15.3 Datagram retry
 

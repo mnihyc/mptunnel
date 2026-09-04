@@ -164,12 +164,15 @@ traffic target, not another Product window or congestion controller.
 
 A target-bound ranked quantum is capped to the maximal lowest prefix with one
 exact live OriginalData owner and an unchanged exact copy-avoidance set;
-application/cache chunk boundaries alone do not divide that prefix. A suffix
-may fill only the same bounded structural target service window and must pass
-per-slice Product and native revalidation. A pre-existing target-unbound tail
-instead retains its bounded unassigned prefix and is revalidated against the
-exact target at dispatch. A response FIN tail ranked from target-specific
-capacity remains bound to that exact output incarnation through dispatch.
+application/cache chunk boundaries alone do not divide that prefix. While its
+OriginalData owner remains live, Apply may shrink that ranked quantum for exact
+target capacity but cannot append a suffix from the larger target service
+window. Exact terminal failure instead may use the full cause-specific,
+structurally bounded service extent because no live owner remains. A
+pre-existing target-unbound tail retains only its bounded ranked unassigned
+quantum and is revalidated against the exact target at dispatch. A response FIN
+tail ranked from target-specific capacity remains bound to that exact output
+incarnation through dispatch.
 
 Product-queue insertion does not consume final publication authority. At
 actual writer Apply, the actor reserves the exact native command, atomically

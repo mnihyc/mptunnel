@@ -4033,9 +4033,9 @@ async fn live_owner_final_tail_does_not_become_path_failure_when_alternate_lacks
     );
     assert_eq!(outcome.blocked_frontier_offset, None);
     assert_eq!(outcome.frontier_limit, 16);
-    assert!(
-        outcome.service_limit > outcome.frontier_limit,
-        "target Product headroom may exceed the exact lowest owner-uniform FIN frontier",
+    assert_eq!(
+        outcome.service_limit, outcome.frontier_limit,
+        "larger target Product headroom must not widen the exact lowest owner-uniform FIN frontier",
     );
     assert_eq!(
         outcome.queued, 1,
@@ -5207,7 +5207,7 @@ fn response_ack_gap_planner_extent_is_percentage_invariant() {
 }
 
 #[test]
-fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() {
+fn persistent_response_ack_gap_commits_only_the_ranked_frontier_quantum() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(103);
     let original_key = CarrierPathKey {
@@ -5538,9 +5538,9 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         limits,
         stream_id,
     );
-    assert!(
-        blocked.frame_count >= 2,
-        "the target-bound transaction contains only the lowest owner-uniform gap",
+    assert_eq!(
+        blocked.frame_count, 1,
+        "the target-bound live-owner transaction may plan only its ranked frontier quantum",
     );
     assert_eq!(
         blocked.queued, 0,
@@ -5580,9 +5580,9 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         limits,
         stream_id,
     );
-    assert!(
-        middle_blocked.frame_count >= 2,
-        "a later sparse gap requires a new target decision rather than joining this batch",
+    assert_eq!(
+        middle_blocked.frame_count, 1,
+        "an unscored suffix cannot join the live-owner frontier transaction",
     );
     assert_eq!(middle_blocked.queued, 1);
     assert_eq!(
@@ -5604,16 +5604,15 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         stream_id,
     );
 
-    assert!(
-        outcome.queued >= 2,
-        "a proven recovery-copy timeout may fill the owner-uniform extent behind the scored frontier quantum"
+    assert_eq!(
+        outcome.queued, 1,
+        "one live-owner recovery decision may commit only the quantum it ranked",
     );
     assert_eq!(
         response_sender.bytes(),
-        quantum,
-        "structural target service may fill the owner-uniform extent but cannot cross into the next sparse gap"
+        scored_frontier_bytes,
+        "target Product headroom must not widen Apply beyond the ranked frontier quantum",
     );
-    assert!(response_sender.bytes() > scored_frontier_bytes);
     assert!(outcome.persistent_ready);
     assert!(progress.next_reinjection_deadline().is_some());
     let data_ack_outstanding_bytes = send_stream.reinjection_bytes();

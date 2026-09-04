@@ -653,8 +653,11 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     } else {
         base_reinjection_limit
     };
-    let reinjection_limit =
-        reliable_live_gap_reinjection_authority(target_service_limit, ack_gap_reinjection_ready);
+    let reinjection_limit = reliable_live_gap_reinjection_authority(
+        target_service_limit,
+        frontier_limit,
+        ack_gap_reinjection_ready,
+    );
     let reinjection_retry_after = reinjection_target.map_or_else(
         || reliable_data_retransmission_interval(ack_gap_original_underlay, original_path_timing),
         |(_, snapshot)| {

@@ -261,11 +261,12 @@ pub(crate) fn reliable_live_frontier_reinjection_limit_bytes(
 /// Sizes one Product reinjection service window from the selected target's
 /// measured opportunity without replacing native transport recovery.
 ///
-/// Exact carrier failure and a persistent authoritative MPP Data ACK gap have
-/// different eligibility rules, but once either has selected a target they
-/// share the same byte authority: unacknowledged ranges may fill only the
-/// target's available Product service window. The target's TCP or QUIC sender
-/// remains the final pacing, congestion, and enqueue authority.
+/// This computes target capacity, not cause-specific publication authority.
+/// Exact carrier failure may consume the bounded service window; a persistent
+/// authoritative MPP Data ACK gap whose original owner remains live is capped
+/// separately to the exact frontier quantum that selected the target. The
+/// target's TCP or QUIC sender remains the final pacing, congestion, and
+/// enqueue authority.
 pub(crate) fn reliable_reinjection_service_limit_bytes(
     target: ReliableReinjectionTargetWork,
     reinjection_debt_bytes: usize,
@@ -316,19 +317,21 @@ pub(crate) fn reliable_reinjection_service_limit_bytes(
     )
 }
 
-/// Applies retained recovery timing to the selected target's exact Product
-/// service authority.
+/// Preserves one live owner's ranked Product frontier through Apply.
 ///
 /// The target limit already subtracts queued, accepted, and stable-slot repair
-/// debt. A configured traffic-accounting percentage is deliberately absent:
-/// once a recovery cause is due it cannot reduce Product eligibility or byte
-/// extent. Native admission remains the final authority below this model.
+/// debt.  That larger service opportunity cannot widen the exact quantum whose
+/// completion selected the target: a Data-ACK gap proves Product reordering or
+/// loss, not failure of the live native-reliable owner.  A configured traffic-
+/// accounting percentage is deliberately absent, and native admission remains
+/// the final authority below this model.
 pub(crate) fn reliable_live_gap_reinjection_authority(
     target_service_limit: usize,
+    ranked_frontier_limit: usize,
     recovery_ready: bool,
 ) -> usize {
     if recovery_ready {
-        target_service_limit
+        target_service_limit.min(ranked_frontier_limit)
     } else {
         0
     }
@@ -421,17 +424,27 @@ mod live_owner_reinjection_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn live_gap_authority_uses_full_structural_target_service_when_due() {
-        assert_eq!(reliable_live_gap_reinjection_authority(100, true), 100);
+    fn live_gap_authority_preserves_the_ranked_frontier_when_due() {
+        assert_eq!(reliable_live_gap_reinjection_authority(100, 40, true), 40);
         assert_eq!(
-            reliable_live_gap_reinjection_authority(100, false),
+            reliable_live_gap_reinjection_authority(20, 40, true),
+            20,
+            "exact target headroom may shrink but never widen the ranked frontier",
+        );
+        assert_eq!(
+            reliable_live_gap_reinjection_authority(100, 40, false),
             0,
             "a recovery cause that is not due remains a hard denial",
         );
         assert_eq!(
-            reliable_live_gap_reinjection_authority(0, true),
+            reliable_live_gap_reinjection_authority(0, 40, true),
             0,
             "zero exact target service remains a hard structural denial",
+        );
+        assert_eq!(
+            reliable_live_gap_reinjection_authority(100, 0, true),
+            0,
+            "zero ranked frontier cannot manufacture live-owner service",
         );
     }
 

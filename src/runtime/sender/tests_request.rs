@@ -1431,6 +1431,12 @@ async fn request_completion_tail_extent_is_percentage_invariant() {
         .expect("retained completion tail");
     let startup_floor = sender_optional_reinjection_startup_floor_bytes(limits);
     assert!(tail_bytes > startup_floor);
+    let ranked_frontier_bytes = adaptive_reliable_relay_reinjection_bytes(
+        context.reliable_path_snapshot_for_instance(target),
+        TrafficClass::Throughput,
+        limits,
+    );
+    assert!(ranked_frontier_bytes > 0);
     let delivered_bytes = tail_bytes.saturating_mul(10);
     let default_percent = MppPerformanceConfig::default().optional_reinjection_budget_percent;
     let mut cases = [0, default_percent, 200].map(|percent| {
@@ -1478,9 +1484,10 @@ async fn request_completion_tail_extent_is_percentage_invariant() {
         (*percent, outcome.queued, queued_bytes, exact_target)
     });
     let structural = outcomes[2];
-    assert!(
-        structural.1 && structural.2 > startup_floor && structural.3,
-        "the large-hint control must expose a multi-quantum structurally eligible exact-target tail: {structural:?}",
+    assert!(structural.1 && structural.3);
+    assert_eq!(
+        structural.2, ranked_frontier_bytes,
+        "a live completion-tail decision must admit only the exact frontier it ranked",
     );
     for outcome in outcomes {
         assert_eq!(
@@ -1493,7 +1500,7 @@ async fn request_completion_tail_extent_is_percentage_invariant() {
 }
 
 #[tokio::test]
-async fn completion_tail_uses_cache_independent_common_extent_for_target_and_apply() {
+async fn completion_tail_uses_cache_independent_ranked_frontier_for_target_and_apply() {
     let stream_id = StreamId(228);
     let resource_limits = ResourceLimits {
         max_repair_bytes: 128 * 1024,
@@ -1561,6 +1568,12 @@ async fn completion_tail_uses_cache_independent_common_extent_for_target_and_app
         target.key,
         PathRateSample::new(64 * 1024, Duration::from_micros(1049)).expect("fast target sample"),
     );
+    let ranked_frontier_bytes = adaptive_reliable_relay_reinjection_bytes(
+        context.reliable_path_snapshot_for_instance(target),
+        TrafficClass::Throughput,
+        limits,
+    );
+    assert!(ranked_frontier_bytes > 0 && ranked_frontier_bytes < 64 * 1024);
 
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     let first = send_stream
@@ -1679,9 +1692,8 @@ async fn completion_tail_uses_cache_independent_common_extent_for_target_and_app
         cursor = end;
     }
     assert_eq!(
-        cursor,
-        64 * 1024,
-        "Apply uses the same owner-uniform range scored independently of the two cache chunks",
+        cursor, ranked_frontier_bytes as u64,
+        "Apply uses the same ranked owner-uniform frontier independently of the two cache chunks",
     );
 
     let mut late_suffix_stream = ReliableSendStream::new(stream_id, limits);
@@ -1709,8 +1721,8 @@ async fn completion_tail_uses_cache_independent_common_extent_for_target_and_app
     assert!(late_suffix_outcome.queued);
     assert_eq!(
         late_suffix_queue.reinjection_bytes(),
-        64 * 1024,
-        "a fresh same-owner assignment beyond ranked M cannot postpone recovery of the mature lowest M",
+        ranked_frontier_bytes,
+        "a fresh same-owner assignment beyond the ranked frontier cannot widen or postpone recovery of that mature frontier",
     );
 
     let (boundary_target_commands, mut boundary_target_receivers) =
@@ -2583,43 +2595,95 @@ fn request_reinjection_final_enqueue_is_percentage_invariant_and_exactly_account
     }
 }
 
-#[test]
-fn client_exact_failure_reinjection_remains_critical_and_exactly_accounted() {
+#[tokio::test]
+async fn client_exact_failure_recovery_keeps_full_structural_target_service() {
     let stream_id = StreamId(95);
+    let limits = MuxLimits::default();
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10371?initial-srtt-s=0.08&initial-rate-mbps=10",
+        "tcp://127.0.0.1:10372?initial-srtt-s=0.02&initial-rate-mbps=500",
+    ]);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, target_commands));
+    consume_client_path_proof_for_test(&mut target_receivers);
+    let target = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        })
+        .expect("exact-failure target");
+    seed_client_bulk_evidence_for_test(&context, owner);
+    seed_client_bulk_evidence_for_test(&context, target);
+
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let retained = send_stream
+        .send_data(Bytes::from(vec![0x74; 256 * 1024]))
+        .expect("multi-quantum retained request");
     let mut sender = RequestSenderService::new_with_performance(
         stream_id,
         MppPerformanceConfig {
             optional_reinjection_budget_percent: 0,
         },
     );
+    sender.record_original_frame_for_test(owner, &retained);
+    assert!(sender.fail_client_path_instance(&context, &mut remotes, owner));
+
     let mut sender_queue = ReliableRelaySenderQueue::default();
-    let payload = Bytes::from_static(b"tail");
-    let frame = Frame::StreamData {
-        stream_id,
-        offset: 0,
-        payload: payload.clone(),
-    };
+    let (modeled, exhausted) = sender.multipath.reinjection_path_snapshot(
+        &context,
+        &remotes,
+        &[owner],
+        &sender_queue,
+        send_stream.reinjection_bytes(),
+        limits,
+    );
+    assert!(!exhausted);
+    let (modeled_target, target_snapshot, target_service_limit) =
+        modeled.expect("exact failure retains a structurally eligible target");
+    assert_eq!(modeled_target, target);
+    let ranked_frontier_bytes = adaptive_reliable_relay_reinjection_bytes(
+        Some(target_snapshot),
+        TrafficClass::Throughput,
+        limits,
+    );
+    assert!(target_service_limit > ranked_frontier_bytes);
+
     let accounted_before = sender.optional_reinjection.reinjected_bytes();
-    sender.enqueue_critical_reinjection_frame(
+    let outcome = sender.drive_request_path_recovery(
         &mut sender_queue,
-        frame,
-        RelaySendCause::PathFailureReinjection,
+        &context,
+        &remotes,
+        &send_stream,
+        TrafficClass::Throughput,
+    );
+    assert!(outcome.queued);
+    assert_eq!(
+        sender_queue.reinjection_bytes(),
+        target_service_limit,
+        "exact failure must retain full bounded target service rather than the live-owner frontier cap",
     );
     assert_eq!(
-        sender.optional_reinjection.reinjected_bytes(),
-        accounted_before + payload.len() as u64,
+        sender
+            .optional_reinjection
+            .reinjected_bytes()
+            .saturating_sub(accounted_before),
+        target_service_limit as u64,
     );
-    let (lane, work) = sender_queue
-        .pop_front()
-        .expect("exact failure recovery remains queued");
-    assert_eq!(lane, ReliableWorkClass::Reinjection);
-    assert!(matches!(
-        work.kind,
-        ReliableRelayQueuedWorkKind::Reinjection {
-            cause: RelaySendCause::PathFailureReinjection,
-            ..
-        }
-    ));
+    while let Some((lane, work)) = sender_queue.pop_front() {
+        assert_eq!(lane, ReliableWorkClass::Reinjection);
+        assert!(matches!(
+            work.kind,
+            ReliableRelayQueuedWorkKind::Reinjection {
+                cause: RelaySendCause::ClientPathFailureReinjection(identity),
+                ..
+            } if identity.instance == target
+        ));
+    }
 }
 
 #[tokio::test]

@@ -1252,8 +1252,11 @@ fn enqueue_live_response_final_tail_reinjection(
         false,
         mux_limits,
     );
-    let service_limit =
-        reliable_live_gap_reinjection_authority(target_service_limit, owner_recovery_ready);
+    let service_limit = reliable_live_gap_reinjection_authority(
+        target_service_limit,
+        frontier_limit,
+        owner_recovery_ready,
+    );
     if service_limit == 0 {
         return LiveResponseFinalTailEnqueueOutcome {
             frontier_limit,
@@ -1590,10 +1593,11 @@ fn evaluate_server_data_ack_reinjection(
     };
 
     // A complete persistent gap proves missing Product order, not failure of
-    // the live native-reliable owner. The due recovery cause admits only the
-    // selected target's exact Product service window; stable-slot publication,
-    // retained range, queue, and native authority remain hard bounds. Exact
-    // terminal failure uses its separate cause-bounded critical path below.
+    // the live native-reliable owner. The selected target's Product service
+    // window is only a capacity ceiling; the ranked frontier below is the
+    // publication authority. Stable-slot, retained-range, queue, and native
+    // bounds remain hard. Exact terminal failure uses its separate
+    // cause-bounded critical path below.
     let target_service_limit = response_sender.reinjection_service_limit_for_target(
         path_stream,
         send_stream,
@@ -1605,8 +1609,11 @@ fn evaluate_server_data_ack_reinjection(
     let owner_recovery_deadline = progress
         .original_owner_recovery_deadline()
         .expect("persistent target retains its exact owner fallback");
-    let service_limit =
-        reliable_live_gap_reinjection_authority(target_service_limit, persistent_ready);
+    let service_limit = reliable_live_gap_reinjection_authority(
+        target_service_limit,
+        frontier_limit,
+        persistent_ready,
+    );
     let frames = normalized_stream_ack_first_gap(ranges)
         .and_then(|(frontier, _)| {
             let applied_extent = service_limit.min(
@@ -1862,6 +1869,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
             );
             let gap_limit = reliable_live_gap_reinjection_authority(
                 frontier_limit,
+                frontier_limit,
                 live_ack_gap_owner_recovery_ready,
             );
             let gap_source_frames = stream_ack_gap_frontier_reinjection_frames_normalized(
@@ -1955,6 +1963,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 mux_limits,
             );
             let tail_limit = reliable_live_gap_reinjection_authority(
+                frontier_limit,
                 frontier_limit,
                 live_tail_owner_recovery_ready,
             );

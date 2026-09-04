@@ -1619,7 +1619,8 @@ impl RequestSenderService {
             send_stream.reinjection_bytes(),
             context.mux_limits,
         );
-        let reinjection_limit = reliable_live_gap_reinjection_authority(reinjection_limit, true);
+        let reinjection_limit =
+            reliable_live_gap_reinjection_authority(reinjection_limit, reinjection_limit, true);
         if reinjection_limit == 0 {
             return RequestTailReinjectionOutcome::default();
         }
@@ -1835,8 +1836,11 @@ impl RequestSenderService {
             context.mux_limits,
         )
         .min(target.service_limit_bytes);
-        let service_limit =
-            reliable_live_gap_reinjection_authority(target.service_limit_bytes, true);
+        let service_limit = reliable_live_gap_reinjection_authority(
+            target.service_limit_bytes,
+            frontier_limit,
+            true,
+        );
         if service_limit == 0 {
             return RequestCompletionTailEnqueueOutcome {
                 blocked_for_carrier_capacity: target.service_limit_bytes == 0,

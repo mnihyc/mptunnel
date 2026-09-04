@@ -675,7 +675,7 @@ fn persistent_request_revalidation_uses_the_selected_targets_queue_view() {
 }
 
 #[tokio::test]
-async fn persistent_request_ack_gap_commits_frontier_before_filling_service_window() {
+async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(104);
     let context = ClientPathContext::new(
@@ -1054,8 +1054,9 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         send_stream.reinjection_bytes(),
         limits,
     );
-    let expected_fallback_extent =
-        fallback_service_limit.min(fallback_observation.uniform_frontier_extent_bytes);
+    let expected_fallback_extent = fallback_service_limit
+        .min(fallback_observation.uniform_frontier_extent_bytes)
+        .min(early_frontier_bytes);
     let fallback = evaluate_client_data_ack_reinjection(
         &mut early_state,
         &mut early_sender,
@@ -1071,7 +1072,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
     assert_eq!(
         early_queue.bytes(),
         expected_fallback_extent,
-        "post-fallback request recovery must admit the exact retained extent bounded by current target Product service",
+        "post-fallback request recovery must admit the ranked frontier bounded by current target Product service",
     );
     assert!(
         early_sender.live_owner_frontier_floor_deadline().is_some(),
@@ -1128,7 +1129,10 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         stream_id,
     );
     assert!(blocked.persistent_ready);
-    assert!(blocked.frame_count >= 2);
+    assert_eq!(
+        blocked.frame_count, 1,
+        "the target-bound live-owner transaction may plan only its ranked frontier quantum",
+    );
     assert_eq!(
         sender_queue.bytes(),
         blocked_bytes,
@@ -1160,9 +1164,9 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         TrafficClass::Throughput,
         stream_id,
     );
-    assert!(
-        middle_blocked.frame_count >= 2,
-        "the target-bound transaction contains only the lowest owner-uniform gap; later sparse gaps require a new decision",
+    assert_eq!(
+        middle_blocked.frame_count, 1,
+        "an unscored suffix cannot join the live-owner frontier transaction",
     );
     assert_eq!(
         sender_queue.bytes(),
@@ -1183,10 +1187,14 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         stream_id,
     );
     assert!(admitted.persistent_ready);
-    assert!(admitted.frame_count >= 2);
-    assert!(
-        sender_queue.bytes() > scored_frontier_bytes,
-        "committing the request frontier unlocks the measured service window"
+    assert_eq!(
+        admitted.frame_count, 1,
+        "one live-owner recovery decision may commit only the quantum it ranked",
+    );
+    assert_eq!(
+        sender_queue.bytes(),
+        scored_frontier_bytes,
+        "target Product headroom must not widen Apply beyond the ranked frontier quantum",
     );
     let (planner_target, planner_snapshot) = sender
         .data_ack_gap_reinjection_model(
@@ -1261,8 +1269,8 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
     let planner_k = planner_repair_cap.saturating_sub(planner_accepted);
     assert_eq!(
         natural_batch_bytes,
-        planner_k.min(quantum),
-        "the natural request batch must equal the planner's exact K bounded by the retained first gap",
+        planner_k.min(scored_frontier_bytes),
+        "the request batch must equal the ranked frontier bounded by exact target K",
     );
 
     let apply_snapshot = sender
@@ -1341,13 +1349,10 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         sender_queue.bytes(),
         natural_batch_bytes.saturating_sub(frontier_payload_bytes),
     );
-    assert!(matches!(
-        sender_queue.front().map(|(_, work)| &work.kind),
-        Some(ReliableRelayQueuedWorkKind::Reinjection {
-            frame: Frame::StreamData { offset, .. },
-            cause: RelaySendCause::PersistentClientAckGapReinjection(_),
-        }) if *offset > quantum as u64
-    ));
+    assert!(
+        sender_queue.is_empty(),
+        "the accepted frontier must not leave an unscored live-owner suffix queued",
+    );
     assert_eq!(
         sender_queue.request_target_queued_reinjection_bytes(planner_target.instance(), false),
         natural_batch_bytes.saturating_sub(frontier_payload_bytes),

@@ -189,9 +189,9 @@ pub(in crate::runtime) fn stream_ack_gap_reinjection_frames_normalized(
     }
 }
 
-/// Builds only the exact lowest omitted Product extent. This is the bounded
-/// liveness floor; a larger persistent-gap service window is produced by the
-/// separate helper above after this frontier wins admission.
+/// Builds only the exact lowest omitted Product extent. For a live owner this
+/// ranked frontier is also the complete Apply extent; target headroom cannot
+/// widen it after selection.
 pub(in crate::runtime) fn stream_ack_gap_frontier_reinjection_frames_normalized(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
@@ -217,9 +217,10 @@ pub(in crate::runtime) fn stream_ack_gap_frontier_reinjection_frames_normalized(
 
 /// Keeps recovery observe/decide/apply on the same lowest-missing quantum.
 ///
-/// Persistent recovery may fill a larger target service window after target
-/// selection. Regenerating that window must not coalesce the first range past
-/// the payload extent whose completion selected and authorized the target.
+/// The caller must already bound the total Apply range. This helper preserves
+/// the first scoring-quantum boundary when a retained storage frame crosses
+/// it; any supplied suffix remains present and therefore gains no authority
+/// from this helper.
 pub(in crate::runtime) fn preserve_reinjection_frontier_quantum(
     frames: Vec<Frame>,
     frontier_frame_limit: usize,

@@ -38,6 +38,28 @@ fn t02_configured_startup_projection_retains_integer_identity() {
 }
 
 #[test]
+fn t03_exact_startup_timing_preserves_omitted_variation() {
+    let path = "tcp://127.0.0.1:10000?initial-srtt-s=0.125"
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let instance = CarrierPathInstanceId::from_raw(91);
+    let snapshot = path_startup_snapshot_for_instance(
+        &path,
+        PathId(4),
+        instance,
+        PathMetricDirection::ClientToServer,
+    );
+    let timing = snapshot.directional_timing().expect("exact startup timing");
+
+    assert_eq!(
+        timing.scope(),
+        DirectionalServiceRateScope::new(instance, PathMetricDirection::ClientToServer),
+    );
+    assert_eq!(timing.round_trip_time(), Duration::from_millis(125));
+    assert_eq!(timing.variation(), None);
+}
+
+#[test]
 fn t02_path_metrics_do_not_serialize_endpoint_local_startup_but_keep_observed_diagnostics() {
     let exact = (1_u64 << 53) + 1;
     let path = format!("tcp://127.0.0.1:10000?initial-rate-bps={exact}")

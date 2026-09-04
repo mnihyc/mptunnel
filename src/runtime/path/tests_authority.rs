@@ -167,6 +167,88 @@ fn scheduling_shape_binds_central_rate_to_one_exact_active_path_shape() {
 }
 
 #[test]
+fn t03_native_shape_timing_publications_are_coherent_and_exhaustion_preserves_prior() {
+    let authority_scope = scope(171, PathMetricDirection::ClientToServer);
+    let handle = authority(authority_scope, source(1, 9, None));
+    handle.set_next_timing_epoch_for_test(u64::MAX);
+    let last = handle
+        .scheduling_shape_for_test(authority_scope, shape(1, 9, None, 80, 64_000, 12_000))
+        .expect("last named timing publication");
+    let last_timing = last.directional_timing().expect("valid timing");
+    assert_eq!(last_timing.scope(), authority_scope);
+    assert_eq!(last_timing.epoch().as_u64(), u64::MAX);
+    assert_eq!(last_timing.round_trip_time(), Duration::from_millis(80));
+    assert_eq!(last_timing.variation(), Some(Duration::from_millis(16)));
+
+    let exhausted = handle
+        .scheduling_shape_for_test(authority_scope, shape(1, 9, None, 45, 96_000, 24_000))
+        .expect("shape publication continues after timing epoch exhaustion");
+    assert_eq!(exhausted.congestion_window(), 96_000);
+    assert_eq!(exhausted.srtt(), Duration::from_millis(45));
+    assert_eq!(
+        exhausted.directional_timing(),
+        Some(last_timing),
+        "epoch exhaustion preserves the accepted timing without failing shape authority",
+    );
+}
+
+#[test]
+fn t03_unchanged_native_timing_retains_epoch_and_shape_equality() {
+    let authority_scope = scope(173, PathMetricDirection::ClientToServer);
+    let handle = authority(authority_scope, source(1, 9, Some(80)));
+    let native_shape = shape(1, 9, Some(80), 80, 64_000, 12_000);
+
+    let first = handle
+        .scheduling_shape_for_test(authority_scope, native_shape)
+        .expect("first coherent shape");
+    let unchanged = handle
+        .scheduling_shape_for_test(authority_scope, native_shape)
+        .expect("unchanged coherent shape");
+
+    assert_eq!(
+        unchanged, first,
+        "an unchanged native poll must not fabricate a new shape publication",
+    );
+
+    let changed = handle
+        .scheduling_shape_for_test(authority_scope, shape(1, 9, Some(80), 81, 64_000, 12_000))
+        .expect("changed coherent timing");
+    assert!(
+        changed
+            .directional_timing()
+            .expect("changed timing")
+            .epoch()
+            > first.directional_timing().expect("initial timing").epoch(),
+        "a real timing change must advance the timing publication identity",
+    );
+}
+
+#[test]
+fn t03_native_shape_timing_does_not_cross_transport_activation() {
+    let authority_scope = scope(172, PathMetricDirection::ClientToServer);
+    let handle = authority(authority_scope, source(1, 9, Some(80)));
+    let first = handle
+        .scheduling_shape_for_test(authority_scope, shape(1, 9, Some(80), 80, 64_000, 12_000))
+        .expect("first activation shape");
+    assert!(first.directional_timing().is_some());
+
+    handle
+        .publish_observation_for_test(2, 10, Some(160))
+        .expect("successor activation becomes central authority");
+    let successor = handle
+        .scheduling_shape_for_test(authority_scope, shape(2, 10, Some(160), 0, 96_000, 24_000))
+        .expect("successor shape remains usable without live timing");
+
+    assert_eq!(successor.finite_rate_bps(), Some(160));
+    assert_eq!(successor.congestion_window(), 96_000);
+    assert_eq!(
+        successor.directional_timing(),
+        None,
+        "a successor activation cannot inherit its predecessor's timing",
+    );
+}
+
+#[test]
 fn scheduling_shape_uses_central_g_during_bounded_same_activation_publication_lag() {
     let authority_scope = scope(72, PathMetricDirection::ServerToClient);
     let handle = authority(authority_scope, source(1, 10, Some(80)));

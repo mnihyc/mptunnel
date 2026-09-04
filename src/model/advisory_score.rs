@@ -26,6 +26,36 @@ impl DirectionalTimingEpoch {
     }
 }
 
+/// Checked, non-reusing publication identity owned by one timing producer.
+///
+/// Exhaustion is deliberately represented by `None`: timing remains advisory,
+/// so a producer that can no longer name a fresh tuple preserves its last
+/// accepted value without failing carrier I/O, rate publication, or Product
+/// work.
+#[derive(Debug)]
+pub(crate) struct DirectionalTimingEpochIssuer {
+    next: Option<u64>,
+}
+
+impl Default for DirectionalTimingEpochIssuer {
+    fn default() -> Self {
+        Self { next: Some(1) }
+    }
+}
+
+impl DirectionalTimingEpochIssuer {
+    pub(crate) fn issue(&mut self) -> Option<DirectionalTimingEpoch> {
+        let current = self.next?;
+        self.next = current.checked_add(1);
+        Some(DirectionalTimingEpoch::from_raw(current))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_for_test(&mut self, next: u64) {
+        self.next = Some(next);
+    }
+}
+
 /// Checked round-trip component of one producer timing publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectionalRoundTripTime {

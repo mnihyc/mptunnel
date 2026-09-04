@@ -4,6 +4,7 @@
 //! no queues, flow lifetimes, carrier I/O, or simulator-only heuristics.
 
 use super::TrafficClass;
+use crate::model::advisory_score::DirectionalTiming;
 use crate::model::path::PathPolicy;
 use crate::model::service_rate::DirectionalServiceRate;
 use crate::protocol::{PathId, PathUsage, UnderlayProtocol};
@@ -44,6 +45,12 @@ pub struct PathSnapshot {
     /// legacy fixtures may omit it; an exact production action must bind the
     /// carrier instance and original-sender direction before ranking.
     pub(crate) scheduling_service_rate: Option<DirectionalServiceRate>,
+    /// Exact coherent timing input for RFC 10.2 advisory ranking.
+    ///
+    /// Legacy snapshots may omit it. This private typed sidecar does not alter
+    /// legacy `score_path`; exact-action owners opt in only after their full
+    /// transaction model is migrated.
+    pub(crate) directional_timing: Option<DirectionalTiming>,
     pub rate_scope: PathRateScope,
     /// Qualified native carrier delivery capacity, when distinct from the
     /// product flow's completion rate.
@@ -90,6 +97,7 @@ impl PathSnapshot {
             jitter_ms: 0.0,
             delivery_rate_bps,
             scheduling_service_rate: None,
+            directional_timing: None,
             rate_scope: PathRateScope::PathCapacity,
             carrier_delivery_rate_bps: None,
             product_progress_rate_bps: None,
@@ -120,6 +128,15 @@ impl PathSnapshot {
 
     pub(crate) fn scheduling_service_rate(self) -> Option<DirectionalServiceRate> {
         self.scheduling_service_rate
+    }
+
+    pub(crate) fn with_directional_timing(mut self, timing: DirectionalTiming) -> Self {
+        self.directional_timing = Some(timing);
+        self
+    }
+
+    pub(crate) fn directional_timing(self) -> Option<DirectionalTiming> {
+        self.directional_timing
     }
 }
 

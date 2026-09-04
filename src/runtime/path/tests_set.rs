@@ -8,7 +8,9 @@ fn tcp_path(port: u16) -> PathSpec {
 
 fn tcp_state(path_count: usize) -> Arc<ClientPathState> {
     ClientPathState::new(ClientPathHealth::new(
-        vec![ClientPathHealthRecord::default(); path_count],
+        std::iter::repeat_with(ClientPathHealthRecord::default)
+            .take(path_count)
+            .collect(),
         Vec::new(),
     ))
 }

@@ -1,4 +1,7 @@
 use crate::model::admission::BulkPathCandidate;
+use crate::model::advisory_score::{
+    DirectionalRoundTripTime, DirectionalTiming, DirectionalTimingEpoch, DirectionalTimingVariation,
+};
 use crate::model::capacity::{
     MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES, MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES,
     PathRateSample, QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY,
@@ -635,20 +638,14 @@ pub(in crate::runtime) fn path_snapshot_with_id(
     observation: ClientPathObservation,
 ) -> PathSnapshot {
     let startup_diagnostic_rate_bps = startup_rate_prediction_bps(path.metadata.initial_rate);
-    let scheduling_service_rate = observation
-        .native_scheduling_shape
-        .filter(|shape| {
-            path.underlay == UnderlayProtocol::Udp
-                && observation
-                    .path_instance_id
-                    .is_some_and(|path_instance_id| {
-                        shape.service_rate().scope()
-                            == DirectionalServiceRateScope::new(
-                                path_instance_id,
-                                PathMetricDirection::ClientToServer,
-                            )
-                    })
-        })
+    let exact_scope = observation.path_instance_id.map(|path_instance_id| {
+        DirectionalServiceRateScope::new(path_instance_id, PathMetricDirection::ClientToServer)
+    });
+    let exact_native_shape = observation.native_scheduling_shape.filter(|shape| {
+        path.underlay == UnderlayProtocol::Udp
+            && exact_scope.is_some_and(|scope| shape.service_rate().scope() == scope)
+    });
+    let scheduling_service_rate = exact_native_shape
         .map(NativeCarrierSchedulingShapeSnapshot::service_rate)
         .or_else(|| {
             observation.path_instance_id.and_then(|path_instance_id| {
@@ -659,6 +656,19 @@ pub(in crate::runtime) fn path_snapshot_with_id(
                 )
             })
         });
+    let directional_timing = exact_scope.and_then(|scope| {
+        let startup = || directional_startup_timing(path, scope);
+        match exact_native_shape {
+            Some(shape) => shape
+                .directional_timing()
+                .filter(|timing| timing.scope() == scope)
+                .or_else(startup),
+            None => observation
+                .directional_timing
+                .filter(|timing| timing.scope() == scope)
+                .or_else(startup),
+        }
+    });
     // The health record retains the raw Product point for diagnostics and
     // smoothing. Completion/ranking sees it only through the established
     // Product service-quantum qualification boundary.
@@ -694,6 +704,7 @@ pub(in crate::runtime) fn path_snapshot_with_id(
         jitter_ms,
         delivery_rate_bps,
         scheduling_service_rate,
+        directional_timing,
         rate_scope,
         carrier_delivery_rate_bps: carrier_capacity_rate_bps,
         product_progress_rate_bps,
@@ -757,6 +768,32 @@ pub(in crate::runtime) fn directional_startup_service_rate(
     .ok()
 }
 
+fn directional_startup_timing(
+    path: &PathSpec,
+    scope: DirectionalServiceRateScope,
+) -> Option<DirectionalTiming> {
+    // Epoch zero is reserved for the immutable local startup prior. Live
+    // producers issue checked nonzero epochs within the same exact scope.
+    let epoch = DirectionalTimingEpoch::from_raw(0);
+    let round_trip_time = path
+        .metadata
+        .initial_srtt_ms
+        .map_or(RELIABLE_INITIAL_RTT, |milliseconds| {
+            Duration::from_millis(u64::from(milliseconds))
+        });
+    DirectionalTiming::checked_from_parts(
+        DirectionalRoundTripTime::from_duration(scope, epoch, round_trip_time),
+        path.metadata.initial_jitter_ms.map(|milliseconds| {
+            DirectionalTimingVariation::from_duration(
+                scope,
+                epoch,
+                Duration::from_millis(u64::from(milliseconds)),
+            )
+        }),
+    )
+    .ok()
+}
+
 pub(in crate::runtime) fn path_startup_snapshot_for_instance(
     path: &PathSpec,
     path_id: PathId,
@@ -764,8 +801,11 @@ pub(in crate::runtime) fn path_startup_snapshot_for_instance(
     direction: PathMetricDirection,
 ) -> PathSnapshot {
     let snapshot = path_startup_snapshot(path, path_id);
-    directional_startup_service_rate(path, path_instance_id, direction)
-        .map_or(snapshot, |rate| snapshot.with_scheduling_service_rate(rate))
+    let scope = DirectionalServiceRateScope::new(path_instance_id, direction);
+    let snapshot = directional_startup_service_rate(path, path_instance_id, direction)
+        .map_or(snapshot, |rate| snapshot.with_scheduling_service_rate(rate));
+    directional_startup_timing(path, scope)
+        .map_or(snapshot, |timing| snapshot.with_directional_timing(timing))
 }
 
 pub(in crate::runtime) fn path_startup_snapshot(path: &PathSpec, path_id: PathId) -> PathSnapshot {
@@ -1294,6 +1334,8 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) relay_queue_bytes: u64,
     pub(in crate::runtime) carrier_srtt_ms: Option<f64>,
     pub(in crate::runtime) carrier_rttvar_ms: Option<f64>,
+    /// Producer-validated live timing for one exact carrier direction.
+    pub(in crate::runtime) directional_timing: Option<DirectionalTiming>,
     pub(in crate::runtime) carrier_loss_rate: Option<f64>,
     pub(in crate::runtime) carrier_ecn_rate: Option<f64>,
     pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
@@ -1351,6 +1393,7 @@ impl Default for ClientPathObservation {
             relay_queue_bytes: 0,
             carrier_srtt_ms: None,
             carrier_rttvar_ms: None,
+            directional_timing: None,
             carrier_loss_rate: None,
             carrier_ecn_rate: None,
             carrier_delivery_rate_bps: None,

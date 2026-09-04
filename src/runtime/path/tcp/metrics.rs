@@ -3,6 +3,7 @@
 //! Polling stays beside the socket lifecycle. Capability-graded observations
 //! preserve unknown host fields; receipt authority remains in `capacity`.
 
+use crate::model::advisory_score::{DirectionalTimingEpoch, DirectionalTimingEpochIssuer};
 use crate::model::capacity::PATH_OPEN_SCORE_BYTES;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::model::{metric_epoch_now, ratio_to_ppm};
@@ -40,6 +41,7 @@ impl TcpSenderQueueSnapshot {
 pub(in crate::runtime) struct TcpNativeObservation {
     path_id: PathId,
     direction: PathMetricDirection,
+    timing_epoch: Option<DirectionalTimingEpoch>,
     srtt_us: Option<u32>,
     rttvar_us: Option<u32>,
     bytes_in_flight: Option<u64>,
@@ -65,6 +67,10 @@ impl TcpNativeObservation {
 
     pub(in crate::runtime) fn direction(self) -> PathMetricDirection {
         self.direction
+    }
+
+    pub(in crate::runtime) fn timing_epoch(self) -> Option<DirectionalTimingEpoch> {
+        self.timing_epoch
     }
 
     pub(in crate::runtime) fn srtt_us(self) -> Option<u32> {
@@ -242,6 +248,7 @@ impl TcpNativeObservation {
 pub(in crate::runtime) struct TcpMetricPublisher {
     socket: TcpTelemetrySocket,
     tracker: Option<TcpSenderMetricTracker>,
+    timing_epochs: DirectionalTimingEpochIssuer,
     next_sample_at: Instant,
 }
 
@@ -251,6 +258,7 @@ impl TcpMetricPublisher {
             Ok(Some(socket)) => Some(Self {
                 socket,
                 tracker: None,
+                timing_epochs: DirectionalTimingEpochIssuer::default(),
                 next_sample_at: Instant::now(),
             }),
             Ok(None) => {
@@ -266,13 +274,11 @@ impl TcpMetricPublisher {
 
     /// Starts the cumulative sender epoch after authenticated readiness bytes.
     pub(in crate::runtime) fn begin_epoch(&mut self) {
-        self.tracker = match self.socket.snapshot() {
-            Ok(Some(snapshot)) if snapshot.flight.is_some() => {
-                Some(TcpSenderMetricTracker::new(snapshot))
-            }
+        let baseline = match self.socket.snapshot() {
+            Ok(Some(snapshot)) if snapshot.flight.is_some() => Some(snapshot),
             Ok(Some(snapshot)) => {
                 warn_portable_tcp_capacity_fallback(None);
-                Some(TcpSenderMetricTracker::new(snapshot))
+                Some(snapshot)
             }
             Ok(None) => {
                 warn_portable_tcp_capacity_fallback(None);
@@ -282,6 +288,14 @@ impl TcpMetricPublisher {
                 warn_portable_tcp_capacity_fallback(Some(&error));
                 None
             }
+        };
+        self.tracker = match (self.tracker.take(), baseline) {
+            (Some(mut tracker), Some(snapshot)) => {
+                tracker.begin_delivery_epoch(snapshot);
+                Some(tracker)
+            }
+            (None, Some(snapshot)) => Some(TcpSenderMetricTracker::new(snapshot)),
+            (_, None) => None,
         };
         self.next_sample_at = Instant::now();
     }
@@ -318,11 +332,14 @@ impl TcpMetricPublisher {
             self.tracker = Some(TcpSenderMetricTracker::new(current));
             return None;
         }
-        let observation = self
+        let mut observation = self
             .tracker
             .as_mut()
             .expect("native TCP tracker established above")
             .observe(path_id, direction, current);
+        observation.timing_epoch = observation
+            .srtt_us()
+            .and_then(|_| self.timing_epochs.issue());
         let interval = observation
             .srtt_us()
             .map(|srtt_us| Duration::from_micros(u64::from(srtt_us.max(1))) / 2)
@@ -354,6 +371,8 @@ pub(in crate::runtime) struct TcpSenderMetricTracker {
     previous_retransmission_counter: Option<u64>,
     delivery_window_floor_bytes: u64,
     loss: Option<TcpLossTracker>,
+    #[cfg(test)]
+    timing_epochs: DirectionalTimingEpochIssuer,
 }
 
 /// Accumulates modular kernel counters so a long-lived fast carrier can cross
@@ -382,7 +401,29 @@ impl TcpSenderMetricTracker {
                 sent_segments: 0,
                 retransmits: 0,
             }),
+            #[cfg(test)]
+            timing_epochs: DirectionalTimingEpochIssuer::default(),
         }
+    }
+
+    /// Restarts cumulative delivery evidence for the same physical socket
+    /// without reusing its timing publication identities.
+    fn begin_delivery_epoch(&mut self, baseline: TcpNativeSnapshot) {
+        #[cfg(test)]
+        {
+            let timing_epochs = std::mem::take(&mut self.timing_epochs);
+            *self = Self::new(baseline);
+            self.timing_epochs = timing_epochs;
+        }
+        #[cfg(not(test))]
+        {
+            *self = Self::new(baseline);
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn set_next_timing_epoch_for_test(&mut self, next: u64) {
+        self.timing_epochs.set_next_for_test(next);
     }
 
     pub(in crate::runtime) fn observe(
@@ -395,6 +436,10 @@ impl TcpSenderMetricTracker {
             .rtt
             .map(|rtt| (Some(rtt.srtt_us), rtt.rttvar_us))
             .unwrap_or((None, None));
+        #[cfg(test)]
+        let timing_epoch = srtt_us.and_then(|_| self.timing_epochs.issue());
+        #[cfg(not(test))]
+        let timing_epoch = None;
         let (bytes_in_flight, inflight_limit_bytes, inflight_hi_bytes) = current
             .flight
             .map(|flight| {
@@ -458,6 +503,7 @@ impl TcpSenderMetricTracker {
         TcpNativeObservation {
             path_id,
             direction,
+            timing_epoch,
             srtt_us,
             rttvar_us,
             bytes_in_flight,

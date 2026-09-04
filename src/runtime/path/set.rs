@@ -526,8 +526,16 @@ impl ClientPathContext {
         let udp_tls = Arc::new(udp_tls);
         let path_proof_limit = resources.max_streams.saturating_mul(2).max(1);
         let state = ClientPathState::new(ClientPathHealth::new(
-            vec![ClientPathHealthRecord::with_path_proof_limit(path_proof_limit); tcp_paths.len()],
-            vec![ClientPathHealthRecord::with_path_proof_limit(path_proof_limit); udp_paths.len()],
+            std::iter::repeat_with(|| {
+                ClientPathHealthRecord::with_path_proof_limit(path_proof_limit)
+            })
+            .take(tcp_paths.len())
+            .collect(),
+            std::iter::repeat_with(|| {
+                ClientPathHealthRecord::with_path_proof_limit(path_proof_limit)
+            })
+            .take(udp_paths.len())
+            .collect(),
         ));
         let codec_limits = resources.into();
         let mux_limits = resources.into();

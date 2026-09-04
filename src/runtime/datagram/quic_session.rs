@@ -127,7 +127,9 @@ impl UdpDatagramClientSession {
     ) -> Result<Self, RuntimeError> {
         let state = ClientPathState::new(ClientPathHealth::new(
             Vec::new(),
-            vec![ClientPathHealthRecord::default(); path_index.saturating_add(1)],
+            std::iter::repeat_with(ClientPathHealthRecord::default)
+                .take(path_index.saturating_add(1))
+                .collect(),
         ));
         let peer_status = PeerStatusBroker::new(false);
         let path_session = ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {

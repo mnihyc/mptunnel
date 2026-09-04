@@ -33,6 +33,43 @@ fn sender_queue_snapshot(bytes_in_flight: u64, notsent_bytes: u32) -> TcpSenderQ
 }
 
 #[test]
+fn t03_tcp_timing_epochs_are_nonreused_and_optional_variation_is_coherent() {
+    let baseline = snapshot();
+    let mut tracker = TcpSenderMetricTracker::new(baseline);
+    let first = tracker.observe(PathId(7), PathMetricDirection::ClientToServer, baseline);
+    let windows_like = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            srtt_us: 31_000,
+            rttvar_us: None,
+        }),
+        ..baseline
+    };
+    let second = tracker.observe(PathId(7), PathMetricDirection::ClientToServer, windows_like);
+
+    assert!(first.timing_epoch().is_some());
+    assert!(second.timing_epoch() > first.timing_epoch());
+    assert_eq!(second.srtt_us(), Some(31_000));
+    assert_eq!(second.rttvar_us(), None);
+}
+
+#[test]
+fn t03_tcp_timing_epoch_exhaustion_does_not_drop_the_observation() {
+    let baseline = snapshot();
+    let mut tracker = TcpSenderMetricTracker::new(baseline);
+    tracker.set_next_timing_epoch_for_test(u64::MAX);
+
+    let last = tracker.observe(PathId(8), PathMetricDirection::ClientToServer, baseline);
+    let exhausted = tracker.observe(PathId(8), PathMetricDirection::ClientToServer, baseline);
+
+    assert_eq!(
+        last.timing_epoch().map(|epoch| epoch.as_u64()),
+        Some(u64::MAX)
+    );
+    assert_eq!(exhausted.timing_epoch(), None);
+    assert_eq!(exhausted.srtt_us(), baseline.rtt.map(|rtt| rtt.srtt_us));
+}
+
+#[test]
 fn tcp_receipt_baseline_waits_only_for_unsent_bytes() {
     assert!(sender_queue_snapshot(0, 0).is_write_queue_drained());
     assert!(

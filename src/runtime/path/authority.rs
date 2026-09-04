@@ -4,6 +4,10 @@
 //! activation fence, serializes the reducer, and deliberately retains no
 //! parallel copy of its activation, controller, revision, or rate.
 
+use crate::model::advisory_score::{
+    DirectionalRoundTripTime, DirectionalTiming, DirectionalTimingEpochIssuer,
+    DirectionalTimingVariation,
+};
 use crate::model::carrier_rate_authority::{
     CarrierRateAuthorityBasis, CarrierRateAuthorityError, CarrierRateAuthorityMode,
     CarrierRateAuthorityScope, CarrierRateAuthoritySnapshot, CarrierRateAuthorityStamp,
@@ -117,6 +121,7 @@ pub(in crate::runtime) struct NativeCarrierRateDecisionSnapshot {
 #[must_use = "native scheduling shape must retain its exact authority stamp"]
 pub(in crate::runtime) struct NativeCarrierSchedulingShapeSnapshot {
     decision: NativeCarrierRateDecisionSnapshot,
+    directional_timing: Option<DirectionalTiming>,
     srtt: Duration,
     rttvar: Duration,
     congestion_window: u64,
@@ -165,6 +170,10 @@ impl NativeCarrierSchedulingShapeSnapshot {
 
     pub(in crate::runtime) fn basis(self) -> CarrierRateAuthorityBasis {
         self.decision.basis()
+    }
+
+    pub(in crate::runtime) fn directional_timing(self) -> Option<DirectionalTiming> {
+        self.directional_timing
     }
 
     pub(in crate::runtime) fn srtt(self) -> Duration {
@@ -221,7 +230,7 @@ pub(in crate::runtime) struct NativeCarrierRateAuthorityHandle {
     transport: NativeCarrierRateTransportSource,
     /// Latest activation-coherent native shape. This cache is deliberately
     /// rate-free: its stamp binds it to the one central authority value.
-    scheduling_shape: Mutex<Option<ValidatedNativeCarrierShape>>,
+    scheduling_shape: Mutex<NativeCarrierSchedulingShapeCache>,
     accepted_change: watch::Sender<CarrierRateAuthorityStamp>,
 }
 
@@ -254,6 +263,7 @@ struct CoherentNativeCarrierShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ValidatedNativeCarrierShape {
     stamp: CarrierRateAuthorityStamp,
+    directional_timing: Option<DirectionalTiming>,
     srtt: Duration,
     rttvar: Duration,
     congestion_window: u64,
@@ -263,10 +273,70 @@ struct ValidatedNativeCarrierShape {
     app_limited: bool,
 }
 
+#[derive(Debug)]
+struct NativeCarrierSchedulingShapeCache {
+    current: Option<ValidatedNativeCarrierShape>,
+    timing_epochs: DirectionalTimingEpochIssuer,
+}
+
+impl NativeCarrierSchedulingShapeCache {
+    fn new(stamp: CarrierRateAuthorityStamp, shape: CoherentNativeCarrierShape) -> Self {
+        let mut cache = Self {
+            current: None,
+            timing_epochs: DirectionalTimingEpochIssuer::default(),
+        };
+        cache.replace(stamp, shape);
+        cache
+    }
+
+    fn replace(
+        &mut self,
+        stamp: CarrierRateAuthorityStamp,
+        shape: CoherentNativeCarrierShape,
+    ) -> ValidatedNativeCarrierShape {
+        let prior = self.current.filter(|current| {
+            current.stamp.scope() == stamp.scope()
+                && current.stamp.native_activation() == stamp.native_activation()
+        });
+        let prior_timing = prior.and_then(|current| current.directional_timing);
+        let directional_timing = if shape.srtt.is_zero() {
+            prior_timing
+        } else if prior
+            .is_some_and(|current| current.srtt == shape.srtt && current.rttvar == shape.rttvar)
+        {
+            prior_timing
+        } else {
+            self.timing_epochs
+                .issue()
+                .map(|epoch| {
+                    DirectionalTiming::checked_from_parts(
+                        DirectionalRoundTripTime::from_duration(stamp.scope(), epoch, shape.srtt),
+                        Some(DirectionalTimingVariation::from_duration(
+                            stamp.scope(),
+                            epoch,
+                            shape.rttvar,
+                        )),
+                    )
+                    .expect("one validated native shape has one exact timing scope and epoch")
+                })
+                .or(prior_timing)
+        };
+        let replacement =
+            ValidatedNativeCarrierShape::from_coherent(stamp, shape, directional_timing);
+        self.current = Some(replacement);
+        replacement
+    }
+}
+
 impl ValidatedNativeCarrierShape {
-    fn from_coherent(stamp: CarrierRateAuthorityStamp, shape: CoherentNativeCarrierShape) -> Self {
+    fn from_coherent(
+        stamp: CarrierRateAuthorityStamp,
+        shape: CoherentNativeCarrierShape,
+        directional_timing: Option<DirectionalTiming>,
+    ) -> Self {
         Self {
             stamp,
+            directional_timing,
             srtt: shape.srtt,
             rttvar: shape.rttvar,
             congestion_window: shape.congestion_window,
@@ -284,6 +354,7 @@ impl ValidatedNativeCarrierShape {
         debug_assert_eq!(self.stamp, decision.stamp());
         NativeCarrierSchedulingShapeSnapshot {
             decision,
+            directional_timing: self.directional_timing,
             srtt: self.srtt,
             rttvar: self.rttvar,
             congestion_window: self.congestion_window,
@@ -600,7 +671,7 @@ impl NativeCarrierRateAuthorityHandle {
                 let coordinator = NativeCarrierRateAuthority::new(scope, startup, checked_source)
                     .map_err(NativeCarrierRateAuthorityRuntimeError::from)?;
                 let scheduling_shape =
-                    ValidatedNativeCarrierShape::from_coherent(coordinator.stamp(), shape);
+                    NativeCarrierSchedulingShapeCache::new(coordinator.stamp(), shape);
                 Ok((coordinator, scheduling_shape))
             }
             NativeCarrierTransportFenceState::Live(_) => {
@@ -617,7 +688,7 @@ impl NativeCarrierRateAuthorityHandle {
         Ok(Arc::new(Self {
             coordinator: Mutex::new(coordinator),
             transport,
-            scheduling_shape: Mutex::new(Some(scheduling_shape)),
+            scheduling_shape: Mutex::new(scheduling_shape),
             accepted_change,
         }))
     }
@@ -731,11 +802,13 @@ impl NativeCarrierRateAuthorityHandle {
                 }
                 coordinator
                     .commit_if_current(snapshot.stamp(), current, || {
-                        let validated =
-                            ValidatedNativeCarrierShape::from_coherent(snapshot.stamp(), shape);
-                        *self.scheduling_shape.lock().map_err(|_| {
-                            NativeCarrierRateAuthorityRuntimeError::CoordinatorPoisoned
-                        })? = Some(validated);
+                        let validated = self
+                            .scheduling_shape
+                            .lock()
+                            .map_err(|_| {
+                                NativeCarrierRateAuthorityRuntimeError::CoordinatorPoisoned
+                            })?
+                            .replace(snapshot.stamp(), shape);
                         Ok(validated.with_decision(NativeCarrierRateDecisionSnapshot { snapshot }))
                     })
                     .map_err(NativeCarrierRateAuthorityRuntimeError::from)?
@@ -794,6 +867,7 @@ impl NativeCarrierRateAuthorityHandle {
                             .map_err(|_| {
                                 NativeCarrierRateAuthorityRuntimeError::CoordinatorPoisoned
                             })?
+                            .current
                             .ok_or(
                                 NativeCarrierRateAuthorityRuntimeError::SchedulingShapeUnavailable,
                             )?;
@@ -1002,6 +1076,7 @@ impl NativeCarrierRateAuthorityHandle {
                             .map_err(|_| {
                                 NativeCarrierRateAuthorityRuntimeError::CoordinatorPoisoned
                             })?
+                            .current
                             .ok_or(
                                 NativeCarrierRateAuthorityRuntimeError::SchedulingShapeUnavailable,
                             )?;
@@ -1052,7 +1127,7 @@ impl NativeCarrierRateAuthorityHandle {
         let transport = NativeCarrierRateTransportSource::for_test(initial.activation);
         let coordinator =
             NativeCarrierRateAuthority::new(scope, startup, initial.checked_source(scope)?)?;
-        let scheduling_shape = ValidatedNativeCarrierShape::from_coherent(
+        let scheduling_shape = NativeCarrierSchedulingShapeCache::new(
             coordinator.stamp(),
             CoherentNativeCarrierShape {
                 source: initial,
@@ -1069,7 +1144,7 @@ impl NativeCarrierRateAuthorityHandle {
         Ok(Arc::new(Self {
             coordinator: Mutex::new(coordinator),
             transport,
-            scheduling_shape: Mutex::new(Some(scheduling_shape)),
+            scheduling_shape: Mutex::new(scheduling_shape),
             accepted_change,
         }))
     }
@@ -1135,6 +1210,15 @@ impl NativeCarrierRateAuthorityHandle {
         activation: u64,
     ) -> Result<(), NativeCarrierRateAuthorityRuntimeError> {
         self.transport.set_current_activation_for_test(activation)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn set_next_timing_epoch_for_test(&self, next: u64) {
+        self.scheduling_shape
+            .lock()
+            .expect("native scheduling shape test lock")
+            .timing_epochs
+            .set_next_for_test(next);
     }
 
     #[cfg(test)]

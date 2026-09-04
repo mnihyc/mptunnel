@@ -38,6 +38,202 @@ fn request_tcp_native_observation(path_index: usize) -> TcpNativeObservation {
     )
 }
 
+#[test]
+fn t03_client_tcp_timing_is_exact_coherent_and_instance_scoped() {
+    let first_snapshot = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            srtt_us: 80_000,
+            rttvar_us: Some(12_000),
+        }),
+        ..TcpNativeSnapshot::default()
+    };
+    let mut tracker = TcpSenderMetricTracker::new(first_snapshot);
+    let first = tracker.observe(
+        PathId(3),
+        PathMetricDirection::ClientToServer,
+        first_snapshot,
+    );
+    let instance = crate::model::path::next_carrier_path_instance_id();
+    let successor = crate::model::path::next_carrier_path_instance_id();
+    let mut record = ClientPathHealthRecord::default();
+    record.install_tcp_peer_usage(PathId(3), instance, 0, PathUsage::Available);
+    assert!(record.mark_tcp_transport_state(instance, first));
+
+    let path = "tcp://127.0.0.1:10000"
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let first_snapshot = path_snapshot(&path, 3, record.observation_at(Instant::now()));
+    let first_timing = first_snapshot
+        .directional_timing()
+        .expect("live TCP timing");
+    assert_eq!(
+        first_timing.scope(),
+        crate::model::service_rate::DirectionalServiceRateScope::new(
+            instance,
+            PathMetricDirection::ClientToServer,
+        ),
+    );
+    assert_eq!(first_timing.round_trip_time(), Duration::from_millis(80));
+    assert_eq!(first_timing.variation(), Some(Duration::from_millis(12)));
+
+    let windows_like_snapshot = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            srtt_us: 95_000,
+            rttvar_us: None,
+        }),
+        ..TcpNativeSnapshot::default()
+    };
+    let windows_like = tracker.observe(
+        PathId(3),
+        PathMetricDirection::ClientToServer,
+        windows_like_snapshot,
+    );
+    assert!(record.mark_tcp_transport_state(instance, windows_like));
+    let current = path_snapshot(&path, 3, record.observation_at(Instant::now()))
+        .directional_timing()
+        .expect("new live TCP timing");
+    assert_eq!(current.round_trip_time(), Duration::from_millis(95));
+    assert_eq!(current.variation(), None, "new R cannot borrow old J");
+    assert_eq!(
+        first_snapshot.directional_timing(),
+        Some(first_timing),
+        "an immutable snapshot keeps its captured tuple",
+    );
+
+    let wrong_direction = tracker.observe(
+        PathId(3),
+        PathMetricDirection::ServerToClient,
+        TcpNativeSnapshot {
+            rtt: Some(TcpNativeRtt {
+                srtt_us: 1_000,
+                rttvar_us: Some(1_000),
+            }),
+            ..TcpNativeSnapshot::default()
+        },
+    );
+    assert!(!record.mark_tcp_transport_state(instance, wrong_direction));
+    assert_eq!(
+        path_snapshot(&path, 3, record.observation_at(Instant::now())).directional_timing(),
+        Some(current),
+    );
+    assert!(!record.mark_tcp_transport_state(successor, windows_like));
+    assert_eq!(
+        path_snapshot(&path, 3, record.observation_at(Instant::now())).directional_timing(),
+        Some(current),
+        "a wrong physical instance cannot replace the accepted tuple",
+    );
+
+    assert!(!record.publish_carrier_timing_for_test(instance, f64::NAN, Some(2.0),));
+    assert_eq!(
+        path_snapshot(&path, 3, record.observation_at(Instant::now())).directional_timing(),
+        Some(current),
+        "malformed publication preserves the prior tuple",
+    );
+
+    record.install_tcp_peer_usage(PathId(3), successor, 1, PathUsage::Available);
+    let successor_snapshot = path_snapshot(&path, 3, record.observation_at(Instant::now()));
+    let successor_timing = successor_snapshot
+        .directional_timing()
+        .expect("successor exact startup timing");
+    assert_eq!(
+        successor_timing.scope(),
+        crate::model::service_rate::DirectionalServiceRateScope::new(
+            successor,
+            PathMetricDirection::ClientToServer,
+        ),
+    );
+    assert_eq!(successor_timing.round_trip_time(), RELIABLE_INITIAL_RTT);
+    assert_eq!(successor_timing.variation(), None);
+}
+
+#[test]
+fn t03_client_tcp_timing_epoch_exhaustion_preserves_prior_timing() {
+    let native = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            srtt_us: 60_000,
+            rttvar_us: Some(7_000),
+        }),
+        ..TcpNativeSnapshot::default()
+    };
+    let mut tracker = TcpSenderMetricTracker::new(native);
+    tracker.set_next_timing_epoch_for_test(u64::MAX);
+    let instance = crate::model::path::next_carrier_path_instance_id();
+    let mut record = ClientPathHealthRecord::default();
+    record.install_tcp_peer_usage(PathId(6), instance, 0, PathUsage::Available);
+    let last = tracker.observe(PathId(6), PathMetricDirection::ClientToServer, native);
+    assert!(record.mark_tcp_transport_state(instance, last));
+    let accepted = record
+        .observation_at(Instant::now())
+        .directional_timing
+        .expect("last named timing");
+
+    let unnamed = tracker.observe(
+        PathId(6),
+        PathMetricDirection::ClientToServer,
+        TcpNativeSnapshot {
+            rtt: Some(TcpNativeRtt {
+                srtt_us: 5_000,
+                rttvar_us: None,
+            }),
+            ..native
+        },
+    );
+    assert_eq!(unnamed.timing_epoch(), None);
+    assert!(record.mark_tcp_transport_state(instance, unnamed));
+    assert_eq!(
+        record.observation_at(Instant::now()).directional_timing,
+        Some(accepted),
+        "exhaustion affects only fresh advisory timing publication",
+    );
+    assert_eq!(record.carrier_srtt_ms, Some(5.0));
+}
+
+#[test]
+fn t03_current_quic_shape_atomically_supersedes_stale_scalar_timing() {
+    let instance = crate::model::path::next_carrier_path_instance_id();
+    let scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+        instance,
+        PathMetricDirection::ClientToServer,
+    );
+    let authority =
+        NativeCarrierRateAuthorityHandle::from_observation_for_test(scope, 25_000_000, 1, 7, None)
+            .expect("central native authority");
+    let current_shape = authority
+        .refresh_scheduling_shape_for_test(
+            scope,
+            1,
+            7,
+            None,
+            Duration::from_millis(70),
+            Duration::from_millis(9),
+            2 * 1024 * 1024,
+            256 * 1024,
+            1400,
+            Some(30_000_000),
+            false,
+        )
+        .expect("matching current shape");
+    let mut record = ClientPathHealthRecord::default();
+    record.install_udp_peer_usage(instance, 1, 0, PathUsage::Available);
+    let now = Instant::now();
+    let mut stale_metrics = request_quic_path_metrics(now, now + Duration::from_secs(1));
+    stale_metrics.srtt = Duration::from_millis(400);
+    stale_metrics.rttvar = Duration::from_millis(150);
+    record.mark_quic_path_metrics(instance, stale_metrics);
+    let mut observation = record.observation_at(now);
+    observation.native_scheduling_shape = Some(current_shape);
+    let path = "quic://127.0.0.1:10000"
+        .parse::<PathSpec>()
+        .expect("QUIC path");
+
+    let timing = path_snapshot(&path, 0, observation)
+        .directional_timing()
+        .expect("current exact shape timing");
+    assert_eq!(timing.scope(), scope);
+    assert_eq!(timing.round_trip_time(), Duration::from_millis(70));
+    assert_eq!(timing.variation(), Some(Duration::from_millis(9)));
+}
+
 fn request_quic_path_metrics(now: Instant, deadline: Instant) -> UdpPathMetrics {
     UdpPathMetrics {
         controller_path_epoch: 1,

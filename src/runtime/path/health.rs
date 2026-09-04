@@ -10,9 +10,14 @@ use super::proof::PathProofObservation;
 use super::quic::metrics::UdpPathMetrics;
 use super::tcp::capacity::RequestTcpCapacityRecord;
 use super::tcp::metrics::TcpNativeObservation;
+use crate::model::advisory_score::{
+    DirectionalRoundTripTime, DirectionalTiming, DirectionalTimingEpoch,
+    DirectionalTimingEpochIssuer, DirectionalTimingVariation,
+};
 use crate::model::capacity::{PathRateSample, RELIABLE_INITIAL_RTT, TcpCapacityProofCandidate};
 use crate::model::carrier_rate_authority::{CarrierRateAuthorityBasis, CarrierRateAuthorityStamp};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
+use crate::model::service_rate::DirectionalServiceRateScope;
 use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::protocol::{PathId, PathMetricDirection, PathUsage, UnderlayProtocol};
 use crate::runtime::path::CarrierNativeWindowSample;
@@ -39,7 +44,7 @@ pub(super) enum RelayPathLoadOwner {
     ExactInstance(CarrierPathInstanceId),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
@@ -71,6 +76,9 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) consecutive_failures: u32,
     pub(in crate::runtime) measured_srtt_ms: Option<f64>,
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
+    /// Coherent liveness/proof timing for the current physical carrier.
+    measured_timing: Option<DirectionalTiming>,
+    measured_timing_epochs: DirectionalTimingEpochIssuer,
     pub(in crate::runtime) measured_rate_bps: Option<f64>,
     pub(in crate::runtime) measured_loss_rate: Option<f64>,
     /// Generic path-delivery evidence (for example UDP datagram feedback).
@@ -94,6 +102,9 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) relay_queue_bytes: u64,
     pub(in crate::runtime) carrier_srtt_ms: Option<f64>,
     pub(in crate::runtime) carrier_rttvar_ms: Option<f64>,
+    /// Coherent native-carrier timing for the current physical carrier.
+    carrier_timing: Option<DirectionalTiming>,
+    carrier_timing_epochs: DirectionalTimingEpochIssuer,
     pub(in crate::runtime) carrier_loss_rate: Option<f64>,
     pub(in crate::runtime) carrier_ecn_rate: Option<f64>,
     pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
@@ -215,6 +226,8 @@ impl Default for ClientPathHealthRecord {
             consecutive_failures: 0,
             measured_srtt_ms: None,
             measured_jitter_ms: None,
+            measured_timing: None,
+            measured_timing_epochs: DirectionalTimingEpochIssuer::default(),
             measured_rate_bps: None,
             measured_loss_rate: None,
             delivery_samples: 0,
@@ -236,6 +249,8 @@ impl Default for ClientPathHealthRecord {
             relay_queue_bytes: 0,
             carrier_srtt_ms: None,
             carrier_rttvar_ms: None,
+            carrier_timing: None,
+            carrier_timing_epochs: DirectionalTimingEpochIssuer::default(),
             carrier_loss_rate: None,
             carrier_ecn_rate: None,
             carrier_delivery_rate_bps: None,
@@ -343,6 +358,121 @@ impl ClientPathHealth {
 }
 
 impl ClientPathHealthRecord {
+    fn current_timing_scope(&self) -> Option<DirectionalServiceRateScope> {
+        self.path_instance_id.map(|path_instance_id| {
+            DirectionalServiceRateScope::new(path_instance_id, PathMetricDirection::ClientToServer)
+        })
+    }
+
+    fn timing_from_durations(
+        scope: DirectionalServiceRateScope,
+        epoch: DirectionalTimingEpoch,
+        round_trip_time: Duration,
+        variation: Option<Duration>,
+    ) -> DirectionalTiming {
+        DirectionalTiming::checked_from_parts(
+            DirectionalRoundTripTime::from_duration(scope, epoch, round_trip_time),
+            variation.map(|value| DirectionalTimingVariation::from_duration(scope, epoch, value)),
+        )
+        .expect("one health publication binds timing to one scope and epoch")
+    }
+
+    fn publish_measured_timing(&mut self, variation: Option<Duration>) {
+        let Some(scope) = self.current_timing_scope() else {
+            return;
+        };
+        let Some(round_trip_time_ms) = self.measured_srtt_ms else {
+            return;
+        };
+        let Some(epoch) = self.measured_timing_epochs.issue() else {
+            return;
+        };
+        let Ok(round_trip_time) =
+            DirectionalRoundTripTime::checked_from_millis(scope, epoch, round_trip_time_ms)
+        else {
+            return;
+        };
+        let variation =
+            variation.map(|value| DirectionalTimingVariation::from_duration(scope, epoch, value));
+        let Ok(timing) = DirectionalTiming::checked_from_parts(round_trip_time, variation) else {
+            return;
+        };
+        self.measured_timing = Some(timing);
+    }
+
+    fn publish_carrier_timing_from_millis(
+        &mut self,
+        scope: DirectionalServiceRateScope,
+        epoch: DirectionalTimingEpoch,
+        round_trip_time_ms: f64,
+        variation_ms: Option<f64>,
+    ) -> bool {
+        if self.current_timing_scope() != Some(scope) {
+            return false;
+        }
+        let Ok(round_trip_time) =
+            DirectionalRoundTripTime::checked_from_millis(scope, epoch, round_trip_time_ms)
+        else {
+            return false;
+        };
+        let variation = match variation_ms {
+            Some(value) => {
+                let Ok(variation) =
+                    DirectionalTimingVariation::checked_from_millis(scope, epoch, value)
+                else {
+                    return false;
+                };
+                Some(variation)
+            }
+            None => None,
+        };
+        let Ok(timing) = DirectionalTiming::checked_from_parts(round_trip_time, variation) else {
+            return false;
+        };
+        self.carrier_timing = Some(timing);
+        true
+    }
+
+    fn publish_carrier_timing_from_durations(
+        &mut self,
+        round_trip_time: Duration,
+        variation: Option<Duration>,
+    ) {
+        let Some(scope) = self.current_timing_scope() else {
+            return;
+        };
+        let Some(epoch) = self.carrier_timing_epochs.issue() else {
+            return;
+        };
+        self.carrier_timing = Some(Self::timing_from_durations(
+            scope,
+            epoch,
+            round_trip_time,
+            variation,
+        ));
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn publish_carrier_timing_for_test(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        round_trip_time_ms: f64,
+        variation_ms: Option<f64>,
+    ) -> bool {
+        if !self.accepts_native_carrier_observation(path_instance_id) {
+            return false;
+        }
+        let Some(epoch) = self.carrier_timing_epochs.issue() else {
+            return false;
+        };
+        self.publish_carrier_timing_from_millis(
+            DirectionalServiceRateScope::new(path_instance_id, PathMetricDirection::ClientToServer),
+            epoch,
+            round_trip_time_ms,
+            variation_ms,
+        )
+    }
+
     pub(in crate::runtime) fn rate_diagnostics(&self) -> ClientPathRateDiagnostics {
         ClientPathRateDiagnostics {
             measured_rate_bps: self.measured_rate_bps,
@@ -677,7 +807,12 @@ impl ClientPathHealthRecord {
         observation: TcpNativeObservation,
         now: Instant,
     ) -> bool {
-        if !self.accepts_native_carrier_observation(path_instance_id) {
+        if !self.accepts_native_carrier_observation(path_instance_id)
+            || observation.direction() != PathMetricDirection::ClientToServer
+            || self
+                .wire_path_id
+                .is_some_and(|wire_path_id| wire_path_id != observation.path_id())
+        {
             return false;
         }
         self.mark_liveness_success();
@@ -689,6 +824,19 @@ impl ClientPathHealthRecord {
         }
         if let Some(rttvar_us) = observation.rttvar_us() {
             self.carrier_rttvar_ms = Some(f64::from(rttvar_us) / 1_000.0);
+        }
+        if let (Some(epoch), Some(srtt_us)) = (observation.timing_epoch(), observation.srtt_us()) {
+            let _ = self.publish_carrier_timing_from_millis(
+                DirectionalServiceRateScope::new(
+                    path_instance_id,
+                    PathMetricDirection::ClientToServer,
+                ),
+                epoch,
+                f64::from(srtt_us) / 1_000.0,
+                observation
+                    .rttvar_us()
+                    .map(|rttvar_us| f64::from(rttvar_us) / 1_000.0),
+            );
         }
         self.carrier_bytes_in_flight_observed = observation.bytes_in_flight().is_some();
         self.carrier_queue_bytes_observed = observation.queue_bytes().is_some();
@@ -859,6 +1007,7 @@ impl ClientPathHealthRecord {
             relay_queue_bytes: self.relay_queue_bytes,
             carrier_srtt_ms: self.carrier_srtt_ms,
             carrier_rttvar_ms: self.carrier_rttvar_ms,
+            directional_timing: self.carrier_timing.or(self.measured_timing),
             carrier_loss_rate: self.carrier_loss_rate,
             carrier_ecn_rate: self.carrier_ecn_rate,
             carrier_delivery_rate_bps: proof_rate_bps
@@ -949,6 +1098,11 @@ impl ClientPathHealthRecord {
     }
 
     fn record_success(&mut self, elapsed: Duration) {
+        self.record_success_diagnostics(elapsed);
+        self.publish_measured_timing(None);
+    }
+
+    fn record_success_diagnostics(&mut self, elapsed: Duration) {
         self.mark_liveness_success();
         let sample_ms = elapsed.as_secs_f64() * 1000.0;
         self.measured_srtt_ms = Some(match self.measured_srtt_ms {
@@ -1366,7 +1520,7 @@ impl ClientPathHealthRecord {
         observation: UdpDatagramPathObservation,
         now: Instant,
     ) {
-        self.mark_success(observation.rtt);
+        self.record_success_diagnostics(observation.rtt);
         if let Some(sample) = observation.rate_sample {
             self.prepare_delivery_rate_sample(now);
             self.mark_delivery_at_with_expiry(sample, now, observation.rate_sample_expires_at);
@@ -1377,6 +1531,10 @@ impl ClientPathHealthRecord {
             Some(previous) => previous.mul_add(0.875, sample_jitter_ms * 0.125),
             None => sample_jitter_ms,
         });
+        self.publish_measured_timing(
+            self.measured_jitter_ms
+                .map(|milliseconds| Duration::from_secs_f64(milliseconds.max(0.0) / 1_000.0)),
+        );
         if let Some(loss_rate) = observation.loss_rate {
             self.measured_loss_rate = Some(match self.measured_loss_rate {
                 Some(previous) => previous.mul_add(0.875, loss_rate * 0.125),
@@ -1426,6 +1584,7 @@ impl ClientPathHealthRecord {
         if metrics.rtt_observed {
             self.carrier_srtt_ms = Some(metrics.srtt.as_secs_f64() * 1000.0);
             self.carrier_rttvar_ms = Some(metrics.rttvar.as_secs_f64() * 1000.0);
+            self.publish_carrier_timing_from_durations(metrics.srtt, Some(metrics.rttvar));
         }
         if let Some(loss_ppm) = metrics.loss_ppm {
             // `Some(0)` is an observed zero. `None` is an unavailable partial
@@ -1533,6 +1692,9 @@ impl ClientPathHealthRecord {
             self.carrier_srtt_ms = Some(shape.srtt().as_secs_f64() * 1000.0);
             self.carrier_rttvar_ms = Some(shape.rttvar().as_secs_f64() * 1000.0);
         }
+        if let Some(timing) = shape.directional_timing() {
+            self.carrier_timing = Some(timing);
+        }
         if let Some(loss_ppm) = metrics.loss_ppm {
             self.carrier_loss_rate = Some(f64::from(loss_ppm) / 1_000_000.0);
         }
@@ -1621,6 +1783,7 @@ impl ClientPathHealthRecord {
         self.native_authority_inflight_limit_bytes = None;
         self.carrier_srtt_ms = None;
         self.carrier_rttvar_ms = None;
+        self.carrier_timing = None;
         self.carrier_loss_rate = None;
         self.carrier_ecn_rate = None;
         self.carrier_bytes_in_flight = 0;
@@ -1644,6 +1807,7 @@ impl ClientPathHealthRecord {
         self.consecutive_failures = 0;
         self.measured_srtt_ms = None;
         self.measured_jitter_ms = None;
+        self.measured_timing = None;
         self.measured_loss_rate = None;
         self.clear_delivery_rate_evidence();
         self.clear_product_delivery_rate_evidence();

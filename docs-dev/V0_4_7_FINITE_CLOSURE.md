@@ -295,6 +295,15 @@ transaction.
 | T13 | P8 | Does the unchanged ordinary candidate pass every frozen user-visible cell against matched baselines? | No complete post-correction cohort exists. | Accept or reject candidate; no model edit during this row. |
 | T14 | Release | Can the accepted tree be packaged without reopening model work? | T01--T13 closed and CI green. | Release build, public evidence/docs, platform packages, tag/push, and transient cleanup; otherwise reject. |
 
+T04a is now focused GREEN. Its real queue lifecycle produced `P=12,288` total
+command bytes and `W=4,096` dequeued-writer bytes; the old response completion
+projection reported `P+W=16,384`. The corrected projection consumes `P` once
+and preserves the separate native floor. Queue admission, charge lifetime,
+Product flight, request accounting, and native telemetry are unchanged. The
+symbolic owner proof and exact evidence are recorded in
+`T04A_RESPONSE_QUEUE_ACCOUNTING.md`; this result does not waive T04b or any
+runtime acceptance cell.
+
 ### P1 — Lowest-frontier temporal service
 
 Observed symptom: QUIC impairment can pin a 64-MiB Product window and cause

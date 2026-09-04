@@ -384,10 +384,11 @@ pub(super) fn response_completion_snapshot(
     } else {
         0
     };
-    snapshot.queue_bytes = snapshot
-        .queue_bytes
-        .max(exact_native_queue_floor)
-        .saturating_add(target.observation.writer_pending_bytes);
+    // `snapshot.queue_bytes` already includes the complete command charge from
+    // reservation through writer release. `writer_pending_bytes` is the
+    // dequeued subset of that same charge, not a later stage or an independent
+    // fallback. The exact native queue remains a separate observed floor.
+    snapshot.queue_bytes = snapshot.queue_bytes.max(exact_native_queue_floor);
     snapshot.data_level_queue_bytes = 0;
     snapshot.data_level_bytes_in_flight = target.observation.original_data_in_flight_bytes;
     snapshot

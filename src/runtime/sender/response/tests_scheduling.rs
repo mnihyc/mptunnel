@@ -1,12 +1,17 @@
 use super::*;
 use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::{
-    reliable_bulk_carrier_feed_quantum_bytes, reliable_unproven_path_startup_flight_limit_bytes,
+    PATH_OPEN_SCORE_BYTES, reliable_bulk_carrier_feed_quantum_bytes,
+    reliable_unproven_path_startup_flight_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;
-use crate::protocol::{Frame, PathId, PathUsage, StreamId, UnderlayProtocol};
-use crate::runtime::path::commands::reliable_path_command_channels;
+use crate::protocol::{Frame, PathId, PathUsage, SessionId, StreamId, UnderlayProtocol};
+use crate::runtime::path::commands::{
+    reliable_path_command_channels, reliable_path_command_pending_bytes,
+    try_recv_reliable_path_command,
+};
 use crate::runtime::sender::response::test_support::response_target;
+use crate::runtime::stream::response::ResponseStreamBinding;
 use crate::scheduler::{PathRateScope, PathState};
 use bytes::Bytes;
 
@@ -39,6 +44,112 @@ fn block_data_queue(target: &mut ResponseSenderPathTarget) {
         )
         .expect("fill data queue");
     target.command_queue = commands.queue_snapshot();
+}
+
+#[test]
+fn t04a_response_completion_counts_dequeued_writer_charge_once() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(43),
+    };
+    let (commands, mut receivers) = reliable_path_command_channels(2);
+    let binding = ResponseStreamBinding::new(
+        SessionId(43),
+        key.underlay,
+        key.path_id,
+        commands.clone(),
+        TrafficClass::Throughput,
+    );
+    for (offset, bytes) in [(0, 4_096), (4_096, 8_192)] {
+        commands
+            .try_enqueue_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(43),
+                    offset,
+                    payload: Bytes::from(vec![0x43; bytes]),
+                },
+                TrafficClass::Throughput,
+            )
+            .expect("response carrier queue accepts the exact test command");
+    }
+
+    let total_command_pending = commands.pending_bytes();
+    let queued = binding
+        .sender_path_targets(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
+        .into_iter()
+        .next()
+        .expect("live response target before writer dequeue");
+    assert_eq!(
+        queued.observation.snapshot.queue_bytes,
+        total_command_pending
+    );
+    assert_eq!(queued.observation.writer_pending_bytes, 0);
+    assert!(
+        !queued.command_queue.can_enqueue_stream_ordered_frame(),
+        "bounded queue admission remains full before the writer dequeues a command",
+    );
+    assert_eq!(
+        response_completion_snapshot(&queued).queue_bytes,
+        total_command_pending,
+    );
+
+    let dequeued = try_recv_reliable_path_command(&mut receivers)
+        .expect("writer dequeues the first response command");
+    let dequeued_writer_subset = reliable_path_command_pending_bytes(&dequeued) as u64;
+    let writing = binding
+        .sender_path_targets(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
+        .into_iter()
+        .next()
+        .expect("live response target while writer owns a command");
+    assert_eq!(
+        commands.pending_bytes(),
+        total_command_pending,
+        "dequeue retains the total command charge until the writer releases it",
+    );
+    assert_eq!(
+        writing.observation.snapshot.queue_bytes,
+        total_command_pending
+    );
+    assert_eq!(
+        writing.observation.writer_pending_bytes, dequeued_writer_subset,
+        "writer pending is an exact subset of total command pending",
+    );
+    assert!(
+        writing.command_queue.can_enqueue_stream_ordered_frame(),
+        "dequeue releases bounded queue admission independently of byte-charge lifetime",
+    );
+    let writing_completion = response_completion_snapshot(&writing);
+
+    let mut native_floor = writing.clone();
+    native_floor.observation.native_drain_observed = true;
+    native_floor.observation.native_queue_bytes = total_command_pending + 1_024;
+    let native_floor_completion = response_completion_snapshot(&native_floor);
+
+    receivers.release_pending_command_bytes(dequeued_writer_subset as usize);
+    let released = binding
+        .sender_path_targets(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
+        .into_iter()
+        .next()
+        .expect("live response target after writer release");
+    assert_eq!(released.observation.writer_pending_bytes, 0);
+    assert_eq!(
+        released.observation.snapshot.queue_bytes,
+        total_command_pending - dequeued_writer_subset,
+        "writer release removes its charge while the second queued command remains",
+    );
+
+    assert_eq!(
+        writing_completion.queue_bytes, total_command_pending,
+        "completion work must not add the dequeued writer subset to the total command charge",
+    );
+    assert_eq!(
+        native_floor_completion.queue_bytes, native_floor.observation.native_queue_bytes,
+        "an observed native queue remains a floor, not another reason to add the writer subset",
+    );
+
+    let remaining = try_recv_reliable_path_command(&mut receivers)
+        .expect("writer dequeues the remaining response command");
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&remaining));
 }
 
 #[test]

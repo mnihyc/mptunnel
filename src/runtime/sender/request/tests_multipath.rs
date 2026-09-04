@@ -3870,11 +3870,17 @@ async fn request_load_becomes_idle_only_after_final_unique_original_ack() {
     );
 }
 
-#[tokio::test]
-async fn request_requalification_ack_on_authenticated_sibling_resolves_pending_target() {
+struct PendingRequestRequalification {
+    controller: RequestMultipathController,
+    candidate: RelayPathInstance,
+    sibling: RelayPathInstance,
+    probe: StreamRequalificationProbe,
+    deadline: Instant,
+}
+
+fn pending_request_requalification(stream_id: StreamId) -> PendingRequestRequalification {
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
-    let stream_id = StreamId(182);
     let payload_bytes = 4096;
     let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(8);
     let mut remotes = ReliableRelayRemoteSet::new(
@@ -3934,9 +3940,35 @@ async fn request_requalification_ack_on_authenticated_sibling_resolves_pending_t
         },
         _ => panic!("candidate receives the pending exact probe"),
     };
+    let deadline = controller
+        .requalification_deadline()
+        .expect("frozen exact deadline");
+
+    PendingRequestRequalification {
+        controller,
+        candidate,
+        sibling,
+        probe,
+        deadline,
+    }
+}
+
+#[tokio::test]
+async fn request_requalification_ack_on_authenticated_sibling_resolves_pending_target() {
+    let PendingRequestRequalification {
+        mut controller,
+        candidate,
+        sibling,
+        probe,
+        deadline,
+    } = pending_request_requalification(StreamId(182));
 
     assert!(
-        controller.acknowledge_requalification_probe(sibling, probe),
+        controller.acknowledge_requalification_probe_at(
+            sibling,
+            probe,
+            deadline - Duration::from_nanos(1),
+        ),
         "the exact pending tuple, not its authenticated return carrier, identifies the target"
     );
     assert!(
@@ -3947,10 +3979,54 @@ async fn request_requalification_ack_on_authenticated_sibling_resolves_pending_t
             .acquiring()
     );
     assert_eq!(
+        controller
+            .request
+            .path_states
+            .get(candidate)
+            .expect("candidate path state")
+            .product_qualification_authority(),
+        ProductQualificationAuthority::Active
+    );
+    assert_eq!(
         controller.request.requalification.state(sibling),
         StreamPathQualification::Qualified,
         "the ACK carrier is not the requalification target"
     );
+}
+
+#[tokio::test]
+async fn request_requalification_ack_at_or_after_deadline_does_not_reactivate_target() {
+    for (index, lateness) in [Duration::ZERO, Duration::from_millis(1)]
+        .into_iter()
+        .enumerate()
+    {
+        let PendingRequestRequalification {
+            mut controller,
+            candidate,
+            sibling,
+            probe,
+            deadline,
+        } = pending_request_requalification(StreamId(183 + index as u64));
+
+        assert!(!controller.acknowledge_requalification_probe_at(
+            sibling,
+            probe,
+            deadline + lateness,
+        ));
+        assert_eq!(
+            controller.request.requalification.state(candidate),
+            StreamPathQualification::Stale { retry_at: deadline }
+        );
+        assert_eq!(
+            controller
+                .request
+                .path_states
+                .get(candidate)
+                .expect("candidate path state")
+                .product_qualification_authority(),
+            ProductQualificationAuthority::Revoked
+        );
+    }
 }
 
 #[tokio::test]

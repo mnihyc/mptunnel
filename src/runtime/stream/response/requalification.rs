@@ -2,7 +2,10 @@
 
 use super::snapshot::server_bulk_output_snapshot;
 use super::{CarrierPathFlight, ResponseStreamBinding};
-use crate::model::requalification::{StreamPathQualification, StreamRequalificationProbe};
+use crate::model::product_qualification::ProductQualificationAuthority;
+use crate::model::requalification::{
+    StreamPathQualification, StreamRequalificationProbe, StreamRequalificationReceipt,
+};
 use crate::model::timing::reliable_path_stale_interval;
 use crate::model::work::CarrierWorkKind;
 use crate::mux::stream::ReliableSendStream;
@@ -212,7 +215,21 @@ impl ResponseStreamBinding {
         path_instance_id: crate::model::path::CarrierPathInstanceId,
         probe: StreamRequalificationProbe,
     ) -> bool {
-        let now = Instant::now();
+        self.acknowledge_response_requalification_probe_at(
+            key,
+            path_instance_id,
+            probe,
+            Instant::now(),
+        )
+    }
+
+    fn acknowledge_response_requalification_probe_at(
+        &self,
+        key: crate::model::path::CarrierPathKey,
+        path_instance_id: crate::model::path::CarrierPathInstanceId,
+        probe: StreamRequalificationProbe,
+        now: Instant,
+    ) -> bool {
         let mut outputs = self
             .outputs
             .lock()
@@ -226,22 +243,29 @@ impl ResponseStreamBinding {
         {
             return false;
         }
-        let changed = outputs.entries.iter_mut().any(|entry| {
-            if !matches!(
-                entry.qualification,
-                StreamPathQualification::Requalifying {
-                    probe: expected,
-                    ..
-                } if expected == probe
-            ) {
-                return false;
+        let mut changed = false;
+        let mut acknowledged = false;
+        for entry in &mut outputs.entries {
+            match entry.qualification.classify_probe_receipt(probe, now) {
+                StreamRequalificationReceipt::Unmatched => continue,
+                StreamRequalificationReceipt::Expired { retry_at } => {
+                    entry.qualification = StreamPathQualification::Stale { retry_at };
+                    changed = true;
+                }
+                StreamRequalificationReceipt::Timely => {
+                    if entry.product_qualification.authority()
+                        != ProductQualificationAuthority::Revoked
+                        || entry.product_qualification.reactivate_without_evidence() != Ok(true)
+                    {
+                        break;
+                    }
+                    entry.qualification = StreamPathQualification::Acquiring { started_at: now };
+                    changed = true;
+                    acknowledged = true;
+                }
             }
-            if entry.product_qualification.reactivate_without_evidence() != Ok(true) {
-                return false;
-            }
-            entry.qualification = StreamPathQualification::Acquiring { started_at: now };
-            true
-        });
+            break;
+        }
         if changed {
             self.response_model_generation
                 .fetch_add(1, Ordering::AcqRel);
@@ -250,7 +274,7 @@ impl ResponseStreamBinding {
         if changed {
             self.notify_update();
         }
-        changed
+        acknowledged
     }
 
     pub(in crate::runtime) fn response_requalification_deadline(&self) -> Option<Instant> {
@@ -449,6 +473,7 @@ mod tests {
     use crate::runtime::sender::ServerReinjectionOutputIdentity;
     use crate::runtime::stream::response::next_server_carrier_path_instance_id;
     use bytes::Bytes;
+    use std::time::Duration;
 
     fn key(underlay: UnderlayProtocol, path_id: u16) -> crate::model::path::CarrierPathKey {
         crate::model::path::CarrierPathKey {
@@ -760,18 +785,23 @@ mod tests {
             offset: 4096,
             payload_bytes: 1024,
         };
+        let deadline = Instant::now() + Duration::from_secs(1);
         let return_path_instance_id = {
             let mut outputs = binding.outputs.lock().expect("response outputs");
-            let candidate_entry = outputs
+            let candidate_index = outputs
                 .entries
-                .iter_mut()
-                .find(|entry| entry.key == candidate)
+                .iter()
+                .position(|entry| entry.key == candidate)
                 .expect("candidate output");
+            let candidate_entry = &mut outputs.entries[candidate_index];
             candidate_entry.qualification = StreamPathQualification::Requalifying {
                 probe,
-                retry_at: Instant::now(),
+                retry_at: deadline,
             };
             candidate_entry.product_qualification.revoke();
+            outputs.next_requalification_probe_id = Some(probe.id + 1);
+            outputs.next_requalification_candidate_index =
+                (candidate_index + 1) % outputs.entries.len();
             outputs
                 .entries
                 .iter()
@@ -781,10 +811,11 @@ mod tests {
         };
 
         assert!(
-            binding.acknowledge_response_requalification_probe(
+            binding.acknowledge_response_requalification_probe_at(
                 return_carrier,
                 return_path_instance_id,
                 probe,
+                deadline - Duration::from_nanos(1),
             ),
             "the exact pending probe, not its authenticated return carrier, identifies the forward attachment"
         );
@@ -802,12 +833,138 @@ mod tests {
             outputs
                 .entries
                 .iter()
+                .find(|entry| entry.key == candidate)
+                .expect("candidate output")
+                .product_qualification
+                .authority(),
+            ProductQualificationAuthority::Active
+        );
+        assert_eq!(
+            outputs
+                .entries
+                .iter()
                 .find(|entry| entry.key == return_carrier)
                 .expect("return carrier")
                 .qualification,
             StreamPathQualification::Qualified,
             "the ACK carrier is not the requalification target"
         );
+    }
+
+    #[test]
+    fn response_requalification_ack_at_or_after_deadline_is_stale_noop() {
+        for (index, lateness) in [Duration::ZERO, Duration::from_millis(1)]
+            .into_iter()
+            .enumerate()
+        {
+            let candidate = key(UnderlayProtocol::Tcp, 0);
+            let return_carrier = key(UnderlayProtocol::Udp, 1);
+            let (candidate_commands, _candidate_receivers) = reliable_path_command_channels(8);
+            let binding = ResponseStreamBinding::new(
+                SessionId(704 + index as u64),
+                candidate.underlay,
+                candidate.path_id,
+                candidate_commands,
+                TrafficClass::Throughput,
+            );
+            let (return_commands, _return_receivers) = reliable_path_command_channels(8);
+            binding.attach(
+                return_carrier.underlay,
+                return_carrier.path_id,
+                return_commands,
+                TrafficClass::Throughput,
+            );
+            let probe = StreamRequalificationProbe {
+                id: 10,
+                offset: 12_288,
+                payload_bytes: 1024,
+            };
+            let deadline = Instant::now();
+            let (return_path_instance_id, cursor_before, next_probe_id_before) = {
+                let mut outputs = binding.outputs.lock().expect("response outputs");
+                let candidate_index = outputs
+                    .entries
+                    .iter()
+                    .position(|entry| entry.key == candidate)
+                    .expect("candidate output");
+                let candidate_entry = &mut outputs.entries[candidate_index];
+                candidate_entry.qualification = StreamPathQualification::Requalifying {
+                    probe,
+                    retry_at: deadline,
+                };
+                candidate_entry.product_qualification.revoke();
+                outputs.next_requalification_probe_id = Some(probe.id + 1);
+                outputs.next_requalification_candidate_index =
+                    (candidate_index + 1) % outputs.entries.len();
+                let return_path_instance_id = outputs
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == return_carrier)
+                    .expect("authenticated sibling return carrier")
+                    .path_instance_id;
+                (
+                    return_path_instance_id,
+                    outputs.next_requalification_candidate_index,
+                    outputs.next_requalification_probe_id,
+                )
+            };
+            let generation_before = binding.response_model_generation.load(Ordering::Acquire);
+            let mut updates = binding.subscribe_updates();
+
+            assert!(!binding.acknowledge_response_requalification_probe_at(
+                return_carrier,
+                return_path_instance_id,
+                probe,
+                deadline + lateness,
+            ));
+            assert_eq!(
+                binding.response_model_generation.load(Ordering::Acquire),
+                generation_before + 1,
+                "expiry publishes the successor service wake"
+            );
+            assert!(updates.has_changed().expect("response expiry wake"));
+            updates.borrow_and_update();
+            let outputs = binding.outputs.lock().expect("response outputs");
+            let target = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == candidate)
+                .expect("candidate output");
+            assert_eq!(
+                target.qualification,
+                StreamPathQualification::Stale { retry_at: deadline }
+            );
+            assert_eq!(
+                target.product_qualification.authority(),
+                ProductQualificationAuthority::Revoked
+            );
+            assert_eq!(
+                outputs.next_requalification_candidate_index, cursor_before,
+                "receipt expiry cannot rewind the publication cursor"
+            );
+            assert_eq!(
+                outputs.next_requalification_probe_id, next_probe_id_before,
+                "receipt expiry cannot reuse or consume a probe ID"
+            );
+            drop(outputs);
+
+            let generation_after_expiry = binding.response_model_generation.load(Ordering::Acquire);
+            assert!(!binding.acknowledge_response_requalification_probe_at(
+                return_carrier,
+                return_path_instance_id,
+                probe,
+                deadline + lateness,
+            ));
+            assert_eq!(
+                binding.response_model_generation.load(Ordering::Acquire),
+                generation_after_expiry,
+                "an already-retired receipt is an idempotent stale no-op"
+            );
+            assert!(
+                !updates.has_changed().expect("no replay wake"),
+                "an already-retired receipt cannot publish another wake"
+            );
+        }
     }
 
     #[test]
@@ -827,21 +984,23 @@ mod tests {
             offset: 8192,
             payload_bytes: 512,
         };
+        let now = Instant::now();
         {
             let mut outputs = binding.outputs.lock().expect("response outputs");
             let candidate = outputs.entries.first_mut().expect("candidate output");
             candidate.qualification = StreamPathQualification::Requalifying {
                 probe,
-                retry_at: Instant::now(),
+                retry_at: now + Duration::from_secs(1),
             };
             candidate.product_qualification.revoke();
         }
 
         assert!(
-            !binding.acknowledge_response_requalification_probe(
+            !binding.acknowledge_response_requalification_probe_at(
                 unattached,
                 next_server_carrier_path_instance_id(),
                 probe,
+                now,
             ),
             "same-session authentication does not grant stream-attachment authority"
         );

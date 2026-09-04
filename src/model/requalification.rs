@@ -29,9 +29,36 @@ pub(crate) enum StreamPathQualification {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamRequalificationReceipt {
+    Unmatched,
+    Timely,
+    Expired { retry_at: Instant },
+}
+
 impl StreamPathQualification {
     pub(crate) fn stale_for_original_data(self) -> bool {
         matches!(self, Self::Stale { .. } | Self::Requalifying { .. })
+    }
+
+    /// Classifies one exact receipt against the immutable publication
+    /// deadline. The authority interval is half-open: equality is expiry.
+    pub(crate) fn classify_probe_receipt(
+        self,
+        probe: StreamRequalificationProbe,
+        now: Instant,
+    ) -> StreamRequalificationReceipt {
+        match self {
+            Self::Requalifying {
+                probe: expected,
+                retry_at,
+            } if expected == probe && now < retry_at => StreamRequalificationReceipt::Timely,
+            Self::Requalifying {
+                probe: expected,
+                retry_at,
+            } if expected == probe => StreamRequalificationReceipt::Expired { retry_at },
+            _ => StreamRequalificationReceipt::Unmatched,
+        }
     }
 
     #[cfg(test)]
@@ -202,17 +229,17 @@ impl<Candidate: Copy + Eq> StreamPathRequalification<Candidate> {
         now: Instant,
     ) -> bool {
         let state = self.state_mut(candidate);
-        if !matches!(
-            state,
-            StreamPathQualification::Requalifying {
-                probe: expected,
-                ..
-            } if *expected == probe
-        ) {
-            return false;
+        match state.classify_probe_receipt(probe, now) {
+            StreamRequalificationReceipt::Timely => {
+                *state = StreamPathQualification::Acquiring { started_at: now };
+                true
+            }
+            StreamRequalificationReceipt::Expired { retry_at } => {
+                *state = StreamPathQualification::Stale { retry_at };
+                false
+            }
+            StreamRequalificationReceipt::Unmatched => false,
         }
-        *state = StreamPathQualification::Acquiring { started_at: now };
-        true
     }
 
     pub(crate) fn cancel_unpublished_probe(
@@ -339,5 +366,51 @@ mod tests {
             .start_probe(2, 0, 64, retry, now + retry)
             .expect("next stale candidate");
         assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn exact_ack_at_frozen_deadline_expires_before_effect() {
+        let published_at = Instant::now();
+        let retry_after = Duration::from_secs(2);
+        let deadline = published_at + retry_after;
+        let mut state = StreamPathRequalification::<u8>::default();
+        assert!(state.mark_stale(1, published_at));
+        assert!(state.mark_stale(2, published_at));
+        let expired = state
+            .start_probe(1, 0, 64, retry_after, published_at)
+            .expect("first exact probe");
+
+        assert!(!state.acknowledge_probe(1, expired, deadline));
+        assert_eq!(
+            state.state(1),
+            StreamPathQualification::Stale { retry_at: deadline }
+        );
+        assert_eq!(
+            state.eligible_probe_candidate(deadline),
+            Some(2),
+            "expiry preserves the cursor advanced by publication"
+        );
+        let successor = state
+            .start_probe(2, 64, 64, retry_after, deadline)
+            .expect("the next due target can start immediately");
+        assert_ne!(successor.id, expired.id);
+    }
+
+    #[test]
+    fn exact_ack_after_frozen_deadline_expires_before_effect() {
+        let published_at = Instant::now();
+        let retry_after = Duration::from_secs(1);
+        let deadline = published_at + retry_after;
+        let mut state = StreamPathRequalification::<u8>::default();
+        assert!(state.mark_stale(7, published_at));
+        let probe = state
+            .start_probe(7, 4096, 1024, retry_after, published_at)
+            .expect("exact probe");
+
+        assert!(!state.acknowledge_probe(7, probe, deadline + Duration::from_millis(1)));
+        assert_eq!(
+            state.state(7),
+            StreamPathQualification::Stale { retry_at: deadline }
+        );
     }
 }

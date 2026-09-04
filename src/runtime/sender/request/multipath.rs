@@ -1612,10 +1612,22 @@ impl RequestMultipathController {
 
     pub(super) fn acknowledge_requalification_probe(
         &mut self,
-        _authenticated_return_instance: RelayPathInstance,
+        authenticated_return_instance: RelayPathInstance,
         probe: StreamRequalificationProbe,
     ) -> bool {
-        let now = Instant::now();
+        self.acknowledge_requalification_probe_at(
+            authenticated_return_instance,
+            probe,
+            Instant::now(),
+        )
+    }
+
+    fn acknowledge_requalification_probe_at(
+        &mut self,
+        _authenticated_return_instance: RelayPathInstance,
+        probe: StreamRequalificationProbe,
+        now: Instant,
+    ) -> bool {
         // The relay actor authenticates the carrying attachment. The exact
         // non-reused probe, not that return path, identifies the forward
         // attachment whose qualification transaction is pending.

@@ -621,6 +621,9 @@ impl CoherentNativeCarrierShape {
     }
 
     #[cfg(test)]
+    // This fixture names every field of the immutable native scheduling shape;
+    // grouping them would let tests silently inherit production defaults.
+    #[allow(clippy::too_many_arguments)]
     fn checked_for_test(
         activation: u64,
         controller: u64,

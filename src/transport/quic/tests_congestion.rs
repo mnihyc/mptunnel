@@ -1309,6 +1309,7 @@ fn fresh_network_path_keeps_owner_and_isolates_stale_callbacks() {
     assert_eq!(before_current_ack.path_epoch, old_epoch + 1);
     assert_eq!(before_current_ack.newly_acked_bytes, None);
     assert_eq!(before_current_ack.lost_bytes, 0);
+    assert_eq!(before_current_ack.bytes_in_flight, None);
 
     fresh.accumulate_ack_telemetry(base + Duration::from_secs(1), 1200, false);
     fresh.finish_ack_telemetry(
@@ -1564,6 +1565,7 @@ fn quic_first_ack_batch_excludes_path_rtt_and_app_limited_idle() {
         Some(Duration::from_millis(6)),
         "an app-limited end must reset both delivery clocks"
     );
+    assert_eq!(after_idle.bytes_in_flight, Some(0));
 }
 
 #[test]
@@ -1627,6 +1629,7 @@ fn quic_final_non_app_batch_publishes_before_delivery_clock_closes() {
 
     let closing = telemetry.snapshot();
     assert_eq!(closing.delivery_clock_epoch, 1);
+    assert!(closing.app_limited);
     assert_eq!(closing.timed_non_app_limited_acked_bytes, Some(200));
 
     controller.finish_ack_telemetry(base + Duration::from_millis(110), 0, true);

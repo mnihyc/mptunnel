@@ -286,6 +286,8 @@ struct QuicAckTelemetryTotals {
 pub(super) struct QuicCarrierTelemetrySnapshot {
     pub(super) path_epoch: u64,
     pub(super) delivery_clock_epoch: u64,
+    #[cfg(test)]
+    pub(super) bytes_in_flight: Option<u64>,
     pub(super) newly_acked_bytes: Option<u64>,
     pub(super) non_app_limited_acked_bytes: Option<u64>,
     pub(super) timed_non_app_limited_acked_bytes: Option<u64>,
@@ -295,6 +297,8 @@ pub(super) struct QuicCarrierTelemetrySnapshot {
     pub(super) timed_non_app_limited_delivery_sample_count: u64,
     pub(super) loss_ppm: Option<u32>,
     pub(super) lost_bytes: u64,
+    #[cfg(test)]
+    pub(super) app_limited: bool,
 }
 
 pub(super) struct InstrumentedController {
@@ -403,6 +407,17 @@ impl QuicCarrierTelemetry {
 }
 
 impl QuicPathTelemetry {
+    #[cfg(test)]
+    pub(super) fn bytes_in_flight(&self) -> Option<u64> {
+        self.bytes_in_flight_authoritative
+            .load(Ordering::Acquire)
+            .then(|| self.bytes_in_flight.load(Ordering::Relaxed))
+            .filter(|_| {
+                fence(Ordering::Acquire);
+                self.bytes_in_flight_authoritative.load(Ordering::Relaxed)
+            })
+    }
+
     fn ack_totals(&self) -> QuicAckTelemetryTotals {
         loop {
             let before = self.ack_snapshot_sequence.load(Ordering::Acquire);
@@ -469,6 +484,8 @@ impl QuicPathTelemetry {
         QuicCarrierTelemetrySnapshot {
             path_epoch: self.path_epoch,
             delivery_clock_epoch: totals.delivery_clock_epoch,
+            #[cfg(test)]
+            bytes_in_flight: self.bytes_in_flight(),
             newly_acked_bytes: (newly_acked_bytes > 0).then_some(newly_acked_bytes),
             non_app_limited_acked_bytes: (non_app_limited_acked_bytes > 0)
                 .then_some(non_app_limited_acked_bytes),
@@ -481,6 +498,8 @@ impl QuicPathTelemetry {
             timed_non_app_limited_delivery_sample_count,
             loss_ppm,
             lost_bytes,
+            #[cfg(test)]
+            app_limited: self.app_limited.load(Ordering::Relaxed),
         }
     }
     fn add_sent(&self, bytes: u64) {

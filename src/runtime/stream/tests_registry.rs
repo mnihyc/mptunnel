@@ -1003,7 +1003,10 @@ fn accepted_stream_keeps_its_authenticated_opening_carrier_across_reattachment()
                 stream_id,
                 target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
                 initial_demand: StreamDemandHint::Latency,
-                return_plan: Default::default(),
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: later,
                     commands: later_commands,
@@ -1308,7 +1311,10 @@ async fn terminal_session_fence_rejects_existing_stream_reattach_after_carrier_s
                 stream_id,
                 target: target.clone(),
                 initial_demand: StreamDemandHint::Latency,
-                return_plan: Default::default(),
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: live_sibling,
                     commands: live_commands,
@@ -1338,7 +1344,10 @@ async fn terminal_session_fence_rejects_existing_stream_reattach_after_carrier_s
                 stream_id,
                 target,
                 initial_demand: StreamDemandHint::Latency,
-                return_plan: Default::default(),
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: late_sibling,
                     commands: late_commands,
@@ -1686,7 +1695,10 @@ async fn repeated_same_key_reconnect_does_not_wait_for_predecessor_cleanup() {
                         stream_id,
                         target: target.clone(),
                         initial_demand: StreamDemandHint::Throughput,
-                        return_plan: Default::default(),
+                        return_plan: StreamReturnPlan {
+                            phase: StreamAttachmentPhase::Ordinary,
+                            ..Default::default()
+                        },
                         attachment: ServerStreamPathAttachment {
                             path_registration: current.clone(),
                             commands: old_commands,
@@ -1732,7 +1744,10 @@ async fn repeated_same_key_reconnect_does_not_wait_for_predecessor_cleanup() {
                     stream_id,
                     target: target.clone(),
                     initial_demand: StreamDemandHint::Throughput,
-                    return_plan: Default::default(),
+                    return_plan: StreamReturnPlan {
+                        phase: StreamAttachmentPhase::Ordinary,
+                        ..Default::default()
+                    },
                     attachment: ServerStreamPathAttachment {
                         path_registration: successor.clone(),
                         commands: successor_commands,
@@ -2185,7 +2200,10 @@ async fn new_stream_publishes_zero_admission_before_target_owner_runs() {
             stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
             initial_demand: StreamDemandHint::Latency,
-            return_plan: Default::default(),
+            return_plan: StreamReturnPlan {
+                phase: StreamAttachmentPhase::Ordinary,
+                ..Default::default()
+            },
             attachment: ServerStreamPathAttachment {
                 path_registration: alternate.clone(),
                 commands: alternate_commands,
@@ -2249,7 +2267,10 @@ async fn new_stream_publishes_zero_admission_before_target_owner_runs() {
             stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
             initial_demand: StreamDemandHint::Latency,
-            return_plan: Default::default(),
+            return_plan: StreamReturnPlan {
+                phase: StreamAttachmentPhase::Ordinary,
+                ..Default::default()
+            },
             attachment: ServerStreamPathAttachment {
                 path_registration: late.clone(),
                 commands: late_commands,
@@ -2576,7 +2597,10 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
                 stream_id,
                 target: target.clone(),
                 initial_demand: StreamDemandHint::Throughput,
-                return_plan: Default::default(),
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: registration.clone(),
                     commands: replacement_commands,
@@ -3201,7 +3225,10 @@ fn attachment_identity_is_immutable_and_cannot_overwrite_live_response_lane() {
                 stream_id,
                 target: target.clone(),
                 initial_demand: StreamDemandHint::Latency,
-                return_plan: Default::default(),
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: second_registration,
                     commands: second_commands,
@@ -3229,7 +3256,10 @@ fn attachment_identity_is_immutable_and_cannot_overwrite_live_response_lane() {
                 stream_id,
                 target,
                 initial_demand: StreamDemandHint::Throughput,
-                return_plan: Default::default(),
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: mismatched_registration,
                     commands: mismatched_commands,
@@ -3301,7 +3331,10 @@ async fn routed_request_data_updates_feedback_ingress_on_the_same_stream_event_s
                 stream_id,
                 target,
                 initial_demand: StreamDemandHint::Throughput,
-                return_plan: Default::default(),
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: udp.clone(),
                     commands: udp_commands,
@@ -3528,7 +3561,7 @@ async fn queued_ack_precedes_following_path_detach_at_stream_actor() {
 }
 
 #[tokio::test]
-async fn sibling_return_plan_final_withdraws_omitted_output_at_ordered_detach_boundary() {
+async fn sibling_return_plan_final_transfers_recovery_before_ordered_detach_completion() {
     let registry = Arc::new(ServerReliableStreamRegistry::new(4));
     let port = registry.path_port();
     let session_id = SessionId(915);
@@ -3645,9 +3678,13 @@ async fn sibling_return_plan_final_withdraws_omitted_output_at_ordered_detach_bo
         "FINAL must withdraw the omitted exact startup output immediately",
     );
     assert!(binding.has_output_incarnation(opening_key, opening_target.observation.incarnation,));
-    assert!(
-        binding.uncovered_failed_original_ranges().is_empty(),
-        "the omitted output's flight remains owned until its ordered boundary",
+    assert_eq!(
+        binding.uncovered_failed_original_ranges(),
+        vec![OffsetRange {
+            start: 0,
+            end: 58_400,
+        }],
+        "FINAL transfers recovery when the omitted output leaves current membership",
     );
 
     let sentinel = Frame::StreamMaxData {
@@ -3671,7 +3708,7 @@ async fn sibling_return_plan_final_withdraws_omitted_output_at_ordered_detach_bo
             start: 0,
             end: 58_400,
         }],
-        "consuming the omitted output's boundary exposes its exact recovery debt",
+        "ordered detach completion must not duplicate the already transferred recovery debt",
     );
 
     port.detach_path(&sibling, stream_id)

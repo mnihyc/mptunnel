@@ -1299,9 +1299,11 @@ impl FixedReliablePathOutput {
         snapshot.rate_scope = rate_scope;
         snapshot.carrier_delivery_rate_bps = carrier_diagnostic_rate_bps;
         snapshot.product_progress_rate_bps = product_rate_bps;
-        snapshot.has_durable_product_progress = product_rate_bps.is_some()
-            && model.product_progress_bytes
-                >= reliable_path_startup_sample_limit_bytes(self.mux_limits);
+        // Exact acknowledged Product volume and a usable numeric rate are
+        // separate facts. ACK batching may be too fragmented to form a rate
+        // sample, but it must not erase durable exact-path qualification.
+        snapshot.has_durable_product_progress = model.product_progress_bytes
+            >= reliable_path_startup_sample_limit_bytes(self.mux_limits);
         snapshot.pacing_rate_bps = delivery_rate_bps.max(1.0);
         snapshot.carrier_inflight_limit_bytes =
             native_window_epoch.map_or(0, |epoch| epoch.inflight_limit_bytes);

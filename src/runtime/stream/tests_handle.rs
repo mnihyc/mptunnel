@@ -1090,6 +1090,10 @@ fn fixed_native_window_and_rate_evidence_expire_without_rewriting_product_author
     assert_eq!(all_expired.delivery_rate_bps, 25_000_000.0);
     assert_eq!(all_expired.pacing_rate_bps, 25_000_000.0);
     assert_eq!(all_expired.confidence, portable_startup.confidence);
+    assert!(
+        all_expired.has_durable_product_progress,
+        "numeric rate expiry cannot erase exact historical Product progress"
+    );
     assert_eq!(
         all_expired.data_level_limit_bytes, product_limit,
         "expired C/R leave the configured Product envelope intact",
@@ -1138,7 +1142,10 @@ fn fixed_native_window_and_rate_evidence_expire_without_rewriting_product_author
     let reacquired_snapshot = fixed.send_path_snapshot_at(TrafficClass::Throughput, reacquired_at);
     assert_eq!(reacquired_snapshot.product_progress_rate_bps, None);
     assert_eq!(reacquired_snapshot.delivery_rate_bps, 25_000_000.0);
-    assert!(!reacquired_snapshot.has_durable_product_progress);
+    assert!(
+        reacquired_snapshot.has_durable_product_progress,
+        "a partial successor rate epoch cannot revoke historical Product qualification"
+    );
 }
 
 #[test]
@@ -1247,7 +1254,10 @@ fn fixed_product_rate_requires_the_exact_epoch_byte_boundary() {
     assert_eq!(partial.delivery_rate_bps, 25_000_000.0);
     assert_eq!(partial.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(partial.product_progress_rate_bps, None);
-    assert!(!partial.has_durable_product_progress);
+    assert!(
+        partial.has_durable_product_progress,
+        "the exact Product volume threshold is independent of numeric rate qualification"
+    );
 
     {
         let mut model = fixed.model.lock().expect("fixed output model lock");

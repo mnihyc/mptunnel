@@ -2539,7 +2539,7 @@ fn fixed_output_graduates_fragmented_product_acks_at_exact_sample_floor() {
     let mux_limits = MuxLimits::default();
     let (commands, _receivers) = reliable_path_command_channels(8);
     let output =
-        ReliablePathStreamOutput::fixed(UnderlayProtocol::Udp, PathId(4), commands, mux_limits);
+        ReliablePathStreamOutput::fixed(UnderlayProtocol::Tcp, PathId(4), commands, mux_limits);
     let sample_bytes =
         usize::try_from(reliable_path_startup_sample_limit_bytes(mux_limits)).unwrap();
     let frame = Frame::StreamData {

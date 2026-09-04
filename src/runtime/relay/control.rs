@@ -1200,6 +1200,18 @@ where
         );
         let source_path_snapshot = source_admission.selected_path;
         let has_source_output = source_path_snapshot.is_some();
+        // An authenticated QUIC attachment can briefly precede publication of
+        // its exact Native scheduling shape. Zero source admission is correct
+        // during that interval, but it must retain a generation-backed wake;
+        // otherwise a quiet Product socket has no event that can re-evaluate
+        // the newly published exact authority.
+        let source_admission_path_model_wait_active =
+            state.endpoint.local_open && !remotes.is_empty() && !has_source_output;
+        let source_admission_path_model_publication =
+            source_admission_path_model_wait_active.then(|| {
+                context
+                    .arm_path_model_publication(path_model_generation_before_recovery_observation)
+            });
         let adaptive_inflight = source_admission.window_bytes;
         let adaptive_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
             source_path_snapshot,
@@ -1695,6 +1707,16 @@ where
             _ = wait_for_optional_deadline(path_open_suppression_retry_at), if path_open_suppression_retry_at.is_some() => {
                 // Re-enter serialized demand/recovery decisions exactly when
                 // the failed attachment's path-derived retry bound expires.
+                continue;
+            }
+            _ = async move {
+                if let Some(publication) = source_admission_path_model_publication {
+                    publication.await;
+                }
+            }, if source_admission_path_model_wait_active => {
+                // Re-read the exact attachment and its Native authority. The
+                // wake grants no capacity and preserves fail-closed admission
+                // until the current instance publishes a usable shape.
                 continue;
             }
             _ = async move {

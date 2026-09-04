@@ -2,7 +2,7 @@ use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SharedSecret};
 use crate::outbound::OutboundConfig;
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
-use crate::protocol::{CloseReason, PathUsage, StreamDemandHint};
+use crate::protocol::{CloseReason, PathUsage, StreamAttachmentPhase, StreamDemandHint};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
     reliable_path_command_queue_for_payload, reliable_path_priority_headroom_frames,
@@ -2398,6 +2398,8 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
 async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
     let stream_id = StreamId(52);
     let mux_limits = MuxLimits::default();
+    let sample_floor =
+        usize::try_from(reliable_path_startup_sample_limit_bytes(mux_limits)).unwrap();
     let (commands, mut receivers) = reliable_path_command_channels(64);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -2421,12 +2423,12 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
     let mut sender = ServerResponseSenderService::new(SessionId(52), stream_id);
     sender.enqueue_data_for_lane(
-        Bytes::from(vec![0x5a; PATH_OPEN_SCORE_BYTES * 4]),
+        Bytes::from(vec![0x5a; sample_floor]),
         TrafficClass::Throughput,
     );
 
     let mut ack_end = 0_u64;
-    while ack_end < PATH_OPEN_SCORE_BYTES as u64 {
+    while ack_end < sample_floor as u64 {
         let dispatch = sender
             .dispatch_next(
                 &path_stream,
@@ -2448,8 +2450,8 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
         .expect("fixed output exposes learned path model");
     assert!(learned.product_progress_rate_bps.is_some());
     assert!(
-        !learned.has_durable_product_progress,
-        "one small ACK batch exposes a rate without graduating product authority"
+        learned.has_durable_product_progress,
+        "the exact Product sample floor graduates durable progress authority"
     );
     assert!(
         adaptive_reliable_relay_chunk_bytes(Some(learned), TrafficClass::Throughput, mux_limits)
@@ -2648,10 +2650,10 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
         stream_id,
         max_offset: mux_limits.max_stream_window_bytes,
         lane: TrafficClass::Throughput,
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
         output: ReliablePathStreamOutput::fixed(
-            UnderlayProtocol::Udp,
+            UnderlayProtocol::Tcp,
             PathId(0),
             commands,
             mux_limits,
@@ -3163,7 +3165,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     let stream_id = StreamId(49);
     let path_id = PathId(0);
     let old_path_registration =
-        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
+        registry.register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
     let (old_commands, old_receivers) = reliable_path_command_channels(8);
     let accepted = match registry
         .open_or_attach(ServerStreamOpenRequest {
@@ -3191,7 +3193,10 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     let binding = binding.clone();
     registry.record_local_path_metrics(
         server_carrier_identity(&old_path_registration),
-        server_test_bulk_path_metrics(path_id, 200_000_000),
+        PathMetrics {
+            underlay: UnderlayProtocol::Udp,
+            ..server_test_bulk_path_metrics(path_id, 200_000_000)
+        },
         false,
     );
     assert!(
@@ -3205,7 +3210,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     drop(old_path_registration);
 
     let new_path_registration =
-        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
+        registry.register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
     let (new_commands, _new_receivers) = reliable_path_command_channels(8);
     assert!(matches!(
         registry
@@ -3214,7 +3219,10 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
                 stream_id,
                 target: target.clone(),
                 initial_demand: StreamDemandHint::Throughput,
-                return_plan: Default::default(),
+                return_plan: crate::protocol::StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: new_path_registration.clone(),
                     commands: new_commands,
@@ -3227,7 +3235,10 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     ));
     registry.record_local_path_metrics(
         old_path_identity,
-        server_test_bulk_path_metrics(path_id, 300_000_000),
+        PathMetrics {
+            underlay: UnderlayProtocol::Udp,
+            ..server_test_bulk_path_metrics(path_id, 300_000_000)
+        },
         false,
     );
 
@@ -3290,11 +3301,11 @@ async fn server_response_sender_uses_bounded_cross_path_reordering_after_path_lo
         tcp_commands,
         TrafficClass::Throughput,
     );
-    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(4);
+    let (survivor_commands, mut survivor_receivers) = reliable_path_command_channels(4);
     binding.attach(
-        UnderlayProtocol::Udp,
+        UnderlayProtocol::Tcp,
         PathId(1),
-        udp_commands,
+        survivor_commands,
         TrafficClass::Throughput,
     );
     let lower_owner_key = CarrierPathKey {
@@ -3325,7 +3336,7 @@ async fn server_response_sender_uses_bounded_cross_path_reordering_after_path_lo
         stream_id,
         max_offset: 1024,
         lane: TrafficClass::Throughput,
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
         frames: frame_rx.into(),
@@ -3349,13 +3360,13 @@ async fn server_response_sender_uses_bounded_cross_path_reordering_after_path_lo
 
     assert_eq!(
         dispatched.selected_path.map(|key| key.underlay),
-        Some(UnderlayProtocol::Udp)
+        Some(UnderlayProtocol::Tcp)
     );
     assert_eq!(sender.bytes(), 0);
     assert_eq!(sender.data_bytes(), 0);
     assert_eq!(send_stream.next_offset(), 2 + b"later".len() as u64);
     assert!(matches!(
-        recv_emitted_tcp_path_command(&mut udp_receivers).await,
+        recv_emitted_tcp_path_command(&mut survivor_receivers).await,
         Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             offset: 2,
             payload,

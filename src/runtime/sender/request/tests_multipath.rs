@@ -2475,6 +2475,22 @@ async fn retained_tail_uses_only_a_measured_earlier_completion() {
 
     let frame = data_frame(stream_id, 0, 64 * 1024);
     let mut controller = RequestMultipathController::new(stream_id);
+    controller
+        .request
+        .path_states
+        .get_mut(tcp)
+        .set_product_rate_epoch(RequestProductRateEpoch::for_test(
+            slow_owner_sample.rate_bps(),
+            RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        ));
+    controller
+        .request
+        .path_states
+        .get_mut(udp)
+        .set_product_rate_epoch(RequestProductRateEpoch::for_test(
+            fast_alternate_sample.rate_bps(),
+            RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        ));
     controller.record_original_frame_for_test(tcp, &frame);
     context.record_relay_path_send(tcp, reliable_stream_frame_accounted_bytes(&frame));
 

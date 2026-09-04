@@ -326,6 +326,7 @@ fn fresh_product_point_rate_requires_epoch_and_lifetime_floors_for_completion_au
         assert!(!partial_lifetime.has_durable_product_progress);
 
         entry.original_data_acked_bytes = sample_floor;
+        qualify_product_assignment(&mut entry, mux_limits);
         let qualified = server_bulk_output_snapshot_at(
             &entry,
             0,
@@ -2139,7 +2140,15 @@ fn confidence_and_durable_progress_use_explicit_sample_thresholds() {
 
     entry.original_data_acked_bytes = sample_floor;
     let mature = server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, mux_limits);
-    assert!(mature.has_durable_product_progress);
+    assert!(
+        !mature.has_durable_product_progress,
+        "a numeric rate sample cannot substitute for exact Product qualification"
+    );
+    assert!(server_output_has_bulk_rate_evidence(&entry, mux_limits));
+
+    qualify_product_assignment(&mut entry, mux_limits);
+    let qualified = server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, mux_limits);
+    assert!(qualified.has_durable_product_progress);
     assert!(server_output_has_bulk_rate_evidence(&entry, mux_limits));
 }
 

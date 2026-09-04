@@ -2116,6 +2116,11 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     )
     .expect("ctx");
     probe_client_paths(&context, Duration::from_secs(2)).await;
+    let high_bandwidth_instance = context.tcp_sessions[1]
+        .connection_instance_id()
+        .expect("measured high-bandwidth carrier instance");
+    let mut high_bandwidth_attachment =
+        arm_client_relay_attachment_commits_for_test(high_bandwidth_instance, StreamId(0));
     let health_context = context.clone();
     let ingress_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -2188,18 +2193,14 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     release_target_prefix_tx
         .send(())
         .expect("release target response prefix");
-    tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, async {
-        loop {
-            let attached =
-                health_context.health().lock().expect("health lock").tcp[1].active_flows > 0;
-            if attached {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    let attached = tokio::time::timeout(
+        FULL_STACK_RESPONSE_TIMEOUT,
+        high_bandwidth_attachment.wait_committed(),
+    )
     .await
-    .expect("measured high-bandwidth path never became ready");
+    .expect("measured high-bandwidth path never committed its attachment");
+    assert_eq!(attached.path_instance_id, high_bandwidth_instance);
+    assert_eq!(attached.key.index, 1);
     release_target_tail_tx
         .send(())
         .expect("release target response tail");

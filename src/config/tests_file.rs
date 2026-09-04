@@ -2581,6 +2581,7 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
 
 #[test]
 fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
+    const COMMENTED_NODE_PERFORMANCE: &str = "# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 }";
     let load = |contents: &str| {
         let contents = contents
             .replace("REPLACE_ME", "0123456789abcdef0123456789abcdef")
@@ -2603,6 +2604,14 @@ fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
                 "quic_loss_compensation_percent = 12.3456",
                 1,
             )
+    };
+    let with_node_performance = |document: &str, performance: &str| {
+        assert_eq!(
+            document.matches(COMMENTED_NODE_PERFORMANCE).count(),
+            1,
+            "example has exactly one per-node performance placeholder"
+        );
+        document.replacen(COMMENTED_NODE_PERFORMANCE, performance, 1)
     };
 
     let client_document = inherited(include_str!("../../examples/client.toml"));
@@ -2631,10 +2640,9 @@ fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
             .is_none()
     );
 
-    let client_override = client_document.replacen(
-        "# Per-node overrides; path URI still wins for loss.\n# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 }",
+    let client_override = with_node_performance(
+        &client_document,
         "performance = { optional_reinjection_budget_percent = 23, quic_loss_compensation_percent = 7.5 }",
-        1,
     )
     .replace(
         "quic://server.example.com:7443",
@@ -2658,10 +2666,9 @@ fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
         32_500
     );
 
-    let client_zero = client_document.replacen(
-        "# Per-node overrides; path URI still wins for loss.\n# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 }",
+    let client_zero = with_node_performance(
+        &client_document,
         "performance = { optional_reinjection_budget_percent = 0, quic_loss_compensation_percent = 0 }",
-        1,
     );
     let client = load(&client_zero);
     let CommandConfig::Node(client) = client.command;
@@ -2691,10 +2698,9 @@ fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
         17
     );
 
-    let server_override = server_document.replacen(
-        "# Per-node overrides; path URI still wins for loss.\n# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 }",
+    let server_override = with_node_performance(
+        &server_document,
         "performance = { optional_reinjection_budget_percent = 29, quic_loss_compensation_percent = 8.125 }",
-        1,
     );
     let server = load(&server_override);
     let CommandConfig::Node(server) = server.command;

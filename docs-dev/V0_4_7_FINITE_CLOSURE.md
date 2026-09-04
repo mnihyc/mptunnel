@@ -279,7 +279,9 @@ transaction.
 | T03 | P4-score-component | What does the exact score of one already chosen action contain? Can that score alone allocate a sustained sequence? | Arithmetic/timing component REDs are GREEN. A static-winner trace, exact writer release lifetime, 131-slot queue geometry, and 64-MiB Product bound disprove sustained allocation with uniform `A=0`; TCP has no valid dynamic `C`. | Retain the typed single-action arithmetic and coherent timing components. Reject every request/response/L3 runtime-owner migration; make no production selection change. A later allocator must follow dynamic service discovery and own atomic physical-carrier/direction reservations. |
 | T04a | P4-accounting | Does current response scoring count one dequeued writer charge twice? | `server_bulk_output_snapshot_at` includes total `commands.pending_bytes`; `response_completion_snapshot` then adds its `writer_pending_bytes` subset again. Request does not. | One exact RED/GREEN removing only the duplicate projection; preserve queue admission, charge lifetime, native metrics, and request behavior. |
 | T04b | P4-admission | Can inferred ETA, loss, confidence, flow count, or BDP deny ordinary Product work when lifecycle-valid resource headroom exists? | Exact `completion_horizon`/`ecf_no_completion_gain` admission flip; structural `W/P/E` and configured resource limits held constant. | Make inference ranking-only where reachable, or prove a branch structural/unreachable. |
-| T05 | P1-authority | How is renewable repair prevented without a cumulative percentage admission cap? | Proven 434,790,952-byte renewal versus 108,847,604-byte old budget, plus current hard denial sites. | Prove and implement stable live-copy identity, or reject candidate; percentage remains cost/rank only. |
+| T05a | P1-identity | What stable identity bounds live Product recovery copies across port hops and carrier replacement? | Request has stable `RelayPathKey`; response has only reminted path/incarnation identity and `PATH_JOIN` carries no peer configured-member slot. | Add and prove an authenticated configured-member slot and exact range/slot live-copy identity while retaining the old percentage guard. |
+| T05b | P1-authority | Can a cumulative percentage change recovery eligibility or extent once structural copy identity exists? | Current wake, service, and enqueue branches change outcome with percentage while W/P/E/lifecycle/resource state is fixed. | Remove percentage from authority/extent; retain exact accounting and advisory cost/rank only. |
+| T05c | P1-requalification | Is non-delivering requalification probe sizing correctly bounded without percentage authority? | Probe identity is attachment/probe ID, not Product range/slot; current code preserves one minimum quantum after exhaustion. | Separate proof and no-change verdict or isolated correction; do not infer from T05b. |
 | T06 | P1-service | Which sequential, staggered, or concurrent action minimizes frontier time without assuming independent service? | Exact 1.064233-second sequential replay and coupled-service countermodel. | Choose only a symbolically safe policy and exact two-direction RED/GREEN, or reject it. |
 | T07 | P2-domain | Can latency/recovery work overtake native predecessor debt with current domains? | SEEN-6D1 TCP trace; any residual P1 QUIC lower bound. | No-change proof, one carrier-neutral domain design, or model-constrained candidate rejection. |
 | T08a | P3-requalify | Does fresh typed evidence restore 10-to-500 service without restart and preserve cold/warm startup? | User traces where restart immediately restored throughput; current portable TCP startup has no valid dynamic replacement. | One evidence-lifecycle/service-discovery correction or no-change/impossibility proof; no initial-rate cap and no `cwnd/SRTT` authority. |
@@ -564,10 +566,11 @@ cohort, never an isolated cell rerun.
    single-action component and record runtime migration as rejected; then
    close T04a duplicate current accounting and T04b admission separation
    independently.
-4. Close P1 as two sequential atomic transactions (T05 and T06): first replace
-   or reject the hard percentage authority semantics while preserving exact non-renewal;
-   then decide sequential versus concurrent distinct-domain service. Do not
-   implement the concurrency proposal before its symbolic safety proof.
+4. Close P1 in provenance order: T05a installs stable authenticated recovery
+   identity while the old guard remains; T05b then demotes percentage authority;
+   T05c separately adjudicates requalification. Only afterward may T06 decide
+   sequential versus concurrent distinct-domain service. Do not remove the old
+   guard or implement concurrency before its preceding symbolic proof is GREEN.
 5. Re-run the single affected recovery cell once as a smoke gate and then in
    three independent ordinary-build realizations. If paired signs conflict,
    add at most two valid whole-cell realizations. Five valid results are the

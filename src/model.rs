@@ -6,6 +6,7 @@
 
 pub(crate) mod ack_clock;
 pub(crate) mod admission;
+pub(crate) mod advisory_score;
 pub(crate) mod capacity;
 pub(crate) mod carrier_rate_authority;
 pub(crate) mod datagram;

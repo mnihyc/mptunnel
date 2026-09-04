@@ -16,6 +16,8 @@ const MILLIS_PER_SECOND: u64 = 1_000;
 const PORTABLE_STARTUP_PAYLOAD_BYTES: u64 = 14_600;
 const PORTABLE_STARTUP_RTT_MS: u64 = 333;
 const STREAM_DATA_PAYLOAD_FIELDS_BYTES: u64 = 8 + 8 + 4;
+const IP_PACKET_PAYLOAD_FIELDS_BYTES: u64 = 8 + 8 + 4;
+const DATAGRAM_DATA_PAYLOAD_FIELDS_BYTES: u64 = 8 + 8 + 4 + 4;
 
 /// Canonical pre-native Core overhead of one unsplit `STREAM_DATA` frame.
 ///
@@ -24,6 +26,14 @@ const STREAM_DATA_PAYLOAD_FIELDS_BYTES: u64 = 8 + 8 + 4;
 /// on every carrier family.
 pub(crate) const NORMALIZED_STREAM_DATA_OVERHEAD_BYTES: u64 =
     crate::protocol::codec::FRAME_HEADER_LEN as u64 + STREAM_DATA_PAYLOAD_FIELDS_BYTES;
+
+/// Canonical pre-native Core overhead of one unsplit `IP_PACKET` frame.
+pub(crate) const NORMALIZED_IP_PACKET_OVERHEAD_BYTES: u64 =
+    crate::protocol::codec::FRAME_HEADER_LEN as u64 + IP_PACKET_PAYLOAD_FIELDS_BYTES;
+
+/// Canonical pre-native Core overhead of one unsplit `DATAGRAM_DATA` frame.
+pub(crate) const NORMALIZED_DATAGRAM_DATA_OVERHEAD_BYTES: u64 =
+    crate::protocol::codec::FRAME_HEADER_LEN as u64 + DATAGRAM_DATA_PAYLOAD_FIELDS_BYTES;
 
 /// Positive finite service rate in normalized-MPP bits per second.
 ///
@@ -222,14 +232,31 @@ pub(crate) struct NormalizedMppWorkBytes(u64);
 impl NormalizedMppWorkBytes {
     /// Returns the encoded Core work of one unsplit `STREAM_DATA` action.
     pub(crate) fn checked_stream_data(payload_bytes: u64) -> Result<Self, ServiceRateModelError> {
-        payload_bytes
-            .checked_add(NORMALIZED_STREAM_DATA_OVERHEAD_BYTES)
-            .map(Self)
-            .ok_or(ServiceRateModelError::ArithmeticOverflow)
+        Self::checked_data_action(payload_bytes, NORMALIZED_STREAM_DATA_OVERHEAD_BYTES)
+    }
+
+    /// Returns the encoded Core work of one unsplit `IP_PACKET` action.
+    pub(crate) fn checked_ip_packet(payload_bytes: u64) -> Result<Self, ServiceRateModelError> {
+        Self::checked_data_action(payload_bytes, NORMALIZED_IP_PACKET_OVERHEAD_BYTES)
+    }
+
+    /// Returns the encoded Core work of one unsplit `DATAGRAM_DATA` action.
+    pub(crate) fn checked_datagram_data(payload_bytes: u64) -> Result<Self, ServiceRateModelError> {
+        Self::checked_data_action(payload_bytes, NORMALIZED_DATAGRAM_DATA_OVERHEAD_BYTES)
     }
 
     pub(crate) const fn get(self) -> u64 {
         self.0
+    }
+
+    fn checked_data_action(
+        payload_bytes: u64,
+        overhead_bytes: u64,
+    ) -> Result<Self, ServiceRateModelError> {
+        payload_bytes
+            .checked_add(overhead_bytes)
+            .map(Self)
+            .ok_or(ServiceRateModelError::ArithmeticOverflow)
     }
 }
 
@@ -401,6 +428,59 @@ mod tests {
     fn normalized_stream_data_work_rejects_overflow() {
         assert_eq!(
             NormalizedMppWorkBytes::checked_stream_data(u64::MAX),
+            Err(ServiceRateModelError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn normalized_ip_and_datagram_work_match_unsplit_core_codec() {
+        use crate::protocol::{DatagramFlowId, DatagramId, IpPacketId, IpTunnelId};
+
+        for payload_bytes in [1_usize, 14_600] {
+            let payload = Bytes::from(vec![0; payload_bytes]);
+            let ip = Frame::IpPacket {
+                tunnel_id: IpTunnelId(19),
+                packet_id: IpPacketId(29),
+                payload: payload.clone(),
+            };
+            let datagram = Frame::DatagramData {
+                flow_id: DatagramFlowId(31),
+                datagram_id: DatagramId(37),
+                ttl_ms: 1_000,
+                payload,
+            };
+
+            let encoded_ip = encode_frame(&ip, CodecLimits::default()).unwrap();
+            let encoded_datagram = encode_frame(&datagram, CodecLimits::default()).unwrap();
+            assert_eq!(
+                NormalizedMppWorkBytes::checked_ip_packet(payload_bytes as u64)
+                    .unwrap()
+                    .get(),
+                encoded_ip.len() as u64,
+            );
+            assert_eq!(encoded_ip.len(), payload_bytes + 30);
+            assert_eq!(
+                NormalizedMppWorkBytes::checked_datagram_data(payload_bytes as u64)
+                    .unwrap()
+                    .get(),
+                encoded_datagram.len() as u64,
+            );
+            assert_eq!(encoded_datagram.len(), payload_bytes + 34);
+        }
+    }
+
+    #[test]
+    fn every_exact_data_work_constructor_rejects_overflow() {
+        assert_eq!(
+            NormalizedMppWorkBytes::checked_stream_data(u64::MAX),
+            Err(ServiceRateModelError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            NormalizedMppWorkBytes::checked_ip_packet(u64::MAX),
+            Err(ServiceRateModelError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            NormalizedMppWorkBytes::checked_datagram_data(u64::MAX),
             Err(ServiceRateModelError::ArithmeticOverflow)
         );
     }

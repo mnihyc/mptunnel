@@ -2999,7 +2999,7 @@ async fn response_binding_duplicate_live_path_rejects_fresh_output() {
     let (first_commands, mut first_receivers) = reliable_path_command_channels(4);
     let binding = ResponseStreamBinding::new(
         session_id,
-        UnderlayProtocol::Udp,
+        UnderlayProtocol::Tcp,
         PathId(0),
         first_commands,
         TrafficClass::Throughput,
@@ -3007,7 +3007,7 @@ async fn response_binding_duplicate_live_path_rejects_fresh_output() {
     let (second_commands, mut second_receivers) = reliable_path_command_channels(4);
     assert_eq!(
         binding.attach(
-            UnderlayProtocol::Udp,
+            UnderlayProtocol::Tcp,
             PathId(0),
             second_commands,
             TrafficClass::Throughput,
@@ -3020,7 +3020,7 @@ async fn response_binding_duplicate_live_path_rejects_fresh_output() {
         stream_id,
         max_offset: 1024,
         lane: TrafficClass::Throughput,
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
         frames: frame_rx.into(),
@@ -3067,7 +3067,7 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
     let (first_commands, first_receivers) = reliable_path_command_channels(4);
     let binding = ResponseStreamBinding::new(
         session_id,
-        UnderlayProtocol::Udp,
+        UnderlayProtocol::Tcp,
         PathId(0),
         first_commands,
         TrafficClass::Throughput,
@@ -3077,7 +3077,7 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
     let (second_commands, mut second_receivers) = reliable_path_command_channels(4);
     assert_eq!(
         binding.attach(
-            UnderlayProtocol::Udp,
+            UnderlayProtocol::Tcp,
             PathId(0),
             second_commands,
             TrafficClass::Throughput,
@@ -3089,7 +3089,7 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
         stream_id,
         max_offset: 1024,
         lane: TrafficClass::Throughput,
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
         frames: frame_rx.into(),

@@ -25,6 +25,10 @@ Wire version 10 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
+In formulas over nonnegative quantities,
+`clamp(x, low, high) = min(max(x, low), high)` and
+`saturating_sub(x, y) = max(x - y, 0)`.
+
 Product routing, DNS policy, outbound selection, balancing between separate
 MPP sessions, VPN device integration, configuration, management APIs,
 operator presentation, packaging, and platform adapters are outside this
@@ -48,8 +52,6 @@ MPP owns the data level above those transports:
 - ordered delivery, deduplication, MPP Data ACK ranges, and shared receive
   credit;
 - stable identity for original transmissions and reinjected copies;
-- exact carrier-work ownership and peer-processing receipts used only for
-  advisory carrier service pressure;
 - selection among eligible carriers;
 - bounded cross-carrier reinjection and failover; and
 - application demand used as a mutable scheduling objective.
@@ -121,50 +123,8 @@ third transport protocol.
 
 **Product ownership or Product flight**
 : One exact original or reinjected MPP range retained until MPP Data ACK or its
-  exact Product-terminal rule. It is logical delivery/recovery state and is
-  independent of the command's carrier-work token.
-
-**Carrier-work token**
-: Exact local ownership of one normalized reliable command on one physical
-  carrier direction. It moves from provisional reservation through the MPP
-  queue and native ownership until exact peer-processing receipt or terminal
-  cleanup. It is not Product ownership, native send credit, or a packet ACK.
-
-**Carrier-service receipt**
-: An authenticated cumulative `writer_epoch` frontier proving that the peer
-  completely processed exact commands on one ordered writer. It retires only
-  their carrier-work tokens. It neither acknowledges a Product offset nor
-  grants receive credit, qualification, pacing, or native transport authority.
-
-**Carrier observation**
-: Optional encrypted synthetic payload carried and discarded on one exact
-  physical carrier direction to establish achieved-service evidence without
-  creating Product ownership or delivery state. It is admitted only when the
-  exact ordinary decision proves that rate evidence is the causal blocker.
-
-**Observation channel**
-: The same-fate ordered bidirectional carrier-local channel that carries one
-  direction's observation grant and DATA and the reverse cumulative observation
-  ACK. Its incarnation has an exact non-reused endpoint-local epoch and is
-  independent of a Product stream's lifetime. The epoch is the TCP socket or
-  QUIC request-stream incarnation fence; it is not an additional wire field.
-
-**Scheduling-rate authority mode**
-: The exclusive evidence contract selected by one persistent reducer for an
-  exact carrier incarnation and original-sender direction. `NativeMode` admits
-  only the named local controller's current gain-free operational bandwidth
-  state; `ReceiptMode` admits only achieved-service lower bounds derived from
-  exact peer-processing receipts.
-
-**Ordered-writer epoch**
-: A checked nonzero identity, strictly monotonically allocated by its origin
-  and never reused within an authenticated session and original-sender
-  direction, for one cumulatively ordered service frontier.
-  One TCP carrier direction owns one epoch; every independently ordered QUIC
-  HTTP/3 request-stream direction that can carry a generic service-bearing kind
-  `8`, `31`, `33`, or `42` owns a distinct epoch while all of them share
-  physical-carrier capacity. Carrier observation instead owns its separate
-  channel processed-work coordinate.
+  exact Product-terminal rule. It is logical delivery/recovery state, not
+  native transport flight or queue ownership.
 
 **Original transmission**
 : The first assignment of an MPP stream byte range to a carrier.
@@ -239,10 +199,9 @@ The ownership boundary is:
 application
     MPP reliable stream
         per-direction offsets, Data ACK, shared credit, bounded reinjection
-            exact carrier-work ledger and advisory service-pressure rank
-                regular-before-backup carrier selection
-                    TCP controller | QUIC controller
-                        network
+            advisory action rank and regular-before-backup selection
+                TCP controller | QUIC controller
+                    network
 
 application datagram | IP packet service
     bounded datagram/packet admission and carrier selection
@@ -261,16 +220,10 @@ serialized or inferred from traffic.
 ### 4.1 MPP authority
 
 MPP owns stream, datagram, and IP-tunnel identity, offset assignment, Data ACK
-processing, shared receive credit, carrier selection, bounded reinjection,
-exact data-level deduplication, and exact carrier-work token lifecycle above
-the native application interface. Carrier-work accounting supplies only an
-advisory rank; it does not replace native transport authority.
-
-Product and carrier-work ledgers are disjoint. MPP Data ACK may end Product
-ownership without ending the original command's carrier work; a
-carrier-service receipt may end carrier work without acknowledging or
-delivering Product. Neither transition implies the other, and neither ledger
-may be reconstructed from the other's counters.
+processing, shared receive credit, carrier selection, bounded reinjection, and
+exact data-level deduplication. Product ownership, bounded MPP queues, native
+transport backpressure, and configured resource limits remain distinct
+authorities. An advisory action rank does not replace any of them.
 
 A carrier abstraction MUST expose observations and bounded enqueue capacity.
 MPP MAY rank eligible carriers from those observations, but it MUST NOT:
@@ -314,15 +267,15 @@ connection migration, MPP MUST preserve the carrier instance, its attachments,
 and MPP state. QUIC alone decides whether to retain or reset native
 path-dependent state in accordance with RFC 9000 and RFC 9002.
 
-A locator-only migration preserves ordered-writer epochs, exact work tokens,
-and aggregate carrier `Q/Z`. If QUIC installs or restores a different active
-native `PathData`/controller activation within the same connection, the switch
-is fenced at its actual activation boundary under Section 10.2. NativeMode
-installs only the new activation's coherent controller state; ReceiptMode
-instead resets its path-scoped terms, acquisitions, and timing evidence under
-the existing mode rules. Already-owned writer tokens remain. A replacement
-connection transfers neither tokens nor evidence. A locator change that
-retains the exact active `PathData`/controller activation clears none of them.
+A locator-only migration preserves Product state, attachments, bounded MPP
+queues, and the current native-controller activation when QUIC reports that
+the same activation remains active. If QUIC installs or restores a different
+active `PathData` or controller within the same connection, the activation is
+fenced under Section 10.2 and only that activation's coherent native state may
+be used. A replacement connection inherits neither native evidence, the old
+carrier's MPP queue, nor an old exact-output flight. Logical stream-owned
+Product ranges remain retained for exact Data ACK and recovery; they can use a
+replacement only after the authenticated attachment procedure below.
 
 When a QUIC implementation establishes a new connection rather than migrating
 an existing one, MPP MUST create a new carrier instance. A new TCP connection
@@ -430,6 +383,10 @@ MUST NOT retry the default profile on the same or a new carrier attempt.
 All MPP authentication tags use HMAC-SHA256 keyed by the named application
 credential. Integers use network byte order. Every tag is the complete
 32-byte HMAC output.
+
+In authentication and key-derivation transcripts, `||` means byte
+concatenation, a quoted literal contributes its exact ASCII bytes without a
+length prefix or terminator, and `empty` is the zero-length byte string.
 
 QUIC carrier admission sends the following MPP frames, in order, on the first
 selector-accepted HTTP/3 request stream:
@@ -576,7 +533,7 @@ handshake payload is:
 0       transport-profile version   u8; 1
 1..9    issued_at_unix_secs          u64
 9..25   nonce                        16 random bytes
-25..N   padding                      8 through 63 random bytes
+25..end padding                      8 through 63 random bytes
 ```
 
 The responder handshake payload contains only 8 through 63 random padding
@@ -591,6 +548,10 @@ of that Noise message. For direction label `L`, the length mask is the first
 ```text
 HMAC-SHA256(K(L, empty), L || ephemeral_key)
 ```
+
+The first two digest octets are interpreted as one network-order `u16`. The
+encoded length is the network-order `remaining_length XOR mask`; the receiver
+applies the same XOR before validating and reading the remainder.
 
 `L` is `mptunnel noise client handshake length v1` for the initiator flight
 and `mptunnel noise server handshake length v1` for the responder flight. The
@@ -642,6 +603,11 @@ HMAC-SHA256(direction_length_key,
             "mptunnel noise record header v1" || n:u64)
 ```
 
+The first two digest octets are again interpreted as one network-order `u16`.
+The encoded record field is the network-order
+`ciphertext_length XOR mask`; the receiver applies the same XOR before length
+validation.
+
 Plaintext is split into records of at most 65519 bytes. Empty records are
 invalid; ciphertext length is 17 through 65535 bytes. Nonces begin at zero and
 increase without reset. Before processing each nonzero nonce divisible by
@@ -689,6 +655,20 @@ extend an outstanding `PONG` deadline. A late wake coalesces missed timer work
 into at most one probe and never emits a catch-up burst. Thus the maximum
 last-activity-to-failure bound remains `I` plus the configured heartbeat
 timeout.
+
+A receiver of `PING(nonce)` returns exactly `PONG(nonce)` in the opposite
+direction on the same bidirectional reliable carrier operation; a PONG grants
+no Product, flow-control, delivery, or rate evidence. On a TCP carrier the
+client may have at most one heartbeat PING outstanding, the server MUST NOT
+originate an idle heartbeat, and only a PONG carrying that outstanding nonce
+completes the heartbeat. An unsolicited or mismatched TCP heartbeat PONG is a
+carrier protocol violation; failure to receive the matching PONG before expiry
+of the local configured heartbeat timeout terminally fails that exact TCP
+carrier. A QUIC request operation may
+instead use one PING/PONG exchange as a bounded operation-local reachability
+probe. Its local deadline, mismatch, or timeout fails only that probe unless
+native QUIC independently declares the connection terminal.
+
 `PATH_DRAIN` and `PATH_CLOSE` are valid only on TCP carriers. The TCP carrier
 client alone sends `PATH_DRAIN`; the TCP carrier server sends `PATH_CLOSE` only
 as the response that completes that drain. Their `path_id` MUST match the TCP
@@ -708,16 +688,13 @@ completes only after every stream actor has applied its exact detach.
 The server sends `PATH_CLOSE` only after every earlier frame from the client
 has been applied and the exact carrier has no attachment, datagram binding,
 queued or retained frame, original or reinjected Product flight, pending Data
-ACK, path proof, capacity work, unreceipted local carrier-work token, or dirty
-or unpublished processed service frontier in either direction. All cumulative
-service entries and other server frames that complete preceding carrier-owned
-work MUST precede
-`PATH_CLOSE` in the TCP byte stream. The client treats receipt of
+ACK, path proof, or capacity work. All server frames that complete preceding
+carrier-owned protocol work MUST precede `PATH_CLOSE` in the TCP byte stream.
+The client treats receipt of
 `PATH_CLOSE`, not its own write completion or local emptiness, as the aggregate
 retirement acknowledgment. It removes the carrier only after applying every
 preceding server frame and reaching the same local zero-work condition.
 Native failure before that boundary uses ordinary retained-state recovery.
-Local writer completion is not zero carrier work.
 
 The client starts a local absolute graceful-retirement ceiling when it closes
 new carrier admission and begins local drain; the server starts its own when
@@ -816,19 +793,10 @@ session authorization, path authorization, or replay admission. All Section
 
 The first accepted request is the carrier control stream after it completes
 the Section 5 admission flight. Later accepted request streams carry reliable
-stream attachments, datagram flows, the one carrier-observation channel, or a
-bounded one-shot `PING`/`PONG` path proof and do not repeat connection
-admission. The first MPP frame, together with the authenticated physical
-carrier binding, unambiguously selects that operation; an observation request
-starts with `CARRIER_OBSERVE_MAX_WORK` as specified in Sections 12.2 and 15.1.
-
-Both HTTP/3 DATA send halves of the carrier control request stream remain open
-for the complete active carrier lifetime. They are the same-fate reliable
-service-receipt channel defined in Section 8.3. An endpoint MUST NOT issue a
-clean FIN or reset on either half while the carrier remains active. Local or
-remote terminal closure of either half is the exact carrier-terminal event and
-retires all writer scopes on that QUIC carrier; it is not an operation-local
-writer drain.
+stream attachments, datagram flows, or a bounded one-shot `PING`/`PONG` path
+proof and do not repeat connection admission. The first MPP frame, together
+with the authenticated physical carrier binding, unambiguously selects that
+operation.
 
 The server MUST NOT send a successful response before application
 authentication, `PATH_JOIN`, replay admission, and sequence-zero
@@ -853,6 +821,23 @@ same maximum-delay and `[0.8I, I]` renewal semantics as the TCP heartbeat; an
 authenticated packet or send defers the current delay, a fired keep-alive draws
 the next delay, and a late wake emits no catch-up sequence. The server relies on
 the client's PING and its transport ACK to keep both idle timers live.
+
+The carrier control request is a long-lived peer-diagnostics operation; its
+lifetime is not itself the physical carrier lifetime. A clean receive FIN
+exactly at an MPP-frame boundary ends only that carrier's peer-diagnostics
+exchange. The receiver MUST preserve the QUIC connection, exact carrier
+registration, session, sibling request streams, and Product streams or datagram
+associations. Local withdrawal of the peer-diagnostics owner has the same
+diagnostics-only scope.
+
+EOF inside a record-length prefix or frame is truncation. A reset or stop,
+HTTP/3 stream error, malformed or unexpected control frame, or any other
+nonclean terminal failure of the control request is terminal to that exact
+QUIC carrier: the endpoint closes and retires the connection while retaining
+session and Product state under ordinary carrier recovery. An operation-local
+EOF, reset, refusal, finish, or cancellation on any later HTTP/3 request stream
+remains terminal only to that operation and MUST NOT retire the physical QUIC
+carrier. Only authenticated `SESSION_CLOSE` has session scope.
 `PING` and `PONG` on a QUIC request stream may prove MPP response-direction
 reachability, but they do not govern QUIC connection liveness or retirement.
 `PATH_DRAIN`, `PATH_CLOSE`, and all `PATH_CAPACITY_*` frames are invalid on a
@@ -1007,9 +992,10 @@ bounded by the path-derived complete establishment-transaction clock retained
 from the exact prior owner, or by the ordinary startup timing model before a
 first owner exists; it does not shorten QUIC idle timeout, keep-alive, loss
 recovery, or congestion control. Successful reconciliation publishes a fresh
-carrier-instance identity and fresh evidence. An operation-local HTTP/3
-request reset, finish, refusal, or cancellation does not vacate the live
-physical slot and does not wake carrier replacement.
+carrier-instance identity and fresh evidence. An ordinary post-control HTTP/3
+operation's reset, finish, refusal, or cancellation does not vacate the live
+physical slot and does not wake carrier replacement. Section 6.2 separately
+defines a nonclean carrier-control failure as exact-carrier terminal.
 
 On TCP, the carrier client requests graceful retirement with
 `PATH_DRAIN(path_id)` and the carrier server completes it with
@@ -1030,10 +1016,14 @@ carrier count. A future revision may remove `MIN` or restore elastic behavior
 through a proven algorithm; this revision MUST NOT use it for establishment,
 scheduling, restoration, or retirement.
 
-The maximum is the healthy pool target and the hard bound on simultaneously
-establishing, ready, replacing, and draining physical carriers owned by the
-group. While the group and session are enabled, one client session owner
-reconciles durable member ordinals `0` through `MAX - 1` toward that target.
+The maximum is the healthy pool target and the hard bound on current member
+ordinals owned by the group. Outside one planned replacement transaction, at
+most `MAX` physical carriers may be establishing, ready, or draining. During
+one planned replacement transaction, the sole group-scoped transient
+successor permits at most `MAX + 1` physical carriers; it does not increase
+the schedulable member target. While the group and session are enabled, one
+client session owner reconciles durable member ordinals `0` through `MAX - 1`
+toward that target.
 Missing members MAY establish concurrently. Every connection performs a fresh
 TLS handshake, TCP admission prelude, `PATH_JOIN`, sequence-zero
 `PATH_STATUS`, and readiness exchange. No performance comparison or
@@ -1129,6 +1119,7 @@ Idle ready members are event-driven and retain only their bounded socket,
 actor, TLS, heartbeat, and path state. An implementation MUST NOT create an
 unbounded number of carriers or use a fixed Mbps, percentage, source address,
 interface identity, or laboratory threshold to size the pool.
+
 ### 7.3 Directional usage
 
 `PATH_STATUS` contains:
@@ -1165,10 +1156,58 @@ demand are independent facts.
 
 ### 8.1 Open and attachment
 
-`OPEN_STREAM(stream_id, target, demand)` has no carrier role. The first
-accepted open creates the stream. A later open with the same `StreamId` adds an
-attachment only when the target and initial demand hint exactly match the
-original values.
+`OPEN_STREAM(stream_id, target, demand, return_plan)` has no permanent carrier
+role. The first accepted open creates the stream. A later open with the same
+`StreamId` adds an attachment only when the target and initial demand hint
+exactly match the original values and its return-plan fields are valid for the
+retained one-shot response-startup transaction.
+
+The return plan freezes one requester-selected usage tier and a finite set of
+candidate ordinals for the first response prefix. It owns no Product credit,
+rate authority, carrier health, or later ordinary scheduling preference. Its
+wire fields are:
+
+```text
+trigger_bytes       h:u64
+candidate_total     n:u8
+candidate_tier      AVAILABLE(0) | BACKUP(1)
+phase               STARTUP(0) | ORDINARY(1)
+candidate_ordinal   o:u8
+```
+
+Every plan has `n >= 1` and `o < n`. A canonical singleton has `n = 1`,
+`h = 0`, `phase = STARTUP`, `o = 0`, and is ready immediately without a finalization frame. A
+multipath startup plan has `n > 1` and `0 < h <= 58,400` bytes. Its initial
+attachment and every candidate enrolled in that frozen round use `STARTUP`, a
+distinct ordinal, and the same `(h, n, candidate_tier)` signature. An
+`ORDINARY` attachment uses canonical ordinal zero, is not enrolled in the
+round, and cannot settle or alter it, but carries the retained signature while
+the stream exists.
+
+The responder stores a canonical singleton as `Singleton`. It stores a
+multipath plan as `Unresolved`, retaining `h`, `n`, the tier, and each enrolled
+ordinal's exact output association. The first valid finalization changes that
+state to `Finalized` with one immutable retained-ordinal set.
+
+Until a multipath plan is finalized, the responder admits fresh unique
+response offsets only below `h`. Data ACK does not refill this one-shot prefix.
+When the requester observes a contiguous response frontier at least `h`, it
+opens every still-unresolved frozen candidate at most once. After every
+candidate is accepted or has failed, it serializes the ordinals that are both
+accepted and still attached in strictly increasing order and publishes
+`STREAM_RETURN_PLAN_FINAL` on the current logical stream attachments.
+
+The responder accepts the first finalization only when every retained ordinal
+is in range, strictly increasing, and enrolled by an exact accepted startup
+attachment. In one transaction it withdraws every omitted enrolled output from
+new Product placement before removing the prefix ceiling. An equal repeated
+finalization is idempotent; a different repetition or a new `STARTUP`
+attachment after finalization is a protocol violation. The requester retains
+the finalization publication until the contiguous response frontier exceeds
+`h`, or until an exact terminal declaration proves either `final_offset > h`
+or contiguous receipt through that final offset. These rules preserve already
+published Product and ordinary attachment-detach ordering; they do not infer
+which candidate delivered duplicated bytes.
 
 The session initiator allocates nonzero `StreamId` values with checked strict
 monotonicity and never reuses one during the authenticated session. Exhaustion
@@ -1225,8 +1264,8 @@ principal, and opening ingress remain immutable. A matching repeated
 `OPEN_STREAM` while establishment is pending adds an attachment and MUST NOT
 create a second target connection. When target establishment succeeds, the
 receiver advances the retained grant from zero to the configured shared window
-`W` and publishes it to
-every live attachment. An attachment added after establishment receives its
+`W`, defined in Section 15.1, and publishes it to every live attachment. An
+attachment added after establishment receives its
 credit-neutral zero admission followed by the retained nonzero grant. A target
 failure terminates the logical stream once across all attachments; an explicit
 silent-drop policy MAY instead retire it without a refusal frame.
@@ -1277,9 +1316,9 @@ envelope.
 
 ### 8.3 MPP Data ACK
 
-`STREAM_ACK(stream_id, complete, ranges, services)` carries Product ranges and
-carrier-service frontiers. Product ranges are half-open in one directional MPP
-stream offset space. Every listed range is non-empty; either list MAY be empty.
+`STREAM_ACK(stream_id, complete, ranges)` carries a bounded list of
+half-open Product ranges in one directional MPP stream offset space. Every
+listed range is non-empty; the list itself MAY be empty.
 
 When `complete` is true, the list is an authoritative snapshot of the
 receiver's retained received ranges and can establish an omitted gap. When
@@ -1295,188 +1334,46 @@ extent. An incomplete update can fill an already authoritative gap but cannot
 extend its horizon.
 
 That horizon limits negative range inference; it does not erase the sender's
-positive local fact that current-epoch, evidence-eligible OriginalData remains
-retained and unacknowledged on an exact attachment incarnation. Retained
-Product ownership above the horizon remains authoritative only for exact
-Product ACK release and Product recovery. It neither creates nor retains
-carrier/native work, which follows the independent writer-token/frontier
-lifecycle, and MUST NOT by itself arm placement-persistence withdrawal, extend
-the Data ACK horizon, establish a Data ACK gap, or declare native transport
-loss.
+positive local fact that current-epoch OriginalData remains retained and
+unacknowledged on an exact attachment incarnation. Retained Product ownership
+above the horizon remains authoritative for exact Product ACK release and
+Product recovery. It MUST NOT by itself extend the Data ACK horizon, establish
+a Data ACK gap, or declare native transport loss.
 
-Before any mutation, the endpoint MUST structurally validate the complete
-frame, immutably look up and classify the Product stream direction, semantically
-validate every Product range against that exact state when it is live, and
-semantically validate every session-, direction-, and writer-scoped service
-entry. Only after all applicable validation succeeds does one Data ACK
-transaction mutate service first and Product second:
+Before mutation, the endpoint MUST structurally validate the complete frame and
+immutably look up the Product stream direction. A structurally valid ACK for an
+absent or terminal Product stream is a stale no-op. It MUST NOT create, reopen,
+or mutate Product state. For a live Product stream, the endpoint freezes the
+exact current send extent and validates and normalizes every range against that
+extent before any mutation. Data ACK processing is one transaction:
 
-1. validate and normalize Product ranges and service frontiers;
-2. apply every advancing exact carrier-service frontier before Product release;
-3. compute the exact newly acknowledged unique Product coverage without yet
-   releasing its owners or flight;
-4. for every original owner not proved by a previously applied frontier or
-   this service transaction, classify its exact token before releasing Product:
-   cancel and refund a still-queued command when cumulative Product coverage
-   now covers its complete Product range, retain a partly unacknowledged queued
-   command without a guard, or publish the Section 15.1 ambiguous-release guard
-   on an already-native-owned token and its output-admission epoch;
-5. release each newly acknowledged unique byte and every overlapping original
-   or reinjected Product flight exactly once;
-6. update local delivery and admission evidence without changing receive
+1. validate and normalize the ranges;
+2. compute each newly acknowledged unique Product byte once;
+3. release every original or reinjected Product flight overlapping those bytes;
+4. update local delivery and admission evidence without changing receive
    credit; and
-7. publish carrier-specific progress only when attribution is unambiguous.
+5. publish carrier-specific progress only when attribution is unambiguous.
 
-If the immutable lookup classified the named Product stream direction as
-absent or terminal, its structurally valid Product ranges and `complete` bit
-need no live-state semantic validation and are a stale no-op after the fully
-validated service entries have been applied. They MUST NOT create, reopen, or
-mutate Product state. A malformed frame, an invalid service entry, or an
-invalid range for a live Product stream changes no state. This validates the
-whole frame atomically while still permitting a delayed `STREAM_ACK` to retire
-shared-writer tokens after logical-stream teardown without granting Product
-authority.
-
-Steps 2 through 5 have one linearization order even when carrier and stream
-state live in different actors. An implementation MAY use an exact two-phase
-certificate, but no scheduler may observe reopened `O/W` authority between
-service apply, guard publication, and Product release.
+A malformed frame or a range invalid for a live Product stream changes no
+state.
 
 If a byte was outstanding on multiple carriers, the Data ACK proves delivery
 but not which copy delivered it. No implementation may invent per-carrier
 delivery evidence for that range.
 
-Every writer direction that can serialize a generic service-bearing kind `8`,
-`31`, `33`, or `42` has one checked, nonzero `writer_epoch`. Its origin allocates
-epochs with strict monotonicity in the authenticated session and original-
-sender direction and never reuses or wraps one. TCP has one epoch for each
-physical carrier writer direction. QUIC has one epoch for each independently
-ordered HTTP/3 request-stream send half that can carry one of those kinds,
-including reliable attachments and carrier-control proof work; sibling request
-streams MUST NOT share a frontier. The dedicated observation request stream
-does not allocate this generic epoch.
-`SERVICE_EPOCH(writer_epoch)` is the first service-accounting frame on that
-ordered writer. A locator-only QUIC migration preserves it; writer or carrier
-replacement creates a new epoch. Allocation order is origin authority; arrival
-over independently ordered writers is not evidence of that order.
-
-The receiver binds the first `SERVICE_EPOCH` to the exact native-writer
-incarnation carrying it and retains only a bounded live/draining binding map.
-Zero, a second epoch on one writer, or the same epoch concurrently bound to a
-different live writer is a protocol violation. Exact native-writer terminal
-serializes after all accepted frames from that writer and removes the binding;
-no buffered frame from the terminal incarnation may apply later. The receiver
-MUST NOT use a scalar retired high-water to reject a previously unseen epoch:
-legal cross-writer reordering can deliver and retire epoch `e+1` before epoch
-`e` first arrives. A bounded diagnostic tombstone cache MAY detect recent peer
-reuse but is not correctness authority.
-
-The origin retains its checked allocated high-water plus the bounded
-live/draining epoch map. A receipt naming a live epoch is validated and applied
-there. An absent epoch no greater than the origin's allocated high-water is a
-stale receipt for an already terminal writer and is ignored idempotently; an
-epoch above that high-water or in the wrong original-sender direction is a
-protocol violation. Exhaustion fails the new writer closed before publication.
-Thus no honest delayed frame can migrate to a successor native writer, while
-cross-writer arrival order requires no unbounded retired set.
-
-Within an epoch, every irrevocably serialized positive command of generic kind
-`8`, `31`, `33`, or `42` occupies the next half-open interval in a cumulative
-service coordinate. Before serialization, checked addition of the command's
-exact normalized encoded work MUST produce a strictly greater frontier;
-overflow or exhaustion terminalizes that writer without publishing or reusing
-an interval. Both peers can reproduce the work; the sender maps each interval
-endpoint to its exact local carrier-work token. Queue arbitration occurs before
-this allocation, so a command cancelled or overtaken while still MPP-owned
-creates no hole. Reinjection is a new copy and consumes a new interval even
-though it retains the Product offset. Native retransmission consumes none.
-Observation kind `45` uses only its Section 15.1 channel coordinate and MUST NOT
-enter this one.
-
-After complete frame validation and the command's receive-map, dedup, proof,
-capacity, or requalification mutation have succeeded, the
-receiver advances that exact writer's `processed_frontier`. A `STREAM_ACK`
-carries a bounded vector of
-`(writer_epoch, processed_frontier)` service entries in addition to its Product
-ranges. The receiver transaction that first publishes Product coverage caused
-by a command MUST carry the command's origin frontier in that same frame. If a
-processed duplicate or reinjection creates no new Product range, an incomplete
-`STREAM_ACK` with empty Product ranges and a nonempty service vector is a
-service-only receipt. The dedicated ACKs listed in Section 12.2 carry their
-origin epoch and cumulative frontier in the same transaction. Service entries
-are cumulative and may return on any authenticated carrier of the same session.
-
-The sender requires `received_frontier <= assigned_frontier` for the exact
-epoch and applies `acknowledged_frontier = max(acknowledged_frontier,
-received_frontier)`. Equal or lower received values are idempotent; a value
-above the assigned frontier is a protocol violation. Advancing a frontier
-retires only complete work tokens whose interval end it covers. It updates
-carrier work accounting and same-output service provenance, but releases no
-Product range, receive credit, `W/P_i/E_i`, qualification, pacing, native
-window, or application delivery. `STREAM_ACK` itself occupies no service
-coordinate and elicits no receipt, so there is no ACK recursion.
-
-The receiver retains only the current processed frontier and a dirty
-publication bit per live or draining ordered writer. Dirty state belongs to
-the writer/session, not a Product stream. It is published cumulatively through
-the next applicable dedicated ACK, `STREAM_ACK`, or `SERVICE_ACK`; after a
-logical stream terminal, shared TCP writer state continues through
-`SERVICE_ACK`. The dirty bit clears only after a same-fate reliable reverse
-queue accepts a frame containing that frontier, or exact origin-writer/carrier
-terminal. For TCP this queue is the opposite writer on the same TCP
-connection. For QUIC it is the reverse direction of the carrier-control
-request stream whose terminal normatively terminalizes that physical carrier;
-an unrelated operation or attachment request stream is not sufficient. A
-cross-carrier or other operation-local copy is optional acceleration and
-cannot discharge dirty authority. Failure or cancellation before same-fate
-acceptance retains it and retries on existing carrier-capacity or membership
-wakes. Native reliability then shares the origin carrier's fate: delivery
-retires the sender token, while failure of the receipt channel terminally
-retires the token's complete physical-carrier scope.
-
-Stream-owned requalification-receipt state and this ordered-writer dirty
-service authority are distinct. Acceptance of a requalification ACK copy on a
-sibling may complete the former, but MUST NOT discharge the latter unless the
-same-fate reverse queue defined above also accepted the cumulative frontier.
-The sibling copy may accelerate application of that frontier at the sender
-while the receiver retains dirty authority for same-fate publication.
-
-The sender retains its assigned and acknowledged frontiers and
-the bounded ordered token deque. A later frontier subsumes a lost or duplicate
-receipt. An exact writer terminal retires its remaining token ownership without
-claiming service. A logical stream terminal cannot erase native-owned work or
-dirty frontier state on a shared TCP writer. Publication of a service frontier
-is part of the same receiver transaction and no later than Product release it
-enables; otherwise Product ACK could repeatedly reopen `W` while unreceipted
-carrier tokens grow without a bound.
-
-The logical receiver retains its latest cumulative received-range state. It
-retains a causally required service entry only while that exact origin writer
-is live or draining; exact writer terminal or attachment-incarnation retirement
-removes the entry. Thus the vector is bounded by configured concurrent writers,
-not historical writer epochs. A later Product publication without a retired
-origin entry remains safe: the sender already applied it, exact writer terminal
-retired the carrier work and made the bound output epoch non-admitting, or step
-4 publishes the exact token guard.
-Processing any newly received unique Product byte marks the cumulative Data ACK
+Processing newly received unique Product bytes marks the cumulative Data ACK
 state pending and advances one local publication generation. Before the
 serialized receive actor parks or yields its bounded cooperative turn, it MUST
-offer the latest pending generation independently to every currently live exact
-attachment. Several frames processed in that one turn coalesce into the latest
-cumulative state; ACK publication never waits for a byte threshold, another
-Product frame, an application read, or a timer.
+offer the latest pending generation independently to every currently live
+exact attachment. Several frames processed in that turn coalesce into the
+latest cumulative state; ACK publication never waits for an application read
+or another Product frame.
 
-Every fanout copy that could first publish those Product ranges MUST carry the
-same required origin service entries; enqueueing one such copy is insufficient.
-If the required entries and Product ranges do not fit one bounded frame, the
-receiver splits the positive publication so every range-bearing chunk carries
-all causal entries needed for its ranges; omission is forbidden. Dirty
-service-only frontiers may be cumulatively batched separately. Forced
-publication of unchanged state reuses the current generation. Queue acceptance
-advances only that exact attachment incarnation's publication fence; a blocked
-attachment remains pending and retries on carrier-capacity or
+Forced publication of unchanged state reuses the current generation. Queue
+acceptance advances only that exact attachment incarnation's publication
+fence; a blocked attachment remains pending and retries on carrier-capacity or
 attachment-membership wakes. A newly accepted attachment starts without a
-fence and receives the retained latest state. The latest-state replacement and
+fence and receives the retained latest state. Latest-state replacement and the
 chunk cursor keep pending publication bounded. This rule adds no receive
 window, congestion signal, stop-and-wait dependency, or carrier-delivery
 attribution.
@@ -1567,66 +1464,20 @@ while the remaining Product direction stays open.
 
 `STREAM_RESET(stream_id, reason)` terminates the MPP stream.
 
-Product FIN, detach, reset, or logical-stream terminal may cancel and refund
-only exact provisional or queued commands that remain safely removable before
-native handoff. Cancellation clears any guard on that removable token only
-after the bound Product/output epoch has become non-admitting or terminal. It
-MUST NOT erase a native-owned token or its guard metadata on a shared writer or
-claim peer service; writer-scoped `SERVICE_ACK` remains valid after that Product
-stream terminal. Product or output terminal means an old guard no longer
-suppresses a successor epoch, but the physical native token survives until
-service or exact writer terminal.
-
-An advancing Data ACK has one narrower work-conserving cancellation rule. If
-its validated cumulative Product coverage covers the complete Product range of
-an OriginalData command whose exact token is still queued, the ACK transaction
-atomically wins removal against native handoff, refunds both writer-command and
-all-stage token reservations, and retires that command before releasing its
-Product owner. It publishes no guard: queued state proves that this copy never
-entered native or peer service and its now-acknowledged payload has no remaining
-Product purpose. If handoff linearized first, the ACK observes a native-owned
-token and MUST retain and guard it. Partial command coverage cannot cancel or
-split the queued command, but queued state still proves that it has not served;
-the transaction retains its remaining Product owner and exact queue debt
-without a guard. Handoff and ACK classification serialize on the shared
-carrier-ledger generation, so the only outcomes are cancellation before a
-later handoff revalidation fails, or native ownership before the ACK guards it.
-
-Exact ordered-writer terminal atomically cancels every safely removable
-provisional or queued token bound to that writer generation and retires only
-its native-owned epoch tokens, proving neither Product delivery nor service,
-then clamps the physical carrier `Z_c` to remaining `Q^n_c`. It makes every
-bound output direction non-admitting and wakes its retained Product owners for
-ordinary recovery. A TCP writer-direction terminal is also that physical
-carrier-direction terminal. A QUIC attachment/request-writer terminal does not
-clear sibling writer epochs or shared carrier `C/H/Q/Z`; only terminal loss of
-the QUIC carrier control stream or connection does so. Exact carrier terminal
-retires all its writer tokens and clears carrier ledger and evidence without
-acknowledging retained Product, which survives under ordinary recovery rules.
+Product FIN, detach, reset, or logical-stream terminal cancels only work
+that remains locally removable under the exact queue and reservation owners.
+It does not acknowledge native transport bytes or Product delivery. Already
+published Product flight remains subject to Data ACK, recovery, and terminal
+cleanup under its existing owner.
 
 Native TCP EOF ends the carrier and is not stream FIN or detach. Native QUIC
 stream FIN closes only that native byte-stream direction and MUST NOT be
-interpreted as MPP FIN, detach, Product completion, or immediate
-service-writer terminal. The carrier-control exception in Section 6.2 instead
-makes either half's closure a physical-carrier terminal. For every other
-writer, before issuing a clean FIN the origin makes every
-bound output direction non-admitting for new commands and MUST reach
-`Q^p = Q^q = 0` for that writer by cancelling and refunding every uncommitted
-provisional token and handing every committed queued command to native
-ownership under its already-reserved all-stage authority. If it cannot, it uses the
-exact reset or lifecycle/writer-terminal path rather than FIN. A locally issued
-clean FIN then moves that ordered writer to `Draining`: it allocates no new
-service interval and retains every native-owned token, guard, and bound output
-state. The receiver
-processes every preceding complete frame, retains the processed frontier and
-dirty bit after observing FIN, and may terminalize its remote binding only
-after same-fate reverse-queue acceptance has discharged that dirty state. The
-origin terminalizes the drained writer after cumulative service has retired all
-its tokens. Reset, lifecycle terminal, or carrier failure instead uses the exact terminal
-cleanup above. Thus the receiver never treats FIN as permission to forget a
-receipt while the origin still owns native work. A native FIN inside an MPP
-record is truncation; a FIN at a record boundary is a clean native half-close
-governed by this draining rule.
+interpreted as MPP FIN, detach, Product completion, or physical-carrier
+failure. Operation-local HTTP/3 request completion follows the attachment or
+flow lifecycle for that request; only a connection-level terminal event or the
+nonclean carrier-control failure defined by Section 6.2 ends the QUIC carrier.
+A native FIN inside an MPP record is truncation; a FIN at a record boundary is
+a clean native half-close.
 
 ### 8.6 Attachment loss and retention
 
@@ -1646,9 +1497,9 @@ retained stream or datagram state remains within its original configured
 absolute retention lifetime, the client session service may establish
 bounded-pool replacements with the same `SessionId` and fresh carrier
 instances. Reattachment uses ordinary authenticated admission and attachment;
-no authority, attachment, transport evidence, queue, Product flight, or carrier work transfers from
-a failed instance. Reconnect attempts MUST NOT extend any original retention
-deadline.
+no authority, attachment, transport evidence, queue, or Product flight
+transfers from a failed instance. Reconnect attempts MUST NOT extend any
+original retention deadline.
 
 Lack of Product progress while attachments remain live is stream-local
 recovery evidence, not carrier failure. The sender first evaluates retained
@@ -1711,6 +1562,11 @@ Datagram IDs are directional and monotonic within a flow. The full identity is
 `(session_id, flow_id, direction, datagram_id)`. Direction is implicit in
 authenticated frame travel. Equal numeric IDs in opposite directions are
 distinct.
+
+Fresh `datagram_id` values range from zero through `u64::MAX - 1` inclusive.
+`u64::MAX` is reserved because the half-open feedback encoding cannot represent
+its exclusive end. Once the next fresh ID would be reserved, the sender MUST
+retire the flow rather than wrap, reuse an ID, or send that value.
 
 Every retry or carrier copy of one identity MUST preserve its payload. Reuse
 of a retained identity with another payload is a protocol violation. A
@@ -1862,698 +1718,273 @@ MUST NOT change L4 proxy admission, retry, scheduling, or transport behavior.
 
 ### 10.1 Observe, decide, commit
 
-The scheduler evaluates an immutable observation and proposes a carrier. Before
-enqueue, the implementation revalidates current carrier identity, attachment
-identity, stream frontier, output guard/epoch, the complete scheduling-rate
-authority stamp, carrier evidence ordinal, shared carrier-ledger generation,
-command priority and normalized work, ordered-writer generation, and queue
-reservation. It creates visible provisional carrier work
-only after real reservation and commits Product range ownership only in the
-same infallible publication transaction.
+One scheduling action is scoped to an exact logical output, attachment
+incarnation, physical carrier instance, direction, command kind, and proposed
+encoded MPP work. The scheduler evaluates an immutable observation and proposes
+a finite order of actions. Before enqueue, the implementation revalidates the
+exact identities, stream frontier, output-admission epoch, complete rate-
+authority stamp, command priority and work, and queue reservation on which the
+proposal depends. Product range ownership is committed only in the same
+infallible publication transaction as the accepted enqueue.
 
 An observation may contain:
 
 - local carrier health and drain state;
-- peer usage and local backup policy;
+- peer usage and local operator policy;
 - RTT, RTT variation, and jitter;
-- native delivery and pacing rate when available;
+- one typed directional service rate when available;
 - MPP Data ACK progress;
-- native and MPP bytes in flight;
-- transport and MPP queue bytes;
+- native and MPP queue and flight diagnostics;
 - current demand; and
-- evidence provenance, confidence, and freshness.
+- evidence provenance and freshness.
 
 The implementation MUST discard and recompute a proposal when any revalidated
-identity, frontier, guard/epoch, evidence/ledger generation, provenance, or
-reservation is stale. A stale authority stamp requires a new complete ranking;
-substituting a newer rate into the old ranking is not revalidation.
+identity, frontier, epoch, evidence stamp, or reservation is stale. Replacing a
+rate inside an old score is not revalidation.
 
-### 10.2 Evidence provenance
+Ranking is advisory. It cannot grant Product credit, queue capacity, native
+send credit, path proof, lifecycle eligibility, or recovery authority. The
+commit owner tries the frozen finite action order until one exact reservation
+succeeds or every structurally eligible action fails. An unrankable action sorts
+last within its structural tier; it is not thereby made ineligible. Failed and
+draining carriers, forbidden command classes, missing attachments, exhausted
+configured resources, and failed exact reservations remain structural
+ineligibility rather than score penalties.
+
+Peer AVAILABLE versus BACKUP and local backup policy form the outer
+regular-before-backup tier defined in Section 7.3. They are not numeric timing
+penalties. Other explicit operator constraints such as control-only, allow-bulk,
+or allow-datagrams are likewise structural. A policy described only as costly
+or expensive MUST NOT be converted into an arbitrary RTT-, loss-, or payload-
+scaled delay; any implementation-defined cost requires its own declared unit
+and deterministic policy order.
+
+### 10.2 Evidence provenance and advisory rank
 
 Transport queue/flight and MPP queue/Data-ACK flight overlap in one delivery
-pipeline. Sampled counters therefore cannot be added, maximized, or divided by
-flow count to manufacture physical work. Section 15.1 instead gives every
-reliable data-bearing command one exact ownership token and moves that token
-between disjoint stages. Common carrier work is represented once for the
-carrier direction and is visible to every logical stream sharing it.
+pipeline. Sampled counters therefore cannot be added, maximized, divided by
+flow count, or relabelled as one exact physical backlog. Product ownership,
+bounded MPP queues, native flight, and native send capacity retain their own
+owners and terminal rules.
 
-All exact carrier work is measured as the complete encoded MPP frame: the
-10-byte `MPTF` header plus its declared payload. It excludes TCP Noise record
-overhead, HTTP/3 DATA framing, native packet headers, and native
-retransmission. This is the common boundary both endpoints can reproduce before
-carrier-specific wrapping. A candidate command's `M_c` and every exact work
-token use this unit.
+For one exact action a, the advisory service score is:
 
-A rate term `C_c` is expressed in normalized-work bits per second. It MAY be
-formed from a conservatively counted subset of receipted normalized work when
-the subset maps one-for-one into that work. In particular, every byte of an
-observation payload is contained in its encoded MPP frame, so for the same
-commit/receipt interval:
+    S(a) = T(a) + ceil(8 * (A(a) + M(a)) / C(a))
 
-```text
-0 <= payload_subset <= normalized_frame_work <= actual_useful_service.
-```
+where:
 
-Dividing the payload subset by the positive interval therefore gives a valid
-lower bound in the normalized-work rate domain; reconstructing variable frame
-headers is unnecessary for safety, but omitting them is deliberately
-conservative. An adapter that can establish neither exact normalized work nor
-such a one-for-one lower-bound projection MUST omit the measurement. Missing
-evidence is not measured zero.
+- T(a) is a nonnegative duration-valued propagation estimate for the exact
+  action direction;
+- M(a) is the complete encoded MPP frame size: the 10-byte MPTF header plus
+  its declared payload, excluding native framing, headers, and retransmission;
+- A(a) is exact local pre-native predecessor work in the same byte unit,
+  ending when that work is handed to the native transport; and
+- C(a) is a positive finite directional service rate in normalized-MPP bits
+  per second whose scope includes that exact action.
 
-Elapsed time used in an achieved-service denominator MUST be a conservative
-upper bound, not a raw subtraction of quantized clock reads.  For a monotonic
-clock whose read lies in an interval of width at most `g`, Core carries lower
-and upper bounds for cumulative busy time.  Closing or observing a busy
-interval adds a checked lower and upper elapsed bound; equivalently, a
-floor-tick implementation may use at least one additional `g` for each elapsed
-interval.  If the true cumulative busy coordinate is `T`, the maintained
-bounds satisfy `T^- <= T <= T^+`.  An anchor created while the bounds are
-`[T_a^-, T_a^+]` uses `T^+ - T_a^-` as its elapsed upper bound.  Merely taking
-`max(raw_tick_difference, g)` is non-conforming: two endpoint quantization
-errors can otherwise make the denominator smaller than real elapsed time.
+The division rounds upward. Every addition, multiplication, and conversion is
+checked. An unrepresentable score is unrankable rather than saturated into a
+win. A, M, and C MUST name the same direction and declared work domain. If
+comparable A cannot be proved for every candidate in one comparison, A is
+omitted uniformly from that comparison. Missing evidence is not zero.
 
-For one exact carrier direction, let `B(s,t)` be distinct normalized work bytes
-committed no earlier than local time `s` and covered by exact peer-processing
-receipts applied by local time `t`. Let `Y(s,t)` be actual useful carrier
-service in that interval and `D^+(s,t)` a conservative upper bound on its
-positive elapsed duration. Every counted byte satisfies:
+Before a finite typed C exists, an Unknown startup rate uses the portable C_0
+prior defined in Section 15.1. Explicit Unlimited is an ordering-only startup
+sentinel: its service-duration term is defined as zero, so its startup score is
+T(a). Unlimited is not a numeric C, cannot be combined with a measured rate,
+and grants no Product bytes, native send credit, pacing, window, or capacity.
+The first accepted Valid NativeOperational publication replaces either startup
+basis for that activation.
 
-```text
-s <= commit -> peer processing -> local receipt apply <= t
-B(s,t) <= Y(s,t)
-duration(s,t) <= D^+(s,t)
-L(s,t) = 8 * B(s,t) / D^+(s,t)
-         <= 8 * Y(s,t) / duration(s,t).
-```
+A excludes Product or Data-ACK flight, native flight, native retransmission,
+loss, confidence, active-flow count, and health labels. C MUST NOT be divided
+by active-flow count, multiplied by path or flow count, or combined with an
+independent rate by addition. A Product per-flow completion rate cannot be
+silently compared as physical-carrier capacity; a physical-carrier rate cannot
+be silently relabelled as one flow's guaranteed share. The rate-source contract
+must state the comparison scope, normalized work projection, activation
+identity, and freshness.
 
-ACK compression cannot invalidate the inequality. `B(s,t)` MAY sum work from
-different Product writers and the carrier-observation channel only when every
-summand is a distinct exact token committed and service-receipted inside the
-same carrier-direction interval. This is one division after summing disjoint
-physical work, not a sum of independently estimated rates. Detached per-flow,
-per-writer, or per-channel rate estimates MUST NOT be summed, multiplied by
-flow count, copied into another carrier, or copied back into independent
-per-stream rates. `L` is nevertheless only a historical achieved-service lower
-bound. It is not unused capacity, marginal capacity, a future-service promise,
-or evidence that another carrier is independent.
+Loss, ECN, confidence, freshness, application-limited state, and Suspect may
+determine whether a typed observation is valid or may trigger reconsideration,
+but they do not add independent time to S. In particular, a Suspect label alone
+cannot override a finite current typed rank. Native controller and exact
+reservation state continue to constrain actual transmission.
 
-The first receipt cannot identify high-BDP capacity. For stable service `C` in
-bits per second, feedback delay `tau`, and first exact normalized volume `F` in
-bytes, the causal lower
-bound is:
+Equal scores use a canonical exact action key containing output identity,
+carrier instance, attachment incarnation where applicable, direction, and
+command identity. A bare reusable PathId and input order are insufficient. This
+key is only deterministic ordering and conveys no topology or capacity.
 
-```text
-L_first = C * (8 * F) / (C * tau + 8 * F).
-```
+Path retention uses a duration-valued uncertainty `U` separate from `S`. For a
+rankable action `a`, let `J(a)` be its nonnegative jitter value from the same
+exact action, direction, and timing epoch as `T(a)`; the configured value is
+used before a measured value exists. Then:
 
-Thus `L_first / C = 8F / (C * tau + 8F)`. At `F = 64 KiB`, `tau = 100 ms`, and
-`C = 500 Mbit/s`, it is only about `5.2 Mbit/s`. Repeating the same small-flight
-geometry does not remove that bias. Product-volume qualification, physical
-carrier-rate prediction, and native congestion authority are therefore three
-separate facts.
+    U(a) = max(J(a), 1 ms)
 
-Every exact `(carrier incarnation, original-sender direction)` owns one
-persistent scheduling-rate authority reducer. The reducer selects one
-exclusive authority mode; Core MUST NOT take the maximum of native and
-receipt-derived rate authorities. That construction has no stable downshift
-order and can repeatedly fence the receipt acquisition that is intended to
-recover it.
+Switching away from incumbent `i` to challenger `c` requires
+`S(i) - S(c) > U(i) + U(c)`. Jitter is not a statistical rate-confidence
+interval and does not prove that an estimated percentage difference is
+significant. Rate confidence may validate the typed `C`; it does not contribute
+to `U`. A percentage such as ten percent is a validation comparison band or
+operator hint, never a hidden path-swap threshold.
 
-NativeMode additionally uses two logically distinct checked serials. `E_N` is
-the transport-owned, strictly increasing active-source activation serial. `G`
-is the central reducer's authority revision defined below. One `E_N` lifetime
-begins when one exact native `PathData`/controller instance becomes active and
-ends before any different instance becomes active. Every installation and
-every restoration atomically advances `E_N` with the active pointer, even when
-it restores the same underlying controller object, address, native-path label,
-or controller identity `I_N`. `E_N` is mutable NativeMode state, not part of the
-immutable carrier-direction scope. Scheduling compares it for exact equality;
-its numeric value is not capacity, health, or rank evidence.
-Within one `E_N`, `I_N` is immutable. Any change of active `PathData`,
-controller instance, or `I_N` ends that activation and requires the next
-`E_N` before the successor becomes active.
+The formula is an advisory local-service ordering, not an end-to-end
+application-completion estimate. It proves deterministic ordering, monotonic
+response to lower T or A and higher C, and no intentional double counting of
+the excluded stages. It does not prove receiver completion, independent
+bottlenecks, finite native service, restart-free recovery, or superiority to a
+baseline.
 
-This distinction is required because a valid QUIC history may install
-controller `A`, activate validation candidate `B`, and restore `A`, while a
-same-IP `from_previous` transition may clone controller state under an
-unchanged underlying identity and then diverge. The three activation lifetimes
-are therefore distinct even when the first and third name `A`:
+#### 10.2.1 NativeOperational rate authority
 
-```text
-(E1, I_N=A) -> (E2, I_N=B) -> (E3, I_N=A).
-```
+One exact (carrier instance, original-sender direction) owns one persistent
+native scheduling-rate reducer. A native transport rate is authoritative only
+through a named adapter that exports the current positive, finite, gain-free
+operational bandwidth used by that same controller's live send model. This
+value is denoted `B_op`. For the QuinnBbr3NativeOperationalV1 adapter it is
+min(max_bw, bw_shortterm). A gain-scaled pacing rate, detached ACK-window
+estimate, peer metric, Product-goodput estimate, or configured path count is
+not that value.
 
-A delayed proposal carrying `E1` or `E2` is stale after `E3`; equality of the
-first and third `I_N` cannot revive it. A locator-only change that retains the
-exact active `PathData`/controller instance retains `E_N` and does not itself
-change authority.
-
-`G` is the reducer's one checked, nonzero, non-reused authority revision. It
-never resets during the reducer lifetime and advances on every accepted
-semantic change of active-source activation, authority basis, authority mode,
-NativeMode rate, or ReceiptMode term. An exactly repeated semantic state is a
-no-op and does not advance `G`; one accepted atomic transaction that changes
-one or more of those fields advances it exactly once. Revision exhaustion fails
-closed without wrap, alias, or a successor live stamp. A NativeMode scheduling
-snapshot contains the immutable reducer scope, current mode, `E_N`, `I_N`,
-authority basis and rate, and `G`; ReceiptMode carries its corresponding mode-
-owned identities.
-
-For the asynchronous adapter specified here, transport `E_N` and central `G`
-MUST be separately observable and both MUST be revalidated. Every actual
-native activation and restoration is therefore fenced from scheduling, not
-merely discovered by later polling. A candidate installed and rolled back
-entirely between polls still advances `E_N` twice, so an old decision cannot
-remain valid during either activation. A future implementation with one proved
-atomic cross-layer switch, reducer, and scheduling-commit transaction MAY
-encode the two logical serials with one sequence, but that is not this adapter
-and cannot remove either semantic comparison or wake/publication obligation.
-Exhaustion of `E_N` or `G` prevents successor authority from becoming
-schedulable and enters exact carrier-terminal handling; neither serial can wrap
-or reuse an old value.
-
-The transport switch transaction MUST publish a durable activation wake
-atomically with the new `(active pointer, E_N)`. Wakes MAY coalesce only to the
-then-current `E_N`; they cannot disappear while central authority names an
-older activation. Under fair coordinator service and an activation that remains
-current for the adapter's declared `D_pub`, the publisher MUST install that
-activation's coherent authority snapshot in every live central consumer within
-`D_pub`. Faster repeated switching voids that conditional publication bound but
-not the immediate `E_N` precommit fence. A scheduler whose central `E_N` lags
-the transport MUST arm the activation wake and park or recompute; it cannot use
-the predecessor authority on the successor activation.
-
-`NativeMode` is permitted only for a named local adapter whose native
-controller exports its current positive, finite, gain-free operational
-bandwidth `B_op`. `B_op` MUST be the rate component that the same controller
-uses to construct its live send model; for the
-`QuinnBbr3NativeOperationalV1` adapter it is
-`min(max_bw, bw_shortterm)`. It is not a gain-scaled pacing rate,
-detached ACK-window estimator, Product-goodput estimate, peer metric, or
-ReceiptMode achieved-service lower bound. In particular, it may intentionally
-restore a retained probe opportunity before a new high delivery sample and may
-include the adapter's declared loss-compensation policy. Native congestion
-window, pacing, recovery, and flow control still bound every transmitted byte.
-
-The adapter contract MUST declare the exact carrier incarnation and original-
-sender direction; the exact switch-time mechanism that creates and publishes a
-fresh `E_N` for every active `PathData`/controller installation or restoration;
-units and positive representable rate lattice; checked conversion into
-normalized-work bits per second; raw-versus-loss-compensated service domain;
-application-limited update rules that do not reinterpret a low application-
-limited delivery sample as a lower service bound; structural initialization,
-active-source change and rollback, explicit invalidation, revocation, and
-terminal events; and its stable environment envelope. Saturation, wrap, NaN,
-or infinity cannot become an authority update and MUST NOT manufacture a
-maximum value. An unrepresentable checked score product makes that proposal
-lose without mutation; it cannot saturate into a win.
-
-The NativeMode adapter exports one coherent active-controller observation:
+The adapter exports one coherent observation:
 
 ```text
 (E_N, I_N, kind, rate)
 
-kind = Absent
-     | Valid                 # rate = B_op
+kind = Absent                    # no rate is present
+     | Valid                     # rate = positive finite B_op
 ```
 
-An adapter MAY classify an internally available controller value as `Absent`
-until a declared lifecycle qualification proves that value belongs to the
-current operational epoch. Such a classifier MUST consume exact native
-provenance, MUST NOT modify the native controller, and MUST declare its finite
-progress bound. A detached ACK aggregate, wall-clock delay, payload heuristic,
-or previously retained numeric value cannot qualify a controller output.
+`Absent` is no authority event for an already initialized activation: it does
+not clear a retained valid value or restore a startup prior. A new activation
+with `Absent` retains only its own configured startup prior until its first
+`Valid(B_op)` observation.
 
-`Absent` means that this raw read contains no valid operational-rate
-observation. On a newly accepted `E_N`, it leaves that activation on `C_0`
-until its first `Valid(B_op)`. After the same activation has initialized, a
-missed poll, absent optional value, post-round zero, or failed numeric
-conversion is no authority event: it cannot clear the retained valid value or
-restore the startup prior.
+The transport owner publishes two distinct checked identities:
 
-Structural invalidation is not a raw observation kind. It is a separate
-explicit coordinator command carrying the exact current scope, `E_N`, `I_N`,
-expected `G`, reason, and structural fence. The coordinator may accept that
-command only while those values remain current under the transport activation
-fence. Acceptance performs the one-way fenced NativeMode-to-ReceiptMode
-transition below or exact terminal handling. A missing, zero, malformed, or
-unrepresentable rate observation cannot construct or impersonate this command,
-and invalidation cannot leave a knowingly invalid NativeMode value live.
+- E_N, the strictly increasing active-source activation serial; and
+- I_N, the immutable controller identity within one E_N.
 
-The current `(E_N, I_N, kind, rate)` MUST be read atomically from the same
-active-`PathData`/controller snapshot. An underlying controller identity is not
-a substitute for `E_N`: a same-identity clone may own distinct and diverging
-live state.
-The coherent snapshot reader and current-`E_N` fence MUST be obtained as one
-opaque transport-owner capability. They cannot be supplied independently and
-then associated by comparing raw `E_N` or `I_N`: another connection may
-legitimately issue equal numeric values, and those values have no meaning
-outside their issuing fence.
-Legacy RTT, flight, loss, or queue diagnostics MAY be sampled independently,
-but if they participate in the same scheduling decision they MUST carry the
-same current activation fence and authority revision or come from that
-coherent snapshot; a mismatched bundle is discarded rather than fused.
+Every installation and every restoration of an active native PathData or
+controller advances E_N, including restoration of the same object or identity.
+A locator-only change that retains the exact active controller retains E_N. A
+valid history may therefore be:
 
-Publication uses capture/read/compare-apply, not a caller-supplied current
-stamp attached to a detached rate. The serialized coordinator first captures
-its current central authority stamp, reads the transport's coherent
-`(E_N, I_N, kind, rate)` observation, and then verifies that `E_N` still names
-the current active pointer. It compare-applies only against the captured central
-`G`; any central-stamp or current-`E_N` failure discards the entire snapshot and
-retries from capture. It MUST NOT pair a value read from one activation with a
-freshly read later stamp. Proposals for the same `E_N` are serialized through
-one coordinator or use compare-and-swap on their captured `(E_N, G)`; a loser
-discards its whole snapshot and rereads. Thus an older same-activation rate
-cannot overwrite a newer accepted rate. `E_N` and `I_N` have no rate, health,
-or path-order meaning.
+    (E1, I_N=A) -> (E2, I_N=B) -> (E3, I_N=A)
 
-A switch racing after the publisher's last current-`E_N` read may leave a
-briefly installed central snapshot naming the predecessor, but it cannot make
-that snapshot consumable: the switch has already advanced transport `E_N`,
-published the durable wake, and every precommit compares that current value.
-Only a central snapshot whose `E_N` still equals transport `E_N` is live
-scheduling authority.
+A proposal carrying E1 or E2 is stale after E3; equality of I_N cannot revive
+it. Exhaustion fails closed without wrap or reuse.
 
-An accepted change of `E_N` advances `G` even when the underlying identity and
-projected numeric rate are unchanged. It clears the predecessor activation's
-controller-owned initialization and rate state and installs only the new active
-state: `C_0` for `Absent`, or that activation's own `B_op` for
-`Valid(B_op)`. Thus a new active instance cannot inherit MPP authority merely
-from identity equality. When a retained or cloned controller becomes active,
-only its current coherent observation decides the new basis; the reducer never
-reuses a predecessor activation's MPP state. This source transition preserves
-carrier work, Product state, and aggregate `Q/Z` under their separate rules.
+The central reducer owns a separate checked, nonzero, non-reused revision G.
+One accepted semantic change of active source, authority basis, or
+NativeOperational rate advances G exactly once; an exact repetition is a no-op.
+A scheduling snapshot contains the immutable reducer scope, E_N, I_N,
+authority basis, normalized rate, and G. Every consumer revalidates the complete
+stamp.
 
-This authority state machine is an implementation gate, not a universal
-performance theorem. Before an adapter supplies live NativeMode authority,
-deterministic transition tests MUST cover uninitialized-to-valid publication,
-same-source rate replacement, distinct activation lifetimes for install,
-rollback, and same-identity clone, delayed predecessor rejection, a complete
-install-and-rollback between polls, failed capture/read/compare-apply retry,
-serialized or compare-and-swap same-activation publication, durable activation
-wake and bounded stable-activation publication, explicit structural
-invalidation, checked `E_N`/`G` exhaustion, and consumer precommit rejection of
-every stale complete stamp. These tests establish the reducer and publication
-contract only; controller convergence remains subject to the bounded adapter
-premises and empirical acceptance rules below.
+The current (E_N, I_N, kind, rate) MUST be read atomically from one active
+native controller snapshot. Publication uses capture, coherent read, and compare-
+apply against the captured G, followed by a current-E_N check. A failed
+comparison discards the whole observation and rereads; it cannot pair a rate
+from one activation with a later identity. Same-activation publishers are
+serialized or compare-and-swap their complete captured stamp.
 
-Within that declared envelope, the adapter MUST document finite funded backlog
-work `W_up`, a finite upshift progress/round bound `K_up` under sustained native
-backlog and positive service/ACK progress, a finite downshift bound `K_down`
-under continued ordinary backlog, and a finite controller-update-to-live-
-consumer publication bound `D_pub`.
-Loss or blackhole behavior needed for either finite bound MUST itself be
-bounded; a mean loss percentage alone is insufficient. The upshift statement
-quantifies only over positive representable required rates `R<C` in the
-declared envelope, not over every real number. These are named adapter
-obligations, not conclusions that Core derives from score arithmetic.
+A transport activation switch publishes a durable wake atomically with the new
+active pointer and E_N. Wakes may coalesce only to the then-current activation.
+A central consumer that still names an earlier E_N parks or recomputes; it
+cannot use predecessor authority on the successor activation. A briefly
+published predecessor observation racing a later switch is unconsumable
+because precommit also compares current transport E_N.
 
-A configured `C_0 > 0` is only the NativeMode `StartupPrior` basis before the
-adapter's first `Valid(B_op)` for the exact active source. That publication
-changes the basis to `NativeOperational` and monotonically initializes that
-source; thereafter `C_c = B_op`. A stable initialized source cannot revert to
-`C_0` because of wall time, idleness, missing polls, application-limited
-samples, or a low value. Every later changed valid controller value atomically
-replaces `B_op` and advances `G`. MPP MUST NOT smooth it, cap its growth from an
-earlier MPP estimate, maximize it with receipt or Product rate, or impose an
-independent freshness or recovery timer. Receipt-derived Product and
-observation rates remain diagnostic.
+The successful final complete-stamp comparison and authority-dependent
+ownership/enqueue commit MUST have one linearization order with native active-
+pointer switching. An implementation may hold the switch fence through commit
+or carry E_N into the native writer, which rejects it before ownership transfer
+when it no longer names the current activation. A check followed by an unfenced
+gap before commit is not precommit revalidation.
 
-For `QuinnBbr3NativeOperationalV1`, an explicit finite QUIC startup-rate
-contract enables a bounded pre-operational classifier. Omitted and Unlimited
-configuration bypass it and retain the ordinary immediate projection. For one
-finite-target controller lineage, let `A` be the authenticated MPP
-application-ready event, `F` the first subsequently sent Data-space packet
-number, and `S` BBR's immutable latest completed delivery-rate sample record.
-The classifier is:
+A configured initial rate is a sender-local startup prior for a fresh
+activation before its first valid NativeOperational publication.
+`[flow].initial_rate_mbps` supplies the optional default for every local MPP
+TCP and QUIC path; it is a positive whole decimal-Mbit/s integer. An explicit
+path `initial-rate-bps`, `initial-rate-kbps`, or `initial-rate-mbps` value
+overrides it;
+`initial-rate=unknown` explicitly suppresses it, and
+`initial-rate=unlimited` selects the unbounded hint form. A path URI contains
+at most one of those rate forms. Every numeric form is a positive integer and
+its scaling MUST fit in `u64` bits per second. Omission at both scopes means
+Unknown. The resolved prior is endpoint-local and is neither serialized nor
+inferred for the peer: a client outbound controls client-to-server scheduling,
+and a server inbound controls server-to-client scheduling.
 
-```text
-PreReady
-  -- A, serialized with packet processing --> AwaitFloor
-AwaitFloor
-  -- first subsequent Data packet F --> AwaitFirst(F)
-AwaitFirst(F)
-  -- eligible S1 from send-time round r1 --> Armed(F, r1)
-Armed(F, r1)
-  -- eligible S2 with S2.source_round > r1 --> Operational
-```
+On TCP the value is only an MPP scheduling prior and does not change native TCP
+congestion control. On QUIC, a finite rate `R` and configured initial RTT `T`
+(333 ms when omitted) use `MDS`, the maximum QUIC datagram size at controller
+construction, and `IW10 = min(10*MDS, max(2*MDS, 14,720))` bytes, the RFC 9002
+initial congestion window. They set the native initial window target to
+`max(IW10, ceil(R*T/8))` bytes and the initial pacing target to `ceil(R/8)`
+bytes per second. The configured targets seed neither BBR
+bandwidth nor `max_bw` and do not otherwise change Quinn's controller model.
+Configuration MUST reject a finite QUIC pair unless
+`ceil(R/8) <= 2^53` bytes per second and
+`ceil(R*T/8) <= u64::MAX`; it cannot round or saturate those targets silently.
+This QUIC constraint does not apply to a TCP-only finite prior. Unknown and
+Unlimited preserve the native BBR3 startup defaults.
 
-Each record carries a checked nonzero controller-local revision, raw-sample
-validity, selected source packet space and number, its send-time BBR round, and
-its send-time application-limited bit. A record is eligible only when its
-revision is new, its raw delivery sample and current `B_op` are positive and
-representable, its selected source is Data with packet number at least `F`,
-and BBR marked that packet non-application-limited. Pre-ready, pre-floor,
-wrong-space, stale-revision, invalid, zero, unrepresentable, application-
-limited, and same-round records are no-ops. They do not reset `Armed`, because
-absence of evidence is not revocation.
+For a finite QUIC prior, MPP retains that prior as scheduling authority until
+the exact post-authentication native controller has supplied valid Data-space,
+non-application-limited evidence in two distinct packet-timed source rounds.
+The first Data-space packet after the local post-authentication
+application-ready boundary fixes the packet-number floor. Pre-ready,
+pre-floor, stale-revision, wrong-space, invalid, zero, unrepresentable,
+application-limited, absent, and same-round records are no-ops. A fresh native
+controller obtains a fresh floor; a retained clone or rollback retains its
+handoff state. This qualification changes only which rate basis MPP projects;
+native BBR consumes its evidence and controls window, pacing, loss, and
+recovery throughout. Unknown and Unlimited bypass the qualification gate. The
+first qualifying valid publication changes the MPP basis; later missing polls
+or idleness do not restore the prior or erase a retained valid value. Explicit
+structural invalidation is a separate fenced command, not a numeric sample. It
+removes the invalid authority or terminalizes the exact carrier according to
+the adapter contract; it cannot silently create a different rate source.
 
-The two distinct send-time rounds exclude Quinn's one-transmit-poll lag in its
-application-limited stamp. Every packet in the first post-ready poll may carry
-the preceding pre-ready `false`, but it belongs to one BBR send-time round. A
-higher source round requires ACK progress and a subsequent transmit poll; a
-non-application-limited selected packet there is backed by post-ready native
-pressure. This proves a qualified native operational observation, not stable
-capacity, spare headroom, or Product delivery. Sustained authenticated control
-traffic may qualify; Product completion remains DataACK authority.
+The adapter contract declares its carrier/direction scope, unit conversion,
+activation and rollback behavior, application-limited rules, publication wake,
+structural invalidation, exhaustion behavior, and finite stable-activation
+publication bound `D_pub` within a declared environment that includes bounded
+fair coordinator service. If one complete
+`(E_N, I_N, kind, rate)` observation remains current for `D_pub`, every live
+central consumer MUST receive that observation's authority revision within
+`D_pub`. A faster activation or observation change waives only that
+conditional deadline; it never waives the immediate current-`E_N` precommit
+fence. The adapter MUST have
+deterministic tests for install, restore,
+same-identity clone, delayed predecessor rejection, capture/read/compare races,
+wake publication, invalidation, and checked exhaustion. These obligations prove
+authority chronology only; they are not a throughput theorem.
 
-Readiness is monotonic and connection-shared. The floor, consumed-sample
-revision, armed round, and operational latch are controller-lineage state. A
-same-controller clone and retained rollback preserve them; a genuinely fresh
-controller observes shared readiness but obtains a fresh floor and proof.
-`Operational` is absorbing for the lineage. While qualification is pending,
-the central reducer retains `C_0`, but native BBR still consumes every sample
-and exclusively controls `bw`, `max_bw`, window, pacing, loss, and recovery.
-The classifier is not another window, pacer, estimator, or traffic cap.
+Other typed sources may be used only under their own declared scope and
+freshness. A configured rate is a prior, a Product delivery rate is Product
+evidence, and a TCP capacity receipt is a bounded measurement. None may be
+merged with NativeOperational authority by taking an unqualified maximum.
+Peer PATH_METRICS is detached diagnostic evidence and cannot serialize or
+replace a local native-controller lifetime.
 
-Under sustained backlog, positive ACK progress, and a finite per-round
-feedback/recovery bound `Delta_feedback`, the conservative handoff bound is
-`D_send + 3*Delta_feedback + D_pub`; the common stale-first-flight case needs
-two rounds. No finite bound exists under a blackhole, unbounded loss, or an
-application-limited workload, in which case retaining the explicitly
-configured prior is intentional.
-
-Every ordinary evaluation and its precommit revalidation MUST read an
-immutable snapshot of the current central carrier authority and exact
-authority stamp. Before commitment it MUST compare the complete captured stamp
-for equality, including mode, central `(E_N, I_N, G)` in NativeMode, and the
-separately observed current transport `E_N`. Failure discards the proposal and
-recomputes selection from a fresh snapshot; merely rereading the rate, patching
-the old proposal, or checking that the numeric value is similar is
-insufficient. Any
-separately required evidence ordinal, ledger generation, or reservation is
-revalidated in the same transaction. A construction-time or per-stream copy
-cannot be scheduling authority; it is diagnostic unless it is refreshed
-through the bounded live-publication contract.
-
-The successful final fence comparison and authority-dependent commit MUST have
-one linearization order with native active-pointer switching. An implementation
-may hold the switch fence through commit or carry `E_N` into the native writer,
-which rejects it before ownership transfer if it no longer equals the current
-activation. A check followed by an unfenced gap before commit is not
-precommit revalidation.
-
-`ReceiptMode` is selected at reducer creation when no such adapter contract
-exists, or by the one fenced NativeMode revocation below. Native rate samples
-and detached Product-flow rate samples are diagnostic-only for the remaining
-reducer lifetime. A fresh ReceiptMode native-path scope starts with fallback
-`H_R = C_0`, no active receipt term, and no acquisition. A ReceiptMode
-native-path identity change fences the old term and acquisition, starts this
-fresh ReceiptMode state, and advances `G`; it does not construct a new reducer
-or switch authority mode. The ReceiptMode native-path identity is therefore a
-subordinate equality fence for receipt evidence, not immutable reducer scope or
-an ordering substitute for `G`.
-
-ReceiptMode has exactly one optional active term `R_A > H_R`. It controls the
-prediction until its absolute expiry, which is frozen from the exact
-publication snapshot and is never refreshed. Otherwise the prediction is
-`H_R`. Individual receipt events and detached local candidates cannot overwrite
-or extend a live `R_A`. Only a disjoint `Acq_c` that independently passes the exact
-ordinary decision below may supersede it in one close-and-fence transaction;
-otherwise expiry settles `Z_c` under the old prediction and returns to `H_R`.
-`Acq_c` may also publish in that serialized expiry transaction, but expiry by
-itself cannot improve the carrier.
-
-ReceiptMode also has at most one carrier-direction rate acquisition `Acq_c`.
-When ReceiptMode evidence capacity is available, an otherwise-admitted positive
-Product token MUST atomically create an absent `Acq_c` and its first suffix
-anchor and receive its tag without any rate-causal prerequisite; this passive
-metadata action sends no extra traffic. Evidence-capacity absence or exhaustion
-leaves the Product token untagged and MUST NOT fail or block its commit. An observation token
-may create and join `Acq_c` only after the exact rate-causal synthetic-admission
-check in Section 15.1. A later Product commit naturally creates the disjoint
-successor after publication closed its predecessor, except for the serialized
-publication handoff defined below.
-
-`Acq_c` owns a checked, non-reused acquisition generation; exact scope
-`(session generation, original-sender direction, carrier incarnation,
-native-path epoch, authority mode)`; carrier-ledger commit fence `f_acq`;
-checked lower and upper accumulated busy-duration coordinates
-`T_acq^- = T_acq^+ = 0`; one optional open-busy start `b_acq`; one optional
-immutable quiescent freshness deadline `E_acq`; and a bounded ordered set of
-suffix anchors.  Creation freezes one evidence feedback bound
-
-```text
-P_acq = SRTT + max(4 * RTTVAR, 1 ms) + 25 ms
-```
-
-from the exact carrier snapshot, or the startup tuple `333 ms` and `166.5 ms`,
-using checked ceiling conversion to timer ticks.  Core's declared renewal
-fraction is `alpha = 9/10`, so it freezes the busy-age authority horizon
-
-```text
-H_acq = ceil(P_acq / (1 - alpha)) = 10 * P_acq.
-```
-
-The normative algebra in this subsection treats `P_acq`, `H_acq`, `q_acq`,
-`T_acq`, and `D_a^+` as fixed-point durations. An implementation represents
-them as checked timer ticks at a positive frozen scale `G_acq` ticks per second.
-Thus the integer expansion of a rate division is
-`floor(8 * W_a * G_acq / D_a_ticks^+)`; dividing bytes by a bare tick count is
-dimensionally invalid.
-
-It also freezes a local anchor bound `J_acq >= 11` and spacing
-`q_acq = ceil(H_acq / (J_acq - 1))` in timer ticks.  These are one operating-
-envelope snapshot, not values refreshed by later RTT, polling, traffic shape,
-or receipts.  An anchor is authority-live through elapsed upper bound
-`H_acq` inclusive and becomes diagnostic-only above it.  `Acq_c` is carrier-
-scoped rather than Product-stream- or synthetic-generation-scoped. An atomic
-publication-handoff successor instead inherits the one `P_pub/H_pub` snapshot
-captured by that transaction as specified below; it MUST NOT reread transport
-state independently from its active term.
-
-Ordinary creation, first-busy opening, token commit, and tagging are one
-linearization: `f_acq` is the immediately preceding exact carrier-ledger
-boundary and `b_acq` is the positive first token's commit time. That commit also
-creates the first anchor `(f_anchor, busy-coordinate lower bound, counted
-work=0)`, where `f_anchor` is the exact carrier-ledger boundary immediately
-before the token's checked post-commit ordinal. Queue or actor delay before an
-unselected carrier's actual commit is
-therefore not misclassified as carrier service time. The sole pre-commit
-exception is an atomic publication handoff: after installing `R_A`, the same
-serialized transaction recomputes ordinary selection under the new rate and
-may open its zero-work successor at that new fence only when positive exact
-target-local backlog remains, every non-writer fact is true, and evidence state
-is available. Actor/writer delay from that proved target boundary is genuine
-busy time and conservatively lowers the successor rate. Cancellation,
-rerouting, or loss of the target-local predicate closes an empty successor;
-scope change fences it. Every later eligible commit revalidates the acquisition
-fence and receives the same live tag.
-After removing anchors whose elapsed upper bound exceeds `H_acq`, that commit
-creates one new anchor when the set is empty or when the current busy-coordinate
-lower bound is at least the last anchor's lower bound plus `q_acq`.  Thus anchor
-creation follows proved busy-time resolution rather than Product frame count.
-When, and only when, an exact peer-processing service frontier first retires
-such a token, its normalized forward-frame work is added once to every retained
-anchor whose `f_anchor` is strictly less than that token's post-commit carrier-
-ledger ordinal. Product
-Data ACK without exact copy service, queued cancellation, native loss,
-terminal-without-service, polling, and duplicate receipt add nothing. A late
-receipt for a closed acquisition may still retire carrier work but is an
-acquisition semantic no-op. Observation contributes its DATA work `N + 32`,
-not its `N + 68` receiver-grant charge: the reserved ACK is reverse-direction
-work and is not proved by forward processing.
-
-The busy interval remains open while at least one live acquisition-tagged token
-is outstanding; or a fresh ordinary evaluation targets this exact carrier for
-positive Product source/staged work with every non-writer fact satisfied and
-only its actor/writer admission temporarily blocking commit; or one currently
-rate-causal observation head has every non-writer authority and funding
-prerequisite. A traffic-class label, work selected or committed elsewhere,
-loss to another carrier by ordinary score, missing observation grant/budget,
-application think time, or an empty source does not keep this carrier busy.
-Writer, actor, native-flow-control, congestion, and receipt stalls while one of
-the exact target-local predicates holds do keep it open and therefore cannot be
-hidden from the rate denominator.
-
-When a serialized recheck finds no such backlog and zero tagged outstanding
-tokens, it closes the busy interval by adding conservative lower and upper
-bounds for `t-b_acq` to `T_acq^-` and `T_acq^+` and, on the first such close
-only, freezes `E_acq` at `t + 3 * P_acq`. A later eligible token before
-`E_acq` reopens busy at its
-commit time and excludes only the work-free idle gap; it cannot move or cancel
-`E_acq`. Expiry closes and fences the acquisition even if a later busy interval
-has reopened. Its old tags remain valid service ownership but become
-acquisition no-ops, and a later eligible commit may create a successor. An
-acquisition that stays continuously busy never arms this quiescent deadline.
-
-Let `[T_acq^-(t), T_acq^+(t)]` include the checked elapsed bounds of a current
-open interval when one exists. Anchor `a` retains its `f_anchor`,
-busy-coordinate lower bound `T_a^-`, and checked counted normalized work
-`W_a`. Define its conservative elapsed upper bound
-`D_a^+(t) = max(timer granularity, T_acq^+(t) - T_a^-)`. While `W_a=0`, its
-candidate is absent; while `D_a^+(t) <= H_acq`, it is authority-live; above
-that boundary it is diagnostic-only. A positive-work authority-live anchor's
-current exact suffix candidate is:
-
-```text
-r_a(t) = floor(8 * W_a / D_a^+(t))
-r_acq(t) = max r_a(t) over authority-live anchors.
-```
-
-Every candidate is a separate post-anchor achieved-service lower bound; Core
-maximizes rates but never sums them. Retaining every anchor until its authority
-end or acquisition terminal avoids an eviction rule that repeatedly discards
-the only mature recent suffix. Since live anchor lower coordinates are at least
-`q_acq` apart, at most `floor(H_acq / q_acq) + 1 <= J_acq` are authority-live.
-Arbitrarily small Product commands therefore cannot consume the anchor bound
-before a high-BDP proof. Checked counter or coordinate exhaustion fences the
-old acquisition before an otherwise-admitted Product commit; that commit may
-create a zero-work successor without blocking Product. Observation may rotate
-only when all of its independent optional authorities admit the new head. A
-capacity contradiction despite the spacing proof is an evidence-local
-internal fault: it fences acquisition and never fails Product.
-
-Core re-evaluates current ordinary opportunities on every exact wake; the
-opportunity need not be the one present when `Acq_c` began. A candidate is publishable
-only when one evaluation fails with the current prediction solely because of
-rate and the same evaluation, with every non-rate fact unchanged and `C_c`
-replaced by `r_acq(t)`, reaches the reservation step. A positive candidate that
-does not satisfy this exact comparator remains acquisition-local. It cannot
-change `R_A`, close or rebase `Acq_c`, advance `f_acq`, refresh an expiry, or alter
-Product authority. Thus prompt small receipts and unrelated small Product
-flows add disjoint work but cannot repeatedly reset the integration interval.
-
-Publication is one serialized transaction: revalidate the acquisition scope,
-generation, exact maximizing anchor and work, busy time, authority horizon,
-candidate time, and frozen ordinary snapshot; name that source acquisition's
-frozen values `P_src=P_acq` and `H_src=H_acq`; capture one checked positive
-`P_pub` from the current exact carrier snapshot using the complete `P_acq`
-construction above, including its startup tuple and checked ceiling-to-ticks
-rule, and derive
-`H_pub = 10 * P_pub`; settle `Z_c` under the old prediction; install `r_acq` as
-the new `R_A` with absolute lifetime `H_pub`;
-close `Acq_c` and advance its exact commit fence; recompute ordinary selection
-under the new rate; and, only under the exact target-local predicate above,
-atomically open a zero-work successor whose first anchor stores that new fence
-as `f_anchor` and whose `P_acq/H_acq` equal the same `P_pub/H_pub` before
-waking. A race may prevent the later Product commit, but cannot unpublish the
-carrier term or let any token from the closed acquisition enter its successor.
-A successor created by this handoff tags only later commits. If the predicate
-is false or evidence state is unavailable, a later eligible commit may create
-the successor normally without blocking Product, but seamless active renewal
-is then not claimed. Failure to represent `P_pub`, `H_pub`, the active expiry,
-or successor state aborts this optional publication transaction without
-changing Product or current evidence.
-
-Active-term expiry does not close, rebase, or consume an unresolved `Acq_c`.
-After returning the prediction to `H_R`, Core applies the same fresh exact
-decision test to `r_acq`; it publishes only if that candidate now changes the
-decision, and otherwise the acquisition continues. Likewise, a successful
-same-carrier ordinary commit stops further synthetic DATA but does not destroy
-`Acq_c`: that Product command's later exact service is legitimate carrier work.
-`Acq_c` ends only on publication, its immutable quiescent freshness expiry,
-checked acquisition-identifier or duration/work exhaustion, explicit
-cancellation, or replacement/terminal of its exact session, direction,
-carrier, native-path, or authority-mode scope. Exhaustion
-of observation grant or optional local budget stops only synthetic admission
-while ordinary Product commits can still feed `Acq_c`; one source cannot erase the
-other source's accumulated legitimate work. Locator-only migration may
-preserve `Acq_c` only when it preserves the declared native-path epoch.
-
-This state is bounded by one active term, one acquisition with at most
-`J_acq` authority-live suffix anchors, checked clock/work counters, and the
-already-bounded exact token ledger. Its historical influence is also explicit:
-an acquisition may span an earlier active term's expiry, and a term it later
-publishes may remain live for one further fixed freshness lifetime. The first
-quiescent deadline bounds reuse across application-idle gaps without truncating
-one continuously busy high-BDP measurement. ReceiptMode
-therefore provides conditional finite recovery, not unconditional stable-rate
-renewal. No finite receipt horizon can continuously prove an arbitrarily high
-fraction of capacity on every high-BDP path.
-
-Authority mode is fixed at reducer creation except for one serialized explicit
-structural adapter-contract-unavailable or contract-revoked event, which MAY
-switch `NativeMode` to a ready `ReceiptMode` once in the same carrier-direction
-reducer lifetime. It compare-applies the exact structural fence, settles `Z_c`
-under the old prediction, clears native scheduling-rate authority and any
-pre-switch diagnostic receipt acquisition, freezes the current carrier-ledger
-commit ordinal as the earliest ReceiptMode acquisition floor, freezes
-`H_R = min(C_0, C_old)` from the positive prediction in force immediately
-before the switch, and advances both the authority revision and the applicable
-evidence ordinal in one mutation. Thus loss of the adapter contract cannot
-improve the carrier's rank by restoring the larger startup prior. A receipt
-term is authority-mode-scoped and cannot be reclassified afterward merely
-because the mode changed. The transaction preserves the observation
-generation, queued/native work, cumulative spend, and Product state. A low
-`B_op`, a missing poll, application idleness, wall time, or score change is not
-contract revocation. `ReceiptMode` MUST NOT switch back within that reducer
-lifetime; a new carrier incarnation constructs a new reducer and chooses
-authority afresh.
-
-The native timing projection has the same non-promotion rule. Let configured
-propagation and jitter priors be `P_0` and `J_0`. The latest qualified timing
-sample `(p,j)` overwrites persistent fallbacks with
-`H_P = max(P_0,p)` and `H_J = max(J_0,j)`. Fresh timing uses `(p,j)`; after its
-expiry the projection uses `(H_P,H_J)`. Therefore a high-delay or high-jitter
-sample cannot become a better path merely by expiring, while a later genuinely
-lower sample clears the caution back toward the configured priors. These
-memories reset only with the exact native network-path epoch. A locator-only
-port hop that preserves that epoch does not reset them.
-
-Every indivisible evidence transaction receives one checked, non-reused
-ordinal when its source event enters the serialized carrier-direction evidence
-actor. All terms from that event share the ordinal. An asynchronous proposal
-carries its capture ordinal and is rejected if a later carrier transaction has
-committed. Ordinal exhaustion disables new optional evidence publication for
-that exact carrier incarnation and clears its live ReceiptMode optional terms;
-scheduling uses the specified ReceiptMode pessimistic fallback. It is a
-structural failure of a NativeMode adapter's bounded live-publication contract
-and MUST be handled by the fenced revocation or carrier-terminal rule above,
-not by silently restoring `C_0`. It MUST NOT block the same frame's independent
-service, Product, credit, or terminal transition. A `NativeMode` controller
-update changes only native scheduling evidence; it does not fence,
-terminalize, pace, shrink, or refund the carrier-observation excitation that
-supplies its backlog. A native-controller update received in `ReceiptMode`
-cannot update scheduling evidence. This evidence ordinal does not replace the
-central authority revision `G`: an authority mutation advances `G` under the
-rules above, while an unrelated diagnostic evidence mutation need not do so.
-
-The freshness deadline of a detached rate, a ReceiptMode active rate, or a
-timing sample is fixed from the sample's own timing epoch. Later polling,
-idleness, transport shape, or application-limited state cannot move it.
-NativeMode `B_op` has the exact activation-fence and authority-revision
-lifetime instead of such a sample deadline. An open ReceiptMode acquisition
-may cross the active term's deadline
-because it has not yet published or reused that term's source. It retains only
-its own post-fence exact token sum and checked acquisition generation; its
-qualifying completion starts a disjoint active epoch.
-
-A local native controller may expose a current gain-free operational bandwidth
-model. It enters `C_c` only through the named NativeMode operational-bandwidth
-contract above; in every other mode it is diagnostic. Pacing rate is gain-
-scaled send intent and is never interchangeable with `B_op`. Raw ACK-window,
-Product-goodput, receipt, and peer rate estimates are also diagnostic in
-NativeMode. None can grant Product bytes, writer credit, qualification, path
-independence, or confidence. Peer `PATH_METRICS` is detached evidence and
-cannot select authority mode or serialize a local live-controller lifetime.
-
-An unambiguous MPP Data ACK may establish Product qualification, but
-ReceiptMode carrier rate counts a Product command only when its exact-copy
-peer-processing service frontier retires the tagged carrier-work token. A
-duplicated range with no exact copy receipt proves Product delivery but not
-which carrier served it. It contributes no carrier rate and triggers the causal
-output rule in Section 15.1. Native TCP ACKs, QUIC packet ACKs, stream writes,
-queue deltas, or receiver callbacks cannot invent Product attribution.
-
-MPP commit time precedes native departure and Core has no receiver delivery
-timestamp. A sender therefore MUST NOT imitate a packet delivery sampler from
-commit spacing or ACK callback spacing. Any finite-anchor approximation needs
-its own proved accuracy and adaptation bound; the only Core approximation is
-the explicit conservative-clock, `H_acq/J_acq/q_acq` suffix construction above.
-A locator, interface, route, carrier family, active-flow count, or configured
+Native ACK evidence may establish native transport service within its carrier.
+Only unambiguous MPP Data ACK coverage establishes unique Product delivery on
+an output. Data ACK coverage of duplicated bytes MUST NOT be attributed to
+either copy. A locator, interface, address, route, carrier family, or configured
 path count establishes neither capacity nor bottleneck identity.
 
 ### 10.3 No second congestion controller
 
 RTT, loss, ECN, jitter, queue, flight, pacing, and delivery observations MAY
-affect ranking, qualification of their own typed evidence, diagnostics, and
-application record or batch size. They MUST NOT shape the Product acquisition
-envelope `E_i` specified in Section 15.1. Native
-admission remains the exact bounded writer reservation and native backpressure;
-the portable atomic Product quantum only bounds one scheduler commitment. MPP MUST NOT
-use those observations to:
+affect advisory ranking, typed-evidence validity, diagnostics, and application
+record or batch size. They MUST NOT shape an independent Product congestion
+window. Native admission remains the bounded writer reservation and native
+backpressure. MPP MUST NOT use those observations to:
 
 - maintain an independent loss- or ECN-driven congestion window;
 - install a native-packet pacer;
@@ -2563,9 +1994,9 @@ use those observations to:
 - make a native controller's packet-loss decision.
 
 The output carrying the contiguous stream frontier remains bounded by shared
-MPP credit, enqueue capacity, and its native controller. An unproven additional
-output is limited to a bounded startup flight until sufficient unambiguous
-delivery evidence exists.
+MPP credit, enqueue capacity, configured Product resources, and its native
+controller. Additional-output placement and repair retain their exact Product
+identity and bounds from Section 15.
 
 ### 10.4 Bounded work and fairness
 
@@ -2573,33 +2004,27 @@ All MPP-owned scheduling, retention, reinjection, measurement, queue, and
 diagnostic allocations MUST have byte and item bounds plus one exact
 cancellation or terminal owner. A time bound is REQUIRED only where this RFC
 defines a timer or absolute retention lifetime. Native-owned reliable debt has
-no finite service-time guarantee while its native transport remains live; it
-stays charged within its byte/item cap until exact peer-processing receipt or
-writer/carrier terminal. Cancellation MUST reconcile each queue reservation,
-flight, measurement ticket, load lease, and registry entry exactly once.
+no finite service-time guarantee while its native transport remains live.
+Cancellation MUST reconcile each queue reservation, Product flight,
+measurement ticket, load lease, and registry entry exactly once.
 
-The final carrier writer MUST preserve class boundaries while work remains
-MPP-owned. At every MPP command-selection boundary it serves dependency-ready
-Control/lifecycle/Data ACK/carrier-service ACK/carrier-observation grant and ACK
-work first, then Realtime and Latency work, then due cause-bounded recovery,
-ordinary Throughput, optional repair, and carrier-observation DATA in that
-order. It re-enters this arbitration after each selected
-command; it need not wait for native delivery or acknowledgement and therefore
-does not impose one-frame stop-and-wait. A native-capacity release exposes
-pending higher-class work before another lower-class command is handed off.
-Priority MUST NOT overtake an earlier protocol prerequisite: OPEN, DATA, FIN,
-drain, detach, and other lifecycle fences retain their exact dependency order.
+The final carrier writer preserves dependency and class boundaries while work
+remains MPP-owned. At every command-selection boundary it serves
+dependency-ready Control, lifecycle, and Data ACK work first, then Realtime and
+Latency work, due cause-bounded recovery, ordinary Throughput, and optional
+repair. It re-enters arbitration after each selected command; it need not wait
+for native delivery or acknowledgment and therefore imposes no one-frame
+stop-and-wait. Native-capacity release exposes pending higher-class work before
+another lower-class command is handed off. Priority MUST NOT overtake an
+earlier protocol prerequisite.
 
 This priority cannot preempt bytes already accepted by a shared TCP socket,
-QUIC connection, kernel queue, or other native FIFO. No lower-class command
-that is still MPP-owned may be selected ahead of dependency-ready higher-class
-work, but the latter may additionally wait behind bounded mandatory MPP
-predecessor debt and a bounded amount of already-native-owned debt. Core states
-no finite time bound for native debt at zero service and no one-frame native-
-debt bound; either claim would require limiting handoff and BDP fill or
-separating traffic classes onto independent carriers.
-Within one class, positive quanta from continuously ready streams receive
-weakly fair turns and a blocked stream owns no writer turn. Persistent
+QUIC stream, kernel queue, or other native FIFO. No lower-class command still
+owned by MPP may be selected ahead of dependency-ready higher-class work, but
+the latter may wait behind bounded mandatory MPP predecessors and bounded
+already-native debt. Core states no finite time bound for native debt at zero
+service. Within one class, positive quanta from continuously ready streams
+receive weakly fair turns and a blocked stream owns no writer turn. Persistent
 higher-priority overload may starve lower classes; Core makes no contrary
 capacity claim.
 
@@ -2629,8 +2054,9 @@ data_sample_bytes:u64
 The fixed `PATH_METRICS` record is 116 bytes. Offsets 24, 53, 64, and 65 from
 the record start are respectively `rate_observed`, `pacing_rate_observed`,
 `bytes_in_flight_observed`, and `queue_observed`; the corresponding flight and
-queue 64-bit values begin at offsets 66 and 74. A peer-status path entry adds
-one state byte and one usage byte and is therefore 118 bytes.
+queue 64-bit values begin at offsets 66 and 74. A peer-status path entry is
+exactly `state:u8`, then `usage:u8`, then the 116-byte `PATH_METRICS` record,
+and is therefore 118 bytes.
 
 Metrics are advisory and scoped to the authenticated carrier instance and
 direction. `bytes_in_flight_observed` and `queue_observed` independently state
@@ -2655,9 +2081,9 @@ monotonic clock, this field is a remaining diagnostic horizon beginning at recei
 not a cross-host absolute deadline; transport time cannot increase the
 advertised duration.
 
-The receiving peer MUST NOT install, reconstruct, refresh, or downshift local
-`C_c`, NativeMode `B_op`, or ReceiptMode `H_R/R_A` from this detached record;
-only the producer's exact local evidence actor owns that authority.
+The receiving peer MUST NOT install, reconstruct, refresh, or downshift a local
+advisory rate or NativeOperational value from this detached record; only the
+producer's exact local evidence owner may publish such local authority.
 `rate_observed` is true when `delivery_rate_bps` belongs to a measured native,
 Product, or generic delivery epoch and remains true after that epoch expires;
 it is false for an unmeasured startup prior. A nonzero
@@ -2730,8 +2156,8 @@ answers on the same carrier with
 `PEER_STATUS_RESPONSE(request_id, code, paths)`, where `code` is `OK`,
 `DISABLED`, or `UNAVAILABLE`. A non-`OK` response contains no paths.
 
-Each path entry contains local state, directional usage, and one
-`PATH_METRICS` record. A response:
+Each path entry uses the exact 118-byte order defined in Section 11.1: local
+`state:u8`, directional `usage:u8`, then one `PATH_METRICS` record. A response:
 
 - MUST include only the authenticated requester's session;
 - MUST NOT contain endpoints, targets, service labels, credentials, or local
@@ -2774,9 +2200,9 @@ frames.
 | 2 | `SESSION_READY` | none |
 | 3 | `SESSION_CLOSE` | `reason:u8` |
 | 4 | `PATH_JOIN` | `session_id:u64, credential_id, path_id:u16, underlay:u8, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
-| 7 | `OPEN_STREAM` | `stream_id:u64, target, demand:u8` |
+| 7 | `OPEN_STREAM` | `stream_id:u64, target, demand:u8, trigger_bytes:u64, candidate_total:u8, candidate_tier:u8, phase:u8, candidate_ordinal:u8` |
 | 8 | `STREAM_DATA` | `stream_id:u64, offset:u64, length:u32, bytes` |
-| 9 | `STREAM_ACK` | `stream_id:u64, complete:u8, range_count:u16, ranges[range_count], service_count:u16, services[service_count]` |
+| 9 | `STREAM_ACK` | `stream_id:u64, complete:u8, range_count:u16, ranges[range_count]` |
 | 10 | `STREAM_MAX_DATA` | `stream_id:u64, max_offset:u64` |
 | 11 | `STREAM_RESET` | `stream_id:u64, reason:u8` |
 | 12 | `OPEN_DGRAM_FLOW` | `flow_id:u64, target` |
@@ -2793,25 +2219,22 @@ frames.
 | 27 | `STREAM_FIN` | `stream_id:u64, final_offset:u64` |
 | 30 | `STREAM_DETACH` | `stream_id:u64` |
 | 31 | `PATH_PROOF_DATA` | `path_id:u16, proof_id:u64, length:u32, bytes` |
-| 32 | `PATH_PROOF_ACK` | `path_id:u16, proof_id:u64, payload_bytes:u32, writer_epoch:u64, processed_frontier:u64` |
+| 32 | `PATH_PROOF_ACK` | `path_id:u16, proof_id:u64, payload_bytes:u32` |
 | 33 | `PATH_CAPACITY_DATA` | `path_id:u16, measurement_id:u64, length:u32, bytes` |
 | 34 | `PATH_CAPACITY_FINISH` | `path_id:u16, measurement_id:u64, payload_bytes:u64` |
-| 35 | `PATH_CAPACITY_RECEIPT` | `path_id:u16, measurement_id:u64, received_payload_bytes:u64, writer_epoch:u64, processed_frontier:u64` |
+| 35 | `PATH_CAPACITY_RECEIPT` | `path_id:u16, measurement_id:u64, received_payload_bytes:u64` |
 | 36 | `PEER_STATUS_REQUEST` | `request_id:u64` |
-| 37 | `PEER_STATUS_RESPONSE` | `request_id:u64, code:u8, count:u16, paths[count]` |
+| 37 | `PEER_STATUS_RESPONSE` | `request_id:u64, code:u8, count:u16, paths[count]`, each path `state:u8, usage:u8, PATH_METRICS:116B` |
 | 38 | `OPEN_IP_TUNNEL` | `tunnel_id:u64` |
 | 39 | `IP_TUNNEL_READY` | `tunnel_id:u64, mtu:u16, address_count:u8, addresses[address_count]` |
 | 40 | `IP_PACKET` | `tunnel_id:u64, packet_id:u64, length:u32, bytes` |
 | 41 | `IP_TUNNEL_CLOSE` | `tunnel_id:u64, reason:u8` |
 | 42 | `STREAM_REQUALIFY_DATA` | `stream_id:u64, probe_id:u64, offset:u64, length:u32, bytes` |
-| 43 | `STREAM_REQUALIFY_ACK` | `stream_id:u64, probe_id:u64, offset:u64, payload_bytes:u32, writer_epoch:u64, processed_frontier:u64` |
-| 44 | `CARRIER_OBSERVE_MAX_WORK` | `path_id:u16, max_charged_work:u64` |
-| 45 | `CARRIER_OBSERVE_DATA` | `path_id:u16, generation_id:u64, generation_offset:u64, length:u32, bytes` |
-| 46 | `CARRIER_OBSERVE_ACK` | `path_id:u16, generation_id:u64, cumulative_payload_bytes:u64, processed_observation_work:u64` |
-| 47 | `SERVICE_EPOCH` | `writer_epoch:u64` |
-| 48 | `SERVICE_ACK` | `service_count:u16, services[service_count]` |
+| 43 | `STREAM_REQUALIFY_ACK` | `stream_id:u64, probe_id:u64, offset:u64, payload_bytes:u32` |
+| 49 | `STREAM_RETURN_PLAN_FINAL` | `stream_id:u64, retained_count:u8, retained_ordinals[retained_count]` |
 
-Kinds 5, 6, 15, 19, 25, 26, 28, and 29 are reserved and MUST NOT be sent.
+Kinds 5, 6, 15, 19, 25, 26, 28, 29, and 44 through 48 are reserved and
+MUST NOT be sent. A receiver rejects them as unknown kinds.
 
 `SESSION_HELLO` and `SESSION_AUTH` are QUIC carrier-admission frames; TCP uses
 the Section 6.1 prelude. `PATH_DRAIN`, `PATH_CLOSE`, and kinds 33 through 35
@@ -2831,69 +2254,18 @@ is only authenticated return service; the sender's exact pending tuple names
 the forward target. A reusable path ID or the ACK carrier cannot substitute
 for either exact attachment incarnation.
 
-Kinds 44 through 46 are the carrier-directional observation transaction from
-Section 15.1. Each `path_id` MUST equal the authenticated physical carrier
-binding. `CARRIER_OBSERVE_MAX_WORK` is cumulative and nondecreasing; sent from A
-to B, it grants B observation work toward A. It elicits no ACK. DATA has exact
-normalized work `N + 32` bytes and consumes charged grant `N + 68`, reserving
-one maximum 36-byte cumulative ACK. Observation payload is not Product and MUST
-NOT enter a receive map, Data ACK, credit, or qualification state.
-
-On TCP, kinds 44 through 46 use the authenticated physical carrier writers and
-the socket incarnation is their channel epoch. On QUIC they are valid only on
-the one client-opened observation request stream of that physical connection;
-the first MPP frame in each half MUST be kind 44, including zero grant. DATA and
-its ACK cannot move to the control stream, a Product request stream, or another
-carrier. Receiving them in another context is a protocol violation.
-
-`CARRIER_OBSERVE_ACK` is cumulative in two independent coordinates. The
-generation payload frontier drives only live semantic evidence; the channel
-processed-work frontier retires complete observation tokens across current or
-retired generations. ACKs name but occupy no interval in that processed-work
-coordinate and elicit no ACK. Kinds 45 and 46 MUST NOT also enter generic
-Section 8.3 service accounting.
-
-Kind 47 establishes the Section 8.3 service coordinate for the carrying
-ordered writer direction. On TCP it appears once after carrier readiness and
-before the first positive generic service-bearing kind `8`, `31`, `33`, or `42`
-sent in that direction. On QUIC it appears once on each HTTP/3 request-stream
-send half that can carry one of those kinds, after its opening or acceptance
-prerequisite and before its first such command. It MUST NOT appear on the
-dedicated observation request stream. A second or zero epoch on the same writer
-is a protocol violation.
-
-Kinds 8, 31, 33, and 42 are generic service-bearing frames. Each occupies its exact
-normalized encoded-work interval in the carrying writer coordinate after full
-processing. The corresponding kinds 9, 32, 35, and 43 carry the cumulative
-service frontier that covers that command. A dedicated receipt first applies
-its service entry, then applies only its proof, capacity, or requalification
-semantics; it MUST NOT retire carrier work a second time. A later
-cumulative frontier subsumes a lost dedicated receipt, so repeated bounded
-transactions cannot leak native-owned carrier work while the writer remains
-live. `PATH_CAPACITY_RECEIPT` remains diagnostic in its capacity semantics;
-its service entry proves only processing of the exact forward command.
-
-Kind 48 is a Product-neutral cumulative service-only publication. A copy is
-valid on any authenticated carrier of the same session and may carry frontiers
-for any exact forward writer epoch in the opposite original-sender direction.
-It uses the same validation and retirement semantics as a `STREAM_ACK` service
-vector, carries no Product range or stream identity, and elicits no ACK. It is
-the required publication path when an origin logical stream has terminalized
-but its shared writer and processed frontier remain live. Only acceptance by
-the same-fate reverse queue defined in Section 8.3 discharges the receiver's
-dirty authority; other copies are optional acceleration.
+Kind 49 carries the one-shot response-startup finalization from Section 8.1.
+It is valid only for an existing reliable stream and may be sent on its current
+attachments. The retained ordinals are strictly increasing, each is less than
+the retained `candidate_total`, and each names an exact startup attachment
+enrolled under the same frozen return-plan signature. An empty retained set is
+valid. The first valid frame is absorbing; an equal duplicate is idempotent and
+a different duplicate is a protocol violation.
 
 ### 12.3 Common field encodings
 
 Each `ranges[range_count]` entry is `start:u64, end:u64` and represents
 `[start, end)`. `start` MUST be less than `end`.
-
-Each `services[service_count]` entry is
-`writer_epoch:u64, processed_frontier:u64`. The epoch is nonzero. Service
-entries in one frame MUST have distinct epochs and canonical increasing epoch
-order. The complete Product bit has no effect on their cumulative semantics.
-`SERVICE_ACK` requires `service_count > 0`; an empty service-only publication
-is noncanonical and rejected.
 
 A target begins with a type:
 
@@ -2915,6 +2287,7 @@ values are TCP `1` and UDP `2`. Directional wire fields use client-to-server
 `1` and server-to-client `2`. Boolean fields use `0` or `1`.
 
 Usage values are `AVAILABLE = 0` and `BACKUP = 1`.
+Return-plan phase values are `STARTUP = 0` and `ORDINARY = 1`.
 
 Close reasons are normal `0`, protocol error `1`, authentication failed `2`,
 and policy rejected `3`. Stream-reset reasons are refused `1`, timed out `2`,
@@ -2934,14 +2307,10 @@ Endpoints MUST enforce configured bounds for:
 - shared receive credit and retained stream ranges;
 - reorder bytes and intervals;
 - carrier queues and flight;
-- live ordered-writer epochs, sender token deques, dirty service frontiers,
-  service-vector entries, output-admission epochs and guarded-token counts,
-  aggregate carrier `Q/Z`, and ledger generations;
+- output-admission and attachment epochs, queue reservations, and Product
+  flight records;
 - datagram attempts, TTL, caches, fragments, and reassemblies;
 - proof, capacity, metric, and peer-status work;
-- observation channels and semantic generations, ReceiptMode acquisitions and
-  token tags, heads, cumulative work-token intervals, dirty ACK state, and
-  channel/session/principal grant escrow and spend;
 - TCP pool-member actors, reconciliation and reconnect attempts, group
   reservations, `PathId` allocation, and drain work;
 - TCP group removal and bound-reduction drains and carrierless-session
@@ -2967,19 +2336,21 @@ Failure publication MUST carry exact carrier-instance identity. A delayed
 status, ACK, measurement, or teardown from an older instance MUST NOT alter
 newer state.
 
-Loss of an established QUIC connection or its HTTP/3 carrier request stream is
-a failure of that exact carrier instance, not of every Product stream using the
-session. Carrier recovery preserves the logical stream and its exact retained
-ranges on surviving authenticated attachments. Frame-codec, authentication,
-configuration, and Product protocol failures do not acquire that recovery
-authority merely because they were observed through a QUIC carrier.
+Loss of an established QUIC connection or non-clean terminal loss of its
+HTTP/3 carrier-control request stream is a failure of that exact carrier
+instance, not of every Product stream using the session. Carrier recovery
+preserves the logical stream and its exact retained ranges on surviving
+authenticated attachments. Frame-codec, authentication, configuration, and
+Product protocol failures do not acquire that recovery authority merely
+because they were observed through a QUIC carrier.
 
 Peer abandonment of one operation-scoped HTTP/3 request-stream direction with
 application code zero is an operation-local, error-free shutdown signal. It
 MUST NOT alone publish carrier failure or warn as a carrier runtime error; the
 connection and sibling request streams remain authoritative. A nonzero
-application error, malformed/truncated frame, or terminal loss of a carrier
-control stream keeps its ordinary smallest-safe-scope failure semantics.
+application error, malformed/truncated frame, or non-clean terminal loss of a
+carrier-control stream keeps its ordinary smallest-safe-scope failure
+semantics.
 
 ## 14. Security and Privacy
 
@@ -3008,8 +2379,8 @@ grant policy or capacity.
 
 ### 14.2 Malicious evidence and resource exhaustion
 
-Peer metrics, usage, and capacity-measurement receipts are authenticated input. They MUST
-NOT:
+Peer metrics, usage, and capacity-measurement receipts are authenticated input.
+They MUST NOT:
 
 - grant receive credit;
 - release retained data;
@@ -3017,28 +2388,6 @@ NOT:
 - declare local health;
 - bypass queue or flight bounds; or
 - transfer state to another carrier instance.
-
-A carrier-service entry is separately authenticated in the exact session,
-original-sender direction, and ordered-writer epoch. The sender rejects a
-frontier above its assigned value; an equal or lower value is idempotent. An
-advancing value may retire only complete covered tokens and update exact
-same-output service provenance. It MUST NOT release Product, grant credit or
-qualification, rewrite usage or health, create native authority, or mutate a
-different physical carrier. The complete containing frame is validated before
-any service or Product mutation.
-
-Carrier-observation work is accepted only on its exact authenticated channel
-and atomically within channel, session-direction, and principal-direction
-grant/escrow. One-byte heads cannot amplify receiver work or reverse ACKs
-because accepted charged work includes the complete DATA frame plus one maximum
-ACK. Invalid, gapped, overlapping, replayed, grant-exceeding, or wrong-channel
-DATA changes no counter and elicits no ACK. Channel/session creation cannot
-renew principal startup authority, and terminal refunds only unused escrow.
-Observation grant or receipt MUST NOT grant Product credit, delivery,
-qualification, target policy, health, native send credit, or another carrier's
-authority. The principal-direction consumption ledger survives closure of its
-last session within the endpoint policy epoch; otherwise reconnect alone would
-replay the startup allowance.
 
 A peer cannot select the client's TCP pool size or member identity. The client
 MUST bound every carrier group to its configured current members plus the sole
@@ -3094,14 +2443,12 @@ native TCP, QUIC, MPTCP, or HTTP/3 timers.
 
 ### 15.1 Original placement
 
-Within the Regular or Backup set selected by Section 7, ordinary original-data
-placement uses a carrier-scoped service-pressure rank subject to shared receive
-credit, carrier enqueue capacity, and reorder bounds. The rank is advisory and
-does not claim to minimize unknowable receiver completion time. Product
-qualification is a consequence of ordinary placement; it does not own a
-fairness cursor, force a visit, or turn an unmeasured service prediction into
-fact. The optional non-delivering observation plane below can refresh
-suppressed carrier evidence without assigning a Data Sequence range.
+Within the regular or backup set selected by Section 7, ordinary original-data
+placement uses the advisory action rank in Section 10.2 subject to shared
+receive credit, configured Product resources, current attachment/output
+lifecycle, reorder bounds, and exact writer reservation. The rank does not
+claim receiver completion time and cannot deny the only action whose
+authoritative owners admit the command.
 
 The output carrying the contiguous frontier is governed by shared MPP credit
 and its native carrier. Before an additional output in either stream direction
@@ -3109,1490 +2456,320 @@ has durable, unambiguous Data ACK coverage for original transmissions, it may
 own at most one bounded startup flight. Native TCP ACK or QUIC packet-ACK
 evidence alone does not unlock mature additional-output placement.
 
-That live-contiguous treatment applies only while the lowest
-outstanding frontier is live: no retained complete Data ACK proves that its
-lowest range is missing. When a retained complete Data ACK omits that range,
-the frontier becomes an authoritative-gap frontier. Its exact owner remains
-the ordering, hysteresis, and recovery reference, but fresh originals on that
-owner MUST use the additional-output Product and reorder position until Data
-ACK progress advances or resolves the gap. Every live or
-authoritative-gap owner still passes the Product assignment authority defined
-below. Other eligible outputs are not globally paused. An
-incomplete positive ACK cannot create this state, and this rule neither lowers
-the configured reorder envelope nor changes native TCP or QUIC recovery.
+That live-contiguous treatment applies only while no retained complete Data ACK
+proves the lowest outstanding range missing. When a complete Data ACK omits
+that range, the frontier becomes an authoritative-gap frontier. Its exact owner
+remains the ordering, hysteresis, and recovery reference, but fresh originals
+on that owner use the additional-output Product and reorder position until Data
+ACK progress advances or resolves the gap. Other eligible outputs are not
+globally paused. An incomplete positive ACK cannot create this state, and this
+rule changes neither configured reorder resources nor native recovery.
 
 An output does not become the contiguous-frontier owner merely because it is
 the only output that can currently enqueue. While an unresolved lower original
 range belongs to another output, the survivor remains an additional output and
-MUST retain the corresponding Product flight and reorder bounds.
+retains the corresponding Product flight and reorder bounds.
 
-After current-generation exact tagged OriginalData Data ACK coverage reaches
-the configured positive qualification floor, the output gains durable `q_i`
-and its configured `P_i` assignment authority. Independently, Section 10.2 may
-accept typed evidence for the shared carrier direction. Duplicated Product
-bytes do not satisfy the volume floor or establish a delivery sample for either
-copy; an exact same-copy service receipt remains valid carrier-work evidence.
+For an active output, `q_i = 0` means unqualified and `q_i = 1` means
+qualified. After current-generation unambiguous OriginalData Data ACK coverage
+reaches the configured positive qualification floor, the output gains durable
+qualification `q_i = 1` and its configured `P_i` assignment authority.
+Duplicated Product bytes satisfy neither the volume floor nor a
+carrier-specific delivery sample. NativeOperational evidence remains
+independently scoped under Section 10.2. An application-limited native
+observation has only the update effect
+declared by that native-controller adapter and neither creates nor revokes
+Product qualification.
 
-In NativeMode, an app-limited transport observation has only the update effect
-declared by the named controller contract. It neither creates a wrapper rate
-nor revokes or expires `B_op`; current controller state retains scheduling
-authority for its exact activation fence and authority revision. In ReceiptMode,
-an app-limited native observation is diagnostic, and expiry of a qualified
-receipt term returns only
-to the Section 10.2 pessimistic fallback without manufacturing an improvement.
-Neither observation creates a Product admission generation or placement
-authority. Exact Product-volume qualification remains durable for the current
-active incarnation, so a ReceiptMode rate expiry neither demotes `P_i`
-assignment authority nor starts another qualification generation. Ordinary
-Product placed under that authority may mature later ReceiptMode evidence
-opportunistically.
+Reliable OriginalData uses separate Product-resource, lifecycle, and native-
+transport authorities. Its Product byte authority is independent of traffic
+class and TCP or QUIC underlay. Let:
 
-Reliable OriginalData uses resource, acquisition, and native-transport
-authorities that MUST remain separate. Its Product byte authority is independent
-of traffic class and TCP/QUIC underlay. Let:
+    I_0 = 10 * 1460 = 14,600 Product payload bytes
 
-```text
-I_0 = 10 * 1460 = 14,600 Product payload bytes
+    W   = min(configured stream window,
+              configured repair window,
+              configured reorder window)
 
-W   = min(configured stream window,
-          configured repair window,
-          configured reorder window)
+    P_i = min(W, configured path-flight window)
 
-P_i = min(W, configured path-flight window)
+    E_i = min(P_i,
+              max(I_0,
+                  configured qualification floor
+                  + maximum atomic Product quantum))
 
-E_i = min(P_i,
-          max(I_0,
-              configured qualification floor
-              + maximum atomic Product quantum))
-```
+W is the shared logical-stream Product resource envelope. P_i is exact output
+i's configured Product envelope for unique bytes awaiting MPP Data ACK. I_0 is
+portable startup Product geometry, not a claim about TCP MSS, QUIC PMTU,
+native congestion window, or achieved capacity. E_i is the Product risk cap
+for an unqualified additional output. Native windows, native send credit,
+pacing, or connection-wide QUIC limits cannot enlarge these Product resources;
+they remain independently enforced below them. Publication of zero P_i is
+complete negative output authority.
 
-`W` is the shared logical-stream Product resource envelope. `P_i` is exact
-output `i`'s configured Product envelope for unique bytes awaiting MPP Data
-ACK. `I_0` is the profile's immutable portable startup scoring prior, retained
-from the ten-segment initial-flight geometry; it is Product payload geometry,
-not a claim about the current TCP MSS, QUIC PMTU, native congestion window, or
-achieved capacity. `E_i` is the class- and underlay-independent Product risk
-cap needed to carry one complete qualification floor plus its possible final-
-quantum rounding. A native congestion window, available congestion credit, peer flow-
-control window, pacing estimate, or connection-wide QUIC limit cannot make
-unique low-sequence exploration safer and therefore cannot enlarge `E_i`.
-Those native authorities remain enforced by the exact writer below it. An
-exact output publication of zero `P_i` is a complete negative observation and
-MUST fail closed; global path discovery may use configured `P_i` only as an
-advisory projection before an exact output exists.
+Traffic class controls arbitration priority, path activation, and maximum
+atomic service quantum. It MUST NOT select a smaller W, P_i, initial reliable
+receive grant, or Data-ACK release rule. The initial STREAM_MAX_DATA authority
+is W; later grants are monotonic under Section 8. Advertising that authority
+does not allocate W bytes and bypasses no stream, repair, reorder, sparse-node,
+queue, or native-writer bound.
 
-Traffic class controls arbitration priority, path activation, and the maximum
-atomic service quantum. It MUST NOT select a smaller `W`, `P_i`, initial
-reliable receive grant, or Data-ACK release rule. The initial reliable
-`STREAM_MAX_DATA` authority is `W`; later grants remain monotonic under Section
-8. Advertising that authority does not allocate `W` bytes and does not bypass
-the configured stream, repair, reorder, sparse-node, or native-writer bounds.
-In particular, a latency-class or `Automatic` stream over QUIC MUST NOT begin
-with a class-specific Product window: such a window is an additional Product
-ACK clock above an already congestion-controlled carrier and imposes the hard
-throughput ceiling `8 * window / RTT` until replenishment.
+These Product envelopes are Data-ACK-clocked resource windows. If tau is the
+elapsed time from assignment until advancing Data ACK can release authority, a
+sole output can sustain no more than 8*P_i/tau bits per second from P_i alone,
+all outputs together no more than 8*W/tau from W alone, and an unqualified
+additional output no more than 8*E_i/tau until qualification. A profile
+claiming Product rates therefore declares `R`, the claimed rate for a sole
+output, and `R_aggregate`, the claimed aggregate rate across outputs. It needs
+`P_i` at least `ceil(R*tau/8)` for the sole-output case and `W` at least
+`ceil(R_aggregate*tau/8)` for the aggregate case over its claimed feedback-
+delay envelope. This is a necessary resource condition, not a throughput
+promise.
 
-These envelopes are safety and reordering authorities, but they are also real
-Data-ACK-clocked windows.  If `tau` is the elapsed time from Product assignment
-until the corresponding advancing Data ACK can release authority, then a sole
-output can sustain no more than `8 * P_i / tau` bits/s from `P_i` alone, and
-all outputs together can sustain no more than `8 * W / tau` bits/s from `W`
-alone.  An unqualified additional output is similarly bounded by
-`8 * E_i / tau` until it qualifies.  A profile intended to sustain Product
-rate `R` MUST therefore configure `P_i >= ceil(R * tau / 8)` for a sole-output
-case and `W >= ceil(R_aggregate * tau / 8)` for the aggregate case, using the
-largest feedback delay in its claimed operating envelope.  This is a necessary
-authority condition, not a throughput promise: native service, receive credit,
-reordering, application consumption, and loss can lower the result.  Core
-claims no target throughput merely from `W`, `P_i`, or `E_i`.
+Let O be the stream's unique OriginalData debt and O_i the subset assigned to
+exact output i. The effective assignment envelope is:
 
-Let `O` be the stream's unique OriginalData debt and `O_i` the subset assigned
-to exact output `i`. The effective assignment envelope `L_i` is:
-
-```text
-L_i = P_i  for the first owner when O = 0;
-      P_i  for the exact owner of a live contiguous frontier;
-      P_i  for a qualified additional output;
-      E_i  for an unqualified additional output.
-```
+    L_i = P_i  for the first owner when O = 0;
+          P_i  for the exact owner of a live contiguous frontier;
+          P_i  for a qualified additional output;
+          E_i  for an unqualified additional output.
 
 An authoritative-gap frontier and a sole currently enqueueable survivor whose
 lower range belongs to another output are additional outputs under this rule.
-For an exact pending OriginalData quantum of `N` bytes, commitment requires
-`O + N <= W` and `O_i + N <= L_i`, plus shared receive credit, current
-structural eligibility, reorder authority, and a real bounded writer-command
-reservation. The complete quantum MUST fit; there is no overshoot exception.
-Planning is advisory.
-After obtaining the writer reservation, the sender MUST revalidate the exact
-output incarnation, current position and qualification, `W`, `P_i`, and `E_i`;
-it then records exact Product ownership before publishing the command. Failed
-revalidation refunds the uncommitted writer reservation.
+For an exact pending OriginalData quantum of N bytes, commitment requires
+O+N <= W and O_i+N <= L_i, plus shared receive credit, structural eligibility,
+reorder authority, and a real bounded writer-command reservation. The complete
+quantum must fit; there is no overshoot exception.
 
-Ordinary numeric order uses only the current carrier-direction service
-prediction and propagation timing defined below. Sampled native queue, flight,
-loss, ECN, confidence, application-limited state, and active-flow count may
-qualify typed carrier evidence or diagnose service, but do not add independent
-score penalties and MUST NOT multiply or divide physical carrier capacity.
-They do not establish Product assignment qualification; only current-generation
-exact tagged Product delivery reaching the configured qualification floor
-changes an additional output from `E_i` to `P_i`.
+After obtaining the writer reservation, the sender revalidates the exact
+output and attachment incarnations, output-admission epoch, current position
+and qualification, W, P_i, E_i, receive credit, and source frontier. It then
+records Product ownership before publishing the command. Failed revalidation
+refunds the uncommitted reservation and changes no Product range. Data ACK or
+terminal Product cleanup releases O and O_i exactly once; native ACK does not.
 
-Those observations MUST NOT shrink or enlarge `W` or `P_i`, and the advisory
-score MUST NOT install another Product congestion gate above the writer. The
-selected TCP or QUIC writer, its bounded command admission, native socket or
-stream backpressure, pacing, congestion control, and recovery remain final
-native transport authority. A native ACK can reopen that native authority, but
-it cannot release `O` or `O_i`; only MPP Data ACK or terminal Product cleanup
-can do so. Recovery authority `K` remains separately bounded and cannot mint
-fresh OriginalData. None of these authorities bypasses shared receive credit,
-reorder, queue, repair, or configured resource bounds.
+Ordinary numeric order uses only the typed action terms in Section 10.2.
+Sampled native queue, flight, loss, ECN, confidence, application-limited state,
+active-flow count, and Suspect label may validate typed evidence or diagnose
+service, but do not add independent score penalties and MUST NOT multiply or
+divide a physical carrier rate. They neither shrink nor enlarge W, P_i, E_i, or
+shared receive credit.
+
+The selected TCP or QUIC writer, its bounded command admission, native socket
+or stream backpressure, pacing, congestion control, and recovery remain final
+native transport authority. An advisory score MUST NOT install another Product
+congestion gate above that writer. A native ACK may reopen native admission but
+cannot release Product debt. Recovery authority remains separately bounded and
+cannot mint fresh OriginalData.
 
 Attachment membership is not active path demand. A carrier-open transaction
-MAY publish one prospective load claim while asynchronous I/O is outstanding,
-but MUST release it when the attachment commits, fails, is cancelled, or is
-rejected. A current attachment publishes active demand exactly while it owns
-un-DataACKed unique OriginalData (`O_i > 0`). ReinjectedData does not create or
-retain that demand. Detach removes demand synchronously before asynchronous
-wire cleanup; retained old-incarnation Product debt remains in the stream
-ledger for ACK and recovery and MUST NOT be projected into a same-key physical
-successor.
+may publish one prospective load claim while asynchronous I/O is outstanding,
+but releases it when the attachment commits, fails, is cancelled, or is
+rejected. A current attachment publishes active Product demand exactly while it
+owns un-Data-ACKed unique OriginalData. ReinjectedData does not create or retain
+that demand. Detach removes demand synchronously before asynchronous wire
+cleanup; old-incarnation Product debt remains available for ACK and recovery
+and MUST NOT be projected into a same-key physical successor.
 
 Fresh OriginalData is reserved in the shared bounded carrier command queue
-before Product flight is published. That queue is the single staging resource
-and reservation linearization point for all Product actors sharing one native
-writer. Its exact pending-byte accounting is resource state, not renewable send
-credit, and MUST NOT impose a smaller one-frame or one-quantum stop-and-wait
-lease above the native transport. The carrier writer MAY continue through a
-bounded sequence of reserved commands without waiting for a native ACK, but
-re-enters class/dependency arbitration after each command; native `AsyncWrite`
-or QUIC stream flow control remains backpressure authority. Control and
-ReinjectedData retain their separate priority admission, while the common
-queue and configured Product envelopes continue to bound aggregate memory and
+before Product flight is published. That queue is the staging resource and
+reservation linearization point for Product actors sharing one native writer.
+Its pending-byte accounting is resource state, not renewable send credit. The
+writer may continue through a bounded sequence of reserved commands without
+waiting for a native ACK, but re-enters class and dependency arbitration after
+each command. Control and ReinjectedData retain their priority admission while
+the common queue and configured Product envelopes bound aggregate memory and
 ordering debt.
 
 Current local controller application-limited state is separate from the
-immutable application-limited provenance of a qualified delivery-rate epoch.
-Retaining, expiring, or replacing carrier evidence MUST NOT rewrite that
-current local state, and peer telemetry MUST NOT supply it. Native admission
-participates symmetrically in both directions through exact writer-command
-reservation and native backpressure. There is no request-only QUIC tie-break.
+application-limited provenance of a qualified rate epoch. Retaining, replacing,
+or invalidating evidence MUST NOT rewrite that native state, and peer telemetry
+MUST NOT supply it. Native admission participates symmetrically in both
+directions through exact writer reservation and native backpressure. There is
+no request-only QUIC tie-break.
+
+Connection-wide source staging precedes stream-offset assignment and may
+contain bounded work for several independently admitted outputs. It is
+governed by the shared stream, repair, reorder, and configured resource
+envelopes, not by one selected output's native congestion window. For reliable
+bulk work, one coherent view first selects the eligible output tier and then
+sets the allowance to:
+
+    min(W, sum(P_i for each output in that selected tier))
+
+Withdrawn, inactive, unschedulable, or zero-P_i outputs contribute zero.
+The exact tier order is non-stale Regular, non-stale Backup, stale Regular,
+then stale Backup; only the first nonempty eligible tier contributes. With one
+eligible output the allowance is exactly P_i. Traffic class may keep source
+reads and each atomic service turn smaller, but it does not replace this
+Product byte authority. Staging grants no output ownership or native
+reservation; every assignment still passes the exact checks above.
+
+An authenticated admission-active attachment may precede its first exact-
+instance measurement. It remains unproven and uses only configured startup
+priors and startup-flight bounds. Absence of measurement is not absence of an
+output; source admission is zero when the coherent selected tier contains no
+current eligible output with a positive Product envelope. Evidence from
+another carrier incarnation with the same path key MUST NOT be substituted.
+
+The Core startup score uses the following portable priors only where a more
+specific configured or typed observation is absent:
+
+    M_0   = I_0 + 30 = 14,630 normalized MPP bytes
+    RTT_0 = 333 ms
+    T_0   = RTT_0 / 2
+    J_0   = RTT_0 / 2
+    C_0   = 8 * M_0 / RTT_0, approximately 351 kbit/s
+
+A low or missing C orders alternatives but does not rate-limit, window-limit,
+or pace the sole admitting carrier. Missing evidence is never measured zero.
+
+Each output-admission epoch is checked and non-reusing within its exact output
+incarnation. Attachment admission creates the initial epoch. Revocation makes
+that epoch non-admitting before asynchronous cleanup. Exact requalification
+activates only the already-advanced successor epoch with q_i reset; it does not
+inherit predecessor Product qualification, rate evidence, queue reservation,
+or byte authority. A delayed predecessor event cannot revive the successor.
+Exhaustion leaves the output non-admitting until attachment replacement.
+Output or direction terminal revokes its current epoch without acknowledging
+retained Product.
+
+An OriginalData flight is evidence-eligible only when it was committed under
+the named current output-admission epoch and exact attachment incarnation while
+that output was admission-active and non-stale, and no later exact lifecycle
+transition has invalidated that evidence. The bit is retained with the exact
+flight and is cleared when that output enters stale/requalification authority;
+it cannot be reconstructed from a current output that merely reuses the same
+path key. Evidence eligibility grants no Product or native authority.
+
+For each active unqualified output, one Product qualification generation begins
+when the serialized stream owner commits its first current-epoch OriginalData
+quantum to that output. The commit freezes the exact positive configured
+qualification floor F_i and exact positive maximum atomic Product quantum
+N_i^max used by that commit and by E_i above. F_i MUST be representable by the
+implementation's range-index and byte-measure integer types. A later commit in
+the generation MUST present the same frozen pair; a mismatch fails without
+mutation. The commit also records the exact output-admission epoch and a tagged
+prefix of that OriginalData before publishing the already-reserved command.
+The generation grants no rate, credit, recovery, pacing, or native authority.
+
+Let T_i be the normalized set of nonempty disjoint outstanding tagged ranges,
+M_i its byte measure, and V_i the exact uniquely Data-ACKed tag volume. Before
+mutating the generation for an already admitted quantum, the implementation
+MUST prove 0 < N <= N_i^max, that the range is fresh non-reinjected
+OriginalData for this exact output and epoch, and that it overlaps no current
+tag. It then tags only the deterministic prefix of length:
+
+    x_i = min(N, F_i - V_i - M_i)
+
+when the subtraction is positive. Only unambiguous MPP Data ACK coverage of
+that exact current-generation OriginalData moves tag weight from M_i to V_i.
+Reinjection, ambiguous coverage, or terminal cleanup removes overlapping
+outstanding tag weight without increasing V_i. Let items(T_i) be the number of
+retained ranges. Because every normalized integer range is nonempty, every
+transition is clipped to the exact epoch and tagged ranges and preserves:
+
+    items(T_i) <= M_i <= F_i
+    0 <= V_i + M_i <= F_i
+
+A first/frontier commit may carry an admitted surplus beyond the remaining tag
+deficit; that surplus is useful Product but not qualification evidence. A
+rejected parameter, range, overlap, or authority check changes no generation
+state. No fallible step may remain between qualification/Product metadata
+mutation and publication of the already-reserved command.
+
+Accepted reinjection and Data ACK application for one stream direction share a
+serialized order. Exact qualification metadata is recorded before publishing
+the corresponding original command, and only an opaque receipt carried by the
+exact overlapping OriginalData flight can release a tag. If reinjection is
+recorded first, it removes overlapping current tags before a later ACK can
+verify them. If exact ACK application occurs first, it may verify the still-
+unique tag because a later duplicate cannot have caused that earlier ACK. An
+ACK received earlier but applied after reinjection is conservatively ambiguous.
+Native-carrier concurrency does not relax this Product-level serialization.
+
+When V_i reaches F_i, q_i becomes one even if the same ACK has no usable timing
+sample. Qualification is durable only for that active output incarnation and
+epoch. Rate changes, usage, rank, and application-limited observations preserve
+it. Stale or Requalifying entry, detach, or exact incarnation replacement
+revokes it, advances the output epoch once for that inactive interval, and
+resets q_i, V_i, and M_i without erasing unresolved Product debt. After exact
+requalification, only a later current-incarnation OriginalData commit can
+begin a new generation; predecessor tags cannot be reused.
+
+The retained OriginalData debt invariants are:
+
+    sum(O_i over all exact original owners) = O
+    O <= min(W, configured reorder authority)
+    O_i <= P_i
+
+E_i is a prospective commit ceiling, not a retroactive debt invariant. Every
+new unqualified-additional commit must leave O_i within its then-current E_i.
+A first/frontier or previously qualified output may retain O_i greater than a
+later E_i after a role transition, qualification revocation, or configured
+envelope reduction. Those transitions preserve exact debt under P_i, W, and
+reorder authority and admit no new unqualified-additional OriginalData until
+Data ACK or terminal cleanup restores current E_i headroom.
+
+Every ordinary positive quantum freezes a finite candidate order by structural
+tier, Section 10.2 score, uncertainty, and canonical action identity. It tries
+each candidate until one real writer reservation and every Product authority
+succeed, then ends after that one commitment. It does not allocate equal shares.
+Backup is considered only after every regular candidate fails the exact
+commit. A backup uses the same L_i rule and one backup commitment never promotes
+it ahead of regular candidates for a successor quantum.
+
+Each exact writer-admission resource owns a checked monotonic capacity
+generation. Reservation acquisition or refund, dequeue, close, policy or
+class-limit change, and an applied native-ready event advance it when the
+transition can change a positive reservation result. A captured proposal
+revalidates that generation at commit. Exhaustion invalidates captured
+proposals and prevents new reservation on that resource while preserving
+dequeue, refund, and terminal cleanup; replacement uses a fresh resource
+identity. This generation is a race detector, not byte credit or rate evidence.
+
+A zero-commit regular pass records the membership, lifecycle, Product-
+authority, and writer-capacity generations it exhausted. A backup proposal is
+valid only while those generations remain unchanged. An external advance
+before backup reservation restarts the regular pass. The generation advance
+caused by the successful backup reservation is part of that same transaction
+and cannot invalidate itself.
+
+A zero-commit scan drops every temporary reservation, arms the relevant source,
+Product-authority, writer-capacity, topology, and terminal wakes, rechecks exact
+state, and then parks. It cannot spin or treat advisory queue readiness as a
+reservation. Additions wait for a successor attempt; removal or replacement is
+skipped by exact revalidation.
+
+A positive ordinary commitment is durable successor work. While staged bytes
+remain and one exact candidate currently satisfies Product resources, receive
+credit, reorder authority, and writer readiness, the direction reconsiders
+higher-priority work and attempts a successor quantum without waiting for an
+unrelated socket, timer, ACK, or topology event. One actor turn may end after a
+bounded number of commits for cooperative fairness, but publishes one coalesced
+self-wake before yielding when that same exact predicate remains true. A raced
+predicate makes the finite scan arm exact wakes and park; it cannot self-wake
+again without positive work.
+
+The response-startup return plan in Section 8.1 is a separate finite one-shot
+prefix transaction. Its unresolved prefix ceiling does not refill on Data ACK,
+does not become a recurring Product window, and does not alter later ordinary
+ranking after finalization.
+
+TCP pool establishment remains owned by Section 7.2 and independent of
+instantaneous Product demand. A ready member enters the regular or backup set,
+receives no fixed traffic share, and uses the same Product, rank, queue, and
+native authorities as every other carrier. No Mbps value, transient utilization
+percentage, source address, locator, interface identity, application-flow
+count, laboratory condition, or fixed observation window may create, promote,
+or revoke a TCP pool member. Exact native failure changes liveness immediately;
+planned changes follow Section 7.2.
+
+Core does not infer a common bottleneck from path membership or transient
+comparative throughput. It makes no claim that more carriers aggregate
+capacity, that two carriers are independent, or that one scalar group can model
+overlapping shared resources. Such inference is outside Core Profile 7.
 
-Core does not construct numeric native send credit from sampled queue, writer,
-flight, Product counters, or their maximum. Those counters can overlap and use
-different units. Instead, every reliable data-bearing command owns one exact
-carrier-work token in the normalized unit of Section 10.2. The token exists in
-exactly one of these disjoint stages:
-
-```text
-provisional reservation -> MPP queue -> native-owned -> peer-processed
-```
-
-An exact cancellation before native handoff retires a provisional or queued
-token without claiming service. Dequeue and final writer handoff move the same
-token to native ownership. A generic kind `8`, `31`, `33`, or `42` allocates its
-writer-epoch interval; observation kind `45` instead allocates its exact
-observation-channel work interval. Local write completion does not retire
-either. The corresponding advancing authenticated frontier retires the covered
-native-owned token after peer processing. Exact carrier or observation-channel
-terminal may retire the tokens in its exact scope without claiming service.
-Product ownership `O/O_i`, native carrier-work ownership, receive credit, and
-writer reservation are intentionally distinct authorities.
-
-Each active reliable session direction has per-stream ordinary Product
-placement and Product-neutral per-carrier observation planes. Ordinary
-placement is scoped to stream and attachment incarnation and assigns fresh Data
-Sequence ranges. Observation is scoped to carrier/channel incarnation and
-assigns none. Both create exact carrier work when they publish a data-bearing
-command, but observation uses its independent cumulative processed-work
-coordinate rather than a generic ordered-writer service interval.
-
-For one exact carrier direction `c`, let `Q^p_{c,h}`, `Q^q_{c,h}`, and
-`Q^n_c` be normalized work owned respectively by provisional reservations,
-the MPP queue, and the native writer, where `h` is the arbitration priority.
-Let `Q^t_c = Q^n_c + sum_h(Q^p_{c,h} + Q^q_{c,h})`, let `K^t_c` be the
-number of tokens in all three stages, and let `K^n_c` be the native-owned
-subset. Let the finite checked `N^B_c` and `N^I_c` be respectively that exact
-carrier direction's immutable all-stage carrier-token byte and item
-authorities. A data-bearing carrier requires `N^I_c >= 1` and `N^B_c` at least
-the largest atomic positive encoded-work command that its profile permits;
-otherwise configuration fails before carrier publication. These authorities
-are fixed when the carrier direction is created; changing one
-requires an exact replacement carrier identity rather than mutating a live
-bound beneath retained debt. Let `Z_c` be predicted remaining native-owned
-service work. At every linearization point:
-
-```text
-Q^p_{c,h} >= 0, Q^q_{c,h} >= 0, Q^n_c >= 0,
-Q^t_c = Q^n_c + sum_h(Q^p_{c,h} + Q^q_{c,h}) <= N^B_c,
-0 <= Z_c <= Q^n_c,
-0 <= K^n_c <= K^t_c <= N^I_c.
-```
-
-These totals and their clock belong to the physical carrier direction. All
-QUIC HTTP/3 writer epochs on one connection map into the same `Q/Z`; giving
-each writer its own clock would manufacture one full `C_c` of service per
-stream. Writer epochs retain exact token/frontier identity but no independent
-capacity.
-
-Queued or provisional work does not drain with wall time. Creating one exact
-token of work `w` atomically reserves its eventual native-ledger byte and item
-slot together with its writer-command reservation. It requires
-`Q^t_c + w <= N^B_c` and `K^t_c + 1 <= N^I_c`. A failed reservation publishes
-no token or Product owner and lets ordinary finite candidate selection try an
-alternate carrier. Zero-coordinate `STREAM_ACK`, `SERVICE_ACK`, and dedicated
-receipts own their separately bounded Control-queue reservations but no
-carrier-work token, so positive token exhaustion cannot consume their
-same-fate receipt authority or create ACK recursion.
-An ordinary payload quantum larger than the profile's maximum fitting atomic
-work is split before Product assignment; an indivisible positive protocol
-command that cannot fit is rejected before publication. Neither case leaves
-partial Product ownership or a provisional token.
-
-Moving a reserved token from queue to native ownership then preserves
-`Q^t_c` and `K^t_c`, increments `K^n_c`, and adds `w` to `Z_c`; it cannot lose
-a second capacity race after Product publication. Cancellation before handoff,
-receipt after peer processing, or exact terminal removal releases the exact
-all-stage byte and item reservation and publishes the corresponding capacity
-wake. The shared carrier-ledger generation covers reservation, transfer, and
-release, so concurrent writers cannot each consume the same last byte or item.
-At zero reverse service the separately bounded Control queue can itself fill;
-Core then promises bounded backpressure, not impossible progress.
-
-`N^B_c` and `N^I_c` are resource bounds, not another pacer or congestion
-window. They MUST NOT be derived, divided, shrunk, or expanded from sampled
-rate, RTT, loss, ECN, active-flow count, or controller flight; doing so would
-install another transport controller. They nevertheless can impose feedback-clocked ceilings: if a token
-remains charged for service-receipt delay `tau_s`, then the byte authority
-alone can cap publication near `8 * N^B_c / tau_s`, and the item authority can
-cap it near `N^I_c / tau_s` commands/s. A claimed operating
-profile MUST size both above its maximum intended encoded-work BDP and command
-rate over the claimed same-fate receipt delay.  Core claims bounded memory and
-honest backpressure, not target throughput, from these authorities.
-
-Before any later carrier-ledger event at `t`, the one shared native service
-clock settles:
-
-```text
-Z_c(t) = max(0, Z_c(t0) - C_c * (t - t0) / 8).
-```
-
-There is exactly one such clock per carrier direction, not one clock per
-logical output, stream, or work token. Applying an exact service receipt first
-removes the covered tokens from `Q^n_c`, then sets
-`Z_c = min(Z_c, Q^n_c)`. It does not subtract the covered bytes a second time.
-A current-rate transition first settles through its exact boundary using the
-old `C_c`, then installs the new value. The clock retains its fractional
-service remainder, never creates future credit, and is invariant within one
-representational quantum to splitting one interval across polls or events.
-
-For pending priority and dependency key `k`, let `Pred^m_c(k)` be the exact set
-of provisional or queued tokens that the carrier arbiter proves the command
-cannot overtake: unmet dependencies, higher class, earlier same-class order,
-and any cross-writer work for which no central ordering certificate proves
-overtaking. Define the carrier debt ahead of that command as:
-
-```text
-D_c(k) = Z_c + sum of normalized work in Pred^m_c(k).
-```
-
-Every already-native command is included because MPP can no longer preempt it.
-A lower-priority queued token may be excluded only when the shared carrier
-arbiter and its generation prove that this command will hand off first. Across
-independent QUIC writers, absent that proof it remains in `Pred^m_c(k)` because
-native inter-stream service order is not portably observable. Handoff moves one
-must-precede token from `Pred^m` to `Z_c` with its full work, so the score cannot
-gain a fictitious discount. If `M_c > 0` is the pending command's exact
-normalized encoded work, `C_c > 0` the Section 10.2 carrier service prediction,
-and `T_c` the current one-way propagation prediction, the advisory
-service-pressure score is:
-
-```text
-S_c(k, M_c) = T_c + ceil(8 * (D_c(k) + M_c) / C_c).
-U_c          = max(J_c, timer granularity).
-```
-
-`S_c` is evaluated in an extended nonnegative time domain. Implementations
-compare finite terms with checked widened arithmetic; if the advisory sum,
-product, quotient, or duration is not representable, that candidate's score is
-`+infinity` for this frozen ordering pass. Infinity is worst rank, not
-structural ineligibility or enqueue refusal. If it is the only candidate whose
-real Product and writer authorities admit, Core still attempts that exact
-commit. Thus advisory arithmetic cannot contradict work conservation.
-
-The score and uncertainty use current carrier-scoped evidence. Before evidence
-exists they use carrier startup priors. Let `M_0` be the canonical normalized
-encoded work of one `STREAM_DATA` carrying `I_0` Product bytes; under this wire
-profile `M_0 = I_0 + 30 = 14,630` bytes. When omitted, the timing priors are
-`RTT_0 = 333 ms`, `T_0 = RTT_0 / 2 = 166.5 ms`, and `J_0 = 166.5 ms`, while
-`C_0 = 8 * M_0 / RTT_0` (approximately `351 kbit/s`). A low or unknown `C_c` orders alternatives but
-does not rate-limit, window-limit, or pace the sole admitting carrier. Missing
-evidence is never measured zero.
-
-All ownership-ledger arithmetic is checked fixed-point arithmetic. Time
-projection rounds up; achieved-service bounds round down. An unrepresentable
-frame/work amount is rejected before reservation and changes no Product or work
-ownership; overflow of a live ownership counter takes the absorbing terminal
-path below. Advisory score overflow follows the `+infinity` rule above and
-never removes an otherwise admitting carrier. Every provisional addition, transition,
-cancellation, receipt, rate boundary, and ordinary terminal clear advances a
-checked non-reusing carrier-ledger generation. Candidate apply binds and
-revalidates that shared generation, the complete scheduling-rate authority
-stamp, evidence ordinal, priority, `M_c`, exact writer generation, and Product
-authorities. Thus concurrent streams cannot all quote the same empty carrier
-and then publish unaccounted work.
-
-Carrier-ledger generation exhaustion is not an ordinary failed proposal,
-because existing receipts and terminal cleanup must still make progress. The
-last representable successor is reserved as an absorbing `Exhausted` state. An
-attempt to allocate it atomically makes the carrier direction non-admitting,
-invalidates every captured plan, and performs exact carrier-terminal cleanup
-without allocating another numeric generation or acknowledging Product. The
-physical carrier closes through ordinary exact-failure recovery; retained
-Product survives. Thereafter only idempotent terminal cleanup and stale-receipt
-no-ops may touch that exhausted ledger. It never wraps, saturates as a live
-generation, or admits a new Product or work token.
-
-Only a successful command commitment, after real writer reservation, creates
-one provisional work token. The same infallible mutation records Product or
-optional ownership when applicable and advances the shared ledger generation
-before publication. Failed revalidation removes the provisional token and
-refunds its reservation. Publication moves it to the queue; writer handoff
-moves it to native ownership. Reinjection, observation, and requalification
-create their own copy-specific carrier tokens even when they create no new
-Product owner. Product Data ACK never retires native-owned `Q^n`, settles
-`Z_c`, or claims carrier service. Its sole carrier-ledger removal is Section
-8.5's atomic complete-range cancellation of an exact still-queued original;
-partial queued work and native-owned work remain charged.
-
-The score is a deterministic rank, not a claimed receiver-completion bound.
-It makes no assertion that historical service is future service, paths have
-independent or additive bottlenecks, flow shares sum to carrier capacity, or
-one command completes by `S_c`. Loss, confidence, active-flow count, carrier
-family, and a `Suspect` label add no independent numeric penalty. Their valid
-effect enters through typed carrier rate/timing evidence or structural
-eligibility. In particular, physical `C_c` MUST NOT be divided by the number
-of active Product flows: the shared ledger already represents their work.
-
-For the same selected structural tier, let `b` be the best candidate. An
-eligible incumbent `o` is retained while:
-
-```text
-S_o <= S_b + U_o + U_b.
-```
-
-A challenger replaces it only under the strict reverse inequality. This
-deadband is a deterministic anti-flap rule, not a bound on prediction error or
-a guarantee of optimal completion. An evidence expiry is an exact wake;
-Section 10.2's pessimistic fallback ensures expiry alone cannot improve rate or
-timing. Exact identity is the final tie break.
-
-Once an original token is native-owned, carrier service accounting cannot by
-itself distinguish two Product-release worlds: that original on output `i` may
-have served, or a reinjected copy on another output may have caused the same
-Data ACK. Wall projection may already have reduced that original's `Z_c` to
-zero even though its exact native token remains. Core therefore retains an
-exact nonnumeric ambiguous-release guard on that native-owned token rather
-than inventing an output rate penalty or an independent assignment ordinal.
-A queued token is different: its exact stage proves non-service and follows
-Section 8.5's cancellation or unguarded-retention rule.
-
-Every published OriginalData owner records its exact output incarnation,
-current checked output-admission epoch, exact carrier-work token, and whether
-same-copy service has been proved. Product publication and movement of the
-token from provisional reservation to the queue are one transaction, so an
-externally visible Product owner always names a queued or native-owned token.
-An advancing same-writer service frontier marks every covered linked original
-as same-copy-served before retiring the carrier token. A partial or complete
-Data ACK that releases any part of an original still lacking that proof first
-applies Section 8.5's complete-range queued cancellation when available. If
-the token is native-owned, the transaction sets one idempotent guard bit on
-that exact still-live token before Product release. A partly unacknowledged
-queued command remains unguarded because its stage is exact proof of
-non-service; ACK fragmentation or overlap cannot create another guard.
-
-Each output maintains the count of guarded tokens bound to its current
-output-admission epoch. It is guarded exactly when that count is nonzero. A
-later exact service frontier clears the token's bit and decrements that count
-once. A Product-published queued token may otherwise be cancelled only in the
-same transition that makes its bound output-admission epoch non-admitting or
-terminal, that terminalizes the Product itself, or the complete-range Data ACK
-case in Section 8.5 before any guard exists. Cancellation cannot silently drop
-a current guard while preserving fresh admission. Native-owned tokens remain
-until exact service receipt or writer terminal as specified below.
-
-The output-admission epoch is the qualification epoch defined below; there is
-only one output-local lifecycle fence. A newly admitted attachment owns its
-initial checked epoch. The `AdmissionActive` to `Revoked` transition allocates
-the checked non-reused successor as non-admitting. Successful exact
-requalification activates that already-advanced epoch with zero current guards
-and `q_i = 0`; it does not allocate another identity and inherits no carrier
-rate, Product qualification, or byte authority. Tokens, guards, Product owners,
-and carrier debt from the predecessor remain bound to that predecessor epoch
-until their exact service, cancellation, Product, or writer terminal rules
-apply. A delayed predecessor ACK can therefore guard only its predecessor and
-cannot relatch the successor. Exhaustion makes the exact output permanently
-ineligible for a successor epoch without changing existing Product or carrier
-work; attachment replacement is required. Exact output incarnation or
-direction terminal revokes its current epoch. One active output epoch binds one
-ordered-writer epoch in its send direction; independent writer frontiers are
-never merged to manufacture proof.
-
-Usage tier remains the outer structural order. Core first tries unguarded
-Regular outputs by `S/U`, then guarded Regular outputs as fallback. It may
-consider Backup only after no Regular output can complete the exact commit, and
-then tries unguarded Backup before guarded Backup. A guarded output therefore
-cannot beat an unguarded peer in the same usage tier, a sole guarded Regular
-remains work-conserving, and an administratively Backup output never jumps an
-admitting Regular merely because of the guard. The guard grants no bytes, does
-not change `S_c`, and does not bypass `W/L_i`, receive credit, reorder
-authority, writer admission, or peer `PATH_STATUS`.
-
-Native handoff gives a token no MPP wall deadline. Receipt latency includes
-ordered native debt, native flow and congestion control, peer scheduling, and
-reverse receipt service; Core has no valid finite upper bound for that sum and
-MUST NOT close a healthy slow writer by inventing one. Every native-owned token
-and guard remains charged within the aggregate all-stage `N^B_c/N^I_c`
-byte/item authority until its
-exact cumulative peer-processing receipt or the exact writer/carrier terminal
-rules in Section 8.5. At the cap, the physical carrier direction admits no new
-positive carrier-work token; sibling QUIC writers share that result. Other
-carrier directions and physical carriers remain independent, while a sole
-carrier direction exposes honest bounded backpressure. Zero-coordinate
-receipts retain their separate Control-queue authority.
-
-Conditional progress requires native service, peer processing, same-fate
-reverse service, and fair actor/writer arbitration. At zero service, under
-persistent higher-priority overload, or while an authenticated peer retains a
-live but nonprocessing writer, `Q^n` and an ambiguous-release guard may persist
-without a finite reuse guarantee. This is bounded state, not permission to
-refund, recycle, or pretend service. Provisional and queued work remains
-separately bounded and follows exact handoff, cancellation, and terminal
-ownership. The token guard remains the separate ambiguous-Product-release
-mechanism.
-
-Every ordinary positive quantum freezes a finite regular-before-backup
-candidate order under the `S/U` rank and incumbent hysteresis above, tries exact outputs
-until one real writer reservation and all Product authorities succeed, and
-ends after that one commitment. It does not give every output an equal byte
-allotment. Carrier evidence orders candidates and estimates relative service
-pressure; it is not Product or native byte authority. Backup
-is considered only after every frozen Regular candidate has failed the current
-exact commit. A Backup uses the same exact `L_i` as any other output: `P_i` for
-the first owner, live-frontier owner, or qualified additional output, and `E_i`
-only for an unqualified additional output. Mere structural Regular membership cannot deadlock
-the stream after every Regular writer or authority has failed, and one Backup
-commit does not promote it ahead of a Regular on a successor quantum.
-
-Each exact writer-admission resource owns a checked monotone local capacity
-generation. Enqueue, dequeue, reservation acquisition or refund, close, policy
-or class-limit change, and an applied native-ready event MUST advance it when
-that transition can change the result of an exact positive reservation. A
-capacity event not yet serialized is ordered after the current mutation; once
-applied it cannot change reservation outcome without advancing the generation.
-Generation exhaustion fails later advisory certificates closed and arms no
-reused value. It atomically makes that exact writer-admission resource
-non-admitting for new reservations and invalidates every captured certificate;
-existing dequeue, refund, receipt, and terminal cleanup remain permitted but
-cannot reopen admission. The resource then reaches exact writer terminal or is
-replaced under its ordinary lifecycle with a fresh resource identity. This
-generation is a race detector, not byte credit, path evidence, or a polling
-counter.
-
-A zero-commit Regular pass records the exact Regular membership, eligibility,
-Product-authority, and writer-capacity generations that it exhausted. A Backup
-certificate is valid only while all those generations remain unchanged. Backup
-apply validates them immediately before and atomically with acquiring the exact
-Backup writer reservation. An external advance before that linearization
-restarts the Regular pass. The identified capacity-generation advance caused by
-the Backup reservation itself is part of the same successful mutation and does
-not invalidate its own certificate; an event serialized afterward belongs to
-the successor quantum, which starts with Regular again. Unchanged structural
-presence of a still-non-admitting Regular does not invalidate Backup.
-
-A zero-commit attempt scan MUST drop every temporary reservation, arm the
-relevant source, Product-authority, writer-capacity, topology, and terminal
-wakes, recheck exact state, and then park. It cannot spin or treat an advisory
-queue-ready sample as a reservation. Same-tier additions wait for a successor
-attempt; removal or replacement is skipped by exact revalidation and cannot
-retarget the pending quantum.
-
-A positive ordinary commitment is itself durable successor work. While staged
-source bytes remain and there exists one same exact candidate `i` for which
-`W/L_i`, receive credit, reorder authority, and writer readiness are all
-currently true, the direction MUST reconsider higher-priority work and then
-attempt a successor quantum without waiting for an unrelated socket, timer,
-ACK, or topology event. The existential predicate cannot combine authority
-from one candidate with writer readiness from another. One actor turn may end
-after a bounded number of commits for cooperative fairness, but it MUST publish
-exactly one coalesced self-wake before yielding when that same predicate still
-holds. A raced advisory predicate merely causes the successor finite scan to
-arm exact wakes and park; it cannot self-wake again without positive work. Each
-loop therefore
-either commits positive bytes, eliminates one frozen candidate, or parks after
-the wake/recheck protocol; it cannot become one-quantum-per-external-wake or
-busy-poll an unchanged writer.
-
-Queue reservation itself is the portable native-admission capability for that
-exact writer. Together with the all-stage carrier-token reservation it
-precharges the command before Product publication;
-cancellation before native handoff refunds it and retires the same provisional
-or queued work token. Dequeue transfers reservation ownership to the writer
-and moves the token into native ownership; local writer completion releases
-only the transient writer-command reservation, not the token's all-stage byte
-or item reservation. The token remains in `Q^n_c` and charged to `Q^t_c/K^t_c`
-until its exact
-peer-processing receipt or exact carrier terminal. A QUIC logical-stream
-writer reservation does not claim connection-wide native credit; QUIC
-connection flow control and congestion control remain authoritative below it.
-This separation is symmetric across request/response and TCP/QUIC.
-
-Ordinary service-pressure ranking alone cannot promptly rediscover a carrier
-that it does not feed: a still-slow world and a recovered world are
-observationally identical. Sending unique Product bytes buys the information by
-risking a Data Sequence hole. Core instead defines optional **carrier
-observation**: encrypted synthetic payload carried and discarded on one exact
-physical carrier direction. It creates no Product owner, source lease,
-receive-map entry, Data ACK horizon, receive credit, qualification tag, or
-Product delivery sample. Its loss, reordering, or terminal cleanup cannot open
-a Product gap.
-
-Observation scope is the tuple `(authenticated session generation,
-original-sender direction, carrier incarnation, active native activation
-fence, observation-channel epoch, generation_id)`. Carrier, activation, and
-channel identities are equality fences, not locators, capacity evidence, or
-rank. A locator-only QUIC migration that preserves the exact active
-`PathData`/controller activation preserves scope; installation or restoration
-of another activation does not. Each carrier direction has at most one live
-semantic observation generation, while different carriers may run generations
-concurrently. No Product stream owns a generation or contributes a separate
-startup allowance merely by existing.
-
-Carrier observation is eligible only while at least one ordinary pending
-opportunity in that session direction has effective `Throughput` demand.
-`Automatic` retains its existing latency-first classifier; an explicit
-throughput hint may opt in immediately. Polling, Product flight, or observation
-itself cannot create demand. Latency and realtime work never starts synthetic
-observation, although their ordinary traffic may naturally refresh native
-evidence. Before every synthetic head, the coordinator also requires no pending
-effective `Realtime` or `Latency` work anywhere in that same session direction.
-This direction-wide sensitive-pressure gate is required even when that work
-uses another writer or carrier, because local writer priority cannot disprove a
-shared Wi-Fi, ISP, relay, or egress bottleneck. It stops new optional heads but
-cannot preempt already-MPP-queued or native-owned bounded observation debt and
-therefore makes no zero-latency-interference claim. It also makes no assertion
-about another session or external traffic; process-global coupling without
-resource evidence would create unrelated-tenant starvation.
-
-Observation starts only when rate is the causal blocker for an exact frozen
-ordinary opportunity. Core reruns the ordinary candidate algorithm with every
-fact unchanged except that the target carrier's `C_c` is replaced by the
-largest representable positive rate. Usage tier, guard, Product authority,
-credit, writer state, debt, propagation, uncertainty, identities, and incumbent
-remain unchanged. A target is rate-causal only when this counterfactual reaches
-its reservation step while the real evaluation does not. If the
-counterfactual fails, additional rate cannot resolve the blocker; Core arms the
-exact non-rate wake and sends no observation.
-
-For the integer score in this profile, let `S_o` be the incumbent score in
-timer ticks and define:
-
-```text
-H = S_o - U_o - U_c - T_c
-N = 8 * (D_c(k) + M_c) * ticks_per_second
-q(C) = ceil(N / C).
-```
-
-Strict replacement requires `q(C) < H`. In the unbounded positive-integer rate
-domain a winning rate exists exactly when `H >= 2`, and the exact derived
-threshold is `C_req = ceil(N / (H - 1))`. In a finite implementation it exists
-only when the ordinary comparator also wins at the largest representable rate;
-an unrepresentable `N`, threshold, or score is not silently saturated into a
-win. Division by `H` is incorrect because completion rounds upward and
-replacement is strict. Implementations MUST use the existing checked score
-comparator, or monotone search over that comparator, as authority; the scalar is
-explanatory and cannot become a second arithmetic path. The counterfactual
-includes current `D_c`, not only the new command, and is revalidated after any
-debt, incumbent, uncertainty, evidence, or identity change. If an ordinary
-commit already feeds the target, synthetic observation is unnecessary even
-when its prediction is low.
-
-Observation arbitration has a Product-neutral finite cyclic cursor. One pass
-freezes the exact carriers in the selected usage tier for which some current
-ordinary opportunity is rate-causal, beginning after the last surviving
-boundary. A target already receiving ordinary work, already owning a live
-generation, lacking an observation channel, or failing any exact authority is
-skipped and advances the cursor. Removal is skipped without rewind, additions
-wait for a successor pass, and a tier or session-direction change invalidates
-the pass. A successful first-head publication starts that target's generation
-and advances the boundary; it does not end generations already active on other
-carriers. One globally live generation would let a permanently slow carrier
-monopolize rediscovery of every sibling and is forbidden.
-
-A pass starts only after an exact demand, rate-evidence, budget/grant, writer-
-capacity, topology, or terminal wake followed by immediate recheck. If its
-finite vector produces no head, the coordinator arms the exact failed
-prerequisite wakes, rechecks, and parks. An empty pass cannot self-schedule.
-After one positive head, remaining eligible targets or continuation work own
-exactly one coalesced successor wake. Each round freezes membership, attempts
-every member at most once, and advances after success, block, or invalidation;
-new members wait for the next round. Under positive authority and fair writer
-opportunities, one continuously eligible carrier therefore receives a bounded
-attempt opportunity independent of sibling order.
-
-Observation DATA uses a separate lowest-priority MPP lane. Control, lifecycle,
-carrier-observation grant/ACK, Data ACK, realtime, latency, due cause-bounded
-recovery, ordinary throughput, and optional repair are reconsidered before
-each head. At most one head is MPP-queued per exact carrier direction. No
-observation wait owns a global scheduler, ACK-held, Product, or writer turn.
-Heads already transferred to a native TCP socket or QUIC connection cannot be
-preempted; the all-stage byte/item cap is therefore the honest bound on
-same-carrier native debt attributable to observation. It is not a finite
-wall-time claim at zero service.
-
-An observation generation, carrier acquisition, or pending receipt grants no reservation
-that excludes ordinary work. Immediately before each observation head's
-admission linearization, the actor reruns ordinary selection for that exact
-carrier; ordinary work that is then pending and can commit takes priority. A
-positive ordinary commitment on the target stops synthetic admission because
-it supplies the required native backlog. Ordinary commitment on another carrier
-neither ends this target's generation nor consumes its opportunity. After an
-observation head is published, however, its exact shared-cap reservation and
-queued/native debt are real: later-arriving ordinary work may wait for that
-bounded head's receipt or terminal, and Core claims no zero head-of-line delay
-after native handoff. After a bounded cooperative turn, a pending independently
-writable target is attempted or owns one exact self-wake before yield.
-Persistent higher-priority work on the same native writer may starve
-observation; unrelated-writer traffic may not erase its turn.
-
-Observation mints no traffic allowance. The local sender owns one coordinator
-keyed by `(local optional-policy epoch, authenticated remote principal,
-original-sender direction d)` and shared by every session for that key. Let
-`U_p,d` be cumulative uniquely Data-ACKed Product bytes across those sessions,
-counted once, and let `X_p,d` be all sender-published optional reliable payload:
-repair, stale requalification, carrier observation, and separately authorized
-critical recovery debt. The policy epoch freezes one startup allowance
-`F0_p,d` and optional fraction `b_p,d`:
-
-```text
-A_p,d = max(0, F0_p,d + floor(b_p,d * U_p,d) - X_p,d).
-```
-
-The check and charge are atomic across every carrier writer in that direction.
-A stream, carrier, session, or reconnect does not contribute another startup
-allowance. Published spend never refunds on ACK, loss, deadline, generation/
-channel reset, carrier terminal, session close, or reconnect. Critical cause-
-bounded recovery retains its separately defined temporary exception but is
-still included in `X_p,d`, leaving ordinary optional authority zero until
-unique Product progress repays it. The coordinator and startup-issued state
-survive the last session close. A successor policy epoch may reset them only
-after every old-epoch session/writer is fenced, and a different credential ID
-mapping to the same authenticated principal cannot mint another allowance.
-Native retransmission remains outside this MPP payload ledger. Session-local
-subcounters MAY diagnose or escrow work but cannot independently fund it.
-
-The receiver separately grants only explicitly identifiable carrier-
-observation work. It cannot enforce a grant on repair alone because an original
-`STREAM_DATA` and a reinjected copy that arrives first have the same wire form;
-charging every such frame would create another Product-credit gate. For each
-observation-channel direction `o`, the receiver publishes cumulative
-`M_o = max_charged_work` and retains accepted cumulative `C_o`. The sender
-separately retains its cumulative published charged work `W_o^sent`; it may
-publish a DATA head with `N > 0` only if checked
-`W_o^sent + N + 68 <= M_o`, and the infallible publication atomically advances
-`W_o^sent` by `N + 68`. The receiver
-independently applies the same checked addition to `C_o` before accepting that
-head. Thus `C_o <= W_o^sent <= M_o` while the ordered channel is live, including
-with several outstanding heads. `N + 32` is the exact normalized DATA frame and
-36 bytes reserve its maximum one cumulative ACK. ACK coalescing does not refund
-the conservative charge.
-
-Channel maxima are allocated by one atomic session-direction and authenticated-
-principal-direction coordinator. For principal authority `E_p`, irreversible
-consumed work `C_p`, and live channel escrows, it preserves:
-
-```text
-C_p + sum_live_o(M_o - C_o) <= E_p.
-```
-
-The principal coordinator is keyed by one non-reused endpoint policy epoch,
-stable authenticated principal identity, and original-sender direction. It
-outlives every session and carrier in that epoch. Closing the final session
-returns only unused channel/session escrow; it does not clear `C_p`, restore a
-startup-issued flag, or create a new `E_p`. A new principal policy epoch may
-reset that state only after serialized revocation/terminal has fenced every old
-session and channel so no old frame can be accepted into the successor epoch.
-
-The session coordinator preserves the analogous inequality inside one exact
-authenticated session generation and direction. `E_p` may grow only from one
-configured principal startup allowance per principal policy epoch, receiver-
-observed unique Product progress counted once, or an explicit checked principal
-policy allowance. Observation work cannot fund it. Session or channel creation
-does not grow principal authority. Accepting a head atomically moves its charged
-work from channel escrow to irreversible session/principal consumption;
-terminal returns only unused escrow. Thus reconnecting or opening parallel
-carriers cannot multiply startup work.
-
-Starting one semantic generation freezes positive finite payload cap `G`, head
-cap `J_max`, and absolute admission deadline `D_O`, each bounded by configured
-observation resources and currently available local principal-direction authority. These are hard
-resource limits, not targets, BDP estimates, pacing rates, or promises of
-completion. Before every head, Core rechecks its positive payload against
-remaining `G` and live `A_p,d`, its `N + 68` work against channel grant, and its
-one token against shared all-stage carrier byte/item authority. It charges all
-ledgers before infallible publication. A provisional failure changes none;
-published work and payload never refund.
-
-A semantic successor may start after predecessor terminal while old
-observation tokens still await the same channel's cumulative processed-work
-ACK, provided the shared all-stage cap admits the successor. Requiring zero old
-tokens would turn cumulative service into stop-and-wait. Channel terminal, by
-contrast, retires all its unresolved tokens without claiming service before a
-fresh channel epoch can publish. Checked counter exhaustion fails new work
-closed and never wraps or reuses an identifier.
-
-After every head, receipt, authority-mode event, evidence expiry, ledger or
-grant mutation, incumbent change, writer-capacity event, and ordinary attempt,
-the coordinator recomputes the exact counterfactual from fresh state.
-
-- `Run` requires continuing throughput demand, no direction-wide pending
-  effective Realtime/Latency work, a live exact scope, positive finite
-  authorities, no ordinary target feed, counterfactual target selection, and
-  failure of real selection solely because of rate. In `NativeMode`, an early
-  or low `B_op` re-enters this predicate; it cannot stop, pace, shrink, or
-  refund excitation.
-- `Pause` retains the generation, spend, grants, and queued/native tokens and
-  does not clear carrier-scoped `Acq_c`, but admits no new synthetic head. It applies when evidence is
-  sufficient but ordinary commit loses a Product/writer race, or when a
-  temporary non-rate prerequisite or direction-wide sensitive-pressure gate
-  prevents commitment. Exact typed wakes re-evaluate from the beginning.
-  Evidence expiry can therefore resume a paused generation.
-- `Successful` terminal requires an actual positive ordinary commitment to the
-  exact carrier. Observation evidence alone neither qualifies Product nor
-  proves that commitment; later unambiguous unique Data ACK retains Product
-  authority.
-- Other semantic terminal causes are disappearance of throughput demand or
-  pending work, class/tier or policy ineligibility, exact session/carrier/path/
-  channel replacement or terminal, explicit cancellation, completed payload
-  cap, local or peer authority exhaustion, `J_max`, `D_O`, or checked counter
-  exhaustion. Incumbent or score change alone is recomputation, not terminality.
-
-Terminal stops new semantic admission. It neither clears carrier-scoped `Acq_c`
-nor refunds published spend or erases queued/native channel tokens. A later
-cumulative channel ACK may retire those tokens before or during a successor
-generation while applying predecessor generation semantics as a no-op. Exact
-channel terminal retires all remaining channel tokens without claiming service
-and returns only unused receiver escrow; their acquisition tags contribute
-nothing, but already folded carrier evidence remains.
-
-Every valid authenticated observation ACK transaction first applies any
-advancing channel processed-work frontier, then applies generation semantics if
-the exact generation is still live. A nonadvancing channel frontier may still
-publish a later semantic payload frontier only up to already service-certified
-`K`. `NativeMode` receipts retire service and wake native evidence but publish
-no receipt rate. In `ReceiptMode`, exact service retirement folds a matching
-live acquisition tag once into every covered authority-retained suffix anchor's
-`W_a` before observation generation semantics; `V` does not count the same
-DATA again. A published active term
-remains authoritative only for its exact session generation, direction,
-carrier, native-path epoch, authority mode, and fixed freshness. Observation
-channel or semantic-generation success, deadline, cap, cancellation, or
-replacement does not retroactively erase already folded carrier evidence. No
-event publishes a positive term without distinct receipted work.
-
-One observation-channel direction owns a checked non-reused generation
-sequence, one cumulative assigned normalized DATA-work coordinate, and a
-bounded ordered token deque across semantic generations. A generation has
-positive `generation_id`, contiguous payload offset, published payload `B`,
-cumulatively service-certified payload `K`, cumulatively receipted payload `V`,
-and semantically unreceipted payload `M`:
-
-```text
-0 <= V <= K <= B <= G
-M = B - V.
-```
-
-The first published generation uses the channel's next identifier and offset
-zero. A head with `N > 0` carries the current `B`; checked publication advances
-`B` by `N`, the channel assigned-work frontier by `N + 32`, and the head count
-by one. It creates one exact token interval in that work coordinate and charges
-`X_d` plus receiver work before publication. Every counter is checked; gaps,
-overlap, reuse, wrap, saturation, or a nonzero first offset fail closed.
-Synthetic bytes need no retained Product source or payload identity.
-
-For each direction, the receiver retains the current semantic generation and
-retired generation high-water, cumulative charged work, cumulative processed
-DATA work, and one dirty cumulative ACK owner. It validates the complete DATA
-envelope, authenticated path/channel, length, checked offset/work arithmetic,
-channel grant, and generation classification before mutation. It then
-atomically charges `N + 68`, advances `processed_observation_work` by `N + 32`,
-discards the payload without Product delivery, applies live generation state,
-and marks the cumulative ACK dirty. The first exact successor at offset zero
-retires predecessor semantics; delayed predecessor service remains represented
-by the channel coordinate. A gap, overlap, reused/older generation, impossible
-future generation, grant excess, or arithmetic failure is a protocol violation
-and changes no state.
-
-`CARRIER_OBSERVE_ACK` carries both the named generation's cumulative payload
-frontier and the channel's cumulative processed DATA-work frontier. The sender
-fully validates exact channel scope, allocated generation classification, and
-`processed_observation_work <= assigned_observation_work` before mutation. The
-service scope is `(session generation, original-sender direction, carrier
-incarnation, observation-channel epoch)`; it deliberately excludes native-path
-epoch and semantic generation, so a cumulative successor ACK can retire old
-tokens after either changes while publishing no stale evidence.
-
-Each token maps its channel work-interval end to its semantic scope and
-generation payload end. The sender transaction first derives, without
-mutation, every complete token interval covered by the proposed processed-work
-frontier and a prospective `K_candidate`: the current live generation's `K`
-raised to the greatest contiguous covered payload end in its exact semantic
-scope. If the ACK names that live generation, complete validation additionally
-requires `cumulative_payload_bytes <= K_candidate <= B`; the prospective
-`V_candidate` is `max(V, cumulative_payload_bytes)`. If it names an
-allocated retired generation, the payload field is a semantic no-op and no
-historical `B` is retained merely to validate it. A future unallocated
-generation is a protocol violation. Failure of any validation changes neither
-service nor semantic state.
-
-After complete validation, one indivisible mutation first advances the channel
-processed-work frontier and retires exactly the covered tokens, then installs
-`K_candidate` for the still-live matching semantic scope and installs
-`V_candidate`. No scheduler can observe an
-intermediate phase. Thus service can advance across semantic generations, but
-no payload receipt can outrun the work that the same channel frontier proves
-processed, and a malformed semantic frontier cannot partially retire service
-or raise `K`. Generic carrier-work service coordinates MUST NOT account this
-DATA again.
-
-The ACK returns only through the opposite half of the same reliable observation
-channel. Dirty receiver authority clears only when that exact reverse queue
-accepts the cumulative ACK or the channel terminalizes. Constructing a frame,
-a full-queue attempt, or a cross-carrier copy cannot clear it. ACKs occupy no
-processed-work coordinate and elicit no ACK, so recursion is impossible. A
-later frontier subsumes a lost or coalesced predecessor. Carrier observation
-and stale requalification retain distinct frames, identifiers, state, and
-lifecycle effects.
-
-In `NativeMode`, observation is pipelined through ordinary native admission and
-waits on native congestion control, pacing, flow control, and socket
-backpressure; `C_c` ranks ordinary work but MUST NOT meter the observation
-producer. Observation attempts to keep funded native backlog available. The
-adapter's finite-recovery contract applies only during an interval in which its
-declared sustained-backlog, positive-progress, and bounded-loss/blackhole
-premises actually hold through `K_up`; one queued head, a finite grant, or mean
-loss alone does not assert that premise. The contracted native controller, not
-an MPP receipt formula, then updates `B_op`, and the adapter publishes that
-exact state to every live consumer within `D_pub`. If achieved native service
-remains below `C_req`, no observation model can prove unsent link headroom;
-controller recovery is a separate obligation.
-
-In `ReceiptMode`, observation semantic generations and carrier-rate acquisition
-are deliberately independent. Opening, succeeding, succeeding-with-old-tokens,
-or successfully stopping a synthetic generation neither creates nor clears
-`Acq_c`. An otherwise-admitted positive Product token creates an absent
-acquisition and its first suffix anchor when evidence capacity is available; an
-observation token may do so only after its synthetic rate-causal admission
-succeeds. Every later eligible token on any writer of the same exact carrier
-direction receives that tag; after expired-anchor removal it creates a commit-
-boundary anchor only when the set is empty or the frozen `q_acq` busy-time
-spacing is reached. Only after the token's exact service coordinate proves full
-peer processing does the sender add its normalized work once to every retained
-anchor whose `f_anchor` strictly precedes that token's post-commit carrier-
-ledger ordinal. Observation ACK
-payload `V` remains semantic evidence for the synthetic generation but does not
-add a second copy of the DATA work.
-
-Service apply precedes the acquisition fold in the same transaction. A
-partially covered token, ambiguous Product Data ACK, queued cancellation, or
-terminal-without-service contributes nothing. A delayed tag from a closed or
-wrong-scope acquisition is discarded after ordinary service retirement; it
-cannot enter a successor. The existing all-stage carrier token cap bounds tags,
-and `J_acq` bounds suffix state. Checked acquisition identifier, anchor work,
-busy-duration, or item exhaustion fences acquisition without wrap,
-publication, or refund. A transient tag-cap failure leaves ordinary Product
-untagged and leaves an existing acquisition intact; an optional observation
-head fails before commit.
-
-At each exact receipt, expiry, ordinary-decision, and typed prerequisite wake,
-Core recomputes every authority-live exact suffix and their current maximum
-`r_acq(t)` from Section 10.2. It stores neither a latest detached rate nor an
-unbounded historical maximum: latest-per-source reintroduces source eviction,
-while `H_acq` prevents an old fast suffix from regaining authority forever.
-Checked cross multiplication and round-down are mandatory; no live anchor,
-zero work, overflow, or an unrepresentable result publishes nothing. Only the fresh
-real-versus-`r_acq` ordinary comparator can activate the candidate. The chosen
-opportunity may differ from the one present when `Acq_c` began; no Product flow
-owns carrier acquisition.
-
-The suffix set is a bounded liveness certificate, not a claim of arbitrary
-change-detection speed. For one authority-live anchor `a`, let its closed and
-current suffix busy intervals be disjoint `I_a,j`. Every token counted by `a`
-has its entire commit-to-peer-process-to-local-receipt interval inside one
-`I_a,j`. Let `F_a = 8 * W_a` be its counted bits and `D_a^+` its conservative
-elapsed upper bound. Then
-
-```text
-F_a <= Y(union I_a,j)
-duration(union I_a,j) <= D_a^+
-r_a = floor(F_a / D_a^+).
-```
-
-Thus `r_a` is a conservative achieved busy-service lower bound. Taking the
-maximum selects one actually achieved suffix; it does not add their work or
-rates. This permits summing distinct token work inside one suffix before one
-division and forbids summing detached rates.
-
-For this one anchor, suppose uncounted or interleaved work is bounded by `A_a`
-bits, all pre-service, actor, peer-processing, receipt, and conservative clock
-overhead by `Delta_a` seconds, and tagged work receives common achieved service
-`C>0`, so that at the receipt being evaluated:
-
-```text
-D_a^+ <= (F_a + A_a) / C + Delta_a.
-```
-
-If that anchor remains authority-live through the receipt, one current exact
-rate-causal opportunity and all of its non-rate prerequisites remain stable,
-and its comparator requires a positive integer rate `R` bit/s with `R<C`, then
-`r_acq >= r_a >= R` whenever:
-
-```text
-(C - R) * F_a >= R * (A_a + C * Delta_a).
-```
-
-The inequality first proves the unfloored ratio `F_a / D_a^+ >= R`.
-Because `R` is an integer in the same bit/s domain as the checked candidate,
-rounding that ratio down still leaves `r_a >= R`. This typing is essential:
-the implication is false for a non-integer equality target.
-
-Here `C` is achieved service offered to tagged work after the stated bounded
-interference, not latent link capacity or aggregate service under
-fair-but-unbounded competing work. The claim also requires stable acquisition
-scope, retention of this specific anchor, enough Product or observation
-authority, bounded writer/peer-processing/receipt service, a receipt and fair
-evaluation while `D_a^+ <= H_acq`, and an exact required rate that does not grow
-to `C` as carrier debt changes. A slow pre-anchor prefix is excluded; actual
-post-anchor interference increases `A_a`, and delay or clock uncertainty
-increases `Delta_a`. Intermediate receipts and active expiry preserve this
-anchor and its work. A path, mode, authority-horizon, or immutable quiescent-
-freshness expiry instead removes its authority honestly.
-
-The Core horizon has a precise conditional meaning. If
-`A_a / C + Delta_a <= P_acq`, continuous tagged service persists, and the
-receipt/evaluation event occurs no later than the boundary, the threshold work
-for a positive integer required rate `R<C` is:
-
-```text
-F_req = ceil(R * (A_a + C * Delta_a) / (C - R))
-D_at_req^+ <= (F_req + A_a + C * Delta_a) / C.
-```
-
-The ceiling is not silently erased: the exact receipt must still satisfy
-`D_a^+ <= H_acq`. In the divisible-work fluid model, choosing
-`F_a = 9 * (A_a + C * Delta_a)` gives:
-
-```text
-F_a / D_a^+ >= alpha * C = 0.9 * C
-D_a^+ <= (A_a / C + Delta_a) / (1 - alpha)
-       <= 10 * P_acq = H_acq.
-```
-
-Consequently, an implementation receipt within the inclusive horizon
-qualifies every positive integer comparator requirement
-`R <= floor(0.9 * C)` for which the exact checked cross-product inequality
-holds. No claim is made that an arbitrarily coarse token or receipt must land
-on the fluid boundary; its actual work and elapsed bounds decide authority.
-
-With `J_acq >= 11`, `q_acq <= P_acq`; under continuous eligible commits, a
-rate change therefore gets a post-change anchor within at most one additional
-`P_acq` plus the next commit, and that anchor then owns its full `H_acq` proof
-horizon. Under continuous target-local backlog, the atomic publication handoff
-instead creates the successor anchor at the publication boundary itself; all
-subsequent actor/writer delay is already included in `Delta_a`. Exact receipt
-apply, suffix recomputation, and comparator publication are one transaction,
-so there is no unaccounted post-receipt evaluator delay. In this renewal case
-the successor has `P_acq=P_pub` and `H_acq=H_pub`, exactly matching the active
-lifetime. That lifetime is therefore sufficient to renew an exact integer
-requirement at or below `floor(90% * C)` without an intentional fallback when
-its checked work inequality holds and receipt apply and evaluation occur by the
-inclusive boundary. If
-no successor is opened, a
-receipt is applied later, or a coarse final token crosses the boundary, the
-claim does not apply. Equality with the fluid `90%` boundary is covered only
-when it is representable and the exact integer inequality and receipt fit that
-inclusive boundary. This is the declared
-operating envelope, not a universal confidence claim.
-
-An acquisition-wide average does not have this property. After `60 s` at
-`10 Mbit/s`, a change to `500 Mbit/s` still needs `87 s` before the cumulative
-average crosses `300 Mbit/s`; a post-change suffix reaches the same threshold
-after its own bounded work and receipt interval. Conversely, retaining a fast
-suffix forever would mis-rank a path forever after a downshift. The finite
-`H_acq` makes that old suffix ineligible after at most its authority horizon of
-continued busy time, while the immutable quiescent deadline bounds wall-clock
-reuse during idle. No receipt-only estimator can both integrate over an
-unbounded BDP and forget every old service history within a finite bound. A
-configured initial-rate prior or a qualified native-controller contract is
-required outside the declared envelope. `[flow].initial_rate_mbps` supplies an
-optional endpoint-local prior to every MPP path; omission means unknown, and
-any explicit path `initial-rate-*` form overrides it, including
-`initial-rate=unknown`. For TCP it remains an MPP scheduling prior and does not
-alter native TCP congestion control. For a finite resolved QUIC rate `R` and
-initial RTT `T` (configured `initial-srtt-s`, otherwise `333 ms`), the native
-initial window target is `max(IW10, ceil(R*T/8))` bytes and the native initial
-pacing target is `ceil(R/8)` bytes/s. Neither seeds BBR `bw`, `max_bw`, or MPP
-operational-rate authority; unknown and unlimited retain the exact native BBR3
-defaults. An overestimate therefore authorizes a larger initial burst and may
-cause queueing or loss, while native congestion control and recovery remain
-authoritative. Configuration MUST reject a resolved finite QUIC pair unless
-`ceil(R/8) <= 2^53` bytes/s and `ceil(R*T/8) <= u64::MAX` bytes; it MUST NOT
-silently round the native pacing target or saturate the window. This
-QUIC-native exactness bound does not restrict a TCP-only prior. Before the
-finite-target controller has satisfied the authenticated two-round
-qualification above, its internally learned bandwidth remains native BBR
-state but is projected as `Absent`, so central scheduling retains `C_0`.
-Qualification changes only the MPP authority basis; it never restores the
-configured window/pacer, seeds BBR bandwidth, or weakens native downshift and
-recovery. Omitted and Unlimited configurations do not enter this classifier.
-
-Repeated isolated flights also do not amortize feedback delay: for `m` equal
-`f`-bit bursts with delay `tau`, both counted work and delay grow by `m`, leaving
-`r_acq = C*f/(f+C*tau)`. High-BDP capacity from only small stop/start objects is
-therefore unidentifiable without native evidence, continuous observation, or a
-configured rate prior.
-
-At `C = 500 Mbit/s`, `Delta = 100 ms`, and `A = 0`, approximately `125 KiB` can
-prove more than `10 Mbit/s`, while proving `90%` of `C` needs about `53.6 MiB`.
-This is an information bound, not a chosen probe size. A small object cannot
-both finish immediately and reveal unsent high-BDP capacity without a
-configured rate prior such as Hysteria2's target-rate model.
-
-Every published Core Profile ReceiptMode active term owns an absolute expiry
-`t + H_pub`, frozen from the one publication snapshot shared with its atomic
-successor. The source acquisition's `H_src` only licenses the old candidate;
-`H_pub` cannot revive an expired source. Later polling or transport shape
-cannot extend either term. The exact deadline is one
-serialized, externally indivisible transaction: settle `Z_c` through the
-deadline under the old `R_A`; logically remove that term and restore `H_R`;
-apply any same-boundary exact receipt whose conservative elapsed bound remains
-within its inclusive anchor horizon; recompute `r_acq` and the exact ordinary
-comparator against `H_R`; and optionally install a qualifying successor before
-exposing state or waking scheduling. An equal achieved rate can therefore
-renew after the old term logically expires, while expiry alone cannot improve
-the carrier. The
-sample is ReceiptMode-only, cannot survive scope/mode replacement, cannot be
-summed across carriers or multiplied by flow count, and creates no discrete
-promotion flag. Active expiry applies the exact `H_R` transition in Section
-10.2 without closing a live `Acq_c`; a lower receipt candidate never causes an
-earlier downshift.
-
-The snapshot-derived `3 * P_acq` horizon freezes `E_acq` when `Acq_c`
-first becomes quiescent. Later polling, a short new burst, another quiescent
-transition, or transport-shape change cannot move or cancel that absolute
-deadline. This bounds wall-clock reuse of a completed busy prefix; a sliding
-deadline would let one tiny keepalive retain old fast evidence indefinitely.
-Three feedback bounds are a Core bounded-freshness policy, not a consequence of
-the `90%` recovery theorem. It retains the existing short-burst reuse policy
-while bounding stale idle evidence and remains an empirical acceptance item,
-not a symbolically optimal constant. No recovery across an idle gap is promised unless a
-reopened suffix satisfies its inequality before this deadline. Under continued
-busy time an old suffix plus a term it publishes can influence scheduling for
-at most `H_src + H_pub`. If first quiescence intervenes, the conservative mixed
-wall-time bound is time to that first quiescence plus
-`3 * P_src + H_pub`, never a sliding renewal.
-
-On TCP, observation DATA uses the existing authenticated physical writer and
-MAX/ACK uses the opposite writer of the same socket. TCP terminal ends the
-observation channel. On QUIC, the client opens exactly one long-lived
-bidirectional HTTP/3 observation request stream per physical Quinn connection;
-the first MPP frame in each half is `CARRIER_OBSERVE_MAX_WORK`, including zero
-grant. DATA and its reverse ACK remain on that exact stream. The carrier-control
-stream is forbidden because stream-wide priority cannot make bulk observation
-low priority while retaining control priority.
-
-The client sends the ordinary request field section before request DATA. The
-server validates the first kind-44 frame and exact carrier binding and
-atomically acquires the singleton observation-channel slot before accepting the
-operation. It then sends a successful response field section before response
-DATA and places its own first kind-44 frame there. A duplicate channel, policy
-refusal, or bounded-resource refusal receives a non-success response or request-
-stream reset and creates no channel state. That refusal is operation-local and
-MUST NOT publish physical-carrier failure.
-
-The QUIC adapter MUST expose observation below ordinary throughput at its
-stream arbiter; a diagnostic-only priority setter is insufficient. ACK or grant
-starvation is conservative and halts further optional work under the finite
-token/grant cap. Request-stream-local FIN, reset, refusal, truncation, or error
-on either observation half terminalizes the whole observation channel, clears
-semantic state and dirty ACK, retires its tokens without service, and returns
-unused escrow. It does not retire the Quinn connection, physical carrier,
-control stream, or Product. A QUIC-connection or HTTP/3 connection error retains
-its ordinary physical-carrier terminal semantics. The client may open a
-replacement only after exact old-channel terminal, with a fresh non-reused
-channel epoch and zeroed wire coordinates.
-
-Carrier observation proves only achieved service on one direction. It cannot
-prove unused headroom, future capacity, path independence, or that TCP and QUIC
-avoid a shared bottleneck. Several carrier terms are never summed into aggregate
-capacity. Ordinary placement remains subject to exact usage, hysteresis,
-Product, guard, credit, debt, and writer revalidation.
-
-Connection-wide source staging precedes DSN assignment and may contain bounded
-work for several independently admitted outputs. It is therefore governed by
-the shared stream, repair, reorder, and configured resource envelopes, not by
-one selected output's native congestion window. For reliable work its active
-allowance is the bounded sum of the configured per-output Product envelopes
-`P_i` for the exact live outputs eligible for original data, capped by shared
-`W`; with one output it is exactly that output's envelope. Traffic class may
-keep source reads and each atomic service turn small, but it does not replace
-this byte authority with a smaller Product window. Selection and allowance use
-one coherent
-view: withdrawn or unschedulable outputs contribute nothing, non-stale outputs
-precede stale recovery fallbacks, and a backup contributes only when no regular
-output is eligible. Staging grants no output ownership or carrier reservation;
-every assignment still revalidates `L_i` and reserves the exact native writer
-as described above.
-
-An authenticated, admission-active attachment can precede its first fresh
-qualified carrier-service epoch. Its carrier uses the configured startup
-prediction until Section 10.2 accepts stronger evidence; Product assignment nevertheless
-uses exact `L_i`: `P_i` for a first/live-frontier or volume-qualified output,
-and `E_i` only for an unqualified additional output. A
-`PATH_CAPACITY_*` diagnostic result does not change either authority. Absence
-of achieved-service evidence is not absence of an output. Source
-admission is zero when no live eligible output contributes a positive Product
-envelope; an exact zero `P_i` fails closed. Evidence from another carrier
-incarnation with the same path key MUST NOT be substituted for the unmeasured
-attachment.
-
-Fresh Product acquisition is durable exact-volume qualification, not a rate or
-path-capacity measurement. Each exact attachment direction has an
-always-present, checked, non-reused output-admission epoch, which is also the
-qualification and ambiguous-release-guard fence, and one of three local
-authorities: `AdmissionActive`, `Revoked`, or permanently `Exhausted`. Counter
-exhaustion MUST clear evidence and fail permanently closed; it MUST NOT wrap.
-Each admission-active, non-stale exact direction also has a qualification bit
-`q_i`. `q_i = 0` is unqualified and `q_i = 1` is qualified; `Stale` and
-`Requalifying` remain separate lifecycle states governed by Section 15.2. The
-first owner while `O = 0` and the live contiguous-frontier owner retain
-`L_i = P_i` for either value of `q_i`. A qualified additional output also uses
-`P_i`; only an unqualified additional output uses `E_i`.
-
-The admission-active to revoked edge clears the generation and advances the
-output-admission epoch even when no generation has started. Repeated revocation
-inside the same inactive interval is idempotent. Exact requalification receipt
-changes `Revoked` back to `AdmissionActive` under that already-advanced epoch,
-without evidence and without starting a generation. Thus an initially active
-attachment with no generation and the same attachment after a stale and
-requalification cycle never have the same qualification identity. A new exact
-attachment incarnation may begin its local epoch sequence again because the
-attachment identity itself has changed.
-
-For each unqualified exact direction, one Product qualification generation
-begins atomically under the current output-admission epoch when the serialized
-stream owner successfully commits its first current-generation OriginalData
-quantum to that attachment. The same rule starts the successor generation only
-after exact requalification has restored `AdmissionActive`. The commit first
-revalidates all ordinary assignment and writer authorities, reserves the exact
-writer, and then freezes both a strictly positive generation volume floor
-`F_i > 0` and the strictly positive maximum atomic Product quantum
-`N_i^max > 0`.
-It records exact Product ownership and qualification metadata before publishing
-the command. No fallible operation may remain between that metadata mutation
-and the already-reserved command's publication. The generation creates no
-rate, credit, recovery, pacing, or native-transport authority.
-
-Let `V_i` be exact uniquely Data-ACKed qualification-tag volume. Let `T_i` be
-the normalized set of nonempty disjoint outstanding qualification-tag ranges,
-and let `M_i = measure(T_i)`. `M_i` is metadata on a subset of `O_i`, not
-another byte owner. Define qualification-only accounting:
-
-```text
-B_i^Q = V_i + M_i
-d_i^Q = F_i - B_i^Q
-x_i^Q = min(N, d_i^Q)
-```
-
-where `N` is the complete OriginalData quantum already admitted by `W/L_i`.
-Before mutating the generation, the implementation MUST prove
-`0 < N <= N_i^max`,
-that the range is fresh non-reinjected OriginalData for this exact owner, and
-that it does not overlap another current tag. The commit tags only the
-deterministic `x_i^Q`-byte prefix of that range and retains an opaque receipt
-containing the output-admission epoch and exact tagged prefix with the OriginalData
-Product flight. A
-first/live-frontier commit may carry `N > d_i^Q` under its ordinary `P_i`
-authority; its surplus is useful Product but not qualification evidence. An
-unqualified-additional acquisition commit requires `d_i^Q > 0`, must still fit
-`E_i` exactly, and may carry one final atomic quantum with `N > d_i^Q`; only
-the remaining `d_i^Q` bytes are tagged. This is a bounded evidence-floor rounding of
-less than one maximum quantum, not a `W`, `P_i`, or `E_i` overshoot.
-
-Only unambiguous MPP Data ACK coverage of uniquely attributable current-
-generation OriginalData may move exact tag weight from `M_i` into `V_i`.
-Predecessor-generation, reinjected, duplicated, native-ACKed,
-capacity-receipted, terminally discarded, or otherwise ambiguous portions do
-not advance `V_i`. Accepted recovery, ambiguity, or terminal cleanup removes
-only the overlapping tag from `M_i` without increasing `V_i`; the underlying
-Product debt follows its independent ACK and recovery rules.
-
-Every release is clipped to both the receipt's tagged range and the exact event
-range, checks that the receipt epoch is the currently active epoch, and removes
-only coverage still present in `T_i`. Consequently copied receipts, split
-flight records, duplicate Data ACKs, repeated ambiguity reports, and delayed
-predecessor releases are idempotent. Normalized nonempty integer ranges also
-give the explicit state bound:
-
-```text
-items(T_i) <= measure(T_i) = M_i <= F_i.
-```
-
-`F_i` MUST be representable by the implementation's collection index type.
-This is a bound derived from the existing qualification envelope, not another
-traffic or tuning parameter.
-
-When `V_i = F_i`, the sender sets `q_i = 1` even if the same Data ACK
-transaction has invalid, zero-duration, source-limited, or otherwise unusable
-timing. One Data ACK transaction may produce at most one numeric rate sample
-per exact output, but numeric sample validity cannot undo exact volume progress
-or split one transaction into several qualification events. Short or sparse
-work MAY finish while an output remains unqualified.
-
-Qualification is durable for the exact active attachment incarnation and
-output-admission epoch. Time and rate expiry cannot make the historical
-exact-volume fact false, and `q_i`
-grants only configured `P_i` behind all ordinary Product and native authorities.
-Role, usage, carrier rank, application-limited state, and native-window
-changes therefore preserve `q_i`, `V_i`, and `M_i`. Entering `Stale` or
-`Requalifying`, exact detach, or incarnation replacement atomically revokes the
-active authority, advances its epoch exactly once for that inactive interval,
-and sets `q_i=0`, `V_i=0`, and `M_i=0` without deleting unresolved `O/O_i`.
-Exact terminal Product cleanup also revokes that state, but releases
-Product debt only through its independent terminal ownership rule. OriginalData
-sent through a `Stale` sole-survivor fallback MUST NOT begin acquisition or
-clear stale state. `Stale` to `Requalifying` and duplicate cleanup do not
-advance the output-admission epoch again. After exact `STREAM_REQUALIFY_ACK`, the
-authority is active but empty; only a later current-incarnation OriginalData
-commit may start the successor generation. No predecessor evidence is
-inherited.
-
-The qualification invariant is:
-
-```text
-0 <= V_i + M_i <= F_i.
-```
-
-It is inductive across every placement role. A commit adds at most `d_i^Q` tag
-weight; an exact ACK moves the same weight from `M_i` to `V_i`; ambiguity,
-recovery, and terminal cleanup only reduce `M_i`; qualification and unrelated
-role or rate transitions add nothing. Capping the tag rather than every Product
-commit is necessary: otherwise a first/frontier owner may tag `P_i >> F_i` and
-a later role change falsifies the claimed bound. This evidence invariant grants
-no Product or native authority; every complete quantum still passes the
-independent `O/W/P_i/E_i`, credit, reorder, reservation, and writer checks.
-
-Accepted reinjection and Data ACK application for one stream direction MUST
-share a serialized order. Qualification and exact flight metadata are recorded
-before a duplicate or original command is published. Both transitions consume
-only opaque receipts found on the exact overlapping OriginalData flight; they
-MUST NOT broadcast a raw range under the current epoch or synthesize a receipt
-from current ledger state. The receipt binds exact output, output-admission epoch,
-and tagged range. If reinjection is recorded first, it removes overlapping
-`T_i` through those receipts before a later ACK can verify it.
-If exact ACK application occurs first, it may move the still-unique tag into
-`V_i`; a duplicate published later cannot have caused that earlier ACK and does
-not retroactively revoke verified history. An ACK received earlier but applied
-after reinjection is conservatively ambiguous. Native carrier concurrency does
-not relax this Product-level serialization.
-
-Qualification owns no separate arbitration cursor, ACK-held turn, or
-mandatory preemption. When ordinary `S/U` order reaches an unqualified additional
-output, the same useful Product commit is an acquisition commit: its exact
-assignment authority is `L_i = E_i`, and it may start or advance the
-qualification generation above. Short or sparse work may end before any
-additional output qualifies.
-
-For an absent generation, the first successful ordinary commit atomically
-freezes `F_i` and `N_i^max` and initially has `d_i^Q = F_i`. Later ordinary
-commits may advance its remaining tag deficit while `d_i^Q > 0`. A currently
-blocked, ineligible, failed, or Product-exhausted advisory candidate is skipped
-for the current frozen candidate order without blocking an independently usable
-sibling. Regular membership remains structural, but only a Regular that passes
-the current exact Product and writer checks is usable for this quantum. After a
-finite zero-commit Regular pass, Backup retains the same role-sensitive `L_i`
-(`P_i` for first/live-frontier or qualified additional, `E_i` only for
-unqualified additional); every Backup remains below every Regular again on the
-successor quantum. Stale sole-survivor behavior remains the separate Section
-15.2 rule.
-
-Planning remains advisory. Each ordinary attempt binds the pending exact range
-and positive `N`, selected tier, exact attachment and path epochs, qualification
-epoch and deficit, role, and whole-quantum legality. Exact candidate identities
-MUST be unique. Apply obtains the real writer reservation and independently
-revalidates that certificate plus `W/L_i`, receive credit, reorder, and current
-writer authority. For a Backup certificate, an external change in any recorded
-Regular membership, eligibility, Product-authority, or writer-capacity
-generation before the atomic target-reservation linearization invalidates the
-attempt and restarts Regular. The target reservation's own identified
-generation advance does not; unchanged structural Regular presence does not.
-A non-target sibling otherwise cannot grant or revoke target authority.
-A failed reservation or revalidation changes no Product state. A successful
-apply records `F_i/N_i^max/T_i` when applicable, `O/O_i`, and exact Product-flight state
-before publishing the infallible reserved command. No qualification or planning
-token grants bytes, ACK, rate, recovery, or native authority, and no await or
-second reservation may remain after Product mutation.
-
-During any stable interval in which output `i` remains an unqualified additional
-output and no Data ACK or terminal transition releases its debt, newly assigned
-OriginalData is bounded by:
-
-```text
-new_i <= max(0, E_i - O_i_start)
-```
-
-and independently by remaining shared `W`, receive credit, reorder authority,
-and successful writer reservations. There is no quantum overshoot. Qualification
-tag rounding remains bounded by the already-proved `V_i + M_i <= F_i`
-invariant and does not enlarge Product exposure.
-
-An unqualified output that ordinary `S/U` order never selects may remain unqualified
-indefinitely. This is intentional: forcing unique low-sequence work onto it
-would exchange discovery for Product head-of-line risk. The observation plane
-may instead improve its carrier evidence without Product ownership; if that
-evidence becomes competitive, a later ordinary commitment can begin or
-advance qualification. Observation itself can never set `q_i`.
-
-After `q_i` becomes one, the output immediately has `P_i` assignment authority
-but retains whichever typed rate state Section 10.2 actually proved. Its raw
-qualifying point is not mature rate authority, and Core creates no discrete
-post-qualification promotion. A low NativeMode `B_op`, or low, expired, or
-absent ReceiptMode rate evidence, may move a carrier later in ordinary `S/U`
-order but does not remove it from the structural tier. Conditional carrier
-observation, rather than mandatory unique traffic, is the mechanism that can
-replace suppressed rate evidence.
-
-More precisely, suppose an exact carrier, direction, authority mode, selected
-tier, and NativeMode activation fence (or ReceiptMode native-path scope) remain
-stable; effective throughput demand, positive local and peer
-authority, bounded actor/writer/peer/ACK service, and native progress persist;
-the exact required rate remains `R<C`; and Product and writer admission
-eventually permit the ordinary quantum. In `NativeMode`, the required rate must
-be positive and representable inside the declared adapter envelope, funding
-must cover its documented observation work `W_up`, and the adapter's sustained-
-backlog, positive-progress, and bounded-loss/blackhole premises must hold. The
-controller then reaches `B_op >= R` within `K_up`, the adapter publishes it to
-every live scheduler within `D_pub`, and the next fairly serviced exact
-ordinary decision observes and successfully revalidates that authority. In
-`ReceiptMode`, one specific
-post-change suffix anchor must remain authority-live while its exact service
-curve and sufficient `F_a` satisfy
-`(C-R)F_a >= R(A_a+C*Delta_a)` and `D_a^+ <= H_acq`; the frozen spacing and
-horizon give the Section 15.1 operating-envelope bound rather than an
-acquisition-wide average. Either event wakes
-the exact ordinary decision; only a later positive Product commit and its
-unambiguous Data ACK can qualify the output.
-
-Those premises are necessary, not hidden tuning. For every finite observation
-budget there are two paths with the same transcript through that budget that
-diverge on the next byte. If the native controller never delivers above the
-required rate, funded volume is insufficient, reverse receipts fail, service is
-zero, scope changes indefinitely, or other optional work consumes all local
-authority, finite rediscovery is impossible. A small receipt can prove
-reachability without proving high-BDP service. Forcing unique Product instead
-would risk head-of-line delay. Core states this information-performance
-boundary rather than hiding it behind a scan or threshold tweak.
-
-The invariant debt bounds are:
-
-```text
-sum(O_i over all exact original owners) = O
-O <= min(W, configured reorder authority)
-O_i <= P_i
-```
-
-`E_i` is a prospective commit ceiling, not a retroactive debt invariant. Every
-new commit made while the output is currently unqualified and additional MUST
-leave `O_i <= E_i` under the then-current exact observation. A previously
-qualified or first/frontier output may legally retain `O_i > E_i` after
-qualification revocation at a lifecycle boundary or after a first/frontier
-role transition, and a later configured Product-envelope change may shrink `E_i` below
-already committed debt. Those transitions MUST preserve exact Product
-ownership; they admit no new OriginalData on an unqualified additional output
-until Data ACK or terminal cleanup restores current `E_i` headroom. Rate expiry
-alone does not revoke qualification or change this assignment authority. All
-retained debt remains bounded by `P_i` and shared `W`/reorder authority.
-
-These debt bounds are also inductive. Only an OriginalData commit increases
-`O` or one `O_i`, and it first proves the corresponding `W` and `L_i <= P_i`
-inequalities. Data ACK and terminal Product cleanup only decrease them;
-evidence, role, configured-envelope, and lifecycle transitions do not reassign or
-duplicate retained original ownership. Reinjection adds no member to `O`.
-
-These are the configured aggregate useful-Product/reordering bounds, not a new
-congestion or pacing window. A stricter hidden aggregate Product-owner cap has
-no unique derivation from these Product authorities and would serialize
-healthy cold-path discovery. This does not remove the independent finite
-all-stage carrier-token resource authority in Section 15.1. A blackholed unknown output can still create application head-of-line
-delay; that cost is unavoidable when ordered useful Product explores an
-unknown path. Each unqualified-additional commit is bounded by its then-current
-`E_i`, while any debt inherited from earlier `P_i` authority remains bounded by
-`P_i`; the existing Product recovery deadlines bound both cases without
-logically blocking another output that still has shared headroom. No capacity
-receipt or observation-generation deadline owns Product liveness.
-
-Ordinary acquisition adds no synthetic traffic. Optional observation does, but
-charges every payload byte and never owns Product order. Its direct Product
-head-of-line cost is therefore zero. Its resource cost is not zero: one atomic
-head already accepted by a TCP FIFO cannot be preempted, a completed generation
-may have transferred as many as `G` bytes, and traffic on nominally separate
-carriers may share an unknown bottleneck. The distinct lowest-priority queue and
-per-head arbitration prevent an unadmitted train from blocking later ordinary
-or control work; they cannot promise zero network delay or a finite drain time
-when service is zero. This is the unavoidable information-versus-interference
-tradeoff, bounded in payload bytes by the cumulative ledger and generation cap.
-
-TCP pool establishment is owned by Section 7.2 and is independent of
-instantaneous Product demand. A ready pool member enters the regular or backup
-placement set defined by Sections 7.2 and 7.3. It receives no fixed share and
-no special startup rate: acquisition is bounded by the existing unproven-path
-flight, shared credit, queue, repair, and reorder rules above.
-
-The scheduler evaluates every exact carrier direction from the shared carrier
-ledger and current carrier service evidence. Qualified Product volume changes
-an additional output from bounded `E_i` acquisition to configured `P_i`
-assignment; it does not itself change `S_c`, the output guard, or `P_i`. Only
-separately valid typed carrier rate/timing evidence or exact ledger work may
-change `S/U`; usage selects the structural tier. Other sampled queue, flight,
-loss, ECN, confidence, health, active-flow count, or native state cannot add an
-independent score term. Exhausted Product/resource headroom, failed exact writer
-reservation or native backpressure, structural ineligibility,
-or lack of residual backlog may leave an output without new Product work.
-Inferior or expired carrier evidence may suppress ordinary placement but
-cannot remove structural membership; only eligible throughput observation may
-then add bounded duplicate load. Carrier presence alone is therefore not
-payload allocation or active flow load.
-
-While the ordinary incumbent remains admitted, both request and response
-placement apply the same `S/U` inequality above. The pending exact command
-appears once as `M_c`; committed predecessor work appears once in `D_c`.
-Counting either again can pin an incumbent by its own serialization delay.
-Shared carrier-ledger generation revalidation exposes a concurrently accepted
-quantum before another commit. This transport-neutral hysteresis reduces
-ownership flapping without turning ownership into a fixed path preference.
-
-The Core does not infer a common bottleneck or condition carrier membership or
-directional authority on transient comparative throughput samples. Such a
-comparison cannot reliably mature a new kernel TCP flow across the full
-supported bandwidth and RTT range, and it makes the physical pool depend on
-one transient traffic direction. The configured maximum is the explicit,
-bounded connection policy; native TCP congestion control and ordinary carrier
-service-pressure ordering remain the traffic policy.
-
-No Mbps value, utilization percentage, source address, locator, interface
-identity, application flow count, laboratory condition, or fixed observation
-window may create, promote, or revoke a TCP pool member. Exact native failure
-changes liveness immediately; planned configuration and maintenance changes
-use the gradual lifecycle in Section 7.2.
 ### 15.2 Reinjection budget and timing
 
 Ordinary optional reliable payload is limited by cumulative extra-traffic
@@ -4602,10 +2779,10 @@ The Product default is 10 percent. `[flow].optional_reinjection_budget_percent`
 sets the local sender default and an MPP inbound/outbound performance value may
 override it for that node. The value is directional and peers do not negotiate
 it. It meters optional repair reinjection, including persistent authoritative
-gap repair while the exact original carrier remains live, active observation,
-and stale-path requalification payload. It does not meter native transport
-retransmission, MPP control headers or receipts, or the cause-bounded critical
-recovery authority defined below.
+gap repair while the exact original carrier remains live, and stale-path
+requalification payload. It does not meter native transport retransmission,
+MPP control frames, or the cause-bounded critical recovery authority defined
+below.
 
 Exact carrier-instance failure permits immediate bounded reinjection on an
 eligible live alternative. A measured survivor is preferred, but liveness is
@@ -4615,7 +2792,8 @@ A complete Data ACK snapshot may establish omitted ranges. Later positive
 partial ranges extend known progress but do not establish omissions alone.
 
 The MPP recovery interval uses the original carrier's underlay and latest
-snapshot:
+snapshot. When that snapshot contains an observation, let `srtt` and `jitter`
+be its nonnegative directional smoothed-RTT and jitter durations:
 
 - TCP: with an observation, let `SRTT = max(srtt, 1 ms)` and
   `RTTVAR = max(jitter, SRTT / 8)`. The interval is
@@ -4639,36 +2817,29 @@ absolute deadlines, as specified below. The thresholds are:
 - `5/4 * SRTT` for TCP; or
 - `9/8 * SRTT` for QUIC;
 
-Before `fallback_at`, score the exact live owner `o` and each currently
-measured alternate `t` from one immutable observation. The frontier payload
-`M_s` is already accepted OriginalData in the owner's Product debt and may
-also remain in native debt; it is new work only for the alternate. At
-serialized evaluation time `now`, an
-alternate is an advisory completion-winning repair candidate no earlier than
-`loss_at` only when:
+For a candidate extent, let `loss_at` be the maximum applicable `loss_at_j`
+and `fallback_at` the maximum applicable `fallback_at_j`. If any participating
+span lacks `loss_at_j`, the aggregate `loss_at` is absent and pre-fallback
+speculation is disabled. No earlier than `loss_at` and before `fallback_at`,
+a sender MAY offer the exact frontier as
+bounded speculative repair on a currently measured, distinct alternate, but
+only from already-funded optional credit and the existing target, queue,
+flight, and retained-range bounds defined below. Section 10.2 ranks eligible
+alternate repair actions using one common captured positive frontier payload,
+also defined below. That rank
+neither scores the already-accepted owner with a zero-size action nor proves
+that an alternate will complete before the owner. Exercising or declining this
+optional opportunity is local policy and grants no additional traffic
+authority. Without a current measured alternate there is no pre-fallback
+target-bound candidate; the independent owner fallback remains retained.
 
-```text
-max(now, loss_at) + S_t(M_s) < now + S_o(0)
-```
-
-The owner fallback is an independent authority epoch, not an owner-delivery
-estimate, and therefore MUST NOT replace the right-hand completion term.
-`S_o(0)` may conservatively include later outstanding offsets because Product
-debt is aggregate per output/instance and portable native telemetry does not
-expose an exact byte position inside an established TCP or QUIC ordering
-domain. It is consequently a bounded scheduling hint, not proof that the exact
-frontier owner will lose. A missing or non-finite owner
-projection supplies no early-race evidence, so a measured target retains
-`fallback_at` as its next evaluation. Without a measured target there is no
-target-bound candidate deadline; the independent owner fallback epoch remains
-retained for a later target observation and actor wake calculation.
-These loss, fallback, and completion comparisons are scheduling hints; they do
-not cap native rate, ordinary Product placement, or path capacity. At or after
-`fallback_at`, an eligible distinct alternate may perform bounded optional
-repair without a completion gain. Crossing `fallback_at` makes the first
-shared live-owner attempt token eligible without a completion gain. It neither
-proves native failure nor waives optional credit beyond the exact frontier
-floor defined below. Later attempts follow the same shared-token rule.
+At or after `fallback_at`, an eligible measured distinct alternate may perform
+bounded optional repair without an owner-completion comparison. Crossing
+`fallback_at` makes the first shared live-owner attempt token eligible. It
+neither proves native failure nor waives optional credit beyond the exact
+frontier floor defined below. These loss and fallback comparisons are
+scheduling hints; they do not cap native rate, ordinary Product placement, or
+path capacity. Later attempts follow the same shared-token rule.
 
 The repair uses exact target `t`'s current published Product envelope `P_t`,
 already bounded by shared `W` and the configured repair and path-flight
@@ -4677,6 +2848,13 @@ from a native-window observation of an older epoch. Let `O_t` be exact
 un-DataACKed OriginalData on that target and let `A_t^r` be one
 repair-admission quantum. This symbol is distinct from the unqualified
 OriginalData Product envelope `E_i` in Section 15.1.
+`B_t` is queued ReinjectedData bound to exact target `t`; `U_s` is
+target-unbound queued ReinjectedData in the current stream and direction; and
+`J_t` is every un-DataACKed ReinjectedData byte already accepted by exact
+target `t`. Repair bound to another target is excluded. Raw OriginalData
+staging, control work, other streams, aggregate path-health Product flight,
+and sampled native queue or packet flight are excluded from the repair
+accounting below.
 The target's Product repair capacity is:
 
 ```text
@@ -4685,32 +2863,42 @@ R_t = B_t + U_s + J_t
 K_t = repair_cap_t - R_t                 (saturating at zero)
 ```
 
+Those excluded categories do not contribute to `R_t`.
+
 For one logical-stream send direction `s`, let `C_s` be remaining cumulative
 optional-reinjection credit after the minimum-useful-attempt rule. Let `G_s` be
 its single non-accumulating live-owner attempt token, shared by authoritative-
 gap and contiguous-tail recovery. For byte `x`, let `O_s(x)` be the complete
 set of live exact OriginalData output incarnations covering it and let
 `A_s(x)` be the complete set of exact output incarnations with unresolved
-OriginalData or accepted ReinjectedData covering it. Let `V_s` be the maximal
-retained contiguous prefix from the lowest uncovered byte on which `O_s(x)`
-is the same non-empty singleton and `A_s(x)` is unchanged. A cache or
+OriginalData or accepted ReinjectedData covering it. Let `V_s` be the byte
+length of the maximal retained contiguous prefix from the lowest uncovered
+byte on which `O_s(x)` is the same non-empty singleton and `A_s(x)` is
+unchanged. A cache or
 application-write boundary alone does not end `V_s`; a retained-data hole,
 ambiguous owner, non-live owner, or exact identity-set change does. Let `H_s`
-be the uncovered bytes in the exact lowest retained Product frontier, let
-`Q_s^r` be the direction's common immutable repair quantum captured for target
-ranking, and let `M_s = min(Q_s^r, H_s, V_s)`. After selecting a bound target,
+be the byte length of the uncovered portion of the exact lowest retained
+Product frontier, let `Q_s^r` be the direction's common immutable repair
+quantum captured for target ranking, and let
+`M_s = min(Q_s^r, H_s, V_s)`. After selecting a bound target,
 Apply defines:
 
 ```text
-F_t = min(K_t, A_t^r, M_s)
+F_t^r = min(K_t, A_t^r, M_s)
 ```
 
 Thus Apply may shrink the ranked frontier for exact target capacity but may
 never enlarge or skip it, and the complete bound service prefix is capped by
-`V_s`. For target-unbound tail work, the serialized queue
-uses its bounded unassigned capacity and quantum
-`F_u = min(K_u, A_u^r, H_s)`; native dispatch later revalidates exact `K_t`
-before commitment.
+`V_s`. Target-unbound repair has no independent Product-capacity grant. Before
+target binding, its queued extent is bounded by the retained lowest frontier,
+captured common repair quantum, retained repair debt, configured repair and
+path-flight envelopes, and, for optional work, `C_s`. Queued target-unbound
+ReinjectedData `U_s` is conservatively included in `R_t` for every eligible
+target. At dispatch, after reserving the actual writer command, Apply
+recomputes that exact target's `K_t` while excluding only the current front
+intent and commits the complete frame only when its payload fits; otherwise it
+cancels the reservation and reevaluates. Queueing unbound work neither creates
+nor preserves target service authority.
 
 For every OriginalData assignment span `j` intersecting `M_s`, retain its
 immutable assignment time `a_j` and applicable owner recovery interval
@@ -4719,12 +2907,13 @@ immutable assignment time `a_j` and applicable owner recovery interval
 its corresponding absolute per-span deadlines. Therefore post-fallback
 authority begins only after every byte in the ranked prefix has matured.
 
-Before `fallback_at`, a completion-winning authoritative-gap attempt has
-`L_t = min(K_t, V_s, C_s)`. At or after `fallback_at`, it has:
+No earlier than `loss_at` and before `fallback_at`, a permitted speculative
+authoritative-gap attempt has `L_t = min(K_t, V_s, C_s)`. At or after
+`fallback_at`, it has:
 
 ```text
-L_t = min(K_t, V_s, max(C_s, F_t))
-D_t = max(0, L_t - C_s) <= F_t
+L_t = min(K_t, V_s, max(C_s, F_t^r))
+D_t = max(0, L_t - C_s) <= F_t^r
 ```
 
 If `G_s` is consumed, or the owner boundary has not elapsed, the over-credit
@@ -4733,7 +2922,8 @@ floor is unavailable but funded work remains
 `D_t = 0`. Thus the frontier floor replaces, and never adds to, optional
 credit; it does not suspend cumulative optional service. A full persistent-gap
 target window remains optional and cumulative only within the same exact
-identity-uniform prefix. Since `F_t <= M_s`, any accepted suffix after `F_t`
+identity-uniform prefix. Since `F_t^r <= M_s`, any accepted suffix after
+`F_t^r`
 has `D_t = 0` and is funded entirely by cumulative credit. Every suffix slice
 MUST remain retained and unacknowledged, keep the same exact identity sets,
 exclude frozen target `t`, and pass fresh exact Product and native admission;
@@ -4758,25 +2948,20 @@ no-progress interval and cannot move an existing deadline earlier. Sparse
 suffix ACK release does not restart it. Gap and tail observations cannot each
 spend a token in the same interval.
 
-`B_t` is queued ReinjectedData bound to exact target `t`; `U_s` is
-target-unbound queued ReinjectedData in the current stream and direction; and
-`J_t` is every un-DataACKed ReinjectedData byte already accepted by exact
-target `t`. Repair bound to another target is excluded. Raw OriginalData
-staging, control work, other streams, aggregate path-health Product flight,
-and sampled native queue or packet flight are excluded from `R_t`. Global
-retained repair debt and configured resource ceilings then cap `K_t`.
+Global retained repair debt and configured resource ceilings further cap
+`K_t`.
 
 When ordinary target headroom is full, `A_t^r` is one single outstanding
 emergency reserve for the exact directional recovery target. It is not renewed
 per range, timer expiry, evaluation, actor wake, or native queue drain.
-Target-unbound repair conservatively consumes every eligible target's reserve
-until assignment; after assignment it consumes only its exact target's
-reserve. The actual bounded writer-command reservation is the native admission
-boundary. After obtaining that reservation, the serialized Product actor MUST
-revalidate `K_t` while excluding the current front intent from `B_t`/`U_s`,
-record the accepted exact copy in `J_t`, and only then commit the writer
-reservation. Failed revalidation drops the reservation without recording the
-copy.
+Target-unbound `U_s` reduces every eligible target's `K_t` until assignment; it
+does not mint a separate reserve. After assignment it consumes only its exact
+target's reserve. The actual bounded writer-command reservation is the native
+admission boundary. After obtaining that reservation, the serialized Product
+actor MUST revalidate `K_t` while excluding the current front intent from
+`B_t`/`U_s`, record the accepted exact copy in `J_t`, and only then commit the
+writer reservation. Failed revalidation drops the reservation without
+recording the copy.
 If the highest-ranked target has neither ordinary service headroom nor
 emergency reserve, recovery MUST continue through the remaining eligible
 regular-before-backup targets and block only when none can admit the frontier.
@@ -4793,21 +2978,22 @@ cannot extend that horizon or create negative evidence. Both directions use
 the immutable epochs of every exact OriginalData assignment span in the
 candidate extent. For the same exact gap and assignment spans, later owner
 observations may move a threshold-derived deadline earlier but MUST NOT restart
-an assignment epoch or aggregate clock later. Alternate eligibility and
-service-pressure projection are evaluated from the current target; a departed
-target's early projection MUST NOT be inherited by its replacement. Without exact
-ownership or a live measured distinct alternate no target-bound repair is
-sent; when an eligible alternate cannot win early, ACK silence waits until the
-one-interval `fallback_at` rather than erasing that fallback.
+an assignment epoch or aggregate clock later. Alternate eligibility and the
+advisory action rank are evaluated from the current target; a departed target's
+rank MUST NOT be inherited by its replacement. Exact ownership and a live
+measured distinct alternate are required for target-bound live-owner repair;
+otherwise ACK silence waits until the one-interval `fallback_at` rather than
+erasing that fallback.
 
 Recovery target ranking and commitment MUST refer to the same lowest-missing,
 identity-uniform frontier. Decide ranks candidate targets using the common
 captured payload `M_s`; after selection, Apply may shrink the ranked frontier
-floor only to exact `F_t`. A separately funded suffix may extend total service
+floor only to exact `F_t^r`. A separately funded suffix may extend total service
 to `L_t` only under the rules below.
 The first committed repair frame has the same lowest offset, normalized
-frontier identity, and shared carrier-ledger generation whose `S_t` rank
-authorized that target, and its payload MUST NOT exceed `M_s`. If that frame
+frontier identity, output incarnation, and writer-capacity generation used by
+the frozen Section 10.2 target order, and its payload MUST NOT exceed `M_s`.
+If that frame
 cannot be committed because it overlaps queued or recent
 repair work, the evaluation MUST stop without publishing later omitted ranges.
 After the frontier quantum is committed, the sender may fill the remainder of
@@ -4816,7 +3002,7 @@ the frozen target remains absent from the unchanged `A_s(x)` set. A larger
 coalesced batch or whole-window throughput estimate MUST NOT replace the exact
 frontier-quantum carrier rank as the primary target objective.
 
-When a target-bound live-owner gap or completion-tail repair batch is accepted,
+When a target-bound live-owner gap or speculative-tail repair batch is accepted,
 its immutable next-attempt deadline is fixed from the selected alternate's
 observed MPP recovery interval. An accepted target-unbound tail instead fixes
 the then-observed original-owner tail interval. If one serialized batch admits
@@ -4838,11 +3024,11 @@ another wake cannot restart either silence clock.
 
 A contiguous live tail without an authoritative gap uses the same `G_s`.
 After the owner boundary it may cross remaining optional credit by at most
-bound `F_t` or unassigned `F_u`; a larger admitted tail remains bounded by
-`C_s` and its corresponding `K_t` or `K_u`, and unbound native dispatch still
-revalidates exact `K_t`. Admission while the token is available consumes the
-same opportunity as gap repair. Another over-credit attempt requires the
-shared full no-progress interval.
+the applicable bounded frontier quantum. Any larger admitted tail is funded by
+`C_s`, and every target-unbound native dispatch revalidates exact `K_t`.
+Admission while the token is available consumes the same opportunity as gap
+repair. Another over-credit attempt requires the shared full no-progress
+interval.
 
 For the finite-drain rule below, MPP Data ACK progress means newly
 acknowledged unique Product bytes. Receipt or republication of an unchanged or
@@ -4909,7 +3095,7 @@ its duplicate-suppression authority across the target set: the range becomes
 eligible on another exact target, but the accepted copy remains in `J_t` and
 the same exact reliable target remains ineligible for that range until Data ACK
 or its terminal attachment boundary. Native queue drain, packet ACK, stream
-write completion, carrier-service receipt, or another timer MUST NOT release
+write completion, or another timer MUST NOT release
 `J_t`; TCP and QUIC already
 recover the accepted bytes on that live reliable carrier. A replacement
 incarnation does not inherit the old target's `J_t`. The structural alternative
@@ -4918,8 +3104,8 @@ copy already committed. If no other exact target is eligible when `D` expires,
 MPP waits for Data ACK, a target-set change, or an exact terminal event instead
 of duplicating native recovery on the same survivor. The successful commitment
 directly publishes `D` into the actor's
-durable one-shot wake, even if `D` becomes due before the next ledger
-observation. That next exact-ledger observation reconciles or cancels a future
+durable one-shot wake, even if `D` becomes due before the next serialized actor
+observation. That next exact-state observation reconciles or cancels a future
 wake after Data ACK, detach, or failure. A due one-shot is consumed by the
 serialized recovery pass before awaited topology work; an unrelated ready
 event cannot erase it, and consuming one due deadline MUST preserve a later
@@ -4932,21 +3118,15 @@ by each exact reliable target incarnation until MPP Data ACK covers it or that
 target becomes terminal, while the existing queue, exact Product flight,
 repair, and extra-traffic bounds limit aggregate work.
 
-The reinjected command owns a separate carrier-work token. Its cumulative
-service receipt may retire that token without releasing `J_t`; the MPP Data ACK
-may release `J_t` and Product flight without directly retiring carrier `Q/Z`.
-
 Lifecycle and Product qualification are independent state axes. The
 directional attachment lifecycle is `Active`, `Stale`, `Requalifying`, or
 `Detached`; an active exact incarnation separately owns the `q_i` and
 qualification generation defined in Section 15.1. Stale entry revokes that
 Product qualification generation and makes `q_i = 0`. Entry into
 `Requalifying` or `Detached` has the same output-local clearing rule. It does
-not terminalize the Product-neutral carrier-observation generation, erase a
-still-fresh carrier-scoped ReceiptMode active term or acquisition, or retire
-native-owned carrier work; those retain their own carrier/path/mode and
-service-frontier lifecycle. Neither a later requalification nor an otherwise equal path
-identifier inherits output-local Product evidence.
+not terminate the physical carrier or rewrite native-controller state.
+Neither a later requalification nor an otherwise equal path identifier
+inherits output-local Product evidence.
 An exact requalification receipt moves
 `Requalifying` to `Active(q_i=0)` under the already-advanced output-admission
 epoch, and only the ordinary capped-volume rule can
@@ -4987,8 +3167,8 @@ requalification transactions for that session direction without wrapping;
 ordinary Product recovery and exact cleanup continue.
 
 Call a frozen target visit-admitting when, at its serialized visit, retained
-copy identity, budget or critical authority, all-stage token headroom, and the
-exact writer reservation all revalidate and that reservation succeeds.
+copy identity, budget or critical authority, Product resources, and the exact
+writer reservation all revalidate and that reservation succeeds.
 For an initial finite eligible cohort of size `n` with no exogenous membership
 or policy changes, suppose retained probe bytes and recurring budget or
 critical authority exist, every still-stale target is visit-admitting when
@@ -5003,8 +3183,8 @@ wake, it is selected within `n` subsequent successful publications under the
 same remaining premises. This is bounded attempt
 fairness, not a delivery promise. Core claims no wall-clock recovery under zero
 native or reverse service, persistent higher-priority starvation, absent
-retained bytes, permanently unavailable writer or all-stage token authority,
-exhausted identifiers, or continuously changing membership.
+retained bytes, permanently unavailable writer authority, exhausted
+identifiers, or continuously changing membership.
 
 Re-entry uses `STREAM_REQUALIFY_DATA` and `STREAM_REQUALIFY_ACK`. At most one
 requalification transaction may be pending in one stream direction. The
@@ -5024,8 +3204,8 @@ head-of-line blocking or make its OriginalData owner's ACK ambiguous.
 
 The receiver authenticates and fully processes the frame under the ordinary
 carrier session and returns `STREAM_REQUALIFY_ACK`, echoing the stream ID,
-probe ID, offset, payload length, origin writer epoch, and cumulative processed
-frontier. For one session and stream direction, define exact probe identity
+probe ID, offset, and payload length. For one session and stream direction,
+define exact probe identity
 `P = (stream_id, probe_id, offset, payload_bytes)`. The original sender's one
 non-reused pending lookup binds `P` to one exact forward attachment incarnation
 `T(P)`. The attachment `R` carrying the ACK is only authenticated reverse
@@ -5062,10 +3242,10 @@ zero-publication pending receipt, which permits sender expiry and legal
 cross-attachment reordering without unbounded replay fanout.
 
 On ACK receipt the sender first authenticates `R`, fully validates `P`, resolves
-only the exact pending `T(P)`, applies the cumulative carrier-service frontier,
-and then applies the dedicated requalification effect. A different session,
+only the exact pending `T(P)`, and then applies the dedicated requalification
+effect. A different session,
 unattached return carrier, mismatched field, reused ID, stale or absent target,
-`PATH_PROOF`, generic `STREAM_ACK`, or `CARRIER_OBSERVE_ACK` does not change
+`PATH_PROOF`, or generic `STREAM_ACK` does not change
 qualification state. Target terminal or expiry before effect application makes
 the effect stale; a successor never inherits it. Return-attachment terminal
 after accepted-receipt linearization cannot retroactively invalidate it.
@@ -5092,21 +3272,20 @@ ordered-control queue remains open, and an accepted copy drains in order. A new
 drain begins; a copy already accepted before drain is processed normally. ACK
 publication neither cancels drain nor revives or qualifies its return carrier.
 
-Loss of the probe leaves Product ownership unchanged. Its native-owned
-carrier-work token remains until a later cumulative frontier or exact writer
-terminal. At successful publication the transaction freezes the absolute
+Loss of the probe leaves Product ownership unchanged. At successful
+publication the transaction freezes the absolute
 deadline `D = published_at + stale-attachment recovery interval` from that
 exact attachment snapshot. The sender MUST compute `D` by checked addition
 before publication; failure refunds every provisional reservation, publishes
 no probe, advances the finite pass, and never saturates or wraps. Exhaustion of
 the monotonic deadline domain for every candidate disables new
 requalification deadlines for that exact session direction. Later metric, role, or policy
-changes do not move `D`. At `D`, expiry cancels and refunds a still-removable provisional or queued
-probe token, but retains a native-owned token until cumulative service or exact
-writer terminal. It retires the pending proof identity, returns the target to
-`Stale`, publishes the next cursor wake, and cannot leak or double-retire work.
-A late ACK still applies any valid cumulative service frontier first, while its
-expired requalification effect is a stale no-op. The next selected attempt
+changes do not move `D`. At `D`, expiry cancels and refunds a still-removable
+queued probe reservation. Work already accepted by the native transport
+follows that transport's ordinary ownership and terminal path. Expiry retires
+the pending proof identity, returns the target to `Stale`, publishes the next
+cursor wake, and cannot leak or double-retire work. A late ACK's expired
+requalification effect is a stale no-op. The next selected attempt
 uses a fresh probe ID. Probe bytes consume the existing optional extra-traffic
 budget and remain charged. Budget exhaustion MUST NOT permanently prevent
 re-entry: one minimum useful recovery quantum may be sent per exact stale
@@ -5117,8 +3296,8 @@ probe loss, at most one quantum per stale interval over time, excluding frame
 headers. Later optional reinjection authority remains reduced by that debt.
 
 The placement-persistence clock is independent for every exact attachment
-incarnation that owns current-epoch, evidence-eligible OriginalData omitted
-below a complete authoritative Data ACK horizon. Positive ACK ranges are
+incarnation that owns evidence-eligible OriginalData omitted below a complete
+authoritative Data ACK horizon. Positive ACK ranges are
 released before this decision, so a retained flight below that horizon is an
 authoritative omission. An incomplete ACK may fill an omission below an
 existing retained horizon, but cannot extend the horizon or create one. A
@@ -5137,9 +3316,10 @@ owner and predicate remain valid, scheduler polls, timer wakes, queue or
 capacity notifications, or RTT, jitter, loss, and model changes MUST NOT move
 that absolute deadline earlier or later.
 
-Only a Data ACK transaction that newly acknowledges unique current-epoch,
-evidence-eligible OriginalData bytes unambiguously attributable to that exact
-owner may replace its deadline. The attachment carrying the `STREAM_ACK` is
+Only a Data ACK transaction that newly acknowledges evidence-eligible
+OriginalData bytes unambiguously attributable to that exact owner and output-
+admission epoch may replace its deadline. The attachment carrying the
+`STREAM_ACK` is
 irrelevant. If authoritative omitted owner bytes and the predicate remain after
 that progress, the replacement deadline is the transaction observation instant
 plus a newly computed then-current placement-persistence interval; otherwise
@@ -5227,15 +3407,17 @@ A conforming implementation preserves all of the following:
     once.
 18. Simultaneous TCP carriers within one MPP session always have distinct
     `PathId` values and distinct carrier instances.
-19. Each TCP carrier group reconciles toward its configured healthy maximum
-    without exceeding it; the reserved first range value changes no behavior.
+19. Each TCP carrier group reconciles toward its configured healthy member
+    maximum without exceeding it; only the sole planned-replacement overlap in
+    Section 7.2 may temporarily raise its physical count to `MAX + 1`. The
+    reserved first range value changes no behavior.
 20. Every authenticated ready TCP pool member has bidirectional Product
     authority subject to directional `AVAILABLE`/`BACKUP` usage. Usage follows
     configured endpoint topology and never a throughput comparison.
 21. Carrier presence never forces payload placement or duplication. The
     ordinary scheduler revalidates exact carrier health, usage, Product
-    authority, shared carrier-ledger generation, writer reservation, credit,
-    output guard/epoch, and carrier service prediction before every commit.
+    authority, writer-capacity generation, writer reservation, credit,
+    output-admission epoch, and typed action rank before every commit.
 22. Server `PATH_CLOSE` is the ordered aggregate acknowledgment of a matching
     client `PATH_DRAIN`; local emptiness or write completion cannot replace it.
 23. `SESSION_CLOSE` retires the complete `SessionId`; carrier drain does not.
@@ -5247,8 +3429,8 @@ A conforming implementation preserves all of the following:
     carrier instance has its own wire lifecycle, while a stream never owns
     group capacity or replacement.
 26. A durable member ordinal persists across successive exact replacement
-    instances. A planned replacement permits only the bounded
-    current/successor/predecessor overlap in Section 7.2 and transfers no
+    instances. A planned replacement permits only one bounded predecessor/
+    successor overlap in Section 7.2 and transfers no
     attachment, queue, flight, authority, or evidence.
 27. A disabled TCP carrier group establishes no carrier and grants no new
     original placement. Every exact instance already in that group reaches
@@ -5285,150 +3467,68 @@ A conforming implementation preserves all of the following:
     jointly bounded by shared receive credit, reorder, queue, native-transport,
     and ordinary recovery authority; no output owns a direction-global
     acquisition token.
-34. The `PATH_CAPACITY_*` measurement result is diagnostic in Core Profile 7.
-    It creates no Product, carrier-lifecycle, usage, health,
-    congestion-control, or capacity authority and cannot gate unrelated
-    carrier work. Its positive data command still owns and retires the same
-    generic carrier-work token as every service-bearing command.
-35. Each positive reliable service-bearing command owns exactly one token in
-    exactly one provisional, queued, or native-owned stage. Transfers are
-    atomic, with no gap or duplication, and preserve
-    `0 <= Z_c <= Q^n_c <= Q^t_c <= N^B_c` and
-    `0 <= K^n_c <= K^t_c <= N^I_c`.
-36. A carrier-service frontier is cumulative, exact-writer scoped, and no
-    greater than the assigned frontier. It retires only complete covered
-    carrier-work tokens. Product ACK never retires `Qn`, settles `Z`, or claims
-    service; its sole `Qq/Qt` edit is the complete-range queued cancellation in
-    Section 8.5. A service receipt never releases Product, credit, `q_i`, or
-    native authority.
-37. Applying causal service entries, publishing exact token guards, and
-    releasing Product ownership have one linearization order before any new
-    scheduling decision.
-38. Output/stream terminal, ordered-writer terminal, native activation change,
-    and physical-carrier terminal clear only their exact scopes and imply
-    neither Product delivery nor peer service. Every actual `PathData`/
-    controller installation or restoration is fenced at switch time, including
-    same-identity cloning and complete install-and-rollback between polls. It
-    replaces only activation-owned state from one coherent new-source snapshot
-    in NativeMode, or clears path-scoped rate/timing evidence under the existing
-    ReceiptMode rules, while preserving same-connection writer tokens and
-    `Q/Z`; a writer terminal cancels its removable `Qp/Qq`, retires its `Qn`,
-    and makes its bound output directions non-admitting; a physical-carrier
-    terminal clears all writer scopes on that carrier.
-39. All QUIC ordered-writer epochs on one physical connection direction share
-    one aggregate carrier `Q/Z/C` clock. No logical stream, flow, or writer may
-    copy, multiply, or divide that capacity, and every candidate commit
-    atomically revalidates and advances the shared carrier-ledger generation.
-40. A complete-range Product ACK atomically cancels a still-queued original
-    before ownership release; partial queued work remains exact unguarded debt.
-    An ambiguous Product release sets at most one guard only on an exact
-    native-owned token, so `guarded(token)` implies `stage(token) = Qn`. Exact
-    service clears it once; a successor output-
-    admission epoch cannot be relatched by predecessor work. A guarded current
-    epoch demotes fresh originals only while an unguarded candidate admits and
-    never rewrites peer usage.
-41. An origin allocates ordered-writer epochs strictly increasingly without
-    reuse or wrap in one authenticated session and original-sender direction.
-    The receiver enforces bounded live native-writer bindings without a scalar
-    retired-order assumption. The origin ignores absent allocated epochs as
-    stale receipts and rejects future or wrong-direction epochs.
-42. Processed service-frontier state belongs to the ordered writer, not the
-    Product stream. A Product-neutral `SERVICE_ACK` can drain shared-writer work
-    after stream terminal and cannot grant Product authority.
-43. Every positive token reserves exact all-stage byte/item authority before
-    publication and has no synthetic MPP service deadline. Stage transfer
-    cannot lose a second capacity race; native-owned tokens and guards remain
-    charged until cumulative service receipt or exact writer/carrier terminal.
-    Zero native service may therefore retain bounded backpressure without a
-    finite progress claim, while zero-coordinate receipts remain token-free.
-44. Receiver dirty service authority clears only after same-fate reverse-queue
-    acceptance or exact origin terminal. For TCP that queue is on the same
-    connection; for QUIC it is the carrier-control reverse writer whose loss
-    terminalizes the carrier. Cross-carrier and operation-local copies do not
-    discharge it.
-45. A `STREAM_ACK` is completely validated against an immutable Product-state
-    classification and its session-scoped service state before mutation. The
-    transaction then applies service before Product. An absent or terminal
-    non-reused `StreamId` makes only the Product subrecord stale and cannot
-    discard valid service or resurrect Product state.
-46. Carrier-ledger generation exhaustion enters one absorbing non-admitting
-    state, invalidates captured plans, and performs exact carrier-terminal
-    cleanup without a successor ordinal. It cannot strand existing ownership,
-    wrap, saturate as a live generation, or admit new work.
-47. Stale requalification uses one finite cyclic exact-incarnation cursor and
-    at most one pending proof and one stream-owned receipt per direction. The
-    ACK carrier is authenticated return service only; the exact non-reused
-    pending tuple selects the forward target. One bounded pass copies a receipt
-    at most once to each queue-admitting current attachment, retains it only
-    after zero publications, and suppresses replay with the accepted exact
-    probe high-water. A stable eligible set has bounded attempt fairness under
-    the stated retained-byte, authority, local-admission, deadline, and
-    actor-fairness assumptions; no rule claims delivery or wall-clock recovery
-    at zero service.
-48. Carrier observation is scoped to exact session generation, direction,
-    carrier, native activation fence, observation-channel, and generation
-    identities. It can create carrier work and rate evidence only; it cannot
-    create or mutate Product ownership, ranges, Data ACK, receive credit,
-    qualification, usage, health, or native congestion authority.
-49. Each exact carrier-incarnation and original-sender direction has one
-    persistent, exclusive scheduling-rate authority reducer and one checked
-    non-resetting revision. `NativeMode` uses only the named controller's
-    current gain-free operational `B_op`, consumed from coherent live central
-    authority; `ReceiptMode` uses only receipt-derived evidence. Every actual
-    Native `PathData`/controller activation has a distinct equality-compared
-    lifetime fence, including restoration and same-identity clone. The
-    asynchronous adapter exposes transport-owned strictly increasing `E_N` and
-    central non-resetting `G` separately; both are carried through every
-    decision and precommit, and polling alone is insufficient. Every accepted
-    activation, basis/mode, or rate semantic change advances `G`; every
-    decision and precommit compare the complete applicable fences. A
-    serialized explicit structural contract revocation may switch
-    Native→Receipt once while preserving work and spend and cannot raise its
-    fallback; low controller state, missing polls, idleness, and wall time
-    cannot switch or repeatedly fence acquisition. A construction-time copy is
-    never live authority.
-50. Observation starts only when changing the target rate alone changes the
-    exact checked ordinary decision. The counterfactual preserves debt and all
-    non-rate facts. Low native evidence cannot stop rate-causal NativeMode
-    excitation; ordinary same-carrier feed pauses or successfully ends it.
-51. Sender-local principal-policy-direction authority charges every optional reliable
-    payload once. Receiver observation grant is per exact channel and escrowed
-    atomically under session and principal direction. Consumed work never
-    refunds, terminal returns only unused escrow, and session/channel creation
-    cannot mint principal startup authority. Principal consumption survives the
-    last session close until an exact old-policy epoch is fully fenced.
-52. ReceiptMode has exactly one fixed-expiry active term and one carrier-
-    direction acquisition `Acq_c`. The acquisition freezes `P_acq`,
-    `H_acq=10*P_acq`, `J_acq>=11`, `q_acq=ceil(H_acq/(J_acq-1))`, conservative
-    lower/upper busy-clock bounds, and at most `J_acq` authority-live suffix
-    anchors. The first/empty anchor is unconditional; later anchors are at
-    least `q_acq` lower-bound busy time apart. Every exact post-fence Product or
-    observation token is tagged once and contributes its forward normalized
-    work once to every covering retained anchor only after exact peer-
-    processing service; it cannot enter a successor. Each candidate divides
-    by a conservative elapsed upper bound and is live through `H_acq`
-    inclusive. Publication captures one `P_pub/H_pub` snapshot shared by the
-    fixed-expiry active term and any atomic zero-work successor; source and
-    successor tokens remain fenced. Low candidates and active expiry leave
-    `Acq_c` intact; only the fresh exact comparator may publish and fence it. No detached-rate sum,
-    unbounded historical maximum, arbitrary eviction, latest-source
-    replacement, cross-carrier sum, flow-count multiplier, or per-sample
-    native fence supplies rate.
-53. Observation DATA and ACK use one exact same-fate channel with a cumulative
-    processed-work frontier independent of native-path and semantic-generation
-    epochs. ACK applies service before fully scoped semantics, and semantic
-    payload cannot exceed its covered-token frontier. A semantic successor may
-    coexist with unresolved predecessor tokens under the shared all-stage cap;
-    channel terminal retires them without service before channel-epoch reuse.
-54. Observation arbitration is scoped to its exact target writer. Higher-
-    priority work on that writer may starve it, but ordinary backlog on another
-    writer cannot consume its opportunity. No new head is admitted while any
-    effective Realtime/Latency work is pending in the same session direction,
-    including on another carrier; already-native bounded debt is not
-    preemptible. A finite frozen round advances after every attempt and
-    publishes one successor wake only after positive work. An ordinary command
-    pending at head admission wins; later arrival may wait only behind already-
-    published bounded observation debt.
+34. The PATH_CAPACITY transaction is diagnostic in Core Profile 7. It
+    creates no Product, lifecycle, usage, health, congestion-control, or
+    scheduling-rate authority and cannot gate unrelated Product work.
+35. Advisory action rank uses only a coherent propagation term, exact
+    comparable pre-native predecessor work when available, the encoded action
+    work, and a typed positive directional rate. It rounds service time upward,
+    uses checked arithmetic, and never divides capacity by active-flow count.
+36. Rank is not admission. Every finite candidate order is revalidated against
+    Product, lifecycle, queue, and native authorities; an unrankable action
+    sorts last but remains eligible for an exact commit attempt.
+37. Equal scores use a canonical output, carrier-instance, attachment-
+    incarnation, direction, and command identity. PathId and input order are
+    insufficient. Incumbent hysteresis is duration-valued uncertainty separate
+    from the score; a percentage hint is not a hidden eligibility gate.
+38. Every active native PathData or controller installation and restoration is
+    fenced by a distinct E_N, including same-identity restoration. Every
+    accepted activation, basis, or NativeOperational rate change advances the
+    central G. Scheduling and precommit compare the complete coherent stamp.
+39. A locator-only migration that preserves the exact active controller
+    preserves E_N. A replacement connection or active-controller transition
+    cannot inherit a stale activation's native evidence merely because a path
+    label, locator, or controller identity is equal.
+40. A STREAM_ACK carries Product ranges only. Complete-frame validation and
+    Product release are atomic; an absent or terminal non-reused StreamId makes
+    the ACK stale and cannot resurrect Product state. Duplicated coverage
+    proves no carrier attribution.
+41. The response-startup return plan is one immutable finite transaction.
+    Before FINAL, fresh unique response offsets cannot exceed trigger_bytes and
+    ACK cannot refill that prefix. FINAL may retain only sorted enrolled
+    ordinals, atomically withdraws omitted enrolled outputs before removing the
+    ceiling, and is absorbing and idempotent only for an equal repetition.
+42. Kinds 44 through 48 are reserved and MUST be rejected as unknown under
+    version 10.
+43. Stale requalification uses one finite cyclic exact-incarnation cursor and
+    at most one pending proof and one stream-owned ACK publication per
+    direction. The ACK carrier is authenticated return service only; the exact
+    non-reused pending tuple selects the forward target. A bounded fanout pass
+    may publish one identical ACK on each currently attached accepting output
+    and makes no finite delivery claim when every reverse writer stalls.
+44. STREAM_REQUALIFY_DATA is Product-neutral and cannot advance a receive map,
+    Data ACK horizon, Product flight, or delivery evidence.
+    STREAM_REQUALIFY_ACK activates only its exact still-pending target's
+    already-advanced output epoch with Product qualification reset.
+45. Exact carrier, attachment, output-admission, writer-capacity, proof,
+    measurement, requalification, and Product identities are independent
+    fences. Terminal or exhaustion clears only the state owned by that exact
+    scope and never implies Product delivery.
+46. MPP-owned queue and Product resources have exact byte/item bounds and
+    owners. Native transport debt may have no finite service time while the
+    transport remains live; local write completion is neither MPP Data ACK nor
+    proof of application delivery.
+47. Optional reinjection accounting is directional and every published
+    optional Product byte is charged once. It never alters native
+    retransmission, native congestion control, or shared receive credit.
+48. Peer PATH_METRICS is detached diagnostic evidence. Unknown is not measured
+    zero, stale values remain visibly stale, and peer metrics cannot replace
+    local NativeOperational chronology.
+49. PATH_PROOF, PATH_CAPACITY, and STREAM_REQUALIFY acknowledgments carry
+    exactly the fields assigned in Section 12.2; trailing fields are invalid.
+50. Every new stream and attachment uses checked non-reused identity. The v10
+    return-plan transaction, Product ACK, lifecycle, and cleanup rules remain
+    bounded by configured frame, path, stream, queue, and retention limits.
 
 ## 17. Relationship to Existing Standards
 
@@ -5438,11 +3538,12 @@ RFC 8684 provides the established principles of stable data identity across
 subflows, a data-level acknowledgment distinct from transport ACKs, shared
 connection flow control, reinjection, bounded path management, and backup
 preference. MPP uses an explicit configured carrier bound rather than a
-traffic-rate threshold. Section 3.3.8 motivates regular-to-backup transition.
-Section 2.6 permits one MPTCP subflow to close through ordinary TCP FIN/ACK
-without closing the MPTCP connection; MPP's ordered per-carrier wire
-transaction is independently defined as client `PATH_DRAIN` followed by server
-`PATH_CLOSE`.
+traffic-rate threshold. RFC 8684 Section 3.3.8 motivates regular-to-backup
+transition.
+RFC 8684 Section 2.6 permits one MPTCP subflow to close through ordinary TCP
+FIN/ACK without closing the MPTCP connection; MPP's ordered per-carrier wire
+transaction is independently defined as client `PATH_DRAIN` followed by
+server `PATH_CLOSE`.
 
 MPP follows those principles but is not MPTCP-conformant. Its offset space is
 per direction of each MPP stream rather than one connection-level DSN space
@@ -5455,14 +3556,13 @@ can be less fair than one TCP flow. MPP cannot install coupled control above
 kernel TCP and does not claim coupled fairness or common-bottleneck detection.
 The configured pool maximum is therefore the explicit resource and concurrency
 policy; each member retains native TCP congestion-control authority and the
-usage-aware carrier service-pressure scheduler may leave redundant members idle.
+usage-aware advisory action rank may leave redundant members idle.
 
-This Core Profile declares no named TCP NativeMode operational-bandwidth
-adapter. A TCP carrier therefore selects ReceiptMode. Kernel TCP delivery,
-pacing, congestion-window, and queue telemetry remains diagnostic for
-scheduling-rate authority; a future profile may select NativeMode only by
-declaring the full Section 10.2 adapter contract when a new carrier-incarnation
-and direction reducer is constructed.
+This Core Profile declares no named TCP NativeOperational adapter. Kernel TCP
+delivery, pacing, congestion-window, and queue telemetry therefore remains
+diagnostic unless a separately typed evidence source satisfies Section 10.2.
+A future profile may define a native TCP adapter only by declaring that full
+contract for a new carrier-incarnation and direction reducer.
 
 ### 17.2 QUIC
 
@@ -5470,28 +3570,29 @@ RFC 9000 and RFC 9002 govern each QUIC carrier's connection identity, network
 paths, address validation, migration, congestion control, loss recovery, RTT,
 ECN, and PMTU behavior. MPP does not redefine those mechanisms.
 
-A model-based native QUIC controller should not necessarily use one delay
-estimate for two different jobs. A raw minimum RTT is propagation evidence: it
-is appropriate for the controller's minimum-delay filter and for draining the
-queue during a ProbeRTT state. The flight needed during ordinary Startup,
-Drain, and bandwidth-probing states is instead a service-window estimate. On a
-variable-delay path, one reordered fast-tail sample can be a valid minimum RTT
-while still being far below the delay that normally bounds delivered flight.
-Using that sample for both jobs can make `gain * bandwidth * RTT` too small,
-age the bandwidth estimate down behind the resulting underflight, and create a
-self-sustaining rate collapse.
+A proposed speed fix is to give a model-based native QUIC controller separate
+propagation and service-window delay estimates: raw minimum RTT would retain
+minimum-delay and ProbeRTT duties, while a larger estimate would size ordinary
+Startup, Drain, and ProbeBW flight. On a variable-delay path this can avoid
+using one reordered fast-tail sample to compute a small
+`gain * bandwidth * RTT` flight. It is nevertheless only a hypothesis: the
+endpoint cannot prove that a larger observed delay is unavoidable service time
+rather than external queueing. The preferred profile therefore rejects this
+change on the latency argument given below and retains raw minimum RTT for both
+jobs.
 
-The `QuinnBbr3NativeOperationalV1` NativeMode adapter exports the controller's
-current gain-free **operational bandwidth component** `B_op`, specifically
-`min(max_bw, bw_shortterm)`, because that is the rate component used by the
-controller's live send model. It MUST NOT export only the stale-high long-term
+A Valid `QuinnBbr3NativeOperationalV1` adapter observation exports the
+controller's current gain-free **operational bandwidth component** `B_op`,
+specifically `min(max_bw, bw_shortterm)`, because that is the rate component
+used by the controller's live send model. It MUST NOT export only the stale-high long-term
 `max_bw` filter, a gain-scaled pacing rate, or an independently smoothed ACK
 window. `B_op` is not asserted to be fresh achieved goodput: it may retain or
 restore a probe opportunity before a new high sample, and its declared
-loss-compensation domain may exceed raw delivered rate. With `p0 = 10%`, that
-compensation alone is bounded by `1/(1-p0) = 10/9`, or about `11.11%`, over the
-aligned raw rate. This operational state is advisory to Core scheduling; the
-native controller still enforces cwnd, pacing, and recovery.
+loss-compensation domain may exceed raw delivered rate. With a ten-percent
+authorized-loss allowance, that compensation alone is bounded by
+`1/(1-0.10) = 10/9`, or about `11.11%`, over the aligned raw rate. This
+operational state is advisory to Core scheduling; the native controller still
+enforces cwnd, pacing, and recovery.
 
 The adapter reads `(E_N, I_N, kind, rate)` from one atomic active Quinn
 `PathData`/controller snapshot. The most recently allocated validation
@@ -5505,14 +3606,16 @@ remain distinct. Port rebinding that retains the exact active `PathData`/
 controller activation does not create a new fence merely because the locator
 changed.
 
-The export changes whenever the active native controller changes this
+After Section 10.2.1 qualification, or immediately for Unknown or Unlimited,
+the export changes whenever the active native controller changes this
 component. A source change resets predecessor-owned initialization and rate
 evidence and compare-applies only the coherent new active snapshot, as defined
 in Section 10.2. MPP adds no independent smoothing, cap, maximum with another
-rate source, expiry, or recovery timer. Every live scheduling consumer
-receives the corresponding central-authority revision within `D_pub`;
-publication MUST detect a `B_op` change directly and cannot depend on a
-detached wrapper sample-count change. This asynchronous adapter exposes
+rate source, expiry, or recovery timer. If that complete changed observation
+remains current for `D_pub` in the adapter's declared stable environment,
+every live scheduling consumer receives its central-authority revision within
+`D_pub`. Publication MUST detect a `B_op` change directly and cannot depend
+on a detached wrapper sample-count change. This asynchronous adapter exposes
 transport `E_N` separately from central `G`; snapshots and precommits compare
 both, including switches completed between polls. A consumer MUST discard and
 recompute an old decision when any component of its complete applicable
@@ -5539,14 +3642,14 @@ as a separate empirical controller policy, disabled by the preferred profile,
 and accepted only by both goodput and loaded-latency evidence.  It cannot be
 used to satisfy Core conformance or the implementation gate in this document.
 
-On a path where the operator deliberately authorizes an exogenous-loss
-allowance, the preferred BBR-family model separates service estimation from
+On a path where sender-local policy authorizes an exogenous-loss allowance,
+the preferred BBR-family model separates service estimation from
 its residual congestion-loss objective.  Let `p0` be the sender-local
 authorized loss-compensation fraction and let `q` be the controller's ordinary
 residual loss objective, with exact domains `0 <= p0 < 1` and `0 <= q < 1`.
-Configuration represents both as checked rational fixed-point values; NaN,
-infinity, negative, or unit-and-above values are invalid at configuration
-time.
+The `p0` configuration and the controller's `q` are each represented as checked
+rational fixed-point values; NaN, infinity, negative, or unit-and-above values
+are invalid.
 
 For one aligned delivery sample, let `d >= 0` and `l >= 0` be its delivered and
 declared-lost bytes, and let `r_raw >= 0` be its raw delivery rate.  When
@@ -5562,25 +3665,10 @@ When `d + l = 0`, no compensated sample exists.  Because
 `a <= l / (d + l)`, `d <= d_comp <= d + l`; compensation cannot claim more
 service than the aligned resolved volume.  A clean sample has `a = 0` and is
 unchanged.  Missing or unalignable loss evidence uses the raw sample and no
-allowance.  Integer implementations round compensated volume and rate down,
-round `A`, `B`, and every credit addition down, and round loss debits up.  They use checked
-widened arithmetic; inability to represent an input or result takes the raw-
-authority transition below rather than wrapping, saturating optimistically,
-panicking, or dropping evidence.
-
-The corresponding high-loss boundary is the exact dimensionless fraction:
-
-```text
-theta = 1 - (1 - p0) * (1 - q)
-```
-
-That expression is a population-rate policy, not permission to compare every
-finite packet-timed round's point estimate independently with the boundary.
-Doing so makes ordinary placement variance repeatedly look like congestion;
-because the native response is multiplicative, those false decisions can
-ratchet the bandwidth and flight models downward. A fixed-sample confidence
-interval is not a clean repair: repeated looks invalidate its coverage, and
-loss may be correlated rather than Bernoulli.
+allowance.  Integer implementations round compensated volume and rate down
+and use checked widened arithmetic; inability to represent an input or result
+takes the raw-authority transition below rather than wrapping, saturating
+optimistically, panicking, or dropping evidence.
 
 Loss-only observations also cannot distinguish an arbitrarily correlated
 erasure burst from a drop-only policer. A nonzero `p0` profile therefore needs
@@ -5594,27 +3682,40 @@ A     = H * p0 * E
 B     = (1 - theta) * A
 ```
 
+`theta` is the exact dimensionless high-loss boundary. It is a population-rate
+policy, not permission to compare every finite packet-timed round's point
+estimate independently with the boundary. Doing so makes ordinary placement
+variance repeatedly look like congestion; because the native response is
+multiplicative, those false decisions can ratchet the bandwidth and flight
+models downward. A fixed-sample confidence interval is not a clean repair:
+repeated looks invalidate its coverage, and loss may be correlated rather than
+Bernoulli.
+
 `A` is the product policy's tolerated displacement of authorized lost bytes.
 `B` is the corresponding excess-loss credit: a lost byte also contributes
 `theta` credit as part of resolved volume, and therefore consumes
-`1 - theta` net credit.  Before the first complete non-application-limited
-round, `E` is the larger of the positive initial window and the earliest-sent
-aligned lost packet's nonnegative transmit flight.  Thereafter only the
-preceding complete non-application-limited round's positive resolved volume
-may replace `E`.  If no positive representable `E` exists, this epoch has no
+`1 - theta` net credit. Before the first complete non-application-limited
+round, the retained positive initial window and the identity and nonnegative
+transmit flight of the earliest-sent aligned lost packet are the **cold-start
+anchor**; `E` is the larger positive value supplied by that anchor. Thereafter
+only the preceding complete non-application-limited round's positive resolved
+volume may replace `E`. If no positive representable `E` exists, this epoch has no
 compensated decision and takes raw authority.  Three rounds is an explicit
 MPTUNNEL product risk policy: at `p0 = 10%`, it permits at most `0.3 * E` lost
 bytes to move across neighboring evidence rounds. It is not a BBR draft
 constant, an inferred path property, or a value selected by a benchmark.
+Integer implementations round `A`, `B`, and every credit addition down and
+round loss debits up.
 
 The sender maintains excess-loss credit `C` in `[0, B]`.  Creating the first
 valid envelope initializes `C := B`; this initial full bucket is the premise
-of the response-delay formula below.  Replacing an envelope computes the new
-bound only after applying the closing epoch to the old `(C, B)`, then sets
-`C := min(C, B_new)`.  Thus a smaller bound clamps retained credit and a larger
-bound never mints it. While compensation remains enabled, every loss
-declaration admitted to its journal has one stable record carrying its packet
-number space, packet number, byte count,
+of the response-delay formula below. Replacing an envelope first applies the
+closing epoch to the old `(C, B, E)`, then derives the new positive envelope
+`E'`, `A' = H * p0 * E'`, and `B' = (1 - theta) * A'`, and atomically sets
+`(C, B, E) := (min(C, B'), B', E')`. Thus a smaller bound clamps retained
+credit and a larger bound never mints it. While compensation remains enabled,
+every loss declaration admitted to its journal has one stable record carrying
+its packet number space, packet number, byte count,
 aligned send evidence when available, and recovery-transaction owner. Its
 class is exactly one of ordinary, raw-authority, or proven-spurious. For one
 immutable epoch, `delta_delivered` is the non-compensated, non-overlapping raw
@@ -5859,15 +3960,6 @@ MPP defines a private encrypted request opt-in and its own datagram envelope.
 It is deliberately not RFC 9298 CONNECT-UDP: it uses `POST`, MPP flow-open
 frames, MPP IDs, feedback, TTL, and fragmentation.
 
-The carrier-observation channel is an ordinary client-initiated bidirectional
-HTTP/3 request stream, not a QUIC control stream. It retains the profile's
-canonical encrypted `mpp-datagram: ?1` request field but opens no datagram flow
-and carries observation frames only in reliable HTTP/3 DATA. HTTP/3 request/
-response field sections and stream errors retain RFC 9114 semantics.
-Operation-local observation-stream FIN or reset cannot be promoted into a
-QUIC-connection or MPP-carrier failure; a connection-level error is still
-carrier-terminal.
-
 ### 17.4 Congestion-control coupling
 
 RFC 6356 describes coupled congestion control for MPTCP subflows. MPP does not
@@ -5897,6 +3989,7 @@ pools; it neither leases addresses dynamically nor installs host routes.
 - [RFC 8446: The Transport Layer Security (TLS) Protocol Version
   1.3](https://www.rfc-editor.org/rfc/rfc8446.html)
 - [RFC 9000: QUIC: A UDP-Based Multiplexed and Secure Transport](https://www.rfc-editor.org/rfc/rfc9000.html)
+- [RFC 9001: Using TLS to Secure QUIC](https://www.rfc-editor.org/rfc/rfc9001.html)
 - [RFC 9002: QUIC Loss Detection and Congestion Control](https://www.rfc-editor.org/rfc/rfc9002.html)
 - [RFC 9114: HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html)
 - [RFC 9221: An Unreliable Datagram Extension to QUIC](https://www.rfc-editor.org/rfc/rfc9221.html)

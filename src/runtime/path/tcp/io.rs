@@ -179,6 +179,16 @@ mod tests {
             .await
             .expect("write frame before native terminal");
         client.flush().await.expect("flush frame before terminal");
+
+        // Local flush does not prove that the peer decoded the frame. Establish
+        // the full-queue precondition before inducing the platform-native EOF.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while frames.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("decoded frame did not fill the actor queue");
         drop(client);
 
         tokio::time::timeout(Duration::from_secs(5), observed_terminal_rx)

@@ -734,7 +734,11 @@ Carrier endpoints use `tcp://HOST:PORT[-END]` or
 unknown, duplicate, empty, or inapplicable options fail configuration load.
 `backup`, `expensive`, `allow-bulk`, `control-only`, and `allow-datagrams` are
 operator constraints that remain in force until configuration or management
-policy changes them. `initial-srtt-s`, `initial-rttvar-s`, and the
+policy changes them. Regular paths precede backup paths; a later tier is tried
+only after the earlier tier is empty or its exact commits fail. Within the same
+freshness and regular/backup class, non-expensive paths precede expensive
+fallbacks. Neither preference is converted into an arbitrary timing penalty.
+`initial-srtt-s`, `initial-rttvar-s`, and the
 `initial-rate-*` forms are startup measurement priors that live evidence may
 replace. An omitted path rate inherits `[flow].initial_rate_mbps`, then defaults
 to unknown; explicit `initial-rate=unknown` suppresses inheritance.
@@ -763,10 +767,11 @@ resolved by the next diagnostic request.
 
 During authenticated setup the peer advertises sequence-zero directional
 `PathUsage::{Available, Backup}`. This is separate from local path health.
-Ordinary scheduling considers available paths first and uses backup paths only
-when no eligible available choice exists. Metrics rank paths within the chosen
-set. The receiver accepts only strictly newer later sequences. Runtime control
-does not originate a post-handshake preference change.
+Ordinary scheduling attempts available paths first and advances to backup only
+when that tier is empty or all exact commits there fail. Metrics rank paths
+within the current tier. The receiver accepts only strictly newer later
+sequences. Runtime control does not originate a post-handshake preference
+change.
 
 Management path controls change endpoint-local policy or lifecycle. They do not
 rewrite peer usage, forge transport evidence, or assign a fixed data path to a

@@ -1084,13 +1084,17 @@ Section 7.3 and may leave a redundant member idle. Pool membership never
 forces payload duplication and introduces no group-specific pacing or
 congestion controller.
 
-When eligible carriers otherwise have equal evidence, the client's configured-
-order fallback visits one member ordinal across every configured endpoint
-before visiting the next member ordinal. This prevents redundant members of an
+When eligible carriers otherwise have equal evidence during evidence-free
+startup, the client's configured-order coordinate visits one member ordinal
+across every configured endpoint before visiting the next member ordinal. This
+coordinate precedes only the final canonical exact-action key. It is computed
+as `(member ordinal, endpoint ordinal)` from stable configured values, never
+from the caller's input iteration order. This prevents redundant members of an
 earlier endpoint from displacing distinct configured endpoints during
-evidence-free startup. The order is not link identity, capacity evidence, a
-traffic share, or a common-bottleneck inference; current typed carrier service
-evidence remains authoritative.
+evidence-free startup.
+The order is not link identity, capacity evidence, a traffic share, or a
+common-bottleneck inference; current typed carrier service evidence remains
+authoritative.
 
 Because only `MAX` is effective, one group configured `3-3` and one group
 configured `1-3` expose the same three ready carriers. Three otherwise
@@ -1142,12 +1146,25 @@ space.
 For ordinary data, an endpoint MUST:
 
 1. remove locally ineligible carriers;
-2. form the regular (`AVAILABLE`) eligible set;
-3. use the backup set only when the regular set is empty; and
-4. rank carriers within the selected set from current evidence and demand.
+2. partition eligible carriers into regular (`AVAILABLE`) before backup usage;
+3. within each usage class, partition locally non-expensive before locally
+   `expensive` carriers;
+4. rank carriers within one structural tier from current evidence and demand;
+   and
+5. advance to the next declared tier only when the preceding tier has no
+   eligible candidate or every exact commit attempted there fails.
 
 Backup preference MUST NOT be represented as an arbitrary additive timing
-penalty. Local policy MAY further reserve a carrier as backup.
+penalty. Local policy MAY further reserve a carrier as backup. `expensive` is
+likewise a categorical endpoint-local operator preference, not a duration: an
+expensive carrier remains a fallback after every cheaper action in the same
+freshness and usage class fails exact commit.
+
+Reliable source admission adds freshness outside this generic hierarchy:
+nonstale precedes stale, then usage and cost apply within each freshness class.
+Thus a nonstale backup precedes a stale regular carrier. This refinement is
+explicit Product policy, not a numeric penalty or an inference that backup is
+faster.
 
 Usage, local health, authentication, liveness, proof, congestion state, and
 demand are independent facts.
@@ -1697,9 +1714,12 @@ count, reliable-stream window, or application-datagram admission rule.
 
 TCP and QUIC attachments are equally eligible after authentication,
 validation, readiness, usage, MTU, and queue admission. An implementation MUST
-NOT select a carrier family from protocol name alone. Each direction selects
-independently from current native rate, RTT, loss, congestion, queue, and
-configured regular/backup evidence.
+NOT select a carrier family from protocol name alone. Each direction applies
+the structural policy tiers and advisory rank in Section 10 independently.
+Native loss, congestion, and queue state retain their transport evidence-
+validation and admission roles. Queue state enters the common advisory score
+only as exact comparable pre-native `A`; loss and congestion labels are not
+independent numeric score terms.
 
 The packet scheduler SHOULD retain a healthy exact-carrier binding for one
 inner flow to avoid transport-damaging reordering. It MAY reselect immediately
@@ -1708,8 +1728,9 @@ loss, and MAY reselect at a flowlet boundary derived from current transport
 timing. A `Full` result drops the current packet, preserves the healthy flow
 binding, and does not prove path failure or authorize a duplicate. Opposite
 directions have independent affinity, so asymmetric carriers may be selected
-independently. Selection MAY include direction-local packet-flow load, but that
-evidence MUST age with actual flow activity and MUST NOT be borrowed from
+independently. Direction-local packet-flow load MAY govern affinity activity
+and flowlet reselection, but it is not an independent Section 10.2 score term.
+That evidence MUST age with actual flow activity and MUST NOT be borrowed from
 Product flow accounting. IP packet admission and its queue evidence are
 independent of reliable-stream and application-datagram queues; changing them
 MUST NOT change L4 proxy admission, retry, scheduling, or transport behavior.
@@ -1739,8 +1760,13 @@ An observation may contain:
 - evidence provenance and freshness.
 
 The implementation MUST discard and recompute a proposal when any revalidated
-identity, frontier, epoch, evidence stamp, or reservation is stale. Replacing a
-rate inside an old score is not revalidation.
+identity, frontier, authoritative epoch, rate-authority stamp, or reservation
+is stale. Replacing a rate inside an old score is not revalidation. The
+coherent timing tuple used only for advisory order is frozen for that finite
+attempt pass; a later timing publication is consumed by the next pass and does
+not by itself invalidate an otherwise current exact commit. Turning every
+rank-only timing update into an Apply fence can prevent work conservation
+under continuously changing measurements.
 
 Ranking is advisory. It cannot grant Product credit, queue capacity, native
 send credit, path proof, lifecycle eligibility, or recovery authority. The
@@ -1751,13 +1777,15 @@ draining carriers, forbidden command classes, missing attachments, exhausted
 configured resources, and failed exact reservations remain structural
 ineligibility rather than score penalties.
 
-Peer AVAILABLE versus BACKUP and local backup policy form the outer
-regular-before-backup tier defined in Section 7.3. They are not numeric timing
-penalties. Other explicit operator constraints such as control-only, allow-bulk,
-or allow-datagrams are likewise structural. A policy described only as costly
-or expensive MUST NOT be converted into an arbitrary RTT-, loss-, or payload-
-scaled delay; any implementation-defined cost requires its own declared unit
-and deterministic policy order.
+Peer AVAILABLE versus BACKUP and local backup policy form the structural
+regular-before-backup usage tier defined in Section 7.3. Reliable source
+freshness may wrap that tier exactly as declared there. These are not numeric
+timing penalties. Other explicit operator constraints such as control-only,
+allow-bulk, or allow-datagrams are likewise structural. A policy described only
+as costly or expensive MUST NOT be converted into an arbitrary RTT-, loss-, or
+payload-scaled delay. A numeric/additive cost requires its own declared unit
+and deterministic policy order; a categorical boolean such as `expensive`
+instead requires the explicit tier in Section 7.3 and has no numeric unit.
 
 ### 10.2 Evidence provenance and advisory rank
 
@@ -1767,26 +1795,77 @@ flow count, or relabelled as one exact physical backlog. Product ownership,
 bounded MPP queues, native flight, and native send capacity retain their own
 owners and terminal rules.
 
-For one exact action a, the advisory service score is:
+For one exact action a, at the Core millisecond service resolution, the
+advisory service score is:
 
-    S(a) = T(a) + ceil(8 * (A(a) + M(a)) / C(a))
+    S_ms(a) = T_ms(a)
+              + ceil(8000 * (A_bytes(a) + M_bytes(a)) / C_bps(a))
 
 where:
 
-- T(a) is a nonnegative duration-valued propagation estimate for the exact
+- T(a) is a nonnegative duration-valued propagation projection for the exact
   action direction;
-- M(a) is the complete encoded MPP frame size: the 10-byte MPTF header plus
-  its declared payload, excluding native framing, headers, and retransmission;
+- M(a) is the canonical pre-native Core work of one unsplit logical action:
+  the 10-byte MPTF header plus its declared fields and Product payload,
+  excluding carrier-specific re-recording, native framing, headers, and
+  retransmission;
 - A(a) is exact local pre-native predecessor work in the same byte unit,
   ending when that work is handed to the native transport; and
 - C(a) is a positive finite directional service rate in normalized-MPP bits
   per second whose scope includes that exact action.
 
-The division rounds upward. Every addition, multiplication, and conversion is
-checked. An unrepresentable score is unrankable rather than saturated into a
-win. A, M, and C MUST name the same direction and declared work domain. If
-comparable A cannot be proved for every candidate in one comparison, A is
-omitted uniformly from that comparison. Missing evidence is not zero.
+The factor 8000 is exactly 8 bits per byte times 1000 milliseconds per second;
+it is not a policy constant. Only the positive service duration is rounded
+upward to a whole millisecond. T retains its validated duration precision.
+Every addition, multiplication, division, and duration conversion is checked.
+An unrepresentable score is unrankable rather than saturated into a win. A, M,
+and C MUST name the same direction and declared work domain. If comparable A
+cannot be proved for every candidate in one comparison, the comparison uses
+the formula without A, equivalently `A_bytes = 0` uniformly; a missing A on one
+candidate MUST NOT be interpreted as observed zero. Missing evidence is not
+measured zero.
+
+Core v10 has no synchronized one-way-delay authority. Its live timing input is
+therefore one exact local tuple `(timing epoch, validated RTT, optional J)`
+bound to the carrier instance and original-sender direction. It projects
+`T = validated RTT / 2`. When J is present it MUST come from that same tuple; a
+newer RTT cannot be combined with an older, configured, or differently scoped
+J. J may be unavailable even when RTT is valid: for example, the Windows
+same-socket TCP API exposes SRTT but not RTT variation. That absence does not
+discard valid RTT, does not mean measured zero, and does not authorize borrowing
+variation from another source. Before a valid live RTT exists, the immutable
+configured startup tuple is used, with the portable Section 15.1 values for
+omitted fields. NaN, infinity, negative input, a scope mismatch, or an
+unrepresentable present duration rejects that raw live publication rather than
+clamping or combining it. Rejection does not replace a previously accepted
+live tuple; when none exists, a valid exact-scope startup tuple is the fallback.
+Only an action with no representable effective timing tuple is unrankable. The
+timing tuple's provenance is checked when the immutable observation is
+constructed and the tuple remains frozen through that finite candidate pass.
+It is not an independent commit authority and MUST NOT be repurposed as a
+high-frequency Apply fence. The directional rate-authority stamp and all
+structural/Product/native reservation fences remain independently revalidated.
+
+For the ordinary Core data actions with payload length `p`, canonical work is:
+
+    STREAM_DATA:   M_bytes = p + 30
+    IP_PACKET:     M_bytes = p + 30
+    DATAGRAM_DATA: M_bytes = p + 34
+
+The first two add the 10-byte MPTF header, two `u64` identities, and one `u32`
+payload length. `DATAGRAM_DATA` additionally carries the `u32` TTL. Each value
+MUST be constructed by an action-specific checked type; a caller MUST NOT pass
+raw Product payload bytes or substitute a projected bulk horizon. Other frame
+kinds require their own complete transaction model before they can claim an
+exact Section 10.2 rank. In particular, path/open acquisition may project
+future demand but is not an ordinary data action, and an advisory score alone
+does not prove that a datagram meets a TTL or delivery deadline.
+
+This normalized work boundary is intentionally carrier-neutral. If a carrier
+adapter later splits or re-records the logical action, those additional MPTF
+records and their native presentation overhead do not change M. A carrier-
+specific physical-byte score would require a separately proven attributed
+conversion and MUST NOT be silently substituted for this nominal Core domain.
 
 Before a finite typed C exists, an Unknown startup rate uses the portable C_0
 prior defined in Section 15.1. Explicit Unlimited is an ordering-only startup
@@ -1811,24 +1890,53 @@ but they do not add independent time to S. In particular, a Suspect label alone
 cannot override a finite current typed rank. Native controller and exact
 reservation state continue to constrain actual transmission.
 
-Equal scores use a canonical exact action key containing output identity,
-carrier instance, attachment incarnation where applicable, direction, and
-command identity. A bare reusable PathId and input order are insufficient. This
-key is only deterministic ordering and conveys no topology or capacity.
+Equal scores use the complete exact action identity from Section 10.1 as a
+canonical lexicographic key, ordered by logical output identity, physical
+carrier instance, attachment incarnation where applicable, original-sender
+direction, command kind, and exact proposed Product/command identity. A bare
+reusable PathId, configured vector position, cyclic cursor, and input order are
+insufficient. This key is only deterministic ordering and conveys no topology
+or capacity. Equal S uses this key in the canonical base order when no exact
+incumbent is retained; the one incumbent promotion below is the only explicit
+exception and does not reorder the remaining candidates.
+
+Within one unchanged structural tier, rankable actions precede unrankable
+actions. A rankable challenger displaces an unrankable incumbent; an
+unrankable challenger never displaces a rankable incumbent; if both are
+unrankable the canonical key orders them. Unrankability never changes
+structural eligibility or suppresses an exact commit attempt.
 
 Path retention uses a duration-valued uncertainty `U` separate from `S`. For a
-rankable action `a`, let `J(a)` be its nonnegative jitter value from the same
-exact action, direction, and timing epoch as `T(a)`; the configured value is
-used before a measured value exists. Then:
+rankable action `a`, let optional `J(a)` be a present nonnegative jitter value
+from the same exact action, direction, and timing epoch as `T(a)`. A present
+configured value is used with the startup RTT before live timing exists. Then:
 
-    U(a) = max(J(a), 1 ms)
+    J present: U(a) = max(J(a), 1 ms)
+    J absent:  U(a) = 1 ms
 
-Switching away from incumbent `i` to challenger `c` requires
-`S(i) - S(c) > U(i) + U(c)`. Jitter is not a statistical rate-confidence
-interval and does not prove that an estimated percentage difference is
-significant. Rate confidence may validate the typed `C`; it does not contribute
-to `U`. A percentage such as ten percent is a validation comparison band or
-operator hint, never a hidden path-swap threshold.
+The absent case is a policy/timer-resolution floor, not measured zero.
+
+`U` MUST NOT participate in a general sort comparator: its pair-dependent
+relation need not be transitive across three candidates. The scheduler first
+builds the canonical base order by structural tier, rankability, S, the
+conditional evidence-free configured-order coordinate, and the complete
+action key. If the exact incumbent is still eligible in the base-best
+challenger's structural tier, it is compared only with that challenger.
+Rankable challenger `c` displaces rankable incumbent `i` only when
+`S(i) - S(c) > U(i) + U(c)`. Equality retains the incumbent. A rankable
+challenger displaces an unrankable incumbent; an unrankable challenger does not
+displace a rankable incumbent; two unrankable actions use the base order.
+
+When displacement fails, the incumbent is promoted to the first attempt and
+all other candidates remain in canonical base order. If the incumbent's exact
+commit fails, the owner continues that unmodified base order; retention cannot
+hide the challenger or terminate fallback. A better structural tier appearing,
+or the incumbent becoming structurally ineligible, is not gated by numeric
+uncertainty. Jitter is not a statistical rate-confidence interval and does not
+prove that an estimated percentage difference is significant. Rate confidence
+may validate the typed `C`; it does not contribute to `U`. A percentage such
+as ten percent is a validation comparison band or operator hint, never a hidden
+path-swap threshold.
 
 The formula is an advisory local-service ordering, not an end-to-end
 application-completion estimate. It proves deterministic ordering, monotonic
@@ -2598,9 +2706,12 @@ sets the allowance to:
     min(W, sum(P_i for each output in that selected tier))
 
 Withdrawn, inactive, unschedulable, or zero-P_i outputs contribute zero.
-The exact tier order is non-stale Regular, non-stale Backup, stale Regular,
-then stale Backup; only the first nonempty eligible tier contributes. With one
-eligible output the allowance is exactly P_i. Traffic class may keep source
+The exact tier order is non-stale Regular cheap, non-stale Regular expensive,
+non-stale Backup cheap, non-stale Backup expensive, stale Regular cheap, stale
+Regular expensive, stale Backup cheap, then stale Backup expensive; only the
+first nonempty eligible tier contributes. `expensive` here is the configured
+categorical policy from Sections 7.3 and 10.1, never a numeric score penalty.
+With one eligible output the allowance is exactly P_i. Traffic class may keep source
 reads and each atomic service turn smaller, but it does not replace this
 Product byte authority. Staging grants no output ownership or native
 reservation; every assignment still passes the exact checks above.
@@ -2618,11 +2729,16 @@ specific configured or typed observation is absent:
     M_0   = I_0 + 30 = 14,630 normalized MPP bytes
     RTT_0 = 333 ms
     T_0   = RTT_0 / 2
-    J_0   = RTT_0 / 2
+    J_0   = unavailable
+    U_0   = 1 ms
     C_0   = 8 * M_0 / RTT_0, approximately 351 kbit/s
 
 A low or missing C orders alternatives but does not rate-limit, window-limit,
-or pace the sole admitting carrier. Missing evidence is never measured zero.
+or pace the sole admitting carrier. J is RTT variation, not unknown RTT; an
+omitted startup jitter therefore remains unavailable and uses only the Section
+10.2 one-millisecond uncertainty floor rather than inventing `RTT_0/2`
+variation or calling absence measured zero.
+Missing live evidence is never measured zero.
 
 Each output-admission epoch is checked and non-reusing within its exact output
 incarnation. Attachment admission creates the initial epoch. Revocation makes
@@ -2711,13 +2827,19 @@ envelope reduction. Those transitions preserve exact debt under P_i, W, and
 reorder authority and admit no new unqualified-additional OriginalData until
 Data ACK or terminal cleanup restores current E_i headroom.
 
-Every ordinary positive quantum freezes a finite candidate order by structural
-tier, Section 10.2 score, uncertainty, and canonical action identity. It tries
-each candidate until one real writer reservation and every Product authority
-succeed, then ends after that one commitment. It does not allocate equal shares.
-Backup is considered only after every regular candidate fails the exact
-commit. A backup uses the same L_i rule and one backup commitment never promotes
-it ahead of regular candidates for a successor quantum.
+Every ordinary positive quantum freezes a canonical finite base order by
+structural tier; rankable before unrankable; increasing Section 10.2 score; the
+conditional evidence-free configured-order coordinate; and canonical action
+identity. Incumbent uncertainty is then applied exactly once against the base-
+best same-tier challenger as specified in Section 10.2; it is not a sorting
+relation. If retained, the incumbent is attempted first, and an incumbent
+commit failure resumes the unchanged base order. The owner tries candidates
+until one real writer reservation and every Product authority succeed, then
+ends after that one commitment. It does not allocate equal shares.
+Backup is considered only after every regular candidate in the current
+freshness class fails the exact commit. A backup uses the same L_i rule and one
+backup commitment never promotes it ahead of regular candidates for a
+successor quantum.
 
 Each exact writer-admission resource owns a checked monotonic capacity
 generation. Reservation acquisition or refund, dequeue, close, policy or
@@ -3470,17 +3592,23 @@ A conforming implementation preserves all of the following:
 34. The PATH_CAPACITY transaction is diagnostic in Core Profile 7. It
     creates no Product, lifecycle, usage, health, congestion-control, or
     scheduling-rate authority and cannot gate unrelated Product work.
-35. Advisory action rank uses only a coherent propagation term, exact
-    comparable pre-native predecessor work when available, the encoded action
-    work, and a typed positive directional rate. It rounds service time upward,
-    uses checked arithmetic, and never divides capacity by active-flow count.
+35. Advisory action rank uses only a coherent RTT/2 propagation projection,
+    exact comparable pre-native predecessor work when available, the encoded
+    action work, and one typed directional rate authority. Finite-positive C
+    uses the millisecond service term
+    `ceil(8000*(A_bytes+M_bytes)/C_bps)`; declared `UnlimitedStartup` contributes
+    zero service duration. Both use checked arithmetic and never divide
+    capacity by active-flow count.
 36. Rank is not admission. Every finite candidate order is revalidated against
     Product, lifecycle, queue, and native authorities; an unrankable action
     sorts last but remains eligible for an exact commit attempt.
-37. Equal scores use a canonical output, carrier-instance, attachment-
-    incarnation, direction, and command identity. PathId and input order are
-    insufficient. Incumbent hysteresis is duration-valued uncertainty separate
-    from the score; a percentage hint is not a hidden eligibility gate.
+37. Equal scores and all-unrankable ties use the complete canonical output,
+    carrier-instance, attachment-incarnation, original-sender-direction,
+    command-kind, and Product/command identity. PathId and input order are
+    insufficient. Incumbent hysteresis is one same-tier comparison against the
+    base-best challenger, never a sort relation; it uses duration-valued
+    uncertainty separate from the score. A percentage hint is not a hidden
+    eligibility gate.
 38. Every active native PathData or controller installation and restoration is
     fenced by a distinct E_N, including same-identity restoration. Every
     accepted activation, basis, or NativeOperational rate change advances the
@@ -3621,9 +3749,11 @@ both, including switches completed between polls. A consumer MUST discard and
 recompute an old decision when any component of its complete applicable
 authority fence fails precommit equality.
 
-The preferred model retains raw minimum RTT for propagation, ProbeRTT, and
-ordinary BBR flight.  A larger packet-qualified "operational RTT" is not part
-of the preferred profile.  End-to-end low-flight observations cannot prove
+The preferred native BBR model retains raw minimum RTT for its internal
+propagation model, ProbeRTT, and ordinary BBR flight. This controller-internal
+value is not the Core scheduler's Section 10.2 timing tuple or its validated
+SRTT/2 projection. A larger packet-qualified "operational RTT" is not part of
+the preferred profile. End-to-end low-flight observations cannot prove
 that delay above raw minimum RTT is propagation rather than an external shared
 queue.  If a candidate controller substitutes `R_op > R_min` at bandwidth `B`
 and ordinary gain `g`, its nominal flight increases by exactly

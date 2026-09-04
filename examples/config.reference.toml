@@ -581,7 +581,8 @@ paths = [
 # - initial-srtt-s=<0.001..4294967.295>: initial smoothed RTT in seconds;
 #   omission uses the 0.333 s runtime startup model until live evidence exists;
 # - initial-rttvar-s=<0..4294967.295>: initial RTT variation in seconds;
-#   omission uses 0 s until live evidence exists. Decimal seconds preserve
+#   omission leaves variation unavailable and advisory retention uses only its
+#   0.001 s timer floor. This is not measured zero. Decimal seconds preserve
 #   millisecond-granular startup evidence;
 # - exactly one initial-rate-bps|initial-rate-kbps|initial-rate-mbps=<nonzero-u64>,
 #   or initial-rate=unknown|unlimited; scaled values must fit in u64 bits/second;
@@ -605,8 +606,10 @@ paths = [
 #   omission on a ranged path defaults to 300 s.
 #
 # Scheduling constraints are explicit `true` or `false`:
-# - backup: use only after schedulable regular paths (default false);
-# - expensive: add an evidence-scaled scheduling cost (default false);
+# - backup: try after the regular tier is empty or its exact commits fail
+#   (default false);
+# - expensive: prefer this path only after non-expensive paths in the same
+#   freshness and regular/backup class fail exact commit (default false);
 # - allow-bulk: permit throughput scheduling (default true);
 # - control-only: prohibit application data and retain control/probe work only
 #   (default false);

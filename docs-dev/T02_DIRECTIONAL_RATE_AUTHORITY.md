@@ -126,6 +126,11 @@ M0 = 14,600 + 30 = 14,630 bytes
 C0 = ceil(8 * M0 * 1,000 / 333) = 351,472 bit/s
 ```
 
+T03 extends this same normalized-Core domain with action-specific checked
+constructors rather than reusing a raw payload count: `IP_PACKET` is likewise
+`p+30`, while `DATAGRAM_DATA` is `p+34` because it also carries a four-byte
+TTL. This does not change the T02 rate authority or the reliable startup prior.
+
 QUIC currently re-records a Core action larger than 12,000 payload bytes below
 Product scheduling. A 14,600-byte action therefore emits two MPTF frames and
 14,660 MPTF bytes, plus two four-byte record prefixes and native H3/QUIC
@@ -157,9 +162,13 @@ For one canonical action with local pre-native work `A`, timing `T`, and the
 effective rate state above:
 
 ```text
-Finite(C):          S = T + ceil(8 * (A + M) / C)
-UnlimitedStartup:   S = T
+Finite(C):          S_ms = T_ms + ceil(8000 * (A_bytes + M_bytes) / C_bps)
+UnlimitedStartup:   S_ms = T_ms
 ```
+
+The factor 8000 is the exact bits/byte and milliseconds/second conversion.
+T03 owns the checked millisecond calculation; T02 supplies only typed `C` and
+canonical byte-domain `M`.
 
 The model establishes:
 

@@ -1466,7 +1466,7 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
         path_id: PathId(0),
     };
     let reinjection_key = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let (original_commands, mut original_receivers) = reliable_path_command_channels(8);
@@ -1688,7 +1688,7 @@ async fn sparse_ack_failed_original_reinjection_starts_at_lowest_hole() {
         path_id: PathId(0),
     };
     let reinjection_key = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -2622,7 +2622,7 @@ fn failed_original_tail_reinjection_queues_one_bounded_target_flight() {
         path_id: PathId(0),
     };
     let failover_key = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -2655,16 +2655,23 @@ fn failed_original_tail_reinjection_queues_one_bounded_target_flight() {
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
-    let unresolved_payload_len = reliable_relay_buffer_len(limits)
-        .saturating_add(MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
-        .min(limits.max_payload_bytes);
-    let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x52; unresolved_payload_len]))
-        .expect("prepare original-transmission path data");
-    send_stream
-        .commit_prepared_data(&frame)
-        .expect("commit original-transmission path data");
-    binding.record_original_flight(original_key, &frame);
+    let unresolved_payload_len = reliable_relay_buffer_len(limits);
+    assert!(
+        unresolved_payload_len > MAX_RELIABLE_SERVICE_QUANTUM_BYTES,
+        "fixture requires one valid relay quantum larger than the 64 KiB service quantum",
+    );
+    let mut remaining = unresolved_payload_len;
+    while remaining > 0 {
+        let chunk = remaining.min(reliable_relay_buffer_len(limits));
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x52; chunk]))
+            .expect("prepare original-transmission path data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit original-transmission path data");
+        binding.record_original_flight(original_key, &frame);
+        remaining = remaining.saturating_sub(chunk);
+    }
     binding.detach(original_key, &original_commands);
     let ack_ranges = [OffsetRange {
         start: 0,
@@ -2807,7 +2814,7 @@ async fn unknown_original_tail_reinjection_dispatches_as_path_failure_reinjectio
         path_id: PathId(0),
     };
     let failover_key = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -3029,7 +3036,7 @@ fn live_original_without_data_ack_does_not_probe_prefix() {
     let total = reliable_relay_buffer_len(limits).saturating_mul(4);
     let mut remaining = total;
     while remaining > 0 {
-        let chunk = remaining.min(limits.max_payload_bytes);
+        let chunk = remaining.min(reliable_relay_buffer_len(limits));
         let frame = send_stream
             .prepare_data(Bytes::from(vec![0x48; chunk]))
             .expect("prepare original-transmission path data");
@@ -4196,7 +4203,7 @@ fn response_fin_keeps_its_exact_decide_target_across_metric_churn() {
         path_id: PathId(0),
     };
     let selected_key = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let challenger_key = CarrierPathKey {
@@ -4234,7 +4241,7 @@ fn response_fin_keeps_its_exact_decide_target_across_metric_churn() {
     for key in [owner_key, selected_key, challenger_key] {
         binding.mark_output_path_proven_for_test(key);
     }
-    record_server_delivery_evidence_with_srtt(&binding, owner_key, 80_000);
+    record_server_delivery_evidence_with_srtt(&binding, owner_key, 300_000);
     record_server_delivery_evidence_with_srtt(&binding, selected_key, 10_000);
     record_server_delivery_evidence_with_srtt(&binding, challenger_key, 100_000);
 
@@ -4540,7 +4547,7 @@ fn detached_response_owner_uses_its_own_underlay_recovery_default() {
 }
 
 #[tokio::test]
-async fn exact_terminal_tail_reinjection_uses_only_available_path() {
+async fn exact_terminal_tail_reinjection_waits_while_only_current_owner_remains() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(126);
     let original_key = CarrierPathKey {
@@ -4613,27 +4620,20 @@ async fn exact_terminal_tail_reinjection_uses_only_available_path() {
         "exact terminal-failure repair remains independent of the live-owner epoch",
     );
 
-    response_sender
-        .dispatch_next_with_data_ack_outstanding(
+    assert!(matches!(
+        response_sender.dispatch_next_with_data_ack_outstanding(
             &path_stream,
             &mut send_stream,
             TrafficClass::Latency,
             limits,
             0,
-        )
-        .expect("final-tail reinjection must use the only available path");
-
-    let command = try_recv_reliable_path_command(&mut original_receivers)
-        .expect("expected final-tail reinjection on the available path");
-    match command {
-        ReliablePathCommand::SendFrame(Frame::StreamData {
-            offset, payload, ..
-        }) => {
-            assert_eq!(offset, 128);
-            assert_eq!(payload.len(), 64);
-        }
-        _ => panic!("expected final-tail reinjected STREAM_DATA"),
-    }
+        ),
+        Err(RuntimeError::SenderServiceBlocked),
+    ));
+    assert!(
+        try_recv_reliable_path_command(&mut original_receivers).is_none(),
+        "a terminal cause cannot publish a second copy while its only current target still owns the same Product range and configured slot",
+    );
 }
 
 #[tokio::test]
@@ -5787,7 +5787,7 @@ fn persistent_tail_reinjection_preserves_original_flight_attribution() {
     let reinjection_debt = reliable_relay_buffer_len(limits).saturating_mul(4);
     let mut remaining = reinjection_debt;
     while remaining > 0 {
-        let chunk = remaining.min(limits.max_payload_bytes);
+        let chunk = remaining.min(reliable_relay_buffer_len(limits));
         let frame = send_stream
             .send_data(Bytes::from(vec![0x43; chunk]))
             .expect("seed original-transmission path data");

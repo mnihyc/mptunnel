@@ -410,7 +410,7 @@ fn closed_carrier_queue_cannot_overtake_ordered_detach() {
 fn reinjection_prefers_a_path_without_the_original_range() {
     let mut fixture = switchable_fixture();
     let alternate = crate::model::path::CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(8);
@@ -531,11 +531,11 @@ fn timer_expiry_does_not_retry_an_unresolved_range_on_the_same_outputs() {
 fn timer_expiry_can_move_unresolved_repair_to_a_different_exact_output() {
     let mut fixture = switchable_fixture();
     let first_alternate = crate::model::path::CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let second_alternate = crate::model::path::CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(2),
     };
     let (first_commands, mut first_receivers) = reliable_path_command_channels(8);

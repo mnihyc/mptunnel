@@ -675,14 +675,45 @@ pub(in crate::runtime) fn path_snapshot_with_id(
     let product_progress_rate_bps =
         client_path_observation_qualified_product_completion_rate(path, observation);
     let has_durable_product_progress = product_progress_rate_bps.is_some();
-    let carrier_capacity_rate_bps = observation.carrier_delivery_rate_bps;
-    // Keep the legacy scalar as a lossy diagnostic projection of the one
-    // typed authority only. Product, PATH_CAPACITY, generic, and TCP kernel
-    // samples retain their own fields but cannot select C.
-    let delivery_rate_bps = scheduling_service_rate
-        .and_then(DirectionalServiceRate::finite_rate_bps)
-        .map_or(startup_diagnostic_rate_bps, |rate| rate as f64);
-    let rate_scope = PathRateScope::PathCapacity;
+    let legacy_carrier_rate_bps = observation.carrier_delivery_rate_bps.filter(|_| {
+        path.underlay != UnderlayProtocol::Tcp
+            || bulk_candidate_has_native_carrier_rate_evidence(path, observation)
+    });
+    // `score_path` still consumes this scalar. Preserve its complete legacy
+    // source ordering until a sustained typed allocator replaces that scorer,
+    // while giving an exact activation-scoped QUIC shape first refusal. The
+    // typed sidecar below remains the sole Section 10.2 service-rate value.
+    let (delivery_rate_bps, rate_scope, carrier_capacity_rate_bps) =
+        if let Some(shape) = exact_native_shape {
+            let finite_rate = shape.finite_rate_bps().map(|rate| rate as f64);
+            (
+                finite_rate.unwrap_or(startup_diagnostic_rate_bps),
+                PathRateScope::PathCapacity,
+                (shape.basis() == CarrierRateAuthorityBasis::NativeOperational)
+                    .then_some(finite_rate)
+                    .flatten(),
+            )
+        } else if let Some(rate) = legacy_carrier_rate_bps {
+            (rate, PathRateScope::PathCapacity, Some(rate))
+        } else if let Some(rate) = product_progress_rate_bps {
+            if startup_diagnostic_rate_bps >= rate {
+                (
+                    startup_diagnostic_rate_bps,
+                    PathRateScope::PathCapacity,
+                    None,
+                )
+            } else {
+                (rate, PathRateScope::PerFlowGoodput, None)
+            }
+        } else if let Some(rate) = observation.measured_rate_bps {
+            (rate, PathRateScope::PathCapacity, None)
+        } else {
+            (
+                startup_diagnostic_rate_bps,
+                PathRateScope::PathCapacity,
+                None,
+            )
+        };
     let delivery_rate_bps = delivery_rate_bps.max(1.0);
     let srtt_ms = path_model_srtt_ms(path, observation);
     let jitter_ms = observation
@@ -749,10 +780,9 @@ pub(in crate::runtime) fn path_snapshot_with_id(
 /// no measurement provenance or Product qualification.
 pub(in crate::runtime) fn startup_rate_prediction_bps(initial_rate: RateHint) -> f64 {
     match initial_rate {
-        RateHint::Unknown | RateHint::Unlimited => portable_startup_rate()
-            .expect("portable scheduling rate is representable")
-            .get() as f64,
-        RateHint::BitsPerSecond(rate) => rate as f64,
+        RateHint::Unknown => default_path_rate_bps(),
+        RateHint::Unlimited => 1_000_000_000_000.0,
+        RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
     }
 }
 
@@ -855,13 +885,28 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
     // than guessing it from equal numeric rates. Startup priors and a live
     // controller opportunity have no detached rate authority; carrier,
     // Product, and generic samples retain only their immutable source lifetime.
-    let carrier_rate_selected = snapshot.carrier_delivery_rate_bps.is_some();
+    let exact_native_shape = observation.native_scheduling_shape.filter(|shape| {
+        snapshot.underlay == UnderlayProtocol::Udp
+            && observation
+                .path_instance_id
+                .is_some_and(|path_instance_id| {
+                    shape.service_rate().scope()
+                        == DirectionalServiceRateScope::new(path_instance_id, direction)
+                })
+    });
+    let native_startup_selected = exact_native_shape
+        .is_some_and(|shape| shape.basis() == CarrierRateAuthorityBasis::StartupPrior);
+    let carrier_rate_selected =
+        snapshot.carrier_delivery_rate_bps.is_some() && !native_startup_selected;
     let native_authority_selected = carrier_rate_selected
         && observation.native_carrier_authority_basis
             == Some(CarrierRateAuthorityBasis::NativeOperational);
-    let product_rate_selected =
-        !carrier_rate_selected && snapshot.product_progress_rate_bps.is_some();
-    let generic_rate_selected = !carrier_rate_selected
+    let product_rate_selected = exact_native_shape.is_none()
+        && !carrier_rate_selected
+        && snapshot.product_progress_rate_bps.is_some()
+        && snapshot.rate_scope == PathRateScope::PerFlowGoodput;
+    let generic_rate_selected = exact_native_shape.is_none()
+        && !carrier_rate_selected
         && snapshot.product_progress_rate_bps.is_none()
         && observation.measured_rate_bps.is_some();
     // Detached PATH_METRICS is diagnostic telemetry. Once scheduling C is
@@ -926,8 +971,10 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
         } else {
             (None, None, 0, 0)
         };
-    let has_ack_derived_data_sample = !native_authority_selected
-        && (data_sample_count > 0 || observation.carrier_ack_derived_data_seen);
+    let has_ack_derived_data_sample = data_sample_count > 0
+        || (!native_authority_selected
+            && carrier_rate_selected
+            && observation.carrier_ack_derived_data_seen);
     let has_rate_epoch = rate_observed_at
         .zip(rate_expires_at)
         .is_some_and(|(observed_at, _)| observed_at <= now);
@@ -1302,9 +1349,7 @@ pub(in crate::runtime) fn default_path_srtt_ms() -> f64 {
 }
 
 pub(in crate::runtime) fn default_path_rate_bps() -> f64 {
-    portable_startup_rate()
-        .expect("portable scheduling rate is representable")
-        .get() as f64
+    PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
 }
 
 #[derive(Debug, Clone, Copy)]

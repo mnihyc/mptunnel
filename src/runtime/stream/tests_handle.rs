@@ -633,7 +633,7 @@ fn tcp_fixed_output_product_lower_bound_cannot_downshift_startup_prior() {
 }
 
 #[test]
-fn tcp_fixed_output_carrier_diagnostic_cannot_downshift_startup_prior() {
+fn tcp_fixed_output_fresh_exact_carrier_rate_overrides_scalar_startup_only() {
     let mux_limits = MuxLimits::default();
     let (commands, _receivers) = reliable_path_command_channels(8);
     let instance = CarrierPathInstanceId::from_raw(81);
@@ -660,10 +660,33 @@ fn tcp_fixed_output_carrier_diagnostic_cannot_downshift_startup_prior() {
     );
 
     let snapshot = fixed.send_path_snapshot_at(TrafficClass::Throughput, observed_at);
-    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(snapshot.delivery_rate_bps, 100_000_000.0);
     assert_eq!(snapshot.scheduling_service_rate(), Some(service_rate));
     assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(snapshot.carrier_delivery_rate_bps, Some(100_000_000.0));
+}
+
+#[test]
+fn tcp_fixed_output_unlimited_restores_only_the_legacy_scalar_sentinel() {
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let instance = CarrierPathInstanceId::from_raw(82);
+    let service_rate = DirectionalServiceRate::from_startup_hint(
+        DirectionalServiceRateScope::new(instance, PathMetricDirection::ClientToServer),
+        RateHint::Unlimited,
+    )
+    .expect("Unlimited TCP startup rate");
+    let startup = PathSnapshot::new(PathId(82), UnderlayProtocol::Tcp, 20.0, 1_000_000_000_000.0)
+        .with_scheduling_service_rate(service_rate);
+    let fixed = FixedReliablePathOutput::new_with_snapshot_and_path_instance(
+        startup, startup, instance, None, None, commands, mux_limits,
+    );
+
+    let snapshot = fixed.send_path_snapshot_at(TrafficClass::Throughput, Instant::now());
+    assert_eq!(snapshot.delivery_rate_bps, 1_000_000_000_000.0);
+    assert_eq!(snapshot.scheduling_service_rate(), Some(service_rate));
+    assert_eq!(service_rate.finite_rate_bps(), None);
+    assert_eq!(snapshot.carrier_delivery_rate_bps, None);
 }
 
 #[test]
@@ -834,7 +857,7 @@ fn native_fixed_output_invalid_authority_states_fail_closed() {
 }
 
 #[test]
-fn tcp_fixed_output_keeps_startup_authority_across_diagnostic_freshness() {
+fn tcp_fixed_output_exact_carrier_expiry_restores_scalar_startup() {
     let mux_limits = MuxLimits::default();
     let (commands, _receivers) = reliable_path_command_channels(8);
     let instance = CarrierPathInstanceId::from_raw(47);
@@ -864,7 +887,7 @@ fn tcp_fixed_output_keeps_startup_authority_across_diagnostic_freshness() {
         fixed
             .send_path_snapshot_at(TrafficClass::Throughput, observed_at)
             .delivery_rate_bps,
-        500_000_000.0
+        100_000_000.0
     );
     assert_eq!(
         fixed
@@ -1022,6 +1045,8 @@ fn fixed_native_window_and_rate_evidence_expire_without_rewriting_product_author
     );
     assert!(both_fresh.carrier_delivery_rate_bps.is_some());
     assert!(both_fresh.product_progress_rate_bps.is_some());
+    assert_eq!(both_fresh.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(both_fresh.rate_scope, PathRateScope::PerFlowGoodput);
     assert!(
         rates_fresh_without_native_window
             .carrier_delivery_rate_bps
@@ -1035,6 +1060,14 @@ fn fixed_native_window_and_rate_evidence_expire_without_rewriting_product_author
         rates_fresh_without_native_window
             .product_progress_rate_bps
             .is_some()
+    );
+    assert_eq!(
+        rates_fresh_without_native_window.delivery_rate_bps,
+        500_000_000.0,
+    );
+    assert_eq!(
+        rates_fresh_without_native_window.rate_scope,
+        PathRateScope::PerFlowGoodput,
     );
     let product_limit = reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
     for snapshot in [
@@ -1050,6 +1083,8 @@ fn fixed_native_window_and_rate_evidence_expire_without_rewriting_product_author
     }
     assert_eq!(product_rate_only.carrier_delivery_rate_bps, None);
     assert!(product_rate_only.product_progress_rate_bps.is_some());
+    assert_eq!(product_rate_only.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(product_rate_only.rate_scope, PathRateScope::PerFlowGoodput);
     assert_eq!(all_expired.carrier_delivery_rate_bps, None);
     assert_eq!(all_expired.product_progress_rate_bps, None);
     assert_eq!(all_expired.delivery_rate_bps, 25_000_000.0);
@@ -1107,7 +1142,7 @@ fn fixed_native_window_and_rate_evidence_expire_without_rewriting_product_author
 }
 
 #[test]
-fn t02_fixed_product_rate_stays_diagnostic_beside_configured_service_rate() {
+fn t02_fixed_qualified_product_promotes_legacy_scalar_without_rewriting_typed_rate() {
     let mux_limits = MuxLimits {
         max_repair_bytes: 32 * 1024 * 1024,
         max_reorder_bytes: 32 * 1024 * 1024,
@@ -1158,16 +1193,16 @@ fn t02_fixed_product_rate_stays_diagnostic_beside_configured_service_rate() {
     let expected = reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
 
     assert_eq!(snapshot.carrier_inflight_limit_bytes, 1024 * 1024);
-    assert_eq!(snapshot.delivery_rate_bps, 80_000_000.0);
+    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
     assert_eq!(
         snapshot.scheduling_service_rate(),
         Some(startup_service_rate)
     );
     assert_eq!(snapshot.product_progress_rate_bps, Some(500_000_000.0));
-    assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
     assert_eq!(
         snapshot.data_level_limit_bytes, expected,
-        "Product completion remains diagnostic and cannot replace configured carrier C",
+        "Product completion may rank the legacy scalar without replacing configured Product authority",
     );
     let output = ReliablePathStreamOutput::Fixed(fixed);
     let (_, source_window) = output
@@ -1223,9 +1258,9 @@ fn fixed_product_rate_requires_the_exact_epoch_byte_boundary() {
             .sample_bytes = sample_floor;
     }
     let qualified = fixed.send_path_snapshot_at(TrafficClass::Throughput, observed_at);
-    assert_eq!(qualified.delivery_rate_bps, 25_000_000.0);
+    assert_eq!(qualified.delivery_rate_bps, raw_rate);
     assert_eq!(qualified.scheduling_service_rate(), Some(service_rate));
-    assert_eq!(qualified.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(qualified.rate_scope, PathRateScope::PerFlowGoodput);
     assert_eq!(qualified.product_progress_rate_bps, Some(raw_rate));
     assert!(qualified.has_durable_product_progress);
 }

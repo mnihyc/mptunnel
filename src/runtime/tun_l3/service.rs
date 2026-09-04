@@ -1180,14 +1180,14 @@ fn server_native_packet_snapshot(
     } else {
         crate::runtime::path::model::default_path_srtt_ms()
     };
-    // This numeric field is a compatibility projection until the scheduler
-    // consumes the typed service-rate value directly. Unlimited deliberately
-    // has no numeric surrogate and therefore retains only the portable
-    // diagnostic projection here.
-    let rate_bps = finite_rate_bps
-        .map_or_else(crate::runtime::path::model::default_path_rate_bps, |rate| {
-            rate as f64
-        });
+    // The active scorer still consumes this compatibility scalar. Preserve
+    // its former Unlimited sentinel without inventing a finite value in the
+    // typed service-rate model.
+    let rate_bps = if valid {
+        finite_rate_bps.map_or(1_000_000_000_000.0, |rate| rate as f64)
+    } else {
+        crate::runtime::path::model::default_path_rate_bps()
+    };
     let mut snapshot = crate::scheduler::PathSnapshot::new(
         attachment.key.path_id,
         attachment.key.underlay,
@@ -1240,14 +1240,23 @@ fn server_tcp_packet_snapshot(
     server_tcp_packet_snapshot_at(status, attachment, Instant::now())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ServerTcpPacketLegacyRateBundle {
+    delivery_rate_bps: f64,
+    pacing_rate_bps: f64,
+    confidence: f64,
+    app_limited: bool,
+}
+
 fn server_tcp_packet_snapshot_at(
     status: Option<&crate::runtime::path::ServerCarrierPathStatusSnapshot>,
     attachment: &ServerIpAttachment,
     now: Instant,
 ) -> crate::scheduler::PathSnapshot {
-    // A peer hint describes the opposite direction. TCP packet dispatch uses
-    // only this exact attachment's immutable startup prior for service rate;
-    // endpoint-local TCP delivery samples remain diagnostic.
+    // A peer hint describes the opposite direction. The typed sidecar retains
+    // the attachment's immutable startup service rate. Independently, the
+    // still-live scalar scorer keeps the pre-T02 coherent local TCP sample
+    // bundle until that exact epoch expires.
     let metrics = status
         .and_then(|status| status.metrics)
         .filter(|metrics| metrics.direction == PathMetricDirection::ServerToClient);
@@ -1262,15 +1271,28 @@ fn server_tcp_packet_snapshot_at(
         attachment.startup_rate_prior,
     )
     .ok();
-    let measured_rate = server_tcp_packet_delivery_rate_diagnostic_at(
+    let measured_rate = server_tcp_packet_legacy_rate_bundle_at(
+        metrics,
         status.and_then(|status| status.carrier_delivery_rate_sample),
         now,
     );
-    let rate = service_rate
-        .and_then(DirectionalServiceRate::finite_rate_bps)
-        .map_or_else(crate::runtime::path::model::default_path_rate_bps, |rate| {
-            rate as f64
-        });
+    let startup_delivery_rate_bps =
+        crate::runtime::path::model::startup_rate_prediction_bps(attachment.startup_rate_prior);
+    let startup_rate = ServerTcpPacketLegacyRateBundle {
+        delivery_rate_bps: startup_delivery_rate_bps,
+        pacing_rate_bps: startup_metrics.map_or(startup_delivery_rate_bps, |metrics| {
+            if metrics.pacing_rate_observed {
+                metrics.pacing_rate_bps.max(1) as f64
+            } else {
+                startup_delivery_rate_bps
+            }
+        }),
+        confidence: startup_metrics.map_or(1.0, |metrics| {
+            f64::from(metrics.confidence_ppm) / 1_000_000.0
+        }),
+        app_limited: startup_metrics.is_some_and(|metrics| metrics.app_limited),
+    };
+    let legacy_rate = measured_rate.unwrap_or(startup_rate);
     let srtt_ms = metrics.or(startup_metrics).map_or_else(
         crate::runtime::path::model::default_path_srtt_ms,
         |metrics| f64::from(metrics.srtt_us) / 1_000.0,
@@ -1279,7 +1301,7 @@ fn server_tcp_packet_snapshot_at(
         attachment.key.path_id,
         attachment.key.underlay,
         srtt_ms,
-        rate,
+        legacy_rate.delivery_rate_bps,
     );
     if let Some(service_rate) = service_rate {
         snapshot = snapshot.with_scheduling_service_rate(service_rate);
@@ -1323,31 +1345,38 @@ fn server_tcp_packet_snapshot_at(
         // assertion that an exact queue or flight observation is available.
         snapshot.carrier_inflight_limit_bytes = metrics.inflight_limit_bytes;
     }
-    if let Some(startup_metrics) = startup_metrics {
-        snapshot.pacing_rate_bps = if startup_metrics.pacing_rate_observed {
-            startup_metrics.pacing_rate_bps.max(1) as f64
-        } else {
-            rate
-        };
-        snapshot.confidence = f64::from(startup_metrics.confidence_ppm) / 1_000_000.0;
-        snapshot.app_limited = startup_metrics.app_limited;
-    }
-    snapshot.carrier_delivery_rate_bps = measured_rate;
+    snapshot.pacing_rate_bps = legacy_rate.pacing_rate_bps;
+    snapshot.confidence = legacy_rate.confidence;
+    snapshot.app_limited = legacy_rate.app_limited;
+    snapshot.carrier_delivery_rate_bps = measured_rate.map(|rate| rate.delivery_rate_bps);
     snapshot
 }
 
-fn server_tcp_packet_delivery_rate_diagnostic_at(
+fn server_tcp_packet_legacy_rate_bundle_at(
+    metrics: Option<crate::protocol::PathMetrics>,
     carrier_sample: Option<CarrierDeliveryRateSample>,
     now: Instant,
-) -> Option<f64> {
+) -> Option<ServerTcpPacketLegacyRateBundle> {
     if let Some(sample) = carrier_sample {
-        // Presence dominates diagnostic freshness: an expired sidecar cannot
-        // fall through to retained PathMetrics and masquerade as a fresh
-        // carrier observation.
+        // Presence dominates freshness: an expired sidecar cannot fall
+        // through to retained PathMetrics and silently regain authority.
         if sample.delivery_rate_bps == 0 || sample.observed_at > now || now >= sample.expires_at {
             return None;
         }
-        return Some(sample.delivery_rate_bps as f64);
+        let delivery_rate_bps = sample.delivery_rate_bps as f64;
+        return Some(ServerTcpPacketLegacyRateBundle {
+            delivery_rate_bps,
+            pacing_rate_bps: sample
+                .pacing_rate_bps
+                .filter(|rate| *rate > 0)
+                .map_or(delivery_rate_bps, |rate| rate as f64),
+            confidence: metrics.map_or(1.0, |metrics| {
+                f64::from(metrics.confidence_ppm) / 1_000_000.0
+            }),
+            // A CarrierDeliveryRateSample is a qualified positive-ACK,
+            // non-application-limited sample by contract.
+            app_limited: false,
+        });
     }
 
     None
@@ -2014,7 +2043,10 @@ mod packet_metric_authority_tests {
         assert_eq!(service_rate.basis(), ServiceRateBasis::UnlimitedStartup);
         assert_eq!(service_rate.value(), ServiceRateValue::UnlimitedStartup);
         assert_eq!(snapshot.carrier_delivery_rate_bps, None);
-        assert_ne!(snapshot.delivery_rate_bps, 1_000_000_000_000.0);
+        assert_eq!(
+            snapshot.delivery_rate_bps, 1_000_000_000_000.0,
+            "typed Unlimited remains nonnumeric while the live legacy scorer retains its former scalar sentinel",
+        );
     }
 
     #[test]
@@ -2249,7 +2281,7 @@ mod packet_metric_authority_tests {
     }
 
     #[test]
-    fn tcp_packet_snapshot_sidecar_deadline_gates_diagnostic_only() {
+    fn tcp_packet_snapshot_sidecar_restores_legacy_scalar_until_exact_expiry() {
         let now = Instant::now();
         let expires_at = now + Duration::from_millis(10);
         let (startup, live) = packet_metrics(UnderlayProtocol::Tcp);
@@ -2270,14 +2302,21 @@ mod packet_metric_authority_tests {
             &attachment,
             expires_at - Duration::from_nanos(1),
         );
-        assert_eq!(fresh.delivery_rate_bps, 25_000_000.0);
-        assert_eq!(fresh.pacing_rate_bps, 25_000_000.0);
-        assert_eq!(fresh.confidence, 0.1);
-        assert!(fresh.app_limited);
+        assert_eq!(fresh.delivery_rate_bps, 120_000_000.0);
+        assert_eq!(fresh.pacing_rate_bps, 140_000_000.0);
+        assert_eq!(fresh.confidence, 0.7);
+        assert!(!fresh.app_limited);
         assert_eq!(fresh.carrier_delivery_rate_bps, Some(120_000_000.0));
+        assert_eq!(
+            fresh
+                .scheduling_service_rate()
+                .and_then(DirectionalServiceRate::finite_rate_bps),
+            Some(25_000_000),
+            "the compatibility scalar must not rewrite typed C",
+        );
 
-        // At the exact deadline, an expired sidecar disappears as a
-        // diagnostic and never changes the immutable scheduling rate.
+        // At the exact deadline, the legacy scalar returns to the attached
+        // configured startup projection while typed C remains unchanged.
         let expired = server_tcp_packet_snapshot_at(Some(&status), &attachment, expires_at);
         assert_startup_rate_bundle(expired);
     }
@@ -2307,7 +2346,10 @@ mod packet_metric_authority_tests {
         assert_eq!(service_rate.basis(), ServiceRateBasis::UnlimitedStartup);
         assert_eq!(service_rate.value(), ServiceRateValue::UnlimitedStartup);
         assert_eq!(service_rate.finite_rate_bps(), None);
-        assert_ne!(snapshot.delivery_rate_bps, 1_000_000_000_000.0);
+        assert_eq!(
+            snapshot.delivery_rate_bps, 1_000_000_000_000.0,
+            "the still-live legacy scorer retains its former scalar sentinel",
+        );
     }
 
     #[test]

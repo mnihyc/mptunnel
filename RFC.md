@@ -2173,7 +2173,7 @@ connection.
 
 ### 11.1 Path metrics
 
-`PATH_METRICS` carries typed directional evidence:
+`PATH_METRICS` carries direction-scoped diagnostic fields:
 
 ```text
 path_id:u16, underlay:u8, direction:u8, metric_epoch:u64,
@@ -2220,10 +2220,22 @@ advertised duration.
 
 The receiving peer MUST NOT install, reconstruct, refresh, or downshift a local
 advisory rate or NativeOperational value from this detached record; only the
-producer's exact local evidence owner may publish such local authority.
-`rate_observed` is true when `delivery_rate_bps` belongs to a measured native,
-Product, or generic delivery epoch and remains true after that epoch expires;
-it is false for an unmeasured startup prior. A nonzero
+producer's exact local evidence owner may publish such local authority. The
+producer publishes exactly the diagnostic rate selected by its temporary
+compatibility projection: an exact Native shape has first refusal, otherwise a
+qualified carrier sample, a qualified Product sample only when it won that
+projection, or a generic sample only when no higher source was selected. A
+lower, stale, scope-mismatched, or otherwise unqualified source MUST NOT donate
+its value, lifetime, sample counters, or ACK provenance. With only startup,
+configuration, Unlimited, or no selected observation, the producer publishes
+the portable C0 placeholder `351472`, `rate_observed = false`, and zero
+validity. A controller-local NativeOperational rate MAY be numerically visible,
+but has no transferable measurement epoch and therefore also publishes
+`rate_observed = false` and zero validity.
+
+`rate_observed` is true only when the selected carrier, Product, or generic
+diagnostic belongs to a real delivery epoch; it remains true after that epoch
+expires while its validity becomes zero. A nonzero
 `rate_valid_for_us` with `rate_observed = false` is noncanonical and MUST be
 rejected. Producer-side freshness requires both `rate_observed = true` and a
 nonzero remaining budget. Product `has_ack_derived_data_sample`, `data_sample_count`, and
@@ -2274,7 +2286,10 @@ acquisition phase. Core Profile 7 MUST NOT automatically initiate it as a
 prerequisite for ordinary placement, qualification, carrier readiness, or
 pool reconciliation. A receipt proves only ordered ingress of the declared
 measurement payload on that exact carrier and direction. It establishes no
-Product or scheduling completion-rate authority. A pending transaction or
+Product or typed Section 10.2 scheduling-rate authority. During the temporary
+legacy-scorer compatibility period, a qualified receipt may still feed the
+owner-specific historical scalar projection; that scalar grants no Product,
+admission, pacing, or native-controller authority. A pending transaction or
 receipt MUST NOT be a logical eligibility prerequisite or hold exclusive
 writer ownership; after each bounded diagnostic frame, the writer MUST return
 to ordinary arbitration so Product, Data ACK, control, and lifecycle work
@@ -2769,14 +2784,15 @@ only where a more specific configured or valid typed observation is absent:
     C_0   = 8 * M_0 / RTT_0, exactly 351,472 bit/s after upward rounding
 
 The temporary legacy compatibility scalar is deliberately not normalized by
-that model checkpoint. Until a future allocator replaces it atomically, every
-current owner retains its complete pre-`b5b4b5a` source precedence, rate scope,
-and projection behavior. In particular, legacy Unknown uses 14,600 bytes over
-333 ms (approximately 350,751 bit/s), legacy Unlimited uses the 1-Tbit/s
-ordering sentinel, and owner-specific observed Product, carrier, peer, or
-generic branches retain their former precedence. These are compatibility
-values consumed by the shipped projected-path rank, not typed Section 10.2 C
-and not transport pacing or admission authority.
+that model checkpoint. An exact activation-scoped QUIC Native shape has first
+refusal. Until a future allocator replaces the scalar atomically, every
+remaining non-Native branch retains its complete pre-`b5b4b5a` source
+precedence, rate scope, and projection behavior. In particular, legacy Unknown
+uses 14,600 bytes over 333 ms (approximately 350,751 bit/s), legacy Unlimited
+uses the 1-Tbit/s ordering sentinel, and owner-specific observed Product,
+carrier, peer, or generic branches retain their former precedence. These are
+compatibility values consumed by the shipped projected-path rank, not typed
+Section 10.2 C and not transport pacing or admission authority.
 
 A low or missing C orders alternatives but does not rate-limit, window-limit,
 or pace the sole admitting carrier. J is RTT variation, not unknown RTT; an
@@ -3641,8 +3657,10 @@ A conforming implementation preserves all of the following:
     and ordinary recovery authority; no output owns a direction-global
     acquisition token.
 34. The PATH_CAPACITY transaction is diagnostic in Core Profile 7. It
-    creates no Product, lifecycle, usage, health, congestion-control, or
-    scheduling-rate authority and cannot gate unrelated Product work.
+    creates no Product, lifecycle, usage, health, congestion-control, or typed
+    Section 10.2 scheduling-rate authority and cannot gate unrelated Product
+    work. A qualified result may temporarily feed the historical legacy rank
+    scalar; that compatibility projection grants none of those authorities.
 35. If an implementation computes the optional Section 10.2 action-score
     component, that component uses only a coherent RTT/2 propagation
     projection, exact comparable pre-native predecessor work when available,
@@ -3744,7 +3762,10 @@ the static advisory tie key alone is not evidence of fairness or aggregation.
 
 This Core Profile declares no named TCP NativeOperational adapter. Kernel TCP
 delivery, pacing, congestion-window, and queue telemetry therefore remains
-diagnostic unless a separately typed evidence source satisfies Section 10.2.1.
+outside typed Section 10.2 authority unless a separately typed evidence source
+satisfies Section 10.2.1. Qualified telemetry may temporarily feed the
+historical legacy rank scalar, which grants no admission, pacing, Product, or
+native-controller authority.
 A future profile may define a native TCP adapter only by declaring that full
 contract for a new carrier-incarnation and direction reducer.
 

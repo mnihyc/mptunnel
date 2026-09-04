@@ -1258,14 +1258,28 @@ impl FixedReliablePathOutput {
                     Some(shape.service_rate()),
                 ),
             };
-        // This scalar remains a compatibility/diagnostic projection while T03
-        // moves scoring to the exact typed value. Product completion and TCP
-        // carrier samples remain visible below but cannot select C.
-        let delivery_rate_bps = service_rate
-            .and_then(DirectionalServiceRate::finite_rate_bps)
-            .map_or(self.portable_startup.delivery_rate_bps.max(1.0), |rate| {
-                rate as f64
-            });
+        // The deployed scorer still consumes this legacy scalar. Preserve its
+        // complete pre-typed projection until scorer migration is atomic:
+        // Legacy uses fresh attached carrier evidence or its startup fallback,
+        // then lets qualified Product completion raise (never lower) that
+        // baseline. Native uses only its exact typed value; Unlimited retains
+        // the startup scalar solely as a compatibility projection.
+        let scalar_startup_rate_bps = self.portable_startup.delivery_rate_bps.max(1.0);
+        let scalar_carrier_rate_bps = match rate_decision {
+            FixedRateDecision::Legacy => {
+                carrier_diagnostic_rate_bps.unwrap_or(scalar_startup_rate_bps)
+            }
+            FixedRateDecision::Native(_) => service_rate
+                .and_then(DirectionalServiceRate::finite_rate_bps)
+                .map_or(scalar_startup_rate_bps, |rate| rate as f64),
+        };
+        let (delivery_rate_bps, rate_scope) = match (rate_decision, product_rate_bps) {
+            (FixedRateDecision::Legacy, Some(rate)) if rate > scalar_carrier_rate_bps => {
+                (rate, PathRateScope::PerFlowGoodput)
+            }
+            _ => (scalar_carrier_rate_bps, PathRateScope::PathCapacity),
+        };
+        let delivery_rate_bps = delivery_rate_bps.max(1.0);
         let srtt_ms = match rate_decision {
             FixedRateDecision::Native(shape) => {
                 if shape.srtt().is_zero() {
@@ -1282,7 +1296,7 @@ impl FixedReliablePathOutput {
         snapshot.srtt_ms = srtt_ms;
         snapshot.delivery_rate_bps = delivery_rate_bps;
         snapshot.scheduling_service_rate = service_rate;
-        snapshot.rate_scope = PathRateScope::PathCapacity;
+        snapshot.rate_scope = rate_scope;
         snapshot.carrier_delivery_rate_bps = carrier_diagnostic_rate_bps;
         snapshot.product_progress_rate_bps = product_rate_bps;
         snapshot.has_durable_product_progress = product_rate_bps.is_some()

@@ -470,8 +470,9 @@ server is a primary design target; Linux, macOS, Windows, and the Android
 library target must compile without changing the protocol model.
 
 TCP and QUIC evidence remain typed by provenance. Request TCP capacity receipts
-and optional exact-socket telemetry are diagnostics; Core grants neither one
-scheduling-rate authority. QUIC alone has the named
+and optional exact-socket telemetry do not create typed Section 10.2 authority;
+qualified observations may temporarily feed the legacy rank scalar without
+granting admission, pacing, Product, or native-controller authority. QUIC alone has the named
 `QuinnBbr3NativeOperationalV1` adapter, whose exact local controller state may
 replace its immutable startup rate for advisory ranking. Product delivery and
 peer metric hints remain separately scoped diagnostics and cannot mint either

@@ -204,11 +204,14 @@ Retain:
 
 Supersede:
 
-- `RateHint -> f64`, including the fabricated 1-Tbit/s Unlimited value;
+- `RateHint -> f64` inside the typed authority automaton, including a fabricated
+  1-Tbit/s representation of typed Unlimited; the still-live legacy scalar
+  retains that historical ordering sentinel until its allocator is replaced;
 - payload-only derivation of `C0`;
-- `max(startup/native, Product)` in request, fixed, and switchable projections;
+- `max(startup/native, Product)` as a way to construct typed `C` in request,
+  fixed, and switchable projections;
 - treating a fixed attachment-time TCP telemetry copy as scheduling authority;
-- relabelling `PATH_CAPACITY` as native carrier authority;
+- relabelling `PATH_CAPACITY` as typed native carrier authority;
 - active-flow division while selecting `C`; and
 - the unused ReceiptMode scheduling-rate draft. The actual wire
   `PathCapacityReceipt` remains unchanged and diagnostic.
@@ -221,8 +224,8 @@ Production changes begin only after REDs establish these current failures:
 2. A configured rate above `2^53` loses integer identity through `f64`.
 3. The portable prior is derived from 14,600 payload bytes rather than 14,630
    canonical work bytes.
-4. A fresh `PATH_CAPACITY` receipt changes request scheduling `C`.
-5. Changing only Product delivery changes request, fixed, or switchable
+4. A fresh `PATH_CAPACITY` receipt changes typed request scheduling `C`.
+5. Changing only Product delivery changes typed request, fixed, or switchable
    carrier `C`.
 6. Changing only same-socket TCP telemetry changes fixed or switchable `C`,
    despite Core declaring no TCP adapter.
@@ -254,7 +257,10 @@ The value binds one carrier instance and original-sender direction, preserves
 finite `u64` identity, represents `UnlimitedStartup` without a sentinel, and
 allows only the named Quinn BBR3 native source to replace startup. Product,
 `PATH_CAPACITY`, peer/generic measurements, and TCP kernel telemetry remain
-separate diagnostics.
+separate from typed authority. While the shipped scorer still reads its
+historical scalar projection, qualified owner-specific carrier, Product, peer,
+or generic observations may continue to supply that compatibility scalar;
+they cannot alter typed `C`.
 
 QUIC planning is advisory. Its final request, fixed-response,
 switchable-response, client-L3, and server-L3 ownership transfers now execute
@@ -268,9 +274,12 @@ non-native commit path.
 `PATH_METRICS` no longer serializes endpoint-local configured or Unlimited
 startup policy. With no independent observed diagnostic it emits the public
 portable C0 placeholder, `351472`, together with `rate_observed=false` and zero
-validity. A real observed diagnostic remains visible, and a true
-NativeOperational diagnostic remains distinguishable without fabricating an
-ACK epoch.
+validity. It publishes only the diagnostic source selected by the compatibility
+projection: an exact Native shape first, otherwise qualified carrier, winning
+qualified Product, or generic evidence. A lower or unqualified source cannot
+lend its value, epoch, or ACK provenance. Controller-local NativeOperational
+rate may remain numerically visible, but it has no transferable observation
+epoch and therefore remains `rate_observed=false` with zero validity.
 
 ## Foreseen oversights closed before checkpoint
 
@@ -341,8 +350,9 @@ scalar, and a server TCP L3 120-Mbit/s observation remained at a 25-Mbit/s
 startup scalar. Those expectations prove typed exclusivity but also encode an
 unaccepted legacy behavior change.
 
-The bounded correction is projection-only and restores the complete scalar
-decision tree that existed immediately before `b5b4b5a`:
+The bounded correction is projection-only. An exact activation-scoped QUIC
+Native shape has first refusal; every remaining non-Native branch restores the
+complete scalar decision tree that existed immediately before `b5b4b5a`:
 
 1. retain typed startup/Unlimited/NativeOperational state;
 2. retain exact direction/incarnation scopes and current-shape QUIC commit

@@ -574,7 +574,10 @@ form overrides it; explicit `initial-rate=unknown` disables the global prior
 for that path. TCP uses the resolved value only for MPP startup scheduling and
 does not modify or replace the operating system's native TCP congestion
 controller. The rate is local configuration, never peer evidence or a
-guaranteed capacity claim, and live qualified evidence may replace it.
+guaranteed capacity claim. For typed Section 10.2 authority, only an exact QUIC
+NativeOperational observation may replace startup; TCP retains typed startup.
+Qualified TCP, peer, Product, or generic evidence may replace only the
+temporary compatibility scalar read by the legacy rank.
 
 For a finite resolved QUIC rate `R` bits/s and initial RTT `T` (the path's
 `initial-srtt-s`, or 333 ms when omitted), QUIC starts with native window target
@@ -740,8 +743,11 @@ freshness and regular/backup class, non-expensive paths precede expensive
 fallbacks. Neither preference is converted into an arbitrary timing penalty.
 `initial-srtt-s`, `initial-rttvar-s`, and the
 `initial-rate-*` forms are startup measurement priors that live evidence may
-replace. An omitted path rate inherits `[flow].initial_rate_mbps`, then defaults
-to unknown; explicit `initial-rate=unknown` suppresses inheritance.
+replace only under the authority distinction above: exact QUIC NativeOperational
+may replace typed startup, while other qualified evidence affects only the
+temporary legacy scalar. An omitted path rate inherits
+`[flow].initial_rate_mbps`, then defaults to unknown; explicit
+`initial-rate=unknown` suppresses inheritance.
 `source-address` selects a TCP or QUIC client source IP;
 `max-datagram-payload-bytes` is QUIC-client-only;
 `max-tcp-carriers` is TCP-client-only; and `port-rotation-interval-s` requires
@@ -1230,7 +1236,9 @@ unsent queue from one snapshot; otherwise it waits on exact MPP application-data
 flight.
 
 TCP capacity receipts and exact-socket telemetry remain separate diagnostics;
-neither supplies Core's advisory scheduling rate. QUIC publishes the named
+neither supplies typed Section 10.2 authority. Qualified observations may
+temporarily feed the historical scalar read by the legacy rank, without
+granting admission, pacing, Product, or native-controller authority. QUIC publishes the named
 controller-local `QuinnBbr3NativeOperationalV1` rate and relies on its native
 congestion controller for send credit; it has no separate MPP calibration
 transaction. These sources are not interchangeable. MPP Data ACK remains the

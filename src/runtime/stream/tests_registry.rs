@@ -3096,7 +3096,10 @@ fn request_requalification_ack_can_return_on_a_healthy_same_session_sibling() {
                 stream_id,
                 target,
                 initial_demand: StreamDemandHint::Throughput,
-                return_plan: Default::default(),
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: sibling.clone(),
                     commands: sibling_commands,

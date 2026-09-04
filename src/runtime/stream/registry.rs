@@ -19,8 +19,8 @@ use crate::product::PrincipalPermit;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{
-    Frame, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, ResetReason, SessionId,
-    StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+    ConfiguredMemberSlot, Frame, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus,
+    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::RuntimeError;
 #[cfg(test)]
@@ -101,6 +101,9 @@ struct ServerPathUsageEntry {
 
 #[derive(Clone)]
 struct ServerRegisteredPath {
+    /// Authenticated peer configuration identity, stable across a physical
+    /// replacement which receives a new PathId and instance identity.
+    configured_slot: ConfiguredMemberSlot,
     local: crate::runtime::path::ServerLocalPathProperties,
     state: PeerPathState,
     peer_usage: Option<ServerPathUsageEntry>,
@@ -1113,6 +1116,7 @@ impl ServerReliableStreamRegistry {
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
+        configured_slot: ConfiguredMemberSlot,
         local: crate::runtime::path::ServerLocalPathProperties,
         initial_peer_usage: Option<PathUsage>,
         native_capacity_epoch: u64,
@@ -1191,6 +1195,7 @@ impl ServerReliableStreamRegistry {
             .insert(
                 server_physical_path_key(identity),
                 ServerRegisteredPath {
+                    configured_slot,
                     local,
                     state: PeerPathState::Active,
                     peer_usage: initial_peer_usage
@@ -1234,19 +1239,26 @@ impl ServerReliableStreamRegistry {
         }
     }
 
-    fn carrier_path_accepts_attachment(&self, identity: ServerCarrierPathIdentity) -> bool {
+    fn carrier_path_attachment_slot(
+        &self,
+        identity: ServerCarrierPathIdentity,
+    ) -> Option<ConfiguredMemberSlot> {
         let paths = self
             .registered_path_instances
             .lock()
             .expect("server active path instance lock");
-        paths
+        (paths
             .logical_instances
             .get(&server_logical_path_key(identity))
-            == Some(&identity.path_instance_id)
-            && paths
+            == Some(&identity.path_instance_id))
+        .then(|| {
+            paths
                 .instances
                 .get(&server_physical_path_key(identity))
-                .is_some_and(|path| !path.retirement_started)
+                .filter(|path| !path.retirement_started)
+                .map(|path| path.configured_slot)
+        })
+        .flatten()
     }
 
     fn retire_carrier_path(
@@ -1430,18 +1442,18 @@ impl ServerReliableStreamRegistry {
             .streams
             .lock()
             .expect("server reliable stream registry lock");
-        if !self.carrier_path_accepts_attachment(ServerCarrierPathIdentity {
+        let Some(configured_slot) = self.carrier_path_attachment_slot(ServerCarrierPathIdentity {
             session_id,
             underlay,
             path_id,
             path_instance_id,
-        }) {
+        }) else {
             // Retirement marks the exact physical owner before taking the
             // stream-membership lock. An opener that linearized first is
             // included in its detach scan; a later opener cannot resurrect the
             // predecessor after scheduler withdrawal.
             return Ok(ServerReliableStreamOpen::Rejected);
-        }
+        };
         // Resolve stored evidence after taking the stream membership lock. An
         // update published while this opener waited must either be inherited
         // here or observe the newly published binding afterward.
@@ -1475,6 +1487,7 @@ impl ServerReliableStreamRegistry {
                     ResponseOutputAttachment {
                         key: CarrierPathKey { underlay, path_id },
                         path_instance_id,
+                        configured_slot,
                         local_policy,
                         startup_rate_prior,
                         commands,
@@ -1590,6 +1603,7 @@ impl ServerReliableStreamRegistry {
             mux_limits,
             self.session_tracker.clone(),
             path_instance_id,
+            configured_slot,
             local_policy,
             startup_rate_prior,
             return_plan,
@@ -2399,6 +2413,7 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
+        configured_slot: ConfiguredMemberSlot,
         local: crate::runtime::path::ServerLocalPathProperties,
         initial_peer_usage: Option<PathUsage>,
         native_capacity_epoch: u64,
@@ -2408,6 +2423,7 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
     ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
         self.registry.activate_carrier_path(
             identity,
+            configured_slot,
             local,
             initial_peer_usage,
             native_capacity_epoch,

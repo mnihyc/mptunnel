@@ -8,7 +8,9 @@ use super::{
 };
 use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, OffsetRange, PathId, PathUsage, StreamId, UnderlayProtocol};
+use crate::protocol::{
+    ConfiguredMemberSlot, Frame, OffsetRange, PathId, PathUsage, StreamId, UnderlayProtocol,
+};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_priority_command,
@@ -41,6 +43,7 @@ fn output_incarnation_exhaustion_fails_before_new_membership_publication() {
             .try_attach_output(ResponseOutputAttachment {
                 key: last_key,
                 path_instance_id: next_server_carrier_path_instance_id(),
+                configured_slot: ConfiguredMemberSlot(last_key.path_id.0),
                 local_policy: PathPolicy::default(),
                 startup_rate_prior: RateHint::Unknown,
                 commands: last_commands,
@@ -82,6 +85,7 @@ fn output_incarnation_exhaustion_fails_before_new_membership_publication() {
                     path_id,
                 },
                 path_instance_id: next_server_carrier_path_instance_id(),
+                configured_slot: ConfiguredMemberSlot(path_id.0),
                 local_policy: PathPolicy::default(),
                 startup_rate_prior: RateHint::Unknown,
                 commands,
@@ -132,6 +136,7 @@ fn output_incarnation_exhaustion_preserves_closed_predecessor() {
         binding.try_attach_output(ResponseOutputAttachment {
             key,
             path_instance_id: next_server_carrier_path_instance_id(),
+            configured_slot: ConfiguredMemberSlot(key.path_id.0),
             local_policy: PathPolicy::default(),
             startup_rate_prior: RateHint::Unknown,
             commands,
@@ -237,6 +242,7 @@ fn exact_carrier_cannot_reattach_while_ordered_detach_is_pending() {
         binding.attach_output(ResponseOutputAttachment {
             key,
             path_instance_id,
+            configured_slot: ConfiguredMemberSlot(key.path_id.0),
             local_policy: PathPolicy::default(),
             startup_rate_prior: RateHint::Unknown,
             commands,
@@ -276,6 +282,7 @@ fn successor_can_coexist_with_exact_predecessor_detach() {
         binding.attach_output(ResponseOutputAttachment {
             key,
             path_instance_id: successor_instance,
+            configured_slot: ConfiguredMemberSlot(key.path_id.0),
             local_policy: PathPolicy::default(),
             startup_rate_prior: RateHint::Unknown,
             commands: successor_commands,
@@ -721,6 +728,7 @@ fn startup_rate_prior_is_immutable_for_live_channel_and_rebound_on_replacement()
         binding.attach_output(ResponseOutputAttachment {
             key,
             path_instance_id: first_instance,
+            configured_slot: ConfiguredMemberSlot(key.path_id.0),
             local_policy: PathPolicy::default(),
             startup_rate_prior: RateHint::BitsPerSecond(500_000_000),
             commands: commands.clone(),
@@ -733,6 +741,7 @@ fn startup_rate_prior_is_immutable_for_live_channel_and_rebound_on_replacement()
         binding.attach_output(ResponseOutputAttachment {
             key,
             path_instance_id: first_instance,
+            configured_slot: ConfiguredMemberSlot(key.path_id.0),
             local_policy: PathPolicy::default(),
             startup_rate_prior: RateHint::BitsPerSecond(1),
             commands,
@@ -766,6 +775,7 @@ fn startup_rate_prior_is_immutable_for_live_channel_and_rebound_on_replacement()
         binding.attach_output(ResponseOutputAttachment {
             key,
             path_instance_id: second_instance,
+            configured_slot: ConfiguredMemberSlot(key.path_id.0),
             local_policy: PathPolicy::default(),
             startup_rate_prior: RateHint::BitsPerSecond(80_000_000),
             commands: replacement_commands,

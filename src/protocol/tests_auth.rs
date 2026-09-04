@@ -74,7 +74,7 @@ fn session_auth_tag_verifies_and_detects_tampering() {
 }
 
 #[test]
-fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
+fn path_join_tag_covers_exact_path_configured_slot_underlay_nonce_and_freshness() {
     let auth = authenticator();
     let credential_id = "home-client";
     let nonce = AuthNonce([3; 16]);
@@ -83,6 +83,7 @@ fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
         SessionId(9),
         credential_id,
         PathId(2),
+        ConfiguredMemberSlot(4),
         UnderlayProtocol::Udp,
         nonce,
         issued_at,
@@ -91,6 +92,7 @@ fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
         session_id: SessionId(9),
         credential_id,
         path_id: PathId(2),
+        configured_slot: ConfiguredMemberSlot(4),
         underlay: UnderlayProtocol::Udp,
         nonce,
         issued_at_unix_secs: issued_at,
@@ -106,6 +108,10 @@ fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
     }));
     assert!(!auth.verify_path_join(PathJoinAuthCheck {
         path_id: PathId(3),
+        ..check
+    }));
+    assert!(!auth.verify_path_join(PathJoinAuthCheck {
+        configured_slot: ConfiguredMemberSlot(5),
         ..check
     }));
     assert!(!auth.verify_path_join(PathJoinAuthCheck {
@@ -146,14 +152,15 @@ fn auth_contexts_and_tcp_prelude_have_stable_tags() {
             SessionId(9),
             "home-client",
             PathId(2),
+            ConfiguredMemberSlot(4),
             UnderlayProtocol::Udp,
             AuthNonce([3; 16]),
             issued_at,
         ),
         AuthTag([
-            0xc0, 0x53, 0x93, 0xfe, 0x7e, 0x8c, 0xbf, 0xe7, 0x1e, 0x35, 0x2d, 0x0e, 0xaa, 0x98,
-            0x3a, 0x1f, 0xb4, 0xf3, 0x3a, 0x8d, 0x30, 0xb3, 0x7a, 0xb2, 0x80, 0x46, 0xaf, 0xe7,
-            0x2e, 0x3c, 0xc8, 0x9b,
+            0x33, 0xa3, 0x47, 0x0d, 0x24, 0x26, 0x93, 0x2d, 0x10, 0x26, 0xae, 0x0c, 0x47, 0xb1,
+            0x43, 0x45, 0xf7, 0x80, 0x27, 0xed, 0x54, 0x7c, 0x20, 0x92, 0xf5, 0x5c, 0x65, 0x81,
+            0xf1, 0xb0, 0xf9, 0xc6,
         ])
     );
     assert_eq!(

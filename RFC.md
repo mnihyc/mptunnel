@@ -94,6 +94,12 @@ third transport protocol.
 : The opaque `PathId` wire label for a carrier. It is not an address,
   interface, configuration ordinal, or lifetime identity.
 
+**Configured member slot**
+: The initiator-assigned, underlay-local `u16` identity of one configured
+  carrier-set member. It is stable across physical replacement and locator
+  changes within a session, but is opaque to the peer and grants no native
+  carrier authority.
+
 **QUIC network path**
 : The local-address/remote-address route used by a QUIC connection as defined
   by RFC 9000. A QUIC network path can change without creating a new MPP
@@ -435,7 +441,7 @@ The common `PATH_JOIN` transcript is:
 "mptunnel path join v10" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
-path_id:u16 || underlay:u8 ||
+path_id:u16 || configured_member_slot:u16 || underlay:u8 ||
 nonce:16B ||
 issued_at_unix_secs:u64
 ```
@@ -445,7 +451,7 @@ The receiver MUST:
 - resolve the canonical credential ID;
 - reject an unknown, revoked, expired, or unauthorized credential;
 - validate timestamp freshness, session identity, credential identity,
-  `PathId`, underlay, nonce, and tag;
+  `PathId`, configured member slot, underlay, nonce, and tag;
 - reject replayed authentication and path-join nonces within the configured
   freshness boundary;
 - require `PATH_JOIN` identities to equal the carrier-authenticated
@@ -486,6 +492,16 @@ preference in `PATH_STATUS`, not a carrier-admission phase.
 Within a session, the wire label is `(underlay, path_id)`. The initiator
 selects `path_id`; the receiver treats it as opaque. The same numeric
 `path_id` MAY label one TCP carrier and one QUIC carrier.
+
+The stable configured-member identity is
+`(session_id, underlay, configured_member_slot)`. The initiator assigns the
+slot from its immutable configured carrier-set member index. The same numeric
+slot MAY identify one TCP member and one QUIC member. A locator change or
+physical carrier replacement for that member MUST retain the slot. Distinct
+configured members of the same underlay MUST use distinct slots. The receiver
+treats the authenticated slot as an opaque Product ordering-domain identity;
+it MUST NOT use it as native carrier-instance authority or infer it from a
+listener, address, port, or `PathId`.
 
 The client session allocates TCP `PathId` values across the complete MPP
 session, not independently per configured endpoint. It MUST NOT assign a value
@@ -2351,7 +2367,7 @@ frames.
 | 1 | `SESSION_HELLO` | `session_id:u64` |
 | 2 | `SESSION_READY` | none |
 | 3 | `SESSION_CLOSE` | `reason:u8` |
-| 4 | `PATH_JOIN` | `session_id:u64, credential_id, path_id:u16, underlay:u8, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
+| 4 | `PATH_JOIN` | `session_id:u64, credential_id, path_id:u16, configured_member_slot:u16, underlay:u8, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
 | 7 | `OPEN_STREAM` | `stream_id:u64, target, demand:u8, trigger_bytes:u64, candidate_total:u8, candidate_tier:u8, phase:u8, candidate_ordinal:u8` |
 | 8 | `STREAM_DATA` | `stream_id:u64, offset:u64, length:u32, bytes` |
 | 9 | `STREAM_ACK` | `stream_id:u64, complete:u8, range_count:u16, ranges[range_count]` |
@@ -3033,10 +3049,15 @@ from a native-window observation of an older epoch. Let `O_t` be exact
 un-DataACKed OriginalData on that target and let `A_t^r` be one
 repair-admission quantum. This symbol is distinct from the unqualified
 OriginalData Product envelope `E_i` in Section 15.1.
-`B_t` is queued ReinjectedData bound to exact target `t`; `U_s` is
-target-unbound queued ReinjectedData in the current stream and direction; and
-`J_t` is every un-DataACKed ReinjectedData byte already accepted by exact
-target `t`. Repair bound to another target is excluded. Raw OriginalData
+Let `d(t)` be exact target `t`'s authenticated configured member slot, scoped
+by its underlay. `B_t` is queued ReinjectedData bound to exact target `t`;
+`U_s` is target-unbound queued ReinjectedData in the current stream and
+direction; and `J_d(t)` is the byte measure of the interval union of every
+un-DataACKed ReinjectedData range whose exact attachment remains in current
+Product scheduling membership and owns publication in `d(t)`. Repeated
+physical attempts for the same range and slot therefore consume one unit of
+current Product repair debt, while remaining separate in cumulative wire
+accounting. Repair bound to another target is excluded. Raw OriginalData
 staging, control work, other streams, aggregate path-health Product flight,
 and sampled native queue or packet flight are excluded from the repair
 accounting below.
@@ -3044,7 +3065,7 @@ The target's Product repair capacity is:
 
 ```text
 repair_cap_t = max(saturating_sub(P_t, O_t), A_t^r)
-R_t = B_t + U_s + J_t
+R_t = B_t + U_s + J_d(t)
 K_t = repair_cap_t - R_t                 (saturating at zero)
 ```
 
@@ -3144,13 +3165,16 @@ does not mint a separate reserve. After assignment it consumes only its exact
 target's reserve. The actual bounded writer-command reservation is the native
 admission boundary. After obtaining that reservation, the serialized Product
 actor MUST revalidate `K_t` while excluding the current front intent from
-`B_t`/`U_s`, record the accepted exact copy in `J_t`, and only then commit the
-writer reservation. Failed revalidation drops the reservation without
-recording the copy.
+`B_t`/`U_s`, prove that no current attachment Product publication overlaps the
+frame in `d(t)`, record the accepted exact copy in `J_d(t)`, and only then
+commit the writer reservation. Failed revalidation drops the reservation
+without recording the copy.
 If the highest-ranked target has neither ordinary service headroom nor
 emergency reserve, recovery MUST continue through the remaining eligible
 regular-before-backup targets and block only when none can admit the frontier.
-Recovery debt, flight, and deadlines MUST NOT transfer between exact targets.
+Physical flight and deadlines MUST NOT transfer between exact targets. Current
+Product repair debt is shared by replacement targets in the same configured
+slot while their predecessor remains in current Product membership.
 This is Data Sequence service authority, not native congestion
 authority: the selected TCP or QUIC sender remains the final enqueue, pacing,
 congestion, and recovery authority. These ratios are local approximations
@@ -3276,35 +3300,52 @@ the absolute deadline `D = accepted_at + interval` with the ReinjectedData
 flight before committing the reservation. This covers only that copy's Data
 Sequence range. It MUST NOT delay a disjoint stale-owned range that has no
 current recovery copy. Later RTT, jitter, rate-model, lane, policy, usage,
-qualification, or ordered-drain changes MUST NOT move `D` or erase the exact
-copy's native recovery ownership. Exact Data ACK or exact attachment detach or
-failure ends that copy's retained target ownership. Deadline expiry ends only
-its duplicate-suppression authority across the target set: the range becomes
-eligible on another exact target, but the accepted copy remains in `J_t` and
-the same exact reliable target remains ineligible for that range until Data ACK
-or its terminal attachment boundary. Native queue drain, packet ACK, stream
-write completion, or another timer MUST NOT release
-`J_t`; TCP and QUIC already
-recover the accepted bytes on that live reliable carrier. A replacement
-incarnation does not inherit the old target's `J_t`. The structural alternative
-predicate gates a new Product recovery commitment; it is not the lifetime of a
-copy already committed. If no other exact target is eligible when `D` expires,
-MPP waits for Data ACK, a target-set change, or an exact terminal event instead
-of duplicating native recovery on the same survivor. The successful commitment
+qualification, ordered-drain, port-hop, or incarnation changes alone MUST NOT
+move `D` or mint another publication owner in the same configured slot.
+Deadline expiry ends only duplicate suppression across
+distinct vacant configured slots: the range becomes eligible on another exact
+target in such a slot, while the accepted copy remains in `J_d(t)` and every
+target in the same slot remains ineligible until Product Data ACK or serialized
+removal of the owning attachment from current Product scheduling membership.
+Native queue drain, packet ACK, stream write completion, and another timer MUST
+NOT release `J_d(t)`.
+
+Exact attachment removal closes further Product publication through that
+attachment and transfers the configured-slot publication key to a successor.
+Removal and final Apply MUST be serialized by the same membership boundary: an
+Apply that loses the race cannot record Product flight or publish its reserved
+native command. Removal does not assert peer settlement; predecessor bytes
+already admitted to the native carrier may still arrive and are deduplicated
+by Product offset. Those physical attempts remain in cumulative wire
+accounting, but no longer consume current attachment slot debt. Product Data
+ACK clips or retires the retained range directly. The existing membership
+notification MUST wake the serialized stream owner after removal; an
+implementation MUST NOT depend on an unrelated timer, capacity, ACK, or metric
+event to observe that transfer. The structural alternative predicate gates a
+new Product recovery commitment; it is not the lifetime of a physical attempt
+already committed. If no other exact target is eligible when `D` expires, MPP
+waits for Data ACK, a target-set change, or exact attachment removal instead of
+duplicating native recovery on the same survivor. The successful commitment
 directly publishes `D` into the actor's
 durable one-shot wake, even if `D` becomes due before the next serialized actor
 observation. That next exact-state observation reconciles or cancels a future
-wake after Data ACK, detach, or failure. A due one-shot is consumed by the
-serialized recovery pass before awaited topology work; an unrelated ready
-event cannot erase it, and consuming one due deadline MUST preserve a later
-deadline for a disjoint copy. Rejection of a completed topology open MUST
+wake after Data ACK or exact attachment removal. A due one-shot is consumed
+by the serialized recovery pass before awaited topology work; an unrelated
+ready event cannot erase it, and consuming one due deadline MUST preserve a
+later deadline for a disjoint copy. Rejection of a completed topology open MUST
 transfer the exact uncommitted stream to the carrier-owned retirement mailbox,
 which preserves detach-before-close ordering without making the Product actor
 await bounded command capacity; completed-open ready-drain therefore cannot
 hold the actor across an armed `D`. Thus every range is accepted at most once
 by each exact reliable target incarnation until MPP Data ACK covers it or that
-target becomes terminal, while the existing queue, exact Product flight,
-repair, and extra-traffic bounds limit aggregate work.
+exact attachment is removed from current Product scheduling membership, while
+the existing queue, exact Product flight, repair, and extra-traffic bounds
+limit aggregate work. For any session,
+direction, logical stream, Product range, underlay, and configured member slot,
+at most one current attachment owns publication authority at a time. Repeated
+definitive attachment or carrier failures may require repeated physical
+attempts; no finite cumulative-attempt bound can also preserve liveness across
+an unknown finite failure sequence.
 
 Lifecycle and Product qualification are independent state axes. The
 directional attachment lifecycle is `Active`, `Stale`, `Requalifying`, or

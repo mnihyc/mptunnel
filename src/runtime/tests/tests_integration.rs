@@ -4548,6 +4548,7 @@ async fn assert_tcp_server_rejects_wrong_mpp_credential(transport_secret: Option
         crate::runtime::path::tcp::admission::ClientTcpPathAuthentication::for_new_session(
             &client_security,
             PathId(0),
+            crate::protocol::ConfiguredMemberSlot(0),
             &transport_binding,
         )
         .expect("TCP authentication")

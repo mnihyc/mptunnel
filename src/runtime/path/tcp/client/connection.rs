@@ -9,7 +9,7 @@ use super::super::metrics::TcpMetricPublisher;
 use crate::config::ClientSecurityConfig;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{Frame, PathId, PathUsage, SessionId};
+use crate::protocol::{ConfiguredMemberSlot, Frame, PathId, PathUsage, SessionId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
 use crate::runtime::path::client_session::ClientSessionLifecycle;
@@ -44,6 +44,7 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
 pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
     pub(in crate::runtime) path: &'a PathSpec,
     pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) configured_slot: ConfiguredMemberSlot,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) security: &'a ClientSecurityConfig,
@@ -126,6 +127,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
     let ClientTcpCarrierConnect {
         path,
         path_id,
+        configured_slot,
         carrier_identity,
         session_id,
         security,
@@ -163,6 +165,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         let (admission_prelude, path_join) = ClientTcpPathAuthentication::for_session(
             security,
             path_id,
+            configured_slot,
             session_id,
             &transport_binding,
         )?

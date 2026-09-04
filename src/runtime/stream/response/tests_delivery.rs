@@ -1,16 +1,21 @@
-use super::super::attachment::ResponseDispatchTarget;
+use super::super::attachment::{
+    ResponseDispatchTarget, ResponseOutputAttachment, ResponseOutputAttachmentState,
+};
+use super::super::next_server_carrier_path_instance_id;
 use super::super::test_support::{
     binding_for_underlay, native_response_binding_fixture, stream_data_frame_at,
 };
 use super::*;
 use crate::model::carrier_rate_authority::CarrierRateAuthorityBasis;
+use crate::model::path::PathPolicy;
 use crate::model::work::CarrierWorkKind;
-use crate::protocol::{OffsetRange, PathId, UnderlayProtocol};
+use crate::protocol::{ConfiguredMemberSlot, OffsetRange, PathId, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
 };
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::TrafficClass;
+use crate::transport::RateHint;
 use std::collections::BTreeMap;
 
 fn key(underlay: UnderlayProtocol, path_id: u16) -> CarrierPathKey {
@@ -409,10 +414,12 @@ fn failed_response_ranges_wait_for_a_schedulable_recovery_output() {
 }
 
 #[test]
-fn committed_recovery_copy_survives_ordered_drain_until_exact_detach() {
+fn committed_recovery_copy_releases_publication_at_detach_start() {
     let (binding, owner, _owner_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
-    let copy = key(UnderlayProtocol::Udp, 5);
+    let copy = key(UnderlayProtocol::Tcp, 5);
     let survivor = key(UnderlayProtocol::Tcp, 6);
+    let successor = key(UnderlayProtocol::Tcp, 7);
+    let stable_slot = ConfiguredMemberSlot(5);
     let (copy_commands, _copy_receivers) = reliable_path_command_channels(8);
     let (survivor_commands, _survivor_receivers) = reliable_path_command_channels(8);
     binding.attach(
@@ -451,7 +458,7 @@ fn committed_recovery_copy_survives_ordered_drain_until_exact_detach() {
     let recovery = binding.stale_original_recovery_state(owner_identity, TrafficClass::Throughput);
     assert!(
         recovery.uncovered_ranges.is_empty(),
-        "an already-committed exact copy remains transport-owned during ordered drain",
+        "drain alone does not remove an attachment from Product scheduling membership",
     );
     assert!(
         recovery.retry_deadline.is_some(),
@@ -466,25 +473,165 @@ fn committed_recovery_copy_survives_ordered_drain_until_exact_detach() {
         | super::super::ResponsePathDetachOutcome::Pending(incarnation) => incarnation,
     };
     assert_eq!(copy_incarnation, copy_identity.incarnation);
-    assert!(
-        binding
-            .stale_original_recovery_state(owner_identity, TrafficClass::Throughput,)
-            .uncovered_ranges
-            .is_empty(),
-        "the exact copy remains authoritative while ordered detach owns it",
-    );
-    binding.complete_path_detach(copy, copy_path_instance_id, copy_incarnation);
+    let (successor_commands, mut successor_receivers) = reliable_path_command_channels(8);
     assert_eq!(
-        binding.accepted_reinjected_data_in_flight_bytes_at(copy_identity),
+        binding.attach_output(ResponseOutputAttachment {
+            key: successor,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            configured_slot: stable_slot,
+            local_policy: PathPolicy::default(),
+            startup_rate_prior: RateHint::Unknown,
+            commands: successor_commands,
+            state: ResponseOutputAttachmentState::default(),
+        }),
+        super::super::ResponseStreamAttachOutcome::Attached,
+    );
+    let successor_identity = server_output_identity(&binding, successor);
+    let survivor_identity = server_output_identity(&binding, survivor);
+    assert_eq!(
+        binding.accepted_reinjected_data_in_flight_bytes_at(successor_identity),
         0,
-        "exact terminal detach releases the old target's Product recovery authority",
+        "detach start transfers publication authority; the historical physical attempt remains only in the ACK/wire ledger",
     );
     assert_eq!(
         binding
             .stale_original_recovery_state(owner_identity, TrafficClass::Throughput,)
             .uncovered_ranges,
         vec![range(0, 4096)],
-        "completed exact detach revokes the old copy and exposes recovery through the survivor",
+        "membership removal immediately exposes the range to a current successor",
+    );
+    let avoided = binding.reinjection_avoid_outputs_for_frame(&frame);
+    assert!(
+        !avoided.contains(&(successor_identity.key, successor_identity.incarnation)),
+        "Decide must not inherit historical flight ownership across membership removal",
+    );
+    assert!(
+        !avoided.contains(&(survivor_identity.key, survivor_identity.incarnation)),
+        "a distinct configured slot must remain eligible for recovery",
+    );
+    let successor_target: ResponseDispatchTarget = binding
+        .sender_path_targets(TrafficClass::Throughput, 4096)
+        .into_iter()
+        .find(|target| target.observation.key == successor)
+        .expect("same-slot successor target")
+        .into();
+    binding
+        .try_enqueue_reinjected_frame_for_target(
+            &successor_target,
+            &frame,
+            TrafficClass::Throughput,
+            0,
+            4096,
+            None,
+        )
+        .expect("same-slot successor receives publication authority after detach start");
+    assert!(try_recv_reliable_path_command(&mut successor_receivers).is_some());
+    assert_eq!(
+        binding.accepted_reinjected_data_in_flight_bytes_at(successor_identity),
+        4096,
+        "the committed successor copy becomes the sole current stable-slot debt",
+    );
+    binding.complete_path_detach(copy, copy_path_instance_id, copy_incarnation);
+    assert_eq!(
+        binding
+            .stale_original_recovery_state(owner_identity, TrafficClass::Throughput,)
+            .uncovered_ranges,
+        Vec::<OffsetRange>::new(),
+        "physical settlement cannot revoke the successor's current publication",
+    );
+}
+
+#[test]
+fn configured_slot_reinjection_debt_is_an_interval_union_across_physical_attempts() {
+    let (binding, _owner, _owner_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let first = key(UnderlayProtocol::Tcp, 5);
+    let second = key(UnderlayProtocol::Tcp, 7);
+    let successor = key(UnderlayProtocol::Tcp, 9);
+    let stable_slot = ConfiguredMemberSlot(41);
+    let (first_commands, _first_receivers) = reliable_path_command_channels(8);
+    let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+    let (successor_commands, mut successor_receivers) = reliable_path_command_channels(8);
+    for (path, commands) in [
+        (first, first_commands.clone()),
+        (second, second_commands.clone()),
+        (successor, successor_commands),
+    ] {
+        assert_eq!(
+            binding.attach_output(ResponseOutputAttachment {
+                key: path,
+                path_instance_id: next_server_carrier_path_instance_id(),
+                configured_slot: stable_slot,
+                local_policy: PathPolicy::default(),
+                startup_rate_prior: RateHint::Unknown,
+                commands,
+                state: ResponseOutputAttachmentState::default(),
+            }),
+            super::super::ResponseStreamAttachOutcome::Attached,
+        );
+    }
+    let second_identity = server_output_identity(&binding, second);
+    let successor_identity = server_output_identity(&binding, successor);
+    let (first_instance, second_instance) = {
+        let outputs = binding.outputs.lock().expect("response outputs");
+        let instance = |key| {
+            outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .expect("same-slot output")
+                .path_instance_id
+        };
+        (instance(first), instance(second))
+    };
+    binding.record_reinjected_flight(first, &stream_data_frame_at(0, 4096));
+    binding.record_reinjected_flight(second, &stream_data_frame_at(2048, 4096));
+    assert_eq!(
+        binding.accepted_reinjected_data_in_flight_bytes_at(second_identity),
+        6144,
+        "overlapping physical attempts in one stable slot consume one Product interval union",
+    );
+    let blocked_frame = stream_data_frame_at(1024, 1024);
+    let successor_target: ResponseDispatchTarget = binding
+        .sender_path_targets(TrafficClass::Throughput, 1024)
+        .into_iter()
+        .find(|target| target.observation.key == successor)
+        .expect("current same-slot successor")
+        .into();
+    assert!(matches!(
+        binding.try_enqueue_reinjected_frame_for_target(
+            &successor_target,
+            &blocked_frame,
+            TrafficClass::Throughput,
+            0,
+            1024,
+            None,
+        ),
+        Err(RuntimeError::SenderServiceBlocked),
+    ));
+    assert!(try_recv_reliable_path_command(&mut successor_receivers).is_none());
+
+    binding.release_normalized_acked_ranges(&[range(0, 2048)]);
+    assert_eq!(
+        binding.accepted_reinjected_data_in_flight_bytes_at(second_identity),
+        4096,
+        "Product DataACK clips the stable-slot interval union exactly",
+    );
+
+    binding
+        .begin_path_detach(first, first_instance)
+        .expect("first current publication leaves membership");
+    assert_eq!(
+        binding.accepted_reinjected_data_in_flight_bytes_at(second_identity),
+        4096,
+        "one detached attempt cannot release overlap still owned by another current attempt",
+    );
+    binding
+        .begin_path_detach(second, second_instance)
+        .expect("second current publication leaves membership");
+    assert_eq!(
+        binding.accepted_reinjected_data_in_flight_bytes_at(successor_identity),
+        0,
+        "the stable slot is vacant once every overlapping publication owner leaves current membership",
     );
 }
 
@@ -612,7 +759,7 @@ fn committed_response_copy_deadline_is_not_recomputed_from_later_path_timing() {
 }
 
 #[test]
-fn draining_stale_owner_continues_recovery_until_exact_detach() {
+fn draining_stale_owner_transfers_recovery_at_detach_start() {
     let (binding, owner, _owner_receivers) = binding_for_underlay(UnderlayProtocol::Udp);
     let survivor = key(UnderlayProtocol::Tcp, 7);
     let (survivor_commands, _survivor_receivers) = reliable_path_command_channels(8);
@@ -660,8 +807,13 @@ fn draining_stale_owner_continues_recovery_until_exact_detach() {
         binding
             .stale_original_recovery_state(owner_identity, TrafficClass::Throughput,)
             .uncovered_ranges,
+        Vec::<OffsetRange>::new(),
+        "detach start withdraws the exact original from current publication membership",
+    );
+    assert_eq!(
+        binding.uncovered_failed_original_ranges(),
         vec![range(0, 4096)],
-        "ordered detachment retains the exact original flight while another output can recover it",
+        "the same exact flight transfers to failed-owner recovery at membership removal",
     );
 
     binding.complete_path_detach(owner, owner_path_instance_id, output_incarnation);
@@ -670,17 +822,17 @@ fn draining_stale_owner_continues_recovery_until_exact_detach() {
             .stale_original_recovery_state(owner_identity, TrafficClass::Throughput,)
             .uncovered_ranges
             .is_empty(),
-        "completed detach transfers the range out of stale-owner recovery",
+        "physical settlement cannot restore withdrawn publication membership",
     );
     assert_eq!(
         binding.uncovered_failed_original_ranges(),
         vec![range(0, 4096)],
-        "the same exact flight becomes failed-owner recovery without a gap",
+        "physical settlement cannot duplicate or revoke transferred recovery debt",
     );
 }
 
 #[test]
-fn failed_owner_keeps_a_committed_draining_copy_until_exact_detach() {
+fn failed_owner_releases_committed_copy_at_detach_start() {
     let (binding, failed, _failed_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let copy = key(UnderlayProtocol::Udp, 8);
     let survivor = key(UnderlayProtocol::Tcp, 9);
@@ -734,15 +886,16 @@ fn failed_owner_keeps_a_committed_draining_copy_until_exact_detach() {
         | super::super::ResponsePathDetachOutcome::Pending(incarnation) => incarnation,
     };
     assert_eq!(begun_incarnation, copy_incarnation);
-    assert!(
-        binding.uncovered_failed_original_ranges().is_empty(),
-        "ordered detachment retains the committed recovery copy",
+    assert_eq!(
+        binding.uncovered_failed_original_ranges(),
+        vec![range(0, 4096)],
+        "detach start withdraws the committed copy's publication ownership",
     );
     binding.complete_path_detach(copy, copy_path_instance_id, copy_incarnation);
     assert_eq!(
         binding.uncovered_failed_original_ranges(),
         vec![range(0, 4096)],
-        "completed exact detach revokes the copy and exposes the failed-owner range",
+        "physical settlement cannot duplicate or revoke transferred recovery debt",
     );
 }
 

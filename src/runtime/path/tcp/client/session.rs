@@ -1407,6 +1407,7 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
         ClientTcpCarrierConnect {
             path: runtime.path(),
             path_id,
+            configured_slot: runtime.configured_member_slot(),
             carrier_identity: runtime.carrier_identity,
             session_id: runtime.session_id,
             security: runtime.security(),

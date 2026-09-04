@@ -1,9 +1,9 @@
 use super::{
-    AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IpPacketId, IpTunnelId,
-    OffsetRange, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics,
-    PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode, ResetReason, SessionId,
-    StreamAttachmentPhase, StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr,
-    UnderlayProtocol,
+    AuthNonce, AuthTag, CloseReason, ConfiguredMemberSlot, DatagramFlowId, DatagramId, Frame,
+    IpPacketId, IpTunnelId, OffsetRange, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId,
+    PathMetricDirection, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode,
+    ResetReason, SessionId, StreamAttachmentPhase, StreamDemandHint, StreamId, StreamReturnPlan,
+    TargetAddr, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -260,6 +260,7 @@ fn encode_payload(
             session_id,
             credential_id,
             path_id,
+            configured_slot,
             underlay,
             nonce,
             issued_at_unix_secs,
@@ -268,6 +269,7 @@ fn encode_payload(
             put_u64(out, session_id.0);
             encode_credential_id(out, credential_id)?;
             put_u16(out, path_id.0);
+            put_u16(out, configured_slot.0);
             put_u8(out, underlay_to_u8(*underlay));
             encode_nonce(out, *nonce);
             put_u64(out, *issued_at_unix_secs);
@@ -619,6 +621,7 @@ fn decode_payload(
             session_id: SessionId(reader.get_u64()?),
             credential_id: decode_credential_id(reader)?,
             path_id: PathId(reader.get_u16()?),
+            configured_slot: ConfiguredMemberSlot(reader.get_u16()?),
             underlay: underlay_from_u8(reader.get_u8()?)?,
             nonce: decode_nonce(reader)?,
             issued_at_unix_secs: reader.get_u64()?,

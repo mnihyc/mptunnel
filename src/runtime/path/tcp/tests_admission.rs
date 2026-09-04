@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ServerSecurityConfig, SharedSecret};
+use crate::protocol::ConfiguredMemberSlot;
 use crate::runtime::path::authentication::ProductCredentialAdmission;
 
 fn security() -> (ClientSecurityConfig, ServerSecurityConfig) {
@@ -17,10 +18,16 @@ fn fixed_tcp_prelude_authenticates_session_and_then_distinct_path_join() {
     let transport_binding = [7; 32];
     let session_id = SessionId(41);
     let path_id = PathId(9);
-    let (prelude, path_join) =
-        ClientTcpPathAuthentication::for_session(&client, path_id, session_id, &transport_binding)
-            .expect("client TCP admission")
-            .into_parts();
+    let configured_slot = ConfiguredMemberSlot(4);
+    let (prelude, path_join) = ClientTcpPathAuthentication::for_session(
+        &client,
+        path_id,
+        configured_slot,
+        session_id,
+        &transport_binding,
+    )
+    .expect("client TCP admission")
+    .into_parts();
 
     assert_eq!(prelude.len(), TCP_ADMISSION_PRELUDE_LEN);
     assert_eq!(prelude[ROLE_OFFSET], CLIENT_ROLE);
@@ -51,6 +58,7 @@ fn fixed_tcp_prelude_authenticates_session_and_then_distinct_path_join() {
         .expect("separately authenticated PATH_JOIN");
     assert_eq!(joined.session_id, session_id);
     assert_eq!(joined.path_id, path_id);
+    assert_eq!(joined.configured_slot, configured_slot);
 }
 
 #[test]
@@ -60,6 +68,7 @@ fn tcp_prelude_rejects_cross_connection_replay_and_malformed_fixed_fields() {
     let (prelude, _) = ClientTcpPathAuthentication::for_session(
         &client,
         PathId(2),
+        ConfiguredMemberSlot(1),
         SessionId(8),
         &transport_binding,
     )

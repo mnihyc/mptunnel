@@ -19,20 +19,20 @@ use crate::runtime::stream::response::ResponseStreamBinding;
 
 pub(super) type ResponseOutputIdentity = (CarrierPathKey, u64);
 
-/// One exact output incarnation may carry at most one unresolved copy of the
-/// same Product range.
+/// One stable configured slot may own at most one current local publication
+/// of the same Product range.
 ///
-/// Native suppression deadlines only make a different exact incarnation
-/// eligible for recovery. They do not authorize another copy behind the same
-/// obstruction; the accepted copy retains that target's K until DataACK or
-/// target terminal/detach.
+/// Native suppression deadlines and physical replacement do not transfer that
+/// authority while the predecessor remains in Product scheduling membership.
+/// Product DataACK releases the range; serialized membership removal transfers
+/// publication authority to an attached successor.
 pub(super) fn response_reinjection_avoid_outputs(
     binding: &ResponseStreamBinding,
     frame: &Frame,
     cause: RelaySendCause,
 ) -> Vec<ResponseOutputIdentity> {
     if cause.is_reinjection() {
-        binding.flight_outputs_overlapping_frame(frame)
+        binding.reinjection_avoid_outputs_for_frame(frame)
     } else {
         Vec::new()
     }

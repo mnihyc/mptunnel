@@ -1,11 +1,13 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ServerSecurityConfig, SharedSecret};
 use crate::product::{CredentialAuthority, CredentialCatalog, CredentialRecord, PrincipalId};
+use crate::protocol::ConfiguredMemberSlot;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const SESSION_ID: SessionId = SessionId(41);
 const PATH_ID: PathId = PathId(7);
+const CONFIGURED_SLOT: ConfiguredMemberSlot = ConfiguredMemberSlot(3);
 
 fn security(freshness_window_secs: u64) -> (ClientSecurityConfig, ServerSecurityConfig) {
     let secret =
@@ -72,6 +74,7 @@ fn path_join_frame(security: &ClientSecurityConfig, issued_at_unix_secs: u64) ->
         session_id: SESSION_ID,
         credential_id: credential_id.to_string(),
         path_id: PATH_ID,
+        configured_slot: CONFIGURED_SLOT,
         underlay: UnderlayProtocol::Tcp,
         nonce,
         issued_at_unix_secs,
@@ -79,10 +82,36 @@ fn path_join_frame(security: &ClientSecurityConfig, issued_at_unix_secs: u64) ->
             SESSION_ID,
             credential_id,
             PATH_ID,
+            CONFIGURED_SLOT,
             UnderlayProtocol::Tcp,
             nonce,
             issued_at_unix_secs,
         ),
+    }
+}
+
+#[test]
+fn client_authentication_flight_keeps_configured_slot_across_physical_path_ids() {
+    let (client, _) = security(10);
+    for path_id in [PathId(8), PathId(9)] {
+        let flight = ClientPathAuthenticationFrames::for_session(
+            &client,
+            path_id,
+            CONFIGURED_SLOT,
+            UnderlayProtocol::Udp,
+            SESSION_ID,
+        )
+        .expect("client authentication flight");
+        assert!(matches!(
+            flight.path_join,
+            Frame::PathJoin {
+                session_id: SESSION_ID,
+                path_id: observed_path_id,
+                configured_slot: CONFIGURED_SLOT,
+                underlay: UnderlayProtocol::Udp,
+                ..
+            } if observed_path_id == path_id
+        ));
     }
 }
 
@@ -351,6 +380,29 @@ fn authenticated_path_join_preserves_its_signed_issue_time() {
 
     assert_eq!(joined.session_id, SESSION_ID);
     assert_eq!(joined.path_id, PATH_ID);
+    assert_eq!(joined.configured_slot, CONFIGURED_SLOT);
     assert_eq!(joined.issued_at_unix_secs, 104);
     assert_eq!(joined.verified_at_unix_secs, 106);
+}
+
+#[test]
+fn authenticated_path_join_rejects_configured_slot_substitution() {
+    let (client, server) = security(10);
+    let authenticated =
+        authenticated_session(&client, &server, 100, 100).expect("fresh SESSION_AUTH");
+    let mut join = path_join_frame(&client, 100);
+    let Frame::PathJoin {
+        configured_slot, ..
+    } = &mut join
+    else {
+        unreachable!("test helper returns PATH_JOIN");
+    };
+    *configured_slot = ConfiguredMemberSlot(CONFIGURED_SLOT.0 + 1);
+
+    assert!(
+        authenticated
+            .authenticate_path_join_at(UnderlayProtocol::Tcp, join, 100)
+            .is_none(),
+        "the configured ordering-domain slot is authenticated PATH_JOIN identity"
+    );
 }

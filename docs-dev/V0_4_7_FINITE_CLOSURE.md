@@ -23,10 +23,10 @@ path-choice, and extra-traffic percentage thresholds are soft evidence. They
 MAY influence ranking, probing, confidence, cost, or reconsideration. They
 MUST NOT become a hard native-rate ceiling, an ordinary-Product or recovery
 admission cap, or a permanent path ban. Finite protocol structure may still
-prove a cardinality bound, such as one exact copy per distinct native ordering
-domain in one unresolved-frontier epoch. Explicit memory, queue, session, and
-connection maxima remain operator resource contracts; they are not inferred
-network-performance thresholds.
+prove a cardinality bound, such as one current-attachment Product publication
+owner per configured member slot for an unresolved Product range. Explicit
+memory, queue, session, and connection maxima remain operator resource
+contracts; they are not inferred network-performance thresholds.
 
 ## Reflection on the delay
 
@@ -279,7 +279,7 @@ transaction.
 | T03 | P4-score-component | What does the exact score of one already chosen action contain? Can that score alone allocate a sustained sequence? | Arithmetic/timing component REDs are GREEN. A static-winner trace, exact writer release lifetime, 131-slot queue geometry, and 64-MiB Product bound disprove sustained allocation with uniform `A=0`; TCP has no valid dynamic `C`. | Retain the typed single-action arithmetic and coherent timing components. Reject every request/response/L3 runtime-owner migration; make no production selection change. A later allocator must follow dynamic service discovery and own atomic physical-carrier/direction reservations. |
 | T04a | P4-accounting | Does current response scoring count one dequeued writer charge twice? | `server_bulk_output_snapshot_at` includes total `commands.pending_bytes`; `response_completion_snapshot` then adds its `writer_pending_bytes` subset again. Request does not. | One exact RED/GREEN removing only the duplicate projection; preserve queue admission, charge lifetime, native metrics, and request behavior. |
 | T04b | P4-admission | Can inferred ETA, loss, confidence, flow count, or BDP deny ordinary Product work when lifecycle-valid resource headroom exists? | Exact `completion_horizon`/`ecf_no_completion_gain` admission flip; structural `W/P/E` and configured resource limits held constant. | Make inference ranking-only where reachable, or prove a branch structural/unreachable. |
-| T05a | P1-identity | What stable identity bounds live Product recovery copies across port hops and carrier replacement? | Request has stable `RelayPathKey`; response has only reminted path/incarnation identity and `PATH_JOIN` carries no peer configured-member slot. | Add and prove an authenticated configured-member slot and exact range/slot live-copy identity while retaining the old percentage guard. |
+| T05a | P1-identity | What stable identity bounds current Product recovery publication across port hops and carrier replacement? | Request has stable `RelayPathKey`; response has only reminted path/incarnation identity and `PATH_JOIN` carries no peer configured-member slot. | Add and prove an authenticated configured-member slot and exact range/slot publication identity while retaining the old percentage guard. |
 | T05b | P1-authority | Can a cumulative percentage change recovery eligibility or extent once structural copy identity exists? | Current wake, service, and enqueue branches change outcome with percentage while W/P/E/lifecycle/resource state is fixed. | Remove percentage from authority/extent; retain exact accounting and advisory cost/rank only. |
 | T05c | P1-requalification | Is non-delivering requalification probe sizing correctly bounded without percentage authority? | Probe identity is attachment/probe ID, not Product range/slot; current code preserves one minimum quantum after exhaustion. | Separate proof and no-change verdict or isolated correction; do not infer from T05b. |
 | T06 | P1-service | Which sequential, staggered, or concurrent action minimizes frontier time without assuming independent service? | Exact 1.064233-second sequential replay and coupled-service countermodel. | Choose only a symbolically safe policy and exact two-direction RED/GREEN, or reject it. |
@@ -346,10 +346,11 @@ and has no finite bound if no domain supplies finite service. No score or
 timeout can remove that physical constraint.
 
 Promoted decision: determine whether one epoch may make one exact frontier
-copy available concurrently to every eligible distinct ordering domain while
-retaining exact target identity, one copy per domain, non-renewal, and
-ordinary native admission. The extra-traffic percentage remains a scheduling
-cost hint; it cannot deny the structurally bounded recovery operation.
+publication available concurrently to every eligible distinct ordering domain
+while retaining exact target identity, one current-attachment publication
+owner per domain, non-renewal, and ordinary native admission. The extra-traffic
+percentage remains a scheduling cost hint; it cannot deny the structurally
+bounded recovery operation.
 Concurrent fanout would have conditional completion
 
 ```text
@@ -368,15 +369,17 @@ exact wire accounting must expose it rather than enforce a percentage cap.
 
 The candidate structural identity is
 `(session, direction, logical stream, Product range, configured ordering-domain slot)`.
-An observation timer, a port hop, or a carrier incarnation MUST NOT mint a new
-simultaneous copy for the same key. Product acknowledgement past the range or
-terminal stream/session disposal retires the key. A definitively failed native
-copy may be replaced in its configured slot, but replacement inherits the key
-and cannot coexist with its predecessor. This bounds *live* duplicate work by
-configured ordering-domain cardinality. It intentionally does not promise a
-finite cumulative byte count across an unbounded sequence of terminal network
-failures: a finite cumulative retry cap and liveness after an unknown finite
-failure sequence are mutually incompatible.
+An observation timer, a port hop, or a carrier incarnation alone MUST NOT mint
+a new current publication owner for the same key. Product acknowledgement past
+the range or terminal stream/session disposal retires the key. Serialized
+removal of the exact attachment from current Product membership transfers
+publication to a replacement in the same slot. Data already admitted by the
+removed predecessor may still arrive and is Product-offset-deduplicated, so
+this bound does not pretend to count unknowable packets in the network. It
+intentionally does not promise a finite cumulative byte count across an
+unbounded sequence of definitive attachment or carrier failures: a finite
+cumulative retry cap and liveness after an unknown finite failure sequence are
+mutually incompatible.
 
 Measured state may rank or schedule these structurally permitted actions, but
 loss, rate, RTT, jitter, confidence, freshness, `Suspect`, and extra-traffic

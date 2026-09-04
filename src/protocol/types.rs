@@ -12,6 +12,15 @@ pub struct SessionId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PathId(pub u16);
 
+/// Underlay-local, session-scoped identity of one configured multipath
+/// ordering-domain member.
+///
+/// Unlike [`PathId`], this value remains stable when the member's physical
+/// carrier instance is replaced. It is opaque to the peer and grants no
+/// authority over that carrier's lifecycle or native transport state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConfiguredMemberSlot(pub u16);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub u64);
 
@@ -241,6 +250,7 @@ pub enum Frame {
         session_id: SessionId,
         credential_id: String,
         path_id: PathId,
+        configured_slot: ConfiguredMemberSlot,
         underlay: UnderlayProtocol,
         nonce: AuthNonce,
         issued_at_unix_secs: u64,

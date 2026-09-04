@@ -4,8 +4,8 @@ use crate::model::carrier_rate_authority::CarrierRateAuthorityScope;
 use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
 use crate::protocol::{
-    CloseReason, OffsetRange, PathMetricDirection, PathUsage, StreamAttachmentPhase,
-    StreamDemandHint, StreamReturnPlan,
+    CloseReason, ConfiguredMemberSlot, OffsetRange, PathMetricDirection, PathUsage,
+    StreamAttachmentPhase, StreamDemandHint, StreamReturnPlan,
 };
 use crate::runtime::path::authority::{
     NativeCarrierRateAuthorityHandle, NativeCarrierSchedulingShapeSnapshot,
@@ -656,6 +656,7 @@ fn server_path_authority_separates_native_and_structural_lifetimes() {
             session_id,
             UnderlayProtocol::Udp,
             path_id,
+            ConfiguredMemberSlot(path_id.0),
             ServerLocalPathProperties::default(),
             PathUsage::Available,
             7,
@@ -731,6 +732,7 @@ fn server_quic_native_epoch_rejects_late_metrics_and_survives_missing_rate() {
             session_id,
             UnderlayProtocol::Udp,
             path_id,
+            ConfiguredMemberSlot(path_id.0),
             ServerLocalPathProperties::default(),
             PathUsage::Available,
             7,
@@ -1223,6 +1225,7 @@ fn repeated_session_retirement_resweeps_an_exact_late_path_instance() {
         paths.instances.insert(
             server_physical_path_key(identity),
             ServerRegisteredPath {
+                configured_slot: ConfiguredMemberSlot(identity.path_id.0),
                 local: ServerLocalPathProperties::default(),
                 state: PeerPathState::Active,
                 peer_usage: None,
@@ -2627,11 +2630,13 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
     let session_id = SessionId(702);
     let stream_id = StreamId(10);
     let path_id = PathId(4);
+    let configured_slot = ConfiguredMemberSlot(41);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let first_registration = port.register_test_carrier_path(
+    let first_registration = port.register_test_carrier_path_with_configured_slot(
         session_id,
         UnderlayProtocol::Udp,
         path_id,
+        configured_slot,
         Default::default(),
     );
     port.record_path_proof_success(
@@ -2666,13 +2671,19 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
             .observation
             .has_path_proof_evidence
     );
+    assert_eq!(
+        binding.configured_slot_for_instance_for_test(first_registration.path_instance_id()),
+        Some(configured_slot),
+        "the authenticated configured member slot must reach response publication state independently of PathId",
+    );
 
     let first_instance = first_registration.path_instance_id();
     drop(first_registration);
-    let replacement_registration = port.register_test_carrier_path(
+    let replacement_registration = port.register_test_carrier_path_with_configured_slot(
         session_id,
         UnderlayProtocol::Udp,
         path_id,
+        configured_slot,
         Default::default(),
     );
     assert_ne!(
@@ -2688,7 +2699,10 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
                 stream_id,
                 target,
                 initial_demand: StreamDemandHint::Throughput,
-                return_plan: Default::default(),
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
                 attachment: ServerStreamPathAttachment {
                     path_registration: replacement_registration.clone(),
                     commands: replacement_commands,
@@ -2706,6 +2720,11 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
             candidate.observation.path_instance_id == replacement_registration.path_instance_id()
         })
         .expect("replacement response target");
+    assert_eq!(
+        binding.configured_slot_for_instance_for_test(replacement_registration.path_instance_id()),
+        Some(configured_slot),
+        "physical replacement must retain its authenticated configured-member identity",
+    );
     assert!(
         !replacement.observation.has_path_proof_evidence,
         "proof from a retired carrier instance must not validate its replacement",
@@ -2784,6 +2803,7 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
         .insert(
             server_physical_path_key(stale_identity),
             ServerRegisteredPath {
+                configured_slot: ConfiguredMemberSlot(stale_identity.path_id.0),
                 local: ServerLocalPathProperties::default(),
                 state: PeerPathState::Draining,
                 peer_usage: None,

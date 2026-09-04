@@ -936,6 +936,13 @@ pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
 }
 
 impl ClientUdpPathSessionRuntime {
+    fn configured_member_slot(&self) -> crate::protocol::ConfiguredMemberSlot {
+        crate::protocol::ConfiguredMemberSlot(
+            u16::try_from(self.path_index)
+                .expect("validated QUIC configured-member inventory fits the wire slot"),
+        )
+    }
+
     pub(in crate::runtime) fn path(&self) -> &PathSpec {
         self.paths
             .get(self.config_index)
@@ -1490,6 +1497,7 @@ async fn perform_client_udp_path_handshake(
     let [session_hello, session_auth, path_join] = ClientPathAuthenticationFrames::for_session(
         runtime.security(),
         path_id,
+        runtime.configured_member_slot(),
         UnderlayProtocol::Udp,
         runtime.session_id,
     )?

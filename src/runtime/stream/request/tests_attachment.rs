@@ -52,6 +52,37 @@ fn opened_stream_at(
 }
 
 #[tokio::test]
+async fn request_membership_serializes_same_key_replacement() {
+    let stream_id = StreamId(799);
+    let (opened, _frames, _receivers) = opened_stream_at(stream_id, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let predecessor = remotes.paths[0].instance();
+
+    let (overlap, _overlap_frames, _overlap_receivers) = opened_stream_at(stream_id, 0);
+    assert_eq!(
+        remotes
+            .try_attach_candidate(overlap)
+            .expect("attachment identity remains available"),
+        ReliableRelayAttachOutcome::RejectedDuplicate,
+        "one current attachment already owns the stable request path key",
+    );
+    assert_eq!(remotes.path_instances(), vec![predecessor]);
+
+    drop(remotes.remove_path_instance(predecessor));
+    let (replacement, _replacement_frames, _replacement_receivers) = opened_stream_at(stream_id, 0);
+    assert_eq!(
+        remotes
+            .try_attach_candidate(replacement)
+            .expect("attachment identity remains available"),
+        ReliableRelayAttachOutcome::Attached,
+        "serialized predecessor removal makes the stable key vacant",
+    );
+    let successor = remotes.paths[0].instance();
+    assert_eq!(successor.key, predecessor.key);
+    assert_ne!(successor, predecessor);
+}
+
+#[tokio::test]
 async fn attachment_identity_exhaustion_fails_before_request_membership_publication() {
     let stream_id = StreamId(800);
     let (opened, _frames, _receivers) = opened_stream_at(stream_id, 0);

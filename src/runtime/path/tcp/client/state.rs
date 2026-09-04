@@ -14,7 +14,7 @@ use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::path_capacity::{CapacityReceiveTracker, PathCapacityReceiveError};
-use crate::protocol::{PathId, PathMetricDirection, PathMetrics, SessionId};
+use crate::protocol::{ConfiguredMemberSlot, PathId, PathMetricDirection, PathMetrics, SessionId};
 use crate::runtime::path::commands::TcpCapacityProbeCommand;
 use crate::runtime::path::model::{path_metrics_from_snapshot, path_snapshot_with_id};
 use crate::runtime::path::proof::PathProofTracker;
@@ -126,6 +126,16 @@ impl ClientTcpPathSessionRuntime {
     pub(in crate::runtime) fn path_id(&self) -> PathId {
         self.path_id
             .expect("physical TCP actor owns one reserved wire PathId")
+    }
+
+    /// Stable configured ordering-domain identity for this expanded TCP pool
+    /// member. Physical `PathId` and carrier instance IDs may change while the
+    /// underlay-local configured member slot does not.
+    pub(in crate::runtime) fn configured_member_slot(&self) -> ConfiguredMemberSlot {
+        ConfiguredMemberSlot(
+            u16::try_from(self.path_index)
+                .expect("validated TCP configured-member inventory fits the wire slot"),
+        )
     }
 
     pub(in crate::runtime) fn path(&self) -> &PathSpec {

@@ -11,7 +11,9 @@ use crate::product::{
 use crate::protocol::auth::{
     PathJoinAuthCheck, SessionAuthCheck, SessionAuthenticator, TcpSessionAuthCheck,
 };
-use crate::protocol::{AuthNonce, AuthTag, Frame, PathId, SessionId, UnderlayProtocol};
+use crate::protocol::{
+    AuthNonce, AuthTag, ConfiguredMemberSlot, Frame, PathId, SessionId, UnderlayProtocol,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::{current_unix_secs, random_nonce};
 use crate::transport::quic::{QuicCandidateSelector, QuicCandidateVerifier};
@@ -169,6 +171,7 @@ impl ClientPathAuthenticationFrames {
     pub(in crate::runtime) fn for_session(
         security: &ClientSecurityConfig,
         path_id: PathId,
+        configured_slot: ConfiguredMemberSlot,
         underlay: UnderlayProtocol,
         session_id: SessionId,
     ) -> Result<Self, RuntimeError> {
@@ -187,6 +190,7 @@ impl ClientPathAuthenticationFrames {
             session_id,
             credential_id,
             path_id,
+            configured_slot,
             underlay,
             path_nonce,
             issued_at_unix_secs,
@@ -204,6 +208,7 @@ impl ClientPathAuthenticationFrames {
                 session_id,
                 credential_id: credential_id.to_string(),
                 path_id,
+                configured_slot,
                 underlay,
                 nonce: path_nonce,
                 issued_at_unix_secs,
@@ -396,6 +401,7 @@ impl AuthenticatedServerPathSession {
             session_id,
             credential_id,
             path_id,
+            configured_slot,
             underlay,
             nonce,
             issued_at_unix_secs,
@@ -411,6 +417,7 @@ impl AuthenticatedServerPathSession {
                 session_id,
                 credential_id: self.credential_id.as_str(),
                 path_id,
+                configured_slot,
                 underlay,
                 nonce,
                 issued_at_unix_secs,
@@ -425,6 +432,7 @@ impl AuthenticatedServerPathSession {
             session_id,
             credential_id: self.credential_id,
             path_id,
+            configured_slot,
             nonce,
             issued_at_unix_secs,
             verified_at_unix_secs: now_unix_secs,
@@ -438,6 +446,7 @@ pub(in crate::runtime) struct AuthenticatedPathJoin {
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) credential_id: CredentialId,
     pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) configured_slot: ConfiguredMemberSlot,
     pub(in crate::runtime) nonce: AuthNonce,
     pub(in crate::runtime) issued_at_unix_secs: u64,
     pub(in crate::runtime) verified_at_unix_secs: u64,

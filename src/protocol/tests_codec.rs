@@ -656,6 +656,7 @@ fn control_frames_round_trip_auth_and_path_metrics() {
         session_id: SessionId(42),
         credential_id: "home-client".to_string(),
         path_id: PathId(3),
+        configured_slot: ConfiguredMemberSlot(5),
         underlay: UnderlayProtocol::Udp,
         nonce,
         issued_at_unix_secs: 1_735_689_600,
@@ -781,6 +782,7 @@ fn path_join_has_stable_canonical_layout() {
         session_id: SessionId(0x0102_0304_0506_0708),
         credential_id: "a".to_string(),
         path_id: PathId(0x1112),
+        configured_slot: ConfiguredMemberSlot(0x1314),
         underlay: UnderlayProtocol::Udp,
         nonce: AuthNonce([3; 16]),
         issued_at_unix_secs: 0x2122_2324_2526_2728,
@@ -790,17 +792,40 @@ fn path_join_has_stable_canonical_layout() {
 
     assert_eq!(&encoded[..4], b"MPTF");
     assert_eq!(encoded[4], VERSION);
-    assert_eq!(&encoded[5..10], &[4, 0, 0, 0, 69]);
+    assert_eq!(&encoded[5..10], &[4, 0, 0, 0, 71]);
     assert_eq!(&encoded[10..18], &0x0102_0304_0506_0708_u64.to_be_bytes());
     assert_eq!(&encoded[18..20], &[1, b'a']);
     assert_eq!(&encoded[20..22], &0x1112_u16.to_be_bytes());
-    assert_eq!(encoded[22], 2);
-    assert_eq!(&encoded[23..39], &[3; 16]);
-    assert_eq!(&encoded[39..47], &0x2122_2324_2526_2728_u64.to_be_bytes());
-    assert_eq!(&encoded[47..], &[4; 32]);
+    assert_eq!(&encoded[22..24], &0x1314_u16.to_be_bytes());
+    assert_eq!(encoded[24], 2);
+    assert_eq!(&encoded[25..41], &[3; 16]);
+    assert_eq!(&encoded[41..49], &0x2122_2324_2526_2728_u64.to_be_bytes());
+    assert_eq!(&encoded[49..], &[4; 32]);
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded.clone()), CodecLimits::default()).expect("decode"),
         frame
+    );
+}
+
+#[test]
+fn provisional_path_join_without_configured_slot_fails_closed() {
+    let frame = Frame::PathJoin {
+        session_id: SessionId(1),
+        credential_id: "a".to_string(),
+        path_id: PathId(2),
+        configured_slot: ConfiguredMemberSlot(3),
+        underlay: UnderlayProtocol::Udp,
+        nonce: AuthNonce([4; 16]),
+        issued_at_unix_secs: 5,
+        auth_tag: AuthTag([6; 32]),
+    };
+    let mut provisional = encode_frame(&frame, CodecLimits::default()).expect("encode");
+    provisional.drain(22..24);
+    provisional[6..10].copy_from_slice(&69_u32.to_be_bytes());
+
+    assert!(
+        decode_frame_bytes(Bytes::from(provisional), CodecLimits::default()).is_err(),
+        "the unreleased slot-less v10 candidate must not acquire an inferred slot",
     );
 }
 

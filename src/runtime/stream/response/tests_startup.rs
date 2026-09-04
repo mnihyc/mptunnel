@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::admission::BulkCandidatePosition;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
-use crate::protocol::{PathId, UnderlayProtocol};
+use crate::protocol::{ConfiguredMemberSlot, PathId, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::stream::response::{
     ResponseOutputAttachment, ResponseOutputAttachmentState, ResponsePathDetachOutcome,
@@ -268,6 +268,7 @@ fn exact_enrollment_survives_detach_before_final_and_duplicate_is_stable() {
                 ResponseOutputAttachment {
                     key: alternate_key,
                     path_instance_id: alternate_instance,
+                    configured_slot: ConfiguredMemberSlot(alternate_key.path_id.0),
                     local_policy: PathPolicy::default(),
                     startup_rate_prior: RateHint::Unknown,
                     commands: alternate_commands,
@@ -338,6 +339,7 @@ fn rejected_startup_enrollment_publishes_nothing_and_burns_no_exact_identity() {
                 ResponseOutputAttachment {
                     key: alternate_key,
                     path_instance_id: alternate_instance,
+                    configured_slot: ConfiguredMemberSlot(alternate_key.path_id.0),
                     local_policy: PathPolicy::default(),
                     startup_rate_prior: RateHint::Unknown,
                     commands: invalid_commands,
@@ -364,6 +366,7 @@ fn rejected_startup_enrollment_publishes_nothing_and_burns_no_exact_identity() {
                 ResponseOutputAttachment {
                     key: alternate_key,
                     path_instance_id: alternate_instance,
+                    configured_slot: ConfiguredMemberSlot(alternate_key.path_id.0),
                     local_policy: PathPolicy::default(),
                     startup_rate_prior: RateHint::Unknown,
                     commands: valid_commands,
@@ -430,6 +433,7 @@ fn binding_with_enrolled_alternate() -> EnrolledBindingFixture {
                 ResponseOutputAttachment {
                     key: alternate_key,
                     path_instance_id: alternate_instance,
+                    configured_slot: ConfiguredMemberSlot(alternate_key.path_id.0),
                     local_policy: PathPolicy::default(),
                     startup_rate_prior: RateHint::Unknown,
                     commands: alternate_commands,
@@ -577,7 +581,7 @@ fn empty_final_withdraws_every_enrolled_ghost_exactly_once() {
 }
 
 #[test]
-fn omitted_ghost_range_crosses_the_ordered_detach_boundary_exactly_once() {
+fn omitted_ghost_range_crosses_the_membership_boundary_exactly_once() {
     let final_first = binding_with_enrolled_alternate();
     let opening_target: super::super::ResponseDispatchTarget = final_first
         .binding
@@ -618,18 +622,6 @@ fn omitted_ghost_range_crosses_the_ordered_detach_boundary_exactly_once() {
             ),
         Err(crate::runtime::RuntimeError::SenderServiceBlocked),
     ));
-    assert!(
-        final_first
-            .binding
-            .uncovered_failed_original_ranges()
-            .is_empty(),
-        "the retained native flight survives until its ordered detach event",
-    );
-    final_first.binding.complete_path_detach(
-        opening_target.key,
-        opening_target.path_instance_id,
-        opening_target.incarnation,
-    );
     let expected = vec![crate::protocol::OffsetRange {
         start: 0,
         end: 58_400,
@@ -637,7 +629,12 @@ fn omitted_ghost_range_crosses_the_ordered_detach_boundary_exactly_once() {
     assert_eq!(
         final_first.binding.uncovered_failed_original_ranges(),
         expected,
-        "ordered detach exposes the ghost-owned prefix to ordinary recovery",
+        "startup final removes the omitted ghost from current membership and transfers recovery",
+    );
+    final_first.binding.complete_path_detach(
+        opening_target.key,
+        opening_target.path_instance_id,
+        opening_target.incarnation,
     );
     final_first.binding.complete_path_detach(
         opening_target.key,
@@ -669,6 +666,11 @@ fn omitted_ghost_range_crosses_the_ordered_detach_boundary_exactly_once() {
         ResponsePathDetachOutcome::Begun(incarnation) => incarnation,
         ResponsePathDetachOutcome::Pending(_) => panic!("first detach cannot already be pending"),
     };
+    assert_eq!(
+        detach_first.binding.uncovered_failed_original_ranges(),
+        expected,
+        "detach start is the exact current-membership transfer boundary",
+    );
     assert_eq!(
         detach_first
             .binding

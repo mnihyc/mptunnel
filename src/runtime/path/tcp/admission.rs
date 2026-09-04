@@ -6,7 +6,9 @@
 
 use crate::config::{ClientSecurityConfig, ServerSecurityConfig};
 use crate::protocol::auth::SessionAuthenticator;
-use crate::protocol::{AuthNonce, AuthTag, Frame, PathId, SessionId, UnderlayProtocol};
+use crate::protocol::{
+    AuthNonce, AuthTag, ConfiguredMemberSlot, Frame, PathId, SessionId, UnderlayProtocol,
+};
 use crate::runtime::error::RuntimeError;
 #[cfg(test)]
 use crate::runtime::identity::random_session_id;
@@ -42,14 +44,22 @@ impl ClientTcpPathAuthentication {
     pub(in crate::runtime) fn for_new_session(
         security: &ClientSecurityConfig,
         path_id: PathId,
+        configured_slot: ConfiguredMemberSlot,
         transport_binding: &[u8; 32],
     ) -> Result<Self, RuntimeError> {
-        Self::for_session(security, path_id, random_session_id()?, transport_binding)
+        Self::for_session(
+            security,
+            path_id,
+            configured_slot,
+            random_session_id()?,
+            transport_binding,
+        )
     }
 
     pub(in crate::runtime) fn for_session(
         security: &ClientSecurityConfig,
         path_id: PathId,
+        configured_slot: ConfiguredMemberSlot,
         session_id: SessionId,
         transport_binding: &[u8; 32],
     ) -> Result<Self, RuntimeError> {
@@ -74,6 +84,7 @@ impl ClientTcpPathAuthentication {
             session_id,
             credential_id,
             path_id,
+            configured_slot,
             UnderlayProtocol::Tcp,
             path_nonce,
             issued_at_unix_secs,
@@ -90,6 +101,7 @@ impl ClientTcpPathAuthentication {
                 session_id,
                 credential_id: credential_id.to_string(),
                 path_id,
+                configured_slot,
                 underlay: UnderlayProtocol::Tcp,
                 nonce: path_nonce,
                 issued_at_unix_secs,

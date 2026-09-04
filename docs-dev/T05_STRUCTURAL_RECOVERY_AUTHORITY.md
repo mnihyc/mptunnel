@@ -6,7 +6,7 @@ document does not claim runtime acceptance or release readiness.
 ## Decision and scope
 
 T05 replaces a cumulative percentage as Product recovery authority with an
-exact live-copy identity. It is deliberately split:
+exact current-attachment publication identity. It is deliberately split:
 
 1. **T05a -- identity foundation.** Add an authenticated, sender-assigned
    configured-member slot which survives carrier replacement. Track unresolved
@@ -68,25 +68,50 @@ physical carrier replacement, and authenticated as part of `PATH_JOIN`.
 separate exact-lifetime identities; none may be used as the stable slot.
 
 For a logical-stream send direction `s`, exact retained Product range `r`, and
-configured slot `d`, the live-copy key is:
+configured slot `d`, the publication key is:
 
 ```text
 X = (session, direction, stream, r, d)
 ```
 
-Range identity is interval based. Partial Product ACK clips a live key to its
-unacknowledged remainder; complete Product ACK retires it. Stream or session
-termination retires it. A timer, metric publication, queue removal, port hop,
-or incarnation change cannot retire or mint it.
+Range identity is interval based. Partial Product ACK clips a publication key
+to its unacknowledged remainder; complete Product ACK retires it. The
+serialized removal of its exact attachment from current Product scheduling
+membership ends that attachment's publication ownership. Stream or session
+termination retires it. A timer, metric publication, queue observation, port
+change, or incarnation change alone cannot retire or mint it.
 
 A planned replacement may temporarily overlap its predecessor. Both map to the
-same `d`, so at most one may own a live copy of the same `r`. The successor may
-replace that copy only after exact terminal evidence proves the predecessor can
-no longer coexist as a delivering native copy. Exact incarnation still fences
-the final writer reservation and commit; stable slot identity does not let a
-successor inherit stale Native authority.
+same `d`, so at most one current attachment may own publication authority for
+the same `r`. The successor may acquire that authority only after the
+predecessor leaves current Product attachment membership. That removal is
+serialized with final Apply: if Apply wins, it records and publishes before
+removal; if removal wins, later Apply cannot find the exact attachment and
+fails. Exact incarnation still fences the final writer reservation and commit;
+stable slot identity does not let a successor inherit stale Native authority.
 
-## Recovery authority
+Attachment removal is not a claim that the peer has settled every preceding
+byte. That claim is impossible without Product acknowledgement: queued,
+locally flushed, or in-progress predecessor data may still arrive after
+authority transfers. Such an arrival is a legal duplicate of the same Product
+offset and is deduplicated by the receiver. Its physical attempt remains in
+cumulative wire accounting. The structural invariant bounds current
+publication owners, not unknowable packets already in the network.
+
+An intermediate model used the whole carrier's sticky terminal signal as this
+boundary because response membership removal can precede native writer drain.
+That model is rejected. Writer drain matters to physical settlement, not to
+future Product publication, and a QUIC operation-local attachment can be
+removed while its carrier remains healthy indefinitely. Requiring carrier
+terminal would therefore strand the configured slot. The shared Apply/removal
+serialization is both the weaker sufficient proof and the only boundary that
+handles carrier-local and operation-local lifetimes uniformly.
+
+## Post-T05b recovery authority
+
+T05a installs and proves the identity terms below while deliberately retaining
+the current percentage guard. T05b removes that percentage from authority and
+extent so the complete expression becomes normative only after both slices.
 
 For candidate target `t`, let:
 
@@ -95,7 +120,8 @@ For candidate target `t`, let:
 - `E(t)` mean `t` is live, policy-eligible, and distinct from every current
   owner of `r`;
 - `d(t)` be `t`'s authenticated configured slot;
-- `V(s,r,d)` mean no unresolved live copy of `r` occupies slot `d`;
+- `V(s,r,d)` mean no current attachment publication owner for `r` occupies
+  slot `d`;
 - `K_t` be exact target Product repair headroom after queued and accepted debt;
 - `Q(s,r,t)` be the cause-specific retained frontier/service extent; and
 - `N(t)` mean the exact queue/native reservation can commit.
@@ -138,25 +164,34 @@ L(S, p1) = L(S, p2)
 Only advisory cost and reported amplification may differ. T05b must prove this
 in both Product directions at cause reachability and at final enqueue.
 
-### Live-copy cardinality
+### Publication-owner cardinality
 
 Let `D_s` be the finite configured slot set eligible for direction `s`. Vacancy
 is consumed atomically with final target validation. Because one `(s,r,d)` key
-can have at most one live owner:
+can have at most one current attachment publication owner:
 
 ```text
-live_copies(s,r) <= |D_s|
+current_publication_owners(s,r) <= |D_s|
 ```
 
 Port hopping and carrier replacement preserve `d`, so they cannot increase the
 bound. Two physical carriers temporarily sharing one replacement slot still
-consume one key. Product ACK clipping cannot increase cardinality.
+consume one publication key while both remain current attachments. Serialized
+removal of the owning attachment transfers that key; its draining physical
+attempt remains separately accounted. Product ACK clipping cannot increase
+cardinality.
 
-This is a live-copy bound, not a false finite-delivery theorem. An unbounded
-sequence of definitive terminal carrier failures may require an unbounded
-cumulative number of attempts to preserve liveness. T05 does not cap that
-sequence by a percentage and does not promise progress when every eligible
-native domain supplies zero service.
+This is not a bound on delayed physical packets and not a false finite-delivery
+theorem. An unbounded sequence of definitive attachment or carrier failures
+may require an unbounded cumulative number of attempts to preserve liveness.
+T05 does not cap that sequence by a percentage and does not promise progress
+when every eligible native domain supplies zero service.
+
+Stable per-slot Product repair debt is the interval union of unresolved ranges
+owned by current attachments. Merely replacing an incarnation or recording
+the same range twice cannot enlarge that debt while the predecessor remains in
+current membership. Physical attempt bytes are deliberately counted
+separately and never collapsed.
 
 ### Atomicity
 
@@ -180,14 +215,26 @@ T05a RED/GREEN must prove:
 
 - the new member slot is canonical wire data and covered by `PATH_JOIN` HMAC;
 - changing the slot invalidates authentication;
-- two current carriers cannot claim one slot except the already bounded planned
-  replacement overlap;
+- distinct configured members get distinct underlay-local slots, while a
+  bounded planned predecessor/successor overlap retains the same slot;
 - predecessor and successor share one recovery slot while exact incarnation
   Apply fences remain independent;
-- timer, metric, queue, port, and incarnation churn cannot mint a second live
-  `(s,r,d)` copy;
-- Product ACK clips/releases the key; terminal stream/session releases it; and
+- timer, metric, queue, port, and incarnation churn cannot mint a second
+  current `(s,r,d)` publication owner;
+- Product ACK clips/releases the key; serialized exact attachment removal
+  transfers it and its existing membership notification wakes the Product
+  owner; terminal stream/session releases it; and
 - request and response behaviors are symmetric.
+
+## Wire-version decision
+
+The public `v0.4.6` tag speaks wire version 9. Wire version 10 exists only in
+the untagged `v0.4.7` candidate, so T05a completes that unreleased canonical
+layout in place: it adds the mandatory slot to `PATH_JOIN` and to its existing
+v10 authentication transcript. There is no deployed v10 compatibility format
+to preserve, no fallback decoder, and no reason to mint a second provisional
+version. A peer using the earlier candidate layout fails closed on frame
+length/authentication rather than being silently assigned an invented slot.
 
 T05b RED/GREEN must hold all structural inputs fixed and vary percentage across
 zero, default, and a large value for request ACK-gap, response ACK-gap, request

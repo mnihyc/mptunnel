@@ -11,8 +11,9 @@ use crate::model::path::{CarrierPathInstanceId, PathPolicy, try_next_carrier_pat
 use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;
 use crate::protocol::{
-    CloseReason, Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus,
-    SessionId, StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr, UnderlayProtocol,
+    CloseReason, ConfiguredMemberSlot, Frame, OffsetRange, PathId, PathMetrics, PathUsage,
+    PeerPathState, PeerPathStatus, SessionId, StreamDemandHint, StreamId, StreamReturnPlan,
+    TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
@@ -830,6 +831,7 @@ struct ServerCarrierPathRegistrationInner {
     backend: Arc<dyn ServerStreamPortBackend>,
     owner_token: usize,
     identity: ServerCarrierPathIdentity,
+    configured_slot: ConfiguredMemberSlot,
     local: ServerLocalPathProperties,
     principal_permit: PrincipalPermit,
     observed_ingress: Option<ServerCarrierObservedIngress>,
@@ -877,6 +879,12 @@ impl ServerCarrierPathRegistration {
 
     pub(in crate::runtime) fn path_id(&self) -> PathId {
         self.inner.identity.path_id
+    }
+
+    /// Peer-authenticated configured member identity. Unlike `PathId` and the
+    /// physical instance, this survives planned carrier replacement.
+    pub(in crate::runtime) fn configured_slot(&self) -> ConfiguredMemberSlot {
+        self.inner.configured_slot
     }
 
     pub(in crate::runtime) fn local_policy(&self) -> PathPolicy {
@@ -981,6 +989,7 @@ impl std::fmt::Debug for ServerCarrierPathRegistration {
             .field("session_id", &self.session_id())
             .field("underlay", &self.underlay())
             .field("path_id", &self.path_id())
+            .field("configured_slot", &self.configured_slot())
             .field("path_instance_id", &self.path_instance_id())
             .field("local_config_ordinal", &self.local_config_ordinal())
             .finish()
@@ -1054,6 +1063,7 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
+        configured_slot: ConfiguredMemberSlot,
         local: ServerLocalPathProperties,
         initial_peer_usage: Option<PathUsage>,
         native_capacity_epoch: u64,
@@ -1230,6 +1240,7 @@ impl ServerStreamPort {
             session_id,
             underlay,
             path_id,
+            ConfiguredMemberSlot(path_id.0),
             local,
             None,
             0,
@@ -1244,6 +1255,7 @@ impl ServerStreamPort {
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
+        configured_slot: ConfiguredMemberSlot,
         local: ServerLocalPathProperties,
         peer_usage: PathUsage,
         native_capacity_epoch: u64,
@@ -1255,6 +1267,7 @@ impl ServerStreamPort {
             session_id,
             underlay,
             path_id,
+            configured_slot,
             local,
             Some(peer_usage),
             native_capacity_epoch,
@@ -1282,6 +1295,7 @@ impl ServerStreamPort {
             session_id,
             underlay,
             path_id,
+            ConfiguredMemberSlot(path_id.0),
             local,
             None,
             0,
@@ -1299,6 +1313,7 @@ impl ServerStreamPort {
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
+        configured_slot: ConfiguredMemberSlot,
         local: ServerLocalPathProperties,
         initial_peer_usage: Option<PathUsage>,
         native_capacity_epoch: u64,
@@ -1316,6 +1331,7 @@ impl ServerStreamPort {
         let apply_authority = ServerCarrierPathApplyAuthority::new();
         let session_retirement = self.backend.activate_carrier_path(
             identity,
+            configured_slot,
             local,
             initial_peer_usage,
             native_capacity_epoch,
@@ -1328,6 +1344,7 @@ impl ServerStreamPort {
                 backend: self.backend.clone(),
                 owner_token: self.owner_token,
                 identity,
+                configured_slot,
                 local,
                 principal_permit,
                 observed_ingress,
@@ -1361,6 +1378,34 @@ impl ServerStreamPort {
             None,
         )
         .expect("register test carrier path")
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn register_test_carrier_path_with_configured_slot(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        configured_slot: ConfiguredMemberSlot,
+        local: ServerLocalPathProperties,
+    ) -> ServerCarrierPathRegistration {
+        self.register_carrier_path_with_observed_peer_and_authority(
+            session_id,
+            underlay,
+            path_id,
+            configured_slot,
+            local,
+            PathUsage::Available,
+            0,
+            PrincipalPermit::for_test("test-peer"),
+            ServerCarrierPeer::fixed(
+                "203.0.113.7:51000"
+                    .parse()
+                    .expect("authenticated test carrier peer"),
+            ),
+            None,
+        )
+        .expect("register test carrier path with configured slot")
     }
 
     pub(in crate::runtime) fn register_realtime_flow(

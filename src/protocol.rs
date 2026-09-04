@@ -10,9 +10,9 @@ pub(crate) mod path_capacity;
 mod types;
 
 pub use types::{
-    AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IpPacketId, IpTunnelId,
-    OffsetRange, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics,
-    PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode, ResetReason, SessionId,
-    StreamAttachmentPhase, StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr,
-    UnderlayProtocol,
+    AuthNonce, AuthTag, CloseReason, ConfiguredMemberSlot, DatagramFlowId, DatagramId, Frame,
+    IpPacketId, IpTunnelId, OffsetRange, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId,
+    PathMetricDirection, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode,
+    ResetReason, SessionId, StreamAttachmentPhase, StreamDemandHint, StreamId, StreamReturnPlan,
+    TargetAddr, UnderlayProtocol,
 };

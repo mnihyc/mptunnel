@@ -176,6 +176,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
             session_id,
             UnderlayProtocol::Tcp,
             path_id,
+            path_join.configured_slot,
             local_properties,
             peer_usage,
             0,

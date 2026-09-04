@@ -19,8 +19,8 @@ use crate::model::product_qualification::ProductQualificationLedger;
 use crate::model::requalification::StreamPathQualification;
 use crate::mux::MuxLimits;
 use crate::protocol::{
-    PathId, PathUsage, ResetReason, SessionId, StreamAttachmentPhase, StreamId, StreamReturnPlan,
-    UnderlayProtocol,
+    ConfiguredMemberSlot, PathId, PathUsage, ResetReason, SessionId, StreamAttachmentPhase,
+    StreamId, StreamReturnPlan, UnderlayProtocol,
 };
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
@@ -171,6 +171,7 @@ impl ResponseStreamBinding {
             mux_limits,
             session_tracker.clone(),
             next_server_carrier_path_instance_id(),
+            ConfiguredMemberSlot(path_id.0),
             PathPolicy::default(),
         )
         .expect("register active test response owner");
@@ -188,6 +189,7 @@ impl ResponseStreamBinding {
         mux_limits: MuxLimits,
         session_tracker: Arc<ServerSessionTracker>,
         path_instance_id: CarrierPathInstanceId,
+        configured_slot: ConfiguredMemberSlot,
         local_policy: PathPolicy,
     ) -> Result<Arc<Self>, RuntimeError> {
         Self::new_with_limits_tracker_path_instance_and_return_plan(
@@ -199,6 +201,7 @@ impl ResponseStreamBinding {
             mux_limits,
             session_tracker,
             path_instance_id,
+            configured_slot,
             local_policy,
             RateHint::Unknown,
             StreamReturnPlan {
@@ -223,6 +226,7 @@ impl ResponseStreamBinding {
         mux_limits: MuxLimits,
         session_tracker: Arc<ServerSessionTracker>,
         path_instance_id: CarrierPathInstanceId,
+        configured_slot: ConfiguredMemberSlot,
         local_policy: PathPolicy,
         startup_rate_prior: RateHint,
         return_plan: StreamReturnPlan,
@@ -253,6 +257,7 @@ impl ResponseStreamBinding {
                 entries: vec![ResponseStreamOutputEntry {
                     key,
                     path_instance_id,
+                    configured_slot,
                     local_policy,
                     startup_rate_prior,
                     incarnation: 1,

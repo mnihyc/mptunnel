@@ -1,6 +1,6 @@
 //! Session and path-join authentication for the MPP wire protocol.
 
-use super::{AuthNonce, AuthTag, PathId, SessionId, UnderlayProtocol};
+use super::{AuthNonce, AuthTag, ConfiguredMemberSlot, PathId, SessionId, UnderlayProtocol};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
@@ -40,6 +40,7 @@ pub struct PathJoinAuthCheck<'a> {
     pub session_id: SessionId,
     pub credential_id: &'a str,
     pub path_id: PathId,
+    pub configured_slot: ConfiguredMemberSlot,
     pub underlay: UnderlayProtocol,
     pub nonce: AuthNonce,
     pub issued_at_unix_secs: u64,
@@ -155,6 +156,7 @@ impl SessionAuthenticator {
         session_id: SessionId,
         credential_id: &str,
         path_id: PathId,
+        configured_slot: ConfiguredMemberSlot,
         underlay: UnderlayProtocol,
         nonce: AuthNonce,
         issued_at_unix_secs: u64,
@@ -164,6 +166,7 @@ impl SessionAuthenticator {
         update_session_id(&mut mac, session_id);
         update_credential_id(&mut mac, credential_id);
         update_path_id(&mut mac, path_id);
+        update_configured_slot(&mut mac, configured_slot);
         update_underlay(&mut mac, underlay);
         update_nonce(&mut mac, nonce);
         update_issued_at(&mut mac, issued_at_unix_secs);
@@ -183,6 +186,7 @@ impl SessionAuthenticator {
         update_session_id(&mut mac, check.session_id);
         update_credential_id(&mut mac, check.credential_id);
         update_path_id(&mut mac, check.path_id);
+        update_configured_slot(&mut mac, check.configured_slot);
         update_underlay(&mut mac, check.underlay);
         update_nonce(&mut mac, check.nonce);
         update_issued_at(&mut mac, check.issued_at_unix_secs);
@@ -238,6 +242,10 @@ fn update_credential_id(mac: &mut HmacSha256, credential_id: &str) {
 
 fn update_path_id(mac: &mut HmacSha256, path_id: PathId) {
     mac.update(&path_id.0.to_be_bytes());
+}
+
+fn update_configured_slot(mac: &mut HmacSha256, configured_slot: ConfiguredMemberSlot) {
+    mac.update(&configured_slot.0.to_be_bytes());
 }
 
 fn update_underlay(mac: &mut HmacSha256, underlay: UnderlayProtocol) {

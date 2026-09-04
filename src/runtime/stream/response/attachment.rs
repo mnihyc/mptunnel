@@ -15,7 +15,7 @@ use crate::model::requalification::StreamPathQualification;
 use crate::model::response::ResponsePathObservation;
 #[cfg(test)]
 use crate::protocol::PathId;
-use crate::protocol::{Frame, PathUsage, StreamId, UnderlayProtocol};
+use crate::protocol::{ConfiguredMemberSlot, Frame, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::commands::{
@@ -63,6 +63,7 @@ pub(in crate::runtime) struct ResponseOutputAttachmentState {
 pub(in crate::runtime) struct ResponseOutputAttachment {
     pub(in crate::runtime::stream) key: CarrierPathKey,
     pub(in crate::runtime::stream) path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime::stream) configured_slot: ConfiguredMemberSlot,
     pub(in crate::runtime::stream) local_policy: PathPolicy,
     /// Endpoint-local configuration bound to this exact carrier incarnation.
     /// Mutable evidence refreshes cannot rewrite it.
@@ -151,6 +152,9 @@ fn apply_attachment_state(
 pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) key: CarrierPathKey,
     pub(super) path_instance_id: CarrierPathInstanceId,
+    /// Authenticated peer-configured ordering domain. Unlike the surrounding
+    /// exact carrier identities, this survives planned replacement.
+    pub(super) configured_slot: ConfiguredMemberSlot,
     pub(super) local_policy: PathPolicy,
     pub(super) startup_rate_prior: RateHint,
     pub(super) incarnation: u64,
@@ -326,6 +330,23 @@ fn retry_pending_ack(
 }
 
 impl ResponseStreamBinding {
+    #[cfg(test)]
+    pub(in crate::runtime) fn configured_slot_for_instance_for_test(
+        &self,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> Option<ConfiguredMemberSlot> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs
+            .entries
+            .iter()
+            .chain(outputs.detaching.iter())
+            .find(|entry| entry.path_instance_id == path_instance_id)
+            .map(|entry| entry.configured_slot)
+    }
+
     pub(in crate::runtime) fn has_live_output(&self) -> bool {
         self.outputs
             .lock()
@@ -488,6 +509,7 @@ impl ResponseStreamBinding {
         self.attach_output(ResponseOutputAttachment {
             key,
             path_instance_id,
+            configured_slot: ConfiguredMemberSlot(path_id.0),
             local_policy: PathPolicy::default(),
             startup_rate_prior: RateHint::Unknown,
             commands,
@@ -519,6 +541,7 @@ impl ResponseStreamBinding {
         let ResponseOutputAttachment {
             key,
             path_instance_id,
+            configured_slot,
             local_policy,
             startup_rate_prior,
             commands,
@@ -631,6 +654,7 @@ impl ResponseStreamBinding {
             if entry.commands.is_closed() {
                 replaced_incarnation = Some(entry.incarnation);
                 entry.path_instance_id = path_instance_id;
+                entry.configured_slot = configured_slot;
                 entry.local_policy = local_policy;
                 entry.startup_rate_prior = startup_rate_prior;
                 entry.incarnation = allocated_incarnation;
@@ -685,6 +709,7 @@ impl ResponseStreamBinding {
             ResponseStreamOutputEntry {
                 key,
                 path_instance_id,
+                configured_slot,
                 local_policy,
                 startup_rate_prior,
                 incarnation: allocated_incarnation,

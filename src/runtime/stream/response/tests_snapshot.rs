@@ -29,7 +29,8 @@ use crate::model::requalification::StreamPathQualification;
 use crate::model::service_rate::{ServiceRateBasis, ServiceRateValue};
 use crate::mux::MuxLimits;
 use crate::protocol::{
-    PathId, PathMetricDirection, PathMetrics, PathUsage, SessionId, UnderlayProtocol,
+    ConfiguredMemberSlot, PathId, PathMetricDirection, PathMetrics, PathUsage, SessionId,
+    UnderlayProtocol,
 };
 use crate::runtime::path::authority::NativeCarrierRateAuthorityHandle;
 use crate::runtime::path::commands::{
@@ -51,6 +52,7 @@ fn output_entry(
     ResponseStreamOutputEntry {
         key,
         path_instance_id: next_server_carrier_path_instance_id(),
+        configured_slot: ConfiguredMemberSlot(key.path_id.0),
         local_policy: PathPolicy::default(),
         startup_rate_prior: RateHint::Unknown,
         incarnation: 1,

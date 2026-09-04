@@ -68,7 +68,7 @@ inferred network thresholds.
 | SEEN-3 | Sparse Data ACK allegedly erased receiver reorder debt | Disproved | `S - A = O + H <= W`; no code change |
 | SEEN-4 | Response settlement waited on local application delivery | Implementation-fixed / matrix-pending | MPP-frontier trigger separated from local write; `444fb38` |
 | SEEN-5 | Finite request replacement/ghost lifecycle | Disproved on current build | One fixed request, one attempt, complete body, no replacement; no code change |
-| SEEN-6A | Persistent live-owner ACK-gap repair could renew critical authority | Safety defect fixed; authority model promoted for redesign | `0b50e9a` proves and stops renewable repair, but its hard percentage budget violates hints-only semantics; redesign with structural frontier-epoch copy cardinality under P1 |
+| SEEN-6A | Persistent live-owner ACK-gap repair could renew critical authority | Safety defect fixed; authority model promoted for redesign | `0b50e9a` proves and stops renewable repair, but its hard percentage budget violates hints-only semantics; redesign with current-attachment range/slot publication cardinality under P1 |
 | SEEN-6B | HTTP/3 migration left QUIC latency priority diagnostic-only | Implementation-fixed / matrix-pending | Actual Quinn priority RED/GREEN plus ordinary two-run non-downgrade; `a9450d8` cannot waive native-HOL or final matrix gates |
 | SEEN-6C | QUIC-only sustained bulk/read-gap and loaded-latency mechanism | Model-constrained; encompassing acceptance remains open | Current same-native-stream gap is attributed to ordered QUIC recovery; this does not close cold/warm, recovery, upload, or concurrent behavior |
 | SEEN-6D1 | TCP-only loaded interactive latency while bulk occupies every configured TCP carrier | Current model-constrained; promoted P2 decision open | Current unified matrix: 303.372 Mbps bulk but 1,417 ms interactive p95 versus 522 ms raw TCP and 538 ms V2Ray; exact diagnostics show zero MPP command wait and hundreds of KiB to MiB of already-native FIFO debt. A later priority frame cannot overtake that prefix without a hard handoff bound or another ordering domain |
@@ -100,7 +100,7 @@ third domain delivered after another 251 ms, producing a 1.064233-second gap.
 This proves the timer and actor-wakeup hypotheses wrong for that replay. It
 does not prove every recovery execution correct, nor does it prove concurrent
 copies faster under a shared bottleneck. P1 must replace the hard percentage
-admission semantics with a structural live-copy identity, then adjudicate
+admission semantics with a structural publication-owner identity, then adjudicate
 sequential, staggered, and concurrent service against joint offered load.
 `dc4853d` and `93e6284` remain exact local comparator/accounting corrections;
 their broad performance benefit is not claimed. Full detail is in
@@ -130,7 +130,7 @@ close one as disproved, unreachable, model-constrained, or stale fixture debt.
 
 | Item | Promoted scope | Why it is necessary / finite closure |
 | --- | --- | --- |
-| SEEN-P1 | Lowest-frontier temporal service and the hard optional-repair percentage gate | Necessary: exact diagnostics show RFC-conforming sequential copies contribute observed delay, while a percentage currently denies recovery as a hard cap. Replace budget authority with structural live-copy identity, then prove or reject each service policy under coupled load. |
+| SEEN-P1 | Lowest-frontier temporal service and the hard optional-repair percentage gate | Necessary: exact diagnostics show RFC-conforming sequential copies contribute observed delay, while a percentage currently denies recovery as a hard cap. Replace budget authority with structural publication-owner identity, then prove or reject each service policy under coupled load. |
 | SEEN-P2 | Sufficiency of native ordering domains, including a possible additional QUIC/TCP domain | Already triggered for TCP by SEEN-6D1; P1 may also trigger QUIC. Prove current-domain sufficiency, validate one clean domain design, or reject the candidate as model-constrained. |
 | SEEN-P3 | Request/fixed-output typed rate hints, omitted-hint startup, and stale-path requalification | Necessary: cold/warm startup and restart-dependent 10-to-500 recovery are reported SEEN symptoms. Close with exact authority chronology and restart-free recovery. |
 | SEEN-P4 | Generic score/admission conformance, uncertainty, flapping, and overlapping contention | Necessary at the carrier-neutral decision boundary for reported L4 default-path sway and marginal path swaps. Experimental L3 inherits correctness only. Overlapping latent-factor inference is processed by proving it necessary or irrelevant to v0.4.7; it is not automatically implemented. |

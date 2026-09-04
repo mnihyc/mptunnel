@@ -299,10 +299,9 @@ impl NativeCarrierSchedulingShapeCache {
                 && current.stamp.native_activation() == stamp.native_activation()
         });
         let prior_timing = prior.and_then(|current| current.directional_timing);
-        let directional_timing = if shape.srtt.is_zero() {
-            prior_timing
-        } else if prior
-            .is_some_and(|current| current.srtt == shape.srtt && current.rttvar == shape.rttvar)
+        let directional_timing = if shape.srtt.is_zero()
+            || prior
+                .is_some_and(|current| current.srtt == shape.srtt && current.rttvar == shape.rttvar)
         {
             prior_timing
         } else {
@@ -571,6 +570,9 @@ impl CoherentNativeCarrierSource {
     }
 
     #[cfg(test)]
+    // This fixture constructor names every native ownership-envelope field so
+    // tests cannot silently inherit production defaults.
+    #[allow(clippy::too_many_arguments)]
     fn checked_for_test(
         activation: u64,
         controller: u64,
@@ -693,6 +695,7 @@ impl NativeCarrierRateAuthorityHandle {
         }))
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn snapshot(
         &self,
     ) -> Result<Option<CarrierRateAuthoritySnapshot>, NativeCarrierRateAuthorityRuntimeError> {
@@ -704,6 +707,7 @@ impl NativeCarrierRateAuthorityHandle {
 
     /// Read the one central live snapshot and prove that it belongs to the
     /// exact carrier-direction scope expected by this decision consumer.
+    #[cfg(test)]
     pub(in crate::runtime) fn decision_snapshot(
         &self,
         requested: CarrierRateAuthorityScope,

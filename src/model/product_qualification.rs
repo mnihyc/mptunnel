@@ -26,6 +26,7 @@ pub(crate) struct ProductQualificationReceipt {
 }
 
 impl ProductQualificationReceipt {
+    #[cfg(test)]
     pub(crate) fn tagged_range(self) -> OffsetRange {
         self.tagged_range
     }
@@ -346,6 +347,7 @@ impl ProductQualificationLedger {
                 .is_some_and(|generation| self.verified_bytes == generation.floor_bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn epoch(&self) -> ProductQualificationEpoch {
         self.epoch
     }

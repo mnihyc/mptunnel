@@ -343,6 +343,7 @@ async fn drain_server_udp_datagram_commands(
                 }
                 continue;
             }
+            #[cfg(test)]
             ReliablePathCommand::SendTcpCapacityProbe(_) => {
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(

@@ -38,6 +38,9 @@ impl ResponseStreamBinding {
         )
     }
 
+    // Reservation, generation, and apply-clock inputs form one atomic dispatch
+    // ownership envelope; a wrapper object would obscure that transaction.
+    #[allow(clippy::too_many_arguments)]
     fn try_enqueue_data_frame_for_dispatch_target_with_apply_clock(
         &self,
         target: &ResponseDispatchTarget,

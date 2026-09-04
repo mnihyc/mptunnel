@@ -3,6 +3,7 @@
 //! Only this owner batches commands or interlocks reads with a pending write,
 //! preserving frame order without allowing feedback backpressure to deadlock.
 
+#[cfg(test)]
 use super::capacity::{ClientTcpCapacityProbeWriteOutcome, client_write_tcp_capacity_probe};
 use super::datagram::ClientTcpDatagramState;
 use super::receive::handle_client_tcp_path_frame;
@@ -14,6 +15,7 @@ use super::stream::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+#[cfg(test)]
 use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
 use crate::mux::MuxLimits;
 #[cfg(feature = "lab-diagnostics")]
@@ -24,11 +26,12 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::reliable_path_command_writer_run_bytes;
 use crate::runtime::path::commands::{
     ClientTcpOpenedDatagramAttachment, ReliablePathCommand, ReliablePathCommandReceivers,
-    TcpCapacityProbeCommand, reliable_path_command_pending_bytes,
-    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
-    reliable_path_frame_requires_capacity_command, reliable_path_writer_frame_queue,
+    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
+    reliable_path_command_writer_run_budget_items, reliable_path_frame_requires_capacity_command,
     try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
+#[cfg(test)]
+use crate::runtime::path::commands::{TcpCapacityProbeCommand, reliable_path_writer_frame_queue};
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -152,6 +155,7 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 // to the actor so all lanes arbitrate the next command head.
                 break;
             }
+            #[cfg(test)]
             ReliablePathCommand::SendTcpCapacityProbe(probe) => {
                 let stream_id = probe.stream_id;
                 let path_instance = probe.path_instance;
@@ -574,6 +578,7 @@ fn publish_client_tcp_frame_transaction(
     connection.record_outbound_activity();
 }
 
+#[cfg(test)]
 struct ClientTcpCapacityProbeInterlock<'a> {
     streams: &'a mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &'a mut RecentIdCache<StreamId>,
@@ -582,6 +587,7 @@ struct ClientTcpCapacityProbeInterlock<'a> {
     mux_limits: MuxLimits,
 }
 
+#[cfg(test)]
 async fn client_write_tcp_capacity_probe_interlocked(
     connection: &mut ClientTcpPathConnection,
     probe: &TcpCapacityProbeCommand,
@@ -700,7 +706,7 @@ async fn client_write_tcp_capacity_probe_interlocked(
     Ok((measurement, deferred_frames))
 }
 
-#[cfg(feature = "lab-diagnostics")]
+#[cfg(all(test, feature = "lab-diagnostics"))]
 fn client_tcp_write_barrier_reason(
     frame: &Frame,
     streams: &HashMap<StreamId, ClientTcpPathStreamState>,
@@ -1031,6 +1037,7 @@ async fn handle_connected_client_tcp_command(
             connection.record_outbound_activity();
             Ok(())
         }
+        #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(_) => Err(RuntimeError::Protocol(
             "client TCP path received server capacity command",
         )),

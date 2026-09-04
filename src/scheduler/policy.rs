@@ -135,6 +135,7 @@ impl PathSnapshot {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn directional_timing(self) -> Option<DirectionalTiming> {
         self.directional_timing
     }

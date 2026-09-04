@@ -130,6 +130,7 @@ impl ClientReliableReturnPlan {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn plan(&self) -> &Arc<ReliableRelayReturnPlan> {
         &self.plan
     }
@@ -201,9 +202,7 @@ impl ClientReliableReturnPlan {
         if self.done || self.final_retained.is_some() {
             return None;
         }
-        let Some(candidate) = self.plan.candidate_for_key(key) else {
-            return None;
-        };
+        let candidate = self.plan.candidate_for_key(key)?;
         let ordinal = candidate.ordinal;
         let index = usize::from(ordinal);
         if let Some(frozen) = self.bound_instances[index]
@@ -554,6 +553,9 @@ pub(super) fn try_handle_additional_path_open_result(
 }
 
 #[cfg(test)]
+// This test adapter mirrors the complete asynchronous path-open ownership
+// envelope and deliberately adds no second fixture-only aggregate.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_additional_path_open_result(
     stream_id: StreamId,
     remotes: &mut ReliableRelayRemoteSet,
@@ -646,6 +648,8 @@ pub(super) fn try_drain_completed_additional_path_opens(
 }
 
 #[cfg(test)]
+// This test adapter mirrors the production drain ownership envelope exactly.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn drain_completed_additional_path_opens(
     stream_id: StreamId,
     startup: &mut ClientReliableReturnPlan,
@@ -703,7 +707,9 @@ pub(super) struct RelayAdditionalPathOpenResult {
 
 pub(super) struct RelayAdditionalPathOpenTask {
     generation: RelayAdditionalPathOpenGeneration,
+    #[cfg(test)]
     startup_ordinal: Option<u8>,
+    #[cfg(test)]
     startup_expected_instance: Option<CarrierPathInstanceId>,
     #[cfg(feature = "lab-diagnostics")]
     lane: TrafficClass,
@@ -1048,7 +1054,9 @@ fn spawn_reliable_relay_path_opens(
             key,
             RelayAdditionalPathOpenTask {
                 generation,
+                #[cfg(test)]
                 startup_ordinal: candidate.startup_ordinal,
+                #[cfg(test)]
                 startup_expected_instance: candidate.startup_expected_instance,
                 #[cfg(feature = "lab-diagnostics")]
                 lane,

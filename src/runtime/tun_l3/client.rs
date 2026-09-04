@@ -224,6 +224,9 @@ struct ClientIpCarrierState {
     ready: bool,
 }
 
+// The planned candidate is kept inline so packet-path selection remains a
+// copy-only ownership decision with no allocation on the datagram hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 enum ClientIpCarrierSelection {
     Bound(ClientIpCarrierKey),

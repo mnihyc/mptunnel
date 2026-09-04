@@ -28,17 +28,19 @@ use crate::protocol::{
     Frame, OffsetRange, PathMetricDirection, PathMetrics, ResetReason, StreamId, UnderlayProtocol,
 };
 use crate::runtime::RuntimeError;
+#[cfg(test)]
+use crate::runtime::path::RequestTcpCapacityProbeLease;
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
+#[cfg(test)]
+use crate::runtime::path::commands::RequestTcpCapacityProbeRequest;
 use crate::runtime::path::commands::{
     ReliablePathCarrierTerminalSignal, ReliablePathCommand, ReliablePathCommandSender,
-    ReliablePathFrameReservation, RequestTcpCapacityProbeRequest,
+    ReliablePathFrameReservation,
 };
 #[cfg(test)]
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::runtime::path::proof::enqueue_path_proof_frame;
-use crate::runtime::path::{
-    CarrierNativeWindowSample, OpenedReliableCarrierStream, RequestTcpCapacityProbeLease,
-};
+use crate::runtime::path::{CarrierNativeWindowSample, OpenedReliableCarrierStream};
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use smallvec::SmallVec;
@@ -395,13 +397,6 @@ impl ReliablePathStream {
         self.output
             .tail_reinjection_snapshot(ack_frontier, lane)
             .or_else(|| self.send_path_snapshot(lane, payload_bytes))
-    }
-
-    pub(in crate::runtime) fn tail_reinjection_original_underlay(
-        &self,
-        ack_frontier: u64,
-    ) -> Option<UnderlayProtocol> {
-        self.output.tail_reinjection_original_underlay(ack_frontier)
     }
 
     pub(in crate::runtime) fn data_ack_recovery_candidate(
@@ -837,6 +832,7 @@ impl ReliablePathStreamHandle {
         self.output.enqueue_path_proof()
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn try_enqueue_request_tcp_capacity_probe(
         &self,
         request: RequestTcpCapacityProbeRequest,
@@ -878,6 +874,7 @@ impl ReliablePathStreamHandle {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn can_enqueue_work_lane_now(
         &self,
         work_lane: ReliableWorkClass,
@@ -934,6 +931,9 @@ pub(in crate::runtime) struct FixedReliablePathOutput {
     model: Mutex<FixedReliablePathModel>,
 }
 
+// The native snapshot is intentionally inline: this hot ownership decision is
+// copy-only and must not allocate merely to reduce the enum's stack footprint.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 enum FixedRateDecision {
     Legacy,
@@ -1977,16 +1977,6 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(in crate::runtime) fn tail_reinjection_original_underlay(
-        &self,
-        ack_frontier: u64,
-    ) -> Option<UnderlayProtocol> {
-        match self {
-            Self::Fixed(fixed) => Some(fixed.key().underlay),
-            Self::Switchable(binding) => binding.tail_reinjection_original_underlay(ack_frontier),
-        }
-    }
-
     pub(in crate::runtime) fn data_ack_recovery_candidate(
         &self,
         ack_frontier: u64,
@@ -2276,6 +2266,7 @@ impl<T> RequalificationAttempt<T> {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn is_capacity_blocked(&self) -> bool {
         matches!(self, Self::CapacityBlocked { .. })
     }

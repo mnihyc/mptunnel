@@ -403,6 +403,8 @@ impl ClientUdpPathSessionHandle {
         self.owner.reconciliation_deadline()
     }
 
+    // The open boundary transfers the complete logical-stream ownership envelope.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) async fn open_stream(
         &self,
         stream_id: StreamId,
@@ -1612,6 +1614,9 @@ async fn run_client_udp_control_stream(
     }
 }
 
+// This is the single wire-open ownership envelope; grouping it would only move
+// validation away from the protocol construction site.
+#[allow(clippy::too_many_arguments)]
 async fn open_client_udp_stream_on_connection(
     carrier: ClientUdpCarrierInstance,
     stream_id: StreamId,

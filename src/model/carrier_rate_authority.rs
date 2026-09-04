@@ -17,6 +17,7 @@ use super::service_rate::{DirectionalServiceRate, QuinnBbr3NativeOperationalRate
 pub(crate) use super::service_rate::{
     DirectionalServiceRateScope as CarrierRateAuthorityScope, PositiveRateBps as CarrierRateBps,
 };
+#[cfg(test)]
 use crate::transport::RateHint;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -41,7 +42,7 @@ pub(crate) enum CarrierRateConversionError {
 fn checked_native_operational_rate(
     bits_per_second: u128,
 ) -> Result<CarrierRateBps, CarrierRateConversionError> {
-    if bits_per_second % 8 != 0 {
+    if !bits_per_second.is_multiple_of(8) {
         return Err(CarrierRateConversionError::NotByteAligned);
     }
     let bits_per_second =
@@ -57,6 +58,7 @@ impl CarrierRateAuthorityRevision {
     const INITIAL: Self = Self(1);
     const TERMINAL: Self = Self(u64::MAX);
 
+    #[cfg(test)]
     pub(crate) fn as_u64(self) -> u64 {
         self.0
     }
@@ -97,24 +99,29 @@ impl CarrierRateAuthorityStamp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CarrierRateAuthorityMode {
     NativeOperational,
+    #[cfg(test)]
     Receipt,
 }
 
 /// Checked identity of one ReceiptMode lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct ReceiptModeGeneration(NonZeroU64);
 
 /// Checked monotonically issued identity of one immutable ReceiptMode term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg(test)]
 pub(crate) struct ReceiptTermId(NonZeroU64);
 
 /// Full Receipt term identity. A bare term ID is never scheduling provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct ReceiptTermKey {
     generation: ReceiptModeGeneration,
     term_id: ReceiptTermId,
 }
 
+#[cfg(test)]
 impl ReceiptTermKey {
     pub(crate) fn generation(self) -> ReceiptModeGeneration {
         self.generation
@@ -130,7 +137,9 @@ impl ReceiptTermKey {
 pub(crate) enum CarrierRateAuthorityBasis {
     StartupPrior,
     NativeOperational,
+    #[cfg(test)]
     ReceiptFallback,
+    #[cfg(test)]
     ReceiptTerm(ReceiptTermKey),
 }
 
@@ -142,6 +151,7 @@ pub(crate) enum CarrierRateAuthorityBasis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CarrierRateAuthorityValue {
     Native(DirectionalServiceRate),
+    #[cfg(test)]
     ReceiptFinite(CarrierRateBps),
 }
 
@@ -175,6 +185,7 @@ impl CarrierRateAuthoritySnapshot {
     pub(crate) fn service_rate(self) -> Option<DirectionalServiceRate> {
         match self.value {
             CarrierRateAuthorityValue::Native(rate) => Some(rate),
+            #[cfg(test)]
             CarrierRateAuthorityValue::ReceiptFinite(_) => None,
         }
     }
@@ -185,6 +196,7 @@ impl CarrierRateAuthoritySnapshot {
     pub(crate) fn finite_rate_bps(self) -> Option<u64> {
         match self.value {
             CarrierRateAuthorityValue::Native(rate) => rate.finite_rate_bps(),
+            #[cfg(test)]
             CarrierRateAuthorityValue::ReceiptFinite(rate) => Some(rate.get()),
         }
     }
@@ -481,16 +493,18 @@ struct NativeControllerObservationProposal {
 #[derive(Debug)]
 #[must_use = "native scheduling authority must be consumed at ownership transfer"]
 struct NativeAuthorityCommitPermit<'fence> {
-    authority: &'fence CarrierRateAuthorityReducer,
-    active_transport: &'fence mut ActiveNativeTransportGuard,
+    _authority: &'fence CarrierRateAuthorityReducer,
+    _active_transport: &'fence mut ActiveNativeTransportGuard,
+    #[cfg(test)]
     stamp: CarrierRateAuthorityStamp,
 }
 
 impl NativeAuthorityCommitPermit<'_> {
+    #[cfg(test)]
     fn stamp(&self) -> CarrierRateAuthorityStamp {
-        debug_assert!(self.authority.is_current(self.stamp));
+        debug_assert!(self._authority.is_current(self.stamp));
         debug_assert_eq!(
-            self.active_transport.transport_activation,
+            self._active_transport.transport_activation,
             self.stamp
                 .native_activation
                 .expect("NativeMode permit always carries activation")
@@ -505,13 +519,15 @@ impl NativeAuthorityCommitPermit<'_> {
 
 /// Positive achieved-service rate admitted by the ReceiptMode proof model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 struct ReceiptAuthorityRate(CarrierRateBps);
 
+#[cfg(test)]
 impl ReceiptAuthorityRate {
     fn checked_from_bits_per_second(
         bits_per_second: u64,
     ) -> Result<Self, CarrierRateConversionError> {
-        CarrierRateBps::checked_from_bits_per_second(bits_per_second)
+        CarrierRateBps::checked_new(bits_per_second)
             .map(Self)
             .map_err(|_| CarrierRateConversionError::Zero)
     }
@@ -522,6 +538,7 @@ impl ReceiptAuthorityRate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 struct ReceiptAuthorityTerm {
     id: ReceiptTermId,
     rate: ReceiptAuthorityRate,
@@ -530,6 +547,7 @@ struct ReceiptAuthorityTerm {
 /// Non-cloneable ownership of one reducer's fixed ReceiptMode generation.
 #[derive(Debug)]
 #[must_use = "Receipt publication must stay bound to its mode generation"]
+#[cfg(test)]
 struct ReceiptModeCapability {
     authority_key: AuthorityInstanceKey,
     generation: ReceiptModeGeneration,
@@ -541,6 +559,7 @@ struct ReceiptModeCapability {
 /// coordinator must eventually mint it only after old source publication and
 /// the old decision semantics are fenced.
 #[derive(Debug)]
+#[cfg(test)]
 struct FencedNativeController {
     authority_key: AuthorityInstanceKey,
     expected: CarrierRateAuthorityStamp,
@@ -550,6 +569,7 @@ struct FencedNativeController {
 
 /// Proof that one exact ReceiptMode generation is fully prepared.
 #[derive(Debug)]
+#[cfg(test)]
 struct PreparedReceiptMode {
     generation: ReceiptModeGeneration,
 }
@@ -560,6 +580,7 @@ struct PreparedReceiptMode {
 /// the exclusive serialized transaction that combines its two fields.
 #[derive(Debug)]
 #[must_use = "a fenced native source must be committed or terminalized"]
+#[cfg(test)]
 struct NativeToReceiptReady {
     fenced: FencedNativeController,
     receipt: PreparedReceiptMode,
@@ -571,6 +592,7 @@ struct NativeToReceiptReady {
 /// supply a fresh stamp, generation, term identity, or rate to the reducer API.
 #[derive(Debug)]
 #[must_use = "validated Receipt publication must be applied exactly once"]
+#[cfg(test)]
 struct ReceiptTermPublication {
     authority_key: AuthorityInstanceKey,
     expected: CarrierRateAuthorityStamp,
@@ -581,6 +603,7 @@ struct ReceiptTermPublication {
 /// Opaque retirement of the exact active Receipt term installed above.
 #[derive(Debug)]
 #[must_use = "Receipt expiry must retire only its exact published term"]
+#[cfg(test)]
 struct ReceiptTermRetirement {
     authority_key: AuthorityInstanceKey,
     expected: CarrierRateAuthorityStamp,
@@ -595,6 +618,7 @@ enum CarrierRateAuthorityState {
         controller: NativeControllerIdentity,
         operational: Option<CarrierRateBps>,
     },
+    #[cfg(test)]
     Receipt {
         generation: ReceiptModeGeneration,
         fallback: CarrierRateBps,
@@ -621,12 +645,17 @@ pub(crate) enum CarrierRateAuthorityError {
     NativeActivationMismatch,
     WrongMode,
     Terminal,
+    #[cfg(test)]
     ReceiptGenerationMismatch,
+    #[cfg(test)]
     ReceiptRateDoesNotExceedFallback,
+    #[cfg(test)]
     ReceiptTermMismatch,
+    #[cfg(test)]
     ReceiptTermReused,
     NativeActivationReused,
     ActiveTransportMismatch,
+    #[cfg(test)]
     UnlimitedReceiptFallbackUnavailable,
 }
 
@@ -656,16 +685,19 @@ pub(crate) struct NativeCarrierRateAuthority {
 #[derive(Debug)]
 struct NativeControllerInstallation {
     transition: CarrierRateAuthorityTransition,
+    #[cfg(test)]
     activation: Option<NativeControllerActivation>,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct ReceiptTermPublicationOutcome {
     transition: CarrierRateAuthorityTransition,
     retirement: Option<ReceiptTermRetirement>,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct NativeToReceiptOutcome {
     transition: CarrierRateAuthorityTransition,
     receipt: Option<ReceiptModeCapability>,
@@ -731,6 +763,7 @@ impl CarrierRateAuthorityReducer {
         Self::new_native_with_startup(scope, startup, initial)
     }
 
+    #[cfg(test)]
     fn new_receipt(
         scope: CarrierRateAuthorityScope,
         startup_prior: CarrierRateBps,
@@ -770,9 +803,9 @@ impl CarrierRateAuthorityReducer {
                 controller,
                 ..
             } => (Some(transport_activation), Some(controller)),
-            CarrierRateAuthorityState::Receipt { .. } | CarrierRateAuthorityState::Terminal => {
-                (None, None)
-            }
+            #[cfg(test)]
+            CarrierRateAuthorityState::Receipt { .. } => (None, None),
+            CarrierRateAuthorityState::Terminal => (None, None),
         };
         CarrierRateAuthorityStamp {
             scope: self.scope,
@@ -805,6 +838,7 @@ impl CarrierRateAuthorityReducer {
                     CarrierRateAuthorityValue::Native(self.startup),
                 ),
             },
+            #[cfg(test)]
             CarrierRateAuthorityState::Receipt {
                 generation,
                 fallback,
@@ -835,6 +869,7 @@ impl CarrierRateAuthorityReducer {
         })
     }
 
+    #[cfg(test)]
     fn is_current(&self, stamp: CarrierRateAuthorityStamp) -> bool {
         self.state != CarrierRateAuthorityState::Terminal && self.stamp() == stamp
     }
@@ -857,8 +892,9 @@ impl CarrierRateAuthorityReducer {
         };
         self.require_active_transport(active_transport, transport_activation)?;
         Ok(NativeAuthorityCommitPermit {
-            authority: self,
-            active_transport,
+            _authority: self,
+            _active_transport: active_transport,
+            #[cfg(test)]
             stamp,
         })
     }
@@ -919,6 +955,7 @@ impl CarrierRateAuthorityReducer {
         let Some(_) = self.advance_live_revision()? else {
             return Ok(NativeControllerInstallation {
                 transition: CarrierRateAuthorityTransition::Terminal,
+                #[cfg(test)]
                 activation: None,
             });
         };
@@ -929,6 +966,7 @@ impl CarrierRateAuthorityReducer {
         };
         Ok(NativeControllerInstallation {
             transition: CarrierRateAuthorityTransition::Applied,
+            #[cfg(test)]
             activation: Some(NativeControllerActivation {
                 authority_key: self.authority_key.duplicate(),
                 transport_activation: next.transport_activation,
@@ -937,6 +975,7 @@ impl CarrierRateAuthorityReducer {
         })
     }
 
+    #[cfg(test)]
     fn revoke_native_to_receipt(
         &mut self,
         ready: NativeToReceiptReady,
@@ -986,6 +1025,7 @@ impl CarrierRateAuthorityReducer {
         })
     }
 
+    #[cfg(test)]
     fn publish_receipt_term(
         &mut self,
         publication: ReceiptTermPublication,
@@ -1040,6 +1080,7 @@ impl CarrierRateAuthorityReducer {
         })
     }
 
+    #[cfg(test)]
     fn retire_receipt_term(
         &mut self,
         retirement: ReceiptTermRetirement,
@@ -1058,7 +1099,7 @@ impl CarrierRateAuthorityReducer {
         if retirement.generation != generation {
             return Err(CarrierRateAuthorityError::ReceiptGenerationMismatch);
         }
-        if !active.is_some_and(|term| term.id == retirement.term_id) {
+        if active.is_none_or(|term| term.id != retirement.term_id) {
             return Err(CarrierRateAuthorityError::ReceiptTermMismatch);
         }
         self.commit(CarrierRateAuthorityState::Receipt {
@@ -1246,6 +1287,7 @@ impl NativeCarrierRateAuthority {
                 authority_key: self.reducer.authority_key.duplicate(),
                 expected: self.reducer.stamp(),
             }),
+            #[cfg(test)]
             CarrierRateAuthorityState::Receipt { .. } => Err(CarrierRateAuthorityError::WrongMode),
             CarrierRateAuthorityState::Terminal => Err(CarrierRateAuthorityError::Terminal),
         }

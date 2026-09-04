@@ -583,13 +583,12 @@ impl ServerCarrierPathApplyAuthority {
             .inner
             .lock()
             .expect("server carrier apply-authority lock");
-        if let Some(previous) = state.native_scheduling_shape {
-            if shape.stamp().revision() < previous.stamp().revision()
+        if let Some(previous) = state.native_scheduling_shape
+            && (shape.stamp().revision() < previous.stamp().revision()
                 || (shape.stamp().revision() == previous.stamp().revision()
-                    && shape.stamp() != previous.stamp())
-            {
-                return false;
-            }
+                    && shape.stamp() != previous.stamp()))
+        {
+            return false;
         }
         if state.native_scheduling_shape == Some(shape) {
             false
@@ -1060,6 +1059,9 @@ type ServerStreamPortFuture<'a, T> =
 pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
     fn owner_token(&self) -> usize;
 
+    // This port is the ownership handoff for one authenticated carrier; keeping
+    // the fields explicit avoids a second, partially initialized identity type.
+    #[allow(clippy::too_many_arguments)]
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,

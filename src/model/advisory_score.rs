@@ -1,12 +1,15 @@
 //! Exact-action advisory service score from RFC Section 10.2.
 
-use super::service_rate::{
-    DirectionalServiceRate, DirectionalServiceRateScope, NormalizedMppWorkBytes, ServiceRateValue,
-};
+use super::service_rate::DirectionalServiceRateScope;
+#[cfg(test)]
+use super::service_rate::{DirectionalServiceRate, NormalizedMppWorkBytes, ServiceRateValue};
+#[cfg(test)]
 use std::cmp::Ordering;
 use std::time::Duration;
 
+#[cfg(test)]
 const BITS_MILLISECONDS_PER_BYTE_SECOND: u128 = 8_000;
+#[cfg(test)]
 const MINIMUM_TIMING_UNCERTAINTY: Duration = Duration::from_millis(1);
 
 /// Producer-owned identity of one coherent directional timing publication.
@@ -21,6 +24,7 @@ impl DirectionalTimingEpoch {
         Self(raw)
     }
 
+    #[cfg(test)]
     pub(crate) const fn as_u64(self) -> u64 {
         self.0
     }
@@ -201,14 +205,17 @@ impl DirectionalTiming {
         self.scope
     }
 
+    #[cfg(test)]
     pub(crate) const fn epoch(self) -> DirectionalTimingEpoch {
         self.epoch
     }
 
+    #[cfg(test)]
     pub(crate) const fn round_trip_time(self) -> Duration {
         self.round_trip_time
     }
 
+    #[cfg(test)]
     pub(crate) const fn variation(self) -> Option<Duration> {
         self.variation
     }
@@ -233,6 +240,7 @@ pub(crate) enum DirectionalTimingModelError {
 /// Option fields distinguish a missing/rejected producer value from a valid
 /// zero-like value. The scorer has no internal fallback authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct ExactActionScoreInput {
     action_scope: DirectionalServiceRateScope,
     work: Option<NormalizedMppWorkBytes>,
@@ -240,6 +248,7 @@ pub(crate) struct ExactActionScoreInput {
     timing: Option<DirectionalTiming>,
 }
 
+#[cfg(test)]
 impl ExactActionScoreInput {
     pub(crate) const fn new(
         action_scope: DirectionalServiceRateScope,
@@ -261,6 +270,7 @@ impl ExactActionScoreInput {
 /// `Unrankable` remains an eligible result. Structural owners sort it after
 /// rankable actions in the same tier and may still attempt it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum ActionScore {
     Rankable {
         service_time: Duration,
@@ -269,14 +279,8 @@ pub(crate) enum ActionScore {
     Unrankable,
 }
 
+#[cfg(test)]
 impl ActionScore {
-    pub(crate) const fn service_time(self) -> Option<Duration> {
-        match self {
-            Self::Rankable { service_time, .. } => Some(service_time),
-            Self::Unrankable => None,
-        }
-    }
-
     pub(crate) const fn uncertainty(self) -> Option<Duration> {
         match self {
             Self::Rankable { uncertainty, .. } => Some(uncertainty),
@@ -303,6 +307,7 @@ impl ActionScore {
 }
 
 /// Computes the exact-action score without choosing or repairing inputs.
+#[cfg(test)]
 pub(crate) fn exact_action_score(input: ExactActionScoreInput) -> ActionScore {
     let Some(work) = input.work else {
         return ActionScore::Unrankable;
@@ -359,6 +364,7 @@ pub(crate) fn exact_action_score(input: ExactActionScoreInput) -> ActionScore {
 /// order from RFC Section 7.2. `K` must be the full canonical action identity;
 /// this model never manufactures it from a reusable path id or input index.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct CanonicallyRankedAction<O, K, V> {
     score: ActionScore,
     configured_order: O,
@@ -366,6 +372,7 @@ pub(crate) struct CanonicallyRankedAction<O, K, V> {
     value: V,
 }
 
+#[cfg(test)]
 impl<O, K, V> CanonicallyRankedAction<O, K, V> {
     pub(crate) const fn new(score: ActionScore, configured_order: O, key: K, value: V) -> Self {
         Self {
@@ -391,17 +398,10 @@ impl<O, K, V> CanonicallyRankedAction<O, K, V> {
     pub(crate) const fn value(&self) -> &V {
         &self.value
     }
-
-    pub(crate) const fn value_mut(&mut self) -> &mut V {
-        &mut self.value
-    }
-
-    pub(crate) fn into_value(self) -> V {
-        self.value
-    }
 }
 
 /// Establishes the permutation-invariant base order for one structural tier.
+#[cfg(test)]
 pub(crate) fn sort_canonical_base_order<O: Ord, K: Ord, V>(
     actions: &mut [CanonicallyRankedAction<O, K, V>],
 ) {
@@ -415,6 +415,7 @@ pub(crate) fn sort_canonical_base_order<O: Ord, K: Ord, V>(
 
 /// Result of the one allowed post-sort incumbent operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum IncumbentPromotion {
     NotFound,
     AlreadyFirst,
@@ -430,6 +431,7 @@ pub(crate) enum IncumbentPromotion {
 /// comparator: pairwise uncertainty is non-transitive and must never be fed
 /// to `sort_by`. Rotation preserves the relative order of every fallback, so
 /// a failed incumbent commit proceeds with the unchanged canonical base order.
+#[cfg(test)]
 pub(crate) fn promote_incumbent_for_first_attempt<O, K: Eq, V>(
     canonical_base_order: &mut [CanonicallyRankedAction<O, K, V>],
     incumbent_key: &K,
@@ -486,6 +488,7 @@ fn checked_duration_from_millis(milliseconds: f64) -> Option<Duration> {
         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
 }
 
+#[cfg(test)]
 fn duration_from_millis_u128(milliseconds: u128) -> Option<Duration> {
     let seconds = u64::try_from(milliseconds / 1_000).ok()?;
     let subsec_millis = u32::try_from(milliseconds % 1_000).ok()?;

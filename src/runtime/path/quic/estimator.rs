@@ -202,6 +202,7 @@ impl QuicPathMetricTracker {
         self.delivery_sample_bytes = 0;
     }
 
+    #[cfg(test)]
     fn observe(
         &mut self,
         stats: quinn::ConnectionStats,
@@ -232,6 +233,7 @@ impl QuicPathMetricTracker {
         )
     }
 
+    #[cfg(test)]
     fn observe_at(
         &mut self,
         stats: quinn::ConnectionStats,
@@ -460,6 +462,7 @@ impl QuicPathMetricTracker {
             direction,
             srtt: rtt,
             rttvar,
+            #[cfg(test)]
             rtt_observed: !raw_rtt.is_zero(),
             // NativeMode has one scheduling rate: the central C0/Bop value.
             // An Unlimited startup has no numeric authority, so this legacy

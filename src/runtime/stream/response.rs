@@ -19,9 +19,11 @@ use crate::model::product_qualification::ProductQualificationLedger;
 use crate::model::requalification::StreamPathQualification;
 use crate::mux::MuxLimits;
 use crate::protocol::{
-    ConfiguredMemberSlot, PathId, PathUsage, ResetReason, SessionId, StreamAttachmentPhase,
-    StreamId, StreamReturnPlan, UnderlayProtocol,
+    ConfiguredMemberSlot, PathId, ResetReason, SessionId, StreamId, StreamReturnPlan,
+    UnderlayProtocol,
 };
+#[cfg(test)]
+use crate::protocol::{PathUsage, StreamAttachmentPhase};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::scheduler::TrafficClass;
@@ -180,6 +182,7 @@ impl ResponseStreamBinding {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(in crate::runtime::stream) fn new_with_limits_tracker_and_path_instance(
         session_id: SessionId,
         underlay: UnderlayProtocol,
@@ -302,14 +305,6 @@ impl ResponseStreamBinding {
 
     pub(in crate::runtime::stream) fn session_send_buffer(&self) -> super::SessionSendBuffer {
         self.session_registration.send_buffer()
-    }
-
-    pub(in crate::runtime::stream) fn attach_output_if_session_active(
-        &self,
-        attachment: ResponseOutputAttachment,
-    ) -> Result<ResponseStreamAttachOutcome, RuntimeError> {
-        self.session_registration
-            .commit_if_active(|| self.try_attach_output(attachment))?
     }
 
     /// Atomically publishes one exact output and applies its phase-tagged

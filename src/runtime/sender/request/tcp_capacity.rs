@@ -4,28 +4,39 @@
 //! outcomes upward because only the request product owner may graduate a
 //! path_state or preserve a sealed ACK-clock transaction.
 
-#[cfg(feature = "lab-diagnostics")]
+#[cfg(all(test, feature = "lab-diagnostics"))]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::TcpCapacityProofCandidate;
 use crate::model::path::RelayPathInstance;
+#[cfg(test)]
 use crate::model::request_capacity::{
     request_capacity_stable_candidate_share_bytes,
     request_tcp_capacity_candidate_can_start_receipt, request_tcp_capacity_measurement_geometry,
     request_tcp_capacity_measurement_lease,
 };
+#[cfg(test)]
 use crate::model::request_evidence::RequestProductRateEpoch;
+#[cfg(test)]
 use crate::model::timing::transport_pto_from_snapshot;
+#[cfg(test)]
 use crate::model::work::ReliableWorkClass;
+#[cfg(test)]
 use crate::protocol::{StreamId, UnderlayProtocol};
+#[cfg(test)]
 use crate::runtime::path::{
     CapacityProbeCommandTicket, ClientPathContext, RequestCapacityProbeCampaignBudget,
-    RequestCapacityReconciliationView, RequestTcpCapacityProbeLease,
-    RequestTcpCapacityProbeRequest, RequestTcpCapacityProofQuery,
+    RequestTcpCapacityProbeRequest,
+};
+use crate::runtime::path::{
+    RequestCapacityReconciliationView, RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery,
 };
 use crate::runtime::stream::ReliableRelayRemoteSet;
+#[cfg(test)]
 use crate::runtime::stream::request::RequestStreamState;
+#[cfg(test)]
 use crate::scheduler::TrafficClass;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -81,7 +92,9 @@ pub(super) enum RequestTcpCapacityEvent {
 #[derive(Debug)]
 pub(super) struct RequestTcpCapacityController {
     pub(super) measurements: HashMap<RelayPathInstance, RequestTcpCapacityMeasurement>,
+    #[cfg(test)]
     pub(super) attempted_paths: HashSet<usize>,
+    #[cfg(test)]
     pub(super) campaign: Arc<RequestCapacityProbeCampaignBudget>,
 }
 
@@ -89,7 +102,9 @@ impl Default for RequestTcpCapacityController {
     fn default() -> Self {
         Self {
             measurements: HashMap::new(),
+            #[cfg(test)]
             attempted_paths: HashSet::new(),
+            #[cfg(test)]
             campaign: Arc::new(RequestCapacityProbeCampaignBudget::default()),
         }
     }
@@ -229,6 +244,7 @@ impl RequestTcpCapacityController {
 }
 
 impl RequestTcpCapacityController {
+    #[cfg(test)]
     pub(super) fn try_start(
         &mut self,
         stream_id: StreamId,

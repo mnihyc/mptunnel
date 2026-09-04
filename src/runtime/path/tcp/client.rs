@@ -249,6 +249,8 @@ impl ClientTcpPathSessionHandle {
         }
     }
 
+    // The open boundary transfers the complete logical-stream ownership envelope.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) async fn open_stream_with_deadlines(
         &self,
         stream_id: StreamId,
@@ -271,6 +273,8 @@ impl ClientTcpPathSessionHandle {
         .await
     }
 
+    // This private continuation deliberately mirrors the public ownership envelope.
+    #[allow(clippy::too_many_arguments)]
     async fn open_stream_with_deadlines_active(
         &self,
         stream_id: StreamId,

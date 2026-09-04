@@ -21,7 +21,7 @@ pub(crate) struct BulkPathCandidate {
     pub(crate) has_liveness_evidence: bool,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(crate) has_path_proof_evidence: bool,
-    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) has_ack_data_evidence: bool,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(crate) has_bulk_rate_evidence: bool,
@@ -336,14 +336,6 @@ pub(crate) fn bulk_reorder_window_bytes(payload_bytes: usize, mux_limits: MuxLim
         .min(stream_window)
         .max(base_payload)
         .max(1)
-}
-
-pub(crate) fn bulk_scheduling_window_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> usize {
-    let horizon = bulk_scheduling_horizon_bytes(payload_bytes, mux_limits);
-    let envelope = bulk_reorder_window_bytes(payload_bytes, mux_limits);
-    ((horizon as f64) * RELIABLE_PIPE_WINDOW_BDPS)
-        .ceil()
-        .clamp(horizon as f64, envelope as f64) as usize
 }
 
 #[cfg(test)]

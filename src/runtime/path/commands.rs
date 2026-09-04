@@ -8,9 +8,10 @@ use super::queue::TcpCapacityProbeLease;
 use super::tcp::capacity::RequestTcpCapacityProbeLease;
 use super::tcp::client::ClientTcpDatagramInbound;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
+#[cfg(test)]
+use crate::protocol::PathId;
 use crate::protocol::{
-    DatagramFlowId, Frame, PathId, ResetReason, StreamDemandHint, StreamId, StreamReturnPlan,
-    TargetAddr,
+    DatagramFlowId, Frame, ResetReason, StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr,
 };
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::{PathSnapshot, TrafficClass};
@@ -64,6 +65,7 @@ pub(in crate::runtime) struct CapacityProbeCommandTicket {
 }
 
 impl CapacityProbeCommandTicket {
+    #[cfg(test)]
     pub(in crate::runtime) fn new() -> Self {
         Self {
             state: Arc::new(CapacityProbeCommandTicketState {
@@ -144,6 +146,7 @@ impl CapacityProbeCommandTicket {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 pub(in crate::runtime) struct RequestTcpCapacityProbeRequest {
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) path_instance: RelayPathInstance,
@@ -163,14 +166,21 @@ pub(in crate::runtime) struct RequestTcpCapacityProbeRequest {
 pub(in crate::runtime) struct TcpCapacityProbeCommand {
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) path_instance: RelayPathInstance,
+    #[cfg(test)]
     pub(in crate::runtime) path_id: PathId,
     pub(in crate::runtime) measurement_id: u64,
     pub(in crate::runtime) train_payload_bytes: u64,
+    #[cfg(test)]
     pub(in crate::runtime) sample_floor_bytes: u64,
+    #[cfg(test)]
     pub(in crate::runtime) warmup_carrier_bytes: u64,
+    #[cfg(test)]
     pub(in crate::runtime) timing_slack_bytes: u64,
+    #[cfg(test)]
     pub(in crate::runtime) required_timed_carrier_bytes: u64,
+    #[cfg(test)]
     pub(in crate::runtime) baseline_expires_at: Instant,
+    #[cfg(test)]
     pub(in crate::runtime) write_expires_at: Instant,
     pub(in crate::runtime) expires_at: Instant,
     pub(in crate::runtime) request_lease: RequestTcpCapacityProbeLease,
@@ -182,6 +192,7 @@ impl TcpCapacityProbeCommand {
         &self.request_lease
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn valid_request_tcp_train(&self) -> bool {
         let measurement_bytes = match self
             .timing_slack_bytes
@@ -256,6 +267,7 @@ pub(in crate::runtime) enum ReliablePathCommand {
         response: Option<oneshot::Sender<Result<(), RuntimeError>>>,
     },
     SendFrame(Frame),
+    #[cfg(test)]
     SendTcpCapacityProbe(TcpCapacityProbeCommand),
     ResetAndCloseStream {
         stream_id: StreamId,

@@ -575,6 +575,7 @@ pub(in crate::runtime) fn bulk_path_candidate(
         eta_ms,
         has_liveness_evidence: bulk_candidate_has_liveness_evidence(path, observation),
         has_path_proof_evidence: bulk_candidate_has_path_proof_evidence(observation),
+        #[cfg(test)]
         has_ack_data_evidence: bulk_candidate_has_ack_data_evidence(path, observation),
         has_bulk_rate_evidence: bulk_candidate_has_bulk_rate_evidence(path, observation),
         has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
@@ -618,6 +619,7 @@ pub(in crate::runtime) fn packet_path_snapshot(
             product_delivery_rate_bps: None,
             product_delivery_samples: 0,
             product_delivery_sample_bytes: 0,
+            #[cfg(test)]
             datagram_feedback_samples: 0,
             last_delivery_at: None,
             delivery_rate_expires_at: None,
@@ -1368,6 +1370,7 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) product_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) product_delivery_samples: u32,
     pub(in crate::runtime) product_delivery_sample_bytes: u64,
+    #[cfg(test)]
     pub(in crate::runtime) datagram_feedback_samples: u32,
     pub(in crate::runtime) last_delivery_at: Option<Instant>,
     pub(in crate::runtime) delivery_rate_expires_at: Option<Instant>,
@@ -1427,6 +1430,7 @@ impl Default for ClientPathObservation {
             product_delivery_rate_bps: None,
             product_delivery_samples: 0,
             product_delivery_sample_bytes: 0,
+            #[cfg(test)]
             datagram_feedback_samples: 0,
             last_delivery_at: None,
             delivery_rate_expires_at: None,
@@ -1464,6 +1468,7 @@ impl Default for ClientPathObservation {
     }
 }
 
+#[cfg(test)]
 pub(super) fn reliable_reservation_should_use_endpoint_only_startup_order(
     tcp_paths: &[PathSpec],
     tcp_observations: &[ClientPathObservation],
@@ -1487,6 +1492,7 @@ fn observation_has_validated_rtt_evidence(observation: ClientPathObservation) ->
         && (observation.measured_srtt_ms.is_some() || observation.carrier_srtt_ms.is_some())
 }
 
+#[cfg(test)]
 fn paths_have_sender_delivery_evidence(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],

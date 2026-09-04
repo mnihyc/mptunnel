@@ -80,6 +80,7 @@ where
         self.compact_expiries_if_needed();
     }
 
+    #[cfg(test)]
     pub(super) fn current(
         &mut self,
         flow: &IpPacketFlowKey,

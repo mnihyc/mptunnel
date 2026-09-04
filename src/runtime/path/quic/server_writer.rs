@@ -52,6 +52,7 @@ pub(super) async fn drain_one_server_udp_command_while_input_deferred(
             path_proofs.record_sent_frame(&frame);
             Ok(false)
         }
+        #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(_) => {
             commands.release_pending_command_bytes(pending_bytes);
             Err(RuntimeError::Protocol(
@@ -245,6 +246,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 }
                 continue;
             }
+            #[cfg(test)]
             ReliablePathCommand::SendTcpCapacityProbe(_) => {
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(

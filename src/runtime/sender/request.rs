@@ -85,6 +85,7 @@ impl RequestAfterFrameReservationHook {
 
 mod multipath;
 mod scheduling;
+#[cfg(test)]
 mod tcp_capacity;
 #[cfg(test)]
 #[path = "request/tests_test_support.rs"]

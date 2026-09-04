@@ -14,9 +14,13 @@ use crate::model::advisory_score::{
     DirectionalRoundTripTime, DirectionalTiming, DirectionalTimingEpoch,
     DirectionalTimingEpochIssuer, DirectionalTimingVariation,
 };
-use crate::model::capacity::{PathRateSample, RELIABLE_INITIAL_RTT, TcpCapacityProofCandidate};
+#[cfg(test)]
+use crate::model::capacity::TcpCapacityProofCandidate;
+use crate::model::capacity::{PathRateSample, RELIABLE_INITIAL_RTT};
 use crate::model::carrier_rate_authority::{CarrierRateAuthorityBasis, CarrierRateAuthorityStamp};
-use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
+#[cfg(test)]
+use crate::model::path::RelayPathInstance;
+use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::model::service_rate::DirectionalServiceRateScope;
 use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::protocol::{PathId, PathMetricDirection, PathUsage, UnderlayProtocol};
@@ -104,6 +108,7 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) carrier_rttvar_ms: Option<f64>,
     /// Coherent native-carrier timing for the current physical carrier.
     carrier_timing: Option<DirectionalTiming>,
+    #[cfg(test)]
     carrier_timing_epochs: DirectionalTimingEpochIssuer,
     pub(in crate::runtime) carrier_loss_rate: Option<f64>,
     pub(in crate::runtime) carrier_ecn_rate: Option<f64>,
@@ -180,11 +185,13 @@ pub(in crate::runtime) struct ClientPathEligibilityFingerprint {
 
 /// One lock-coherent carrier-authority view for request reconciliation.
 /// Controllers consume only exact transaction identities from this snapshot.
+#[cfg(test)]
 pub(in crate::runtime) struct RequestCapacityReconciliationView {
     pub(super) observed_at: Instant,
     pub(super) tcp_proofs: HashMap<RelayPathInstance, TcpCapacityProofCandidate>,
 }
 
+#[cfg(test)]
 impl RequestCapacityReconciliationView {
     pub(in crate::runtime) fn observed_at(&self) -> Instant {
         self.observed_at
@@ -250,6 +257,7 @@ impl Default for ClientPathHealthRecord {
             carrier_srtt_ms: None,
             carrier_rttvar_ms: None,
             carrier_timing: None,
+            #[cfg(test)]
             carrier_timing_epochs: DirectionalTimingEpochIssuer::default(),
             carrier_loss_rate: None,
             carrier_ecn_rate: None,
@@ -364,6 +372,7 @@ impl ClientPathHealthRecord {
         })
     }
 
+    #[cfg(test)]
     fn timing_from_durations(
         scope: DirectionalServiceRateScope,
         epoch: DirectionalTimingEpoch,
@@ -433,6 +442,7 @@ impl ClientPathHealthRecord {
         true
     }
 
+    #[cfg(test)]
     fn publish_carrier_timing_from_durations(
         &mut self,
         round_trip_time: Duration,
@@ -984,6 +994,7 @@ impl ClientPathHealthRecord {
             } else {
                 0
             },
+            #[cfg(test)]
             datagram_feedback_samples: if delivery_rate_fresh {
                 self.datagram_feedback_samples
             } else {
@@ -1555,6 +1566,7 @@ impl ClientPathHealthRecord {
         true
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_quic_path_metrics(
         &mut self,
         path_instance_id: CarrierPathInstanceId,

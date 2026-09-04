@@ -23,6 +23,7 @@ pub(crate) struct ResponsePathObservation {
     /// Exact native flight and unsent-queue counters were both observed.
     pub(crate) native_drain_observed: bool,
     /// Bytes removed from command queues but not yet handed to the carrier.
+    #[cfg(test)]
     pub(crate) writer_pending_bytes: u64,
     /// Exact connection-data bytes assigned to this path and awaiting Data ACK.
     pub(crate) original_data_in_flight_bytes: u64,

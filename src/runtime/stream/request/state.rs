@@ -44,6 +44,7 @@ impl RequestProductQualificationReceipt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum RequestAckClockOperation {
+    #[cfg(test)]
     Pending {
         reference: RelayPathInstance,
         candidate: RelayPathInstance,
@@ -57,7 +58,9 @@ pub(in crate::runtime) enum RequestAckClockOperation {
 impl RequestAckClockOperation {
     pub(in crate::runtime) fn candidate(self) -> RelayPathInstance {
         match self {
-            Self::Pending { candidate, .. } | Self::Owner { candidate, .. } => candidate,
+            #[cfg(test)]
+            Self::Pending { candidate, .. } => candidate,
+            Self::Owner { candidate, .. } => candidate,
         }
     }
 }
@@ -120,6 +123,7 @@ impl RequestPathState {
         self.product_qualification.qualified()
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn product_qualification_deficit_bytes(&self) -> Option<u64> {
         self.product_qualification.deficit_bytes()
     }
@@ -187,6 +191,7 @@ impl RequestPathState {
         self.tcp_capacity_proven
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_tcp_capacity_proven(&mut self) {
         self.tcp_capacity_proven = true;
     }
@@ -207,6 +212,7 @@ impl RequestPathState {
     ///
     /// Allocating a rate tracker or seeding its ACK boundary from an
     /// offset-free carrier receipt is bookkeeping, not Product provenance.
+    #[cfg(test)]
     pub(in crate::runtime) fn has_product_evidence(&self) -> bool {
         self.rate_evidence
             .as_ref()

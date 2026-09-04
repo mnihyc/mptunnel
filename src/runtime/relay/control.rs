@@ -400,6 +400,9 @@ fn reliable_relay_topology_lane(
     }
 }
 
+// Deferral owns the complete open result across an async control boundary;
+// boxing would add allocation to every deferred additional-path open.
+#[allow(clippy::large_enum_variant)]
 enum PendingLocalWritePathOpen {
     Applied(Option<ReliableRelayAttachMode>),
     Deferred(RelayAdditionalPathOpenResult),
@@ -421,8 +424,8 @@ fn drive_client_response_startup_control(
     if return_plan.is_done() {
         remotes.clear_return_plan_final();
     }
-    if response_startup_triggered {
-        if spawn_reliable_relay_response_startup_path_opens(
+    if response_startup_triggered
+        && spawn_reliable_relay_response_startup_path_opens(
             context,
             spec,
             return_plan,
@@ -430,9 +433,9 @@ fn drive_client_response_startup_control(
             stream_id,
             &mut state.recovery.pending_additional_path_opens,
             additional_path_open_tx,
-        )? {
-            state.progress.last_stream_at = Instant::now();
-        }
+        )?
+    {
+        state.progress.last_stream_at = Instant::now();
     }
     if let Some(retained_ordinals) = return_plan.prepare_final(remotes).map(ToOwned::to_owned) {
         remotes.publish_return_plan_final(&retained_ordinals)?;

@@ -16,7 +16,9 @@ const MILLIS_PER_SECOND: u64 = 1_000;
 const PORTABLE_STARTUP_PAYLOAD_BYTES: u64 = 14_600;
 const PORTABLE_STARTUP_RTT_MS: u64 = 333;
 const STREAM_DATA_PAYLOAD_FIELDS_BYTES: u64 = 8 + 8 + 4;
+#[cfg(test)]
 const IP_PACKET_PAYLOAD_FIELDS_BYTES: u64 = 8 + 8 + 4;
+#[cfg(test)]
 const DATAGRAM_DATA_PAYLOAD_FIELDS_BYTES: u64 = 8 + 8 + 4 + 4;
 
 /// Canonical pre-native Core overhead of one unsplit `STREAM_DATA` frame.
@@ -28,10 +30,12 @@ pub(crate) const NORMALIZED_STREAM_DATA_OVERHEAD_BYTES: u64 =
     crate::protocol::codec::FRAME_HEADER_LEN as u64 + STREAM_DATA_PAYLOAD_FIELDS_BYTES;
 
 /// Canonical pre-native Core overhead of one unsplit `IP_PACKET` frame.
+#[cfg(test)]
 pub(crate) const NORMALIZED_IP_PACKET_OVERHEAD_BYTES: u64 =
     crate::protocol::codec::FRAME_HEADER_LEN as u64 + IP_PACKET_PAYLOAD_FIELDS_BYTES;
 
 /// Canonical pre-native Core overhead of one unsplit `DATAGRAM_DATA` frame.
+#[cfg(test)]
 pub(crate) const NORMALIZED_DATAGRAM_DATA_OVERHEAD_BYTES: u64 =
     crate::protocol::codec::FRAME_HEADER_LEN as u64 + DATAGRAM_DATA_PAYLOAD_FIELDS_BYTES;
 
@@ -51,12 +55,6 @@ impl PositiveRateBps {
 
     pub(crate) const fn get(self) -> u64 {
         self.0.get()
-    }
-
-    pub(crate) fn checked_from_bits_per_second(
-        bits_per_second: u64,
-    ) -> Result<Self, ServiceRateModelError> {
-        Self::checked_new(bits_per_second)
     }
 }
 
@@ -178,10 +176,12 @@ impl DirectionalServiceRate {
         self.scope
     }
 
+    #[cfg(test)]
     pub(crate) const fn basis(self) -> ServiceRateBasis {
         self.basis
     }
 
+    #[cfg(test)]
     pub(crate) const fn value(self) -> ServiceRateValue {
         self.value
     }
@@ -216,10 +216,12 @@ impl QuinnBbr3NativeOperationalRate {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn scope(self) -> DirectionalServiceRateScope {
         self.scope
     }
 
+    #[cfg(test)]
     pub(crate) const fn rate(self) -> PositiveRateBps {
         self.rate
     }
@@ -236,11 +238,13 @@ impl NormalizedMppWorkBytes {
     }
 
     /// Returns the encoded Core work of one unsplit `IP_PACKET` action.
+    #[cfg(test)]
     pub(crate) fn checked_ip_packet(payload_bytes: u64) -> Result<Self, ServiceRateModelError> {
         Self::checked_data_action(payload_bytes, NORMALIZED_IP_PACKET_OVERHEAD_BYTES)
     }
 
     /// Returns the encoded Core work of one unsplit `DATAGRAM_DATA` action.
+    #[cfg(test)]
     pub(crate) fn checked_datagram_data(payload_bytes: u64) -> Result<Self, ServiceRateModelError> {
         Self::checked_data_action(payload_bytes, NORMALIZED_DATAGRAM_DATA_OVERHEAD_BYTES)
     }
@@ -277,7 +281,7 @@ fn checked_ceil_div(numerator: u64, denominator: u64) -> Result<u64, ServiceRate
         return Err(ServiceRateModelError::DivisionByZero);
     }
     let quotient = numerator / denominator;
-    if numerator % denominator == 0 {
+    if numerator.is_multiple_of(denominator) {
         Ok(quotient)
     } else {
         quotient

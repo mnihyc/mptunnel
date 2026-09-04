@@ -3492,8 +3492,10 @@ fn rejected_request_qualification_admission_installs_no_flight() {
     );
 
     let mut oversized = RequestMultipathController::new(stream_id);
-    let mut small_quantum = MuxLimits::default();
-    small_quantum.max_reliable_relay_chunk_bytes = 4;
+    let small_quantum = MuxLimits {
+        max_reliable_relay_chunk_bytes: 4,
+        ..MuxLimits::default()
+    };
     assert_eq!(
         oversized.record_original_frame_with_qualification(
             owner,

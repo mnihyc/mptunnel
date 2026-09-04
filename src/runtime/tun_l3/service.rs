@@ -768,6 +768,9 @@ enum ServerIpDispatchOutcome {
     Stale,
 }
 
+// Selection transfers the complete validated dispatch plan; boxing would add
+// allocation to the server datagram hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum ServerIpDispatchSelection {
     Selected(ServerIpDispatchPlan),
@@ -784,6 +787,9 @@ struct RankedServerIpDispatchPlan {
     plan: ServerIpDispatchPlan,
 }
 
+// Evaluation owns the ranked plan until the one-shot apply decision and stays
+// inline to avoid heap traffic per datagram.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum ServerIpCarrierEvaluation {
     Candidate(RankedServerIpDispatchPlan),

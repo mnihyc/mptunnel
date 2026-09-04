@@ -4,7 +4,7 @@
 //! operations under one health lock when admission must be race-free.
 
 use super::set::ClientPathContext;
-#[cfg(feature = "lab-diagnostics")]
+#[cfg(all(test, feature = "lab-diagnostics"))]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
     BulkPathCandidate, bulk_scheduling_horizon_bytes, bulk_striping_admitted_candidates,
@@ -23,12 +23,14 @@ use crate::runtime::path::model::{
     configured_order_path_indices, configured_order_path_scores,
     endpoint_only_reliable_startup_should_preserve_configured_order, health_observations,
     ordered_path_scores, ordered_path_scores_for_ttl, packet_path_snapshot,
-    path_allows_automatic_bulk_use, path_can_be_auto_discovered, path_is_endpoint_only,
-    path_metrics_from_snapshot, path_snapshot, path_startup_snapshot,
-    reliable_reservation_should_use_endpoint_only_startup_order, reliable_stream_path_candidates,
-    reliable_stream_startup_path_scores, udp_datagram_payload_limit_bytes,
-    udp_observation_has_datagram_feedback, udp_path_has_realtime_model,
-    udp_reliable_stream_loss_reinjection_penalty_ms,
+    path_can_be_auto_discovered, path_is_endpoint_only, path_metrics_from_snapshot, path_snapshot,
+    path_startup_snapshot, reliable_stream_path_candidates, reliable_stream_startup_path_scores,
+    udp_datagram_payload_limit_bytes, udp_observation_has_datagram_feedback,
+    udp_path_has_realtime_model, udp_reliable_stream_loss_reinjection_penalty_ms,
+};
+#[cfg(test)]
+use crate::runtime::path::model::{
+    path_allows_automatic_bulk_use, reliable_reservation_should_use_endpoint_only_startup_order,
 };
 use crate::runtime::path::state::RelayPathLoadLease;
 use crate::scheduler::{self, PathSnapshot, PathState as SchedulerPathState, TrafficClass};
@@ -58,6 +60,9 @@ pub(in crate::runtime) struct ReliableRequestPathEvidence {
 /// attachment must not borrow a stale health-cache shape while its own
 /// authority is between activation and coherent-shape publication.
 #[derive(Debug, Clone, Copy)]
+// Keeping the validated native snapshot inline preserves a copy-only apply
+// decision and avoids allocation in the path-selection ownership boundary.
+#[allow(clippy::large_enum_variant)]
 pub(in crate::runtime) enum ReliableRequestNativeShape {
     NotApplicable,
     Current(crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot),
@@ -214,6 +219,7 @@ impl ClientPathContext {
         });
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn relay_path_allows_automatic_bulk_use(
         &self,
         key: RelayPathKey,
@@ -225,6 +231,7 @@ impl ClientPathContext {
         .is_some_and(path_allows_automatic_bulk_use)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn automatic_bulk_path_count(
         &self,
         underlay: UnderlayProtocol,
@@ -338,6 +345,7 @@ impl ClientPathContext {
         ))
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn reserve_reliable_stream_path(
         &self,
         lane: TrafficClass,
@@ -1278,6 +1286,7 @@ impl ClientPathContext {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn relay_path_has_fresh_proof(
         &self,
         underlay: UnderlayProtocol,
@@ -1294,6 +1303,7 @@ impl ClientPathContext {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn relay_path_has_fresh_proof_as_of(
         &self,
         underlay: UnderlayProtocol,
@@ -1336,6 +1346,7 @@ impl ClientPathContext {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn relay_path_fresh_proof_acked_as_of(
         &self,
         underlay: UnderlayProtocol,
@@ -1355,6 +1366,7 @@ impl ClientPathContext {
             })
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn reliable_relay_has_latency_pressure(&self) -> bool {
         let now = Instant::now();
         let health = self.state.health().lock().expect("client path health lock");

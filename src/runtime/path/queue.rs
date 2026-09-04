@@ -1,7 +1,7 @@
 use super::authority::NativeCarrierRateAuthorityHandle;
-use super::commands::{
-    ReliablePathCommand, RequestTcpCapacityProbeRequest, TcpCapacityProbeCommand,
-};
+use super::commands::ReliablePathCommand;
+#[cfg(test)]
+use super::commands::{RequestTcpCapacityProbeRequest, TcpCapacityProbeCommand};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
@@ -9,6 +9,7 @@ use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{DatagramFlowId, Frame, ResetReason, StreamId};
 use crate::runtime::error::RuntimeError;
+#[cfg(test)]
 use crate::runtime::path::tcp::capacity::RequestTcpCapacityProbeLease;
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::scheduler::TrafficClass;
@@ -314,6 +315,7 @@ struct ReliablePathCommandQueueMetrics {
 #[derive(Debug, Default)]
 struct TcpCapacityProbeLeaseState {
     active: AtomicBool,
+    #[cfg(test)]
     attempts: AtomicU8,
 }
 
@@ -736,10 +738,12 @@ impl ReliablePathCommandQueueMetrics {
         self.pending_bytes.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     fn writer_pending_bytes(&self) -> u64 {
         self.writer_pending_bytes.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     fn try_reserve_tcp_capacity_probe(
         self: &Arc<Self>,
     ) -> Result<TcpCapacityProbeLease, RuntimeError> {
@@ -1315,6 +1319,7 @@ impl ReliablePathCommandSender {
     }
 
     /// Queues one client-to-server TCP carrier proof with no product offset.
+    #[cfg(test)]
     pub(in crate::runtime) fn try_enqueue_request_tcp_capacity_probe(
         &self,
         request: RequestTcpCapacityProbeRequest,
@@ -1585,6 +1590,7 @@ impl ReliablePathCommandSender {
     /// Bytes removed from the bounded queues but not yet released by the
     /// carrier writer. Queued fresh data is excluded because repair may still
     /// precede it in the priority queues.
+    #[cfg(test)]
     pub(in crate::runtime) fn writer_pending_bytes(&self) -> u64 {
         self.metrics.writer_pending_bytes()
     }
@@ -1687,11 +1693,12 @@ fn reliable_path_retirable_datagram_flow_id(frame: &Frame) -> Option<DatagramFlo
 
 fn reliable_path_command_requires_product_admission(command: &ReliablePathCommand) -> bool {
     match command {
+        #[cfg(test)]
+        ReliablePathCommand::SendTcpCapacityProbe(_) => true,
         ReliablePathCommand::PrepareConnection { .. }
         | ReliablePathCommand::OpenStream { .. }
         | ReliablePathCommand::OpenDatagramAttachment { .. }
-        | ReliablePathCommand::OpenDatagramFlow { .. }
-        | ReliablePathCommand::SendTcpCapacityProbe(_) => true,
+        | ReliablePathCommand::OpenDatagramFlow { .. } => true,
         ReliablePathCommand::SendDatagramFrame { frame, .. }
         | ReliablePathCommand::SendFrame(frame) => {
             reliable_path_frame_requires_product_admission(frame)
@@ -2103,6 +2110,7 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
         | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
             reliable_path_frame_pacing_bytes(frame)
         }
+        #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
             usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
         }
@@ -2130,6 +2138,7 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
         | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
             crate::protocol::codec::encoded_frame_capacity_hint(frame).max(1)
         }
+        #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
             usize::try_from(probe.train_payload_bytes)
                 .unwrap_or(usize::MAX)
@@ -2159,6 +2168,7 @@ fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> Option<Stre
         | ReliablePathCommand::OpenDatagramAttachment { .. }
         | ReliablePathCommand::OpenDatagramFlow { .. }
         | ReliablePathCommand::CloseDatagramAttachment { .. } => None,
+        #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(probe) => Some(probe.stream_id),
         ReliablePathCommand::PrepareConnection { .. } => None,
         ReliablePathCommand::OpenStream { stream_id, .. }
@@ -2195,6 +2205,7 @@ fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
         ReliablePathCommand::SendDatagramFrame { frame, .. } => reliable_path_frame_kind(frame),
         ReliablePathCommand::CloseDatagramAttachment { .. } => "close_datagram_attachment",
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),
+        #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(_) => "tcp_capacity_probe",
         ReliablePathCommand::ResetAndCloseStream { .. } => "reset_and_close_stream",
         ReliablePathCommand::CloseStream(_) => "close_stream",

@@ -207,6 +207,7 @@ impl ReliableRelaySenderQueue {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn push_reinjection(&mut self, frame: Frame) -> u64 {
         self.push_reinjection_with_cause(frame, RelaySendCause::AckGapReinjection)
     }

@@ -181,6 +181,7 @@ pub(crate) fn reliable_data_ack_gap_reinjection_deadline(
 /// carrier's RTO/PTO whenever an eligible alternate exists. The alternate's
 /// completion estimate decides whether it can win earlier; it cannot erase the
 /// exact owner fallback. Silence alone is not a RACK or QUIC loss declaration.
+#[cfg(test)]
 pub(crate) fn reliable_data_ack_recovery_deadline(
     original_assignment_at: Option<std::time::Instant>,
     underlay: Option<UnderlayProtocol>,

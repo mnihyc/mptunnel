@@ -19,11 +19,13 @@ const TCP_METRIC_MAX_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Exact same-socket sender queue used to establish a receipt-rate baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(in crate::runtime) struct TcpSenderQueueSnapshot {
     pub(in crate::runtime) bytes_in_flight: Option<u64>,
     pub(in crate::runtime) notsent_bytes: u32,
 }
 
+#[cfg(test)]
 impl TcpSenderQueueSnapshot {
     /// A completed writer flush is the portable fallback. When available, the
     /// native unsent queue proves that the timed train starts at a wire boundary.
@@ -301,6 +303,7 @@ impl TcpMetricPublisher {
     }
 
     /// Queries exact sender queues without advancing periodic metric cadence.
+    #[cfg(test)]
     pub(in crate::runtime) fn sender_queue_snapshot(&self) -> Option<TcpSenderQueueSnapshot> {
         let snapshot = self.socket.snapshot().ok().flatten()?;
         Some(TcpSenderQueueSnapshot {

@@ -11,7 +11,9 @@ use crate::model::capacity::{
 };
 use crate::model::path::RelayPathInstance;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, StreamId, UnderlayProtocol};
-use crate::runtime::path::commands::{CapacityProbeCommandResolution, CapacityProbeCommandTicket};
+#[cfg(test)]
+use crate::runtime::path::commands::CapacityProbeCommandResolution;
+use crate::runtime::path::commands::CapacityProbeCommandTicket;
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::path::state::{
@@ -35,20 +37,24 @@ impl RequestTcpCapacityProbeSession {
         }
     }
 
+    #[cfg(test)]
     fn remaining_bytes(&self, session_limit: u64) -> u64 {
         self.budget.remaining_bytes(session_limit)
     }
 
+    #[cfg(test)]
     fn candidate_share_bytes(&self, proposed_path_limit: u64, session_limit: u64) -> u64 {
         self.budget
             .effective_candidate_share_bytes(proposed_path_limit, session_limit)
     }
 
+    #[cfg(test)]
     fn path_remaining_bytes(&self, path_index: usize, path_limit: u64, session_limit: u64) -> u64 {
         self.budget
             .path_remaining_bytes(path_index, path_limit, session_limit)
     }
 
+    #[cfg(test)]
     fn try_reserve(
         &self,
         path_index: usize,
@@ -85,7 +91,9 @@ struct RequestTcpCapacityProbeReservation {
 
 #[derive(Debug, Clone, Copy)]
 struct RequestTcpCapacityProof {
+    #[cfg(test)]
     stream_id: StreamId,
+    #[cfg(test)]
     path_instance: RelayPathInstance,
     candidate: TcpCapacityProofCandidate,
 }
@@ -99,10 +107,12 @@ struct RequestTcpCapacityProofEvidence {
 }
 
 impl RequestTcpCapacityRecord {
+    #[cfg(test)]
     fn is_idle(&self) -> bool {
         self.reservation.is_none() && self.proof.is_none()
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn reserve(
         &mut self,
@@ -177,6 +187,7 @@ impl RequestTcpCapacityRecord {
             .map(|proof| proof.candidate)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path) fn exact_proof_candidate_at(
         &self,
         stream_id: StreamId,
@@ -242,7 +253,9 @@ impl RequestTcpCapacityRecord {
             return false;
         }
         self.proof = Some(RequestTcpCapacityProof {
+            #[cfg(test)]
             stream_id,
+            #[cfg(test)]
             path_instance,
             candidate,
         });
@@ -250,13 +263,11 @@ impl RequestTcpCapacityRecord {
     }
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestTcpCapacityProbeSpendState {
-    Reserved = 0,
-    Committed = 1,
-    Refund = 2,
-}
+#[cfg(test)]
+const REQUEST_TCP_CAPACITY_PROBE_RESERVED: u8 = 0;
+const REQUEST_TCP_CAPACITY_PROBE_COMMITTED: u8 = 1;
+#[cfg(test)]
+const REQUEST_TCP_CAPACITY_PROBE_REFUND: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct RequestTcpCapacityProbeLease {
@@ -275,31 +286,33 @@ struct RequestTcpCapacityProbeLeaseState {
 }
 
 impl RequestTcpCapacityProbeLease {
+    #[cfg(test)]
     pub(in crate::runtime) fn commit(&self) -> bool {
         match self.state.spend_state.compare_exchange(
-            RequestTcpCapacityProbeSpendState::Reserved as u8,
-            RequestTcpCapacityProbeSpendState::Committed as u8,
+            REQUEST_TCP_CAPACITY_PROBE_RESERVED,
+            REQUEST_TCP_CAPACITY_PROBE_COMMITTED,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             Ok(_) => true,
-            Err(state) => state == RequestTcpCapacityProbeSpendState::Committed as u8,
+            Err(state) => state == REQUEST_TCP_CAPACITY_PROBE_COMMITTED,
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn refund_if_unwritten(&self) {
         // A carrier that proves it wrote nothing returns the planning budget.
         // Refund is terminal so a later planner commit cannot reverse it.
-        self.state.spend_state.store(
-            RequestTcpCapacityProbeSpendState::Refund as u8,
-            Ordering::Release,
-        );
+        self.state
+            .spend_state
+            .store(REQUEST_TCP_CAPACITY_PROBE_REFUND, Ordering::Release);
     }
 
     pub(in crate::runtime) fn is_current(&self) -> bool {
         self.state.ticket.is_current()
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn is_published(&self) -> bool {
         self.state.ticket.resolution() == CapacityProbeCommandResolution::Published
     }
@@ -325,9 +338,7 @@ impl Drop for RequestTcpCapacityProbeLeaseState {
         {
             record.tcp_capacity.clear_token(self.token);
         }
-        if self.spend_state.load(Ordering::Acquire)
-            != RequestTcpCapacityProbeSpendState::Committed as u8
-        {
+        if self.spend_state.load(Ordering::Acquire) != REQUEST_TCP_CAPACITY_PROBE_COMMITTED {
             self.path_state
                 .request_tcp_capacity_probe_session()
                 .refund(self.path_index, self.bytes);
@@ -337,6 +348,7 @@ impl Drop for RequestTcpCapacityProbeLeaseState {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 pub(in crate::runtime) struct RequestTcpCapacityProofQuery {
     pub(in crate::runtime) target: RelayPathInstance,
     pub(in crate::runtime) token: u64,
@@ -379,6 +391,7 @@ impl ClientPathHealthRecord {
 }
 
 impl ClientPathState {
+    #[cfg(test)]
     pub(in crate::runtime::path) fn request_tcp_capacity_probe_remaining_bytes(
         &self,
         session_limit: u64,
@@ -387,6 +400,7 @@ impl ClientPathState {
             .remaining_bytes(session_limit)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path) fn request_tcp_capacity_probe_candidate_share_bytes(
         &self,
         proposed_path_limit: u64,
@@ -396,6 +410,7 @@ impl ClientPathState {
             .candidate_share_bytes(proposed_path_limit, session_limit)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path) fn request_tcp_capacity_probe_path_remaining_bytes(
         &self,
         path_index: usize,
@@ -406,6 +421,7 @@ impl ClientPathState {
             .path_remaining_bytes(path_index, path_limit, session_limit)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime::path) fn try_reserve_request_tcp_capacity_probe(
         self: &Arc<Self>,
@@ -469,7 +485,7 @@ impl ClientPathState {
                 path_index,
                 token,
                 bytes: train_bytes,
-                spend_state: AtomicU8::new(RequestTcpCapacityProbeSpendState::Reserved as u8),
+                spend_state: AtomicU8::new(REQUEST_TCP_CAPACITY_PROBE_RESERVED),
                 ticket,
             }),
         })

@@ -13,6 +13,7 @@ use super::scheduling::{
     choose_ordinary_bulk_relay_path_avoiding, request_ack_clock_measurement_for_ordinary_target,
     request_original_data_authority_snapshot,
 };
+#[cfg(test)]
 use super::tcp_capacity::{
     RequestTcpCapacityController, RequestTcpCapacityEvent, RequestTcpCapacityRetirement,
 };
@@ -26,11 +27,13 @@ use crate::model::admission::{
     BulkCandidatePosition, BulkOriginalDataAssignmentAuthority, ReliableDataAckFrontierState,
     bulk_original_data_assignment_authority,
 };
+#[cfg(test)]
+use crate::model::capacity::product_delivery_samples_override_startup_prior;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, ReliableOriginalDataOutput,
-    ReliableStreamSourceAdmission, product_delivery_samples_override_startup_prior,
-    reliable_bulk_product_windows, reliable_path_startup_sample_limit_bytes,
-    reliable_relay_buffer_len, reliable_stream_source_admission,
+    ReliableStreamSourceAdmission, reliable_bulk_product_windows,
+    reliable_path_startup_sample_limit_bytes, reliable_relay_buffer_len,
+    reliable_stream_source_admission,
 };
 use crate::model::carrier_rate_authority::{CarrierRateAuthorityScope, CarrierRateAuthorityStamp};
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
@@ -648,6 +651,7 @@ impl RequestMultipathPlan {
 pub(super) struct RequestMultipathController {
     stream_id: StreamId,
     request: RequestStreamState,
+    #[cfg(test)]
     tcp_capacity: RequestTcpCapacityController,
     next_send_index: usize,
 }
@@ -676,6 +680,7 @@ impl RequestMultipathController {
         Self {
             stream_id,
             request: RequestStreamState::default(),
+            #[cfg(test)]
             tcp_capacity: RequestTcpCapacityController::default(),
             next_send_index: 0,
         }
@@ -743,6 +748,7 @@ impl RequestMultipathController {
     /// revalidates current structural eligibility and Product W/P/E without
     /// installing a second sampled queue/flight gate.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn bulk_original_data_apply_authority(
         &self,
         context: &ClientPathContext,
@@ -862,6 +868,7 @@ impl RequestMultipathController {
         self.stream_id
     }
 
+    #[cfg(test)]
     pub(super) fn data_ack_gap_reinjection_model(
         &self,
         context: &ClientPathContext,
@@ -880,6 +887,7 @@ impl RequestMultipathController {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn data_ack_gap_reinjection_service_model(
         &self,
         context: &ClientPathContext,
@@ -1162,6 +1170,7 @@ impl RequestMultipathController {
     /// and the original owner no longer falls within the scheduler's adaptive
     /// lead hysteresis. This races a finite retained tail without withdrawing the
     /// live carrier or changing ordinary OriginalData placement.
+    #[cfg(test)]
     pub(super) fn tail_reinjection_earlier_completion_target(
         &self,
         context: &ClientPathContext,
@@ -1181,6 +1190,7 @@ impl RequestMultipathController {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn tail_reinjection_earlier_completion_service_target(
         &self,
         context: &ClientPathContext,
@@ -1204,6 +1214,7 @@ impl RequestMultipathController {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn tail_reinjection_earlier_completion_service_target_for_extent(
         &self,
         context: &ClientPathContext,
@@ -1318,6 +1329,7 @@ impl RequestMultipathController {
         }
     }
 
+    #[cfg(test)]
     fn tail_reinjection_earlier_completion_target_from_model(
         &self,
         context: &ClientPathContext,
@@ -1965,6 +1977,7 @@ impl RequestMultipathController {
         }
     }
 
+    #[cfg(test)]
     fn request_capacity_reference(
         &self,
         context: &ClientPathContext,
@@ -2400,6 +2413,7 @@ impl RequestMultipathController {
                     debug_assert!(false, "measurement owner changed before enqueue commit");
                     return;
                 }
+                #[cfg(test)]
                 if let Some(RequestAckClockOperation::Pending {
                     reference,
                     candidate: pending,
@@ -2500,8 +2514,12 @@ impl RequestMultipathController {
                 )
             })
             .is_some_and(|operation| {
-                let RequestAckClockOperation::Owner { target_bytes, .. } = operation else {
-                    unreachable!("filtered ACK-clock owner operation")
+                let target_bytes = match operation {
+                    RequestAckClockOperation::Owner { target_bytes, .. } => target_bytes,
+                    #[cfg(test)]
+                    RequestAckClockOperation::Pending { .. } => {
+                        unreachable!("filtered ACK-clock owner operation")
+                    }
                 };
                 self.request
                     .path_states
@@ -2519,6 +2537,7 @@ impl RequestMultipathController {
         if let Some(state) = self.request.path_states.get_existing_mut(target) {
             state.clear_tcp_capacity_proven();
         }
+        #[cfg(test)]
         self.tcp_capacity.remove(target);
         let product_transaction_preserved = preserve_committed_product
             && self.request_ack_clock_measurement_target_is_sealed(target);
@@ -2541,6 +2560,7 @@ impl RequestMultipathController {
         false
     }
 
+    #[cfg(test)]
     fn apply_request_tcp_capacity_event(&mut self, event: RequestTcpCapacityEvent) {
         match event {
             RequestTcpCapacityEvent::CarrierProofAccepted {
@@ -2651,33 +2671,39 @@ impl RequestMultipathController {
 
     fn reconcile_request_path_state(
         &mut self,
-        context: &ClientPathContext,
+        _context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
     ) {
         self.reconcile_request_attachment_membership(remotes);
-        let now = Instant::now();
-        let reconciliation = context.request_capacity_reconciliation_view(
-            self.stream_id,
-            self.tcp_capacity.proof_queries(),
-            now,
-        );
-        let committed_product_admissions = self
-            .tcp_capacity
-            .measurements
-            .keys()
-            .copied()
-            .filter(|target| {
-                self.request.path_states.get(*target).is_some_and(|state| {
-                    state.ack_clock_proven() && state.product_rate_epoch().is_some()
+        #[cfg(test)]
+        {
+            let now = Instant::now();
+            let reconciliation = _context.request_capacity_reconciliation_view(
+                self.stream_id,
+                self.tcp_capacity.proof_queries(),
+                now,
+            );
+            let committed_product_admissions = self
+                .tcp_capacity
+                .measurements
+                .keys()
+                .copied()
+                .filter(|target| {
+                    self.request.path_states.get(*target).is_some_and(|state| {
+                        state.ack_clock_proven() && state.product_rate_epoch().is_some()
+                    })
                 })
-            })
-            .collect::<HashSet<_>>();
-        let tcp_events =
-            self.tcp_capacity
-                .reconcile(&reconciliation, remotes, &committed_product_admissions);
-        for event in tcp_events {
-            self.apply_request_tcp_capacity_event(event);
+                .collect::<HashSet<_>>();
+            let tcp_events = self.tcp_capacity.reconcile(
+                &reconciliation,
+                remotes,
+                &committed_product_admissions,
+            );
+            for event in tcp_events {
+                self.apply_request_tcp_capacity_event(event);
+            }
         }
+        #[cfg(test)]
         if self.request.ack_clock_operation.is_some_and(|operation| {
             let RequestAckClockOperation::Pending {
                 reference,
@@ -2805,17 +2831,17 @@ impl RequestMultipathController {
                     .request
                     .requalification
                     .observe_unique_original_progress(release.instance, release.sent_at);
-            if release.kind.is_original_transmission() {
-                if let Some(qualification) = release.qualification {
-                    if product_evidence_eligible {
-                        self.request
-                            .path_states
-                            .release_exact_product_qualification(qualification, release.range);
-                    } else {
-                        self.request
-                            .path_states
-                            .release_ambiguous_product_qualification(qualification, release.range);
-                    }
+            if release.kind.is_original_transmission()
+                && let Some(qualification) = release.qualification
+            {
+                if product_evidence_eligible {
+                    self.request
+                        .path_states
+                        .release_exact_product_qualification(qualification, release.range);
+                } else {
+                    self.request
+                        .path_states
+                        .release_ambiguous_product_qualification(qualification, release.range);
                 }
             }
             if product_evidence_eligible {
@@ -2896,15 +2922,14 @@ impl RequestMultipathController {
                     .path_states
                     .get_mut(instance)
                     .rate_evidence_mut(first_sent_at);
-                let update = evidence.observe(
+                evidence.observe(
                     bytes,
                     first_sent_at,
                     latest_sent_at,
                     acked_at,
                     coverage_floor_bytes,
                     true,
-                );
-                update
+                )
             };
             if let RequestPathRateEvidenceUpdate::Proven {
                 sample,

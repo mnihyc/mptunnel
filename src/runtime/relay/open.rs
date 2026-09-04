@@ -187,6 +187,7 @@ pub(in crate::runtime) struct ReliableInitialOpenAttempt {
     load_lease: RelayPathLoadLease,
 }
 
+#[cfg(test)]
 pub(in crate::runtime) fn reserve_reliable_initial_open_attempt(
     context: &ClientPathContext,
     stream_id: StreamId,

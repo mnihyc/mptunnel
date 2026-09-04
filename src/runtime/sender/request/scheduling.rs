@@ -298,6 +298,7 @@ impl<'a> RequestSchedulingState<'a> {
     }
 }
 
+#[cfg(test)]
 fn observed_request_ack_clock_measurement_transaction(
     paths: &[RequestRelayPathObservation],
     reference_key: RelayPathKey,
@@ -534,6 +535,7 @@ fn request_ack_clock_measurement_start_suppression(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn choose_request_ack_clock_measurement_with_rates(
     observation: &RequestRelaySchedulingObservation,
     lane: TrafficClass,
@@ -1234,6 +1236,7 @@ fn choose_bulk_relay_path_with_mode(
     )
 }
 
+#[cfg(test)]
 pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     request: BulkRelayPathRequest<'_>,
 ) -> BulkRelayPathChoice {

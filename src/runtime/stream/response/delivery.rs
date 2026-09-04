@@ -273,14 +273,6 @@ impl ResponseStreamBinding {
         })
     }
 
-    pub(in crate::runtime) fn tail_reinjection_original_underlay(
-        &self,
-        ack_frontier: u64,
-    ) -> Option<UnderlayProtocol> {
-        self.data_ack_recovery_candidate(ack_frontier)
-            .map(|candidate| candidate.key.underlay)
-    }
-
     pub(in crate::runtime) fn data_ack_recovery_candidate(
         &self,
         ack_frontier: u64,
@@ -1263,6 +1255,8 @@ impl ResponseStreamBinding {
         )
     }
 
+    // Reinjection debt and expiry belong to the same atomic reservation handoff.
+    #[allow(clippy::too_many_arguments)]
     fn try_enqueue_reinjected_frame_for_target_with_after_reserve(
         &self,
         target: &ResponseDispatchTarget,

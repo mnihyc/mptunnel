@@ -4,10 +4,11 @@
 //! module owns its reservation, proof, and rollback transaction.
 
 use super::client_session::{ClientSessionLifecycle, ClientSessionRetirement};
+#[cfg(test)]
 use super::commands::CapacityProbeCommandTicket;
-use super::health::{
-    ClientPathHealth, ClientPathHealthRecord, RelayPathLoadOwner, RequestCapacityReconciliationView,
-};
+#[cfg(test)]
+use super::health::RequestCapacityReconciliationView;
+use super::health::{ClientPathHealth, ClientPathHealthRecord, RelayPathLoadOwner};
 #[cfg(test)]
 use super::model::PathDeliveryStats;
 use super::model::{
@@ -17,18 +18,21 @@ use super::model::{
 #[cfg(test)]
 use super::proof::PathProofObservation;
 use super::set::ClientPathContext;
-use super::tcp::capacity::{
-    RequestTcpCapacityProbeLease, RequestTcpCapacityProbeSession, RequestTcpCapacityProofQuery,
-};
+use super::tcp::capacity::RequestTcpCapacityProbeSession;
+#[cfg(test)]
+use super::tcp::capacity::{RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery};
 use super::tcp::group::{ClientTcpCarrierGroups, ClientTcpEndpointPolicy};
 #[cfg(test)]
 use super::*;
-use crate::model::capacity::{PathRateSample, reliable_capacity_measurement_session_limit_bytes};
+use crate::model::capacity::PathRateSample;
+#[cfg(test)]
+use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::model::timing::path_open_pto_multiplier;
 use crate::protocol::{DatagramFlowId, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::TrafficClass;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -585,6 +589,7 @@ impl ClientPathState {
 pub(in crate::runtime::path) struct RequestCapacityProbeBudget {
     spent_bytes: AtomicU64,
     path_spent_bytes: Box<[AtomicU64]>,
+    #[cfg(test)]
     candidate_share_bytes: AtomicU64,
 }
 
@@ -596,14 +601,17 @@ impl RequestCapacityProbeBudget {
                 .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            #[cfg(test)]
             candidate_share_bytes: AtomicU64::new(0),
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path) fn remaining_bytes(&self, limit: u64) -> u64 {
         limit.saturating_sub(self.spent_bytes.load(Ordering::Acquire))
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path) fn effective_candidate_share_bytes(
         &self,
         proposed_path_limit: u64,
@@ -617,6 +625,7 @@ impl RequestCapacityProbeBudget {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path) fn path_remaining_bytes(
         &self,
         path_index: usize,
@@ -635,6 +644,7 @@ impl RequestCapacityProbeBudget {
         path_limit.saturating_sub(spent.load(Ordering::Acquire))
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path) fn try_reserve(
         &self,
         path_index: usize,
@@ -694,10 +704,12 @@ impl RequestCapacityProbeBudget {
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct RequestCapacityProbeCampaignBudget {
     spent_bytes: AtomicU64,
+    #[cfg(test)]
     limit_bytes: AtomicU64,
 }
 
 impl RequestCapacityProbeCampaignBudget {
+    #[cfg(test)]
     pub(in crate::runtime) fn remaining_bytes(&self, proposed_limit: u64) -> u64 {
         let frozen_limit = self.limit_bytes.load(Ordering::Acquire);
         let limit = if frozen_limit == 0 {
@@ -708,6 +720,7 @@ impl RequestCapacityProbeCampaignBudget {
         limit.saturating_sub(self.spent_bytes.load(Ordering::Acquire))
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path) fn try_reserve(&self, bytes: u64, proposed_limit: u64) -> bool {
         if proposed_limit == 0 {
             return false;
@@ -898,12 +911,14 @@ impl ClientPathContext {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {
         self.state.request_tcp_capacity_probe_remaining_bytes(
             reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn request_tcp_capacity_probe_candidate_share_bytes(
         &self,
         proposed_path_limit: u64,
@@ -914,6 +929,7 @@ impl ClientPathContext {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn request_tcp_capacity_probe_path_remaining_bytes(
         &self,
         path_index: usize,
@@ -926,6 +942,7 @@ impl ClientPathContext {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn try_reserve_request_tcp_capacity_probe(
         &self,
@@ -957,6 +974,7 @@ impl ClientPathContext {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn request_capacity_reconciliation_view(
         &self,
         stream_id: StreamId,

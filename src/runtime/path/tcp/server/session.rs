@@ -712,6 +712,7 @@ impl ServerTcpPathSession {
                     .release_pending_command_bytes(pending_bytes);
                 Ok(ServerTcpSessionDisposition::Continue)
             }
+            #[cfg(test)]
             ReliablePathCommand::SendTcpCapacityProbe(probe) => {
                 drop(probe);
                 self.commands_rx
@@ -800,6 +801,7 @@ impl ServerTcpPathSession {
                     // next head after the exact commit boundary.
                     break;
                 }
+                #[cfg(test)]
                 ReliablePathCommand::SendTcpCapacityProbe(probe) => {
                     drop(probe);
                     self.commands_rx

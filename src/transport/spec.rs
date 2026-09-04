@@ -447,7 +447,7 @@ impl PathMetadata {
             u32::try_from(DEFAULT_QUIC_STARTUP_RTT_MS).expect("default QUIC startup RTT fits u32"),
         ))
         .max(1);
-        let window_bytes = (u128::from(rate_bps) * u128::from(rtt_ms) + 7_999) / 8_000;
+        let window_bytes = (u128::from(rate_bps) * u128::from(rtt_ms)).div_ceil(8_000);
         if pacing_bytes_per_second > MAX_EXACT_QUIC_PACING_BYTES_PER_SECOND
             || window_bytes > u128::from(u64::MAX)
         {

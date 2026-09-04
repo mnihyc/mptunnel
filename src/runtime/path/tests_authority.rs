@@ -269,7 +269,7 @@ fn scheduling_shape_uses_central_g_during_bounded_same_activation_publication_la
 fn scheduling_shape_rejects_same_lineage_from_a_different_activation() {
     let authority_scope = scope(73, PathMetricDirection::ClientToServer);
     let handle = authority(authority_scope, source(1, 11, Some(80)));
-    let _ = handle
+    handle
         .advance_transport_activation_for_test(2)
         .expect("transport installs A2");
 

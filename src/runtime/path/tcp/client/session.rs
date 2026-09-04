@@ -879,6 +879,7 @@ async fn handle_draining_client_tcp_command(
             commands.release_pending_command_bytes(pending_bytes);
             Ok(())
         }
+        #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
             probe.request_lease().refund_if_unwritten();
             commands.release_pending_command_bytes(pending_bytes);
@@ -1077,6 +1078,7 @@ fn reject_client_tcp_command_for_path_drain(command: ReliablePathCommand) {
                 let _ = response.send(Ok(()));
             }
         }
+        #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
             probe.request_lease().refund_if_unwritten();
         }
@@ -1336,6 +1338,7 @@ async fn handle_disconnected_client_tcp_command(
                 let _ = response.send(Ok(()));
             }
         }
+        #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(_) => {}
         ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::SendFrame(_)

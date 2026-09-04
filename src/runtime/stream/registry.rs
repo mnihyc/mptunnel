@@ -1113,6 +1113,9 @@ impl ServerReliableStreamRegistry {
         }
     }
 
+    // This implementation receives the complete authenticated carrier ownership
+    // envelope defined by ServerStreamPortBackend.
+    #[allow(clippy::too_many_arguments)]
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
@@ -1896,7 +1899,7 @@ impl ServerReliableStreamRegistry {
             return false;
         }
         let instance_key = (session_id, underlay, path_id, path_instance_id);
-        let changed = {
+        {
             let mut registered = self
                 .registered_path_instances
                 .lock()
@@ -1905,8 +1908,7 @@ impl ServerReliableStreamRegistry {
                 return false;
             };
             path.apply_authority.stage_native_scheduling_shape(shape)
-        };
-        changed
+        }
     }
 
     fn fanout_native_scheduling_shape(

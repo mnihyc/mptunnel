@@ -8,7 +8,7 @@ fn scope(carrier: u64, direction: PathMetricDirection) -> CarrierRateAuthoritySc
 }
 
 fn bps(rate: u64) -> CarrierRateBps {
-    CarrierRateBps::checked_from_bits_per_second(rate).expect("positive test rate")
+    CarrierRateBps::checked_new(rate).expect("positive test rate")
 }
 
 fn startup(authority_scope: CarrierRateAuthorityScope, rate: u64) -> DirectionalServiceRate {

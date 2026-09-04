@@ -34,6 +34,7 @@ pub(in crate::runtime) struct UdpPathMetrics {
     pub(in crate::runtime) direction: PathMetricDirection,
     pub(in crate::runtime) srtt: Duration,
     pub(in crate::runtime) rttvar: Duration,
+    #[cfg(test)]
     pub(in crate::runtime) rtt_observed: bool,
     pub(in crate::runtime) delivery_rate_bps: f64,
     pub(in crate::runtime) pacing_rate_bps: f64,

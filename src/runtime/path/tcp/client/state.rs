@@ -277,10 +277,12 @@ impl ClientTcpCapacityState {
             .map(|pending| pending.probe.request_lease().clone())
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path::tcp) fn has_pending_request(&self) -> bool {
         self.request_probe.is_some()
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::path::tcp) fn publish_request(
         &mut self,
         probe: TcpCapacityProbeCommand,

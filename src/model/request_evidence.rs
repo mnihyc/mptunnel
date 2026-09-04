@@ -156,6 +156,7 @@ impl RequestPathRateEvidence {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_exact_path_provenance(&self) -> bool {
         self.exact_attributed_bytes >= PATH_OPEN_SCORE_BYTES as u64
     }

@@ -28,10 +28,12 @@ pub(in crate::runtime) use carrier_inventory::{
     AuthenticatedCarrierAvailability, AuthenticatedCarrierInventory,
     AuthenticatedCarrierRegistration,
 };
+#[cfg(test)]
 pub(in crate::runtime) use commands::{CapacityProbeCommandTicket, RequestTcpCapacityProbeRequest};
+#[cfg(test)]
+pub(in crate::runtime) use health::RequestCapacityReconciliationView;
 pub(in crate::runtime) use health::{
     ClientPathHealth, ClientPathHealthRecord, ClientPathRateDiagnostics,
-    RequestCapacityReconciliationView,
 };
 pub(in crate::runtime) use model::{
     PacketPathAttachment, PacketPathSelectionInput, PathDeliveryStats, UdpPathCandidate,
@@ -59,10 +61,12 @@ pub(in crate::runtime) use server_context::{
     CredentialRetirementControl, ServerLocalPath, ServerPathContext,
 };
 pub(in crate::runtime) use set::{ClientPathContext, ClientPathRuntimeOptions};
+#[cfg(test)]
+pub(in crate::runtime) use state::RequestCapacityProbeCampaignBudget;
 pub(in crate::runtime) use state::{
     ClientPathState, ClientSessionProductFlowLease, RelayPathLoadLease,
-    RequestCapacityProbeCampaignBudget,
 };
+#[cfg(test)]
 pub(in crate::runtime) use tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery,
 };

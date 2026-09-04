@@ -14,6 +14,7 @@ pub(crate) mod multipath;
 pub(crate) mod path;
 pub(crate) mod product_qualification;
 pub(crate) mod requalification;
+#[cfg(test)]
 pub(crate) mod request_capacity;
 pub(crate) mod request_evidence;
 pub(crate) mod response;

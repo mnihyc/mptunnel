@@ -7,27 +7,34 @@ use super::super::capacity::{
     request_tcp_capacity_receipt_metrics, tcp_capacity_proof_validity,
     tcp_capacity_receipt_rate_bps,
 };
+#[cfg(test)]
 use super::super::io::EncryptedTcpWriter;
+#[cfg(test)]
 use super::super::metrics::{TcpMetricPublisher, TcpSenderQueueSnapshot};
-use super::state::{
-    ClientTcpCapacityProbeMeasurement, ClientTcpPathConnection, ClientTcpPathSessionRuntime,
-    ClientTcpRequestReceipt,
-};
+#[cfg(test)]
+use super::state::ClientTcpCapacityProbeMeasurement;
+use super::state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime, ClientTcpRequestReceipt};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::{TRANSPORT_TIMER_GRANULARITY, TcpCapacityProofCandidate};
+#[cfg(test)]
+use crate::model::capacity::TRANSPORT_TIMER_GRANULARITY;
+use crate::model::capacity::TcpCapacityProofCandidate;
 use crate::protocol::{Frame, PathMetricDirection, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
+#[cfg(test)]
 use crate::runtime::path::commands::TcpCapacityProbeCommand;
+#[cfg(test)]
 use bytes::Bytes;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(in crate::runtime::path::tcp) enum ClientTcpCapacityProbeWriteOutcome {
     NoWire,
     Measured(ClientTcpCapacityProbeMeasurement),
 }
 
+#[cfg(test)]
 pub(in crate::runtime::path::tcp) async fn client_write_tcp_capacity_probe(
     writer: &mut EncryptedTcpWriter,
     metrics: Option<&TcpMetricPublisher>,
@@ -120,6 +127,7 @@ pub(in crate::runtime::path::tcp) async fn client_write_tcp_capacity_probe(
     }
 }
 
+#[cfg(test)]
 async fn client_write_tcp_capacity_payload(
     writer: &mut EncryptedTcpWriter,
     probe: &TcpCapacityProbeCommand,
@@ -145,6 +153,7 @@ async fn client_write_tcp_capacity_payload(
     Ok(())
 }
 
+#[cfg(test)]
 async fn wait_for_client_tcp_write_queue_drain(
     metrics: Option<&TcpMetricPublisher>,
     expires_at: Instant,

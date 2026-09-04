@@ -138,7 +138,7 @@ pub(super) fn opened_test_relay_stream_with_native_source(
                 startup_metrics: None,
                 commands,
                 mux_limits: MuxLimits::default(),
-                frames: frame_rx.into(),
+                frames: frame_rx,
             },
             path_index,
             0,

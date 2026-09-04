@@ -749,6 +749,7 @@ impl ServerResponseSenderService {
         self.queue.push_final_control(frame)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn enqueue_reinjection_frame_with_priority(
         &mut self,
         frame: Frame,

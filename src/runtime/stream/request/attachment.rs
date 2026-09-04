@@ -124,6 +124,7 @@ impl ReliableRelayReturnPlan {
         self.trigger_bytes
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn candidate_tier(&self) -> PathUsage {
         self.candidate_tier
     }

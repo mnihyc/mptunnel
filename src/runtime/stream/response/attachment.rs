@@ -526,6 +526,7 @@ impl ResponseStreamBinding {
             .expect("test response attachment identity space")
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::stream) fn try_attach_output(
         &self,
         attachment: ResponseOutputAttachment,

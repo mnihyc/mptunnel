@@ -37,6 +37,7 @@ pub(crate) const QUIC_MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 pub(crate) const QUIC_PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
 pub(crate) const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
 pub(crate) const RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
+#[cfg(test)]
 pub(crate) const CAPACITY_TIMING_SLACK_BYTES: u64 = MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64;
 /// An attachment OPEN is acknowledged without granting another receive window.
 ///
@@ -542,6 +543,7 @@ pub(crate) fn reliable_bulk_carrier_feed_quantum_bytes(mux_limits: MuxLimits) ->
         .max(min_reliable_service_quantum_bytes(mux_limits))
 }
 
+#[cfg(test)]
 fn min_reliable_pipe_bytes(mux_limits: MuxLimits) -> usize {
     let cap = mux_limits.max_path_flight_bytes.max(1);
     (MIN_RELIABLE_PIPE_PACKETS * TRANSPORT_MSS_BYTES)
@@ -604,32 +606,7 @@ pub(crate) fn reliable_relay_scheduler_quantum_cap(
     reliable_relay_buffer_len(mux_limits).max(1)
 }
 
-fn reliable_lane_min_inflight_bytes(lane: TrafficClass, mux_limits: MuxLimits) -> usize {
-    let cap = mux_limits.max_path_flight_bytes.max(1);
-    let min_pipe = min_reliable_pipe_bytes(mux_limits);
-    let initial_window = PATH_OPEN_SCORE_BYTES.min(cap).max(min_pipe);
-    match lane {
-        TrafficClass::Control | TrafficClass::RealtimeDatagram => min_pipe,
-        TrafficClass::Latency => initial_window,
-        TrafficClass::Throughput => reliable_relay_buffer_len(mux_limits)
-            .max(initial_window)
-            .min(cap)
-            .max(1),
-    }
-}
-
-fn reliable_lane_startup_inflight_bytes(lane: TrafficClass, mux_limits: MuxLimits) -> usize {
-    let cap = mux_limits.max_path_flight_bytes.max(1);
-    let floor = reliable_lane_min_inflight_bytes(lane, mux_limits);
-    let target = data_level_service_window_bytes_for_model(
-        reliable_startup_bdp_bytes(),
-        reliable_startup_send_quantum_bytes() as f64,
-        min_reliable_pipe_bytes(mux_limits) as f64,
-        lane,
-    );
-    (target.ceil() as usize).clamp(floor.min(cap).max(1), cap)
-}
-
+#[cfg(test)]
 pub(crate) fn data_level_service_window_bytes(
     path: PathSnapshot,
     lane: TrafficClass,
@@ -641,6 +618,7 @@ pub(crate) fn data_level_service_window_bytes(
     data_level_service_window_bytes_for_model(bdp, send_quantum, min_pipe, lane)
 }
 
+#[cfg(test)]
 fn data_level_service_window_bytes_for_model(
     bdp: f64,
     send_quantum: f64,
@@ -658,16 +636,8 @@ fn data_level_service_window_bytes_for_model(
     }
 }
 
-fn reliable_startup_srtt_ms() -> f64 {
-    RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0
-}
-
 fn reliable_startup_rate_bps() -> f64 {
     PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
-}
-
-fn reliable_startup_bdp_bytes() -> f64 {
-    reliable_startup_rate_bps() / 8.0 * (reliable_startup_srtt_ms() / 1000.0)
 }
 
 fn reliable_startup_send_quantum_bytes() -> usize {

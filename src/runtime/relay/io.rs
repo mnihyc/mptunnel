@@ -163,6 +163,7 @@ pub(in crate::runtime) fn stream_ack_gap_reinjection_frames(
     }
 }
 
+#[cfg(test)]
 pub(in crate::runtime) fn stream_ack_gap_reinjection_frames_normalized(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
@@ -277,6 +278,7 @@ pub(in crate::runtime) fn exact_contiguous_retransmission_frames(
     (cursor == range.end).then_some(frames)
 }
 
+#[cfg(test)]
 pub(in crate::runtime) fn stream_final_offset_tail_reinjection_frames_normalized(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
@@ -477,6 +479,8 @@ impl<Candidate: Copy + Eq> ReliablePathStaleness<Candidate> {
 }
 
 impl ReliableAckGapReinjectionProgress {
+    // One observation must carry its full causal timing envelope atomically.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn observe_recovery_timing(
         &mut self,
         complete: bool,

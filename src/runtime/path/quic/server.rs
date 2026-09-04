@@ -405,7 +405,7 @@ async fn admit_server_udp_path(
         .await
         .map_err(|_| RuntimeError::Protocol("failed to bind server QUIC native rate authority"))?;
     let initial_native_shape = stage_current_server_native_scheduling_shape(
-        &context,
+        context,
         &path_registration,
         &native_authority,
         native_scope,

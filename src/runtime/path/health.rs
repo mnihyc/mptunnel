@@ -59,6 +59,8 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     native_authority_basis: Option<CarrierRateAuthorityBasis>,
     /// Non-expiring central C0/Bop projection for the live QUIC activation.
     native_authority_rate_bps: Option<f64>,
+    /// Complete activation-coherent typed C0/Bop and native transport shape.
+    native_scheduling_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
     /// Pacing belongs to the matching activation-local shape, not rate
     /// authority. It is retained only while `native_authority_stamp` is live.
     native_authority_pacing_rate_bps: Option<f64>,
@@ -206,6 +208,7 @@ impl Default for ClientPathHealthRecord {
             native_authority_stamp: None,
             native_authority_basis: None,
             native_authority_rate_bps: None,
+            native_scheduling_shape: None,
             native_authority_pacing_rate_bps: None,
             native_authority_inflight_limit_bytes: None,
             eligibility_epoch: Some(0),
@@ -802,6 +805,7 @@ impl ClientPathHealthRecord {
             state,
             manual_disabled: self.manual_disabled,
             wire_path_id: self.wire_path_id,
+            path_instance_id: self.path_instance_id,
             peer_usage: self.peer_usage,
             measured_srtt_ms: self.measured_srtt_ms,
             measured_jitter_ms: self.measured_jitter_ms,
@@ -858,11 +862,18 @@ impl ClientPathHealthRecord {
             carrier_loss_rate: self.carrier_loss_rate,
             carrier_ecn_rate: self.carrier_ecn_rate,
             carrier_delivery_rate_bps: proof_rate_bps
-                .or(self.native_authority_rate_bps)
+                .or_else(|| {
+                    (self.native_authority_basis
+                        == Some(CarrierRateAuthorityBasis::NativeOperational))
+                    .then_some(self.native_authority_rate_bps)
+                    .flatten()
+                })
                 .or(fresh_carrier_rate),
-            carrier_pacing_rate_bps: self
-                .native_authority_pacing_rate_bps
-                .or(fresh_carrier_pacing),
+            carrier_pacing_rate_bps: (self.native_authority_basis
+                == Some(CarrierRateAuthorityBasis::NativeOperational))
+            .then_some(self.native_authority_pacing_rate_bps)
+            .flatten()
+            .or(fresh_carrier_pacing),
             carrier_bytes_in_flight: self.carrier_bytes_in_flight,
             carrier_bytes_in_flight_observed: self.carrier_bytes_in_flight_observed,
             carrier_queue_bytes: self.carrier_queue_bytes,
@@ -899,6 +910,7 @@ impl ClientPathHealthRecord {
                 || (carrier_rate_fresh && self.carrier_ack_derived_data_seen),
             explicit_carrier_capacity_proof,
             native_carrier_authority_basis: self.native_authority_basis,
+            native_scheduling_shape: self.native_scheduling_shape,
             path_proof_success: self.path_proof_success,
         }
     }
@@ -1505,7 +1517,8 @@ impl ClientPathHealthRecord {
 
         self.native_authority_stamp = Some(shape.stamp());
         self.native_authority_basis = Some(shape.basis());
-        self.native_authority_rate_bps = Some(shape.rate_bps().max(1) as f64);
+        self.native_scheduling_shape = Some(shape);
+        self.native_authority_rate_bps = shape.finite_rate_bps().map(|rate| rate as f64);
         self.native_authority_pacing_rate_bps =
             shape.pacing_rate_bps().map(|rate| rate.max(1) as f64);
         self.native_authority_inflight_limit_bytes = Some(
@@ -1603,6 +1616,7 @@ impl ClientPathHealthRecord {
         self.native_authority_stamp = None;
         self.native_authority_basis = None;
         self.native_authority_rate_bps = None;
+        self.native_scheduling_shape = None;
         self.native_authority_pacing_rate_bps = None;
         self.native_authority_inflight_limit_bytes = None;
         self.carrier_srtt_ms = None;

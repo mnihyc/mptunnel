@@ -7,7 +7,7 @@ use crate::model::carrier_rate_authority::CarrierRateAuthorityBasis;
 use crate::model::work::CarrierWorkKind;
 use crate::protocol::{OffsetRange, PathId, UnderlayProtocol};
 use crate::runtime::path::commands::{
-    reliable_path_command_channels, try_recv_reliable_path_command,
+    ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
 };
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::TrafficClass;
@@ -490,13 +490,15 @@ fn committed_recovery_copy_survives_ordered_drain_until_exact_detach() {
 
 #[test]
 fn committed_response_copy_deadline_is_not_recomputed_from_later_path_timing() {
-    let (binding, owner, _owner_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
-    let copy = key(UnderlayProtocol::Udp, 61);
-    let (copy_commands, _copy_receivers) = reliable_path_command_channels(8);
+    let fixture = native_response_binding_fixture(8, Some(120_000_000));
+    let binding = fixture.binding.clone();
+    let copy = fixture.key;
+    let owner = key(UnderlayProtocol::Tcp, 61);
+    let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
     binding.attach(
-        copy.underlay,
-        copy.path_id,
-        copy_commands,
+        owner.underlay,
+        owner.path_id,
+        owner_commands,
         TrafficClass::Throughput,
     );
     let owner_identity = server_output_identity(&binding, owner);
@@ -565,7 +567,27 @@ fn committed_response_copy_deadline_is_not_recomputed_from_later_path_timing() {
         committed.retry_deadline,
         "later stale-owner timing cannot move an accepted copy's absolute deadline",
     );
-    binding.set_output_product_model_for_test(copy, 200_000_000.0, 5_000.0);
+    let later_shape = fixture
+        .authority
+        .refresh_scheduling_shape_for_test(
+            fixture.scope,
+            1,
+            7,
+            Some(120_000_000),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            2 * 1024 * 1024,
+            256 * 1024,
+            1_400,
+            Some(100_000_000),
+            false,
+        )
+        .expect("refresh the selected carrier's current Native timing");
+    assert!(binding.install_native_scheduling_shape_for_instance(
+        copy,
+        fixture.scope.carrier_instance_id(),
+        later_shape,
+    ));
     let later_snapshot = binding
         .sender_path_targets(TrafficClass::Throughput, 4096)
         .into_iter()
@@ -1115,6 +1137,37 @@ fn response_reinjection_revalidates_exact_k_after_carrier_reservation() {
 }
 
 #[test]
+fn udp_response_reinjection_without_native_authority_fails_closed() {
+    let (binding, output, mut receivers) = binding_for_underlay(UnderlayProtocol::Udp);
+    let target: ResponseDispatchTarget = binding
+        .sender_path_targets(TrafficClass::Throughput, 4_096)
+        .into_iter()
+        .find(|target| target.observation.key == output)
+        .expect("unfenced UDP is visible only to prove final rejection")
+        .into();
+    let frame = stream_data_frame_at(0, 4_096);
+
+    assert!(matches!(
+        binding.try_enqueue_reinjected_frame_for_target(
+            &target,
+            &frame,
+            TrafficClass::Throughput,
+            0,
+            4_096,
+            None,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert_eq!(
+        binding
+            .accepted_reinjected_data_in_flight_bytes_at(server_output_identity(&binding, output,)),
+        0,
+    );
+    assert!(binding.flight_outputs_overlapping_frame(&frame).is_empty());
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+}
+
+#[test]
 fn native_reinjection_final_precommit_rejects_stale_generation_after_real_reservation() {
     let mut fixture = native_response_binding_fixture(1, None);
     let target: ResponseDispatchTarget = fixture
@@ -1203,6 +1256,68 @@ fn native_reinjection_final_precommit_rejects_stale_generation_after_real_reserv
     assert!(fixture.commands.pending_bytes() > 0);
     drop(reservation);
     assert_eq!(fixture.commands.pending_bytes(), 0);
+}
+
+#[test]
+fn native_reinjection_final_precommit_uses_current_same_stamp_recovery_clock() {
+    let mut fixture = native_response_binding_fixture(1, Some(120_000_000));
+    let target: ResponseDispatchTarget = fixture
+        .binding
+        .sender_path_targets(TrafficClass::Throughput, 4_096)
+        .into_iter()
+        .find(|candidate| candidate.observation.key == fixture.key)
+        .expect("current fenced Native response target")
+        .into();
+    let expected_stamp = target
+        .native_authority_stamp
+        .expect("Native response target carries its exact stamp");
+    let frame = stream_data_frame_at(0, 4_096);
+    let before = Instant::now();
+
+    let deadline = fixture
+        .binding
+        .try_enqueue_reinjected_frame_for_target_with_after_reserve(
+            &target,
+            &frame,
+            TrafficClass::Throughput,
+            0,
+            4_096,
+            None,
+            || {
+                let refreshed = fixture
+                    .authority
+                    .refresh_scheduling_shape_for_test(
+                        fixture.scope,
+                        1,
+                        7,
+                        Some(120_000_000),
+                        Duration::from_secs(5),
+                        Duration::from_secs(1),
+                        2 * 1024 * 1024,
+                        256 * 1024,
+                        1_400,
+                        Some(100_000_000),
+                        false,
+                    )
+                    .expect("refresh only Quinn timing shape after reservation");
+                assert_eq!(refreshed.stamp(), expected_stamp);
+                assert_eq!(
+                    fixture.authority.stamp().expect("unchanged central stamp"),
+                    expected_stamp,
+                    "same-controller timing changes do not revise central G",
+                );
+            },
+        )
+        .expect("current same-stamp shape still permits reinjection");
+
+    assert!(
+        deadline.duration_since(before) >= Duration::from_secs(8),
+        "the committed repair clock must come from current 5s/1s Quinn timing",
+    );
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.receivers),
+        Some(ReliablePathCommand::SendFrame(received)) if received == frame
+    ));
 }
 
 #[test]

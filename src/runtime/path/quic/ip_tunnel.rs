@@ -28,6 +28,7 @@ pub(in crate::runtime) struct ClientUdpIpTunnelAttachment {
     retired: watch::Receiver<bool>,
     tunnel_id: IpTunnelId,
     path_instance_id: CarrierPathInstanceId,
+    native_rate_authority: Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>,
 }
 
 pub(in crate::runtime) enum ClientUdpIpTunnelOpenOutcome {
@@ -43,6 +44,12 @@ pub(in crate::runtime) enum ClientUdpIpTunnelOpenOutcome {
 impl ClientUdpIpTunnelAttachment {
     pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
         self.path_instance_id
+    }
+
+    pub(in crate::runtime) fn native_rate_authority(
+        &self,
+    ) -> Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle> {
+        self.native_rate_authority.clone()
     }
 
     pub(in crate::runtime) fn try_send(
@@ -131,6 +138,13 @@ pub(super) async fn open_client_udp_ip_tunnel(
         }
     }
     recv.enable_ip_packets()?;
+    let native_rate_authority =
+        carrier
+            .connection
+            .native_rate_authority()
+            .ok_or(RuntimeError::Protocol(
+                "client QUIC IP tunnel missing native rate authority",
+            ))?;
     runtime
         .ip_tunnels
         .route(crate::runtime::tun_l3::ClientIpTunnelEvent {
@@ -167,6 +181,7 @@ pub(super) async fn open_client_udp_ip_tunnel(
             retired: retired_rx,
             tunnel_id,
             path_instance_id: carrier.path_instance_id,
+            native_rate_authority,
         },
         start,
     })

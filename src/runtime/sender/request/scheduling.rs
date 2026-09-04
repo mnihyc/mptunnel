@@ -18,6 +18,7 @@ use crate::model::admission::{
     bulk_striping_admitted_candidates, original_data_assignment_has_product_headroom,
 };
 use crate::model::capacity::reliable_product_feedback_window_bytes;
+use crate::model::carrier_rate_authority::CarrierRateAuthorityStamp;
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
 use crate::model::request_evidence::RequestProductRateEpoch;
 use crate::mux::MuxLimits;
@@ -74,6 +75,8 @@ pub(super) struct RequestRelayPathObservation {
     pub(super) has_bulk_model_evidence: bool,
     pub(super) has_fresh_native_carrier_rate_evidence: bool,
     pub(super) fresh_proof: Option<RelayPathProofEpoch>,
+    pub(super) native_authority_stamp: Option<CarrierRateAuthorityStamp>,
+    pub(super) native_authority_unavailable: bool,
     pub(super) config_ordinal: usize,
     pub(super) member_ordinal: u16,
 }

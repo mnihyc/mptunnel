@@ -60,6 +60,28 @@ use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+struct RequestAfterFrameReservationHook(Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for RequestAfterFrameReservationHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("RequestAfterFrameReservationHook")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl RequestAfterFrameReservationHook {
+    fn run(&mut self) {
+        if let Some(hook) = self.0.take() {
+            hook();
+        }
+    }
+}
+
 mod multipath;
 mod scheduling;
 mod tcp_capacity;
@@ -186,6 +208,8 @@ pub(in crate::runtime) struct RequestSenderService {
     optional_reinjection: OptionalReinjectionLedger,
     live_owner_frontier_floor: LiveOwnerFrontierFloorEpoch,
     completion_tail_owner_fallback: LiveOwnerFallbackEpoch<RelayPathInstance>,
+    #[cfg(test)]
+    after_frame_reservation: RequestAfterFrameReservationHook,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -251,7 +275,17 @@ impl RequestSenderService {
             optional_reinjection: OptionalReinjectionLedger::default(),
             live_owner_frontier_floor: LiveOwnerFrontierFloorEpoch::default(),
             completion_tail_owner_fallback: LiveOwnerFallbackEpoch::default(),
+            #[cfg(test)]
+            after_frame_reservation: RequestAfterFrameReservationHook(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn set_after_frame_reservation_for_test(
+        &mut self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.after_frame_reservation = RequestAfterFrameReservationHook(Some(Box::new(hook)));
     }
 
     pub(in crate::runtime) fn completion_tail_owner_fallback_deadline(&self) -> Option<Instant> {
@@ -1080,16 +1114,19 @@ impl RequestSenderService {
                     None
                 };
             let path_count = remotes.paths.len();
-            // K freezes exact retained recovery work before native reservation.
-            // Forward bulk W/P/E is instead recomputed from current exact
-            // Product ownership after that reservation succeeds.
-            let reinjection_authority = cause.is_reinjection().then(|| {
-                self.multipath.request_reinjection_target_snapshot(
-                    context,
-                    remotes,
-                    &remotes.paths[position],
-                )
-            });
+            // TCP has no named Native shape adapter, so its existing exact
+            // target snapshot remains the immutable apply input. QUIC must
+            // instead rebuild this snapshot from the current shape supplied
+            // while its Native fence is held below.
+            let tcp_reinjection_authority = (cause.is_reinjection()
+                && instance.key.underlay == UnderlayProtocol::Tcp)
+                .then(|| {
+                    self.multipath.request_reinjection_target_snapshot(
+                        context,
+                        remotes,
+                        &remotes.paths[position],
+                    )
+                });
             // The reservation borrows this local clone rather than the remote
             // entry, leaving the complete exact output set observable during
             // the post-reservation Product transaction.
@@ -1115,39 +1152,13 @@ impl RequestSenderService {
                     cause.is_reinjection(),
                 ) {
                     Ok(command) => {
+                        #[cfg(test)]
+                        self.after_frame_reservation.run();
                         let bulk_original_apply =
                             plan.assigns_original_data() && selection_lane.is_bulk();
-                        if bulk_original_apply {
-                            let authority = self.multipath.bulk_original_data_apply_authority(
-                                context,
-                                remotes,
-                                &plan,
-                                &frame,
-                                selection_lane,
-                                frontier_state,
-                                request_load_claim.is_some(),
-                            );
-                            if authority.is_none_or(|authority| !authority.has_headroom()) {
-                                #[cfg(feature = "lab-diagnostics")]
-                                lab_diagnostic(
-                                    "request_product_admission",
-                                    format_args!(
-                                        "phase=exact_bulk_authority_exhausted stream_id={} underlay={:?} path_index={} instance_id={}",
-                                        self.multipath.stream_id().0,
-                                        instance.key.underlay,
-                                        instance.key.index,
-                                        instance.attachment_id,
-                                    ),
-                                );
-                                if plan.reject_failed_bulk_original_target(
-                                    selection_lane,
-                                    &mut rejected_bulk_original_targets,
-                                ) {
-                                    continue;
-                                }
-                                return Err(RuntimeError::SenderServiceBlocked);
-                            }
-                        } else if !plan.target_retains_exact_eligibility(context, selection_lane) {
+                        if !bulk_original_apply
+                            && !plan.target_retains_exact_eligibility(context, selection_lane)
+                        {
                             #[cfg(feature = "lab-diagnostics")]
                             lab_diagnostic(
                                 "request_path_apply",
@@ -1189,105 +1200,148 @@ impl RequestSenderService {
                             }
                             return Err(RuntimeError::SenderServiceBlocked);
                         }
-                        if cause.is_reinjection() {
-                            let Some(snapshot) = reinjection_authority.flatten() else {
-                                if plan.reject_failed_bulk_original_target(
-                                    selection_lane,
-                                    &mut rejected_bulk_original_targets,
-                                ) {
-                                    continue;
+                        // The exact Native stamp now guards the complete first
+                        // irreversible publication: Product flight, load
+                        // ownership, Product receipt/cursor, and carrier queue.
+                        // A stale stamp drops the still-local command and load
+                        // claim, then replans this same path without treating
+                        // the authority transition as a path failure.
+                        plan.commit_with_current_native_shape(&commands, |native_shape| {
+                            let reinjection_target_snapshot = if cause.is_reinjection() {
+                                match instance.key.underlay {
+                                    UnderlayProtocol::Udp => native_shape.and_then(|shape| {
+                                        self.multipath
+                                            .request_reinjection_target_snapshot_with_native_shape(
+                                                context, remotes, instance, shape,
+                                            )
+                                    }),
+                                    UnderlayProtocol::Tcp => {
+                                        tcp_reinjection_authority.flatten()
+                                    }
                                 }
-                                return Err(RuntimeError::SenderServiceBlocked);
+                            } else {
+                                None
                             };
-                            let queued_reinjection = reinjection_queue.map_or(0, |queue| {
-                                queue.request_target_queued_reinjection_bytes(instance, true)
-                            });
-                            let accepted_reinjection =
-                                self.multipath.accepted_reinjected_data_bytes(instance);
-                            let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-                            let exact_service = reliable_reinjection_service_limit_bytes(
-                                ReliableReinjectionTargetWork::new(
-                                    Some(snapshot),
-                                    queued_reinjection,
-                                    accepted_reinjection,
-                                ),
-                                payload_bytes,
-                                context.mux_limits,
-                            );
-                            if exact_service < payload_bytes {
+                            if cause.is_reinjection() {
+                                let Some(snapshot) = reinjection_target_snapshot else {
+                                    return Err(RequestFrameAdmissionError::ServiceBlocked);
+                                };
+                                let queued_reinjection = reinjection_queue.map_or(0, |queue| {
+                                    queue.request_target_queued_reinjection_bytes(instance, true)
+                                });
+                                let accepted_reinjection =
+                                    self.multipath.accepted_reinjected_data_bytes(instance);
+                                let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
+                                let exact_service = reliable_reinjection_service_limit_bytes(
+                                    ReliableReinjectionTargetWork::new(
+                                        Some(snapshot),
+                                        queued_reinjection,
+                                        accepted_reinjection,
+                                    ),
+                                    payload_bytes,
+                                    context.mux_limits,
+                                );
+                                if exact_service < payload_bytes {
+                                    #[cfg(feature = "lab-diagnostics")]
+                                    lab_diagnostic(
+                                        "request_reinjection_admission",
+                                        format_args!(
+                                            "phase=exact_target_exhausted stream_id={} underlay={:?} path_index={} instance_id={} payload_bytes={} service_bytes={}",
+                                            self.multipath.stream_id().0,
+                                            instance.key.underlay,
+                                            instance.key.index,
+                                            instance.attachment_id,
+                                            payload_bytes,
+                                            exact_service,
+                                        ),
+                                    );
+                                    return Err(RequestFrameAdmissionError::ServiceBlocked);
+                                }
+                            }
+                            if bulk_original_apply {
+                                let authority = self
+                                    .multipath
+                                    .bulk_original_data_apply_authority_with_native_shape(
+                                        context,
+                                        remotes,
+                                        &plan,
+                                        &frame,
+                                        selection_lane,
+                                        frontier_state,
+                                        request_load_claim.is_some(),
+                                        native_shape,
+                                    );
+                                if authority.is_none_or(|authority| !authority.has_headroom()) {
+                                    #[cfg(feature = "lab-diagnostics")]
+                                    lab_diagnostic(
+                                        "request_product_admission",
+                                        format_args!(
+                                            "phase=exact_bulk_authority_exhausted stream_id={} underlay={:?} path_index={} instance_id={}",
+                                            self.multipath.stream_id().0,
+                                            instance.key.underlay,
+                                            instance.key.index,
+                                            instance.attachment_id,
+                                        ),
+                                    );
+                                    return Err(RequestFrameAdmissionError::ServiceBlocked);
+                                }
+                            }
+                            let (payload_bytes, accepted_copy_deadline) = self
+                                .multipath
+                                .record_emitted_frame(
+                                    context,
+                                    instance,
+                                    &frame,
+                                    cause,
+                                    reinjection_target_snapshot,
+                                )
+                                .map_err(|_| RequestFrameAdmissionError::ServiceBlocked)?;
+                            if let Some(claim) = request_load_claim {
+                                let remote = &mut remotes.paths[position];
+                                // The exact path owns the lease after queue
+                                // reservation and before carrier publication;
+                                // path removal or relay cancellation releases it.
+                                assert!(
+                                    remote.load_lease.is_none(),
+                                    "conditionally claimed path load must remain unowned before transfer"
+                                );
+                                remote.load_lease = Some(claim);
                                 #[cfg(feature = "lab-diagnostics")]
                                 lab_diagnostic(
-                                    "request_reinjection_admission",
+                                    "request_startup_selection",
                                     format_args!(
-                                        "phase=exact_target_exhausted stream_id={} underlay={:?} path_index={} instance_id={} payload_bytes={} service_bytes={}",
+                                        "phase=claim_committed stream_id={} path_index={} instance_id={}",
                                         self.multipath.stream_id().0,
-                                        instance.key.underlay,
                                         instance.key.index,
                                         instance.attachment_id,
-                                        payload_bytes,
-                                        exact_service,
                                     ),
                                 );
-                                if plan.reject_failed_bulk_original_target(
-                                    selection_lane,
-                                    &mut rejected_bulk_original_targets,
-                                ) {
-                                    continue;
-                                }
-                                return Err(RuntimeError::SenderServiceBlocked);
                             }
-                        }
-                        // The reserved command and conditional load claim are
-                        // still locally owned here. A rejected qualification
-                        // admission therefore drops both without publishing a
-                        // flight or leaking scheduler demand.
-                        let (payload_bytes, accepted_copy_deadline) = match self
-                            .multipath
-                            .record_emitted_frame(context, instance, &frame, cause)
-                        {
-                            Ok(recorded) => recorded,
-                            Err(_) => {
-                                if plan.reject_failed_bulk_original_target(
-                                    selection_lane,
-                                    &mut rejected_bulk_original_targets,
-                                ) {
-                                    continue;
-                                }
-                                return Err(RuntimeError::SenderServiceBlocked);
-                            }
-                        };
-                        if let Some(claim) = request_load_claim {
-                            let remote = &mut remotes.paths[position];
-                            // The exact path owns the lease after queue
-                            // reservation and before carrier publication; path
-                            // removal or relay cancellation releases it.
-                            assert!(
-                                remote.load_lease.is_none(),
-                                "conditionally claimed path load must remain unowned before transfer"
+                            // Exact Product ownership and its receipt precede
+                            // the final queue publication under the same fence.
+                            self.multipath.commit_enqueued_request_product_send(
+                                context, &frame, &plan, position, path_count,
                             );
-                            remote.load_lease = Some(claim);
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "request_startup_selection",
-                                format_args!(
-                                    "phase=claim_committed stream_id={} path_index={} instance_id={}",
-                                    self.multipath.stream_id().0,
-                                    instance.key.index,
-                                    instance.attachment_id,
-                                ),
-                            );
-                        }
-                        // Exact Product ownership and its receipt now precede
-                        // every remaining infallible mutation and carrier
-                        // publication.
-                        self.multipath.commit_enqueued_request_product_send(
-                            context, &frame, &plan, position, path_count,
-                        );
-                        command.commit();
-                        Ok((payload_bytes, accepted_copy_deadline))
+                            command.commit();
+                            Ok((payload_bytes, accepted_copy_deadline))
+                        })
                     }
-                    Err(error) => Err(error),
+                    Err(error) => Some(Err(error)),
                 }
+            };
+            let Some(publish_result) = publish_result else {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "request_native_authority",
+                    format_args!(
+                        "phase=apply_stale stream_id={} underlay={:?} path_index={} instance_id={}",
+                        self.multipath.stream_id().0,
+                        instance.key.underlay,
+                        instance.key.index,
+                        instance.attachment_id,
+                    ),
+                );
+                continue;
             };
             match publish_result {
                 Ok((payload_bytes, accepted_copy_deadline)) => {

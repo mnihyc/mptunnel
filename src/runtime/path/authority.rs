@@ -7,11 +7,12 @@
 use crate::model::carrier_rate_authority::{
     CarrierRateAuthorityBasis, CarrierRateAuthorityError, CarrierRateAuthorityMode,
     CarrierRateAuthorityScope, CarrierRateAuthoritySnapshot, CarrierRateAuthorityStamp,
-    CarrierRateAuthorityTransition, CarrierRateBps, NativeCarrierRateAuthority,
-    NativeCarrierRateInputError, NativeCarrierRatePublicationTicket,
-    NativeCarrierRateSourceSnapshot, NativeCarrierTransportCurrent,
-    NativeCarrierTransportExhaustion,
+    CarrierRateAuthorityTransition, NativeCarrierRateAuthority, NativeCarrierRateInputError,
+    NativeCarrierRatePublicationTicket, NativeCarrierRateSourceSnapshot,
+    NativeCarrierTransportCurrent, NativeCarrierTransportExhaustion,
 };
+use crate::model::service_rate::{DirectionalServiceRate, ServiceRateModelError};
+use crate::transport::RateHint;
 use crate::transport::quic::{
     NativeControllerAuthoritySnapshot, NativeControllerObservationKind,
     NativeControllerShapeSnapshot,
@@ -37,6 +38,7 @@ pub(in crate::runtime) enum NativeCarrierRateAuthorityRuntimeError {
     SchedulingShapeUnavailable,
     MalformedTransportSource,
     Input(NativeCarrierRateInputError),
+    Startup(ServiceRateModelError),
     Authority(CarrierRateAuthorityError),
     BindingScopeMismatch {
         existing: CarrierRateAuthorityScope,
@@ -73,6 +75,12 @@ impl From<NativeCarrierRateInputError> for NativeCarrierRateAuthorityRuntimeErro
 impl From<CarrierRateAuthorityError> for NativeCarrierRateAuthorityRuntimeError {
     fn from(error: CarrierRateAuthorityError) -> Self {
         Self::Authority(error)
+    }
+}
+
+impl From<ServiceRateModelError> for NativeCarrierRateAuthorityRuntimeError {
+    fn from(error: ServiceRateModelError) -> Self {
+        Self::Startup(error)
     }
 }
 
@@ -123,8 +131,14 @@ impl NativeCarrierRateDecisionSnapshot {
         self.snapshot.stamp()
     }
 
-    pub(in crate::runtime) fn rate_bps(self) -> u64 {
-        self.snapshot.rate().as_u64()
+    pub(in crate::runtime) fn service_rate(self) -> DirectionalServiceRate {
+        self.snapshot
+            .service_rate()
+            .expect("runtime decision snapshots are restricted to Native mode")
+    }
+
+    pub(in crate::runtime) fn finite_rate_bps(self) -> Option<u64> {
+        self.snapshot.finite_rate_bps()
     }
 
     pub(in crate::runtime) fn basis(self) -> CarrierRateAuthorityBasis {
@@ -141,8 +155,12 @@ impl NativeCarrierSchedulingShapeSnapshot {
         self.decision.stamp()
     }
 
-    pub(in crate::runtime) fn rate_bps(self) -> u64 {
-        self.decision.rate_bps()
+    pub(in crate::runtime) fn service_rate(self) -> DirectionalServiceRate {
+        self.decision.service_rate()
+    }
+
+    pub(in crate::runtime) fn finite_rate_bps(self) -> Option<u64> {
+        self.decision.finite_rate_bps()
     }
 
     pub(in crate::runtime) fn basis(self) -> CarrierRateAuthorityBasis {
@@ -567,11 +585,10 @@ impl NativeCarrierRateAuthorityHandle {
     /// connection has released its state lock.
     pub(in crate::runtime) fn construct(
         scope: CarrierRateAuthorityScope,
-        startup_prior_bps: u64,
+        startup_hint: RateHint,
         connection: crate::transport::quic::Connection,
     ) -> Result<Arc<Self>, NativeCarrierRateAuthorityRuntimeError> {
-        let startup_prior = CarrierRateBps::checked_from_bits_per_second(startup_prior_bps)
-            .map_err(NativeCarrierRateInputError::OperationalRate)?;
+        let startup = DirectionalServiceRate::from_startup_hint(scope, startup_hint)?;
         let transport = NativeCarrierRateTransportSource::from_connection(connection);
         let bound_shape = transport.capture_shape()?;
         transport.require_shape_owner(&bound_shape)?;
@@ -580,9 +597,8 @@ impl NativeCarrierRateAuthorityHandle {
         let checked_source = source.checked_source(scope)?;
         let (coordinator, scheduling_shape) = transport.with_current(|state| match state {
             NativeCarrierTransportFenceState::Live(current) if current == source.activation => {
-                let coordinator =
-                    NativeCarrierRateAuthority::new(scope, startup_prior, checked_source)
-                        .map_err(NativeCarrierRateAuthorityRuntimeError::from)?;
+                let coordinator = NativeCarrierRateAuthority::new(scope, startup, checked_source)
+                    .map_err(NativeCarrierRateAuthorityRuntimeError::from)?;
                 let scheduling_shape =
                     ValidatedNativeCarrierShape::from_coherent(coordinator.stamp(), shape);
                 Ok((coordinator, scheduling_shape))
@@ -1029,14 +1045,13 @@ impl NativeCarrierRateAuthorityHandle {
     #[cfg(test)]
     fn new_for_test(
         scope: CarrierRateAuthorityScope,
-        startup_prior_bps: u64,
+        startup_hint: RateHint,
         initial: CoherentNativeCarrierSource,
     ) -> Result<Arc<Self>, NativeCarrierRateAuthorityRuntimeError> {
-        let startup_prior = CarrierRateBps::checked_from_bits_per_second(startup_prior_bps)
-            .map_err(NativeCarrierRateInputError::OperationalRate)?;
+        let startup = DirectionalServiceRate::from_startup_hint(scope, startup_hint)?;
         let transport = NativeCarrierRateTransportSource::for_test(initial.activation);
         let coordinator =
-            NativeCarrierRateAuthority::new(scope, startup_prior, initial.checked_source(scope)?)?;
+            NativeCarrierRateAuthority::new(scope, startup, initial.checked_source(scope)?)?;
         let scheduling_shape = ValidatedNativeCarrierShape::from_coherent(
             coordinator.stamp(),
             CoherentNativeCarrierShape {
@@ -1069,7 +1084,26 @@ impl NativeCarrierRateAuthorityHandle {
     ) -> Result<Arc<Self>, NativeCarrierRateAuthorityRuntimeError> {
         Self::new_for_test(
             scope,
-            startup_prior_bps,
+            RateHint::BitsPerSecond(startup_prior_bps),
+            CoherentNativeCarrierSource::checked_for_test(
+                activation,
+                controller,
+                operational_rate_bps,
+            )?,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn from_startup_hint_for_test(
+        scope: CarrierRateAuthorityScope,
+        startup_hint: RateHint,
+        activation: u64,
+        controller: u64,
+        operational_rate_bps: Option<u128>,
+    ) -> Result<Arc<Self>, NativeCarrierRateAuthorityRuntimeError> {
+        Self::new_for_test(
+            scope,
+            startup_hint,
             CoherentNativeCarrierSource::checked_for_test(
                 activation,
                 controller,

@@ -116,6 +116,29 @@ where
         Some(binding.carrier)
     }
 
+    /// Commit activity only after a packet was accepted by the carrier.
+    ///
+    /// The preceding `planned_current` read is advisory. A blocked, stale, or
+    /// retired send must not extend affinity or recent-load ownership.
+    pub(super) fn commit_planned_current(
+        &mut self,
+        flow: &IpPacketFlowKey,
+        carrier: C,
+        now: Instant,
+    ) -> bool {
+        self.expire(now);
+        let Some(binding) = self.bindings.get_mut(flow) else {
+            return false;
+        };
+        if binding.carrier != carrier
+            || now.saturating_duration_since(binding.last_packet_at) >= binding.flowlet_timeout
+        {
+            return false;
+        }
+        binding.last_packet_at = now;
+        true
+    }
+
     pub(super) fn active_load_for(&self, carrier: C, excluding: &IpPacketFlowKey) -> u32 {
         self.load
             .get(&carrier)

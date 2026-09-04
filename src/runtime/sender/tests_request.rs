@@ -1061,12 +1061,18 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
     let (target_commands, mut target_receivers) = reliable_path_command_channels(1);
     let target_commands_for_fill = target_commands.clone();
     assert_eq!(
-        remotes.attach(opened_test_relay_stream_with_underlay(
-            stream_id,
-            UnderlayProtocol::Udp,
-            0,
-            target_commands,
-        )),
+        remotes.attach(
+            opened_test_relay_stream_with_native_source(
+                stream_id,
+                UnderlayProtocol::Udp,
+                0,
+                target_commands,
+                crate::transport::RateHint::BitsPerSecond(500_000_000),
+                1,
+                None,
+            )
+            .0,
+        ),
         ReliableRelayAttachOutcome::Attached,
     );
     consume_client_path_proof_for_test(&mut target_receivers);
@@ -1395,12 +1401,18 @@ async fn completion_tail_uses_cache_independent_common_extent_for_target_and_app
     let owner = remotes.paths[0].instance();
     let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
     assert_eq!(
-        remotes.attach(opened_test_relay_stream_with_underlay(
-            stream_id,
-            UnderlayProtocol::Udp,
-            0,
-            target_commands,
-        )),
+        remotes.attach(
+            opened_test_relay_stream_with_native_source(
+                stream_id,
+                UnderlayProtocol::Udp,
+                0,
+                target_commands,
+                crate::transport::RateHint::BitsPerSecond(500_000_000),
+                1,
+                None,
+            )
+            .0,
+        ),
         ReliableRelayAttachOutcome::Attached,
     );
     consume_client_path_proof_for_test(&mut target_receivers);

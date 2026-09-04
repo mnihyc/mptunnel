@@ -1,7 +1,9 @@
 # T02 directional scheduling-rate authority
 
-Status: symbolic design checkpoint. This document fixes the model boundary for
-T02 before production code changes. It is not a release-acceptance claim.
+Status: implementation checkpoint complete. The typed projection and exact
+publication fences are locally GREEN, but this checkpoint is not deployable or
+a release-acceptance claim until T03 consumes nonnumeric `Unlimited` directly
+and T04 removes inferred-rate admission coupling.
 
 ## Decision
 
@@ -231,3 +233,81 @@ adapter for a separately declared future profile. The draft therefore crossed
 from auditing existing authority into inventing a new one. This correction is
 made before production code or REDs were written; no TCP runtime behavior was
 changed by the rejected proposal.
+
+## Implementation outcome
+
+The runtime now carries `DirectionalServiceRate` alongside every production
+request, fixed response, switchable response, and L3 scheduling projection.
+The value binds one carrier instance and original-sender direction, preserves
+finite `u64` identity, represents `UnlimitedStartup` without a sentinel, and
+allows only the named Quinn BBR3 native source to replace startup. Product,
+`PATH_CAPACITY`, peer/generic measurements, and TCP kernel telemetry remain
+separate diagnostics.
+
+QUIC planning is advisory. Its final request, fixed-response,
+switchable-response, client-L3, and server-L3 ownership transfers now execute
+under the exact Native activation/stamp fence and consume the current full
+shape returned inside that fence. This distinction is required because Quinn
+RTT, RTT variance, congestion window, flight, pacing, and application-limited
+state can change without advancing central generation `G`. TCP has no named
+NativeOperational adapter and retains its immutable startup basis and existing
+non-native commit path.
+
+`PATH_METRICS` no longer serializes endpoint-local configured or Unlimited
+startup policy. With no independent observed diagnostic it emits the public
+portable C0 placeholder, `351472`, together with `rate_observed=false` and zero
+validity. A real observed diagnostic remains visible, and a true
+NativeOperational diagnostic remains distinguishable without fabricating an
+ACK epoch.
+
+## Foreseen oversights closed before checkpoint
+
+The final integration audit found and closed these defects inside the same T02
+authority transaction:
+
+1. A lazy request observation acquired Native authority while holding the
+   health lock, reversing the publisher's Native-to-health order. Native
+   shapes are now materialized before health observation.
+2. Request, response, and client-L3 apply initially checked only the central
+   stamp or retained a planning-time shape. Same-stamp Quinn timing/window
+   changes could therefore authorize stale Product ownership or freeze a stale
+   recovery clock. All affected publication paths now use the closure-provided
+   current shape before their first irreversible mutation.
+3. Client-L3 advisory flow lookup refreshed activity before carrier
+   acceptance. Activity is now committed only after the planned send is
+   accepted.
+4. Legacy UDP request fixtures treated missing Native authority as
+   `NotApplicable` and permitted an authority-less commit. The test-only
+   escapes were removed; UDP fixtures now carry the exact production authority
+   their premise declares, while missing-authority UDP fails closed in every
+   build.
+5. The first no-observation `PATH_METRICS` correction covered the generic
+   serializer but missed StartupPrior cached through QUIC health. The producer
+   is now basis-gated: only NativeOperational can supply that native wire
+   diagnostic.
+
+An audit hypothesis that native authority and a separate TCP capacity proof
+could coexist on one production carrier was rejected after producer tracing:
+the state is unreachable, so no fallback or provenance branch was added.
+Bound-affinity reselection and per-congestion-window packet admission were also
+rejected from T02 because they change policy rather than rate authority; their
+existing owner transactions remain assigned to T04 or later.
+
+## Focused GREEN evidence
+
+- typed rate/work model: 7/7;
+- central carrier-rate reducer: 19/19;
+- runtime Native authority: 20/20;
+- complete T02 filter: 11/11;
+- health and wire-diagnostic projection: 29/29;
+- request multipath and outer request: 63/63 and 26/26;
+- fixed response, switchable original commit, and response delivery: 27/27,
+  12/12, and 32/32;
+- client L3 and server L3 Native transaction: 3/3 and 13/13; and
+- `cargo check --lib`, formatting, and diff checks: GREEN.
+
+The response snapshot module is 33/35 only because the two exact Product
+confidence/rate-floor failures frozen for T12 remain unchanged. T02 introduces
+no new failure there. T02 must still be followed immediately by T03: the
+legacy scalar scorer cannot represent `UnlimitedStartup`, so this typed
+projection checkpoint is deliberately not a standalone runtime candidate.

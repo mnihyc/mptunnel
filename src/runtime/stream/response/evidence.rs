@@ -224,7 +224,6 @@ pub(super) fn server_output_has_bulk_rate_evidence_at(
             let scope = shape.stamp().scope();
             scope.carrier_instance_id() == entry.path_instance_id
                 && scope.direction() == PathMetricDirection::ServerToClient
-                && shape.rate_bps() > 0
         });
     }
     let has_local_carrier_sample = server_output_local_path_metrics(entry)

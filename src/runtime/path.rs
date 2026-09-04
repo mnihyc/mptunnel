@@ -52,7 +52,9 @@ pub(in crate::runtime) use ports::{
 };
 #[cfg(test)]
 pub(super) use proof::*;
-pub(in crate::runtime) use selection::ReliableRequestTcpPathEvidence;
+pub(in crate::runtime) use selection::{
+    ReliableRequestNativeShape, ReliableRequestTcpPathEvidence,
+};
 pub(in crate::runtime) use server_context::{
     CredentialRetirementControl, ServerLocalPath, ServerPathContext,
 };

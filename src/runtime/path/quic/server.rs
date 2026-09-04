@@ -400,7 +400,7 @@ async fn admit_server_udp_path(
         PathMetricDirection::ServerToClient,
     );
     let native_authority = connection
-        .bind_native_rate_authority(native_scope, local_metrics.delivery_rate_bps)
+        .bind_native_rate_authority(native_scope, local_path.startup_rate_prior())
         .await
         .map_err(|_| RuntimeError::Protocol("failed to bind server QUIC native rate authority"))?;
     let initial_native_shape = stage_current_server_native_scheduling_shape(

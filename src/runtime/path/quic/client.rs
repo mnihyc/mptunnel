@@ -31,7 +31,7 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_command_channels;
-use crate::runtime::path::model::{path_startup_metrics, path_startup_snapshot};
+use crate::runtime::path::model::{path_startup_snapshot, path_startup_snapshot_for_instance};
 use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::state::ClientPathState;
 use crate::runtime::peer_status::{
@@ -1316,17 +1316,13 @@ async fn connect_client_udp_path(
             };
         let path_instance_id =
             try_next_carrier_path_instance_id().ok_or(RuntimeError::ExactIdentityExhausted)?;
-        let path_id = PathId(runtime.path_index as u16);
-        let startup_prior_bps =
-            path_startup_metrics(runtime.path(), path_id, PathMetricDirection::ClientToServer)
-                .delivery_rate_bps;
         connection
             .bind_native_rate_authority(
                 crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
                     path_instance_id,
                     PathMetricDirection::ClientToServer,
                 ),
-                startup_prior_bps,
+                runtime.path().metadata.initial_rate,
             )
             .await
             .map_err(|_| {
@@ -1676,7 +1672,12 @@ async fn open_client_udp_stream_on_connection(
         receivers,
         frames_tx,
     ));
-    let mut startup = path_startup_snapshot(runtime.path(), PathId(runtime.path_index as u16));
+    let mut startup = path_startup_snapshot_for_instance(
+        runtime.path(),
+        PathId(runtime.path_index as u16),
+        carrier.path_instance_id,
+        PathMetricDirection::ClientToServer,
+    );
     startup.peer_usage = runtime
         .state
         .peer_path_usage(UnderlayProtocol::Udp, runtime.path_index);

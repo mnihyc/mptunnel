@@ -9,7 +9,7 @@ use super::super::test_support::{
 use crate::model::admission::{BulkCandidatePosition, bulk_original_data_assignment_authority};
 use crate::model::capacity::{
     RELIABLE_INITIAL_WINDOW_PACKETS, reliable_bulk_product_windows,
-    reliable_path_startup_sample_limit_bytes,
+    reliable_path_startup_sample_limit_bytes, reliable_unproven_path_startup_flight_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
@@ -174,6 +174,49 @@ fn full_carrier_queue_rolls_back_without_publishing_flight() {
 }
 
 #[test]
+fn udp_response_original_without_native_authority_fails_closed() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(27),
+    };
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let binding = ResponseStreamBinding::new(
+        SessionId(189),
+        key.underlay,
+        key.path_id,
+        commands.clone(),
+        TrafficClass::Throughput,
+    );
+    let target: ResponseDispatchTarget = binding
+        .sender_path_targets(TrafficClass::Throughput, 4_096)
+        .into_iter()
+        .next()
+        .expect("unfenced UDP is visible only to prove final rejection")
+        .into();
+    let frame = stream_data_frame(4_096);
+    let generation = binding.response_model_generation();
+
+    assert!(matches!(
+        binding.try_enqueue_data_frame_for_dispatch_target(
+            &target,
+            &frame,
+            TrafficClass::Throughput,
+            generation,
+            BulkCandidatePosition::FirstPath,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(binding.response_model_generation(), generation);
+    assert!(
+        binding
+            .original_flight_outputs_overlapping_frame(&frame)
+            .is_empty()
+    );
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+}
+
+#[test]
 fn native_original_final_precommit_rejects_stale_activation_after_real_reservation() {
     let mut fixture = native_response_binding_fixture(1, Some(120_000_000));
     let target: ResponseDispatchTarget = fixture
@@ -260,6 +303,92 @@ fn native_original_final_precommit_rejects_stale_activation_after_real_reservati
     assert!(fixture.commands.pending_bytes() > 0);
     drop(reservation);
     assert_eq!(fixture.commands.pending_bytes(), 0);
+}
+
+#[test]
+fn native_original_final_precommit_uses_current_same_stamp_window_shape() {
+    let mut fixture = native_response_binding_fixture(1, Some(120_000_000));
+    let target: ResponseDispatchTarget = fixture
+        .binding
+        .sender_path_targets(TrafficClass::Throughput, 4_096)
+        .into_iter()
+        .next()
+        .expect("current fenced Native response target")
+        .into();
+    let expected_stamp = target
+        .native_authority_stamp
+        .expect("Native response target carries its exact stamp");
+    let already_assigned = reliable_unproven_path_startup_flight_limit_bytes(MuxLimits::default());
+    {
+        let mut outputs = fixture
+            .binding
+            .outputs
+            .lock()
+            .expect("test response outputs lock");
+        outputs.original_data_in_flight_bytes = already_assigned;
+        outputs.entries[0].original_data_in_flight_bytes = already_assigned;
+    }
+    let frame = stream_data_frame_at(already_assigned, 4_096);
+    let generation = fixture.binding.response_model_generation();
+
+    let result = fixture
+        .binding
+        .try_enqueue_data_frame_for_dispatch_target_with_apply_clock(
+            &target,
+            &frame,
+            TrafficClass::Throughput,
+            generation,
+            BulkCandidatePosition::AdditionalPath,
+            Instant::now,
+            || {
+                let refreshed = fixture
+                    .authority
+                    .refresh_scheduling_shape_for_test(
+                        fixture.scope,
+                        1,
+                        7,
+                        Some(120_000_000),
+                        Duration::from_millis(80),
+                        Duration::from_millis(12),
+                        1_400,
+                        0,
+                        1_400,
+                        Some(100_000_000),
+                        false,
+                    )
+                    .expect("refresh only Quinn window shape after reservation");
+                assert_eq!(refreshed.stamp(), expected_stamp);
+                assert_eq!(
+                    fixture.authority.stamp().expect("unchanged central stamp"),
+                    expected_stamp,
+                    "same-controller window changes do not revise central G",
+                );
+            },
+        );
+
+    assert!(matches!(result, Err(RuntimeError::SenderServiceBlocked)));
+    assert_eq!(fixture.commands.pending_bytes(), 0);
+    assert_eq!(fixture.binding.response_model_generation(), generation);
+    {
+        let outputs = fixture
+            .binding
+            .outputs
+            .lock()
+            .expect("test response outputs lock");
+        assert_eq!(outputs.original_data_in_flight_bytes, already_assigned);
+        assert_eq!(
+            outputs.entries[0].original_data_in_flight_bytes,
+            already_assigned,
+        );
+    }
+    assert!(
+        fixture
+            .binding
+            .original_flight_outputs_overlapping_frame(&frame)
+            .is_empty(),
+        "the stale larger Quinn window cannot authorize Product ownership",
+    );
+    assert!(try_recv_reliable_path_command(&mut fixture.receivers).is_none());
 }
 
 #[test]

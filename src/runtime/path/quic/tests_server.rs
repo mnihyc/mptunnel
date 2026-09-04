@@ -323,7 +323,10 @@ async fn open_server_ip_tunnel_actor(
         .map_or(1_000_000, |metrics| metrics.delivery_rate_bps.max(1));
     let native_rate_authority = fixture
         ._server_connection
-        .bind_native_rate_authority(native_scope, startup_rate_bps)
+        .bind_native_rate_authority(
+            native_scope,
+            crate::transport::RateHint::BitsPerSecond(startup_rate_bps),
+        )
         .await
         .expect("bind server test QUIC native authority");
     let _ = stage_current_server_native_scheduling_shape(

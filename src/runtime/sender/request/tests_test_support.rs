@@ -6,20 +6,21 @@
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::model::capacity::PathRateSample;
 use crate::model::capacity::reliable_relay_buffer_len;
-use crate::model::path::RelayPathInstance;
+use crate::model::carrier_rate_authority::CarrierRateAuthorityScope;
+use crate::model::path::{RelayPathInstance, next_carrier_path_instance_id};
+use crate::model::service_rate::{DirectionalServiceRate, DirectionalServiceRateScope};
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
-use crate::runtime::path::ClientPathContext;
+use crate::protocol::{Frame, PathId, PathMetricDirection, StreamId, UnderlayProtocol};
 use crate::runtime::path::PathProofObservation;
+use crate::runtime::path::authority::NativeCarrierRateAuthorityHandle;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
     try_recv_reliable_path_priority_command,
 };
-use crate::runtime::stream::{
-    OpenedRemoteStream, ReliablePathStream, ReliablePathStreamOutput, ReliableRelayRemoteSet,
-};
-use crate::scheduler::TrafficClass;
-use crate::transport::PathSpec;
+use crate::runtime::path::{ClientPathContext, OpenedReliableCarrierStream};
+use crate::runtime::stream::{OpenedRemoteStream, ReliableRelayRemoteSet};
+use crate::scheduler::{PathSnapshot, TrafficClass};
+use crate::transport::{PathSpec, RateHint};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -60,23 +61,89 @@ pub(super) fn opened_test_relay_stream_with_underlay(
     path_index: usize,
     commands: ReliablePathCommandSender,
 ) -> OpenedRemoteStream {
-    let (_frame_tx, frame_rx) = mpsc::channel(1);
-    OpenedRemoteStream::pending(
-        ReliablePathStream {
-            stream_id,
-            max_offset: MuxLimits::default().max_stream_window_bytes,
-            lane: TrafficClass::Throughput,
-            underlay,
-            max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-            output: ReliablePathStreamOutput::fixed(
-                underlay,
-                PathId(path_index as u16),
-                commands,
-                MuxLimits::default(),
-            ),
-            frames: frame_rx.into(),
-        },
+    opened_test_relay_stream_with_native_source(
+        stream_id,
+        underlay,
         path_index,
+        commands,
+        RateHint::Unknown,
+        1,
+        None,
+    )
+    .0
+}
+
+pub(super) fn opened_test_relay_stream_with_native_source(
+    stream_id: StreamId,
+    underlay: UnderlayProtocol,
+    path_index: usize,
+    commands: ReliablePathCommandSender,
+    startup_rate: RateHint,
+    native_controller: u64,
+    native_operational_rate_bps: Option<u128>,
+) -> (
+    OpenedRemoteStream,
+    Option<std::sync::Arc<NativeCarrierRateAuthorityHandle>>,
+) {
+    let path_instance_id = next_carrier_path_instance_id();
+    let direction = PathMetricDirection::ClientToServer;
+    let service_rate = DirectionalServiceRate::from_startup_hint(
+        DirectionalServiceRateScope::new(path_instance_id, direction),
+        startup_rate,
+    )
+    .expect("valid test startup service rate");
+    let startup_rate_bps = service_rate
+        .finite_rate_bps()
+        .map_or_else(crate::runtime::path::model::default_path_rate_bps, |rate| {
+            rate as f64
+        });
+    let startup = PathSnapshot::new(
+        PathId(path_index as u16),
+        underlay,
+        crate::runtime::path::model::default_path_srtt_ms(),
+        startup_rate_bps,
+    )
+    .with_scheduling_service_rate(service_rate);
+    let (commands, native_authority) = match underlay {
+        UnderlayProtocol::Tcp => (commands, None),
+        UnderlayProtocol::Udp => {
+            let scope = CarrierRateAuthorityScope::new(path_instance_id, direction);
+            let authority = NativeCarrierRateAuthorityHandle::from_startup_hint_for_test(
+                scope,
+                startup_rate,
+                1,
+                native_controller,
+                native_operational_rate_bps,
+            )
+            .expect("valid exact-instance test QUIC authority");
+            (
+                commands.with_native_rate_authority(authority.clone()),
+                Some(authority),
+            )
+        }
+    };
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    (
+        OpenedRemoteStream::from_opened_carrier(
+            OpenedReliableCarrierStream {
+                stream_id,
+                path_instance_id,
+                max_offset: MuxLimits::default().max_stream_window_bytes,
+                lane: TrafficClass::Throughput,
+                underlay,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                portable_startup: startup,
+                startup,
+                startup_native_window: None,
+                startup_metrics: None,
+                commands,
+                mux_limits: MuxLimits::default(),
+                frames: frame_rx.into(),
+            },
+            path_index,
+            0,
+        ),
+        native_authority,
     )
 }
 

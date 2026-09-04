@@ -42,6 +42,12 @@ impl PositiveRateBps {
     pub(crate) const fn get(self) -> u64 {
         self.0.get()
     }
+
+    pub(crate) fn checked_from_bits_per_second(
+        bits_per_second: u64,
+    ) -> Result<Self, ServiceRateModelError> {
+        Self::checked_new(bits_per_second)
+    }
 }
 
 /// Exact immutable scope of one scheduling-rate authority.
@@ -89,6 +95,15 @@ pub(crate) enum ServiceRateBasis {
 pub(crate) enum ServiceRateValue {
     Finite(PositiveRateBps),
     UnlimitedStartup,
+}
+
+impl ServiceRateValue {
+    pub(crate) const fn finite_rate(self) -> Option<PositiveRateBps> {
+        match self {
+            Self::Finite(rate) => Some(rate),
+            Self::UnlimitedStartup => None,
+        }
+    }
 }
 
 /// One immutable effective rate projection for an exact directional scope.
@@ -159,6 +174,13 @@ impl DirectionalServiceRate {
 
     pub(crate) const fn value(self) -> ServiceRateValue {
         self.value
+    }
+
+    pub(crate) const fn finite_rate_bps(self) -> Option<u64> {
+        match self.value.finite_rate() {
+            Some(rate) => Some(rate.get()),
+            None => None,
+        }
     }
 }
 

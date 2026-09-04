@@ -6,12 +6,16 @@
 use super::flow::PacketFlowTable;
 use super::queue::{IpPacketQueueBudget, IpPacketQueuePermit};
 use crate::ingress::TunL3IngressConfig;
+use crate::model::carrier_rate_authority::CarrierRateAuthorityScope;
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::model::timing::{path_open_timeout, transport_pto_from_snapshot};
 use crate::model::tun_l3::{IpPacketFlowKey, parse_ip_packet};
 use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
-use crate::protocol::{CloseReason, Frame, IpPacketId, IpTunnelId, UnderlayProtocol};
+use crate::protocol::{
+    CloseReason, Frame, IpPacketId, IpTunnelId, PathMetricDirection, UnderlayProtocol,
+};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::model::PacketPathCandidate;
 use crate::runtime::path::quic::ip_tunnel::{
     ClientUdpIpTunnelAttachment, ClientUdpIpTunnelOpenOutcome,
 };
@@ -171,9 +175,15 @@ struct ClientIpCarrierKey {
     path_instance_id: CarrierPathInstanceId,
 }
 
+#[derive(Clone)]
 enum ClientIpCarrier {
     Tcp(Arc<ClientTcpIpTunnelAttachment>),
     Quic(Arc<ClientUdpIpTunnelAttachment>),
+    #[cfg(test)]
+    NativeTest {
+        authority: Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+    },
 }
 
 impl ClientIpCarrier {
@@ -189,6 +199,22 @@ impl ClientIpCarrier {
                 let permit = budget.try_reserve(payload.len())?;
                 attachment.try_send(packet_id, payload, permit)
             }
+            #[cfg(test)]
+            Self::NativeTest { accepted, .. } => {
+                accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+
+    fn native_rate_authority(
+        &self,
+    ) -> Option<Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>> {
+        match self {
+            Self::Tcp(_) => None,
+            Self::Quic(attachment) => Some(attachment.native_rate_authority()),
+            #[cfg(test)]
+            Self::NativeTest { authority, .. } => Some(authority.clone()),
         }
     }
 }
@@ -196,6 +222,20 @@ impl ClientIpCarrier {
 struct ClientIpCarrierState {
     carrier: ClientIpCarrier,
     ready: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ClientIpCarrierSelection {
+    Bound(ClientIpCarrierKey),
+    Planned(PacketPathCandidate),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientIpPacketSendOutcome {
+    Accepted,
+    Blocked,
+    Retired,
+    StaleNativeDecision,
 }
 
 enum ClientIpCarrierUpdate {
@@ -412,48 +452,136 @@ impl ClientIpTunnelState {
             Err(_) => return Ok(false),
         };
         let now = Instant::now();
-        let carrier =
+        let selection =
             self.current_or_select_carrier(context, &metadata.flow_key, payload.len(), now);
-        let Some(carrier) = carrier else {
+        let Some(selection) = selection else {
             return Ok(false);
         };
         let packet_id = IpPacketId(self.next_packet_id);
         self.next_packet_id = self.next_packet_id.wrapping_add(1).max(1);
-        let result = self
-            .carriers
-            .get(&carrier)
-            .ok_or(RuntimeError::ReliablePathRetired)?
-            .carrier
-            .try_send(packet_id, payload.clone(), &self.carrier_packet_budget);
-        match result {
-            Ok(()) => Ok(true),
-            Err(RuntimeError::SenderServiceBlocked) => Ok(false),
-            Err(RuntimeError::ReliablePathRetired)
-            | Err(RuntimeError::ReliablePathSessionClosed) => {
-                self.remove_carrier(carrier);
-                let Some(replacement) =
-                    self.select_carrier(context, &metadata.flow_key, payload.len(), now)
-                else {
-                    return Ok(false);
-                };
-                match self
+        let first =
+            self.try_send_selection(selection, &metadata.flow_key, packet_id, payload.clone())?;
+        match first {
+            ClientIpPacketSendOutcome::Accepted => return Ok(true),
+            ClientIpPacketSendOutcome::Blocked => return Ok(false),
+            ClientIpPacketSendOutcome::Retired => {
+                self.remove_carrier(selection.carrier_key());
+            }
+            ClientIpPacketSendOutcome::StaleNativeDecision => {}
+        }
+
+        // Preserve the existing one replacement attempt. A stale Native
+        // decision is not carrier failure: replan once without blacklisting.
+        let Some(replacement) = self.select_carrier(context, &metadata.flow_key, payload.len())
+        else {
+            return Ok(false);
+        };
+        match self.try_send_planned(replacement, &metadata.flow_key, packet_id, payload)? {
+            ClientIpPacketSendOutcome::Accepted => Ok(true),
+            ClientIpPacketSendOutcome::Blocked | ClientIpPacketSendOutcome::StaleNativeDecision => {
+                Ok(false)
+            }
+            ClientIpPacketSendOutcome::Retired => {
+                self.remove_carrier(ClientIpCarrierKey::from(replacement.attachment));
+                Ok(false)
+            }
+        }
+    }
+
+    fn try_send_selection(
+        &mut self,
+        selection: ClientIpCarrierSelection,
+        flow: &IpPacketFlowKey,
+        packet_id: IpPacketId,
+        payload: Bytes,
+    ) -> Result<ClientIpPacketSendOutcome, RuntimeError> {
+        match selection {
+            ClientIpCarrierSelection::Bound(carrier) => {
+                let result = self
                     .carriers
-                    .get(&replacement)
+                    .get(&carrier)
                     .ok_or(RuntimeError::ReliablePathRetired)?
                     .carrier
-                    .try_send(packet_id, payload, &self.carrier_packet_budget)
+                    .try_send(packet_id, payload, &self.carrier_packet_budget);
+                let outcome = classify_client_ip_packet_send(result)?;
+                if outcome == ClientIpPacketSendOutcome::Accepted {
+                    let _ = self
+                        .flows
+                        .commit_planned_current(flow, carrier, Instant::now());
+                }
+                Ok(outcome)
+            }
+            ClientIpCarrierSelection::Planned(candidate) => {
+                self.try_send_planned(candidate, flow, packet_id, payload)
+            }
+        }
+    }
+
+    fn try_send_planned(
+        &mut self,
+        candidate: PacketPathCandidate,
+        flow: &IpPacketFlowKey,
+        packet_id: IpPacketId,
+        payload: Bytes,
+    ) -> Result<ClientIpPacketSendOutcome, RuntimeError> {
+        let carrier_key = ClientIpCarrierKey::from(candidate.attachment);
+        let carrier = self
+            .carriers
+            .get(&carrier_key)
+            .filter(|carrier| carrier.ready)
+            .ok_or(RuntimeError::ReliablePathRetired)?
+            .carrier
+            .clone();
+        match candidate.attachment.key.underlay {
+            UnderlayProtocol::Tcp => {
+                if candidate.native_authority_stamp.is_some()
+                    || carrier.native_rate_authority().is_some()
                 {
-                    Ok(()) => Ok(true),
-                    Err(RuntimeError::SenderServiceBlocked) => Ok(false),
-                    Err(RuntimeError::ReliablePathRetired)
-                    | Err(RuntimeError::ReliablePathSessionClosed) => {
-                        self.remove_carrier(replacement);
-                        Ok(false)
-                    }
-                    Err(error) => Err(error),
+                    return Ok(ClientIpPacketSendOutcome::StaleNativeDecision);
+                }
+                let result = carrier.try_send(packet_id, payload, &self.carrier_packet_budget);
+                if result.is_ok() {
+                    let flowlet_timeout = transport_pto_from_snapshot(Some(candidate.snapshot));
+                    self.flows
+                        .bind(flow.clone(), carrier_key, Instant::now(), flowlet_timeout);
+                }
+                classify_client_ip_packet_send(result)
+            }
+            UnderlayProtocol::Udp => {
+                let Some(expected_stamp) = candidate.native_authority_stamp else {
+                    return Ok(ClientIpPacketSendOutcome::StaleNativeDecision);
+                };
+                let Some(authority) = carrier.native_rate_authority() else {
+                    return Ok(ClientIpPacketSendOutcome::StaleNativeDecision);
+                };
+                let committed = authority.commit_with_current_scheduling_shape(
+                    expected_stamp,
+                    |current_shape| {
+                        let Some(flowlet_timeout) = client_native_packet_flowlet_timeout(
+                            candidate,
+                            expected_stamp,
+                            current_shape,
+                        ) else {
+                            return Ok(ClientIpPacketSendOutcome::StaleNativeDecision);
+                        };
+                        let result =
+                            carrier.try_send(packet_id, payload, &self.carrier_packet_budget);
+                        if result.is_ok() {
+                            self.flows.bind(
+                                flow.clone(),
+                                carrier_key,
+                                Instant::now(),
+                                flowlet_timeout,
+                            );
+                        }
+                        classify_client_ip_packet_send(result)
+                    },
+                );
+                match committed {
+                    Ok(result) => result,
+                    Err(_) => Ok(ClientIpPacketSendOutcome::StaleNativeDecision),
                 }
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -463,14 +591,15 @@ impl ClientIpTunnelState {
         flow: &IpPacketFlowKey,
         packet_bytes: usize,
         now: Instant,
-    ) -> Option<ClientIpCarrierKey> {
+    ) -> Option<ClientIpCarrierSelection> {
         let carriers = &self.carriers;
-        if let Some(current) = self.flows.current(flow, now, |carrier| {
+        if let Some(current) = self.flows.planned_current(flow, now, |carrier| {
             carriers.get(&carrier).is_some_and(|carrier| carrier.ready)
         }) {
-            return Some(current);
+            return Some(ClientIpCarrierSelection::Bound(current));
         }
-        self.select_carrier(context, flow, packet_bytes, now)
+        self.select_carrier(context, flow, packet_bytes)
+            .map(ClientIpCarrierSelection::Planned)
     }
 
     fn select_carrier(
@@ -478,31 +607,99 @@ impl ClientIpTunnelState {
         context: &ClientPathContext,
         flow: &IpPacketFlowKey,
         packet_bytes: usize,
-        now: Instant,
-    ) -> Option<ClientIpCarrierKey> {
+    ) -> Option<PacketPathCandidate> {
         let inputs = self
             .carriers
             .iter()
             .filter(|(_, carrier)| carrier.ready)
-            .map(|(key, _)| PacketPathSelectionInput {
-                attachment: PacketPathAttachment {
-                    key: key.path,
-                    path_instance_id: key.path_instance_id,
-                },
-                active_flows: self.flows.active_load_for(*key, flow),
+            .filter_map(|(key, state)| {
+                let native_scheduling_shape = match key.path.underlay {
+                    UnderlayProtocol::Tcp => {
+                        if state.carrier.native_rate_authority().is_some() {
+                            return None;
+                        }
+                        None
+                    }
+                    UnderlayProtocol::Udp => {
+                        let authority = state.carrier.native_rate_authority()?;
+                        let scope = CarrierRateAuthorityScope::new(
+                            key.path_instance_id,
+                            PathMetricDirection::ClientToServer,
+                        );
+                        Some(authority.scheduling_shape_snapshot(scope).ok()?)
+                    }
+                };
+                Some(PacketPathSelectionInput {
+                    attachment: PacketPathAttachment {
+                        key: key.path,
+                        path_instance_id: key.path_instance_id,
+                    },
+                    active_flows: self.flows.active_load_for(*key, flow),
+                    native_scheduling_shape,
+                })
             })
             .collect::<Vec<_>>();
-        let candidate = context
+        context
             .ordered_packet_path_candidates(&inputs, packet_bytes)
             .into_iter()
-            .next()?;
-        let carrier = ClientIpCarrierKey {
-            path: candidate.attachment.key,
-            path_instance_id: candidate.attachment.path_instance_id,
-        };
-        let flowlet_timeout = transport_pto_from_snapshot(Some(candidate.snapshot));
-        self.flows.bind(flow.clone(), carrier, now, flowlet_timeout);
-        Some(carrier)
+            .next()
+    }
+}
+
+fn client_native_packet_flowlet_timeout(
+    candidate: PacketPathCandidate,
+    expected_stamp: crate::model::carrier_rate_authority::CarrierRateAuthorityStamp,
+    current_shape: crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot,
+) -> Option<std::time::Duration> {
+    let scope = current_shape.stamp().scope();
+    if current_shape.stamp() != expected_stamp
+        || candidate.native_authority_stamp != Some(expected_stamp)
+        || candidate.attachment.key.underlay != UnderlayProtocol::Udp
+        || scope.carrier_instance_id() != candidate.attachment.path_instance_id
+        || scope.direction() != PathMetricDirection::ClientToServer
+    {
+        return None;
+    }
+    let mut snapshot = candidate
+        .snapshot
+        .with_scheduling_service_rate(current_shape.service_rate());
+    snapshot.srtt_ms = if current_shape.srtt().is_zero() {
+        crate::runtime::path::model::default_path_srtt_ms()
+    } else {
+        current_shape.srtt().as_secs_f64() * 1_000.0
+    };
+    snapshot.jitter_ms = current_shape.rttvar().as_secs_f64() * 1_000.0;
+    Some(transport_pto_from_snapshot(Some(snapshot)))
+}
+
+impl From<PacketPathAttachment> for ClientIpCarrierKey {
+    fn from(attachment: PacketPathAttachment) -> Self {
+        Self {
+            path: attachment.key,
+            path_instance_id: attachment.path_instance_id,
+        }
+    }
+}
+
+impl ClientIpCarrierSelection {
+    fn carrier_key(self) -> ClientIpCarrierKey {
+        match self {
+            Self::Bound(carrier) => carrier,
+            Self::Planned(candidate) => ClientIpCarrierKey::from(candidate.attachment),
+        }
+    }
+}
+
+fn classify_client_ip_packet_send(
+    result: Result<(), RuntimeError>,
+) -> Result<ClientIpPacketSendOutcome, RuntimeError> {
+    match result {
+        Ok(()) => Ok(ClientIpPacketSendOutcome::Accepted),
+        Err(RuntimeError::SenderServiceBlocked) => Ok(ClientIpPacketSendOutcome::Blocked),
+        Err(RuntimeError::ReliablePathRetired) | Err(RuntimeError::ReliablePathSessionClosed) => {
+            Ok(ClientIpPacketSendOutcome::Retired)
+        }
+        Err(error) => Err(error),
     }
 }
 

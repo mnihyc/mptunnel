@@ -32,6 +32,7 @@ use crate::model::capacity::{
     reliable_bulk_product_windows, reliable_path_startup_sample_limit_bytes,
     reliable_relay_buffer_len, reliable_stream_source_admission,
 };
+use crate::model::carrier_rate_authority::{CarrierRateAuthorityScope, CarrierRateAuthorityStamp};
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
 use crate::model::product_qualification::{
     ProductQualificationAdmissionError, ProductQualificationAuthority,
@@ -52,20 +53,40 @@ use crate::model::work::{
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
-use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
-use crate::runtime::path::ClientPathContext;
+use crate::protocol::{Frame, OffsetRange, PathMetricDirection, StreamId, UnderlayProtocol};
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
+use crate::runtime::path::commands::ReliablePathCommandSender;
+use crate::runtime::path::{ClientPathContext, ReliableRequestNativeShape};
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestFlightLedger, RequestPathRelease, RequestStreamState,
 };
 use crate::runtime::stream::{
-    ReliableRelayRemotePath, ReliableRelayRemoteSet, RequalificationAttempt,
-    TargetCarrierCapacityWait,
+    ReliablePathStreamOutput, ReliableRelayRemotePath, ReliableRelayRemoteSet,
+    RequalificationAttempt, TargetCarrierCapacityWait,
 };
 use crate::scheduler::{self, PathSnapshot, TrafficClass, cyclic_cursor_distance};
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+
+fn request_native_scheduling_shape(path: &ReliableRelayRemotePath) -> ReliableRequestNativeShape {
+    if path.key().underlay != UnderlayProtocol::Udp {
+        return ReliableRequestNativeShape::NotApplicable;
+    }
+    let ReliablePathStreamOutput::Fixed(output) = &path.stream.output else {
+        return ReliableRequestNativeShape::Unavailable;
+    };
+    let scope =
+        CarrierRateAuthorityScope::new(path.path_instance_id, PathMetricDirection::ClientToServer);
+    let Some(authority) = output.commands().native_rate_authority() else {
+        return ReliableRequestNativeShape::Unavailable;
+    };
+    authority
+        .scheduling_shape_snapshot(scope)
+        .map(ReliableRequestNativeShape::Current)
+        .unwrap_or(ReliableRequestNativeShape::Unavailable)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn observe_request_relay_scheduling(
@@ -79,17 +100,63 @@ pub(super) fn observe_request_relay_scheduling(
     include_bulk_admission: bool,
     requalification: &StreamPathRequalification<RelayPathInstance>,
 ) -> RequestRelaySchedulingObservation {
-    let path_evidence = context.observe_reliable_request_paths(
-        remote_paths.iter().map(|path| {
+    observe_request_relay_scheduling_with_native_override(
+        context,
+        stream_id,
+        membership_generation,
+        remote_paths,
+        frame,
+        lane,
+        payload_bytes,
+        include_bulk_admission,
+        requalification,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_request_relay_scheduling_with_native_override(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    membership_generation: u64,
+    remote_paths: &[ReliableRelayRemotePath],
+    frame: Option<&Frame>,
+    lane: TrafficClass,
+    payload_bytes: usize,
+    include_bulk_admission: bool,
+    requalification: &StreamPathRequalification<RelayPathInstance>,
+    native_override: Option<(RelayPathInstance, NativeCarrierSchedulingShapeSnapshot)>,
+) -> RequestRelaySchedulingObservation {
+    // Resolve attachment-owned Native shapes before entering the health-lock
+    // observation. Native publication/apply uses Native -> health ordering;
+    // leaving this iterator lazy would invert that order as health -> Native.
+    let attached_paths = remote_paths
+        .iter()
+        .map(|path| {
+            let instance = path.instance();
+            let shape = match native_override {
+                Some((target, shape)) if target == instance => {
+                    ReliableRequestNativeShape::Current(shape)
+                }
+                // The override is evaluated while the target Native fence is
+                // held. Do not acquire another carrier authority lock here;
+                // other candidates remain advisory health observations.
+                Some(_) => ReliableRequestNativeShape::NotApplicable,
+                None => request_native_scheduling_shape(path),
+            };
             (
-                path.instance(),
+                instance,
                 path.path_proof_id.map(|proof_id| RelayPathProofEpoch {
                     proof_id,
                     proof_generation: path.path_proof_generation,
                     attached_at: path.attached_at,
                 }),
+                shape,
             )
-        }),
+        })
+        .collect::<SmallVec<[_; 4]>>();
+    let path_evidence = context.observe_reliable_request_paths(
+        attached_paths,
         payload_bytes,
         include_bulk_admission,
     );
@@ -134,6 +201,8 @@ pub(super) fn observe_request_relay_scheduling(
                 has_fresh_native_carrier_rate_evidence: evidence
                     .has_fresh_native_carrier_rate_evidence,
                 fresh_proof: evidence.fresh_proof,
+                native_authority_stamp: evidence.native_authority_stamp,
+                native_authority_unavailable: evidence.native_authority_unavailable,
                 config_ordinal: evidence.config_ordinal,
                 member_ordinal: evidence.member_ordinal,
             }
@@ -357,6 +426,7 @@ pub(super) struct RequestMultipathPlan {
     product_limit_bytes: Option<u64>,
     request_load_expectation: Option<(RelayPathKey, u32, u32)>,
     request_proof_expectation: Option<RelayPathProofEpoch>,
+    native_authority_stamp: Option<CarrierRateAuthorityStamp>,
     path_eligibility_expectation: SmallVec<[RequestPathEligibilityExpectation; 4]>,
 }
 
@@ -405,6 +475,7 @@ impl RequestMultipathPlan {
             product_limit_bytes: None,
             request_load_expectation: None,
             request_proof_expectation: None,
+            native_authority_stamp: None,
             path_eligibility_expectation: SmallVec::new(),
         }
     }
@@ -419,6 +490,28 @@ impl RequestMultipathPlan {
 
     pub(super) fn proof_expectation(&self) -> Option<RelayPathProofEpoch> {
         self.request_proof_expectation
+    }
+
+    /// Holds the exact Native activation, central generation, and coherent
+    /// shape through the first irreversible Product/queue publication. A
+    /// mismatch means the advisory plan is stale, not that the path failed.
+    pub(super) fn commit_with_current_native_shape<R>(
+        &self,
+        commands: &ReliablePathCommandSender,
+        commit: impl FnOnce(Option<NativeCarrierSchedulingShapeSnapshot>) -> R,
+    ) -> Option<R> {
+        match (
+            commands.native_rate_authority(),
+            self.native_authority_stamp,
+        ) {
+            (Some(authority), Some(stamp)) => authority
+                .commit_with_current_scheduling_shape(stamp, |shape| commit(Some(shape)))
+                .ok(),
+            (None, None) if self.target.instance.key.underlay == UnderlayProtocol::Tcp => {
+                Some(commit(None))
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn assigns_original_data(&self) -> bool {
@@ -472,11 +565,18 @@ impl RequestMultipathPlan {
         request_state: Option<RequestSchedulingState<'_>>,
     ) -> Result<Self, RequestMultipathPlanError> {
         self.path_eligibility_expectation = request_path_eligibility_expectation(observation, lane);
-        self.path_eligibility_expectation
+        let target = self
+            .path_eligibility_expectation
             .iter()
             .find(|expectation| expectation.instance == self.target.instance)
             .filter(|expectation| expectation.eligibility != RequestPathEligibility::Unavailable)
             .ok_or(RequestMultipathPlanError::ServiceBlocked)?;
+        debug_assert_eq!(target.instance, self.target.instance);
+        self.native_authority_stamp = observation
+            .paths
+            .iter()
+            .find(|path| path.instance == self.target.instance)
+            .and_then(|path| path.native_authority_stamp);
         if self.product_mutation.assigns_original_data() {
             let snapshot = request_original_data_authority_snapshot(
                 observation,
@@ -516,9 +616,13 @@ impl RequestMultipathPlan {
         lane: TrafficClass,
     ) -> bool {
         let current = context.observe_reliable_request_paths(
-            self.path_eligibility_expectation
-                .iter()
-                .map(|expectation| (expectation.instance, None)),
+            self.path_eligibility_expectation.iter().map(|expectation| {
+                (
+                    expectation.instance,
+                    None,
+                    ReliableRequestNativeShape::NotApplicable,
+                )
+            }),
             0,
             false,
         );
@@ -648,11 +752,35 @@ impl RequestMultipathController {
         frontier_state: ReliableDataAckFrontierState,
         pending_load_claim: bool,
     ) -> Option<RequestOriginalDataApplyAuthority> {
+        self.bulk_original_data_apply_authority_with_native_shape(
+            context,
+            remotes,
+            plan,
+            frame,
+            lane,
+            frontier_state,
+            pending_load_claim,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bulk_original_data_apply_authority_with_native_shape(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        plan: &RequestMultipathPlan,
+        frame: &Frame,
+        lane: TrafficClass,
+        frontier_state: ReliableDataAckFrontierState,
+        pending_load_claim: bool,
+        native_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
+    ) -> Option<RequestOriginalDataApplyAuthority> {
         if !lane.is_bulk() || !plan.assigns_original_data() {
             return None;
         }
         let (entry_offset, _, payload_bytes) = reliable_stream_frame_extent(frame)?;
-        let observation = observe_request_relay_scheduling(
+        let observation = observe_request_relay_scheduling_with_native_override(
             context,
             self.stream_id,
             remotes.membership_generation(),
@@ -662,6 +790,7 @@ impl RequestMultipathController {
             payload_bytes,
             true,
             &self.request.requalification,
+            native_shape.map(|shape| (plan.target.instance, shape)),
         );
         let eligible = current_request_original_data_tier(
             &observation,
@@ -1565,6 +1694,51 @@ impl RequestMultipathController {
         self.request_reinjection_target_snapshot_from_observation(&observation, path.instance())
     }
 
+    /// Rebuilds one QUIC reinjection target from the exact Native shape held
+    /// by the caller's apply fence. The override is materialized before the
+    /// health lock, preserving the runtime Native -> health lock order.
+    pub(super) fn request_reinjection_target_snapshot_with_native_shape(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        instance: RelayPathInstance,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) -> Option<PathSnapshot> {
+        if instance.key.underlay != UnderlayProtocol::Udp
+            || shape.stamp().scope()
+                != CarrierRateAuthorityScope::new(
+                    instance.path_instance_id,
+                    PathMetricDirection::ClientToServer,
+                )
+        {
+            return None;
+        }
+        let observation = observe_request_relay_scheduling_with_native_override(
+            context,
+            self.stream_id,
+            remotes.membership_generation(),
+            &remotes.paths,
+            None,
+            TrafficClass::Throughput,
+            PATH_OPEN_SCORE_BYTES,
+            false,
+            &self.request.requalification,
+            Some((instance, shape)),
+        );
+        let mut snapshot =
+            self.request_reinjection_target_snapshot_from_observation(&observation, instance)?;
+        if !shape.srtt().is_zero() {
+            snapshot.srtt_ms = shape.srtt().as_secs_f64() * 1_000.0;
+            snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1_000.0;
+        }
+        snapshot.bytes_in_flight = shape.bytes_in_flight();
+        snapshot.carrier_inflight_limit_bytes = shape
+            .congestion_window()
+            .max(u64::from(shape.current_mtu()));
+        snapshot.app_limited = shape.app_limited();
+        Some(snapshot)
+    }
+
     fn request_reinjection_target_snapshot_from_observation(
         &self,
         observation: &RequestRelaySchedulingObservation,
@@ -1684,6 +1858,7 @@ impl RequestMultipathController {
         instance: RelayPathInstance,
         frame: &Frame,
         cause: RelaySendCause,
+        reinjection_target_snapshot: Option<PathSnapshot>,
     ) -> Result<(usize, Option<Instant>), ProductQualificationAdmissionError> {
         if cause.is_reinjection() {
             if let Some((start, end, _)) = reliable_stream_frame_extent(frame) {
@@ -1704,7 +1879,10 @@ impl RequestMultipathController {
             }
             let suppression_interval = reliable_data_retransmission_interval(
                 Some(instance.key.underlay),
-                context.reliable_path_snapshot_for_instance(instance),
+                Some(
+                    reinjection_target_snapshot
+                        .expect("accepted reinjection carries its exact target snapshot"),
+                ),
             );
             Ok(self
                 .request
@@ -2065,6 +2243,13 @@ impl RequestMultipathController {
                             return Err(blocked_attachment_set_error(remotes));
                         }
                         ObservedOrdinaryPathChoice::NoLivePath => {
+                            if relay_observation
+                                .paths
+                                .iter()
+                                .any(|path| path.native_authority_unavailable)
+                            {
+                                return Err(RequestMultipathPlanError::ServiceBlocked);
+                            }
                             return Err(RequestMultipathPlanError::OutputUnavailable);
                         }
                     }

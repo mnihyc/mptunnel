@@ -30,7 +30,9 @@ use crate::runtime::path::commands::{
     recv_reliable_path_command_during_drain, reliable_path_command_pending_bytes,
     reliable_path_receivers_closed, try_recv_reliable_path_command,
 };
-use crate::runtime::path::model::{path_startup_metrics, path_startup_snapshot};
+use crate::runtime::path::model::{
+    directional_startup_service_rate, path_startup_metrics, path_startup_snapshot,
+};
 use crate::runtime::path::state::ClientTcpCarrierPublication;
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
@@ -1440,6 +1442,13 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
     debug_assert_eq!(carrier.path_id, path_id);
     let path_instance_id =
         try_next_carrier_path_instance_id().ok_or(RuntimeError::ExactIdentityExhausted)?;
+    if let Some(service_rate) = directional_startup_service_rate(
+        runtime.path(),
+        path_instance_id,
+        PathMetricDirection::ClientToServer,
+    ) {
+        startup_snapshot = startup_snapshot.with_scheduling_service_rate(service_rate);
+    }
     startup_snapshot.peer_usage = Some(carrier.peer_usage);
     let peer_status = runtime.peer_status.register_path(
         runtime.session_id,

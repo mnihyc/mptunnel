@@ -5,6 +5,7 @@
 
 use super::TrafficClass;
 use crate::model::path::PathPolicy;
+use crate::model::service_rate::DirectionalServiceRate;
 use crate::protocol::{PathId, PathUsage, UnderlayProtocol};
 
 pub(crate) const QUIC_INITIAL_WINDOW_PACKETS: f64 = 10.0;
@@ -39,6 +40,10 @@ pub struct PathSnapshot {
     pub srtt_ms: f64,
     pub jitter_ms: f64,
     pub delivery_rate_bps: f64,
+    /// Exact rate input for RFC 10.2 advisory ranking. Generic snapshots and
+    /// legacy fixtures may omit it; an exact production action must bind the
+    /// carrier instance and original-sender direction before ranking.
+    pub(crate) scheduling_service_rate: Option<DirectionalServiceRate>,
     pub rate_scope: PathRateScope,
     /// Qualified native carrier delivery capacity, when distinct from the
     /// product flow's completion rate.
@@ -84,6 +89,7 @@ impl PathSnapshot {
             srtt_ms,
             jitter_ms: 0.0,
             delivery_rate_bps,
+            scheduling_service_rate: None,
             rate_scope: PathRateScope::PathCapacity,
             carrier_delivery_rate_bps: None,
             product_progress_rate_bps: None,
@@ -102,6 +108,18 @@ impl PathSnapshot {
             confidence: 1.0,
             app_limited: false,
         }
+    }
+
+    pub(crate) fn with_scheduling_service_rate(
+        mut self,
+        service_rate: DirectionalServiceRate,
+    ) -> Self {
+        self.scheduling_service_rate = Some(service_rate);
+        self
+    }
+
+    pub(crate) fn scheduling_service_rate(self) -> Option<DirectionalServiceRate> {
+        self.scheduling_service_rate
     }
 }
 

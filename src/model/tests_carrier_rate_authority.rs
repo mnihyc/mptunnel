@@ -1,4 +1,7 @@
 use super::*;
+use crate::model::path::CarrierPathInstanceId;
+use crate::model::service_rate::{ServiceRateBasis, ServiceRateValue};
+use crate::protocol::PathMetricDirection;
 
 fn scope(carrier: u64, direction: PathMetricDirection) -> CarrierRateAuthorityScope {
     CarrierRateAuthorityScope::new(CarrierPathInstanceId::from_raw(carrier), direction)
@@ -8,9 +11,13 @@ fn bps(rate: u64) -> CarrierRateBps {
     CarrierRateBps::checked_from_bits_per_second(rate).expect("positive test rate")
 }
 
-fn native_bps(rate: u64) -> NativeOperationalRate {
-    NativeOperationalRate::checked_from_bits_per_second(u128::from(rate))
-        .expect("positive byte-aligned native rate")
+fn startup(authority_scope: CarrierRateAuthorityScope, rate: u64) -> DirectionalServiceRate {
+    DirectionalServiceRate::from_startup_hint(authority_scope, RateHint::BitsPerSecond(rate))
+        .expect("positive test startup")
+}
+
+fn native_bps(rate: u64) -> CarrierRateBps {
+    checked_native_operational_rate(u128::from(rate)).expect("positive byte-aligned native rate")
 }
 
 fn controller(raw: u64) -> NativeControllerIdentity {
@@ -107,7 +114,7 @@ fn assert_projection(
     let snapshot = reducer.snapshot().expect("live authority snapshot");
     assert_eq!(snapshot.mode(), mode);
     assert_eq!(snapshot.basis(), basis);
-    assert_eq!(snapshot.rate().as_u64(), rate);
+    assert_eq!(snapshot.finite_rate_bps(), Some(rate));
     snapshot
 }
 
@@ -203,22 +210,21 @@ fn constructors_project_one_fixed_carrier_direction_scope() {
 
 #[test]
 fn native_boundary_rejects_zero_unaligned_and_out_of_u64_rates() {
-    let exact = NativeOperationalRate::checked_from_bits_per_second(100_000_000)
-        .expect("100 Mbit/s is representable");
-    assert_eq!(exact.rate().as_u64(), 100_000_000);
+    let exact = checked_native_operational_rate(100_000_000).expect("100 Mbit/s is representable");
+    assert_eq!(exact.get(), 100_000_000);
     assert_eq!(
-        NativeOperationalRate::checked_from_bits_per_second(0),
+        checked_native_operational_rate(0),
         Err(CarrierRateConversionError::Zero)
     );
     assert_eq!(
-        NativeOperationalRate::checked_from_bits_per_second(9),
+        checked_native_operational_rate(9),
         Err(CarrierRateConversionError::NotByteAligned)
     );
-    let boundary = NativeOperationalRate::checked_from_bits_per_second(u128::from(u64::MAX - 7))
+    let boundary = checked_native_operational_rate(u128::from(u64::MAX - 7))
         .expect("largest exact 8-bit/s lattice value");
-    assert_eq!(boundary.rate().as_u64(), u64::MAX - 7);
+    assert_eq!(boundary.get(), u64::MAX - 7);
     assert_eq!(
-        NativeOperationalRate::checked_from_bits_per_second(u128::from(u64::MAX) + 1),
+        checked_native_operational_rate(u128::from(u64::MAX) + 1),
         Err(CarrierRateConversionError::OutOfRange),
         "the conceptual u64::MAX + 1 value is rejected before entering Rust's u64 boundary"
     );
@@ -308,6 +314,42 @@ fn native_observation_is_direct_exact_and_absence_never_revokes() {
         Ok(CarrierRateAuthorityTransition::Unchanged)
     );
     assert_ne!(initialized.stamp(), low.stamp());
+}
+
+#[test]
+fn unlimited_startup_is_semantic_and_cannot_fabricate_a_receipt_fallback() {
+    let authority_scope = scope(101, PathMetricDirection::ClientToServer);
+    let startup = DirectionalServiceRate::from_startup_hint(authority_scope, RateHint::Unlimited)
+        .expect("Unlimited is a valid semantic startup value");
+    let (mut reducer, activation) = CarrierRateAuthorityReducer::new_native_with_startup(
+        authority_scope,
+        startup,
+        fresh_activation(1, controller(41)),
+    );
+
+    let snapshot = reducer.snapshot().expect("live Unlimited startup");
+    let service_rate = snapshot.service_rate().expect("Native typed service rate");
+    assert_eq!(service_rate.basis(), ServiceRateBasis::UnlimitedStartup);
+    assert_eq!(service_rate.value(), ServiceRateValue::UnlimitedStartup);
+    assert_eq!(snapshot.finite_rate_bps(), None);
+
+    let before = reducer.snapshot();
+    let ready = ready_receipt(&reducer, &activation, generation(1));
+    let mut active_transport = transport_guard(authority_scope, activation.transport_activation);
+    assert!(matches!(
+        reducer.revoke_native_to_receipt(ready, &mut active_transport),
+        Err(CarrierRateAuthorityError::UnlimitedReceiptFallbackUnavailable)
+    ));
+    assert_eq!(reducer.snapshot(), before);
+
+    apply_current_native(&mut reducer, &activation, operational(80))
+        .expect("finite native observation replaces Unlimited startup");
+    let native = reducer.snapshot().expect("finite native replacement");
+    assert_eq!(native.finite_rate_bps(), Some(80));
+    assert_eq!(
+        native.service_rate().expect("Native service rate").basis(),
+        ServiceRateBasis::QuinnBbr3NativeOperationalV1
+    );
 }
 
 #[test]
@@ -899,12 +941,12 @@ fn native_facade_checks_exact_input_and_orders_same_activation_publication() {
 
     let mut authority = NativeCarrierRateAuthority::new(
         authority_scope,
-        bps(80),
+        startup(authority_scope, 80),
         facade_source(authority_scope, 1, 7, Some(100_000_000)),
     )
     .expect("scope-bound authority");
     let initialized = authority.snapshot().expect("initialized authority");
-    assert_eq!(initialized.rate().as_u64(), 100_000_000);
+    assert_eq!(initialized.finite_rate_bps(), Some(100_000_000));
     assert_eq!(
         initialized.basis(),
         CarrierRateAuthorityBasis::NativeOperational
@@ -937,7 +979,7 @@ fn native_facade_checks_exact_input_and_orders_same_activation_publication() {
         ),
         Ok(CarrierRateAuthorityTransition::Applied)
     );
-    assert_eq!(authority.snapshot().unwrap().rate().as_u64(), 160);
+    assert_eq!(authority.snapshot().unwrap().finite_rate_bps(), Some(160));
     assert_eq!(
         authority.compare_apply(
             delayed,
@@ -946,7 +988,7 @@ fn native_facade_checks_exact_input_and_orders_same_activation_publication() {
         ),
         Err(CarrierRateAuthorityError::StaleStamp)
     );
-    assert_eq!(authority.snapshot().unwrap().rate().as_u64(), 160);
+    assert_eq!(authority.snapshot().unwrap().finite_rate_bps(), Some(160));
 }
 
 #[test]
@@ -954,7 +996,7 @@ fn native_facade_coalesces_current_activation_without_inheriting_old_rate() {
     let authority_scope = scope(22, PathMetricDirection::ServerToClient);
     let mut authority = NativeCarrierRateAuthority::new(
         authority_scope,
-        bps(80),
+        startup(authority_scope, 80),
         facade_source(authority_scope, 1, 9, Some(320)),
     )
     .expect("scope-bound authority");
@@ -977,7 +1019,7 @@ fn native_facade_coalesces_current_activation_without_inheriting_old_rate() {
         Some(transport_activation(3))
     );
     assert_eq!(a3.basis(), CarrierRateAuthorityBasis::StartupPrior);
-    assert_eq!(a3.rate().as_u64(), 80);
+    assert_eq!(a3.finite_rate_bps(), Some(80));
     assert!(a3.stamp().revision() > a1.stamp().revision());
 
     let before_stale = authority.snapshot();
@@ -1001,13 +1043,13 @@ fn native_facade_precommit_and_tickets_are_instance_fenced() {
     let shared_scope = scope(23, PathMetricDirection::ClientToServer);
     let mut first = NativeCarrierRateAuthority::new(
         shared_scope,
-        bps(80),
+        startup(shared_scope, 80),
         facade_source(shared_scope, 1, 1, Some(160)),
     )
     .expect("first scope-bound authority");
     let mut second = NativeCarrierRateAuthority::new(
         shared_scope,
-        bps(80),
+        startup(shared_scope, 80),
         facade_source(shared_scope, 1, 1, Some(160)),
     )
     .expect("second scope-bound authority");
@@ -1062,7 +1104,7 @@ fn native_facade_rejects_cross_scope_source_and_current_proofs() {
     assert!(matches!(
         NativeCarrierRateAuthority::new(
             authority_scope,
-            bps(80),
+            startup(authority_scope, 80),
             facade_source(foreign_scope, 1, 1, Some(160)),
         ),
         Err(CarrierRateAuthorityError::AuthorityScopeMismatch)
@@ -1070,7 +1112,7 @@ fn native_facade_rejects_cross_scope_source_and_current_proofs() {
 
     let mut authority = NativeCarrierRateAuthority::new(
         authority_scope,
-        bps(80),
+        startup(authority_scope, 80),
         facade_source(authority_scope, 1, 1, Some(160)),
     )
     .expect("scope-bound authority");
@@ -1123,7 +1165,7 @@ fn native_facade_checked_exhaustion_is_absorbing() {
     );
     let mut authority = NativeCarrierRateAuthority::new(
         authority_scope,
-        bps(8),
+        startup(authority_scope, 8),
         facade_source(authority_scope, u64::MAX - 1, 1, None),
     )
     .expect("scope-bound authority");
@@ -1147,7 +1189,7 @@ fn native_facade_checked_exhaustion_is_absorbing() {
     let lagging_scope = scope(27, PathMetricDirection::ServerToClient);
     let mut lagging = NativeCarrierRateAuthority::new(
         lagging_scope,
-        bps(8),
+        startup(lagging_scope, 8),
         facade_source(lagging_scope, u64::MAX - 2, 2, Some(80)),
     )
     .expect("lagging scope-bound authority");

@@ -12,6 +12,7 @@ use crate::model::admission::{
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes, reliable_bulk_product_windows,
 };
+use crate::model::carrier_rate_authority::CarrierRateAuthorityStamp;
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::health::{ClientPathHealthRecord, RelayPathLoadOwner};
@@ -45,8 +46,22 @@ pub(in crate::runtime) struct ReliableRequestPathEvidence {
     pub(in crate::runtime) has_bulk_model_evidence: bool,
     pub(in crate::runtime) has_fresh_native_carrier_rate_evidence: bool,
     pub(in crate::runtime) fresh_proof: Option<RelayPathProofEpoch>,
+    /// Exact central Native token captured with the scheduling shape.
+    pub(in crate::runtime) native_authority_stamp: Option<CarrierRateAuthorityStamp>,
+    pub(in crate::runtime) native_authority_unavailable: bool,
     pub(in crate::runtime) config_ordinal: usize,
     pub(in crate::runtime) member_ordinal: u16,
+}
+
+/// Exact attachment-owned Native input for one reliable request observation.
+/// `Unavailable` is distinct from `NotApplicable`: a publish-capable QUIC
+/// attachment must not borrow a stale health-cache shape while its own
+/// authority is between activation and coherent-shape publication.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) enum ReliableRequestNativeShape {
+    NotApplicable,
+    Current(crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot),
+    Unavailable,
 }
 
 /// TCP-only priors stay typed so a QUIC observation cannot carry TCP state.
@@ -83,9 +98,39 @@ impl ClientPathContext {
                     UnderlayProtocol::Tcp => self.tcp_path_spec(attachment.key.index),
                     UnderlayProtocol::Udp => self.udp_paths.get(attachment.key.index),
                 }?;
-                let observation = health
+                let mut observation = health
                     .path_record(attachment.key)?
                     .observation_for_instance_at(attachment.path_instance_id, now)?;
+                let native_authority_stamp = match attachment.key.underlay {
+                    UnderlayProtocol::Tcp => {
+                        if input.native_scheduling_shape.is_some() {
+                            return None;
+                        }
+                        None
+                    }
+                    UnderlayProtocol::Udp => {
+                        if let Some(shape) = input.native_scheduling_shape {
+                            let scope = shape.stamp().scope();
+                            if scope.carrier_instance_id() != attachment.path_instance_id
+                                || scope.direction() != PathMetricDirection::ClientToServer
+                            {
+                                return None;
+                            }
+                            // The ready attachment owns the exact authority.
+                            // Use its coherent read directly so first-packet
+                            // ranking does not wait for diagnostic health.
+                            observation.native_scheduling_shape = Some(shape);
+                            Some(shape.stamp())
+                        } else {
+                            // Generic projection callers may inspect a QUIC
+                            // candidate without publishing packet ownership.
+                            // The packet service always supplies the exact
+                            // attachment authority and rejects `None` at its
+                            // commit boundary.
+                            None
+                        }
+                    }
+                };
                 let mut snapshot = packet_path_snapshot(path, attachment.key.index, observation);
                 snapshot.active_flows = input.active_flows;
                 let eta_ms =
@@ -95,6 +140,7 @@ impl ClientPathContext {
                     attachment,
                     snapshot,
                     eta_ms,
+                    native_authority_stamp,
                 })
             })
             .collect::<Vec<_>>();
@@ -682,7 +728,13 @@ impl ClientPathContext {
         include_bulk_admission: bool,
     ) -> ReliableRequestPathBatchObservation
     where
-        I: IntoIterator<Item = (RelayPathInstance, Option<RelayPathProofEpoch>)>,
+        I: IntoIterator<
+            Item = (
+                RelayPathInstance,
+                Option<RelayPathProofEpoch>,
+                ReliableRequestNativeShape,
+            ),
+        >,
     {
         let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
@@ -716,7 +768,7 @@ impl ClientPathContext {
         });
         let paths = attached_paths
             .into_iter()
-            .map(|(instance, proof)| {
+            .map(|(instance, proof, exact_native_shape)| {
                 let key = instance.key;
                 let observed = match key.underlay {
                     UnderlayProtocol::Tcp => self
@@ -737,7 +789,7 @@ impl ClientPathContext {
                                 .map(|observation| (path, observation, record))
                         }),
                 };
-                let Some((path, observation, record)) = observed else {
+                let Some((path, mut observation, record)) = observed else {
                     return ReliableRequestPathEvidence {
                         instance,
                         shared_snapshot: None,
@@ -746,9 +798,71 @@ impl ClientPathContext {
                         has_bulk_model_evidence: false,
                         has_fresh_native_carrier_rate_evidence: false,
                         fresh_proof: None,
+                        native_authority_stamp: None,
+                        native_authority_unavailable: false,
                         config_ordinal: self.relay_path_config_ordinal(key),
                         member_ordinal: self.relay_path_member_ordinal(key),
                     };
+                };
+                let native_authority_stamp = match (key.underlay, exact_native_shape) {
+                    (UnderlayProtocol::Tcp, ReliableRequestNativeShape::NotApplicable) => None,
+                    (UnderlayProtocol::Tcp, _) => {
+                        return ReliableRequestPathEvidence {
+                            instance,
+                            shared_snapshot: None,
+                            startup_snapshot: None,
+                            tcp: None,
+                            has_bulk_model_evidence: false,
+                            has_fresh_native_carrier_rate_evidence: false,
+                            fresh_proof: None,
+                            native_authority_stamp: None,
+                            native_authority_unavailable: false,
+                            config_ordinal: self.relay_path_config_ordinal(key),
+                            member_ordinal: self.relay_path_member_ordinal(key),
+                        };
+                    }
+                    (UnderlayProtocol::Udp, ReliableRequestNativeShape::Current(shape)) => {
+                        let scope = shape.stamp().scope();
+                        if scope.carrier_instance_id() != instance.path_instance_id
+                            || scope.direction() != PathMetricDirection::ClientToServer
+                        {
+                            return ReliableRequestPathEvidence {
+                                instance,
+                                shared_snapshot: None,
+                                startup_snapshot: None,
+                                tcp: None,
+                                has_bulk_model_evidence: false,
+                                has_fresh_native_carrier_rate_evidence: false,
+                                fresh_proof: None,
+                                native_authority_stamp: None,
+                                native_authority_unavailable: false,
+                                config_ordinal: self.relay_path_config_ordinal(key),
+                                member_ordinal: self.relay_path_member_ordinal(key),
+                            };
+                        }
+                        observation.native_scheduling_shape = Some(shape);
+                        Some(shape.stamp())
+                    }
+                    (UnderlayProtocol::Udp, ReliableRequestNativeShape::NotApplicable) => {
+                        observation
+                            .native_scheduling_shape
+                            .map(|shape| shape.stamp())
+                    }
+                    (UnderlayProtocol::Udp, ReliableRequestNativeShape::Unavailable) => {
+                        return ReliableRequestPathEvidence {
+                            instance,
+                            shared_snapshot: None,
+                            startup_snapshot: None,
+                            tcp: None,
+                            has_bulk_model_evidence: false,
+                            has_fresh_native_carrier_rate_evidence: false,
+                            fresh_proof: None,
+                            native_authority_stamp: None,
+                            native_authority_unavailable: true,
+                            config_ordinal: self.relay_path_config_ordinal(key),
+                            member_ordinal: self.relay_path_member_ordinal(key),
+                        };
+                    }
                 };
                 let fresh_proof = proof.filter(|proof| {
                     include_bulk_admission
@@ -788,6 +902,8 @@ impl ClientPathContext {
                             )
                         }),
                     fresh_proof,
+                    native_authority_stamp,
+                    native_authority_unavailable: false,
                     config_ordinal: self.relay_path_config_ordinal(key),
                     member_ordinal: self.relay_path_member_ordinal(key),
                 }

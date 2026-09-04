@@ -198,7 +198,7 @@ impl UdpPathConnection {
     pub(super) async fn bind_native_rate_authority(
         &self,
         scope: crate::model::carrier_rate_authority::CarrierRateAuthorityScope,
-        startup_prior_bps: u64,
+        startup_hint: crate::transport::RateHint,
     ) -> Result<Arc<NativeCarrierRateAuthorityHandle>, NativeCarrierRateAuthorityRuntimeError> {
         if let Some(bound) = self.native_rate_authority.requested_scope_is_bound(scope)? {
             return Ok(bound);
@@ -212,7 +212,7 @@ impl UdpPathConnection {
         loop {
             let candidate = match NativeCarrierRateAuthorityHandle::construct(
                 scope,
-                startup_prior_bps,
+                startup_hint,
                 self.connection.clone(),
             ) {
                 Ok(candidate) => candidate,

@@ -77,6 +77,8 @@ fn observed_path(
             proof_generation: 0,
             attached_at: Instant::now(),
         }),
+        native_authority_stamp: None,
+        native_authority_unavailable: false,
         config_ordinal: instance.key.index,
         member_ordinal: 0,
     }

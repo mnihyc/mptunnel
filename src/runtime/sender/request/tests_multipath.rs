@@ -2,7 +2,8 @@ use super::super::scheduling::choose_request_ack_clock_measurement_with_rates;
 use super::super::test_support::{
     client_test_context_with_paths, consume_client_path_proof_for_test,
     mark_client_path_proof_fresh_for_test, opened_test_relay_stream,
-    opened_test_relay_stream_with_underlay, security, seed_client_bulk_evidence_for_test,
+    opened_test_relay_stream_with_native_source, opened_test_relay_stream_with_underlay, security,
+    seed_client_bulk_evidence_for_test,
 };
 use super::*;
 use crate::config::ResourceLimits;
@@ -355,6 +356,7 @@ fn original_data_apply_plan(
         product_limit_bytes: None,
         request_load_expectation: None,
         request_proof_expectation: None,
+        native_authority_stamp: None,
         path_eligibility_expectation: SmallVec::new(),
     }
 }
@@ -860,7 +862,7 @@ async fn request_ordinary_writer_failure_replans_around_a_and_commits_same_tier_
     assert!(authority.has_headroom());
 
     controller
-        .record_emitted_frame(&context, b, &pending, RelaySendCause::StreamData)
+        .record_emitted_frame(&context, b, &pending, RelaySendCause::StreamData, None)
         .expect("B receipt and flight commit before carrier publication");
     let b_position = remotes
         .paths
@@ -909,6 +911,308 @@ async fn request_ordinary_writer_failure_replans_around_a_and_commits_same_tier_
         Some(_) => panic!("B published a non-frame command"),
         None => panic!("B did not publish its committed Product frame"),
     }
+}
+
+#[tokio::test]
+async fn request_native_authority_change_after_reservation_cannot_publish_product() {
+    let stream_id = StreamId(379);
+    let context = client_test_context_with_paths(&["quic://127.0.0.1:10381?initial-srtt-s=0.02"]);
+    let (commands, mut receivers) = reliable_path_command_channels(8);
+    let (opened, native) = opened_test_relay_stream_with_native_source(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        commands.clone(),
+        crate::transport::RateHint::BitsPerSecond(25_000_000),
+        7,
+        Some(100_000_000),
+    );
+    let native = native.expect("initial exact QUIC authority");
+    let instance = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        path_instance_id: opened.path_instance_id(),
+        attachment_id: 0,
+    };
+    let scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+        instance.path_instance_id,
+        crate::protocol::PathMetricDirection::ClientToServer,
+    );
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 8);
+    let target = remotes.paths[0].instance();
+    assert_eq!(target.path_instance_id, instance.path_instance_id);
+    consume_client_path_proof_for_test(&mut receivers);
+    seed_client_bulk_evidence_for_test(&context, target);
+
+    let frame = data_frame(stream_id, 0, 4096);
+    let mut sender = crate::runtime::sender::request::RequestSenderService::new(stream_id);
+    let native_after_reserve = native.clone();
+    sender.set_after_frame_reservation_for_test(move || {
+        native_after_reserve
+            .advance_transport_activation_for_test(2)
+            .expect("transport switches activation after reservation");
+        native_after_reserve
+            .publish_observation_for_test(2, 8, Some(100_000_000))
+            .expect("same-rate successor advances the central authority stamp");
+        let _ = native_after_reserve
+            .refresh_scheduling_shape_for_test(
+                scope,
+                2,
+                8,
+                Some(100_000_000),
+                Duration::from_millis(20),
+                Duration::from_millis(4),
+                512 * 1024,
+                0,
+                1400,
+                Some(100_000_000),
+                false,
+            )
+            .expect("successor shape is ready for the immediate replan");
+    });
+
+    let outcome = sender
+        .send_frame(
+            &context,
+            &mut remotes,
+            frame.clone(),
+            RelaySendCause::StreamData,
+            Some(TrafficClass::Throughput),
+        )
+        .await
+        .expect("stale Native authority replans the same live path");
+    assert_eq!(outcome.path_key, target.key);
+
+    assert_eq!(
+        sender
+            .multipath
+            .request
+            .flights
+            .original_data_in_flight_bytes(target),
+        4096,
+        "only the successor-authorized apply publishes Product ownership",
+    );
+    let mut published_data = 0;
+    while let Some(published) = try_recv_reliable_path_command(&mut receivers) {
+        match published {
+            ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => {}
+            ReliablePathCommand::SendFrame(Frame::StreamData {
+                stream_id: emitted_stream,
+                offset: 0,
+                payload,
+            }) => {
+                assert_eq!(emitted_stream, stream_id);
+                assert_eq!(payload.len(), 4096);
+                published_data += 1;
+            }
+            ReliablePathCommand::SendFrame(frame) => {
+                panic!("request apply published an unexpected frame: {frame:?}")
+            }
+            _ => panic!("request apply published a non-frame command"),
+        }
+    }
+    assert_eq!(
+        published_data, 1,
+        "the stale attempt must not publish a duplicate carrier command",
+    );
+}
+
+#[tokio::test]
+async fn request_reinjection_commit_uses_same_stamp_current_native_recovery_clock() {
+    let stream_id = StreamId(381);
+    let context = client_test_context_with_paths(&[
+        "quic://127.0.0.1:10386?initial-srtt-s=0.02&initial-rate-mbps=100",
+    ]);
+    let (commands, mut receivers) = reliable_path_command_channels(8);
+    let (opened, native) = opened_test_relay_stream_with_native_source(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        commands,
+        crate::transport::RateHint::BitsPerSecond(100_000_000),
+        7,
+        Some(100_000_000),
+    );
+    let native = native.expect("exact QUIC authority");
+    let instance = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        path_instance_id: opened.path_instance_id(),
+        attachment_id: 0,
+    };
+    let scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+        instance.path_instance_id,
+        crate::protocol::PathMetricDirection::ClientToServer,
+    );
+    let initial_shape = native
+        .refresh_scheduling_shape_for_test(
+            scope,
+            1,
+            7,
+            Some(100_000_000),
+            Duration::from_millis(20),
+            Duration::from_millis(4),
+            512 * 1024,
+            0,
+            1400,
+            Some(100_000_000),
+            false,
+        )
+        .expect("initial coherent shape");
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 8);
+    let target = remotes.paths[0].instance();
+    consume_client_path_proof_for_test(&mut receivers);
+    seed_client_bulk_evidence_for_test(&context, target);
+
+    let mut sender = crate::runtime::sender::request::RequestSenderService::new(stream_id);
+    let native_after_reserve = native.clone();
+    sender.set_after_frame_reservation_for_test(move || {
+        let current_shape = native_after_reserve
+            .refresh_scheduling_shape_for_test(
+                scope,
+                1,
+                7,
+                Some(100_000_000),
+                Duration::from_millis(300),
+                Duration::from_millis(50),
+                64 * 1024,
+                60 * 1024,
+                1400,
+                Some(100_000_000),
+                false,
+            )
+            .expect("same-source current coherent shape");
+        assert_eq!(
+            current_shape.stamp(),
+            initial_shape.stamp(),
+            "the race changes only activation-local shape, not Native authority",
+        );
+    });
+
+    let accepted_before = Instant::now();
+    let outcome = sender
+        .send_frame(
+            &context,
+            &mut remotes,
+            data_frame(stream_id, 0, 4096),
+            RelaySendCause::CompletionTailReinjection(ClientReinjectionOutputIdentity {
+                instance: target,
+            }),
+            Some(TrafficClass::Throughput),
+        )
+        .await
+        .expect("same-stamp current Native shape remains publishable");
+    let accepted_after = Instant::now();
+    let committed_deadline = outcome
+        .accepted_copy_deadline
+        .expect("reinjection publishes one immutable suppression deadline");
+    let current_interval = crate::model::timing::transport_pto_from_ms(300.0, 50.0);
+    assert!(
+        committed_deadline >= accepted_before + current_interval
+            && committed_deadline <= accepted_after + current_interval,
+        "accepted reinjection must freeze the current same-stamp Native recovery clock",
+    );
+}
+
+#[tokio::test]
+async fn request_native_activation_shape_gap_falls_through_to_tcp_without_blacklisting() {
+    let stream_id = StreamId(380);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10384?initial-srtt-s=0.2&initial-rate-mbps=1",
+        "quic://127.0.0.1:10385?initial-srtt-s=0.005&initial-rate-mbps=500",
+    ]);
+
+    let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Tcp,
+            0,
+            tcp_commands.clone(),
+        ),
+        8,
+    );
+    let tcp = remotes.paths[0].instance();
+
+    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
+    let (udp_opened, native) = opened_test_relay_stream_with_native_source(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        udp_commands.clone(),
+        crate::transport::RateHint::BitsPerSecond(500_000_000),
+        17,
+        Some(500_000_000),
+    );
+    let native = native.expect("initial fast QUIC authority");
+    remotes.attach_candidate(udp_opened);
+    let udp = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("QUIC candidate")
+        .instance();
+    consume_client_path_proof_for_test(&mut tcp_receivers);
+    consume_client_path_proof_for_test(&mut udp_receivers);
+    context.install_relay_path_instance_for_test(tcp);
+    context.install_relay_path_instance_for_test(udp);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(200), TrafficClass::Throughput);
+    context.mark_udp_path_open_success(0, Duration::from_millis(5));
+
+    let frame = data_frame(stream_id, 0, 4096);
+    let mut sender = crate::runtime::sender::request::RequestSenderService::new(stream_id);
+    let native_after_reserve = native.clone();
+    sender.set_after_frame_reservation_for_test(move || {
+        native_after_reserve
+            .advance_transport_activation_for_test(2)
+            .expect("transport advances before successor shape publication");
+        native_after_reserve
+            .publish_observation_for_test(2, 18, Some(500_000_000))
+            .expect("same-rate successor advances central authority");
+        // Deliberately leave the coherent shape unavailable. Request
+        // observation must not borrow the predecessor shape from health.
+    });
+
+    let outcome = sender
+        .send_frame(
+            &context,
+            &mut remotes,
+            frame,
+            RelaySendCause::StreamData,
+            Some(TrafficClass::Throughput),
+        )
+        .await
+        .expect("the healthy TCP peer wins while QUIC shape is unpublished");
+    assert_eq!(outcome.path_key, tcp.key);
+    assert_eq!(
+        sender
+            .multipath
+            .request
+            .flights
+            .original_data_in_flight_bytes(udp),
+        0,
+        "stale QUIC never gains Product ownership",
+    );
+    assert_eq!(
+        sender
+            .multipath
+            .request
+            .flights
+            .original_data_in_flight_bytes(tcp),
+        4096,
+        "fallback is a fresh ordinary decision, not a path failure",
+    );
+    assert!(
+        !matches!(
+            try_recv_reliable_path_command(&mut udp_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ),
+        "the stale QUIC reservation must remain unpublished",
+    );
 }
 
 #[tokio::test]
@@ -1444,6 +1748,7 @@ async fn active_ack_clock_original_data_rechecks_downshifted_product_window_and_
         product_limit_bytes: None,
         request_load_expectation: None,
         request_proof_expectation: None,
+        native_authority_stamp: None,
         path_eligibility_expectation: SmallVec::new(),
     }
     .with_eligibility_expectation(

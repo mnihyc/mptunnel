@@ -13,32 +13,17 @@
 //! serialized, opaque, activation-bound source. In particular, general
 //! metrics and a caller-selected "current" stamp are not native authority.
 
-use super::path::CarrierPathInstanceId;
-use crate::protocol::PathMetricDirection;
+use super::service_rate::{DirectionalServiceRate, QuinnBbr3NativeOperationalRate};
+pub(crate) use super::service_rate::{
+    DirectionalServiceRateScope as CarrierRateAuthorityScope, PositiveRateBps as CarrierRateBps,
+};
+use crate::transport::RateHint;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
 #[cfg(test)]
 #[path = "tests_carrier_rate_authority.rs"]
 mod tests;
-
-/// Positive scheduling rate in bits per second.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct CarrierRateBps(NonZeroU64);
-
-impl CarrierRateBps {
-    pub(crate) fn checked_from_bits_per_second(
-        bits_per_second: u64,
-    ) -> Result<Self, CarrierRateConversionError> {
-        NonZeroU64::new(bits_per_second)
-            .map(Self)
-            .ok_or(CarrierRateConversionError::Zero)
-    }
-
-    pub(crate) fn as_u64(self) -> u64 {
-        self.0.get()
-    }
-}
 
 /// Failure to project a native controller value into the scheduler lattice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,51 +38,15 @@ pub(crate) enum CarrierRateConversionError {
 /// Construction is intentionally private to this kernel. The future runtime
 /// adapter must produce it only from a coherent opaque controller observation
 /// after performing one checked bytes/s-to-bits/s conversion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NativeOperationalRate(CarrierRateBps);
-
-impl NativeOperationalRate {
-    fn checked_from_bits_per_second(
-        bits_per_second: u128,
-    ) -> Result<Self, CarrierRateConversionError> {
-        if bits_per_second % 8 != 0 {
-            return Err(CarrierRateConversionError::NotByteAligned);
-        }
-        let bits_per_second =
-            u64::try_from(bits_per_second).map_err(|_| CarrierRateConversionError::OutOfRange)?;
-        CarrierRateBps::checked_from_bits_per_second(bits_per_second).map(Self)
+fn checked_native_operational_rate(
+    bits_per_second: u128,
+) -> Result<CarrierRateBps, CarrierRateConversionError> {
+    if bits_per_second % 8 != 0 {
+        return Err(CarrierRateConversionError::NotByteAligned);
     }
-
-    fn rate(self) -> CarrierRateBps {
-        self.0
-    }
-}
-
-/// Immutable carrier-direction scope of one authority coordinator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CarrierRateAuthorityScope {
-    carrier_instance_id: CarrierPathInstanceId,
-    direction: PathMetricDirection,
-}
-
-impl CarrierRateAuthorityScope {
-    pub(crate) fn new(
-        carrier_instance_id: CarrierPathInstanceId,
-        direction: PathMetricDirection,
-    ) -> Self {
-        Self {
-            carrier_instance_id,
-            direction,
-        }
-    }
-
-    pub(crate) fn carrier_instance_id(self) -> CarrierPathInstanceId {
-        self.carrier_instance_id
-    }
-
-    pub(crate) fn direction(self) -> PathMetricDirection {
-        self.direction
-    }
+    let bits_per_second =
+        u64::try_from(bits_per_second).map_err(|_| CarrierRateConversionError::OutOfRange)?;
+    CarrierRateBps::checked_new(bits_per_second).map_err(|_| CarrierRateConversionError::Zero)
 }
 
 /// Checked non-reused mutation identity within one carrier-direction scope.
@@ -185,6 +134,17 @@ pub(crate) enum CarrierRateAuthorityBasis {
     ReceiptTerm(ReceiptTermKey),
 }
 
+/// Effective value carried by the legacy reducer.
+///
+/// Production Native mode always uses the typed directional service-rate
+/// model. Receipt mode is retained only as finite legacy proof machinery and
+/// cannot manufacture a numeric representation for Unlimited startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarrierRateAuthorityValue {
+    Native(DirectionalServiceRate),
+    ReceiptFinite(CarrierRateBps),
+}
+
 /// Immutable rate and identity read by one scheduler decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "authority snapshots must be revalidated before commit"]
@@ -192,7 +152,7 @@ pub(crate) struct CarrierRateAuthoritySnapshot {
     stamp: CarrierRateAuthorityStamp,
     mode: CarrierRateAuthorityMode,
     basis: CarrierRateAuthorityBasis,
-    rate: CarrierRateBps,
+    value: CarrierRateAuthorityValue,
 }
 
 impl CarrierRateAuthoritySnapshot {
@@ -208,8 +168,25 @@ impl CarrierRateAuthoritySnapshot {
         self.basis
     }
 
-    pub(crate) fn rate(self) -> CarrierRateBps {
-        self.rate
+    /// Returns the typed service rate for production Native mode.
+    ///
+    /// Receipt is intentionally absent from this semantic model: it is kept
+    /// only for the finite legacy reducer tests below.
+    pub(crate) fn service_rate(self) -> Option<DirectionalServiceRate> {
+        match self.value {
+            CarrierRateAuthorityValue::Native(rate) => Some(rate),
+            CarrierRateAuthorityValue::ReceiptFinite(_) => None,
+        }
+    }
+
+    /// Returns a finite numeric rate when the selected semantic value is
+    /// finite. Unlimited startup remains `None`; it is never replaced by a
+    /// large sentinel.
+    pub(crate) fn finite_rate_bps(self) -> Option<u64> {
+        match self.value {
+            CarrierRateAuthorityValue::Native(rate) => rate.finite_rate_bps(),
+            CarrierRateAuthorityValue::ReceiptFinite(rate) => Some(rate.get()),
+        }
     }
 
     /// Returns whether one checked transport source names the exact native
@@ -323,7 +300,7 @@ impl NativeCarrierRateSourceSnapshot {
                 .ok_or(NativeCarrierRateInputError::ControllerIdentityZero)?,
         );
         let observation = operational_bits_per_second
-            .map(NativeOperationalRate::checked_from_bits_per_second)
+            .map(checked_native_operational_rate)
             .transpose()
             .map_err(NativeCarrierRateInputError::OperationalRate)?
             .map_or(
@@ -431,7 +408,7 @@ struct NativeControllerActivation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeControllerObservation {
     Absent,
-    Operational(NativeOperationalRate),
+    Operational(CarrierRateBps),
 }
 
 /// One transport-issued coherent activation event for an installed controller.
@@ -534,7 +511,9 @@ impl ReceiptAuthorityRate {
     fn checked_from_bits_per_second(
         bits_per_second: u64,
     ) -> Result<Self, CarrierRateConversionError> {
-        CarrierRateBps::checked_from_bits_per_second(bits_per_second).map(Self)
+        CarrierRateBps::checked_from_bits_per_second(bits_per_second)
+            .map(Self)
+            .map_err(|_| CarrierRateConversionError::Zero)
     }
 
     fn rate(self) -> CarrierRateBps {
@@ -614,7 +593,7 @@ enum CarrierRateAuthorityState {
     Native {
         transport_activation: NativeTransportActivation,
         controller: NativeControllerIdentity,
-        operational: Option<NativeOperationalRate>,
+        operational: Option<CarrierRateBps>,
     },
     Receipt {
         generation: ReceiptModeGeneration,
@@ -648,6 +627,7 @@ pub(crate) enum CarrierRateAuthorityError {
     ReceiptTermReused,
     NativeActivationReused,
     ActiveTransportMismatch,
+    UnlimitedReceiptFallbackUnavailable,
 }
 
 /// Issuer-owned compare/apply ticket for one Native publication attempt.
@@ -701,14 +681,14 @@ struct CarrierRateAuthorityReducer {
     authority_key: AuthorityInstanceKey,
     scope: CarrierRateAuthorityScope,
     revision: CarrierRateAuthorityRevision,
-    startup_prior: CarrierRateBps,
+    startup: DirectionalServiceRate,
     state: CarrierRateAuthorityState,
 }
 
 impl CarrierRateAuthorityReducer {
-    fn new_native(
+    fn new_native_with_startup(
         scope: CarrierRateAuthorityScope,
-        startup_prior: CarrierRateBps,
+        startup: DirectionalServiceRate,
         initial: NativeControllerActivationEvent,
     ) -> (Self, NativeControllerActivation) {
         let authority_key = AuthorityInstanceKey::new();
@@ -726,7 +706,7 @@ impl CarrierRateAuthorityReducer {
                 authority_key,
                 scope,
                 revision: CarrierRateAuthorityRevision::INITIAL,
-                startup_prior,
+                startup,
                 state: CarrierRateAuthorityState::Native {
                     transport_activation: initial.transport_activation,
                     controller: initial.controller,
@@ -735,6 +715,20 @@ impl CarrierRateAuthorityReducer {
             },
             activation,
         )
+    }
+
+    #[cfg(test)]
+    fn new_native(
+        scope: CarrierRateAuthorityScope,
+        startup_prior: CarrierRateBps,
+        initial: NativeControllerActivationEvent,
+    ) -> (Self, NativeControllerActivation) {
+        let startup = DirectionalServiceRate::from_startup_hint(
+            scope,
+            RateHint::BitsPerSecond(startup_prior.get()),
+        )
+        .expect("positive test startup is a valid typed rate");
+        Self::new_native_with_startup(scope, startup, initial)
     }
 
     fn new_receipt(
@@ -747,12 +741,17 @@ impl CarrierRateAuthorityReducer {
             authority_key: authority_key.duplicate(),
             generation,
         };
+        let startup = DirectionalServiceRate::from_startup_hint(
+            scope,
+            RateHint::BitsPerSecond(startup_prior.get()),
+        )
+        .expect("positive legacy Receipt startup is a valid typed rate");
         (
             Self {
                 authority_key,
                 scope,
                 revision: CarrierRateAuthorityRevision::INITIAL,
-                startup_prior,
+                startup,
                 state: CarrierRateAuthorityState::Receipt {
                     generation,
                     fallback: startup_prior,
@@ -784,17 +783,26 @@ impl CarrierRateAuthorityReducer {
     }
 
     fn snapshot(&self) -> Option<CarrierRateAuthoritySnapshot> {
-        let (mode, basis, rate) = match self.state {
+        let (mode, basis, value) = match self.state {
             CarrierRateAuthorityState::Native { operational, .. } => match operational {
-                Some(operational) => (
-                    CarrierRateAuthorityMode::NativeOperational,
-                    CarrierRateAuthorityBasis::NativeOperational,
-                    operational.rate(),
-                ),
+                Some(operational) => {
+                    let operational =
+                        QuinnBbr3NativeOperationalRate::checked_new(self.scope, operational.get())
+                            .expect("native observations are positive by construction");
+                    let service_rate = self
+                        .startup
+                        .replace_with_quinn_bbr3_native_operational(operational)
+                        .expect("native observation is constructed for this reducer scope");
+                    (
+                        CarrierRateAuthorityMode::NativeOperational,
+                        CarrierRateAuthorityBasis::NativeOperational,
+                        CarrierRateAuthorityValue::Native(service_rate),
+                    )
+                }
                 None => (
                     CarrierRateAuthorityMode::NativeOperational,
                     CarrierRateAuthorityBasis::StartupPrior,
-                    self.startup_prior,
+                    CarrierRateAuthorityValue::Native(self.startup),
                 ),
             },
             CarrierRateAuthorityState::Receipt {
@@ -809,12 +817,12 @@ impl CarrierRateAuthorityReducer {
                         generation,
                         term_id: term.id,
                     }),
-                    term.rate.rate(),
+                    CarrierRateAuthorityValue::ReceiptFinite(term.rate.rate()),
                 ),
                 None => (
                     CarrierRateAuthorityMode::Receipt,
                     CarrierRateAuthorityBasis::ReceiptFallback,
-                    fallback,
+                    CarrierRateAuthorityValue::ReceiptFinite(fallback),
                 ),
             },
             CarrierRateAuthorityState::Terminal => return None,
@@ -823,7 +831,7 @@ impl CarrierRateAuthorityReducer {
             stamp: self.stamp(),
             mode,
             basis,
-            rate,
+            value,
         })
     }
 
@@ -950,8 +958,15 @@ impl CarrierRateAuthorityReducer {
             return Err(CarrierRateAuthorityError::NativeActivationMismatch);
         }
         self.require_active_transport(active_transport, transport_activation)?;
-        let old_prediction = operational.map_or(self.startup_prior, NativeOperationalRate::rate);
-        let fallback = self.startup_prior.min(old_prediction);
+        let startup = self.startup.value().finite_rate();
+        let fallback = match (startup, operational) {
+            (Some(startup), Some(operational)) => startup.min(operational),
+            (Some(startup), None) => startup,
+            (None, Some(operational)) => operational,
+            (None, None) => {
+                return Err(CarrierRateAuthorityError::UnlimitedReceiptFallbackUnavailable);
+            }
+        };
         let generation = ready.receipt.generation;
         let transition = self.commit(CarrierRateAuthorityState::Receipt {
             generation,
@@ -1123,7 +1138,7 @@ impl CarrierRateAuthorityReducer {
         (
             NativeTransportActivation,
             NativeControllerIdentity,
-            Option<NativeOperationalRate>,
+            Option<CarrierRateBps>,
         ),
         CarrierRateAuthorityError,
     > {
@@ -1198,10 +1213,10 @@ impl NativeCarrierRateAuthority {
     /// scope-bound active-controller snapshot.
     pub(crate) fn new(
         scope: CarrierRateAuthorityScope,
-        startup_prior: CarrierRateBps,
+        startup: DirectionalServiceRate,
         initial: NativeCarrierRateSourceSnapshot,
     ) -> Result<Self, CarrierRateAuthorityError> {
-        if initial.scope != scope {
+        if initial.scope != scope || startup.scope() != scope {
             return Err(CarrierRateAuthorityError::AuthorityScopeMismatch);
         }
         let initial = NativeControllerActivationEvent {
@@ -1210,7 +1225,7 @@ impl NativeCarrierRateAuthority {
             observation: initial.observation,
         };
         let (reducer, _initial_activation_capability) =
-            CarrierRateAuthorityReducer::new_native(scope, startup_prior, initial);
+            CarrierRateAuthorityReducer::new_native_with_startup(scope, startup, initial);
         Ok(Self { reducer })
     }
 

@@ -69,7 +69,7 @@ fn request_quic_path_metrics(now: Instant, deadline: Instant) -> UdpPathMetrics 
 }
 
 #[test]
-fn quic_native_authority_bypasses_ack_rate_and_freshness_gates() {
+fn t02_quic_startup_authority_is_local_while_independent_rate_remains_wire_diagnostic() {
     let instance = crate::model::path::next_carrier_path_instance_id();
     let scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
         instance,
@@ -95,17 +95,38 @@ fn quic_native_authority_bypasses_ack_rate_and_freshness_gates() {
         .expect("matching activation-local shape");
     let now = Instant::now();
     let mut raw_ack_metrics = request_quic_path_metrics(now, now + Duration::from_millis(1));
+    raw_ack_metrics.controller_path_epoch = 7;
     raw_ack_metrics.delivery_rate_bps = 900_000_000.0;
     raw_ack_metrics.pacing_rate_bps = 950_000_000.0;
     raw_ack_metrics.inflight_hi = 32 * 1024 * 1024;
 
     let mut record = ClientPathHealthRecord::default();
     record.install_udp_peer_usage(instance, 7, 0, PathUsage::Available);
+    record.mark_quic_path_metrics(instance, raw_ack_metrics);
     record.mark_quic_native_authority_metrics(instance, raw_ack_metrics, shape);
 
+    let path = "quic://127.0.0.1:10000"
+        .parse::<PathSpec>()
+        .expect("QUIC path");
+    let fresh_observation = record.observation_at(now);
+    let fresh_snapshot = path_snapshot(&path, 0, fresh_observation);
+    assert_eq!(fresh_snapshot.delivery_rate_bps, 25_000_000.0);
+    assert_eq!(
+        fresh_snapshot.carrier_delivery_rate_bps,
+        Some(900_000_000.0)
+    );
+    let fresh_wire = path_metrics_from_snapshot_at(
+        fresh_snapshot,
+        fresh_observation,
+        PathMetricDirection::ClientToServer,
+        now,
+    );
+    assert_eq!(fresh_wire.delivery_rate_bps, 900_000_000);
+    assert!(fresh_wire.rate_observed);
+
     let observation = record.observation_at(now + Duration::from_secs(3_600));
-    assert_eq!(observation.carrier_delivery_rate_bps, Some(25_000_000.0));
-    assert_eq!(observation.carrier_pacing_rate_bps, Some(30_000_000.0));
+    assert_eq!(observation.carrier_delivery_rate_bps, None);
+    assert_eq!(observation.carrier_pacing_rate_bps, None);
     assert_eq!(observation.carrier_inflight_limit_bytes, 2 * 1024 * 1024);
     assert_eq!(observation.carrier_bytes_in_flight, 256 * 1024);
     assert_eq!(observation.carrier_delivery_samples, 0);
@@ -116,12 +137,9 @@ fn quic_native_authority_bypasses_ack_rate_and_freshness_gates() {
         Some(crate::model::carrier_rate_authority::CarrierRateAuthorityBasis::StartupPrior)
     );
     assert!(!observation.carrier_queue_bytes_observed);
-    let path = "quic://127.0.0.1:10000"
-        .parse::<PathSpec>()
-        .expect("QUIC path");
     let snapshot = path_snapshot(&path, 0, observation);
     assert_eq!(snapshot.delivery_rate_bps, 25_000_000.0);
-    assert_eq!(snapshot.carrier_delivery_rate_bps, Some(25_000_000.0));
+    assert_eq!(snapshot.carrier_delivery_rate_bps, None);
     assert_eq!(snapshot.product_progress_rate_bps, None);
     let wire = path_metrics_from_snapshot_at(
         snapshot,
@@ -130,9 +148,68 @@ fn quic_native_authority_bypasses_ack_rate_and_freshness_gates() {
         now + Duration::from_secs(3_600),
     );
     assert!(!wire.rate_observed);
+    assert_eq!(wire.delivery_rate_bps, 351_472);
     assert!(!wire.has_ack_derived_data_sample);
     assert_eq!(wire.data_sample_count, 0);
     assert_eq!(wire.data_sample_bytes, 0);
+}
+
+#[test]
+fn t02_quic_native_operational_rate_remains_a_wire_diagnostic_without_ack_provenance() {
+    let instance = crate::model::path::next_carrier_path_instance_id();
+    let scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+        instance,
+        PathMetricDirection::ClientToServer,
+    );
+    let authority = NativeCarrierRateAuthorityHandle::from_observation_for_test(
+        scope,
+        25_000_000,
+        1,
+        7,
+        Some(200_000_000),
+    )
+    .expect("central native authority");
+    let shape = authority
+        .refresh_scheduling_shape_for_test(
+            scope,
+            1,
+            7,
+            Some(200_000_000),
+            Duration::from_millis(80),
+            Duration::from_millis(12),
+            2 * 1024 * 1024,
+            256 * 1024,
+            1400,
+            Some(210_000_000),
+            false,
+        )
+        .expect("matching activation-local shape");
+    let now = Instant::now();
+    let mut metrics = request_quic_path_metrics(now, now + Duration::from_millis(1));
+    metrics.last_delivery_sample_at = None;
+    metrics.bulk_proof_expires_at = None;
+    metrics.delivery_sample_count = 0;
+    metrics.delivery_sample_bytes = 0;
+    let mut record = ClientPathHealthRecord::default();
+    record.install_udp_peer_usage(instance, 7, 0, PathUsage::Available);
+    record.mark_quic_native_authority_metrics(instance, metrics, shape);
+
+    let observation = record.observation_at(now + Duration::from_secs(3_600));
+    assert_eq!(observation.carrier_delivery_rate_bps, Some(200_000_000.0));
+    let path = "quic://127.0.0.1:10000"
+        .parse::<PathSpec>()
+        .expect("QUIC path");
+    let snapshot = path_snapshot(&path, 0, observation);
+    assert_eq!(snapshot.delivery_rate_bps, 200_000_000.0);
+    let wire = path_metrics_from_snapshot_at(
+        snapshot,
+        observation,
+        PathMetricDirection::ClientToServer,
+        now + Duration::from_secs(3_600),
+    );
+    assert_eq!(wire.delivery_rate_bps, 200_000_000);
+    assert!(!wire.rate_observed);
+    assert_eq!(wire.rate_valid_for_us, 0);
 }
 
 #[test]
@@ -922,7 +999,8 @@ fn generic_udp_feedback_does_not_refresh_expired_product_authority() {
         PathMetricDirection::ClientToServer,
         generic_at,
     );
-    assert_eq!(snapshot.delivery_rate_bps, generic_sample.rate_bps());
+    assert_eq!(snapshot.delivery_rate_bps, 351_472.0);
+    assert_eq!(metrics.delivery_rate_bps, generic_sample.rate_bps() as u64);
     assert_eq!(metrics.rate_valid_for_us, 2_000_000);
     assert_eq!(metrics.data_sample_count, 1);
     assert_eq!(metrics.data_sample_bytes, generic_sample.bytes());
@@ -973,7 +1051,8 @@ fn product_delivery_does_not_refresh_expired_generic_or_its_path_metrics_epoch()
         PathMetricDirection::ClientToServer,
         product_at,
     );
-    assert_eq!(snapshot.delivery_rate_bps, sample.rate_bps());
+    assert_eq!(snapshot.delivery_rate_bps, 351_472.0);
+    assert_eq!(metrics.delivery_rate_bps, sample.rate_bps() as u64);
     assert_eq!(metrics.data_sample_count, 1);
     assert_eq!(metrics.data_sample_bytes, sample.bytes());
     assert!(metrics.rate_valid_for_us > 0);
@@ -1011,7 +1090,7 @@ fn quic_native_congestion_remains_diagnostic_without_becoming_product_feedback()
     let snapshot = path_snapshot(&path, 0, observation);
     assert_eq!(snapshot.carrier_delivery_rate_bps, Some(200_000_000.0));
     assert_eq!(snapshot.product_progress_rate_bps, None);
-    assert_eq!(snapshot.delivery_rate_bps, 200_000_000.0);
+    assert_eq!(snapshot.delivery_rate_bps, 351_472.0);
     assert_eq!(snapshot.carrier_inflight_limit_bytes, 4 * 1024 * 1024);
     assert_eq!(snapshot.srtt_ms, 180.0);
     assert_eq!(snapshot.loss_rate, 0.0);

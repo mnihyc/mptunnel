@@ -26,6 +26,7 @@ use crate::protocol::frame::{
 };
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
 use crate::runtime::RuntimeError;
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathSnapshot, TrafficClass};
@@ -1272,7 +1273,7 @@ impl ResponseStreamBinding {
         after_reserve();
         let native_authority = commands.native_rate_authority().cloned();
         let expected_native_stamp = target.native_authority_stamp;
-        let commit = || {
+        let commit = |current_native_shape: Option<NativeCarrierSchedulingShapeSnapshot>| {
             let mut outputs = self
                 .outputs
                 .lock()
@@ -1284,22 +1285,20 @@ impl ResponseStreamBinding {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
             let entry = &outputs.entries[target_index];
-            let snapshot = if let Some(stamp) = expected_native_stamp {
-                let shape = entry
-                    .native_scheduling_shape
-                    .filter(|shape| shape.stamp() == stamp)
-                    .ok_or(RuntimeError::SenderServiceBlocked)?;
-                server_native_bulk_output_snapshot_at(
-                    entry,
-                    outputs.data_level_queue_bytes,
-                    lane,
-                    self.mux_limits,
-                    Some(shape),
-                )
-            } else {
-                outputs
+            let snapshot = match (expected_native_stamp, current_native_shape) {
+                (Some(stamp), Some(shape)) if shape.stamp() == stamp => {
+                    server_native_bulk_output_snapshot_at(
+                        entry,
+                        outputs.data_level_queue_bytes,
+                        lane,
+                        self.mux_limits,
+                        Some(shape),
+                    )
+                }
+                (None, None) => outputs
                     .snapshot_for_instance(target.key, target.incarnation, lane, self.mux_limits)
-                    .ok_or(RuntimeError::SenderServiceBlocked)?
+                    .ok_or(RuntimeError::SenderServiceBlocked)?,
+                _ => return Err(RuntimeError::SenderServiceBlocked),
             };
             let accepted_reinjection_bytes =
                 self.retained_reinjected_data_bytes_for_identity(ServerReinjectionOutputIdentity {
@@ -1342,9 +1341,9 @@ impl ResponseStreamBinding {
         };
         match (native_authority, expected_native_stamp) {
             (Some(authority), Some(stamp)) => authority
-                .commit_if_current(stamp, commit)
+                .commit_with_current_scheduling_shape(stamp, |shape| commit(Some(shape)))
                 .map_err(|_| RuntimeError::SenderServiceBlocked)?,
-            (None, None) => commit(),
+            (None, None) if target.key.underlay == UnderlayProtocol::Tcp => commit(None),
             _ => Err(RuntimeError::SenderServiceBlocked),
         }
     }

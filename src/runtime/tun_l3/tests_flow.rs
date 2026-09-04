@@ -29,6 +29,33 @@ fn recent_load_expires_without_discarding_affinity_cache() {
 }
 
 #[test]
+fn advisory_affinity_read_does_not_extend_activity_before_acceptance() {
+    let now = Instant::now();
+    let timeout = Duration::from_millis(100);
+    let mut table = PacketFlowTable::new(8);
+    let key = flow(3);
+    table.bind(key.clone(), 7_u8, now, timeout);
+
+    assert_eq!(
+        table.planned_current(&key, now + Duration::from_millis(90), |_| true),
+        Some(7),
+    );
+    assert_eq!(
+        table.planned_current(&key, now + Duration::from_millis(110), |_| true),
+        None,
+        "an advisory read cannot keep a blocked or stale carrier affinity live",
+    );
+
+    table.bind(key.clone(), 9_u8, now, timeout);
+    assert!(table.commit_planned_current(&key, 9, now + Duration::from_millis(90),));
+    assert_eq!(
+        table.planned_current(&key, now + Duration::from_millis(110), |_| true),
+        Some(9),
+        "only a carrier-accepted packet extends the activity clock",
+    );
+}
+
+#[test]
 fn carrier_removal_clears_only_its_affinities() {
     let now = Instant::now();
     let timeout = Duration::from_secs(1);

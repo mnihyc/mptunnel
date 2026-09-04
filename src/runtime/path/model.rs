@@ -5,14 +5,18 @@ use crate::model::capacity::{
     RELIABLE_INITIAL_RTT, RELIABLE_INITIAL_WINDOW_PACKETS, UDP_BASELINE_PACKET_PAYLOAD_BYTES,
     reliable_product_feedback_window_bytes,
 };
-use crate::model::carrier_rate_authority::CarrierRateAuthorityBasis;
+use crate::model::carrier_rate_authority::{CarrierRateAuthorityBasis, CarrierRateAuthorityStamp};
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
+use crate::model::service_rate::{
+    DirectionalServiceRate, DirectionalServiceRateScope, portable_startup_rate,
+};
 use crate::model::timing::{transport_pto_from_ms, transport_pto_from_snapshot};
 use crate::mux::MuxLimits;
 use crate::protocol::{
     PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics, PathUsage,
     UnderlayProtocol,
 };
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::scheduler::{
     self, PathRateScope, PathSnapshot, PathState as SchedulerPathState, TrafficClass,
@@ -44,6 +48,9 @@ pub(in crate::runtime) struct PacketPathAttachment {
 pub(in crate::runtime) struct PacketPathSelectionInput {
     pub(in crate::runtime) attachment: PacketPathAttachment,
     pub(in crate::runtime) active_flows: u32,
+    /// Exact Native shape captured from the ready QUIC attachment's own
+    /// authority. TCP has no Native adapter and therefore carries `None`.
+    pub(in crate::runtime) native_scheduling_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
 }
 
 /// One immutable carrier candidate for layer-3 packet affinity.
@@ -52,6 +59,9 @@ pub(in crate::runtime) struct PacketPathCandidate {
     pub(in crate::runtime) attachment: PacketPathAttachment,
     pub(in crate::runtime) snapshot: PathSnapshot,
     pub(in crate::runtime) eta_ms: f64,
+    /// Hard precommit token for a QUIC decision. Advisory health fields alone
+    /// cannot authorize publishing bytes after this stamp changes.
+    pub(in crate::runtime) native_authority_stamp: Option<CarrierRateAuthorityStamp>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -624,30 +634,45 @@ pub(in crate::runtime) fn path_snapshot_with_id(
     path_id: PathId,
     observation: ClientPathObservation,
 ) -> PathSnapshot {
-    let hinted_delivery_rate_bps = startup_rate_prediction_bps(path.metadata.initial_rate);
+    let startup_diagnostic_rate_bps = startup_rate_prediction_bps(path.metadata.initial_rate);
+    let scheduling_service_rate = observation
+        .native_scheduling_shape
+        .filter(|shape| {
+            path.underlay == UnderlayProtocol::Udp
+                && observation
+                    .path_instance_id
+                    .is_some_and(|path_instance_id| {
+                        shape.service_rate().scope()
+                            == DirectionalServiceRateScope::new(
+                                path_instance_id,
+                                PathMetricDirection::ClientToServer,
+                            )
+                    })
+        })
+        .map(NativeCarrierSchedulingShapeSnapshot::service_rate)
+        .or_else(|| {
+            observation.path_instance_id.and_then(|path_instance_id| {
+                directional_startup_service_rate(
+                    path,
+                    path_instance_id,
+                    PathMetricDirection::ClientToServer,
+                )
+            })
+        });
     // The health record retains the raw Product point for diagnostics and
     // smoothing. Completion/ranking sees it only through the established
     // Product service-quantum qualification boundary.
     let product_progress_rate_bps =
         client_path_observation_qualified_product_completion_rate(path, observation);
     let has_durable_product_progress = product_progress_rate_bps.is_some();
-    let carrier_capacity_rate_bps = observation.carrier_delivery_rate_bps.filter(|_| {
-        path.underlay != UnderlayProtocol::Tcp
-            || bulk_candidate_has_native_carrier_rate_evidence(path, observation)
-    });
-    let (delivery_rate_bps, rate_scope) = if let Some(rate) = carrier_capacity_rate_bps {
-        (rate, PathRateScope::PathCapacity)
-    } else if let Some(rate) = product_progress_rate_bps {
-        if hinted_delivery_rate_bps >= rate {
-            (hinted_delivery_rate_bps, PathRateScope::PathCapacity)
-        } else {
-            (rate, PathRateScope::PerFlowGoodput)
-        }
-    } else if let Some(rate) = observation.measured_rate_bps {
-        (rate, PathRateScope::PathCapacity)
-    } else {
-        (hinted_delivery_rate_bps, PathRateScope::PathCapacity)
-    };
+    let carrier_capacity_rate_bps = observation.carrier_delivery_rate_bps;
+    // Keep the legacy scalar as a lossy diagnostic projection of the one
+    // typed authority only. Product, PATH_CAPACITY, generic, and TCP kernel
+    // samples retain their own fields but cannot select C.
+    let delivery_rate_bps = scheduling_service_rate
+        .and_then(DirectionalServiceRate::finite_rate_bps)
+        .map_or(startup_diagnostic_rate_bps, |rate| rate as f64);
+    let rate_scope = PathRateScope::PathCapacity;
     let delivery_rate_bps = delivery_rate_bps.max(1.0);
     let srtt_ms = path_model_srtt_ms(path, observation);
     let jitter_ms = observation
@@ -668,6 +693,7 @@ pub(in crate::runtime) fn path_snapshot_with_id(
         srtt_ms,
         jitter_ms,
         delivery_rate_bps,
+        scheduling_service_rate,
         rate_scope,
         carrier_delivery_rate_bps: carrier_capacity_rate_bps,
         product_progress_rate_bps,
@@ -712,10 +738,34 @@ pub(in crate::runtime) fn path_snapshot_with_id(
 /// no measurement provenance or Product qualification.
 pub(in crate::runtime) fn startup_rate_prediction_bps(initial_rate: RateHint) -> f64 {
     match initial_rate {
-        RateHint::Unknown => default_path_rate_bps(),
-        RateHint::Unlimited => 1_000_000_000_000.0,
-        RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
+        RateHint::Unknown | RateHint::Unlimited => portable_startup_rate()
+            .expect("portable scheduling rate is representable")
+            .get() as f64,
+        RateHint::BitsPerSecond(rate) => rate as f64,
     }
+}
+
+pub(in crate::runtime) fn directional_startup_service_rate(
+    path: &PathSpec,
+    path_instance_id: CarrierPathInstanceId,
+    direction: PathMetricDirection,
+) -> Option<DirectionalServiceRate> {
+    DirectionalServiceRate::from_startup_hint(
+        DirectionalServiceRateScope::new(path_instance_id, direction),
+        path.metadata.initial_rate,
+    )
+    .ok()
+}
+
+pub(in crate::runtime) fn path_startup_snapshot_for_instance(
+    path: &PathSpec,
+    path_id: PathId,
+    path_instance_id: CarrierPathInstanceId,
+    direction: PathMetricDirection,
+) -> PathSnapshot {
+    let snapshot = path_startup_snapshot(path, path_id);
+    directional_startup_service_rate(path, path_instance_id, direction)
+        .map_or(snapshot, |rate| snapshot.with_scheduling_service_rate(rate))
 }
 
 pub(in crate::runtime) fn path_startup_snapshot(path: &PathSpec, path_id: PathId) -> PathSnapshot {
@@ -766,15 +816,38 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
     // controller opportunity have no detached rate authority; carrier,
     // Product, and generic samples retain only their immutable source lifetime.
     let carrier_rate_selected = snapshot.carrier_delivery_rate_bps.is_some();
-    let native_authority_selected =
-        carrier_rate_selected && observation.native_carrier_authority_basis.is_some();
-    let product_rate_selected = !carrier_rate_selected
-        && snapshot.product_progress_rate_bps.is_some()
-        && snapshot.rate_scope == PathRateScope::PerFlowGoodput;
+    let native_authority_selected = carrier_rate_selected
+        && observation.native_carrier_authority_basis
+            == Some(CarrierRateAuthorityBasis::NativeOperational);
+    let product_rate_selected =
+        !carrier_rate_selected && snapshot.product_progress_rate_bps.is_some();
     let generic_rate_selected = !carrier_rate_selected
         && snapshot.product_progress_rate_bps.is_none()
         && observation.measured_rate_bps.is_some();
-    let wire_delivery_rate_bps = snapshot.delivery_rate_bps.max(1.0);
+    // Detached PATH_METRICS is diagnostic telemetry. Once scheduling C is
+    // separated from observations, pairing an observation's lifetime with C
+    // would publish the right provenance and the wrong value. Serialize the
+    // selected diagnostic source itself; use the startup projection only when
+    // no observed source is present (and therefore no observed lifetime).
+    let unobserved_wire_placeholder_bps = portable_startup_rate()
+        .expect("portable PATH_METRICS placeholder is representable")
+        .get() as f64;
+    let wire_delivery_rate_bps = if carrier_rate_selected {
+        snapshot.carrier_delivery_rate_bps
+    } else if product_rate_selected {
+        snapshot.product_progress_rate_bps
+    } else if generic_rate_selected {
+        observation.measured_rate_bps
+    } else {
+        // Configured and Unlimited startup are endpoint-local policy and MUST
+        // NOT be serialized for the peer. PATH_METRICS has no optional rate
+        // integer, so use the deterministic portable C0 placeholder together
+        // with `rate_observed = false`; consumers must treat that pair as no
+        // observed diagnostic rate.
+        Some(unobserved_wire_placeholder_bps)
+    }
+    .unwrap_or(unobserved_wire_placeholder_bps)
+    .max(1.0);
     let (rate_observed_at, rate_expires_at, data_sample_count, data_sample_bytes) =
         if native_authority_selected {
             // Native C0/Bop is endpoint-local central authority, not a
@@ -1189,7 +1262,9 @@ pub(in crate::runtime) fn default_path_srtt_ms() -> f64 {
 }
 
 pub(in crate::runtime) fn default_path_rate_bps() -> f64 {
-    PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
+    portable_startup_rate()
+        .expect("portable scheduling rate is representable")
+        .get() as f64
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1197,6 +1272,7 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
     pub(in crate::runtime) wire_path_id: Option<PathId>,
+    pub(in crate::runtime) path_instance_id: Option<CarrierPathInstanceId>,
     pub(in crate::runtime) peer_usage: Option<PathUsage>,
     pub(in crate::runtime) measured_srtt_ms: Option<f64>,
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
@@ -1241,6 +1317,9 @@ pub(in crate::runtime) struct ClientPathObservation {
     /// Endpoint-local central QUIC C0/Bop provenance. It qualifies NativeMode
     /// scheduling without fabricating an ACK sample or transferable epoch.
     pub(in crate::runtime) native_carrier_authority_basis: Option<CarrierRateAuthorityBasis>,
+    /// Complete exact-scope QUIC rate projection. Independent scalar fields
+    /// remain diagnostics and cannot reconstruct this authority.
+    pub(in crate::runtime) native_scheduling_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
     pub(in crate::runtime) path_proof_success: bool,
 }
 
@@ -1250,6 +1329,7 @@ impl Default for ClientPathObservation {
             state: SchedulerPathState::Suspect,
             manual_disabled: false,
             wire_path_id: None,
+            path_instance_id: None,
             peer_usage: None,
             measured_srtt_ms: None,
             measured_jitter_ms: None,
@@ -1290,6 +1370,7 @@ impl Default for ClientPathObservation {
             carrier_ack_derived_data_seen: false,
             explicit_carrier_capacity_proof: false,
             native_carrier_authority_basis: None,
+            native_scheduling_shape: None,
             path_proof_success: false,
         }
     }

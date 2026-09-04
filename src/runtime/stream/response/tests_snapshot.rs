@@ -26,6 +26,7 @@ use crate::model::capacity::{
 use crate::model::carrier_rate_authority::CarrierRateAuthorityScope;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
 use crate::model::requalification::StreamPathQualification;
+use crate::model::service_rate::{ServiceRateBasis, ServiceRateValue};
 use crate::mux::MuxLimits;
 use crate::protocol::{
     PathId, PathMetricDirection, PathMetrics, PathUsage, SessionId, UnderlayProtocol,
@@ -97,6 +98,52 @@ fn install_raw_product_point_rate(entry: &mut ResponseStreamOutputEntry, rate_bp
     );
 }
 
+fn portable_startup_rate_bps() -> f64 {
+    crate::runtime::path::model::startup_rate_prediction_bps(RateHint::Unknown)
+}
+
+#[test]
+fn t02_red_response_tcp_product_diagnostic_cannot_replace_scoped_startup_service_rate() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(61),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    entry.startup_rate_prior = RateHint::BitsPerSecond(25_000_000);
+    install_product_rate(&mut entry, 900_000_000.0);
+    entry.local_path_metrics = Some(path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        40_000,
+        117_000_000,
+        130_000_000,
+    ));
+
+    let snapshot =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    let service_rate = snapshot
+        .scheduling_service_rate()
+        .expect("an exact response action must carry its scoped service rate");
+
+    assert_eq!(
+        service_rate.scope().carrier_instance_id(),
+        entry.path_instance_id,
+    );
+    assert_eq!(
+        service_rate.scope().direction(),
+        PathMetricDirection::ServerToClient,
+    );
+    assert_eq!(service_rate.basis(), ServiceRateBasis::ConfiguredStartup);
+    assert_eq!(service_rate.finite_rate_bps(), Some(25_000_000));
+    assert_eq!(
+        snapshot.delivery_rate_bps, 25_000_000.0,
+        "Product goodput remains diagnostic and cannot select advisory C",
+    );
+    assert_eq!(snapshot.product_progress_rate_bps, Some(900_000_000.0));
+    assert_eq!(snapshot.carrier_delivery_rate_bps, Some(117_000_000.0));
+}
+
 #[test]
 fn response_product_assignment_qualification_does_not_require_a_rate_epoch() {
     let mux_limits = MuxLimits::default();
@@ -149,13 +196,13 @@ fn response_product_assignment_qualification_does_not_require_a_rate_epoch() {
     );
     assert_eq!(
         target.observation.snapshot.delivery_rate_bps,
-        crate::runtime::path::model::default_path_rate_bps(),
+        portable_startup_rate_bps(),
     );
     assert_eq!(target.observation.snapshot.product_progress_rate_bps, None);
 }
 
 #[test]
-fn product_epoch_snapshot_and_bulk_authority_share_the_exact_deadline() {
+fn product_epoch_diagnostic_and_bulk_eligibility_share_the_exact_deadline() {
     let mux_limits = MuxLimits::default();
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
@@ -177,7 +224,8 @@ fn product_epoch_snapshot_and_bulk_authority_share_the_exact_deadline() {
     let fresh_at = expires_at - Duration::from_nanos(1);
     let fresh =
         server_bulk_output_snapshot_at(&entry, 0, TrafficClass::Throughput, mux_limits, fresh_at);
-    assert_eq!(fresh.delivery_rate_bps, 90_000_000.0);
+    assert_eq!(fresh.delivery_rate_bps, portable_startup_rate_bps());
+    assert_eq!(fresh.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(fresh.product_progress_rate_bps, Some(90_000_000.0));
     assert!(server_output_has_bulk_rate_evidence_at(
         &entry, mux_limits, fresh_at,
@@ -198,10 +246,7 @@ fn product_epoch_snapshot_and_bulk_authority_share_the_exact_deadline() {
 
     let expired =
         server_bulk_output_snapshot_at(&entry, 0, TrafficClass::Throughput, mux_limits, expires_at);
-    assert_eq!(
-        expired.delivery_rate_bps,
-        crate::runtime::path::model::default_path_rate_bps()
-    );
+    assert_eq!(expired.delivery_rate_bps, portable_startup_rate_bps());
     assert_eq!(expired.product_progress_rate_bps, None);
     assert!(!server_output_has_bulk_rate_evidence_at(
         &entry, mux_limits, expires_at,
@@ -215,7 +260,7 @@ fn product_epoch_snapshot_and_bulk_authority_share_the_exact_deadline() {
 fn fresh_product_point_rate_requires_epoch_and_lifetime_floors_for_completion_authority() {
     let mux_limits = MuxLimits::default();
     let sample_floor = reliable_path_startup_sample_limit_bytes(mux_limits);
-    let fallback_rate = crate::runtime::path::model::default_path_rate_bps();
+    let fallback_rate = portable_startup_rate_bps();
     let raw_rate = 900_000_000.0;
 
     for (ordinal, underlay) in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp]
@@ -285,8 +330,8 @@ fn fresh_product_point_rate_requires_epoch_and_lifetime_floors_for_completion_au
             mux_limits,
             observed_at,
         );
-        assert_eq!(qualified.delivery_rate_bps, raw_rate, "{underlay:?}");
-        assert_eq!(qualified.rate_scope, PathRateScope::PerFlowGoodput);
+        assert_eq!(qualified.delivery_rate_bps, fallback_rate, "{underlay:?}");
+        assert_eq!(qualified.rate_scope, PathRateScope::PathCapacity);
         assert_eq!(qualified.product_progress_rate_bps, Some(raw_rate));
         assert!(qualified.has_durable_product_progress);
 
@@ -388,7 +433,13 @@ fn configured_tcp_startup_prior_survives_response_projection_without_becoming_ev
         key.path_id,
         PathMetricDirection::ServerToClient,
     );
-    assert_eq!(startup_metrics.delivery_rate_bps, 500_000_000);
+    assert_eq!(
+        startup_metrics.delivery_rate_bps,
+        crate::model::service_rate::portable_startup_rate()
+            .expect("portable PATH_METRICS placeholder")
+            .get(),
+        "endpoint-local configured startup policy must not be serialized to the peer",
+    );
     assert!(!startup_metrics.rate_observed);
     assert_eq!(startup_metrics.rate_valid_for_us, 0);
     assert!(!startup_metrics.has_ack_derived_data_sample);
@@ -568,7 +619,7 @@ fn reinjection_flight_cannot_mint_new_original_data_credit() {
 }
 
 #[test]
-fn newer_switchable_product_rate_changes_ranking_without_rewriting_product_authority() {
+fn newer_switchable_product_rate_stays_diagnostic_without_rewriting_authorities() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(29),
@@ -613,11 +664,12 @@ fn newer_switchable_product_rate_changes_ranking_without_rewriting_product_autho
     let expected = reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
 
     assert_eq!(snapshot.carrier_inflight_limit_bytes, 1024 * 1024);
-    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
-    assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(snapshot.delivery_rate_bps, portable_startup_rate_bps());
+    assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(snapshot.product_progress_rate_bps, Some(500_000_000.0));
     assert_eq!(
         snapshot.data_level_limit_bytes, expected,
-        "newer exact Product service changes completion ranking while C remains diagnostic and P remains configured",
+        "newer exact Product diagnostics cannot rewrite startup C or configured P",
     );
     let outputs = ResponseStreamOutputs {
         next_output_incarnation: Some(2),
@@ -875,7 +927,7 @@ fn original_flight_demand_divides_capacity_until_its_unique_ack() {
 }
 
 #[test]
-fn tcp_receipt_mode_uses_max_of_startup_prior_and_qualified_product_rate() {
+fn tcp_response_keeps_startup_rate_while_product_and_kernel_rates_stay_diagnostic() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
@@ -929,12 +981,12 @@ fn tcp_receipt_mode_uses_max_of_startup_prior_and_qualified_product_rate() {
     install_product_rate(&mut entry, 800_000_000.0);
     let higher_product =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(higher_product.delivery_rate_bps, 800_000_000.0);
+    assert_eq!(higher_product.delivery_rate_bps, 500_000_000.0);
     assert_eq!(
         higher_product.product_progress_rate_bps,
         Some(800_000_000.0),
     );
-    assert_eq!(higher_product.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(higher_product.rate_scope, PathRateScope::PathCapacity);
 }
 
 #[test]
@@ -1069,6 +1121,118 @@ fn udp_native_snapshot_fails_closed_without_an_exact_carrier_direction_shape() {
 }
 
 #[test]
+fn t02_response_quic_exact_native_shape_replaces_startup_but_product_does_not() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(62),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    entry.startup_rate_prior = RateHint::BitsPerSecond(25_000_000);
+    install_product_rate(&mut entry, 900_000_000.0);
+    let scope =
+        CarrierRateAuthorityScope::new(entry.path_instance_id, PathMetricDirection::ServerToClient);
+    let authority = NativeCarrierRateAuthorityHandle::from_observation_for_test(
+        scope,
+        25_000_000,
+        7,
+        79,
+        Some(200_000_000),
+    )
+    .expect("valid response authority");
+    entry.commands = entry
+        .commands
+        .clone()
+        .with_native_rate_authority(authority.clone());
+    entry.native_scheduling_shape = Some(
+        authority
+            .refresh_scheduling_shape_for_test(
+                scope,
+                7,
+                79,
+                Some(200_000_000),
+                Duration::from_millis(80),
+                Duration::from_millis(8),
+                4_000_000,
+                400_000,
+                1_400,
+                Some(210_000_000),
+                false,
+            )
+            .expect("exact response shape"),
+    );
+
+    let snapshot =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    let service_rate = snapshot
+        .scheduling_service_rate()
+        .expect("exact QUIC response service rate");
+    assert_eq!(service_rate.scope(), scope);
+    assert_eq!(
+        service_rate.basis(),
+        ServiceRateBasis::QuinnBbr3NativeOperationalV1,
+    );
+    assert_eq!(service_rate.finite_rate_bps(), Some(200_000_000));
+    assert_eq!(snapshot.delivery_rate_bps, 200_000_000.0);
+    assert_eq!(snapshot.product_progress_rate_bps, None);
+    assert_eq!(snapshot.carrier_delivery_rate_bps, Some(200_000_000.0));
+}
+
+#[test]
+fn t02_response_quic_unlimited_startup_remains_nonnumeric() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(63),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    entry.startup_rate_prior = RateHint::Unlimited;
+    let scope =
+        CarrierRateAuthorityScope::new(entry.path_instance_id, PathMetricDirection::ServerToClient);
+    let authority = NativeCarrierRateAuthorityHandle::from_startup_hint_for_test(
+        scope,
+        RateHint::Unlimited,
+        11,
+        83,
+        None,
+    )
+    .expect("valid Unlimited response authority");
+    entry.commands = entry
+        .commands
+        .clone()
+        .with_native_rate_authority(authority.clone());
+    entry.native_scheduling_shape = Some(
+        authority
+            .refresh_scheduling_shape_for_test(
+                scope,
+                11,
+                83,
+                None,
+                Duration::from_millis(80),
+                Duration::from_millis(8),
+                4_000_000,
+                0,
+                1_400,
+                None,
+                true,
+            )
+            .expect("exact Unlimited response shape"),
+    );
+
+    let snapshot =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    let service_rate = snapshot
+        .scheduling_service_rate()
+        .expect("Unlimited remains a typed response authority");
+    assert_eq!(service_rate.scope(), scope);
+    assert_eq!(service_rate.basis(), ServiceRateBasis::UnlimitedStartup);
+    assert_eq!(service_rate.value(), ServiceRateValue::UnlimitedStartup);
+    assert_eq!(service_rate.finite_rate_bps(), None);
+    assert_eq!(snapshot.carrier_delivery_rate_bps, None);
+    assert_eq!(snapshot.state, crate::scheduler::PathState::Active);
+}
+
+#[test]
 fn expired_tcp_sample_cannot_reenter_rate_pacing_confidence_or_absent_native_debt() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
@@ -1108,7 +1272,7 @@ fn expired_tcp_sample_cannot_reenter_rate_pacing_confidence_or_absent_native_deb
     ));
     let snapshot =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    let default_rate = crate::runtime::path::model::default_path_rate_bps();
+    let default_rate = portable_startup_rate_bps();
     assert_eq!(snapshot.delivery_rate_bps, default_rate);
     assert_eq!(snapshot.pacing_rate_bps, default_rate);
     assert_eq!(snapshot.carrier_delivery_rate_bps, None);
@@ -1178,7 +1342,7 @@ fn fresh_post_expiry_tcp_epoch_rebuilds_confidence_from_its_own_acks() {
 }
 
 #[test]
-fn tcp_recent_product_goodput_raises_native_rate_as_per_flow_completion_evidence() {
+fn tcp_recent_product_goodput_stays_diagnostic_beside_startup_service_rate() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
@@ -1208,13 +1372,14 @@ fn tcp_recent_product_goodput_raises_native_rate_as_per_flow_completion_evidence
 
     let snapshot =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(snapshot.delivery_rate_bps, product_rate);
-    assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(snapshot.delivery_rate_bps, portable_startup_rate_bps());
+    assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(snapshot.product_progress_rate_bps, Some(product_rate));
     assert_eq!(snapshot.carrier_delivery_rate_bps, Some(500_000_000.0));
 }
 
 #[test]
-fn quic_completion_rate_is_max_of_native_and_mature_product() {
+fn quic_without_named_native_shape_keeps_startup_rate_and_diagnostic_metrics() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Udp,
         path_id: PathId(2),
@@ -1232,20 +1397,21 @@ fn quic_completion_rate_is_max_of_native_and_mature_product() {
 
     let snapshot =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(snapshot.delivery_rate_bps, portable_startup_rate_bps());
     assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(snapshot.pacing_rate_bps, 600_000_000.0);
     assert_eq!(
         snapshot.data_level_limit_bytes,
         reliable_bulk_product_windows(MuxLimits::default()).per_output_product_limit_bytes,
-        "native QUIC capacity ranks completion but never rewrites configured Product authority",
+        "generic QUIC telemetry cannot rewrite startup C or configured Product authority",
     );
 
     install_product_rate(&mut entry, 800_000_000.0);
     let raised =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(raised.delivery_rate_bps, 800_000_000.0);
-    assert_eq!(raised.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(raised.delivery_rate_bps, portable_startup_rate_bps());
+    assert_eq!(raised.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(raised.product_progress_rate_bps, Some(800_000_000.0));
     assert_eq!(raised.carrier_delivery_rate_bps, Some(500_000_000.0));
 }
 
@@ -1290,7 +1456,7 @@ fn unqualified_tcp_native_pacing_never_becomes_completion_rate() {
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(
         snapshot.delivery_rate_bps,
-        crate::runtime::path::model::default_path_rate_bps(),
+        portable_startup_rate_bps(),
         "unqualified native pacing is send intent, not achieved completion service",
     );
     assert_eq!(snapshot.pacing_rate_bps, 280_458_000.0);
@@ -1332,9 +1498,10 @@ fn unqualified_sidecar_without_same_epoch_pacing_grants_no_startup_rate() {
     ));
     let snapshot =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(snapshot.delivery_rate_bps, 80_000_000.0);
-    assert_eq!(snapshot.pacing_rate_bps, 80_000_000.0);
-    assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(snapshot.delivery_rate_bps, portable_startup_rate_bps());
+    assert_eq!(snapshot.pacing_rate_bps, portable_startup_rate_bps());
+    assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(snapshot.product_progress_rate_bps, Some(80_000_000.0));
     assert_eq!(snapshot.carrier_delivery_rate_bps, None);
 }
 
@@ -1433,7 +1600,7 @@ fn sole_quic_output_retains_native_exploration_after_rate_expiry_without_shrinki
         .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
         .min(mux_limits.max_path_flight_bytes);
     assert_eq!(snapshot.carrier_delivery_rate_bps, None);
-    assert_eq!(snapshot.delivery_rate_bps, 2_000_000.0);
+    assert_eq!(snapshot.delivery_rate_bps, portable_startup_rate_bps());
     assert_eq!(snapshot.carrier_inflight_limit_bytes, live_cwnd);
     assert_eq!(
         reliable_bulk_unproven_exploration_limit_bytes(snapshot, mux_limits),
@@ -1526,7 +1693,11 @@ fn partial_udp_product_epoch_survives_for_diagnostics_without_becoming_completio
         mux_limits,
         native_expires_at - Duration::from_nanos(1),
     );
-    assert_eq!(before_expiry.delivery_rate_bps, native_rate_bps as f64);
+    assert_eq!(before_expiry.delivery_rate_bps, portable_startup_rate_bps());
+    assert_eq!(
+        before_expiry.carrier_delivery_rate_bps,
+        Some(native_rate_bps as f64),
+    );
 
     let product_epoch = outputs.entries[0]
         .product_rate_epoch
@@ -1546,7 +1717,7 @@ fn partial_udp_product_epoch_survives_for_diagnostics_without_becoming_completio
     assert_eq!(after_expiry.carrier_delivery_rate_bps, None);
     assert_eq!(
         after_expiry.delivery_rate_bps,
-        crate::runtime::path::model::default_path_rate_bps(),
+        portable_startup_rate_bps(),
         "the retained partial Product point must not become ECF completion service",
     );
     assert_eq!(after_expiry.rate_scope, PathRateScope::PathCapacity);
@@ -1570,7 +1741,7 @@ fn partial_udp_product_epoch_survives_for_diagnostics_without_becoming_completio
 }
 
 #[test]
-fn peer_hint_is_used_only_until_local_evidence_arrives() {
+fn peer_and_local_metrics_update_diagnostics_without_replacing_startup_rate() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Udp,
         path_id: PathId(3),
@@ -1588,7 +1759,7 @@ fn peer_hint_is_used_only_until_local_evidence_arrives() {
     let hinted =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(hinted.srtt_ms, 9.0);
-    assert_eq!(hinted.delivery_rate_bps, 330_000_000.0);
+    assert_eq!(hinted.delivery_rate_bps, portable_startup_rate_bps());
 
     entry
         .peer_path_metrics
@@ -1599,8 +1770,8 @@ fn peer_hint_is_used_only_until_local_evidence_arrives() {
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(
         stale_hint.delivery_rate_bps,
-        crate::runtime::path::model::default_path_rate_bps(),
-        "expired peer advisory rate has no placement authority",
+        portable_startup_rate_bps(),
+        "peer advisory rate has no placement authority regardless of freshness",
     );
 
     entry.local_path_metrics = Some(path_metrics(
@@ -1613,7 +1784,8 @@ fn peer_hint_is_used_only_until_local_evidence_arrives() {
     let local =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(local.srtt_ms, 35.0);
-    assert_eq!(local.delivery_rate_bps, 110_000_000.0);
+    assert_eq!(local.delivery_rate_bps, portable_startup_rate_bps());
+    assert_eq!(local.carrier_delivery_rate_bps, Some(110_000_000.0));
 
     entry.local_path_metrics = None;
     entry.delivery_samples = 1;
@@ -1622,8 +1794,9 @@ fn peer_hint_is_used_only_until_local_evidence_arrives() {
     let learned =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(learned.srtt_ms, 55.0);
-    assert_eq!(learned.delivery_rate_bps, 77_000_000.0);
-    assert_eq!(learned.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(learned.delivery_rate_bps, portable_startup_rate_bps());
+    assert_eq!(learned.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(learned.product_progress_rate_bps, Some(77_000_000.0));
 }
 
 #[test]
@@ -1649,7 +1822,7 @@ fn opposite_direction_peer_hint_is_not_response_rate_authority() {
 
     assert_eq!(
         response.delivery_rate_bps,
-        crate::runtime::path::model::default_path_rate_bps(),
+        portable_startup_rate_bps(),
         "client-to-server peer evidence cannot authorize server-to-client response completion",
     );
 }
@@ -1684,10 +1857,7 @@ fn path_proof_supplies_only_fallback_rtt_until_newer_transport_evidence() {
     let proof_rtt =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(proof_rtt.srtt_ms, 20.0);
-    assert_eq!(
-        proof_rtt.delivery_rate_bps,
-        crate::runtime::path::model::default_path_rate_bps(),
-    );
+    assert_eq!(proof_rtt.delivery_rate_bps, portable_startup_rate_bps(),);
     assert_eq!(proof_rtt.carrier_delivery_rate_bps, Some(500_000_000.0));
     assert_eq!(proof_rtt.pacing_rate_bps, 600_000_000.0);
     assert_eq!(proof_rtt.bytes_in_flight, PATH_OPEN_SCORE_BYTES as u64);
@@ -1705,10 +1875,7 @@ fn path_proof_supplies_only_fallback_rtt_until_newer_transport_evidence() {
     let newer_native =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(newer_native.srtt_ms, 35.0);
-    assert_eq!(
-        newer_native.delivery_rate_bps,
-        crate::runtime::path::model::default_path_rate_bps(),
-    );
+    assert_eq!(newer_native.delivery_rate_bps, portable_startup_rate_bps(),);
     assert_eq!(newer_native.carrier_delivery_rate_bps, Some(500_000_000.0));
 }
 

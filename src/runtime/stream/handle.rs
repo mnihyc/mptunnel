@@ -11,6 +11,7 @@ use crate::model::capacity::{
 };
 use crate::model::carrier_rate_authority::CarrierRateAuthorityScope;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::model::service_rate::{DirectionalServiceRate, DirectionalServiceRateScope};
 use crate::model::timing::{
     reliable_data_retransmission_interval, transport_rate_sample_freshness_horizon,
 };
@@ -924,6 +925,7 @@ pub(in crate::runtime) struct FixedReliablePathOutput {
     key: CarrierPathKey,
     startup: PathSnapshot,
     portable_startup: PathSnapshot,
+    service_rate_scope: DirectionalServiceRateScope,
     native_authority_scope: Option<CarrierRateAuthorityScope>,
     native_window_epoch: Option<CarrierNativeWindowSample>,
     native_rate_epoch: Option<FixedNativeRateEpoch>,
@@ -1110,6 +1112,10 @@ impl FixedReliablePathOutput {
             },
             startup,
             portable_startup,
+            service_rate_scope: DirectionalServiceRateScope::new(
+                path_instance_id,
+                PathMetricDirection::ClientToServer,
+            ),
             native_authority_scope: (startup.underlay == UnderlayProtocol::Udp).then_some(
                 CarrierRateAuthorityScope::new(
                     path_instance_id,
@@ -1163,20 +1169,24 @@ impl FixedReliablePathOutput {
 
     /// Runs one Product ownership transfer against the exact rate decision
     /// that authorized it. TCP remains Receipt/legacy-owned and therefore
-    /// executes directly. QUIC executes only while the transport activation
-    /// fence and central `(scope, A, I, G)` stamp remain current.
+    /// executes directly. QUIC re-reads the full current scheduling shape and
+    /// executes only while the transport activation fence and central
+    /// `(scope, A, I, G)` stamp remain current.
     fn commit_rate_decision<R>(
         &self,
         decision: FixedRateDecision,
-        transfer_ownership: impl FnOnce() -> Result<R, RuntimeError>,
+        transfer_ownership: impl FnOnce(FixedRateDecision) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
         match decision {
-            FixedRateDecision::Legacy => transfer_ownership(),
+            FixedRateDecision::Legacy => transfer_ownership(FixedRateDecision::Legacy),
             FixedRateDecision::Native(decision) => self
                 .commands
                 .native_rate_authority()
                 .ok_or(RuntimeError::SenderServiceBlocked)?
-                .commit_if_current(decision.decision().stamp(), transfer_ownership)
+                .commit_with_current_scheduling_shape(
+                    decision.decision().stamp(),
+                    |current_shape| transfer_ownership(FixedRateDecision::Native(current_shape)),
+                )
                 .map_err(|_| RuntimeError::SenderServiceBlocked)?,
         }
     }
@@ -1210,38 +1220,52 @@ impl FixedReliablePathOutput {
         now: Instant,
         rate_decision: FixedRateDecision,
     ) -> PathSnapshot {
-        let prior_rate_bps = self.portable_startup.delivery_rate_bps.max(1.0);
+        let startup_service_rate = self
+            .startup
+            .scheduling_service_rate()
+            .filter(|rate| rate.scope() == self.service_rate_scope);
         let product_rate_epoch = model
             .product_rate_epoch
             .filter(|epoch| epoch.fresh_rate_at(now).is_some());
         let raw_product_rate_bps = product_rate_epoch.map(|epoch| epoch.rate_bps);
-        let (native_window_epoch, product_rate_bps, native_rate_bps) = match rate_decision {
-            FixedRateDecision::Legacy => {
-                let native_window_epoch =
-                    self.native_window_epoch.filter(|epoch| epoch.fresh_at(now));
-                let product_rate_bps = product_rate_epoch.and_then(|epoch| {
-                    epoch.qualified_completion_rate_at(
-                        now,
-                        model.product_progress_bytes,
-                        self.mux_limits,
+        let (native_window_epoch, product_rate_bps, carrier_diagnostic_rate_bps, service_rate) =
+            match rate_decision {
+                FixedRateDecision::Legacy => {
+                    let native_window_epoch =
+                        self.native_window_epoch.filter(|epoch| epoch.fresh_at(now));
+                    let product_rate_bps = product_rate_epoch.and_then(|epoch| {
+                        epoch.qualified_completion_rate_at(
+                            now,
+                            model.product_progress_bytes,
+                            self.mux_limits,
+                        )
+                    });
+                    let native_rate_bps = self
+                        .native_rate_epoch
+                        .filter(|epoch| epoch.is_fresh_at(now))
+                        .map(|epoch| epoch.rate_bps);
+                    (
+                        native_window_epoch,
+                        product_rate_bps,
+                        native_rate_bps,
+                        startup_service_rate,
                     )
-                });
-                let native_rate_bps = self
-                    .native_rate_epoch
-                    .filter(|epoch| epoch.is_fresh_at(now))
-                    .map(|epoch| epoch.rate_bps);
-                (native_window_epoch, product_rate_bps, native_rate_bps)
-            }
-            FixedRateDecision::Native(shape) => (None, None, Some(shape.rate_bps() as f64)),
-        };
-        let capacity_rate_bps = native_rate_bps.unwrap_or(prior_rate_bps);
-        let (delivery_rate_bps, rate_scope) = match (rate_decision, product_rate_bps) {
-            (FixedRateDecision::Legacy, Some(rate)) if rate > capacity_rate_bps => {
-                (rate, PathRateScope::PerFlowGoodput)
-            }
-            _ => (capacity_rate_bps, PathRateScope::PathCapacity),
-        };
-        let delivery_rate_bps = delivery_rate_bps.max(1.0);
+                }
+                FixedRateDecision::Native(shape) => (
+                    None,
+                    None,
+                    shape.finite_rate_bps().map(|rate| rate as f64),
+                    Some(shape.service_rate()),
+                ),
+            };
+        // This scalar remains a compatibility/diagnostic projection while T03
+        // moves scoring to the exact typed value. Product completion and TCP
+        // carrier samples remain visible below but cannot select C.
+        let delivery_rate_bps = service_rate
+            .and_then(DirectionalServiceRate::finite_rate_bps)
+            .map_or(self.portable_startup.delivery_rate_bps.max(1.0), |rate| {
+                rate as f64
+            });
         let srtt_ms = match rate_decision {
             FixedRateDecision::Native(shape) => {
                 if shape.srtt().is_zero() {
@@ -1257,8 +1281,9 @@ impl FixedReliablePathOutput {
         let mut snapshot = self.startup;
         snapshot.srtt_ms = srtt_ms;
         snapshot.delivery_rate_bps = delivery_rate_bps;
-        snapshot.rate_scope = rate_scope;
-        snapshot.carrier_delivery_rate_bps = native_rate_bps;
+        snapshot.scheduling_service_rate = service_rate;
+        snapshot.rate_scope = PathRateScope::PathCapacity;
+        snapshot.carrier_delivery_rate_bps = carrier_diagnostic_rate_bps;
         snapshot.product_progress_rate_bps = product_rate_bps;
         snapshot.has_durable_product_progress = product_rate_bps.is_some()
             && model.product_progress_bytes
@@ -1379,13 +1404,18 @@ impl FixedReliablePathOutput {
         queued_reinjection_bytes: usize,
         reinjection_debt_bytes: usize,
     ) -> Result<Instant, RuntimeError> {
-        self.commit_rate_decision(rate_decision, || {
+        self.commit_rate_decision(rate_decision, |current_rate_decision| {
             // Lock order is Quinn activation fence -> authority coordinator ->
-            // Product model. Nothing in this closure calls back into Quinn.
+            // current shape -> Product model. Nothing in this closure calls
+            // back into Quinn.
             let mut model = self.model.lock().expect("fixed reliable path model lock");
             let accepted_at = Instant::now();
-            let snapshot =
-                self.send_path_snapshot_with_model_at(&model, lane, accepted_at, rate_decision);
+            let snapshot = self.send_path_snapshot_with_model_at(
+                &model,
+                lane,
+                accepted_at,
+                current_rate_decision,
+            );
             let accepted_reinjection_bytes =
                 Self::retained_reinjected_data_bytes_with_model(&model);
             let exact_service = reliable_reinjection_service_limit_bytes(
@@ -1455,13 +1485,18 @@ impl FixedReliablePathOutput {
         bytes: usize,
         lane: TrafficClass,
     ) -> Result<(), RuntimeError> {
-        self.commit_rate_decision(rate_decision, || {
+        self.commit_rate_decision(rate_decision, |current_rate_decision| {
             // Lock order is Quinn activation fence -> authority coordinator ->
-            // Product model. Nothing in this closure calls back into Quinn.
+            // current shape -> Product model. Nothing in this closure calls
+            // back into Quinn.
             let mut model = self.model.lock().expect("fixed reliable path model lock");
             let accepted_at = Instant::now();
-            let snapshot =
-                self.send_path_snapshot_with_model_at(&model, lane, accepted_at, rate_decision);
+            let snapshot = self.send_path_snapshot_with_model_at(
+                &model,
+                lane,
+                accepted_at,
+                current_rate_decision,
+            );
             if !crate::model::admission::original_data_assignment_has_product_headroom(snapshot) {
                 return Err(RuntimeError::SenderServiceBlocked);
             }

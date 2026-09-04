@@ -10,9 +10,10 @@ use super::evidence::server_output_product_assignment_qualified;
 use super::snapshot::{server_bulk_output_snapshot_at, server_native_bulk_output_snapshot_at};
 use crate::model::admission::{BulkCandidatePosition, bulk_original_data_assignment_authority};
 use crate::model::capacity::reliable_bulk_product_windows;
-use crate::protocol::Frame;
 use crate::protocol::frame::reliable_stream_frame_extent;
+use crate::protocol::{Frame, UnderlayProtocol};
 use crate::runtime::RuntimeError;
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::scheduler::TrafficClass;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -81,7 +82,7 @@ impl ResponseStreamBinding {
         after_reserve();
         let native_authority = target_commands.native_rate_authority().cloned();
         let expected_native_stamp = target.native_authority_stamp;
-        let commit = || {
+        let commit = |current_native_shape: Option<NativeCarrierSchedulingShapeSnapshot>| {
             let mut outputs = self
                 .outputs
                 .lock()
@@ -96,18 +97,14 @@ impl ResponseStreamBinding {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
             let entry = &outputs.entries[target_index];
-            let native_shape = match expected_native_stamp {
-                Some(stamp) => entry
-                    .native_scheduling_shape
-                    .filter(|shape| shape.stamp() == stamp),
-                None => None,
+            let native_shape = match (expected_native_stamp, current_native_shape) {
+                (Some(stamp), Some(shape)) if shape.stamp() == stamp => Some(shape),
+                (None, None) => None,
+                _ => return Err(RuntimeError::SenderServiceBlocked),
             };
-            if expected_native_stamp.is_some() && native_shape.is_none() {
-                return Err(RuntimeError::SenderServiceBlocked);
-            }
             // Planning is advisory. After real writer reservation, recompute
             // the exact output at one instant. Native mode uses only the
-            // already-stamped sidecar while its fence is held.
+            // current full shape while its fence is held.
             let now = apply_now();
             let assignment = if expected_native_stamp.is_some() {
                 server_native_bulk_output_snapshot_at(
@@ -148,16 +145,16 @@ impl ResponseStreamBinding {
 
             // Exact range ownership is visible before the carrier can dequeue
             // the committed command. Lock order for Native is fence ->
-            // coordinator -> outputs -> flights.
+            // coordinator -> current shape -> outputs -> flights.
             self.record_validated_original_flight_with_outputs(&mut outputs, target_index, frame)?;
             command.commit();
             Ok(())
         };
         match (native_authority, expected_native_stamp) {
             (Some(authority), Some(stamp)) => authority
-                .commit_if_current(stamp, commit)
+                .commit_with_current_scheduling_shape(stamp, |shape| commit(Some(shape)))
                 .map_err(|_| RuntimeError::SenderServiceBlocked)?,
-            (None, None) => commit(),
+            (None, None) if target.key.underlay == UnderlayProtocol::Tcp => commit(None),
             _ => Err(RuntimeError::SenderServiceBlocked),
         }
     }

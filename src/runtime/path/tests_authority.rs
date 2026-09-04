@@ -3,6 +3,7 @@ use crate::model::carrier_rate_authority::{
     CarrierRateAuthorityBasis, CarrierRateAuthorityTransition,
 };
 use crate::model::path::CarrierPathInstanceId;
+use crate::model::service_rate::{ServiceRateBasis, ServiceRateValue};
 use crate::protocol::PathMetricDirection;
 use crate::runtime::path::commands::reliable_path_command_channels;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,8 +49,12 @@ fn authority(
     authority_scope: CarrierRateAuthorityScope,
     initial: CoherentNativeCarrierSource,
 ) -> Arc<NativeCarrierRateAuthorityHandle> {
-    NativeCarrierRateAuthorityHandle::new_for_test(authority_scope, 40, initial)
-        .expect("checked native authority")
+    NativeCarrierRateAuthorityHandle::new_for_test(
+        authority_scope,
+        crate::transport::RateHint::BitsPerSecond(40),
+        initial,
+    )
+    .expect("checked native authority")
 }
 
 #[test]
@@ -102,11 +107,43 @@ fn operational_rate_is_already_bits_per_second_and_is_not_converted_twice() {
         .expect("coordinator lock")
         .expect("live snapshot");
 
-    assert_eq!(snapshot.rate().as_u64(), 800);
+    assert_eq!(snapshot.finite_rate_bps(), Some(800));
     assert_eq!(
         snapshot.basis(),
         CarrierRateAuthorityBasis::NativeOperational
     );
+}
+
+#[test]
+fn unlimited_startup_remains_nonnumeric_in_runtime_decision_and_shape() {
+    let authority_scope = scope(70, PathMetricDirection::ClientToServer);
+    let handle = NativeCarrierRateAuthorityHandle::from_startup_hint_for_test(
+        authority_scope,
+        crate::transport::RateHint::Unlimited,
+        1,
+        8,
+        None,
+    )
+    .expect("bind Unlimited startup authority");
+
+    let decision = handle
+        .decision_snapshot(authority_scope)
+        .expect("Unlimited is structurally valid");
+    assert_eq!(decision.finite_rate_bps(), None);
+    assert_eq!(
+        decision.service_rate().basis(),
+        ServiceRateBasis::UnlimitedStartup
+    );
+    assert_eq!(
+        decision.service_rate().value(),
+        ServiceRateValue::UnlimitedStartup
+    );
+
+    let shape = handle
+        .scheduling_shape_snapshot(authority_scope)
+        .expect("cached Unlimited startup shape is valid");
+    assert_eq!(shape.finite_rate_bps(), None);
+    assert_eq!(shape.service_rate(), decision.service_rate());
 }
 
 #[test]
@@ -118,7 +155,7 @@ fn scheduling_shape_binds_central_rate_to_one_exact_active_path_shape() {
         .scheduling_shape_for_test(authority_scope, shape(1, 9, None, 80, 64_000, 12_000))
         .expect("matching startup shape");
 
-    assert_eq!(snapshot.rate_bps(), 40);
+    assert_eq!(snapshot.finite_rate_bps(), Some(40));
     assert_eq!(snapshot.basis(), CarrierRateAuthorityBasis::StartupPrior);
     assert_eq!(snapshot.srtt(), Duration::from_millis(80));
     assert_eq!(snapshot.rttvar(), Duration::from_millis(16));
@@ -138,7 +175,7 @@ fn scheduling_shape_uses_central_g_during_bounded_same_activation_publication_la
         .scheduling_shape_for_test(authority_scope, shape(1, 10, Some(160), 50, 80_000, 20_000))
         .expect("same native controller lifetime remains coherent");
 
-    assert_eq!(snapshot.rate_bps(), 80);
+    assert_eq!(snapshot.finite_rate_bps(), Some(80));
     assert_eq!(
         snapshot.basis(),
         CarrierRateAuthorityBasis::NativeOperational
@@ -181,7 +218,7 @@ fn scheduling_shape_cache_fails_closed_across_g_until_cadence_refreshes_it() {
     let first = handle
         .scheduling_shape_snapshot(authority_scope)
         .expect("cached G1 shape is current");
-    assert_eq!(first.rate_bps(), 80);
+    assert_eq!(first.finite_rate_bps(), Some(80));
     assert_eq!(first.srtt(), Duration::from_millis(60));
 
     handle
@@ -203,7 +240,7 @@ fn scheduling_shape_cache_fails_closed_across_g_until_cadence_refreshes_it() {
     let second = handle
         .scheduling_shape_snapshot(authority_scope)
         .expect("cached G2 shape is current");
-    assert_eq!(second.rate_bps(), 160);
+    assert_eq!(second.finite_rate_bps(), Some(160));
     assert_eq!(second.srtt(), Duration::from_millis(45));
     assert_eq!(second.congestion_window(), 128_000);
 }
@@ -225,7 +262,7 @@ fn same_activation_absence_retains_the_accepted_native_rate() {
         CarrierRateAuthorityTransition::Unchanged
     );
     let snapshot = publication.snapshot().expect("live snapshot");
-    assert_eq!(snapshot.rate().as_u64(), 320);
+    assert_eq!(snapshot.finite_rate_bps(), Some(320));
     assert_eq!(snapshot.stamp(), before);
 }
 
@@ -262,7 +299,7 @@ async fn applied_authority_change_wakes_all_subscribers_with_the_new_stamp() {
         .decision_snapshot(authority_scope)
         .expect("subscriber rereads current authority");
     assert_eq!(decision.stamp(), publication.stamp());
-    assert_eq!(decision.rate_bps(), 160);
+    assert_eq!(decision.finite_rate_bps(), Some(160));
 }
 
 #[tokio::test]
@@ -350,7 +387,7 @@ fn coalesced_a1_to_a3_publication_installs_only_the_current_source() {
         publication.transition(),
         CarrierRateAuthorityTransition::Applied
     );
-    assert_eq!(snapshot.rate().as_u64(), 240);
+    assert_eq!(snapshot.finite_rate_bps(), Some(240));
     assert_eq!(snapshot.stamp().revision().as_u64(), initial_revision + 1);
 }
 

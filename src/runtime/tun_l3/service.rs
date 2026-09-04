@@ -4,6 +4,7 @@ use super::flow::PacketFlowTable;
 use super::{IpPacketQueueBudget, IpPacketQueuePermit};
 use crate::model::carrier_rate_authority::{CarrierRateAuthorityBasis, CarrierRateAuthorityStamp};
 use crate::model::path::CarrierPathInstanceId;
+use crate::model::service_rate::{DirectionalServiceRate, DirectionalServiceRateScope};
 use crate::model::tun_l3::{IpPacketFlowKey, parse_ip_packet};
 use crate::product::{PrincipalId, TunL3AddressPlan, TunL3PeerAllocation};
 use crate::protocol::{
@@ -15,6 +16,7 @@ use crate::runtime::path::{
     CarrierDeliveryRateSample, ServerCarrierPathRegistration, ServerRealtimeFlowLease,
     ServerStreamPort,
 };
+use crate::transport::RateHint;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,6 +82,7 @@ struct ServerIpAttachment {
     key: ServerIpCarrierKey,
     config_ordinal: usize,
     backup: bool,
+    startup_rate_prior: RateHint,
     startup_metrics: Option<crate::protocol::PathMetrics>,
     attachment_generation: u64,
     lifetime: Weak<()>,
@@ -361,6 +364,7 @@ impl ServerIpTunnelPort {
                 key: carrier,
                 config_ordinal: request.path.local_config_ordinal(),
                 backup: request.path.local_policy().backup,
+                startup_rate_prior: request.path.startup_rate_prior(),
                 startup_metrics,
                 attachment_generation,
                 lifetime: Arc::downgrade(&lifetime),
@@ -1162,29 +1166,37 @@ fn server_native_packet_snapshot(
     attachment: &ServerIpAttachment,
     shape: crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot,
 ) -> crate::scheduler::PathSnapshot {
-    let scope = shape.stamp().scope();
+    let service_rate = shape.service_rate();
+    let scope = service_rate.scope();
     let valid = attachment.key.underlay == UnderlayProtocol::Udp
         && status.underlay == UnderlayProtocol::Udp
         && status.path_instance_id == attachment.key.path_instance_id
+        && shape.stamp().scope() == scope
         && scope.carrier_instance_id() == attachment.key.path_instance_id
-        && scope.direction() == PathMetricDirection::ServerToClient
-        && shape.rate_bps() > 0;
+        && scope.direction() == PathMetricDirection::ServerToClient;
+    let finite_rate_bps = valid.then(|| shape.finite_rate_bps()).flatten();
     let srtt_ms = if valid && !shape.srtt().is_zero() {
         shape.srtt().as_secs_f64() * 1_000.0
     } else {
         crate::runtime::path::model::default_path_srtt_ms()
     };
-    let rate_bps = if valid {
-        shape.rate_bps() as f64
-    } else {
-        crate::runtime::path::model::default_path_rate_bps()
-    };
+    // This numeric field is a compatibility projection until the scheduler
+    // consumes the typed service-rate value directly. Unlimited deliberately
+    // has no numeric surrogate and therefore retains only the portable
+    // diagnostic projection here.
+    let rate_bps = finite_rate_bps
+        .map_or_else(crate::runtime::path::model::default_path_rate_bps, |rate| {
+            rate as f64
+        });
     let mut snapshot = crate::scheduler::PathSnapshot::new(
         attachment.key.path_id,
         attachment.key.underlay,
         srtt_ms,
         rate_bps.max(1.0),
     );
+    if valid {
+        snapshot = snapshot.with_scheduling_service_rate(service_rate);
+    }
     snapshot.policy = status.policy;
     snapshot.peer_usage = status.usage;
     snapshot.state = if valid {
@@ -1201,14 +1213,15 @@ fn server_native_packet_snapshot(
         snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1_000.0;
         snapshot.pacing_rate_bps = shape
             .pacing_rate_bps()
-            .map_or(shape.rate_bps() as f64, |rate| rate as f64)
+            .or(finite_rate_bps)
+            .map_or(rate_bps, |rate| rate as f64)
             .max(1.0);
         snapshot.bytes_in_flight = shape.bytes_in_flight();
         snapshot.carrier_inflight_limit_bytes = shape
             .congestion_window()
             .max(u64::from(shape.current_mtu()));
         snapshot.app_limited = shape.app_limited();
-        snapshot.carrier_delivery_rate_bps = Some(shape.rate_bps() as f64);
+        snapshot.carrier_delivery_rate_bps = finite_rate_bps.map(|rate| rate as f64);
         snapshot.confidence = if shape.basis() == CarrierRateAuthorityBasis::NativeOperational {
             1.0
         } else {
@@ -1227,48 +1240,36 @@ fn server_tcp_packet_snapshot(
     server_tcp_packet_snapshot_at(status, attachment, Instant::now())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ServerTcpPacketRateAuthority {
-    delivery_rate_bps: f64,
-    pacing_rate_bps: f64,
-    confidence: f64,
-    app_limited: bool,
-}
-
 fn server_tcp_packet_snapshot_at(
     status: Option<&crate::runtime::path::ServerCarrierPathStatusSnapshot>,
     attachment: &ServerIpAttachment,
     now: Instant,
 ) -> crate::scheduler::PathSnapshot {
-    // A peer hint describes the opposite direction. Packet dispatch consumes
-    // only this endpoint's native sender state (or its configured startup
-    // prior), keeping Product delivery evidence outside the packet plane.
+    // A peer hint describes the opposite direction. TCP packet dispatch uses
+    // only this exact attachment's immutable startup prior for service rate;
+    // endpoint-local TCP delivery samples remain diagnostic.
     let metrics = status
         .and_then(|status| status.metrics)
         .filter(|metrics| metrics.direction == PathMetricDirection::ServerToClient);
     let startup_metrics = attachment
         .startup_metrics
         .filter(|metrics| metrics.direction == PathMetricDirection::ServerToClient);
-    let measured_rate = server_tcp_packet_rate_authority_at(
-        metrics,
+    let service_rate = DirectionalServiceRate::from_startup_hint(
+        DirectionalServiceRateScope::new(
+            attachment.key.path_instance_id,
+            PathMetricDirection::ServerToClient,
+        ),
+        attachment.startup_rate_prior,
+    )
+    .ok();
+    let measured_rate = server_tcp_packet_delivery_rate_diagnostic_at(
         status.and_then(|status| status.carrier_delivery_rate_sample),
         now,
     );
-    let startup_rate = startup_metrics.map(|metrics| ServerTcpPacketRateAuthority {
-        delivery_rate_bps: metrics.delivery_rate_bps.max(1) as f64,
-        pacing_rate_bps: if metrics.pacing_rate_observed {
-            metrics.pacing_rate_bps
-        } else {
-            metrics.delivery_rate_bps
-        }
-        .max(1) as f64,
-        confidence: f64::from(metrics.confidence_ppm) / 1_000_000.0,
-        app_limited: metrics.app_limited,
-    });
-    let rate = measured_rate
-        .or(startup_rate)
+    let rate = service_rate
+        .and_then(DirectionalServiceRate::finite_rate_bps)
         .map_or_else(crate::runtime::path::model::default_path_rate_bps, |rate| {
-            rate.delivery_rate_bps
+            rate as f64
         });
     let srtt_ms = metrics.or(startup_metrics).map_or_else(
         crate::runtime::path::model::default_path_srtt_ms,
@@ -1280,6 +1281,9 @@ fn server_tcp_packet_snapshot_at(
         srtt_ms,
         rate,
     );
+    if let Some(service_rate) = service_rate {
+        snapshot = snapshot.with_scheduling_service_rate(service_rate);
+    }
     snapshot.policy = status.map_or_else(
         || crate::model::path::PathPolicy {
             backup: attachment.backup,
@@ -1288,11 +1292,15 @@ fn server_tcp_packet_snapshot_at(
         |status| status.policy,
     );
     snapshot.peer_usage = status.and_then(|status| status.usage);
-    snapshot.state = match status.map(|status| status.state) {
-        Some(PeerPathState::Active) | None => crate::scheduler::PathState::Active,
-        Some(PeerPathState::Suspect) => crate::scheduler::PathState::Suspect,
-        Some(PeerPathState::Draining) => crate::scheduler::PathState::Draining,
-        Some(PeerPathState::Failed) => crate::scheduler::PathState::Failed,
+    snapshot.state = if service_rate.is_none() {
+        crate::scheduler::PathState::Failed
+    } else {
+        match status.map(|status| status.state) {
+            Some(PeerPathState::Active) | None => crate::scheduler::PathState::Active,
+            Some(PeerPathState::Suspect) => crate::scheduler::PathState::Suspect,
+            Some(PeerPathState::Draining) => crate::scheduler::PathState::Draining,
+            Some(PeerPathState::Failed) => crate::scheduler::PathState::Failed,
+        }
     };
     if let Some(metrics) = metrics {
         snapshot.jitter_ms = f64::from(metrics.jitter_us) / 1_000.0;
@@ -1315,40 +1323,31 @@ fn server_tcp_packet_snapshot_at(
         // assertion that an exact queue or flight observation is available.
         snapshot.carrier_inflight_limit_bytes = metrics.inflight_limit_bytes;
     }
-    if let Some(rate_authority) = measured_rate.or(startup_rate) {
-        snapshot.pacing_rate_bps = rate_authority.pacing_rate_bps;
-        snapshot.confidence = rate_authority.confidence;
-        snapshot.app_limited = rate_authority.app_limited;
+    if let Some(startup_metrics) = startup_metrics {
+        snapshot.pacing_rate_bps = if startup_metrics.pacing_rate_observed {
+            startup_metrics.pacing_rate_bps.max(1) as f64
+        } else {
+            rate
+        };
+        snapshot.confidence = f64::from(startup_metrics.confidence_ppm) / 1_000_000.0;
+        snapshot.app_limited = startup_metrics.app_limited;
     }
-    snapshot.carrier_delivery_rate_bps = measured_rate.map(|rate| rate.delivery_rate_bps);
+    snapshot.carrier_delivery_rate_bps = measured_rate;
     snapshot
 }
 
-fn server_tcp_packet_rate_authority_at(
-    metrics: Option<crate::protocol::PathMetrics>,
+fn server_tcp_packet_delivery_rate_diagnostic_at(
     carrier_sample: Option<CarrierDeliveryRateSample>,
     now: Instant,
-) -> Option<ServerTcpPacketRateAuthority> {
+) -> Option<f64> {
     if let Some(sample) = carrier_sample {
-        // Presence is authoritative: an expired sidecar cannot fall through
-        // to retained PathMetrics and silently regain scheduling authority.
+        // Presence dominates diagnostic freshness: an expired sidecar cannot
+        // fall through to retained PathMetrics and masquerade as a fresh
+        // carrier observation.
         if sample.delivery_rate_bps == 0 || sample.observed_at > now || now >= sample.expires_at {
             return None;
         }
-        let delivery_rate_bps = sample.delivery_rate_bps as f64;
-        return Some(ServerTcpPacketRateAuthority {
-            delivery_rate_bps,
-            pacing_rate_bps: sample
-                .pacing_rate_bps
-                .filter(|rate| *rate > 0)
-                .map_or(delivery_rate_bps, |rate| rate as f64),
-            confidence: metrics.map_or(1.0, |metrics| {
-                f64::from(metrics.confidence_ppm) / 1_000_000.0
-            }),
-            // A CarrierDeliveryRateSample is, by contract, a qualified
-            // positive-ACK non-application-limited sample.
-            app_limited: false,
-        });
+        return Some(sample.delivery_rate_bps as f64);
     }
 
     None
@@ -1389,6 +1388,7 @@ mod packet_metric_authority_tests {
     use crate::config::{MppPerformanceConfig, ResourceLimits, ServerSecurityConfig, SharedSecret};
     use crate::model::carrier_rate_authority::CarrierRateAuthorityScope;
     use crate::model::path::PathPolicy;
+    use crate::model::service_rate::{ServiceRateBasis, ServiceRateValue};
     use crate::outbound::OutboundConfig;
     use crate::product::{TunL3AddressPlan, TunL3AllocationSpec, TunL3ServerSpec};
     use crate::protocol::PathMetrics;
@@ -1814,6 +1814,7 @@ mod packet_metric_authority_tests {
                 },
                 config_ordinal: 0,
                 backup: false,
+                startup_rate_prior: RateHint::BitsPerSecond(25_000_000),
                 startup_metrics: Some(startup_metrics),
                 attachment_generation: 1,
                 lifetime: Arc::downgrade(&lifetime),
@@ -1848,11 +1849,16 @@ mod packet_metric_authority_tests {
     }
 
     fn assert_startup_rate_bundle(snapshot: crate::scheduler::PathSnapshot) {
-        assert_eq!(snapshot.delivery_rate_bps, 5_000_000.0);
-        assert_eq!(snapshot.pacing_rate_bps, 5_000_000.0);
+        assert_eq!(snapshot.delivery_rate_bps, 25_000_000.0);
+        assert_eq!(snapshot.pacing_rate_bps, 25_000_000.0);
         assert_eq!(snapshot.confidence, 0.1);
         assert!(snapshot.app_limited);
         assert_eq!(snapshot.carrier_delivery_rate_bps, None);
+        let service_rate = snapshot
+            .scheduling_service_rate()
+            .expect("exact packet action carries startup service rate");
+        assert_eq!(service_rate.basis(), ServiceRateBasis::ConfiguredStartup);
+        assert_eq!(service_rate.finite_rate_bps(), Some(25_000_000));
     }
 
     #[test]
@@ -1918,6 +1924,15 @@ mod packet_metric_authority_tests {
         status.native_scheduling_shape = Some(shape);
 
         let snapshot = server_native_packet_snapshot(&status, &attachment, shape);
+        assert_eq!(
+            snapshot.scheduling_service_rate(),
+            Some(shape.service_rate())
+        );
+        assert_eq!(
+            shape.service_rate().basis(),
+            ServiceRateBasis::QuinnBbr3NativeOperationalV1,
+        );
+        assert_eq!(shape.service_rate().finite_rate_bps(), Some(83_000_000));
         assert_eq!(snapshot.state, crate::scheduler::PathState::Active);
         assert_eq!(snapshot.delivery_rate_bps, 83_000_000.0);
         assert_eq!(snapshot.carrier_delivery_rate_bps, Some(83_000_000.0));
@@ -1932,6 +1947,74 @@ mod packet_metric_authority_tests {
         assert!(!snapshot.has_durable_product_progress);
         assert_eq!(snapshot.confidence, 1.0);
         assert!(!snapshot.app_limited);
+    }
+
+    #[test]
+    fn tcp_packet_projection_has_exact_scoped_startup_rate() {
+        let (startup, live) = packet_metrics(UnderlayProtocol::Tcp);
+        let status = status(UnderlayProtocol::Tcp, live, None);
+        let (attachment, _lifetime) = attachment(UnderlayProtocol::Tcp, startup);
+
+        let snapshot = server_tcp_packet_snapshot_at(Some(&status), &attachment, Instant::now());
+        let service_rate = snapshot
+            .scheduling_service_rate()
+            .expect("exact TCP packet action must carry its immutable startup service rate");
+        assert_eq!(
+            service_rate.scope().carrier_instance_id(),
+            attachment.key.path_instance_id,
+        );
+        assert_eq!(
+            service_rate.scope().direction(),
+            PathMetricDirection::ServerToClient,
+        );
+        assert_eq!(service_rate.basis(), ServiceRateBasis::ConfiguredStartup);
+        assert_eq!(service_rate.finite_rate_bps(), Some(25_000_000));
+    }
+
+    #[test]
+    fn native_udp_unlimited_startup_is_structurally_valid_before_observation() {
+        let (startup, live) = packet_metrics(UnderlayProtocol::Udp);
+        let mut status = status(UnderlayProtocol::Udp, live, None);
+        let (attachment, _lifetime) = attachment(UnderlayProtocol::Udp, startup);
+        let scope = CarrierRateAuthorityScope::new(
+            attachment.key.path_instance_id,
+            PathMetricDirection::ServerToClient,
+        );
+        let authority = NativeCarrierRateAuthorityHandle::from_startup_hint_for_test(
+            scope,
+            RateHint::Unlimited,
+            1,
+            9,
+            None,
+        )
+        .expect("Unlimited native startup authority");
+        let shape = authority
+            .refresh_scheduling_shape_for_test(
+                scope,
+                1,
+                9,
+                None,
+                Duration::from_millis(37),
+                Duration::from_millis(6),
+                333_000,
+                12_000,
+                1_400,
+                None,
+                true,
+            )
+            .expect("Unlimited startup shape");
+        status.native_scheduling_shape = Some(shape);
+
+        let snapshot = server_native_packet_snapshot(&status, &attachment, shape);
+        assert_eq!(snapshot.state, crate::scheduler::PathState::Active);
+        let service_rate = snapshot
+            .scheduling_service_rate()
+            .expect("Unlimited native startup remains a valid typed rate");
+        assert_eq!(service_rate.scope(), scope);
+        assert_eq!(service_rate.basis(), ServiceRateBasis::UnlimitedStartup);
+        assert_eq!(service_rate.value(), ServiceRateValue::UnlimitedStartup);
+        assert_eq!(snapshot.carrier_delivery_rate_bps, None);
+        assert_ne!(snapshot.delivery_rate_bps, 1_000_000_000_000.0);
     }
 
     #[test]
@@ -2166,7 +2249,7 @@ mod packet_metric_authority_tests {
     }
 
     #[test]
-    fn tcp_packet_snapshot_sidecar_deadline_is_authoritative() {
+    fn tcp_packet_snapshot_sidecar_deadline_gates_diagnostic_only() {
         let now = Instant::now();
         let expires_at = now + Duration::from_millis(10);
         let (startup, live) = packet_metrics(UnderlayProtocol::Tcp);
@@ -2187,14 +2270,14 @@ mod packet_metric_authority_tests {
             &attachment,
             expires_at - Duration::from_nanos(1),
         );
-        assert_eq!(fresh.delivery_rate_bps, 120_000_000.0);
-        assert_eq!(fresh.pacing_rate_bps, 140_000_000.0);
-        assert_eq!(fresh.confidence, 0.7);
-        assert!(!fresh.app_limited);
+        assert_eq!(fresh.delivery_rate_bps, 25_000_000.0);
+        assert_eq!(fresh.pacing_rate_bps, 25_000_000.0);
+        assert_eq!(fresh.confidence, 0.1);
+        assert!(fresh.app_limited);
         assert_eq!(fresh.carrier_delivery_rate_bps, Some(120_000_000.0));
 
-        // At the exact deadline, an expired sidecar must not fall through to
-        // retained diagnostic PathMetrics.
+        // At the exact deadline, an expired sidecar disappears as a
+        // diagnostic and never changes the immutable scheduling rate.
         let expired = server_tcp_packet_snapshot_at(Some(&status), &attachment, expires_at);
         assert_startup_rate_bundle(expired);
     }
@@ -2208,5 +2291,39 @@ mod packet_metric_authority_tests {
         let snapshot = server_tcp_packet_snapshot_at(Some(&status), &attachment, Instant::now());
         assert_startup_rate_bundle(snapshot);
         assert_eq!(snapshot.carrier_delivery_rate_bps, None);
+    }
+
+    #[test]
+    fn tcp_unlimited_startup_remains_typed_and_nonnumeric() {
+        let (startup, live) = packet_metrics(UnderlayProtocol::Tcp);
+        let status = status(UnderlayProtocol::Tcp, live, None);
+        let (mut attachment, _lifetime) = attachment(UnderlayProtocol::Tcp, startup);
+        attachment.startup_rate_prior = RateHint::Unlimited;
+
+        let snapshot = server_tcp_packet_snapshot_at(Some(&status), &attachment, Instant::now());
+        let service_rate = snapshot
+            .scheduling_service_rate()
+            .expect("Unlimited is a typed startup service rate, not absence");
+        assert_eq!(service_rate.basis(), ServiceRateBasis::UnlimitedStartup);
+        assert_eq!(service_rate.value(), ServiceRateValue::UnlimitedStartup);
+        assert_eq!(service_rate.finite_rate_bps(), None);
+        assert_ne!(snapshot.delivery_rate_bps, 1_000_000_000_000.0);
+    }
+
+    #[test]
+    fn tcp_configured_rate_above_f64_integer_range_stays_exact_in_typed_projection() {
+        let exact_rate = (1_u64 << 53) + 1;
+        let (startup, live) = packet_metrics(UnderlayProtocol::Tcp);
+        let status = status(UnderlayProtocol::Tcp, live, None);
+        let (mut attachment, _lifetime) = attachment(UnderlayProtocol::Tcp, startup);
+        attachment.startup_rate_prior = RateHint::BitsPerSecond(exact_rate);
+
+        let snapshot = server_tcp_packet_snapshot_at(Some(&status), &attachment, Instant::now());
+        assert_eq!(
+            snapshot
+                .scheduling_service_rate()
+                .and_then(DirectionalServiceRate::finite_rate_bps),
+            Some(exact_rate),
+        );
     }
 }

@@ -45,17 +45,17 @@ fn install_packet_attachment(
 fn seed_native_packet_evidence(
     context: &ClientPathContext,
     attachment: PacketPathAttachment,
-    rate_bps: f64,
+    rate_bps: u64,
     srtt_ms: f64,
-) {
+) -> crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot {
     let mut health = context.state.health().lock().expect("path health");
     let record = health
         .path_record_mut(attachment.key)
         .expect("packet path record");
     record.carrier_srtt_ms = Some(srtt_ms);
     record.carrier_rttvar_ms = Some(srtt_ms / 8.0);
-    record.carrier_delivery_rate_bps = Some(rate_bps);
-    record.carrier_pacing_rate_bps = Some(rate_bps);
+    record.carrier_delivery_rate_bps = Some(rate_bps as f64);
+    record.carrier_pacing_rate_bps = Some(rate_bps as f64);
     record.carrier_delivery_samples = 10;
     record.carrier_delivery_sample_bytes = MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64;
     record.carrier_delivery_window_covered = true;
@@ -64,6 +64,36 @@ fn seed_native_packet_evidence(
     record.carrier_bulk_proof_expires_at = Some(now + Duration::from_secs(60));
     record.carrier_app_limited = false;
     record.carrier_ack_derived_data_seen = true;
+    drop(health);
+
+    let scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+        attachment.path_instance_id,
+        PathMetricDirection::ClientToServer,
+    );
+    let authority =
+        crate::runtime::path::authority::NativeCarrierRateAuthorityHandle::from_observation_for_test(
+            scope,
+            rate_bps,
+            1,
+            attachment.path_instance_id.as_u64(),
+            Some(u128::from(rate_bps)),
+        )
+        .expect("packet-test native authority");
+    authority
+        .refresh_scheduling_shape_for_test(
+            scope,
+            1,
+            attachment.path_instance_id.as_u64(),
+            Some(u128::from(rate_bps)),
+            Duration::from_secs_f64(srtt_ms / 1_000.0),
+            Duration::from_secs_f64(srtt_ms / 8_000.0),
+            512 * 1_024,
+            0,
+            1_400,
+            Some(rate_bps),
+            false,
+        )
+        .expect("packet-test coherent native shape")
 }
 
 #[test]
@@ -92,7 +122,7 @@ fn request_bulk_discovery_publishes_only_the_configured_planning_product_window(
     }
 
     let observation = context.observe_reliable_request_paths(
-        instances.map(|instance| (instance, None)),
+        instances.map(|instance| (instance, None, ReliableRequestNativeShape::NotApplicable)),
         PATH_OPEN_SCORE_BYTES,
         true,
     );
@@ -149,8 +179,11 @@ fn physical_replacement_clears_predecessor_load_and_stale_drop_cannot_release_su
         .reliable_path_snapshot_for_instance(successor)
         .expect("successor exact health");
     assert_eq!(successor_snapshot.active_flows, 0);
-    let observation =
-        context.observe_reliable_request_paths([(successor, None)], PATH_OPEN_SCORE_BYTES, false);
+    let observation = context.observe_reliable_request_paths(
+        [(successor, None, ReliableRequestNativeShape::NotApplicable)],
+        PATH_OPEN_SCORE_BYTES,
+        false,
+    );
     assert_eq!(observation.paths[0].instance, successor);
     assert_eq!(
         observation.paths[0]
@@ -254,10 +287,12 @@ fn packet_candidates_require_the_current_instance_and_do_not_consume_product_sta
             PacketPathSelectionInput {
                 attachment: stale,
                 active_flows: 0,
+                native_scheduling_shape: None,
             },
             PacketPathSelectionInput {
                 attachment: current,
                 active_flows: 0,
+                native_scheduling_shape: None,
             },
         ],
         1_400,
@@ -305,18 +340,24 @@ fn packet_candidates_use_native_evidence_with_regular_before_backup() {
             )
         })
         .collect::<Vec<_>>();
-    seed_native_packet_evidence(&context, attachments[0], 50_000_000.0, 40.0);
-    seed_native_packet_evidence(&context, attachments[1], 500_000_000.0, 10.0);
-    seed_native_packet_evidence(&context, attachments[2], 10_000_000_000.0, 1.0);
-    seed_native_packet_evidence(&context, attachments[3], 10_000_000_000.0, 1.0);
+    let native_shapes = [
+        seed_native_packet_evidence(&context, attachments[0], 50_000_000, 40.0),
+        seed_native_packet_evidence(&context, attachments[1], 500_000_000, 10.0),
+        seed_native_packet_evidence(&context, attachments[2], 10_000_000_000, 1.0),
+        seed_native_packet_evidence(&context, attachments[3], 10_000_000_000, 1.0),
+    ];
 
     let inputs = attachments
         .iter()
         .copied()
-        .map(|attachment| PacketPathSelectionInput {
-            attachment,
-            active_flows: 0,
-        })
+        .zip(native_shapes)
+        .map(
+            |(attachment, native_scheduling_shape)| PacketPathSelectionInput {
+                attachment,
+                active_flows: 0,
+                native_scheduling_shape: Some(native_scheduling_shape),
+            },
+        )
         .collect::<Vec<_>>();
     let candidates = context.ordered_packet_path_candidates(&inputs, 1_400);
     assert_eq!(
@@ -325,6 +366,11 @@ fn packet_candidates_use_native_evidence_with_regular_before_backup() {
         "control-only paths are not packet outputs"
     );
     assert_eq!(candidates[0].attachment, attachments[1]);
+    assert_eq!(
+        candidates[0].native_authority_stamp,
+        Some(native_shapes[1].stamp()),
+        "packet candidate retains the exact attachment-owned authority token",
+    );
     assert_eq!(candidates[1].attachment, attachments[0]);
     assert_eq!(
         candidates[2].attachment, attachments[2],
@@ -358,10 +404,12 @@ fn packet_candidates_balance_equal_paths_with_packet_plane_load() {
             PacketPathSelectionInput {
                 attachment: attachments[0],
                 active_flows: 8,
+                native_scheduling_shape: None,
             },
             PacketPathSelectionInput {
                 attachment: attachments[1],
                 active_flows: 0,
+                native_scheduling_shape: None,
             },
         ],
         1_400,

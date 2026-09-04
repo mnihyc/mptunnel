@@ -223,7 +223,7 @@ impl QuicPathMetricTracker {
             shape.congestion_window(),
             shape.bytes_in_flight(),
             shape.current_mtu(),
-            shape.rate_bps(),
+            shape.finite_rate_bps(),
             shape.pacing_rate_bps(),
             shape.app_limited(),
             congestion,
@@ -254,7 +254,7 @@ impl QuicPathMetricTracker {
             congestion_window,
             bytes_in_flight,
             stats.path.current_mtu,
-            controller_rate,
+            Some(controller_rate),
             congestion.pacing_rate_bps,
             congestion.app_limited,
             congestion,
@@ -271,7 +271,7 @@ impl QuicPathMetricTracker {
         congestion_window: u64,
         bytes_in_flight: u64,
         current_mtu: u16,
-        authority_rate_bps: u64,
+        authority_rate_bps: Option<u64>,
         native_pacing_rate_bps: Option<u64>,
         native_app_limited: bool,
         congestion: quic_transport::CongestionMetrics,
@@ -300,7 +300,10 @@ impl QuicPathMetricTracker {
         };
         let startup_rate = default_path_rate_bps();
         let raw_pacing_rate = native_pacing_rate_bps.map(|rate| rate.max(1) as f64);
-        let controller_rate = Some(authority_rate_bps.max(1) as f64);
+        // Unlimited startup has no numeric authority value. Metrics may still
+        // report a best-effort native pacing/window estimate, but that
+        // diagnostic must not manufacture a scheduling-rate authority.
+        let controller_rate = authority_rate_bps.map(|rate| rate as f64);
         let usable_pacing_rate = raw_pacing_rate.map(|rate| {
             if self.delivery_sample_count == 0 {
                 rate.max(startup_rate)
@@ -459,10 +462,12 @@ impl QuicPathMetricTracker {
             rttvar,
             rtt_observed: !raw_rtt.is_zero(),
             // NativeMode has one scheduling rate: the central C0/Bop value.
-            // ACK-window estimates below remain diagnostic-only.
-            delivery_rate_bps: authority_rate_bps.max(1) as f64,
+            // An Unlimited startup has no numeric authority, so this legacy
+            // metric reports only the best-effort transport estimate while
+            // the typed scheduling projection remains nonnumeric.
+            delivery_rate_bps: authority_rate_bps.map_or(delivery_rate_bps, |rate| rate as f64),
             pacing_rate_bps,
-            controller_bandwidth_bps: Some(authority_rate_bps.max(1)),
+            controller_bandwidth_bps: authority_rate_bps,
             inflight_hi,
             bytes_in_flight: usize::try_from(bytes_in_flight).unwrap_or(usize::MAX),
             pending_bytes: usize::try_from(carrier_committed_bytes).unwrap_or(usize::MAX),

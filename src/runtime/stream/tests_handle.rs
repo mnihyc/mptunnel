@@ -9,6 +9,7 @@ use crate::model::capacity::{
 };
 use crate::model::carrier_rate_authority::{CarrierRateAuthorityBasis, CarrierRateAuthorityScope};
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::model::service_rate::{DirectionalServiceRate, DirectionalServiceRateScope};
 use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
 use crate::protocol::PathMetricDirection;
@@ -23,6 +24,7 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::stream::reliable_stream_recv_progress_interval;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
+use crate::transport::RateHint;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -276,6 +278,69 @@ fn native_reinjection_precommit_rejects_c0_to_bop_and_refunds_reservation() {
     assert_fixed_output_has_no_flight(&fixed);
     assert!(try_recv_reliable_path_command(&mut receivers).is_none());
     assert_reserved_reinjection_capacity_refunded(&fixed, &frame);
+}
+
+#[test]
+fn native_fixed_reinjection_precommit_uses_current_same_stamp_recovery_clock() {
+    let (fixed, authority, mut receivers) =
+        native_fixed_output_transaction(54, 1, Some(120_000_000), 1);
+    let frame = stream_data_frame(4_096);
+    let scope = CarrierRateAuthorityScope::new(
+        CarrierPathInstanceId::from_raw(54),
+        PathMetricDirection::ClientToServer,
+    );
+    let expected_stamp = authority.stamp().expect("initial native authority stamp");
+    let (offset, end, bytes) = reliable_stream_frame_extent(&frame).expect("stream-data extent");
+    let command = fixed
+        .commands()
+        .try_reserve_reinjection_frame(frame.clone(), TrafficClass::Throughput)
+        .expect("reserve the exact reinjection writer slot first");
+    let decision = fixed
+        .current_rate_decision()
+        .expect("capture the advisory Native shape");
+    let refreshed = authority
+        .refresh_scheduling_shape_for_test(
+            scope,
+            1,
+            7,
+            Some(120_000_000),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            2 * 1024 * 1024,
+            256 * 1024,
+            1_400,
+            Some(100_000_000),
+            false,
+        )
+        .expect("refresh only Quinn timing shape after reservation");
+    assert_eq!(refreshed.stamp(), expected_stamp);
+    assert_eq!(
+        authority.stamp().expect("unchanged central stamp"),
+        expected_stamp
+    );
+    let before = Instant::now();
+
+    let deadline = fixed
+        .commit_reserved_reinjected_frame(
+            command,
+            decision,
+            offset,
+            end,
+            bytes,
+            TrafficClass::Throughput,
+            0,
+            bytes,
+        )
+        .expect("current same-stamp shape still permits reinjection");
+
+    assert!(
+        deadline.duration_since(before) >= Duration::from_secs(8),
+        "the committed repair clock must come from current 5s/1s Quinn timing",
+    );
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(received)) if received == frame
+    ));
 }
 
 #[test]
@@ -568,15 +633,22 @@ fn tcp_fixed_output_product_lower_bound_cannot_downshift_startup_prior() {
 }
 
 #[test]
-fn tcp_fixed_output_fresh_native_rate_can_downshift_startup_prior() {
+fn tcp_fixed_output_carrier_diagnostic_cannot_downshift_startup_prior() {
     let mux_limits = MuxLimits::default();
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let startup = PathSnapshot::new(PathId(81), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
+    let instance = CarrierPathInstanceId::from_raw(81);
+    let service_rate = DirectionalServiceRate::from_startup_hint(
+        DirectionalServiceRateScope::new(instance, PathMetricDirection::ClientToServer),
+        RateHint::BitsPerSecond(500_000_000),
+    )
+    .expect("configured TCP startup rate");
+    let startup = PathSnapshot::new(PathId(81), UnderlayProtocol::Tcp, 20.0, 500_000_000.0)
+        .with_scheduling_service_rate(service_rate);
     let observed_at = Instant::now();
     let fixed = FixedReliablePathOutput::new_with_snapshot_and_path_instance(
         startup,
         startup,
-        CarrierPathInstanceId::from_raw(81),
+        instance,
         None,
         Some(FixedNativeRateEpoch {
             rate_bps: 100_000_000.0,
@@ -588,7 +660,8 @@ fn tcp_fixed_output_fresh_native_rate_can_downshift_startup_prior() {
     );
 
     let snapshot = fixed.send_path_snapshot_at(TrafficClass::Throughput, observed_at);
-    assert_eq!(snapshot.delivery_rate_bps, 100_000_000.0);
+    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(snapshot.scheduling_service_rate(), Some(service_rate));
     assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(snapshot.carrier_delivery_rate_bps, Some(100_000_000.0));
 }
@@ -761,15 +834,22 @@ fn native_fixed_output_invalid_authority_states_fail_closed() {
 }
 
 #[test]
-fn tcp_fixed_output_without_native_handle_keeps_legacy_freshness_behavior() {
+fn tcp_fixed_output_keeps_startup_authority_across_diagnostic_freshness() {
     let mux_limits = MuxLimits::default();
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let startup = PathSnapshot::new(PathId(47), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
+    let instance = CarrierPathInstanceId::from_raw(47);
+    let service_rate = DirectionalServiceRate::from_startup_hint(
+        DirectionalServiceRateScope::new(instance, PathMetricDirection::ClientToServer),
+        RateHint::BitsPerSecond(500_000_000),
+    )
+    .expect("configured TCP startup rate");
+    let startup = PathSnapshot::new(PathId(47), UnderlayProtocol::Tcp, 20.0, 500_000_000.0)
+        .with_scheduling_service_rate(service_rate);
     let observed_at = Instant::now();
     let fixed = FixedReliablePathOutput::new_with_snapshot_and_path_instance(
         startup,
         startup,
-        CarrierPathInstanceId::from_raw(47),
+        instance,
         None,
         Some(FixedNativeRateEpoch {
             rate_bps: 100_000_000.0,
@@ -784,17 +864,21 @@ fn tcp_fixed_output_without_native_handle_keeps_legacy_freshness_behavior() {
         fixed
             .send_path_snapshot_at(TrafficClass::Throughput, observed_at)
             .delivery_rate_bps,
-        100_000_000.0
+        500_000_000.0
     );
     assert_eq!(
         fixed
-            .send_path_snapshot_at(
-                TrafficClass::Throughput,
-                observed_at + Duration::from_millis(11),
-            )
-            .delivery_rate_bps,
-        500_000_000.0
+            .send_path_snapshot_at(TrafficClass::Throughput, observed_at)
+            .carrier_delivery_rate_bps,
+        Some(100_000_000.0),
     );
+    let expired = fixed.send_path_snapshot_at(
+        TrafficClass::Throughput,
+        observed_at + Duration::from_millis(11),
+    );
+    assert_eq!(expired.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(expired.carrier_delivery_rate_bps, None);
+    assert_eq!(expired.scheduling_service_rate(), Some(service_rate));
 }
 
 #[test]
@@ -1023,7 +1107,7 @@ fn fixed_native_window_and_rate_evidence_expire_without_rewriting_product_author
 }
 
 #[test]
-fn newer_fixed_product_rate_changes_ranking_without_rewriting_product_authority() {
+fn t02_fixed_product_rate_stays_diagnostic_beside_configured_service_rate() {
     let mux_limits = MuxLimits {
         max_repair_bytes: 32 * 1024 * 1024,
         max_reorder_bytes: 32 * 1024 * 1024,
@@ -1031,13 +1115,20 @@ fn newer_fixed_product_rate_changes_ranking_without_rewriting_product_authority(
         ..MuxLimits::default()
     };
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let mut startup = PathSnapshot::new(PathId(12), UnderlayProtocol::Tcp, 100.0, 80_000_000.0);
+    let instance = CarrierPathInstanceId::from_raw(12);
+    let startup_service_rate = DirectionalServiceRate::from_startup_hint(
+        DirectionalServiceRateScope::new(instance, PathMetricDirection::ClientToServer),
+        RateHint::BitsPerSecond(80_000_000),
+    )
+    .expect("configured startup service rate");
+    let mut startup = PathSnapshot::new(PathId(12), UnderlayProtocol::Tcp, 100.0, 80_000_000.0)
+        .with_scheduling_service_rate(startup_service_rate);
     startup.carrier_inflight_limit_bytes = 1024 * 1024;
     let observed_at = Instant::now() - Duration::from_millis(20);
     let fixed = FixedReliablePathOutput::new_with_snapshot_and_path_instance(
         startup,
         startup,
-        CarrierPathInstanceId::from_raw(12),
+        instance,
         Some(CarrierNativeWindowSample {
             inflight_limit_bytes: startup.carrier_inflight_limit_bytes,
             observed_at,
@@ -1067,11 +1158,16 @@ fn newer_fixed_product_rate_changes_ranking_without_rewriting_product_authority(
     let expected = reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
 
     assert_eq!(snapshot.carrier_inflight_limit_bytes, 1024 * 1024);
-    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
-    assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(snapshot.delivery_rate_bps, 80_000_000.0);
+    assert_eq!(
+        snapshot.scheduling_service_rate(),
+        Some(startup_service_rate)
+    );
+    assert_eq!(snapshot.product_progress_rate_bps, Some(500_000_000.0));
+    assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(
         snapshot.data_level_limit_bytes, expected,
-        "newer exact Product service changes completion ranking without converting R or C into Product authority",
+        "Product completion remains diagnostic and cannot replace configured carrier C",
     );
     let output = ReliablePathStreamOutput::Fixed(fixed);
     let (_, source_window) = output
@@ -1086,15 +1182,16 @@ fn newer_fixed_product_rate_changes_ranking_without_rewriting_product_authority(
 fn fixed_product_rate_requires_the_exact_epoch_byte_boundary() {
     let mux_limits = MuxLimits::default();
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let startup = PathSnapshot::new(PathId(13), UnderlayProtocol::Tcp, 100.0, 25_000_000.0);
+    let instance = CarrierPathInstanceId::from_raw(13);
+    let service_rate = DirectionalServiceRate::from_startup_hint(
+        DirectionalServiceRateScope::new(instance, PathMetricDirection::ClientToServer),
+        RateHint::BitsPerSecond(25_000_000),
+    )
+    .expect("configured TCP startup rate");
+    let startup = PathSnapshot::new(PathId(13), UnderlayProtocol::Tcp, 100.0, 25_000_000.0)
+        .with_scheduling_service_rate(service_rate);
     let fixed = FixedReliablePathOutput::new_with_snapshot_and_path_instance(
-        startup,
-        startup,
-        CarrierPathInstanceId::from_raw(13),
-        None,
-        None,
-        commands,
-        mux_limits,
+        startup, startup, instance, None, None, commands, mux_limits,
     );
     let observed_at = Instant::now();
     let sample_floor = crate::model::capacity::reliable_path_startup_sample_limit_bytes(mux_limits);
@@ -1126,8 +1223,9 @@ fn fixed_product_rate_requires_the_exact_epoch_byte_boundary() {
             .sample_bytes = sample_floor;
     }
     let qualified = fixed.send_path_snapshot_at(TrafficClass::Throughput, observed_at);
-    assert_eq!(qualified.delivery_rate_bps, raw_rate);
-    assert_eq!(qualified.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(qualified.delivery_rate_bps, 25_000_000.0);
+    assert_eq!(qualified.scheduling_service_rate(), Some(service_rate));
+    assert_eq!(qualified.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(qualified.product_progress_rate_bps, Some(raw_rate));
     assert!(qualified.has_durable_product_progress);
 }

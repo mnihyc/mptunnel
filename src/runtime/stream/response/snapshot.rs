@@ -15,7 +15,7 @@ use super::evidence::{
     server_output_product_rate_epoch_has_bulk_evidence_at, server_path_metrics_estimate_rate_bps,
     server_path_metrics_has_bulk_rate_evidence_at,
     server_path_metrics_has_qualified_delivery_history, server_path_metrics_native_window_sample,
-    server_path_metrics_rate_evidence_is_fresh_at, server_path_metrics_snapshot_is_fresh_at,
+    server_path_metrics_rate_evidence_is_fresh_at,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, ReliableOriginalDataOutput,
@@ -25,12 +25,11 @@ use crate::model::capacity::{
 use crate::model::carrier_rate_authority::CarrierRateAuthorityBasis;
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponsePathObservation;
+use crate::model::service_rate::{DirectionalServiceRate, DirectionalServiceRateScope};
 use crate::mux::MuxLimits;
 use crate::protocol::SessionId;
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
-use crate::runtime::path::model::{
-    default_path_rate_bps, default_path_srtt_ms, startup_rate_prediction_bps,
-};
+use crate::runtime::path::model::{default_path_srtt_ms, startup_rate_prediction_bps};
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use std::sync::Arc;
@@ -395,11 +394,6 @@ pub(super) fn server_bulk_output_snapshot_at(
     let diagnostic_local_rate = local_metrics
         .filter(|metrics| server_path_metrics_has_bulk_rate_evidence_at(*metrics, now))
         .map(server_path_metrics_estimate_rate_bps);
-    // TCP has no named NativeMode adapter. Kernel delivery-rate telemetry is
-    // useful writer shape and diagnostics, but cannot replace ReceiptMode C0.
-    let native_rate = (entry.key.underlay != crate::protocol::UnderlayProtocol::Tcp)
-        .then_some(diagnostic_local_rate)
-        .flatten();
     // A partial native ACK epoch may expose current send intent before it has
     // covered the frozen delivery window. Preserve that value as pacing shape,
     // but never project it into achieved completion service below.
@@ -448,26 +442,24 @@ pub(super) fn server_bulk_output_snapshot_at(
         })
         .map(|rate| rate.max(1) as f64)
         .or(native_startup_pacing_rate);
-    let peer_rate = (entry.key.underlay != crate::protocol::UnderlayProtocol::Tcp)
-        .then(|| {
-            peer_hint
-                .filter(|metrics| server_path_metrics_snapshot_is_fresh_at(*metrics, now))
-                .filter(|metrics| !metrics.metrics.app_limited)
-                .map(server_path_metrics_estimate_rate_bps)
-        })
-        .flatten();
-    // Product completion is a historical lower bound. It may raise the
-    // compatible configured/native projection, but a low Product point cannot
-    // prove that baseline slower.
-    let baseline_rate = native_rate
-        .or(peer_rate)
-        .unwrap_or_else(|| startup_rate_prediction_bps(entry.startup_rate_prior));
-    let (rate_bps, rate_scope) = match qualified_product_completion_rate
-        .filter(|product_rate| *product_rate > baseline_rate)
-    {
-        Some(product_rate) => (product_rate, PathRateScope::PerFlowGoodput),
-        None => (baseline_rate, PathRateScope::PathCapacity),
-    };
+    // One response action has exactly one immutable, endpoint-local startup
+    // service rate. Product ACKs, peer hints, PATH_CAPACITY, and generic or
+    // TCP-kernel metrics remain useful diagnostics but never select C. QUIC's
+    // named native adapter is projected by the exclusive branch above.
+    let scheduling_service_rate = DirectionalServiceRate::from_startup_hint(
+        DirectionalServiceRateScope::new(
+            entry.path_instance_id,
+            crate::protocol::PathMetricDirection::ServerToClient,
+        ),
+        entry.startup_rate_prior,
+    )
+    .ok();
+    // The legacy scalar cannot represent Unlimited. Keep it only as a lossy
+    // display/transition diagnostic; the typed sidecar is the sole authority.
+    let startup_diagnostic_rate = startup_rate_prediction_bps(entry.startup_rate_prior);
+    let rate_bps = scheduling_service_rate
+        .and_then(DirectionalServiceRate::finite_rate_bps)
+        .map_or(startup_diagnostic_rate, |rate| rate as f64);
 
     let mut snapshot = PathSnapshot::new(
         entry.key.path_id,
@@ -475,9 +467,15 @@ pub(super) fn server_bulk_output_snapshot_at(
         srtt_ms,
         rate_bps.max(1.0),
     );
-    snapshot.rate_scope = rate_scope;
+    snapshot.scheduling_service_rate = scheduling_service_rate;
+    snapshot.rate_scope = PathRateScope::PathCapacity;
+    if scheduling_service_rate.is_none() {
+        // A zero configured finite rate is invalid at the typed boundary. It
+        // must not silently fall back to a different scheduling authority.
+        snapshot.state = crate::scheduler::PathState::Failed;
+    }
     // Retain qualified local transport rate for diagnostics and writer-shape
-    // observability. In TCP ReceiptMode it is not the completion-rate basis.
+    // observability. For TCP it is not the scheduling service-rate basis.
     snapshot.carrier_delivery_rate_bps = diagnostic_local_rate;
     snapshot.policy = entry.local_policy;
     snapshot.peer_usage = entry.peer_usage;
@@ -493,8 +491,8 @@ pub(super) fn server_bulk_output_snapshot_at(
     }
     snapshot.active_flows = active_flows;
     snapshot.active_latency_sensitive_flows = active_latency_sensitive_flows;
-    // `product_progress_rate_bps` is consumed by completion and reorder math,
-    // so it carries qualified completion service only, never the raw point.
+    // Product goodput remains an independently qualified diagnostic for
+    // Product/reorder policy; it cannot replace the service-rate sidecar.
     snapshot.product_progress_rate_bps = qualified_product_completion_rate;
     // Tagged Product qualification is an incarnation-local historical fact.
     // Numeric completion service may expire independently without returning
@@ -559,20 +557,28 @@ pub(super) fn server_native_bulk_output_snapshot_at(
         let scope = shape.stamp().scope();
         scope.carrier_instance_id() == entry.path_instance_id
             && scope.direction() == crate::protocol::PathMetricDirection::ServerToClient
-            && shape.rate_bps() > 0
     });
+    let scheduling_service_rate = shape.map(NativeCarrierSchedulingShapeSnapshot::service_rate);
     let srtt_ms = shape
         .filter(|shape| !shape.srtt().is_zero())
         .map_or_else(default_path_srtt_ms, |shape| {
             shape.srtt().as_secs_f64() * 1_000.0
         });
-    let rate_bps = shape.map_or_else(default_path_rate_bps, |shape| shape.rate_bps() as f64);
+    // Unlimited remains nonnumeric. This scalar is only a lossy legacy
+    // diagnostic until the typed scorer transaction consumes the sidecar.
+    let rate_bps = scheduling_service_rate
+        .and_then(DirectionalServiceRate::finite_rate_bps)
+        .map_or_else(
+            || startup_rate_prediction_bps(entry.startup_rate_prior),
+            |rate| rate as f64,
+        );
     let mut snapshot = PathSnapshot::new(
         entry.key.path_id,
         entry.key.underlay,
         srtt_ms,
         rate_bps.max(1.0),
     );
+    snapshot.scheduling_service_rate = scheduling_service_rate;
     snapshot.policy = entry.local_policy;
     snapshot.peer_usage = entry.peer_usage;
     if shape.is_none() {
@@ -591,11 +597,17 @@ pub(super) fn server_native_bulk_output_snapshot_at(
     snapshot.data_level_queue_bytes = data_level_queue_bytes;
     snapshot.data_level_bytes_in_flight = entry.original_data_in_flight_bytes;
     if let Some(shape) = shape {
-        snapshot.carrier_delivery_rate_bps = Some(shape.rate_bps() as f64);
+        let finite_rate_bps = shape.finite_rate_bps();
+        snapshot.carrier_delivery_rate_bps = (shape.basis()
+            == CarrierRateAuthorityBasis::NativeOperational)
+            .then_some(finite_rate_bps)
+            .flatten()
+            .map(|rate| rate as f64);
         snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1_000.0;
         snapshot.pacing_rate_bps = shape
             .pacing_rate_bps()
-            .map_or(shape.rate_bps() as f64, |rate| rate as f64)
+            .or(finite_rate_bps)
+            .map_or(rate_bps, |rate| rate as f64)
             .max(1.0);
         snapshot.bytes_in_flight = shape.bytes_in_flight();
         snapshot.carrier_inflight_limit_bytes = shape

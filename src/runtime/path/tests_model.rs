@@ -1,6 +1,168 @@
 use super::*;
 
 #[test]
+fn t02_portable_startup_projection_uses_encoded_core_work() {
+    let path = "tcp://127.0.0.1:10000"
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let rate = directional_startup_service_rate(
+        &path,
+        CarrierPathInstanceId::from_raw(1),
+        PathMetricDirection::ClientToServer,
+    )
+    .expect("portable startup service rate");
+    assert_eq!(
+        rate.finite_rate_bps(),
+        Some(351_472),
+        "the portable prior must use the complete 14,630-byte Core action and upward rounding",
+    );
+}
+
+#[test]
+fn t02_configured_startup_projection_retains_integer_identity() {
+    let exact = (1_u64 << 53) + 1;
+    let path = format!("tcp://127.0.0.1:10000?initial-rate-bps={exact}")
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let rate = directional_startup_service_rate(
+        &path,
+        CarrierPathInstanceId::from_raw(1),
+        PathMetricDirection::ClientToServer,
+    )
+    .expect("configured startup service rate");
+    assert_eq!(
+        rate.finite_rate_bps(),
+        Some(exact),
+        "configured authority must not lose integer identity through f64",
+    );
+}
+
+#[test]
+fn t02_path_metrics_do_not_serialize_endpoint_local_startup_but_keep_observed_diagnostics() {
+    let exact = (1_u64 << 53) + 1;
+    let path = format!("tcp://127.0.0.1:10000?initial-rate-bps={exact}")
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let instance = CarrierPathInstanceId::from_raw(2);
+    let no_evidence = ClientPathObservation {
+        path_instance_id: Some(instance),
+        ..ClientPathObservation::default()
+    };
+    let startup_snapshot = path_snapshot(&path, 0, no_evidence);
+    assert_eq!(
+        startup_snapshot
+            .scheduling_service_rate()
+            .and_then(DirectionalServiceRate::finite_rate_bps),
+        Some(exact),
+        "the local typed authority retains exact configured identity",
+    );
+
+    let startup_metrics = path_metrics_from_snapshot_at(
+        startup_snapshot,
+        no_evidence,
+        PathMetricDirection::ClientToServer,
+        Instant::now(),
+    );
+    assert_eq!(
+        startup_metrics.delivery_rate_bps,
+        portable_startup_rate().unwrap().get(),
+        "an unobserved wire field uses public C0, never endpoint-local policy",
+    );
+    assert!(!startup_metrics.rate_observed);
+    assert_eq!(startup_metrics.rate_valid_for_us, 0);
+
+    let now = Instant::now();
+    let observed = ClientPathObservation {
+        path_instance_id: Some(instance),
+        measured_rate_bps: Some(90_000_000.0),
+        delivery_samples: 3,
+        delivery_sample_bytes: 256 * 1024,
+        last_delivery_at: Some(now),
+        delivery_rate_expires_at: Some(now + Duration::from_secs(1)),
+        ..ClientPathObservation::default()
+    };
+    let observed_metrics = path_metrics_from_snapshot_at(
+        path_snapshot(&path, 0, observed),
+        observed,
+        PathMetricDirection::ClientToServer,
+        now,
+    );
+    assert_eq!(observed_metrics.delivery_rate_bps, 90_000_000);
+    assert!(observed_metrics.rate_observed);
+    assert_eq!(observed_metrics.rate_valid_for_us, 1_000_000);
+}
+
+#[test]
+fn t02_red_tcp_diagnostics_do_not_replace_configured_startup_authority() {
+    let tcp = "tcp://127.0.0.1:10000?initial-rate-mbps=25"
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let now = Instant::now();
+    let instance = CarrierPathInstanceId::from_raw(3);
+    let snapshot = path_snapshot(
+        &tcp,
+        0,
+        ClientPathObservation {
+            path_instance_id: Some(instance),
+            carrier_delivery_rate_bps: Some(117_000_000.0),
+            carrier_delivery_samples: 1,
+            carrier_delivery_sample_bytes: MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64,
+            carrier_delivery_window_covered: true,
+            carrier_last_delivery_at: Some(now),
+            carrier_bulk_proof_expires_at: Some(now + Duration::from_secs(1)),
+            explicit_carrier_capacity_proof: true,
+            ..ClientPathObservation::default()
+        },
+    );
+
+    assert_eq!(
+        snapshot.delivery_rate_bps, 25_000_000.0,
+        "PATH_CAPACITY and kernel TCP delivery evidence are diagnostics in Core",
+    );
+    assert_eq!(snapshot.carrier_delivery_rate_bps, Some(117_000_000.0));
+    assert_eq!(
+        snapshot
+            .scheduling_service_rate()
+            .and_then(DirectionalServiceRate::finite_rate_bps),
+        Some(25_000_000),
+    );
+}
+
+#[test]
+fn t02_red_product_completion_rate_does_not_replace_carrier_authority() {
+    let tcp = "tcp://127.0.0.1:10000?initial-rate-mbps=25"
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let now = Instant::now();
+    let instance = CarrierPathInstanceId::from_raw(4);
+    let snapshot = path_snapshot(
+        &tcp,
+        0,
+        ClientPathObservation {
+            path_instance_id: Some(instance),
+            product_delivery_rate_bps: Some(900_000_000.0),
+            product_delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+            product_delivery_sample_bytes: MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64,
+            product_last_delivery_at: Some(now),
+            product_delivery_rate_expires_at: Some(now + Duration::from_secs(1)),
+            ..ClientPathObservation::default()
+        },
+    );
+
+    assert_eq!(
+        snapshot.delivery_rate_bps, 25_000_000.0,
+        "a per-flow Product completion observation cannot become physical carrier C",
+    );
+    assert_eq!(snapshot.product_progress_rate_bps, Some(900_000_000.0));
+    assert_eq!(
+        snapshot
+            .scheduling_service_rate()
+            .and_then(DirectionalServiceRate::finite_rate_bps),
+        Some(25_000_000),
+    );
+}
+
+#[test]
 fn configured_order_startup_excludes_backup_while_available_path_is_schedulable() {
     let paths = [
         "tcp://127.0.0.1:10000".parse::<PathSpec>().expect("path"),
@@ -82,16 +244,16 @@ fn path_snapshot_preserves_rate_provenance() {
     let provisional_snapshot = path_snapshot(&tcp, 0, product);
     assert_eq!(provisional_snapshot.delivery_rate_bps, 400_000_000.0);
     assert_eq!(provisional_snapshot.rate_scope, PathRateScope::PathCapacity);
+    let provisional_metrics = path_metrics_from_snapshot_at(
+        provisional_snapshot,
+        product,
+        PathMetricDirection::ClientToServer,
+        now,
+    );
+    assert_eq!(provisional_metrics.rate_valid_for_us, 1_000_000);
     assert_eq!(
-        path_metrics_from_snapshot_at(
-            provisional_snapshot,
-            product,
-            PathMetricDirection::ClientToServer,
-            now,
-        )
-        .rate_valid_for_us,
-        0,
-        "a provisional Product sample must not lend its deadline to the selected startup prior"
+        provisional_metrics.delivery_rate_bps, 120_000_000,
+        "PATH_METRICS publishes the qualified Product diagnostic, not configured scheduling C",
     );
 
     let mature_product = ClientPathObservation {
@@ -107,17 +269,14 @@ fn path_snapshot_preserves_rate_provenance() {
         "the mature exact Product interval remains visible as a historical lower bound",
     );
     assert!(product_snapshot.has_durable_product_progress);
-    assert_eq!(
-        path_metrics_from_snapshot_at(
-            product_snapshot,
-            mature_product,
-            PathMetricDirection::ClientToServer,
-            now,
-        )
-        .rate_valid_for_us,
-        0,
-        "a lower Product bound cannot lend its deadline to the selected configured baseline",
+    let product_metrics = path_metrics_from_snapshot_at(
+        product_snapshot,
+        mature_product,
+        PathMetricDirection::ClientToServer,
+        now,
     );
+    assert_eq!(product_metrics.rate_valid_for_us, 1_000_000);
+    assert_eq!(product_metrics.delivery_rate_bps, 120_000_000);
 
     let carrier = ClientPathObservation {
         carrier_delivery_rate_bps: Some(500_000_000.0),
@@ -131,18 +290,20 @@ fn path_snapshot_preserves_rate_provenance() {
         ..mature_product
     };
     let carrier_snapshot = path_snapshot(&tcp, 0, carrier);
-    assert_eq!(carrier_snapshot.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(carrier_snapshot.delivery_rate_bps, 400_000_000.0);
     assert_eq!(carrier_snapshot.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(
-        path_metrics_from_snapshot_at(
-            carrier_snapshot,
-            carrier,
-            PathMetricDirection::ClientToServer,
-            now,
-        )
-        .rate_valid_for_us,
-        2_000_000
+        carrier_snapshot.carrier_delivery_rate_bps,
+        Some(500_000_000.0),
     );
+    let carrier_metrics = path_metrics_from_snapshot_at(
+        carrier_snapshot,
+        carrier,
+        PathMetricDirection::ClientToServer,
+        now,
+    );
+    assert_eq!(carrier_metrics.rate_valid_for_us, 2_000_000);
+    assert_eq!(carrier_metrics.delivery_rate_bps, 500_000_000);
 
     let generic = ClientPathObservation {
         measured_rate_bps: Some(90_000_000.0),
@@ -286,8 +447,9 @@ fn passive_tcp_carrier_rate_never_claims_mpp_data_ack_evidence() {
     ));
     assert!(!bulk_candidate_has_ack_data_evidence(&tcp, observation));
     let snapshot = path_snapshot(&tcp, 0, observation);
-    assert_eq!(snapshot.delivery_rate_bps, 200_000_000.0);
-    assert_eq!(snapshot.pacing_rate_bps, 200_000_000.0);
+    assert_eq!(snapshot.delivery_rate_bps, 351_472.0);
+    assert_eq!(snapshot.pacing_rate_bps, 351_472.0);
+    assert_eq!(snapshot.carrier_delivery_rate_bps, Some(200_000_000.0));
     let metrics =
         path_metrics_from_snapshot(snapshot, observation, PathMetricDirection::ClientToServer);
     assert!(!metrics.has_ack_derived_data_sample);
@@ -488,14 +650,14 @@ fn global_product_rate_requires_the_exact_service_quantum_boundary() {
             ..boundary_minus_one
         },
     );
-    assert_eq!(qualified.delivery_rate_bps, raw_rate);
-    assert_eq!(qualified.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(qualified.delivery_rate_bps, 25_000_000.0);
+    assert_eq!(qualified.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(qualified.product_progress_rate_bps, Some(raw_rate));
     assert!(qualified.has_durable_product_progress);
 }
 
 #[test]
-fn stale_rate_evidence_cannot_win_scheduler_or_capacity_selection() {
+fn stale_and_fresh_diagnostics_do_not_replace_startup_authority() {
     let paths = [
         "tcp://127.0.0.1:10000".parse::<PathSpec>().expect("path"),
         "tcp://127.0.0.1:10001".parse::<PathSpec>().expect("path"),
@@ -557,11 +719,11 @@ fn stale_rate_evidence_cannot_win_scheduler_or_capacity_selection() {
     );
     assert_eq!(
         path_snapshot(&paths[1], 1, observations[1]).delivery_rate_bps,
-        10_000_000.0
+        default_path_rate_bps()
     );
     assert_eq!(
-        ordered_path_scores(&paths, &observations, TrafficClass::Throughput, 64 * 1024,)[0].0,
-        1,
-        "expired gigabit evidence must not outrank current measured delivery"
+        path_snapshot(&paths[1], 1, observations[1]).product_progress_rate_bps,
+        Some(10_000_000.0),
+        "fresh Product evidence remains visible without becoming carrier C",
     );
 }

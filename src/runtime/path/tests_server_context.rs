@@ -48,7 +48,18 @@ fn local_listener_configuration_is_independent_of_peer_path_id() {
     assert_eq!(metrics.path_id, PathId(0));
     assert_eq!(metrics.underlay, UnderlayProtocol::Udp);
     assert_eq!(metrics.srtt_us, 73_000);
-    assert_eq!(metrics.delivery_rate_bps, 420_000_000);
+    assert_eq!(
+        local.startup_rate_prior(),
+        RateHint::BitsPerSecond(420_000_000)
+    );
+    assert_eq!(
+        metrics.delivery_rate_bps,
+        crate::model::service_rate::portable_startup_rate()
+            .expect("portable PATH_METRICS placeholder")
+            .get(),
+        "endpoint-local configured rate remains local policy and is not serialized as peer-observed PATH_METRICS"
+    );
+    assert!(!metrics.rate_observed);
 }
 
 #[tokio::test]

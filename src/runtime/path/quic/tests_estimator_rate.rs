@@ -50,7 +50,7 @@ fn arbitrary_native_ack_bytes_cannot_mint_product_reachability_or_rate() {
     stats.path.cwnd = congestion.congestion_window;
     stats.path.current_mtu = 1400;
     let mut tracker = QuicPathMetricTracker::default();
-    let _ = tracker.observe(stats, congestion, PathMetricDirection::ClientToServer);
+    let startup = tracker.observe(stats, congestion, PathMetricDirection::ClientToServer);
 
     // These bytes may be H3 headers/control, QUIC DATAGRAM, a sibling request,
     // retransmission, or Product. Native ACK telemetry cannot distinguish them.
@@ -65,7 +65,10 @@ fn arbitrary_native_ack_bytes_cannot_mint_product_reachability_or_rate() {
     assert_eq!(observed.delivery_sample_bytes, 0);
     assert_eq!(observed.latest_rate_sample_elapsed, None);
     assert_eq!(observed.bulk_proof_expires_at, None);
-    assert_eq!(observed.delivery_rate_bps.round() as u64, 80_000_000);
+    assert_eq!(
+        observed.delivery_rate_bps, startup.delivery_rate_bps,
+        "unattributed ACK bytes cannot replace the carrier's pre-existing native rate projection"
+    );
 }
 
 #[test]

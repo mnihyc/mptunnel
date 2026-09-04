@@ -1,13 +1,11 @@
 use super::{
     MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_RTT,
-    RELIABLE_PIPE_WINDOW_BDPS, ReliableOriginalDataOutput, TcpCapacityProofCandidate,
-    adaptive_reliable_relay_chunk_bytes, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
-    min_reliable_pipe_bytes, reliable_bulk_carrier_feed_quantum_bytes,
+    ReliableOriginalDataOutput, TcpCapacityProofCandidate, adaptive_reliable_relay_chunk_bytes,
+    adaptive_reliable_relay_chunk_bytes_with_frame_limit, reliable_bulk_carrier_feed_quantum_bytes,
     reliable_bulk_product_windows, reliable_bulk_unproven_exploration_limit_bytes,
     reliable_product_feedback_window_bytes, reliable_product_measurement_session_envelope_bytes,
     reliable_product_recovery_window_bytes, reliable_relay_buffer_len,
     reliable_relay_scheduler_quantum_cap, reliable_relay_sender_dispatch_budget,
-    reliable_startup_bdp_bytes, reliable_startup_send_quantum_bytes,
     reliable_stream_ack_update_bytes, reliable_stream_advertised_window_bytes,
     reliable_stream_initial_advertised_window_bytes, reliable_stream_max_data_update_bytes,
     reliable_stream_source_admission, reliable_unproven_path_startup_flight_limit_bytes,
@@ -134,18 +132,13 @@ fn data_level_budgets_expand_for_bulk_without_second_congestion_feedback() {
         TrafficClass::Throughput,
         mux_limits,
     );
-    assert!(bulk_inflight >= interactive_inflight);
+    assert_eq!(
+        bulk_inflight, interactive_inflight,
+        "P is one configured Product resource envelope; traffic class changes service arbitration and quantum, not receive authority"
+    );
     assert_eq!(
         bulk_inflight_with_flight, bulk_inflight,
         "in-flight bytes are the controlled BDP-scale flight, not queue pressure"
-    );
-    assert!(
-        interactive_inflight <= reliable_relay_buffer_len(mux_limits),
-        "interactive streams should not inherit the bulk path ceiling"
-    );
-    assert!(
-        bulk_inflight >= interactive_inflight.saturating_mul(8),
-        "bulk transfer should be able to ramp far beyond interactive budget on high-BDP paths"
     );
     assert_eq!(
         unstable_bulk_inflight, bulk_inflight,
@@ -189,22 +182,15 @@ fn reliable_bulk_quantum_keeps_tcp_and_quic_streams_fed_without_rate_prior() {
 }
 
 #[test]
-fn unknown_path_startup_inflight_uses_default_bdp_not_configured_ceiling() {
+fn unknown_path_product_window_uses_configured_p_not_an_inferred_bdp() {
     let mux_limits = MuxLimits::default();
     let startup =
         reliable_product_feedback_window_bytes(None, TrafficClass::Throughput, mux_limits);
-    let default_service_window = (reliable_startup_bdp_bytes() * RELIABLE_PIPE_WINDOW_BDPS)
-        .max(reliable_startup_send_quantum_bytes() as f64)
-        .max(min_reliable_pipe_bytes(mux_limits) as f64)
-        .ceil() as usize;
-
     assert_eq!(
         startup,
-        default_service_window.max(reliable_relay_buffer_len(mux_limits))
-    );
-    assert!(
-        startup < mux_limits.max_path_flight_bytes,
-        "configured inflight is a ceiling, not an unknown-path startup target"
+        usize::try_from(reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes)
+            .expect("default Product window fits usize"),
+        "P is configured resource authority even before a path observation; bounded startup exploration E is modeled separately"
     );
 }
 

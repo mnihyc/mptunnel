@@ -1748,7 +1748,13 @@ mod tests {
         assert_eq!(snapshot.delivery_rate_bps, 420_000_000.0);
         assert_eq!(metrics.srtt_us, 42_000);
         assert_eq!(metrics.rttvar_us, 125_000);
-        assert_eq!(metrics.delivery_rate_bps, 420_000_000);
+        assert_eq!(
+            metrics.delivery_rate_bps,
+            crate::model::service_rate::portable_startup_rate()
+                .expect("portable PATH_METRICS placeholder")
+                .get(),
+            "the local startup rate remains on the exact scheduling snapshot rather than peer-facing metrics"
+        );
         assert!(!metrics.rate_observed);
         assert_eq!(metrics.rate_valid_for_us, 0);
         assert!(!metrics.pacing_rate_observed);

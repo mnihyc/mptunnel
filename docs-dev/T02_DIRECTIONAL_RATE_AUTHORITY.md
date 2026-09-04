@@ -29,8 +29,7 @@ and at most one effective basis:
 
 ```text
 QUIC: QuinnBbr3NativeOperationalV1(positive u64 bits/s)
-TCP:  TcpInfoDeliveredCapacityV1(positive u64 bits/s)
-else: the immutable startup basis
+TCP:  the immutable startup basis
 ```
 
 Source choice is semantic, never numeric. No branch compares two source values,
@@ -52,34 +51,21 @@ revision. A valid publication persists for that activation because the live
 controller continues to use the retained value. An absent later poll is not a
 revocation.
 
-`TcpInfoDeliveredCapacityV1` is a distinct, capability-graded source rather
-than a claim that CUBIC exposes a native operational bandwidth. A valid sample
-must satisfy all of the following:
+Core declares no named TCP NativeOperational adapter. Kernel TCP delivery,
+pacing, congestion-window, and queue observations are therefore diagnostic
+under RFC Section 17.1 and cannot replace startup in T02. In particular, a
+`TCP_INFO` delivery-rate sample is achieved same-socket evidence, not the
+gain-free operational bandwidth of CUBIC's live send model. Its availability
+also differs by platform. Promoting it here would silently invent a new
+profile, make scheduling semantics platform-dependent, and contradict the
+authoritative RFC.
 
-- it comes from one coherent `TCP_INFO` read on the exact locally sending
-  socket and names that carrier instance and direction;
-- `tcpi_delivery_rate` is positive and its paired
-  `tcpi_delivery_rate_app_limited` bit is false in that same read;
-- positive acknowledged-byte advancement has occurred after authenticated
-  carrier readiness;
-- acknowledged coverage reaches the frozen delivery-window floor;
-- bytes/s to bits/s conversion is checked, not saturating;
-- the observation time and immutable expiry belong to that exact sample epoch;
-- a later app-limited or partial poll cannot refresh the epoch; and
-- a replacement carrier starts with no predecessor epoch.
-
-The source temporarily replaces startup while it is current. On expiry it
-falls back to the immutable startup basis. This is deliberately different from
-the QUIC adapter: Linux `TCP_INFO` exports an achieved delivery-rate sample,
-not persistent CUBIC controller state. Retaining it after expiry would recreate
-the stale-low, restart-dependent recovery symptom. Linux and Android can
-provide the complete source today; a platform that omits either delivery rate
-or its paired provenance bit honestly remains on startup authority.
-
-The existing fixed client output copies one `f64` sample when the stream is
-attached and never refreshes it. That copy is not the source above. T02 must
-give fixed outputs a read of the exact carrier's current typed sample, or leave
-them on startup; it may not describe a frozen copy as live authority.
+The existing fixed client output copies one `f64` TCP sample when the stream is
+attached and never refreshes it. That copy is not an authority source. T02
+removes it from `C`; TCP fixed and switchable outputs retain the exact immutable
+startup basis. A future profile may add a distinct TCP adapter only after it
+declares the full rate domain, incarnation/direction reducer, validity,
+freshness, and replacement contract required by Sections 10.2.1 and 17.1.
 
 ## Excluded evidence and counterexamples
 
@@ -147,21 +133,21 @@ keeps `M` carrier-neutral for the same logical action and must be stated in the
 RFC; describing `M` as every actually emitted carrier-side MPTF frame would
 instead require a path-specific work value.
 
-Native sources count their own acknowledged byte domain. T02 uses the named
-adapter projection:
+The named QUIC native source counts its own acknowledged byte domain. T02 uses
+the adapter projection:
 
 ```text
 1 native congestion-accounted byte := 1 normalized Core service byte
 ```
 
 This is a nominal identity projection for advisory ordering, not physical byte
-equality. Quinn accounts QUIC packet bytes and TCP accounts encrypted sequence
-bytes, so presentation, crypto, packet, and retransmission overhead create
-bounded practical error. Exact physical conversion would require an attributed
-MPP-to-native efficiency ledger that the runtime does not have and T01 rejected
-as a Core prerequisite. Consequently the rank is monotone and dimensionally
-stable but is not an exact cross-underlay completion theorem. Close candidates
-remain subject to the final matched runtime matrix.
+equality. Quinn accounts QUIC packet bytes, so presentation, crypto, packet,
+and retransmission overhead create bounded practical error. Exact physical
+conversion would require an attributed MPP-to-native efficiency ledger that
+the runtime does not have and T01 rejected as a Core prerequisite.
+Consequently the rank is monotone and dimensionally stable but is not an exact
+cross-underlay completion theorem. Close candidates remain subject to the final
+matched runtime matrix.
 
 ## Symbolic properties
 
@@ -207,6 +193,7 @@ Supersede:
 - `RateHint -> f64`, including the fabricated 1-Tbit/s Unlimited value;
 - payload-only derivation of `C0`;
 - `max(startup/native, Product)` in request, fixed, and switchable projections;
+- treating a fixed attachment-time TCP telemetry copy as scheduling authority;
 - relabelling `PATH_CAPACITY` as native carrier authority;
 - active-flow division while selecting `C`; and
 - the unused ReceiptMode scheduling-rate draft. The actual wire
@@ -223,14 +210,24 @@ Production changes begin only after REDs establish these current failures:
 4. A fresh `PATH_CAPACITY` receipt changes request scheduling `C`.
 5. Changing only Product delivery changes request, fixed, or switchable
    carrier `C`.
-6. A qualified same-socket TCP sample cannot update a fixed output after its
-   attachment snapshot.
-7. A wrong-direction, expired, app-limited, partial-window, or predecessor-
-   instance TCP sample is rejected.
-8. Canonical encoded work for payloads 1 and 14,600 is exactly payload plus 30
+6. Changing only same-socket TCP telemetry changes fixed or switchable `C`,
+   despite Core declaring no TCP adapter.
+7. Canonical encoded work for payloads 1 and 14,600 is exactly payload plus 30
    and agrees with unsplit Core codec output.
 
-GREEN requires one shared source reducer and the same result/provenance in
-request, fixed response, and switchable response projections. No scheduler
-formula, admission, recovery, requalification, dashboard, or lab threshold is
-changed in T02.
+GREEN requires one shared typed reducer and the same result/provenance in
+request, fixed response, switchable response, and L3 projections. QUIC may use
+its exact native reducer; TCP must retain startup regardless of optional kernel
+telemetry. No scheduler formula, admission, recovery, requalification,
+dashboard, or lab threshold is changed in T02.
+
+## Corrected checkpoint oversight
+
+The first committed draft incorrectly treated a carefully qualified
+`TCP_INFO` delivery sample as sufficient to create a Core TCP scheduling-rate
+adapter. That conclusion considered the sample's local provenance but not the
+full standards hierarchy: RFC Section 17.1 explicitly reserves such an
+adapter for a separately declared future profile. The draft therefore crossed
+from auditing existing authority into inventing a new one. This correction is
+made before production code or REDs were written; no TCP runtime behavior was
+changed by the rejected proposal.

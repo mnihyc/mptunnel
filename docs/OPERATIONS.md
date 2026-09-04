@@ -1218,23 +1218,19 @@ TCP carriers may sample the exact authenticated socket through a host adapter:
   does not expose RTT variance or cumulatively acknowledged bytes in version 0.
 
 Every native field is optional and missing fields are unknown rather than zero.
-Passive native observations are scheduling evidence, not MPP Data ACKs.
+Passive native TCP observations are diagnostics, not MPP Data ACKs or Core
+scheduling-rate authority.
 Native drain-based reinjection requires both exact bytes in flight and the
 unsent queue from one snapshot; otherwise it waits on exact MPP application-data
 flight.
 
-TCP capacity estimates use receiver-confirmed receipts and may combine them
-with exact-socket telemetry. QUIC publishes fresh native packet-ACK-derived
-evidence with an explicit expiry and relies on its native congestion controller
-for send credit; it has no separate MPP calibration transaction. These evidence
-sources are not interchangeable. MPP Data ACK remains the authoritative
-carrier-neutral delivery signal;
-for response bulk admission, QUIC requires locally sourced ACK-derived carrier
-evidence, while durable unambiguous Data ACK progress may additionally establish
-a per-flow TCP MPP rate. While fresh, that exact rate may serve only as a
-demonstrated lower bound for native TCP carrier capacity. It is not multiplied
-across flows, does not lower a faster native observation, and remains divided
-among active flows.
+TCP capacity receipts and exact-socket telemetry remain separate diagnostics;
+neither supplies Core's advisory scheduling rate. QUIC publishes the named
+controller-local `QuinnBbr3NativeOperationalV1` rate and relies on its native
+congestion controller for send credit; it has no separate MPP calibration
+transaction. These sources are not interchangeable. MPP Data ACK remains the
+authoritative carrier-neutral Product-delivery signal and its per-flow rate is
+completion evidence, not physical-carrier capacity.
 
 The adapter is optional. Older systems, unsupported kernels, restricted hosts,
 and compatibility layers that reject the socket query use the portable fallback

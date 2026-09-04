@@ -469,13 +469,10 @@ interface name, or branch on the operating system. Windows client with Linux
 server is a primary design target; Linux, macOS, Windows, and the Android
 library target must compile without changing the protocol model.
 
-TCP and QUIC evidence remain typed by provenance. Request TCP capacity uses a
-receiver-confirmed receipt and optional exact-socket telemetry; request QUIC
-capacity uses fresh native packet-ACK-derived evidence and an independent proof
-lifetime. For response bulk readiness, locally sourced ACK-derived carrier
-evidence is authoritative for QUIC, while durable unambiguous Data ACK progress
-may additionally establish a per-flow TCP MPP rate. A fresh exact TCP Product
-rate can only raise native carrier capacity to the rate already demonstrated on
-that carrier; it is never extrapolated, never lowers a native observation, and
-retains carrier-capacity scope so active-flow sharing still applies. Peer
-metric hints do not mint either proof.
+TCP and QUIC evidence remain typed by provenance. Request TCP capacity receipts
+and optional exact-socket telemetry are diagnostics; Core grants neither one
+scheduling-rate authority. QUIC alone has the named
+`QuinnBbr3NativeOperationalV1` adapter, whose exact local controller state may
+replace its immutable startup rate for advisory ranking. Product delivery and
+peer metric hints remain separately scoped diagnostics and cannot mint either
+native rate or Product authority.

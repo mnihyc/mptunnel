@@ -319,9 +319,11 @@ a runtime fix. Exact focused suites are GREEN; the proof is recorded in
 
 A broad audit exposed one parent-tree response reinjection failure, not a T04b
 regression: untouched `88957df` and the corrected tree both queue the proper
-fallback target and then reject it at Apply. That exact-target recovery issue
-belongs to the already-foreseen P1 transaction and cannot be bundled into
-ordinary Product admission.
+fallback target and then reject it at Apply. The fixture uses bare UDP outputs
+without the activation-scoped Native authority now required by QUIC Apply.
+The carrier-neutral reserve fixture is corrected to use valid TCP outputs;
+dedicated Native tests retain UDP fail-closed coverage. No recovery or Product
+production behavior changes with that fixture correction.
 
 ### P1 — Lowest-frontier temporal service
 

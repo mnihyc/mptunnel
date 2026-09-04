@@ -871,7 +871,10 @@ fn stale_output_recovery_releases_k_only_by_data_ack_and_never_retries_same_targ
         path_id: PathId(0),
     };
     let alternate = crate::model::path::CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        // This fixture exercises target-reserve lifecycle, not Native QUIC
+        // authority. A bare UDP output has no activation-scoped Native stamp
+        // and is intentionally rejected at final Apply.
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let (initial_commands, _initial_receivers) = reliable_path_command_channels(8);
@@ -1022,11 +1025,13 @@ fn stale_output_recovery_falls_through_exhausted_target_reserve() {
         path_id: PathId(0),
     };
     let fast_exhausted = crate::model::path::CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        // Keep this reserve-fallthrough fixture carrier-neutral. Bare UDP
+        // test outputs intentionally fail the separate Native-authority fence.
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let fallback = crate::model::path::CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(2),
     };
     let (initial_commands, _initial_receivers) = reliable_path_command_channels(8);

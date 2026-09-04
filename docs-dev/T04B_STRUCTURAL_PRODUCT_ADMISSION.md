@@ -131,9 +131,9 @@ GREEN. The existing request ACK-clock tests confirm that an optional
 measurement annotation remains subordinate to ordinary Data.
 
 An independent broad audit also found that untouched parent `88957df` fails
-`stale_output_recovery_falls_through_exhausted_target_reserve`: recovery
-correctly queues the second exact target, then Apply rejects the queued copy.
-The T04b tree fails identically, and the failing path does not call ordinary
-Product admission. It is therefore a pre-existing exact-target recovery issue
-owned by the already-foreseen P1 transaction, not evidence for changing or
-expanding T04b.
+`stale_output_recovery_falls_through_exhausted_target_reserve`. Exact Apply
+inspection showed that its bare UDP test outputs have no activation-scoped
+Native authority stamp and are intentionally rejected by the current QUIC
+fence. The reserve fixture predates that fence. This is a stale test fixture,
+not a Product-admission or recovery-authority defect; the carrier-neutral
+reserve test uses TCP outputs while dedicated Native tests cover UDP Apply.

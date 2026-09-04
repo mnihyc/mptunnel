@@ -26,7 +26,7 @@ use crate::transport::PathSpec;
 use std::sync::Arc;
 
 #[test]
-fn budgeted_critical_reinjection_preempts_original_data_and_debits_budget() {
+fn response_critical_reinjection_preempts_original_data_and_is_exactly_accounted() {
     let mux_limits = MuxLimits::default();
     let stream_id = StreamId(79);
     let mut sender = ServerResponseSenderService::new_with_performance(
@@ -39,19 +39,14 @@ fn budgeted_critical_reinjection_preempts_original_data_and_debits_budget() {
     let startup_floor = sender_optional_reinjection_startup_floor_bytes(mux_limits);
 
     sender.enqueue_data_for_lane(Bytes::from_static(b"owner"), TrafficClass::Throughput);
-    assert!(
-        sender
-            .enqueue_reinjection_frame_with_priority(
-                Frame::StreamData {
-                    stream_id,
-                    offset: 0,
-                    payload: Bytes::from(vec![0x7a; startup_floor]),
-                },
-                mux_limits,
-                true,
-            )
-            .is_some(),
-        "startup reinjection floor should be spendable"
+    let accounted_before = sender.optional_reinjection.reinjected_bytes();
+    sender.enqueue_reinjection_frame_with_priority(
+        Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: Bytes::from(vec![0x7a; startup_floor]),
+        },
+        true,
     );
 
     assert_eq!(
@@ -59,9 +54,8 @@ fn budgeted_critical_reinjection_preempts_original_data_and_debits_budget() {
         Some(ReliableWorkClass::Reinjection)
     );
     assert_eq!(
-        sender.reinjection_extra_budget_remaining(mux_limits),
-        0,
-        "critical priority is not budget bypass"
+        sender.optional_reinjection.reinjected_bytes(),
+        accounted_before + startup_floor as u64,
     );
 }
 
@@ -879,14 +873,6 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
     let mut sender = RequestSenderService::new(stream_id);
     sender.record_original_frame_for_test(tcp, &acknowledged);
     sender.record_original_frame_for_test(tcp, &live_tail);
-    let optional_budget = sender.reinjection_extra_event_budget_remaining(limits);
-    assert!(optional_budget > 0);
-    sender.record_reinjection_for_test(optional_budget);
-    assert_eq!(
-        sender.reinjection_extra_event_budget_remaining(limits),
-        0,
-        "fixture must distinguish critical live-tail authority from optional repair credit",
-    );
     let ack_ranges = [OffsetRange { start: 0, end: 64 }];
     let _ = send_stream.apply_ack(&ack_ranges);
 
@@ -1367,6 +1353,143 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
         None,
         "an oversized preview rejected by exact target service cannot consume the epoch",
     );
+}
+
+#[tokio::test]
+async fn request_completion_tail_extent_is_percentage_invariant() {
+    let stream_id = StreamId(229);
+    let resource_limits = ResourceLimits {
+        max_repair_bytes: 512 * 1024,
+        max_path_flight_bytes: 512 * 1024,
+        max_reliable_relay_chunk_bytes: 64 * 1024,
+        ..ResourceLimits::default()
+    };
+    let limits = MuxLimits::from(resource_limits);
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:11371?initial-srtt-s=0.005&initial-rate-mbps=1",
+            "quic://127.0.0.1:11372?initial-srtt-s=0.04&initial-rate-mbps=500",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("path"))
+        .collect(),
+        security(),
+        resource_limits,
+    )
+    .expect("context");
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, owner_commands),
+        8,
+    );
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach(
+            opened_test_relay_stream_with_native_source(
+                stream_id,
+                UnderlayProtocol::Udp,
+                0,
+                target_commands,
+                crate::transport::RateHint::BitsPerSecond(500_000_000),
+                1,
+                None,
+            )
+            .0,
+        ),
+        ReliableRelayAttachOutcome::Attached,
+    );
+    consume_client_path_proof_for_test(&mut target_receivers);
+    let target = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        })
+        .expect("completion-tail target");
+    context.install_relay_path_instance_for_test(owner);
+    context.install_relay_path_instance_for_test(target);
+    context.mark_tcp_path_open_success(
+        owner.key.index,
+        Duration::from_millis(5),
+        TrafficClass::Throughput,
+    );
+    context.mark_udp_path_open_success(target.key.index, Duration::from_millis(40));
+    context.mark_relay_path_rate_sample_for_test(
+        owner.key,
+        PathRateSample::new(64 * 1024, Duration::from_millis(524)).expect("slow owner sample"),
+    );
+    context.mark_relay_path_rate_sample_for_test(
+        target.key,
+        PathRateSample::new(64 * 1024, Duration::from_micros(1049)).expect("fast target sample"),
+    );
+
+    let tail_bytes = 256 * 1024;
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let retained = send_stream
+        .send_data(Bytes::from(vec![0x61; tail_bytes]))
+        .expect("retained completion tail");
+    let startup_floor = sender_optional_reinjection_startup_floor_bytes(limits);
+    assert!(tail_bytes > startup_floor);
+    let delivered_bytes = tail_bytes.saturating_mul(10);
+    let default_percent = MppPerformanceConfig::default().optional_reinjection_budget_percent;
+    let mut cases = [0, default_percent, 200].map(|percent| {
+        let mut sender = RequestSenderService::new_with_performance(
+            stream_id,
+            MppPerformanceConfig {
+                optional_reinjection_budget_percent: percent,
+            },
+        );
+        sender.record_original_frame_for_test(owner, &retained);
+        sender.record_delivered_data_for_test(delivered_bytes);
+        sender.record_reinjection_for_test(startup_floor);
+        (percent, sender)
+    });
+
+    let owner_interval = reliable_data_retransmission_interval(
+        Some(owner.key.underlay),
+        context.reliable_path_snapshot_for_instance(owner),
+    );
+    tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
+
+    let outcomes = cases.each_mut().map(|(percent, sender)| {
+        let mut queue = ReliableRelaySenderQueue::default();
+        let outcome = sender.enqueue_completion_tail_reinjection(
+            &mut queue,
+            &context,
+            &remotes,
+            &send_stream,
+            &[],
+            true,
+            0,
+            TrafficClass::Throughput,
+        );
+        let queued_bytes = queue.reinjection_bytes();
+        let mut exact_target = true;
+        while let Some((_, work)) = queue.pop_front() {
+            exact_target &= matches!(
+                work.kind,
+                ReliableRelayQueuedWorkKind::Reinjection {
+                    cause: RelaySendCause::CompletionTailReinjection(identity),
+                    ..
+                } if identity.instance == target
+            );
+        }
+        (*percent, outcome.queued, queued_bytes, exact_target)
+    });
+    let structural = outcomes[2];
+    assert!(
+        structural.1 && structural.2 > startup_floor && structural.3,
+        "the large-hint control must expose a multi-quantum structurally eligible exact-target tail: {structural:?}",
+    );
+    for outcome in outcomes {
+        assert_eq!(
+            (outcome.1, outcome.2, outcome.3),
+            (structural.1, structural.2, structural.3),
+            "fixed range, exact owner/target, clocks, Product headroom, resource limits, and native capacity must make completion-tail admission and extent invariant to the traffic percentage: percent={}",
+            outcome.0,
+        );
+    }
 }
 
 #[tokio::test]
@@ -2415,100 +2538,88 @@ async fn client_path_failure_releases_optional_load_without_cleanup_queue_wait()
 }
 
 #[test]
-fn client_reinjection_extra_budget_is_cumulative_not_per_event() {
+fn request_reinjection_final_enqueue_is_percentage_invariant_and_exactly_accounted() {
     let mux_limits = MuxLimits::default();
     let stream_id = StreamId(93);
-    let mut sender = RequestSenderService::new_with_performance(
-        stream_id,
-        MppPerformanceConfig {
-            optional_reinjection_budget_percent: 1,
-        },
-    );
-    let mut sender_queue = ReliableRelaySenderQueue::default();
     let startup_floor = sender_optional_reinjection_startup_floor_bytes(mux_limits);
-    let reinjection_payload = Bytes::from(vec![0x33; startup_floor]);
+    let delivered_bytes = startup_floor.saturating_mul(100);
+    let payload_bytes = startup_floor;
+    let default_percent = MppPerformanceConfig::default().optional_reinjection_budget_percent;
 
-    assert!(sender.enqueue_reinjection_frame_with_priority(
-        &mut sender_queue,
-        Frame::StreamData {
+    let outcomes = [0, default_percent, 200].map(|percent| {
+        let mut sender = RequestSenderService::new_with_performance(
             stream_id,
-            offset: 0,
-            payload: reinjection_payload.clone(),
-        },
-        RelaySendCause::AckGapReinjection,
-        mux_limits,
-        false,
-    ));
-    assert!(!sender.enqueue_reinjection_frame_with_priority(
-        &mut sender_queue,
-        Frame::StreamData {
-            stream_id,
-            offset: startup_floor as u64,
-            payload: reinjection_payload.clone(),
-        },
-        RelaySendCause::AckGapReinjection,
-        mux_limits,
-        false,
-    ));
+            MppPerformanceConfig {
+                optional_reinjection_budget_percent: percent,
+            },
+        );
+        sender.record_delivered_data_for_test(delivered_bytes);
+        sender.record_reinjection_for_test(startup_floor);
+        let accounted_before = sender.optional_reinjection.reinjected_bytes();
+        let mut sender_queue = ReliableRelaySenderQueue::default();
+        sender.enqueue_reinjection_frame_with_priority(
+            &mut sender_queue,
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from(vec![0x33; payload_bytes]),
+            },
+            RelaySendCause::AckGapReinjection,
+            false,
+        );
+        let accounted_delta = sender
+            .optional_reinjection
+            .reinjected_bytes()
+            .saturating_sub(accounted_before);
+        (percent, sender_queue.reinjection_bytes(), accounted_delta)
+    });
 
-    sender.record_delivered_data_for_test(startup_floor.saturating_mul(100));
-    assert!(sender.enqueue_reinjection_frame_with_priority(
-        &mut sender_queue,
-        Frame::StreamData {
-            stream_id,
-            offset: (startup_floor * 2) as u64,
-            payload: reinjection_payload,
-        },
-        RelaySendCause::PathFailureReinjection,
-        mux_limits,
-        false,
-    ));
+    for (percent, queued_bytes, accounted_delta) in outcomes {
+        assert_eq!(
+            (queued_bytes, accounted_delta),
+            (payload_bytes, payload_bytes as u64),
+            "a configured traffic percentage may not reject an already-authorized request recovery frame or change its exact accounting: percent={percent}",
+        );
+    }
 }
 
 #[test]
-fn client_exact_failure_reinjection_bypasses_optional_budget_exhaustion() {
-    let mux_limits = MuxLimits::default();
+fn client_exact_failure_reinjection_remains_critical_and_exactly_accounted() {
     let stream_id = StreamId(95);
     let mut sender = RequestSenderService::new_with_performance(
         stream_id,
         MppPerformanceConfig {
-            optional_reinjection_budget_percent: 1,
+            optional_reinjection_budget_percent: 0,
         },
     );
     let mut sender_queue = ReliableRelaySenderQueue::default();
-    let startup_floor = sender_optional_reinjection_startup_floor_bytes(mux_limits);
+    let payload = Bytes::from_static(b"tail");
     let frame = Frame::StreamData {
         stream_id,
         offset: 0,
-        payload: Bytes::from(vec![0x33; startup_floor]),
+        payload: payload.clone(),
     };
-    assert!(sender.enqueue_reinjection_frame_with_priority(
-        &mut sender_queue,
-        frame,
-        RelaySendCause::AckGapReinjection,
-        mux_limits,
-        false,
-    ));
-
-    let closure_frame = Frame::StreamData {
-        stream_id,
-        offset: startup_floor as u64,
-        payload: Bytes::from_static(b"tail"),
-    };
-    assert!(!sender.enqueue_reinjection_frame_with_priority(
-        &mut sender_queue,
-        closure_frame.clone(),
-        RelaySendCause::AckGapReinjection,
-        mux_limits,
-        false,
-    ));
-
+    let accounted_before = sender.optional_reinjection.reinjected_bytes();
     sender.enqueue_critical_reinjection_frame(
         &mut sender_queue,
-        closure_frame,
+        frame,
         RelaySendCause::PathFailureReinjection,
     );
-    assert_eq!(sender.optional_reinjection_budget_remaining(mux_limits), 0);
+    assert_eq!(
+        sender.optional_reinjection.reinjected_bytes(),
+        accounted_before + payload.len() as u64,
+    );
+    let (lane, work) = sender_queue
+        .pop_front()
+        .expect("exact failure recovery remains queued");
+    assert_eq!(lane, ReliableWorkClass::Reinjection);
+    assert!(matches!(
+        work.kind,
+        ReliableRelayQueuedWorkKind::Reinjection {
+            cause: RelaySendCause::PathFailureReinjection,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

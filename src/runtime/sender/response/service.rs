@@ -596,37 +596,6 @@ impl ServerResponseSenderService {
         self.queue.bound_reinjection_deadline()
     }
 
-    pub(in crate::runtime) fn optional_reinjection_budget_remaining(
-        &self,
-        mux_limits: MuxLimits,
-    ) -> usize {
-        self.optional_reinjection
-            .budget(
-                sender_optional_reinjection_startup_floor_bytes(mux_limits),
-                self.performance,
-            )
-            .remaining_bytes()
-    }
-
-    pub(in crate::runtime) fn reinjection_extra_budget_remaining(
-        &self,
-        mux_limits: MuxLimits,
-    ) -> usize {
-        self.optional_reinjection_budget_remaining(mux_limits)
-    }
-
-    pub(in crate::runtime) fn reinjection_extra_event_budget_remaining(
-        &self,
-        mux_limits: MuxLimits,
-    ) -> usize {
-        let remaining = self.reinjection_extra_budget_remaining(mux_limits);
-        if remaining < sender_reinjection_minimum_useful_attempt_bytes(mux_limits) {
-            0
-        } else {
-            remaining
-        }
-    }
-
     pub(in crate::runtime) fn live_owner_frontier_floor_ready(&self, observed_at: Instant) -> bool {
         self.live_owner_frontier_floor.attempt_ready(observed_at)
     }
@@ -783,13 +752,11 @@ impl ServerResponseSenderService {
     pub(in crate::runtime) fn enqueue_reinjection_frame_with_priority(
         &mut self,
         frame: Frame,
-        mux_limits: MuxLimits,
         critical_priority: bool,
-    ) -> Option<u64> {
+    ) -> u64 {
         self.enqueue_reinjection_frame_with_cause_and_priority(
             frame,
             RelaySendCause::AckGapReinjection,
-            mux_limits,
             critical_priority,
         )
     }
@@ -798,25 +765,17 @@ impl ServerResponseSenderService {
         &mut self,
         frame: Frame,
         cause: RelaySendCause,
-        mux_limits: MuxLimits,
         critical_priority: bool,
-    ) -> Option<u64> {
+    ) -> u64 {
         debug_assert!(cause.is_reinjection());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        let budget = self.optional_reinjection.budget(
-            sender_optional_reinjection_startup_floor_bytes(mux_limits),
-            self.performance,
-        );
-        if !budget.can_spend(payload_bytes) {
-            return None;
-        }
         self.optional_reinjection.record_reinjection(payload_bytes);
-        Some(if critical_priority {
+        if critical_priority {
             self.queue
                 .push_critical_reinjection_with_cause(frame, cause)
         } else {
             self.queue.push_reinjection_with_cause(frame, cause)
-        })
+        }
     }
 
     pub(in crate::runtime) fn enqueue_critical_reinjection_frame_with_cause(

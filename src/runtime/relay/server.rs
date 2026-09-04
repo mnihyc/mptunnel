@@ -1076,10 +1076,10 @@ fn response_live_owner_recovery_interval_for_frame(
 /// Enqueues a final-offset tail while its original carrier is still live.
 ///
 /// FIN makes the retained extent exact, but it does not prove carrier failure.
-/// Therefore this path shares the ordinary live-owner budget and temporal
-/// opportunity with ACK-gap/contiguous-tail recovery, and it requires a
-/// distinct response output. Exact failed-owner recovery remains in the
-/// separate `failed_original_ranges` path.
+/// Therefore this path shares the live-owner cause and successor observations
+/// with ACK-gap/contiguous-tail recovery, and it requires a distinct response
+/// output. Exact failed-owner recovery remains in the separate
+/// `failed_original_ranges` path.
 #[allow(clippy::too_many_arguments)]
 fn enqueue_live_response_final_tail_reinjection(
     response_sender: &mut ServerResponseSenderService,
@@ -1252,14 +1252,8 @@ fn enqueue_live_response_final_tail_reinjection(
         false,
         mux_limits,
     );
-    let optional_credit = response_sender.reinjection_extra_event_budget_remaining(mux_limits);
-    let (service_limit, critical_frontier_reinjection) = reliable_live_gap_reinjection_authority(
-        target_service_limit,
-        optional_credit,
-        frontier_limit,
-        owner_recovery_ready,
-        response_sender.live_owner_frontier_floor_ready(observed_at),
-    );
+    let service_limit =
+        reliable_live_gap_reinjection_authority(target_service_limit, owner_recovery_ready);
     if service_limit == 0 {
         return LiveResponseFinalTailEnqueueOutcome {
             frontier_limit,
@@ -1303,21 +1297,12 @@ fn enqueue_live_response_final_tail_reinjection(
             pending = true;
             break;
         }
-        let accepted = if critical_frontier_reinjection {
-            response_sender.enqueue_critical_reinjection_frame_with_cause(frame, cause);
-            true
-        } else {
-            response_sender
-                .enqueue_reinjection_frame_with_cause_and_priority(frame, cause, mux_limits, true)
-                .is_some()
-        };
-        if accepted {
-            queued = queued.saturating_add(1);
-            accepted_recovery_interval = Some(include_live_owner_recovery_interval(
-                accepted_recovery_interval,
-                target_recovery_interval,
-            ));
-        }
+        response_sender.enqueue_reinjection_frame_with_cause_and_priority(frame, cause, true);
+        queued = queued.saturating_add(1);
+        accepted_recovery_interval = Some(include_live_owner_recovery_interval(
+            accepted_recovery_interval,
+            target_recovery_interval,
+        ));
     }
     if let Some(recovery_interval) = accepted_recovery_interval {
         let accepted_at = Instant::now();
@@ -1403,13 +1388,11 @@ fn server_ack_gap_timer_deadline(
 fn server_live_owner_recovery_wake(
     cause_deadline: Option<tokio::time::Instant>,
     epoch_deadline: Option<Instant>,
-    optional_credit: usize,
     observed_at: Instant,
 ) -> LiveOwnerRecoveryWake {
     live_owner_recovery_wake(
         cause_deadline.map(tokio::time::Instant::into_std),
         epoch_deadline,
-        optional_credit,
         observed_at,
     )
 }
@@ -1607,10 +1590,10 @@ fn evaluate_server_data_ack_reinjection(
     };
 
     // A complete persistent gap proves missing Product order, not failure of
-    // the live native-reliable owner. Preserve the full target Product service
-    // window when funded, but racing that owner cannot exceed cumulative
-    // optional-reinjection credit. Exact terminal failure uses its separate
-    // cause-bounded critical path below this lifecycle.
+    // the live native-reliable owner. The due recovery cause admits only the
+    // selected target's exact Product service window; stable-slot publication,
+    // retained range, queue, and native authority remain hard bounds. Exact
+    // terminal failure uses its separate cause-bounded critical path below.
     let target_service_limit = response_sender.reinjection_service_limit_for_target(
         path_stream,
         send_stream,
@@ -1619,20 +1602,11 @@ fn evaluate_server_data_ack_reinjection(
         false,
         mux_limits,
     );
-    let optional_credit = response_sender.reinjection_extra_event_budget_remaining(mux_limits);
     let owner_recovery_deadline = progress
         .original_owner_recovery_deadline()
         .expect("persistent target retains its exact owner fallback");
-    let owner_recovery_ready = observed_at >= owner_recovery_deadline;
-    let live_owner_frontier_floor_ready =
-        response_sender.live_owner_frontier_floor_ready(observed_at);
-    let (service_limit, critical_frontier_reinjection) = reliable_live_gap_reinjection_authority(
-        target_service_limit,
-        optional_credit,
-        frontier_limit,
-        owner_recovery_ready,
-        live_owner_frontier_floor_ready,
-    );
+    let service_limit =
+        reliable_live_gap_reinjection_authority(target_service_limit, persistent_ready);
     let frames = normalized_stream_ack_first_gap(ranges)
         .and_then(|(frontier, _)| {
             let applied_extent = service_limit.min(
@@ -1668,13 +1642,9 @@ fn evaluate_server_data_ack_reinjection(
             || path_stream.has_recent_reinjection_overlap(&frame)
         {
             false
-        } else if critical_frontier_reinjection {
-            response_sender.enqueue_critical_reinjection_frame_with_cause(frame, cause);
-            true
         } else {
-            response_sender
-                .enqueue_reinjection_frame_with_cause_and_priority(frame, cause, mux_limits, true)
-                .is_some()
+            response_sender.enqueue_reinjection_frame_with_cause_and_priority(frame, cause, true);
+            true
         };
         if accepted {
             queued = queued.saturating_add(1);
@@ -1880,7 +1850,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
             // Persistent gap service is driven separately from retained ACK
             // evidence and a measured target, so this generic clock cannot
             // inherit that target's larger service window. Both observations
-            // consume the sender's shared temporal opportunity below.
+            // contribute to the sender's shared successor observation below.
             let frontier_extent = normalized_stream_ack_first_gap(last_send_ack_ranges)
                 .map_or(0, |(start, end)| flight_interval_bytes(start, end));
             let frontier_limit = reliable_live_frontier_reinjection_limit_bytes(
@@ -1890,14 +1860,9 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 send_stream.reinjection_bytes(),
                 mux_limits,
             );
-            let optional_credit =
-                response_sender.reinjection_extra_event_budget_remaining(mux_limits);
-            let (gap_limit, critical_gap_reinjection) = reliable_live_gap_reinjection_authority(
+            let gap_limit = reliable_live_gap_reinjection_authority(
                 frontier_limit,
-                optional_credit,
-                frontier_limit,
-                true,
-                response_sender.live_owner_frontier_floor_ready(observed_at),
+                live_ack_gap_owner_recovery_ready,
             );
             let gap_source_frames = stream_ack_gap_frontier_reinjection_frames_normalized(
                 send_stream,
@@ -1916,7 +1881,6 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                     RelaySendCause::AckGapReinjection,
                 );
             if !gap_frames.is_empty() {
-                critical_tail_reinjection = critical_gap_reinjection;
                 reinjection_limit = gap_limit;
                 reinjection_frames = gap_frames;
                 blocked_frontier_offset = gap_blocked_offset;
@@ -1990,16 +1954,10 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 send_stream.reinjection_bytes(),
                 mux_limits,
             );
-            let optional_credit =
-                response_sender.reinjection_extra_event_budget_remaining(mux_limits);
-            let (tail_limit, critical_live_tail_reinjection) =
-                reliable_live_gap_reinjection_authority(
-                    frontier_limit,
-                    optional_credit,
-                    frontier_limit,
-                    true,
-                    response_sender.live_owner_frontier_floor_ready(observed_at),
-                );
+            let tail_limit = reliable_live_gap_reinjection_authority(
+                frontier_limit,
+                live_tail_owner_recovery_ready,
+            );
             let tail_source_frames = send_stream.retransmission_frames_for_ranges(
                 &[OffsetRange {
                     start: last_send_ack_frontier,
@@ -2016,7 +1974,6 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                     RelaySendCause::TailReinjection,
                 );
             if !tail_reinjection_frames.is_empty() {
-                critical_tail_reinjection = critical_live_tail_reinjection;
                 reinjection_limit = tail_limit;
                 reinjection_frames = tail_reinjection_frames;
                 blocked_frontier_offset = tail_reinjection_blocked_offset;
@@ -2084,27 +2041,21 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 tail_reinjection_path_snapshot,
             )
         });
-        let queued = if critical_tail_reinjection {
-            Some(
-                response_sender
-                    .enqueue_critical_reinjection_frame_with_cause(frame, reinjection_cause),
-            )
+        if critical_tail_reinjection {
+            response_sender.enqueue_critical_reinjection_frame_with_cause(frame, reinjection_cause);
         } else {
             response_sender.enqueue_reinjection_frame_with_cause_and_priority(
                 frame,
                 reinjection_cause,
-                mux_limits,
                 true,
-            )
-        };
-        if queued.is_some() {
-            reinjection_count = reinjection_count.saturating_add(1);
-            if let Some(recovery_interval) = recovery_interval {
-                accepted_live_owner_recovery_interval = Some(include_live_owner_recovery_interval(
-                    accepted_live_owner_recovery_interval,
-                    recovery_interval,
-                ));
-            }
+            );
+        }
+        reinjection_count = reinjection_count.saturating_add(1);
+        if let Some(recovery_interval) = recovery_interval {
+            accepted_live_owner_recovery_interval = Some(include_live_owner_recovery_interval(
+                accepted_live_owner_recovery_interval,
+                recovery_interval,
+            ));
         }
     }
     if reinjection_count > 0
@@ -2945,8 +2896,6 @@ where
             ))
         .then(|| ack_gap_reinjection.next_reinjection_deadline())
         .flatten();
-        let reinjection_optional_credit =
-            response_sender.reinjection_extra_event_budget_remaining(mux_limits);
         let live_owner_epoch_deadline = response_sender.live_owner_frontier_floor_deadline();
         let completion_tail_owner_deadline = final_offset_known
             .then(|| response_sender.completion_tail_owner_fallback_deadline())
@@ -2954,7 +2903,6 @@ where
         let ack_gap_live_owner_wake = live_owner_gap_recovery_wake(
             ack_gap_candidate_deadline,
             ack_gap_reinjection.original_owner_recovery_deadline(),
-            reinjection_optional_credit,
             live_owner_epoch_deadline,
             ack_gap_observed_at,
         );
@@ -2966,7 +2914,6 @@ where
                     .then_some(tail_timer_deadline)
             },
             live_owner_epoch_deadline,
-            reinjection_optional_credit,
             ack_gap_observed_at,
         );
         let failed_tail_deadline = (tail_timer_active && failed_original_tail_reinjection_ready)

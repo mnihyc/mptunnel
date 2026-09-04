@@ -27,22 +27,41 @@ use tokio::sync::{Notify, mpsc};
 #[test]
 fn request_live_tail_uses_the_immutable_shared_epoch_as_its_actor_wake() {
     let observed_at = Instant::now();
+    let owner_deadline = observed_at + Duration::from_millis(20);
     let epoch_deadline = observed_at + Duration::from_millis(50);
 
     assert_eq!(
-        request_live_owner_tail_wake(true, None, Some(epoch_deadline), observed_at),
+        request_live_owner_tail_wake(
+            true,
+            Some(owner_deadline),
+            Some(epoch_deadline),
+            observed_at,
+        ),
         LiveOwnerRecoveryWake {
             due: false,
             deadline: Some(epoch_deadline),
         },
     );
     assert_eq!(
-        request_live_owner_tail_wake(false, None, Some(epoch_deadline), observed_at),
+        request_live_owner_tail_wake(true, None, Some(epoch_deadline), observed_at),
         LiveOwnerRecoveryWake {
             due: false,
             deadline: None,
         },
-        "an old stream epoch is not an independent cause without a retained live tail",
+        "an old stream epoch is not an independent cause without an owner fallback",
+    );
+    assert_eq!(
+        request_live_owner_tail_wake(
+            false,
+            Some(owner_deadline),
+            Some(epoch_deadline),
+            observed_at,
+        ),
+        LiveOwnerRecoveryWake {
+            due: false,
+            deadline: None,
+        },
+        "an owner fallback is not an independent cause without a retained live tail",
     );
 }
 

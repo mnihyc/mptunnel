@@ -33,6 +33,7 @@ use crate::model::work::{
     reliable_live_frontier_reinjection_limit_bytes, reliable_live_gap_reinjection_authority,
     reliable_reinjection_service_limit_bytes,
 };
+#[cfg(test)]
 use crate::mux::MuxLimits;
 use crate::mux::stream::{
     AckOutcome, ReliableRecvStream, ReliableSendStream, StreamError, ValidatedStreamAck,
@@ -301,6 +302,7 @@ impl RequestSenderService {
         remotes.fail_path_instance(context, instance)
     }
 
+    #[cfg(test)]
     fn optional_reinjection_budget_remaining(&self, mux_limits: MuxLimits) -> usize {
         self.optional_reinjection
             .budget(
@@ -308,18 +310,6 @@ impl RequestSenderService {
                 self.performance,
             )
             .remaining_bytes()
-    }
-
-    pub(in crate::runtime) fn reinjection_extra_event_budget_remaining(
-        &self,
-        mux_limits: MuxLimits,
-    ) -> usize {
-        let remaining = self.optional_reinjection_budget_remaining(mux_limits);
-        if remaining < sender_reinjection_minimum_useful_attempt_bytes(mux_limits) {
-            0
-        } else {
-            remaining
-        }
     }
 
     pub(in crate::runtime) fn live_owner_frontier_floor_ready(&self, observed_at: Instant) -> bool {
@@ -352,25 +342,16 @@ impl RequestSenderService {
         sender_queue: &mut ReliableRelaySenderQueue,
         frame: Frame,
         cause: RelaySendCause,
-        mux_limits: MuxLimits,
         critical_priority: bool,
-    ) -> bool {
+    ) {
         debug_assert!(cause.is_reinjection());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        let budget = self.optional_reinjection.budget(
-            sender_optional_reinjection_startup_floor_bytes(mux_limits),
-            self.performance,
-        );
-        if !budget.can_spend(payload_bytes) {
-            return false;
-        }
         self.optional_reinjection.record_reinjection(payload_bytes);
         if critical_priority {
             sender_queue.push_critical_reinjection_with_cause(frame, cause);
         } else {
             sender_queue.push_reinjection_with_cause(frame, cause);
         }
-        true
     }
 
     pub(in crate::runtime) fn enqueue_critical_reinjection_frame(
@@ -530,6 +511,29 @@ impl RequestSenderService {
     ) -> Option<Instant> {
         self.multipath
             .reinjection_suppression_deadline_for_frame(frame, remotes)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn accepted_reinjected_data_bytes_for_test(
+        &self,
+        instance: RelayPathInstance,
+    ) -> usize {
+        self.multipath.accepted_reinjected_data_bytes(instance)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn request_reinjection_target_snapshot_for_test(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        instance: RelayPathInstance,
+    ) -> Option<PathSnapshot> {
+        let path = remotes
+            .paths
+            .iter()
+            .find(|path| path.instance() == instance)?;
+        self.multipath
+            .request_reinjection_target_snapshot(context, remotes, path)
     }
 
     pub(in crate::runtime) fn try_send_requalification_probe(
@@ -1614,16 +1618,7 @@ impl RequestSenderService {
             send_stream.reinjection_bytes(),
             context.mux_limits,
         );
-        let optional_credit = self.reinjection_extra_event_budget_remaining(context.mux_limits);
-        let floor_ready_at_decide = self.live_owner_frontier_floor_ready(observed_at);
-        let (reinjection_limit, critical_live_owner_reinjection) =
-            reliable_live_gap_reinjection_authority(
-                reinjection_limit,
-                optional_credit,
-                reinjection_limit,
-                true,
-                floor_ready_at_decide,
-            );
+        let reinjection_limit = reliable_live_gap_reinjection_authority(reinjection_limit, true);
         if reinjection_limit == 0 {
             return RequestTailReinjectionOutcome::default();
         }
@@ -1675,25 +1670,12 @@ impl RequestSenderService {
             let attempt_recovery_interval = first_reinjection_after;
             let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
             let cause = RelaySendCause::TailReinjection;
-            let accepted = if critical_live_owner_reinjection {
-                self.enqueue_critical_reinjection_frame(sender_queue, frame, cause);
-                true
-            } else {
-                self.enqueue_reinjection_frame_with_priority(
-                    sender_queue,
-                    frame,
-                    cause,
-                    context.mux_limits,
-                    true,
-                )
-            };
-            queued |= accepted;
-            if accepted {
-                accepted_recovery_interval = Some(include_live_owner_recovery_interval(
-                    accepted_recovery_interval,
-                    attempt_recovery_interval,
-                ));
-            }
+            self.enqueue_reinjection_frame_with_priority(sender_queue, frame, cause, true);
+            queued = true;
+            accepted_recovery_interval = Some(include_live_owner_recovery_interval(
+                accepted_recovery_interval,
+                attempt_recovery_interval,
+            ));
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "reinjection",
@@ -1710,9 +1692,8 @@ impl RequestSenderService {
         }
         if let Some(recovery_interval) = accepted_recovery_interval {
             // Owner age was proven above for every accepted frame. Linearize
-            // epoch consumption at the end of the successful batch: optional
-            // work accepted before G opens must not close it, while a batch
-            // crossing the boundary must consume G before another floor use.
+            // the retained successor observation at the end of the successful
+            // batch without making it authority for this due cause.
             let accepted_at = Instant::now();
             if self.live_owner_frontier_floor_ready(accepted_at) {
                 self.record_live_owner_frontier_floor_attempt(accepted_at, recovery_interval);
@@ -1853,16 +1834,8 @@ impl RequestSenderService {
             context.mux_limits,
         )
         .min(target.service_limit_bytes);
-        let optional_credit = self.reinjection_extra_event_budget_remaining(context.mux_limits);
-        let floor_ready_at_decide = self.live_owner_frontier_floor_ready(observed_at);
-        let (service_limit, critical_frontier_reinjection) =
-            reliable_live_gap_reinjection_authority(
-                target.service_limit_bytes,
-                optional_credit,
-                frontier_limit,
-                true,
-                floor_ready_at_decide,
-            );
+        let service_limit =
+            reliable_live_gap_reinjection_authority(target.service_limit_bytes, true);
         if service_limit == 0 {
             return RequestCompletionTailEnqueueOutcome {
                 blocked_for_carrier_capacity: target.service_limit_bytes == 0,
@@ -1885,21 +1858,7 @@ impl RequestSenderService {
             if sender_queue.has_queued_reinjection_overlap(&frame) {
                 break;
             }
-            let accepted = if critical_frontier_reinjection {
-                self.enqueue_critical_reinjection_frame(sender_queue, frame, cause);
-                true
-            } else {
-                self.enqueue_reinjection_frame_with_priority(
-                    sender_queue,
-                    frame,
-                    cause,
-                    context.mux_limits,
-                    true,
-                )
-            };
-            if !accepted {
-                break;
-            }
+            self.enqueue_reinjection_frame_with_priority(sender_queue, frame, cause, true);
             queued = true;
             accepted_recovery_interval = Some(include_live_owner_recovery_interval(
                 accepted_recovery_interval,
@@ -1908,7 +1867,7 @@ impl RequestSenderService {
         }
         if let Some(recovery_interval) = accepted_recovery_interval {
             // The exact original-owner age was proven before target binding.
-            // Consume G only if it is open when this accepted batch commits.
+            // Retain one non-accumulating successor observation for this batch.
             let accepted_at = Instant::now();
             if self.live_owner_frontier_floor_ready(accepted_at) {
                 self.record_live_owner_frontier_floor_attempt(accepted_at, recovery_interval);

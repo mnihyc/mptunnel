@@ -88,14 +88,18 @@ fn request_live_owner_tail_wake(
     epoch_deadline: Option<Instant>,
     observed_at: Instant,
 ) -> LiveOwnerRecoveryWake {
-    live_owner_recovery_wake(
-        retained_live_tail
-            .then_some(owner_fallback_deadline)
-            .flatten(),
-        epoch_deadline,
-        0,
-        observed_at,
-    )
+    // Preserve this actor's floor-only wake. Combining the owner and epoch
+    // clocks prevents the generic cause branch from making a retained tail
+    // independently actionable; broader cause wake is a separate policy.
+    let floor_deadline = retained_live_tail
+        .then_some(owner_fallback_deadline)
+        .flatten()
+        .map(|owner_deadline| {
+            epoch_deadline.map_or(owner_deadline, |epoch_deadline| {
+                owner_deadline.max(epoch_deadline)
+            })
+        });
+    live_owner_recovery_wake(floor_deadline, None, observed_at)
 }
 
 fn reliable_relay_client_ack_gap_path_model_wait_active(
@@ -1260,11 +1264,6 @@ where
             && state.progress.last_send_ack_frontier < send_stream.next_offset()
             && send_stream.reinjection_bytes() > 0
             && remotes.path_keys().len() > 1;
-        let live_owner_tail_observed_at = Instant::now();
-        let live_owner_tail_floor_ready = retained_request_live_tail
-            && sender.live_owner_frontier_floor_ready(live_owner_tail_observed_at);
-        let live_owner_tail_optional_credit =
-            sender.reinjection_extra_event_budget_remaining(context.mux_limits);
         let persistent_product_stall = state
             .progress
             .last_product_stall_attempt_at
@@ -1325,8 +1324,7 @@ where
                 ),
             );
         }
-        if (live_owner_tail_optional_credit > 0 || live_owner_tail_floor_ready)
-            && persistent_product_stall
+        if persistent_product_stall
             && sender.enqueue_tail_reinjection(
                 &mut sender_queue,
                 context,

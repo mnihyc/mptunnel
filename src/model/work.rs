@@ -316,27 +316,22 @@ pub(crate) fn reliable_reinjection_service_limit_bytes(
     )
 }
 
-/// Combines one live owner's optional gap-service credit with the bounded
-/// liveness floor that becomes available only after that owner's recovery
-/// interval. `live_owner_attempt_ready` is durable per-direction epoch state,
-/// not a fact reconstructed from queue or target state. The floor never
-/// enlarges the selected target's Product capacity; it only prevents stronger
-/// evidence of a blocking frontier from removing the one-quantum progress
-/// authority already available to a silent live tail.
+/// Applies retained recovery timing to the selected target's exact Product
+/// service authority.
+///
+/// The target limit already subtracts queued, accepted, and stable-slot repair
+/// debt. A configured traffic-accounting percentage is deliberately absent:
+/// once a recovery cause is due it cannot reduce Product eligibility or byte
+/// extent. Native admission remains the final authority below this model.
 pub(crate) fn reliable_live_gap_reinjection_authority(
     target_service_limit: usize,
-    optional_credit: usize,
-    frontier_limit: usize,
-    owner_recovery_ready: bool,
-    live_owner_attempt_ready: bool,
-) -> (usize, bool) {
-    let critical_floor = if owner_recovery_ready && live_owner_attempt_ready {
-        frontier_limit.min(target_service_limit)
+    recovery_ready: bool,
+) -> usize {
+    if recovery_ready {
+        target_service_limit
     } else {
         0
-    };
-    let service_limit = target_service_limit.min(optional_credit.max(critical_floor));
-    (service_limit, service_limit > optional_credit)
+    }
 }
 
 /// ACK release must use identical range math in both product directions so
@@ -426,50 +421,17 @@ mod live_owner_reinjection_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn authority_uses_max_of_optional_credit_and_one_frontier_floor() {
+    fn live_gap_authority_uses_full_structural_target_service_when_due() {
+        assert_eq!(reliable_live_gap_reinjection_authority(100, true), 100);
         assert_eq!(
-            reliable_live_gap_reinjection_authority(100, 0, 40, true, true),
-            (40, true),
+            reliable_live_gap_reinjection_authority(100, false),
+            0,
+            "a recovery cause that is not due remains a hard denial",
         );
         assert_eq!(
-            reliable_live_gap_reinjection_authority(100, 20, 40, true, true),
-            (40, true),
-            "partial optional credit is replaced by, not added to, the floor",
-        );
-        assert_eq!(
-            reliable_live_gap_reinjection_authority(100, 60, 40, true, true),
-            (60, false),
-        );
-        assert_eq!(
-            reliable_live_gap_reinjection_authority(80, 100, 40, true, true),
-            (80, false),
-        );
-        assert_eq!(
-            reliable_live_gap_reinjection_authority(100, 0, 40, false, true),
-            (0, false),
-            "optional exhaustion before the owner fallback has no bypass",
-        );
-        assert_eq!(
-            reliable_live_gap_reinjection_authority(100, 100, 40, true, false),
-            (100, false),
-            "a consumed temporal opportunity blocks only the over-credit frontier floor",
-        );
-        assert_eq!(
-            reliable_live_gap_reinjection_authority(0, 100, 40, true, true),
-            (0, false),
-            "the floor cannot bypass exact target service capacity",
-        );
-    }
-
-    #[test]
-    fn exact_frontier_smaller_than_credit_is_optional_and_can_fill_credit() {
-        let frontier =
-            reliable_live_frontier_reinjection_limit_bytes(100, 100, 20, 100, MuxLimits::default());
-        assert_eq!(frontier, 20);
-        assert_eq!(
-            reliable_live_gap_reinjection_authority(100, 40, frontier, true, true),
-            (40, false),
-            "H < C < A must preserve optional credit beyond the exact frontier instead of misclassifying H as an over-budget attempt",
+            reliable_live_gap_reinjection_authority(0, true),
+            0,
+            "zero exact target service remains a hard structural denial",
         );
     }
 

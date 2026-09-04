@@ -682,7 +682,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         [
             "tcp://127.0.0.1:11104?initial-srtt-s=0.02&initial-rate-mbps=200",
             "tcp://127.0.0.1:11106?initial-srtt-s=0.02&initial-rate-mbps=200",
-            "quic://127.0.0.1:11105?initial-srtt-s=0.02&initial-rate-mbps=200",
+            "tcp://127.0.0.1:11105?initial-srtt-s=0.02&initial-rate-mbps=200",
         ]
         .into_iter()
         .map(|path| path.parse::<PathSpec>().expect("test path"))
@@ -699,17 +699,12 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
     let owner = remotes.paths[0].instance();
 
     let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
-    let _ = remotes.attach_candidate(opened_request_path_with_underlay(
-        stream_id,
-        UnderlayProtocol::Udp,
-        0,
-        first_commands,
-    ));
+    let _ = remotes.attach_candidate(opened_request_path(stream_id, 2, first_commands));
     consume_path_proof(&mut first_receivers);
     let first_alternate = remotes
         .path_instance_for_key(RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index: 0,
+            underlay: UnderlayProtocol::Tcp,
+            index: 2,
         })
         .expect("first alternate");
 
@@ -746,12 +741,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
     let original = send_stream
         .send_data(Bytes::from(vec![0x61; quantum * 5]))
         .expect("sparse request flight");
-    let mut sender = RequestSenderService::new_with_performance(
-        stream_id,
-        crate::performance::MppPerformanceConfig {
-            optional_reinjection_budget_percent: 100,
-        },
-    );
+    let mut sender = RequestSenderService::new(stream_id);
     sender.record_original_frame_for_test(owner, &original);
     let ack_ranges = vec![
         OffsetRange {
@@ -815,17 +805,8 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
             );
         }
     }
-    let mut predeadline_sender = RequestSenderService::new_with_performance(
-        stream_id,
-        crate::performance::MppPerformanceConfig {
-            optional_reinjection_budget_percent: 100,
-        },
-    );
+    let mut predeadline_sender = RequestSenderService::new(stream_id);
     predeadline_sender.record_original_frame_for_test(owner, &original);
-    assert!(
-        predeadline_sender.reinjection_extra_event_budget_remaining(limits) > 0,
-        "fixture requires optional C before the retained completion cause matures",
-    );
     let mut predeadline_queue = ReliableRelaySenderQueue::default();
     let mut predeadline_state = ClientRelayState::new();
     update_reinjection_authoritative_ack_snapshot(
@@ -853,7 +834,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
             .ack_gap_reinjection
             .next_reinjection_deadline()
             .is_some_and(|deadline| deadline > predeadline_observed_at),
-        "optional credit cannot authorize request ACK-gap Apply before the retained T_c deadline",
+        "request ACK-gap Apply cannot precede the retained T_c deadline",
     );
 
     let zero_resources = ResourceLimits {
@@ -864,7 +845,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         [
             "tcp://127.0.0.1:11104?initial-srtt-s=0.02&initial-rate-mbps=200",
             "tcp://127.0.0.1:11106?initial-srtt-s=0.02&initial-rate-mbps=200",
-            "quic://127.0.0.1:11105?initial-srtt-s=0.02&initial-rate-mbps=200",
+            "tcp://127.0.0.1:11105?initial-srtt-s=0.02&initial-rate-mbps=200",
         ]
         .into_iter()
         .map(|path| path.parse::<PathSpec>().expect("zero-authority path"))
@@ -886,12 +867,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
             }
         }
     }
-    let mut zero_sender = RequestSenderService::new_with_performance(
-        stream_id,
-        crate::performance::MppPerformanceConfig {
-            optional_reinjection_budget_percent: 100,
-        },
-    );
+    let mut zero_sender = RequestSenderService::new(stream_id);
     zero_sender.record_original_frame_for_test(owner, &original);
     let mut zero_queue = ReliableRelaySenderQueue::default();
     let mut zero_state = ClientRelayState::new();
@@ -938,12 +914,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
             );
         }
     }
-    let mut early_sender = RequestSenderService::new_with_performance(
-        stream_id,
-        crate::performance::MppPerformanceConfig {
-            optional_reinjection_budget_percent: 100,
-        },
-    );
+    let mut early_sender = RequestSenderService::new(stream_id);
     early_sender.record_original_frame_for_test(owner, &original);
     let mut early_queue = ReliableRelaySenderQueue::default();
     let mut early_state = ClientRelayState::new();
@@ -1038,11 +1009,9 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
     assert_eq!(
         early_sender.live_owner_frontier_floor_deadline(),
         None,
-        "an early measured request race funded only by C must leave G unconsumed",
+        "an early measured request race before owner fallback must leave the shared epoch unconsumed",
     );
     while early_queue.pop_front().is_some() {}
-    let remaining_credit = early_sender.reinjection_extra_event_budget_remaining(limits);
-    early_sender.record_reinjection_for_test(remaining_credit);
     let exact_owner_interval = reliable_data_retransmission_interval(
         Some(owner.key.underlay),
         context.reliable_path_snapshot_for_instance(owner),
@@ -1065,6 +1034,28 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
             None,
             fallback_at,
         );
+    let fallback_observation = early_sender.data_ack_gap_reinjection_model(
+        &context,
+        &remotes,
+        &send_stream,
+        &early_queue,
+        &authoritative_ranges,
+        early_frontier_bytes,
+        TrafficClass::Throughput,
+    );
+    let (fallback_target, fallback_snapshot) = fallback_observation
+        .reinjection_target
+        .expect("fallback retains an exact measured request target");
+    let fallback_service_limit = request_target_reinjection_service_limit(
+        fallback_target.instance(),
+        fallback_snapshot,
+        &early_queue,
+        fallback_observation.reinjection_target_flight_bytes,
+        send_stream.reinjection_bytes(),
+        limits,
+    );
+    let expected_fallback_extent =
+        fallback_service_limit.min(fallback_observation.uniform_frontier_extent_bytes);
     let fallback = evaluate_client_data_ack_reinjection(
         &mut early_state,
         &mut early_sender,
@@ -1077,10 +1068,23 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         stream_id,
     );
     assert!(fallback.persistent_ready);
-    assert_eq!(early_queue.bytes(), early_frontier_bytes);
+    assert_eq!(
+        early_queue.bytes(),
+        expected_fallback_extent,
+        "post-fallback request recovery must admit the exact retained extent bounded by current target Product service",
+    );
     assert!(
         early_sender.live_owner_frontier_floor_deadline().is_some(),
-        "after owner fallback, exhausted C receives and consumes exactly F",
+        "accepted recovery after owner fallback consumes the shared epoch",
+    );
+    let fallback_epoch_deadline = early_sender
+        .live_owner_frontier_floor_deadline()
+        .expect("accepted request recovery starts one shared epoch");
+    early_sender.record_delivered_data(quantum);
+    assert_eq!(
+        early_sender.live_owner_frontier_floor_deadline(),
+        Some(fallback_epoch_deadline),
+        "new Product ACK progress must not postpone an already-started recovery epoch",
     );
     let observed_at = Instant::now();
     assert!(
@@ -1103,223 +1107,6 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
             .is_some_and(|deadline| deadline <= observed_at)
     );
 
-    let mut exhausted_sender = RequestSenderService::new(stream_id);
-    exhausted_sender.record_original_frame_for_test(owner, &original);
-    tokio::time::sleep(exact_owner_interval + Duration::from_millis(10)).await;
-    let mut exhausted_queue = ReliableRelaySenderQueue::default();
-    let startup_credit = exhausted_sender.reinjection_extra_event_budget_remaining(limits);
-    assert!(startup_credit > 0);
-    exhausted_sender.record_reinjection_for_test(startup_credit);
-    assert_eq!(
-        exhausted_sender.reinjection_extra_event_budget_remaining(limits),
-        0,
-    );
-    let mut exhausted_state = ClientRelayState::new();
-    update_reinjection_authoritative_ack_snapshot(
-        &mut exhausted_state.progress.last_send_ack,
-        &validated_ack,
-    );
-    exhausted_state.progress.last_send_ack_frontier = quantum as u64;
-    let exhausted_observation = exhausted_sender.data_ack_gap_reinjection_model(
-        &context,
-        &remotes,
-        &send_stream,
-        &exhausted_queue,
-        &authoritative_ranges,
-        scored_frontier_bytes,
-        TrafficClass::Throughput,
-    );
-    assert!(exhausted_observation.has_live_original_path);
-    let exhausted_assignment_at = exhausted_observation
-        .original_assignment_at
-        .expect("live exhausted request owner assignment");
-    let exhausted_observed_at = Instant::now();
-    assert!(
-        exhausted_state
-            .progress
-            .ack_gap_reinjection
-            .observe_recovery_timing(
-                true,
-                &authoritative_ranges,
-                true,
-                Some(ReliableDataAckGapTiming {
-                    assignment_at: exhausted_assignment_at,
-                    loss_at: Some(exhausted_assignment_at),
-                    fallback_at: exhausted_assignment_at,
-                }),
-                Some(Duration::ZERO),
-                None,
-                exhausted_observed_at,
-            )
-            .is_some_and(|deadline| deadline <= exhausted_observed_at)
-    );
-    let exhausted = evaluate_client_data_ack_reinjection(
-        &mut exhausted_state,
-        &mut exhausted_sender,
-        &mut exhausted_queue,
-        &context,
-        &remotes,
-        &send_stream,
-        Some(scored_path),
-        TrafficClass::Throughput,
-        stream_id,
-    );
-    assert!(exhausted.persistent_ready);
-    assert!(!exhausted.target_service_exhausted);
-    assert!(
-        exhausted.frame_count > 0,
-        "stronger authoritative gap evidence must retain the one-interval liveness floor already granted to a contiguous live tail",
-    );
-    assert_eq!(
-        exhausted_queue.bytes(),
-        scored_frontier_bytes,
-        "exhausted optional credit may authorize only the exact blocking frontier quantum, not a target service window",
-    );
-    let request_epoch_deadline = exhausted_sender
-        .live_owner_frontier_floor_deadline()
-        .expect("accepted request repair starts one shared recovery epoch");
-    exhausted_sender.record_delivered_data(quantum);
-    assert_eq!(
-        exhausted_sender.live_owner_frontier_floor_deadline(),
-        Some(request_epoch_deadline),
-        "a newly acknowledged sparse suffix may fund optional credit but cannot postpone the blocked lower frontier's epoch",
-    );
-
-    let mut partial_sender = RequestSenderService::new(stream_id);
-    partial_sender.record_original_frame_for_test(owner, &original);
-    tokio::time::sleep(exact_owner_interval + Duration::from_millis(10)).await;
-    partial_sender.record_delivered_data(quantum.saturating_mul(2));
-    let partial_credit = scored_frontier_bytes;
-    let funded_credit = partial_sender.reinjection_extra_event_budget_remaining(limits);
-    assert!(funded_credit > partial_credit);
-    partial_sender.record_reinjection_for_test(funded_credit - partial_credit);
-    assert_eq!(
-        partial_sender.reinjection_extra_event_budget_remaining(limits),
-        partial_credit,
-    );
-    let mut partial_queue = ReliableRelaySenderQueue::default();
-    let partial_observation = partial_sender.data_ack_gap_reinjection_model(
-        &context,
-        &remotes,
-        &send_stream,
-        &partial_queue,
-        &authoritative_ranges,
-        scored_frontier_bytes,
-        TrafficClass::Throughput,
-    );
-    let (partial_target, partial_snapshot) = partial_observation
-        .reinjection_target
-        .expect("partial-credit request repair target");
-    assert!(
-        request_target_reinjection_service_limit(
-            partial_target.instance(),
-            partial_snapshot,
-            &partial_queue,
-            partial_observation.reinjection_target_flight_bytes,
-            send_stream.reinjection_bytes(),
-            limits,
-        ) > partial_credit,
-        "fixture requires target service capacity larger than exact remaining credit",
-    );
-    let partial_assignment_at = partial_observation
-        .original_assignment_at
-        .expect("live partial-credit request owner assignment");
-    let partial_observed_at = Instant::now();
-    let mut partial_state = ClientRelayState::new();
-    update_reinjection_authoritative_ack_snapshot(
-        &mut partial_state.progress.last_send_ack,
-        &validated_ack,
-    );
-    partial_state.progress.last_send_ack_frontier = quantum as u64;
-    assert!(
-        partial_state
-            .progress
-            .ack_gap_reinjection
-            .observe_recovery_timing(
-                true,
-                &authoritative_ranges,
-                true,
-                Some(ReliableDataAckGapTiming {
-                    assignment_at: partial_assignment_at,
-                    loss_at: Some(partial_assignment_at),
-                    fallback_at: partial_assignment_at,
-                }),
-                Some(Duration::ZERO),
-                None,
-                partial_observed_at,
-            )
-            .is_some_and(|deadline| deadline <= partial_observed_at)
-    );
-    let partial = evaluate_client_data_ack_reinjection(
-        &mut partial_state,
-        &mut partial_sender,
-        &mut partial_queue,
-        &context,
-        &remotes,
-        &send_stream,
-        Some(scored_path),
-        TrafficClass::Throughput,
-        stream_id,
-    );
-    assert!(partial.persistent_ready);
-    assert!(!partial.target_service_exhausted);
-    assert!(partial.frame_count > 0);
-    assert_eq!(
-        partial_queue.bytes(),
-        partial_credit,
-        "accepted persistent-gap request payload must not exceed the exact remaining cumulative credit",
-    );
-    assert_eq!(
-        partial_sender.reinjection_extra_event_budget_remaining(limits),
-        0,
-    );
-    let serialized_bytes = partial_queue.bytes();
-    while partial_queue.pop_front().is_some() {}
-    assert!(partial_queue.is_empty());
-    let serialized = evaluate_client_data_ack_reinjection(
-        &mut partial_state,
-        &mut partial_sender,
-        &mut partial_queue,
-        &context,
-        &remotes,
-        &send_stream,
-        Some(scored_path),
-        TrafficClass::Throughput,
-        stream_id,
-    );
-    assert_eq!(serialized.frame_count, 0);
-    assert_eq!(
-        partial_queue.bytes(),
-        0,
-        "a serialized request evaluation cannot renew a fixed repair quantum after prior queued work leaves, before unique Data ACK progress funds it",
-    );
-    assert!(
-        partial_state.progress.data_ack_reinjection_at.is_some(),
-        "the consumed opportunity must retain exactly one immutable next-interval wake",
-    );
-    let cause_deadline = partial_state
-        .progress
-        .ack_gap_reinjection
-        .next_reinjection_deadline()
-        .expect("persistent request gap retains its cause clock");
-    let epoch_deadline = partial_sender
-        .live_owner_frontier_floor_deadline()
-        .expect("accepted request repair retains its shared epoch clock");
-    assert_eq!(
-        partial_state
-            .progress
-            .data_ack_reinjection_at
-            .map(tokio::time::Instant::into_std),
-        Some(cause_deadline.max(epoch_deadline)),
-        "the client actor must wake at the conjunction of cause readiness and the shared epoch",
-    );
-    assert!(serialized_bytes > 0);
-
-    sender.record_delivered_data(quantum.saturating_mul(2));
-    assert!(
-        sender.reinjection_extra_event_budget_remaining(limits) >= quantum,
-        "the exact two acknowledged quanta must fund the one retained request gap",
-    );
     let frontier_frame = send_stream
         .retransmission_frames_for_normalized_ack_gaps(&authoritative_ranges, scored_frontier_bytes)
         .into_iter()
@@ -1401,37 +1188,118 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         sender_queue.bytes() > scored_frontier_bytes,
         "committing the request frontier unlocks the measured service window"
     );
-    let (_, frontier) = sender_queue
-        .pop_front()
-        .expect("committed request frontier");
-    let (frontier_frame, frontier_cause) = match &frontier.kind {
-        ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => (frame.clone(), *cause),
-        _ => panic!("request frontier must be reinjection work"),
-    };
+    let (planner_target, planner_snapshot) = sender
+        .data_ack_gap_reinjection_model(
+            &context,
+            &remotes,
+            &send_stream,
+            &ReliableRelaySenderQueue::default(),
+            &authoritative_ranges,
+            scored_frontier_bytes,
+            TrafficClass::Throughput,
+        )
+        .reinjection_target
+        .expect("admitted request batch retains its exact planned target");
+    let natural_batch_bytes = sender_queue.bytes();
+    let queued_after_front =
+        sender_queue.request_target_queued_reinjection_bytes(planner_target.instance(), true);
+    let (frontier_frame, frontier_cause, frontier_payload_bytes) =
+        match sender_queue.front().map(|(_, work)| &work.kind) {
+            Some(ReliableRelayQueuedWorkKind::Reinjection {
+                frame: Frame::StreamData {
+                    offset, payload, ..
+                },
+                cause,
+            }) if *offset == quantum as u64 && payload.len() == scored_frontier_bytes => (
+                Frame::StreamData {
+                    stream_id,
+                    offset: *offset,
+                    payload: payload.clone(),
+                },
+                *cause,
+                payload.len(),
+            ),
+            work => panic!("request frontier must remain the natural first repair: {work:?}"),
+        };
     assert!(matches!(
-        frontier.kind,
-        ReliableRelayQueuedWorkKind::Reinjection {
-            frame: Frame::StreamData {
-                offset,
-                payload,
-                ..
-            },
-            ..
-        } if offset == quantum as u64 && payload.len() == scored_frontier_bytes
+        frontier_cause,
+        RelaySendCause::PersistentClientAckGapReinjection(_)
     ));
-    let (_, later) = sender_queue
-        .pop_front()
-        .expect("later service-window repair");
-    assert!(matches!(
-        later.kind,
-        ReliableRelayQueuedWorkKind::Reinjection {
-            frame: Frame::StreamData { offset, .. },
-            ..
-        } if offset > quantum as u64
-    ));
-    while sender_queue.pop_front().is_some() {}
+    assert_eq!(
+        sender_queue.request_target_queued_reinjection_bytes(planner_target.instance(), false),
+        natural_batch_bytes,
+        "the queued request batch must retain the planner's exact target identity",
+    );
+    assert_eq!(
+        sender_queue.request_target_queued_reinjection_bytes(owner, false),
+        0,
+        "the target-bound batch must not consume an unrelated exact output's reserve",
+    );
+    assert_eq!(
+        queued_after_front.saturating_add(frontier_payload_bytes),
+        natural_batch_bytes,
+        "excluding the current front must leave exactly the rest of the natural target-bound batch",
+    );
+    let planner_window = reliable_product_recovery_window_bytes(
+        Some(planner_snapshot),
+        TrafficClass::Throughput,
+        limits,
+    );
+    let planner_original =
+        usize::try_from(planner_snapshot.data_level_bytes_in_flight).unwrap_or(usize::MAX);
+    let planner_emergency = adaptive_reliable_relay_reinjection_bytes(
+        Some(planner_snapshot),
+        TrafficClass::Throughput,
+        limits,
+    )
+    .max(reliable_bulk_carrier_feed_quantum_bytes(limits));
+    let planner_repair_cap = planner_window
+        .saturating_sub(planner_original)
+        .max(planner_emergency);
+    let planner_accepted =
+        sender.accepted_reinjected_data_bytes_for_test(planner_target.instance());
+    let planner_k = planner_repair_cap.saturating_sub(planner_accepted);
+    assert_eq!(
+        natural_batch_bytes,
+        planner_k.min(quantum),
+        "the natural request batch must equal the planner's exact K bounded by the retained first gap",
+    );
 
-    sender_queue.push_reinjection_with_cause(frontier_frame, frontier_cause);
+    let apply_snapshot = sender
+        .request_reinjection_target_snapshot_for_test(&context, &remotes, planner_target.instance())
+        .expect("exact target remains observable immediately before Apply");
+    let apply_window = reliable_product_recovery_window_bytes(
+        Some(apply_snapshot),
+        TrafficClass::Throughput,
+        limits,
+    );
+    let apply_original =
+        usize::try_from(apply_snapshot.data_level_bytes_in_flight).unwrap_or(usize::MAX);
+    let apply_emergency = adaptive_reliable_relay_reinjection_bytes(
+        Some(apply_snapshot),
+        TrafficClass::Throughput,
+        limits,
+    )
+    .max(reliable_bulk_carrier_feed_quantum_bytes(limits));
+    let apply_repair_cap = apply_window
+        .saturating_sub(apply_original)
+        .max(apply_emergency);
+    let apply_accepted = sender.accepted_reinjected_data_bytes_for_test(planner_target.instance());
+    let apply_k_after_excluding_front =
+        apply_repair_cap.saturating_sub(queued_after_front.saturating_add(apply_accepted));
+    assert!(
+        apply_k_after_excluding_front >= frontier_payload_bytes,
+        "the natural batch is algebraically admissible before the writer reservation: target={:?} P={} O={} repair_cap={} B_plus_U_after_front={} J={} K_after_front={} front={}",
+        planner_target.instance(),
+        apply_window,
+        apply_original,
+        apply_repair_cap,
+        queued_after_front,
+        apply_accepted,
+        apply_k_after_excluding_front,
+        frontier_payload_bytes,
+    );
+
     let committed_copy = sender
         .dispatch_client_queued_work(
             &context,
@@ -1443,15 +1311,61 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
             ReliableDataAckFrontierState::AuthoritativeGap,
         )
         .await
-        .expect("actual alternate carrier commitment");
+        .unwrap_or_else(|error| {
+            panic!(
+                "the natural planner-admitted batch must commit its exact front: error={error:?} target={:?} planner_P={} planner_O={} planner_repair_cap={} planner_B=0 planner_U=0 planner_J={} planner_K={} batch={} apply_P={} apply_O={} apply_repair_cap={} apply_B_plus_U_after_front={} apply_J={} apply_K_after_front={} front={}",
+                planner_target.instance(),
+                planner_window,
+                planner_original,
+                planner_repair_cap,
+                planner_accepted,
+                planner_k,
+                natural_batch_bytes,
+                apply_window,
+                apply_original,
+                apply_repair_cap,
+                queued_after_front,
+                apply_accepted,
+                apply_k_after_excluding_front,
+                frontier_payload_bytes,
+            )
+        });
     assert!(matches!(
         committed_copy,
         ClientQueuedDispatch::Reinjection {
+            payload_bytes,
             accepted_copy_deadline,
-            ..
-        } if accepted_copy_deadline > Instant::now()
+        } if payload_bytes == frontier_payload_bytes && accepted_copy_deadline > Instant::now()
     ));
-    assert!(sender_queue.is_empty());
+    assert_eq!(
+        sender_queue.bytes(),
+        natural_batch_bytes.saturating_sub(frontier_payload_bytes),
+    );
+    assert!(matches!(
+        sender_queue.front().map(|(_, work)| &work.kind),
+        Some(ReliableRelayQueuedWorkKind::Reinjection {
+            frame: Frame::StreamData { offset, .. },
+            cause: RelaySendCause::PersistentClientAckGapReinjection(_),
+        }) if *offset > quantum as u64
+    ));
+    assert_eq!(
+        sender_queue.request_target_queued_reinjection_bytes(planner_target.instance(), false),
+        natural_batch_bytes.saturating_sub(frontier_payload_bytes),
+    );
+    while sender_queue.pop_front().is_some() {}
+
+    let accepted_target_bytes =
+        sender.accepted_reinjected_data_bytes_for_test(planner_target.instance());
+    assert_eq!(
+        accepted_target_bytes, frontier_payload_bytes,
+        "the accepted exact target ledger must contain the committed frontier once",
+    );
+    let accepted_copy =
+        sender.reinjection_suppression_deadline_for_frame(&frontier_frame, &remotes);
+    assert!(
+        accepted_copy.is_some_and(|deadline| deadline > Instant::now()),
+        "the accepted exact range must retain its immutable suppression deadline",
+    );
 
     let globally_suppressed = evaluate_client_data_ack_reinjection(
         &mut state,

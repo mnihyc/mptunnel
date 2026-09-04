@@ -565,8 +565,6 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             ..ClientDataAckReinjectionOutcome::default()
         };
     }
-    let reinjection_event_budget =
-        sender.reinjection_extra_event_budget_remaining(context.mux_limits);
     let reinjection = sender.data_ack_gap_reinjection_model(
         context,
         remotes,
@@ -632,18 +630,13 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     );
     let persistent_ack_gap_reinjection_ready =
         ack_gap_reinjection_ready && reinjection_target.is_some();
-    // A complete persistent gap proves missing Product order, not failure of
-    // the live native-reliable owner. Racing that owner is optional work, so
-    // its full measured target service window remains subject to the sender's
-    // cumulative optional-reinjection credit. Missing, failed, or
-    // declared-stale owners retain their separate exact-range recovery.
+    // A complete persistent gap proves missing Product order. Its immutable
+    // cause clock and exact current ownership decide recovery readiness; the
+    // selected target's Product headroom bounds the admitted extent.
     let owner_recovery_deadline = state
         .progress
         .ack_gap_reinjection
         .original_owner_recovery_deadline();
-    let owner_recovery_ready =
-        owner_recovery_deadline.is_some_and(|deadline| observed_at >= deadline);
-    let live_owner_frontier_floor_ready = sender.live_owner_frontier_floor_ready(observed_at);
     let target_service_limit = if reinjection.target_service_exhausted {
         0
     } else if persistent_ack_gap_reinjection_ready {
@@ -660,20 +653,8 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     } else {
         base_reinjection_limit
     };
-    let (reinjection_limit, critical_frontier_reinjection) = if ack_gap_reinjection_ready {
-        reliable_live_gap_reinjection_authority(
-            target_service_limit,
-            reinjection_event_budget,
-            frontier_limit,
-            persistent_ack_gap_reinjection_ready && owner_recovery_ready,
-            live_owner_frontier_floor_ready,
-        )
-    } else {
-        // Optional credit funds a copy only after the retained completion
-        // cause T_c. It changes the service branch, not the temporal
-        // authority to race a still-live native owner.
-        (0, false)
-    };
+    let reinjection_limit =
+        reliable_live_gap_reinjection_authority(target_service_limit, ack_gap_reinjection_ready);
     let reinjection_retry_after = reinjection_target.map_or_else(
         || reliable_data_retransmission_interval(ack_gap_original_underlay, original_path_timing),
         |(_, snapshot)| {
@@ -716,29 +697,14 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             || sender_queue.has_queued_reinjection_overlap(&frame)
         {
             false
-        } else if critical_frontier_reinjection {
-            sender.enqueue_critical_reinjection_frame(
-                sender_queue,
-                frame,
-                ack_gap_reinjection_cause,
-            );
-            true
-        } else if persistent_ack_gap_reinjection {
-            sender.enqueue_reinjection_frame_with_priority(
-                sender_queue,
-                frame,
-                ack_gap_reinjection_cause,
-                context.mux_limits,
-                true,
-            )
         } else {
-            sender.enqueue_reinjection_frame_with_priority(
-                sender_queue,
-                frame,
-                RelaySendCause::AckGapReinjection,
-                context.mux_limits,
-                true,
-            )
+            let cause = if persistent_ack_gap_reinjection {
+                ack_gap_reinjection_cause
+            } else {
+                RelaySendCause::AckGapReinjection
+            };
+            sender.enqueue_reinjection_frame_with_priority(sender_queue, frame, cause, true);
+            true
         };
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
@@ -757,9 +723,8 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     }
     if accepted_live_owner_reinjection {
         // L/D/target/F were fixed by the observation above; acceptance is the
-        // linearization point for the temporal token.  An optional-credit
-        // batch before fallback leaves G open, while a boundary-crossing batch
-        // consumes it and prevents an immediate second floor batch.
+        // linearization point for the retained epoch observation. A due cause
+        // remains independently actionable; this clock does not gate it.
         let accepted_at = Instant::now();
         if owner_recovery_deadline.is_some_and(|deadline| accepted_at >= deadline)
             && sender.live_owner_frontier_floor_ready(accepted_at)
@@ -783,7 +748,6 @@ pub(super) fn evaluate_client_data_ack_reinjection(
                 .ack_gap_reinjection
                 .next_reinjection_deadline(),
             owner_recovery_deadline,
-            reinjection_event_budget,
             sender.live_owner_frontier_floor_deadline(),
             observed_at,
         )

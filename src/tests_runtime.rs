@@ -3404,11 +3404,7 @@ async fn server_response_sender_dispatches_reinjection_before_data() {
     ));
     let mut sender = ServerResponseSenderService::new(SessionId(8), stream_id);
     sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), TrafficClass::Throughput);
-    assert!(
-        sender
-            .enqueue_reinjection_frame_with_priority(original, MuxLimits::default(), true,)
-            .is_some()
-    );
+    sender.enqueue_reinjection_frame_with_priority(original, true);
 
     let reinjection_dispatch = sender
         .dispatch_next(

@@ -11,7 +11,7 @@ fn only_original_connection_data_owns_a_sequence_range() {
 }
 
 #[test]
-fn optional_reinjection_budget_is_hard_percent_plus_startup_floor() {
+fn optional_reinjection_accounting_target_is_percent_plus_startup_floor() {
     let budget = OptionalReinjectionBudget::new(
         1_000_000,
         49_999,
@@ -22,8 +22,6 @@ fn optional_reinjection_budget_is_hard_percent_plus_startup_floor() {
     );
 
     assert_eq!(budget.limit_bytes(), 51_024);
-    assert!(budget.can_spend(1025));
-    assert!(!budget.can_spend(1026));
     assert_eq!(budget.remaining_bytes(), 1025);
 }
 
@@ -49,7 +47,7 @@ fn optional_reinjection_ledger_keeps_original_and_duplicate_bytes_separate() {
 }
 
 #[test]
-fn live_owner_frontier_floor_epoch_is_one_target_independent_attempt_per_interval() {
+fn live_owner_frontier_epoch_retains_one_non_accumulating_successor_observation() {
     let started = Instant::now();
     let interval = Duration::from_millis(200);
     let mut epoch = LiveOwnerFrontierFloorEpoch::default();
@@ -70,14 +68,15 @@ fn live_owner_frontier_floor_epoch_is_one_target_independent_attempt_per_interva
 
     // Queue removal, a target switch, or a tail-to-gap evidence transition all
     // merely reevaluate this same direction; none supplies an input capable of
-    // renewing its consumed temporal opportunity.
+    // moving its retained successor observation.
     epoch.record_accepted_attempt_at_for_test(started + Duration::from_millis(50), interval);
     assert_eq!(epoch.next_attempt_at(), Some(first_deadline));
     assert!(!epoch.attempt_ready(first_deadline - Duration::from_nanos(1)));
     assert!(epoch.attempt_ready(first_deadline));
 
-    // Polling across many expired intervals does not accumulate attempts.  The
-    // first accepted retry starts exactly one successor interval from now.
+    // Polling across many expired intervals does not accumulate successor
+    // observations. The next accepted recovery starts exactly one interval
+    // from its own acceptance time.
     let late_retry = started + Duration::from_secs(2);
     assert!(epoch.attempt_ready(late_retry));
     assert!(epoch.attempt_ready(late_retry));
@@ -171,48 +170,92 @@ fn live_owner_fallback_epoch_ignores_scoring_extent_and_metric_churn() {
 }
 
 #[test]
-fn gap_wake_separates_optional_completion_race_from_the_frontier_floor() {
+fn live_owner_recovery_wake_preserves_the_cause_branch() {
     let observed_at = Instant::now();
-    let early = observed_at - Duration::from_millis(1);
-    let fallback = observed_at + Duration::from_millis(100);
+    let due_cause = observed_at - Duration::from_millis(1);
+    let future_cause = observed_at + Duration::from_millis(50);
+    let later_epoch = observed_at + Duration::from_millis(100);
 
     assert_eq!(
-        live_owner_gap_recovery_wake(Some(early), Some(fallback), 0, None, observed_at),
+        live_owner_recovery_wake(Some(due_cause), Some(later_epoch), observed_at),
+        LiveOwnerRecoveryWake {
+            due: true,
+            deadline: Some(later_epoch),
+        },
+        "a due retained cause remains actionable while preserving the later successor observation",
+    );
+    assert_eq!(
+        live_owner_recovery_wake(Some(future_cause), Some(later_epoch), observed_at),
+        LiveOwnerRecoveryWake {
+            due: false,
+            deadline: Some(future_cause),
+        },
+        "the retained cause is the first actionable deadline",
+    );
+    assert_eq!(
+        live_owner_recovery_wake(None, Some(later_epoch), observed_at),
+        LiveOwnerRecoveryWake {
+            due: false,
+            deadline: None,
+        },
+        "an epoch without a retained cause cannot create recovery authority",
+    );
+}
+
+#[test]
+fn live_owner_gap_recovery_wake_preserves_candidate_then_fallback() {
+    let observed_at = Instant::now();
+    let due_candidate = observed_at - Duration::from_millis(1);
+    let future_candidate = observed_at + Duration::from_millis(50);
+    let fallback = observed_at + Duration::from_millis(100);
+    let later_epoch = observed_at + Duration::from_millis(150);
+
+    assert_eq!(
+        live_owner_gap_recovery_wake(
+            Some(due_candidate),
+            Some(fallback),
+            Some(later_epoch),
+            observed_at,
+        ),
+        LiveOwnerRecoveryWake {
+            due: true,
+            deadline: Some(later_epoch),
+        },
+        "a due authoritative-gap candidate keeps the early cause branch",
+    );
+    assert_eq!(
+        live_owner_gap_recovery_wake(
+            Some(future_candidate),
+            Some(fallback),
+            Some(later_epoch),
+            observed_at,
+        ),
+        LiveOwnerRecoveryWake {
+            due: false,
+            deadline: Some(future_candidate),
+        },
+        "the exact candidate remains the first actionable deadline",
+    );
+    assert_eq!(
+        live_owner_gap_recovery_wake(None, Some(fallback), Some(later_epoch), observed_at,),
         LiveOwnerRecoveryWake {
             due: false,
             deadline: Some(fallback),
         },
+        "the retained owner fallback is the cause when no candidate exists",
     );
+
     assert_eq!(
-        live_owner_gap_recovery_wake(Some(early), Some(fallback), 1, None, observed_at),
-        LiveOwnerRecoveryWake {
-            due: true,
-            deadline: Some(fallback),
-        },
-        "available optional credit retains the completion-winning early race",
-    );
-    assert_eq!(
-        live_owner_gap_recovery_wake(Some(early), Some(fallback), 0, None, fallback),
+        live_owner_gap_recovery_wake(
+            Some(due_candidate),
+            Some(fallback),
+            Some(later_epoch),
+            later_epoch,
+        ),
         LiveOwnerRecoveryWake {
             due: true,
             deadline: None,
         },
-        "at the fallback boundary the retained cause is immediately due",
-    );
-
-    let later_epoch = fallback + Duration::from_millis(50);
-    assert_eq!(
-        live_owner_gap_recovery_wake(
-            Some(early),
-            Some(fallback),
-            0,
-            Some(later_epoch),
-            observed_at
-        ),
-        LiveOwnerRecoveryWake {
-            due: false,
-            deadline: Some(later_epoch),
-        },
-        "the exhausted-credit floor waits for both fallback and the shared epoch",
+        "past cause and epoch clocks remain durable due state",
     );
 }

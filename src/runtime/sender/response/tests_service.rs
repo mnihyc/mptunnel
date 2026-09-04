@@ -310,7 +310,7 @@ fn reinjection_frame(offset: u64, payload_bytes: usize) -> Frame {
 }
 
 #[test]
-fn optional_reinjection_budget_is_cumulative_and_data_ack_funded() {
+fn response_reinjection_accounting_tracks_data_ack_and_accepted_product_work() {
     let limits = MuxLimits::default();
     let performance = MppPerformanceConfig {
         optional_reinjection_budget_percent: 1,
@@ -319,28 +319,66 @@ fn optional_reinjection_budget_is_cumulative_and_data_ack_funded() {
         ServerResponseSenderService::new_with_performance(SessionId(31), StreamId(31), performance);
     let startup_floor = sender_optional_reinjection_startup_floor_bytes(limits);
 
-    assert!(
-        sender
-            .enqueue_reinjection_frame_with_priority(
-                reinjection_frame(0, startup_floor),
-                limits,
-                false,
-            )
-            .is_some()
-    );
-    assert_eq!(sender.reinjection_extra_budget_remaining(limits), 0);
-    assert!(
-        sender
-            .enqueue_reinjection_frame_with_priority(
-                reinjection_frame(startup_floor as u64, 1),
-                limits,
-                false,
-            )
-            .is_none()
+    sender.enqueue_reinjection_frame_with_priority(reinjection_frame(0, startup_floor), false);
+    sender
+        .enqueue_reinjection_frame_with_priority(reinjection_frame(startup_floor as u64, 1), false);
+    assert_eq!(sender.bytes(), startup_floor.saturating_add(1));
+    assert_eq!(
+        sender.optional_reinjection.reinjected_bytes(),
+        startup_floor.saturating_add(1) as u64,
     );
 
     sender.record_delivered_data(100_000);
-    assert_eq!(sender.reinjection_extra_budget_remaining(limits), 1_000);
+    assert_eq!(sender.optional_reinjection.delivered_data_bytes(), 100_000);
+}
+
+#[test]
+fn response_reinjection_final_enqueue_is_percentage_invariant_and_exactly_accounted() {
+    let limits = MuxLimits::default();
+    let startup_floor = sender_optional_reinjection_startup_floor_bytes(limits);
+    let delivered_bytes = 1_000_000usize;
+    let payload_bytes = sender_reinjection_minimum_useful_attempt_bytes(limits);
+    let default_percent = MppPerformanceConfig::default().optional_reinjection_budget_percent;
+    let mut observations = Vec::new();
+
+    for percent in [0, default_percent, 200] {
+        let mut sender = ServerResponseSenderService::new_with_performance(
+            SessionId(31),
+            StreamId(31),
+            MppPerformanceConfig {
+                optional_reinjection_budget_percent: percent,
+            },
+        );
+        sender.record_delivered_data(delivered_bytes);
+        sender.record_reinjection_for_test(startup_floor);
+        assert_eq!(
+            sender.optional_reinjection.delivered_data_bytes(),
+            delivered_bytes as u64,
+        );
+        assert_eq!(
+            sender.optional_reinjection.reinjected_bytes(),
+            startup_floor as u64,
+        );
+
+        sender.enqueue_reinjection_frame_with_priority(reinjection_frame(0, payload_bytes), false);
+        observations.push((
+            percent,
+            sender.bytes(),
+            sender.optional_reinjection.reinjected_bytes(),
+        ));
+    }
+
+    for (percent, queued_bytes, reinjected_bytes) in observations {
+        assert_eq!(
+            queued_bytes, payload_bytes,
+            "percentage {percent} must not alter the admitted Product extent",
+        );
+        assert_eq!(
+            reinjected_bytes,
+            startup_floor.saturating_add(payload_bytes) as u64,
+            "percentage {percent} must preserve exact accepted-Product-work accounting",
+        );
+    }
 }
 
 #[test]

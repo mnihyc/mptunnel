@@ -1,7 +1,10 @@
 # Live-owner frontier race model
 
-Status: component-level design and proof for SEEN-6E. This document does not
-claim runtime acceptance or release readiness.
+Status: historical component proof for SEEN-6E. Its cumulative-credit `C` and
+hard over-credit-token `G` authority were superseded by the structural
+range/slot model in `T05_STRUCTURAL_RECOVERY_AUTHORITY.md`. Retain this record
+only for provenance; it does not describe current recovery authority, runtime
+acceptance, or release readiness.
 
 ## Defect boundary and history
 

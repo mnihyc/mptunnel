@@ -14,8 +14,9 @@ exact current-attachment publication identity. It is deliberately split:
    percentage guard during this transaction.
 2. **T05b -- authority demotion.** Once T05a is independently GREEN, remove the
    percentage from recovery readiness, byte extent, and final enqueue
-   admission. Retain exact traffic accounting and expose the percentage only
-   as an advisory cost/rank input.
+   admission. Retain exact traffic accounting. This transaction does not
+   invent a new ranking consumer for the percentage: until a separately
+   proved scheduler policy exists, it is an accounting/diagnostic target only.
 3. **T05c -- requalification adjudication.** Treat non-delivering
    `STREAM_REQUALIFY_DATA` separately. Its identity is an exact attachment and
    probe ID, not a Product range and recovery slot. Current code already
@@ -37,7 +38,7 @@ the old cumulative envelope was 108,847,604 bytes. The hard percentage guard
 stopped that renewal. A later one-attempt epoch restored a small liveness floor,
 but retained the percentage as ordinary recovery authority.
 
-The defect is therefore not the existence of wire accounting or an
+The defect is therefore not the existence of accepted-recovery accounting or an
 anti-renewal invariant. It is using an operator traffic preference to decide
 whether a structurally bounded recovery copy may exist. With Product,
 lifecycle, and native state held fixed, changing a percentage currently changes
@@ -94,8 +95,9 @@ Attachment removal is not a claim that the peer has settled every preceding
 byte. That claim is impossible without Product acknowledgement: queued,
 locally flushed, or in-progress predecessor data may still arrive after
 authority transfers. Such an arrival is a legal duplicate of the same Product
-offset and is deduplicated by the receiver. Its physical attempt remains in
-cumulative wire accounting. The structural invariant bounds current
+offset and is deduplicated by the receiver. Its accepted Product recovery work
+remains in cumulative accepted-recovery accounting; that counter does not prove
+physical serialization. The structural invariant bounds current
 publication owners, not unknowable packets already in the network.
 
 An intermediate model used the whole carrier's sticky terminal signal as this
@@ -122,6 +124,9 @@ For candidate target `t`, let:
 - `d(t)` be `t`'s authenticated configured slot;
 - `V(s,r,d)` mean no current attachment publication owner for `r` occupies
   slot `d`;
+- `S(s,r)` mean no accepted ReinjectedData copy overlapping `r`, whose exact
+  attachment remains in current Product membership, retains an unexpired
+  immutable suppression deadline `D`;
 - `K_t` be exact target Product repair headroom after queued and accepted debt;
 - `Q(s,r,t)` be the cause-specific retained frontier/service extent; and
 - `N(t)` mean the exact queue/native reservation can commit.
@@ -129,7 +134,7 @@ For candidate target `t`, let:
 The Boolean authority is:
 
 ```text
-A(s,r,t) = M(s,r) && T(s,r) && E(t) && V(s,r,d(t))
+A(s,r,t) = M(s,r) && T(s,r) && E(t) && V(s,r,d(t)) && S(s,r)
              && K_t > 0 && N(t)
 ```
 
@@ -140,9 +145,36 @@ L(s,r,t) = min(K_t, bytes(r), Q(s,r,t))
 ```
 
 The optional extra-traffic percentage does not occur in either expression.
-It may contribute an advisory action cost after structurally eligible actions
-exist, and the exact ledger continues to report resulting wire amplification.
-It cannot turn `A` false or reduce `L`.
+The exact ledger continues to report accepted recovery work and its ratio to
+unique acknowledged Product bytes. A future advisory use may rank only among
+the same finite eligible actions under fair traversal; it may not rank recovery
+against a permanent "do nothing" result or otherwise create starvation. T05b
+adds no such use. The percentage cannot turn `A` false or reduce `L`.
+
+Demotion preserves the existing positive-credit cause branch for every value,
+including zero. It does not instead force every action through the later
+over-credit floor epoch: that epoch was introduced as a liveness floor for the
+old cumulative guard, and promoting it to a universal recovery clock would be
+a new staggered-service policy belonging to T06. Existing cause clocks,
+exact-range overlap suppression, target capacity, stable-slot vacancy, and
+native admission still apply. The epoch remains observable for existing
+successor wake calculation until T06 adjudicates service order.
+
+The retained live-owner frontier-floor epoch `G_s` and the accepted-copy
+suppression deadline `D` are different observations. Eligible live-owner work
+may record `G_s` at provisional Product-queue acceptance. After percentage
+demotion, `G_s` does not gate a due cause, does not alter `A` or `L`, and does not
+create or release publication ownership. Final writer Apply records `D` with
+the accepted ReinjectedData flight. While an overlapping current copy has an
+unexpired `D`, `S(s,r)` suppresses that range globally across the current slot
+set. After expiry another eligible structurally vacant slot may be evaluated;
+expiry never releases `J_d(t)` or makes the accepted copy's own slot vacant.
+
+The retained counter records payload accepted into Product recovery work (and
+immediately published requalification payload), not proved physical wire
+serialization. Cancellation does not refund it. Public diagnostics therefore
+may compare this exact accepted-work accounting with the configured target,
+but must not relabel it as actual wire bytes.
 
 Exact carrier failure retains its existing cause-bounded correctness authority.
 Zero configured repair/path-flight limits, exhausted `K_t`, owner-set overlap,
@@ -161,8 +193,10 @@ A(S, p1) = A(S, p2)
 L(S, p1) = L(S, p2)
 ```
 
-Only advisory cost and reported amplification may differ. T05b must prove this
-in both Product directions at cause reachability and at final enqueue.
+Only the reported accounting target and accepted-work ratio may differ in T05b.
+A later, separately proved advisory scheduler may change finite candidate order
+but not reachability or extent. T05b must prove invariance in both Product
+directions at cause reachability and at final enqueue.
 
 ### Publication-owner cardinality
 

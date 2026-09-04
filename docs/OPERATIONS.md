@@ -400,13 +400,13 @@ seconds, and validate the rebuilt file; do not mix it with an earlier schema.
   Finite QUIC targets remain the scheduling basis until exact post-
   authentication native evidence from two packet-timed rounds qualifies;
   omission does not enable that gate.
-- Omitted `[flow].optional_reinjection_budget_percent` is 10. It meters only
-  optional reliable-payload reinjection, not native recovery, control, probes,
-  or the separately bounded cause-specific critical recovery authorities in
-  RFC Section 15.2.
+- Omitted `[flow].optional_reinjection_budget_percent` is 10. This
+  compatibility-named value is a directional accepted-Product-recovery
+  accounting and diagnostic target. It never gates Product recovery
+  eligibility, wake time, extent, target reachability, or final admission.
 - Omitted `[flow].quic_loss_compensation_percent` is separately 10. It adjusts
-  sender-local QUIC delivery/loss evidence without sending bytes or consuming
-  the optional reinjection budget. Ordinary compensated loss carries a
+  sender-local QUIC delivery/loss evidence without sending bytes or recording
+  accepted Product recovery work. Ordinary compensated loss carries a
   deterministic three-operating-round burst envelope and is classified only
   at completed packet-timed boundaries; ECN, persistence, and unknown evidence
   remain immediate.
@@ -609,21 +609,22 @@ silent rounding in native BBR pacing state and saturation of the startup
 window. The QUIC-native exactness bound does not restrict a TCP-only prior.
 
 Omission uses 10 for both `optional_reinjection_budget_percent` and
-`quic_loss_compensation_percent`. The former meters only optional reliable MPP
-payload reinjection; native TCP/QUIC recovery, MPP control and probes, and the
-separately bounded cause-specific critical authorities in RFC Section 15.2 are
-outside that optional allowance. The latter
-changes sender-local QUIC delivery/loss evidence and does not itself send or
-budget bytes. Its nonzero policy includes the RFC's fixed three-round
-authorized-loss burst envelope; this prevents random or correlated placement
+`quic_loss_compensation_percent`. The former is a directional target for
+accepted Product recovery-work accounting and diagnostics. Stable configured
+slot/range publication, exact target Product headroom, queue/flight limits, and
+final native admission govern Product recovery; the percentage governs none of
+them. The latter changes sender-local QUIC delivery/loss evidence and does not
+itself send or account recovery bytes. Its nonzero policy includes the RFC's
+fixed three-round authorized-loss burst envelope; this prevents random or correlated placement
 from repeatedly tripping the population boundary while retaining a bounded
 response to sustained excess loss. A matching MPP inbound/outbound
 `performance` table overrides its `[flow]` value. For QUIC loss compensation
 only, an explicit
 `loss-compensation-percent` path URI value has highest precedence. The complete
 loss-policy order is therefore path URI, node performance, `[flow]`, then the
-built-in 10; optional reinjection uses node performance, `[flow]`, then the
-built-in 10. Each endpoint resolves its local sending direction independently.
+built-in 10; accepted-recovery accounting uses node performance, `[flow]`, then
+the built-in 10. Each endpoint resolves its local sending direction
+independently.
 
 Use `mptunnel --help` and subcommand help as the complete option and environment
 variable reference. Validate configs in the target binary whenever possible;
@@ -1128,26 +1129,31 @@ An operator should investigate sustained duplicate overhead, long zero-progress
 gaps, or a healthy available path remaining unused under bulk backlog. Do not
 work around these with a fixed path role or a Linux-only eligibility rule.
 
-Ordinary reinjection is limited by a cumulative allowance derived from a
-bounded startup floor and unique MPP bytes acknowledged by Data ACK.
-While the exact original carrier is live, a persistent authoritative Data ACK
-gap's full target service window remains within that allowance. At or after the
-original-owner boundary, either a gap or a contiguous tail may exceed remaining
-credit by only one exact frontier quantum. A target-bound ranked quantum covers
-only the maximal lowest prefix with one live exact owner and an unchanged exact
-copy-avoidance set; cache chunking alone does not change its rank. A pre-existing
-target-unbound tail retains a bounded unassigned prefix and is revalidated
-against the exact native target at dispatch. They share one
-non-accumulating over-credit token per stream send direction: acceptance at or
-after the owner boundary while that token is available consumes it, and target churn,
-queue expiry, or evidence transitions do not mint another attempt. Cumulative
-optional credit remains spendable before the owner boundary and while the token
-is closed, and does not renew it. Exact terminal path failure retains separate bounded
-critical authority. Exact retained ranges, queue and flight limits,
-overlap/repeat suppression, and alternate-output requirements still apply.
-Every accepted byte remains charged, reducing later optional allowance. A
-continuous over-budget stream is therefore a defect, not expected failover
-overhead.
+Product reinjection is bounded by exact retained missing ranges and the finite
+configured member-slot set, not by a cumulative percentage. A candidate must
+have a due immutable cause, a live policy-eligible target distinct from every
+current range owner, a vacant range publication in that target's authenticated
+configured slot, exact target Product headroom, and current queue/native
+admission. Its extent remains within the cause-specific retained range,
+configured repair/path-flight limits, and exact target service window.
+
+`optional_reinjection_budget_percent` retains its compatibility name, default,
+and override precedence. It supplies a directional accounting and diagnostic
+target derived from a bounded startup allowance and unique MPP bytes
+acknowledged by Data ACK. Changing it cannot change Product wake, eligibility,
+extent, target reachability, or final admission. Every accepted Product
+recovery byte remains charged to exact recovery-work accounting.
+
+A target-bound ranked quantum covers only the maximal lowest prefix with one
+live exact owner and an unchanged exact copy-avoidance set; cache chunking alone
+does not change its rank. A suffix may fill only the same bounded structural
+target service window. Target-unbound work retains a bounded unassigned prefix
+and is revalidated against the exact target at dispatch. Product-queue insertion
+alone grants no final publication authority: actual writer Apply reserves the
+native command, atomically revalidates exact target headroom, incarnation, and
+stable-slot vacancy, records the range/slot publication, and then commits.
+Exact terminal path failure is immediate but bypasses none of those structural
+or resource checks.
 
 The current timers are cause-specific. Exact path-instance failure permits an
 immediate bounded copy, preferring measured survivors but using any eligible
@@ -1156,14 +1162,21 @@ positive partial ACK ranges may extend established state but cannot infer an
 omission. Fragmented request feedback waits until one original-carrier RTO/PTO
 from the exact OriginalData assignment epoch. Response feedback may use a
 later-ACK TCP 5/4-SRTT or QUIC 9/8-SRTT time threshold; ACK silence waits that
-carrier's RTO/PTO. A live-owner gap/tail batch accepted at or after the owner
-boundary while the over-credit token is available fixes the next frontier-floor
-eligibility one full recovery interval later. Optional-funded work remains
-cause-eligible before that boundary and while the token is closed, and cannot
-move its deadline. Newly
+carrier's RTO/PTO. Accepted recovery retains immutable cause and repeat-delay
+observations, but they are distinct. Eligible Product-queue acceptance may
+record a directional live-owner frontier-floor epoch `G_s`; `G_s` is a
+non-gating observation and an otherwise due cause remains actionable while it
+is in the future. Final writer Apply separately records an immutable accepted-
+copy suppression deadline `D`. While an overlapping copy's exact attachment
+remains in current Product membership and its `D` is in the future, recovery of
+that range is suppressed across every current Product slot, including an
+otherwise-vacant slot. After expiry, another eligible vacant slot may be
+evaluated. Expiry never releases accepted publication debt or vacates the same
+slot; Product Data ACK or serialized exact-attachment removal does that. Newly
 acknowledged contiguous Data-ACK frontier progress, not sparse suffix ACKs,
-polling, or target changes, restarts that interval. A request path becomes
-stale for new placement after four TCP RTOs
+polling, or target changes, may extend `G_s`. Neither `G_s` nor `D` depends on the
+accounting percentage. A request
+path becomes stale for new placement after four TCP RTOs
 or three QUIC PTOs without exact Data ACK progress when another attachment
 exists; this does not terminate native recovery.
 

@@ -2632,7 +2632,7 @@ fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
     );
 
     let client_override = client_document.replacen(
-        "# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 } # overrides [flow]; path URI wins for loss",
+        "# Per-node overrides; path URI still wins for loss.\n# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 }",
         "performance = { optional_reinjection_budget_percent = 23, quic_loss_compensation_percent = 7.5 }",
         1,
     )
@@ -2659,7 +2659,7 @@ fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
     );
 
     let client_zero = client_document.replacen(
-        "# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 } # overrides [flow]; path URI wins for loss",
+        "# Per-node overrides; path URI still wins for loss.\n# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 }",
         "performance = { optional_reinjection_budget_percent = 0, quic_loss_compensation_percent = 0 }",
         1,
     );
@@ -2692,7 +2692,7 @@ fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
     );
 
     let server_override = server_document.replacen(
-        "# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 } # overrides [flow]; path URI wins for loss",
+        "# Per-node overrides; path URI still wins for loss.\n# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 }",
         "performance = { optional_reinjection_budget_percent = 29, quic_loss_compensation_percent = 8.125 }",
         1,
     );

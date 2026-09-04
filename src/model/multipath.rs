@@ -1,8 +1,9 @@
 //! Connection-level accounting shared by multipath scheduling directions.
 //!
 //! TCP and QUIC retain independent congestion control and recovery. This model
-//! only bounds optional duplicate traffic relative to acknowledged progress of
-//! original connection data.
+//! accounts for duplicate traffic relative to acknowledged progress of
+//! original connection data. Product recovery authority is structural and is
+//! not granted or denied by that accounting target.
 
 use crate::performance::MppPerformanceConfig;
 use std::time::{Duration, Instant};
@@ -100,10 +101,6 @@ impl OptionalReinjectionBudget {
             .saturating_sub(self.reinjected_bytes)
             .min(usize::MAX as u64) as usize
     }
-
-    pub(crate) fn can_spend(self, bytes: usize) -> bool {
-        self.reinjected_bytes.saturating_add(bytes as u64) <= self.limit_bytes()
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -144,15 +141,15 @@ impl OptionalReinjectionLedger {
     }
 }
 
-/// One non-accumulating over-credit frontier-floor opportunity per recovery
-/// interval in a sending direction.
+/// One non-accumulating live-owner successor observation per recovery interval
+/// in a sending direction.
 ///
 /// The clock is deliberately independent of gap shape, queue residency, and
 /// target identity.  A contiguous tail and an authoritative frontier gap are
-/// two observations of the same stalled Product direction, so neither may
-/// create a second over-credit floor before this immutable deadline. A batch
-/// accepted while the floor is available consumes it; cumulative optional
-/// credit remains usable while it is closed and does not renew the deadline.
+/// two observations of the same stalled Product direction, so recording either
+/// retains one immutable successor deadline rather than accumulating missed
+/// intervals. The deadline remains observable to the existing tail wake; it is
+/// not Product authority and does not gate a due recovery cause.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LiveOwnerFrontierFloorEpoch {
     next_attempt_at: Option<Instant>,
@@ -165,18 +162,17 @@ pub(crate) struct LiveOwnerRecoveryWake {
     pub(crate) deadline: Option<Instant>,
 }
 
-/// Combines a retained recovery cause with optional credit and the shared
-/// live-owner floor gate.
+/// Combines a retained recovery cause with the existing shared live-owner
+/// successor observation.
 ///
-/// The epoch is only a gate: without a retained gap/tail cause there is no
-/// wake. Optional-funded service needs only the cause clock; service which
-/// crosses optional credit additionally needs the epoch clock. A past
-/// eligibility point is returned as durable due state rather than as a past
-/// timer that can disappear or busy-spin.
+/// Without a retained gap/tail cause there is no wake. The cause clock remains
+/// actionable independently of the configured traffic-accounting target. The
+/// later epoch is retained as a successor observation pending the separate
+/// service-policy transaction. A past eligibility point is returned as durable
+/// due state rather than as a past timer that can disappear or busy-spin.
 pub(crate) fn live_owner_recovery_wake(
     cause_deadline: Option<Instant>,
     epoch_deadline: Option<Instant>,
-    optional_credit: usize,
     observed_at: Instant,
 ) -> LiveOwnerRecoveryWake {
     let Some(cause_deadline) = cause_deadline else {
@@ -185,56 +181,53 @@ pub(crate) fn live_owner_recovery_wake(
             deadline: None,
         };
     };
-    let floor_deadline = epoch_deadline.map_or(cause_deadline, |epoch_deadline| {
+    let successor_deadline = epoch_deadline.map_or(cause_deadline, |epoch_deadline| {
         cause_deadline.max(epoch_deadline)
     });
     live_owner_recovery_wake_from_branches(
-        (optional_credit > 0).then_some(cause_deadline),
-        Some(floor_deadline),
+        Some(cause_deadline),
+        Some(successor_deadline),
         observed_at,
     )
 }
 
-/// Resolves the two-stage authoritative-gap clock without coupling funded
-/// service to the shared over-credit floor token.
+/// Resolves the two-stage authoritative-gap clock without coupling the
+/// retained cause to a configured traffic-accounting target.
 pub(crate) fn live_owner_gap_recovery_wake(
     candidate_deadline: Option<Instant>,
     owner_fallback_at: Option<Instant>,
-    optional_credit: usize,
     epoch_deadline: Option<Instant>,
     observed_at: Instant,
 ) -> LiveOwnerRecoveryWake {
-    let optional_deadline = (optional_credit > 0)
-        .then(|| candidate_deadline.or(owner_fallback_at))
-        .flatten();
-    let floor_deadline = owner_fallback_at.map(|fallback_at| {
+    let cause_deadline = candidate_deadline.or(owner_fallback_at);
+    let successor_deadline = owner_fallback_at.map(|fallback_at| {
         epoch_deadline.map_or(fallback_at, |epoch_deadline| {
             fallback_at.max(epoch_deadline)
         })
     });
-    live_owner_recovery_wake_from_branches(optional_deadline, floor_deadline, observed_at)
+    live_owner_recovery_wake_from_branches(cause_deadline, successor_deadline, observed_at)
 }
 
 fn live_owner_recovery_wake_from_branches(
-    optional_deadline: Option<Instant>,
-    floor_deadline: Option<Instant>,
+    cause_deadline: Option<Instant>,
+    successor_deadline: Option<Instant>,
     observed_at: Instant,
 ) -> LiveOwnerRecoveryWake {
-    let due = optional_deadline
+    let due = cause_deadline
         .into_iter()
-        .chain(floor_deadline)
+        .chain(successor_deadline)
         .any(|deadline| deadline <= observed_at);
-    let deadline = optional_deadline
+    let deadline = cause_deadline
         .into_iter()
-        .chain(floor_deadline)
+        .chain(successor_deadline)
         .filter(|deadline| *deadline > observed_at)
         .min();
     LiveOwnerRecoveryWake { due, deadline }
 }
 
 /// Extends one accepted live-owner repair batch by the recovery interval of
-/// another accepted frame.  The batch cannot renew before every accepted
-/// frame's immutable owner/target interval has elapsed.
+/// another accepted frame without shortening the retained successor
+/// observation.
 pub(crate) fn include_live_owner_recovery_interval(
     current: Option<Duration>,
     accepted: Duration,
@@ -257,8 +250,8 @@ impl LiveOwnerFrontierFloorEpoch {
         observed_at: Instant,
         recovery_interval: Duration,
     ) {
-        // Further optional work inside the current interval does not postpone
-        // or renew its already consumed floor opportunity. Once the immutable
+        // Further accepted recovery inside the current interval does not
+        // postpone its retained successor observation. Once the immutable
         // deadline is due, the first newly accepted live-owner batch starts
         // exactly one successor interval; missed intervals never accumulate.
         if self.attempt_ready(observed_at) {
@@ -271,9 +264,9 @@ impl LiveOwnerFrontierFloorEpoch {
 
     pub(crate) fn record_data_ack_progress(&mut self, observed_at: Instant) {
         let Some(recovery_interval) = self.recovery_interval else {
-            // The first live-owner attempt still derives its deadline from
-            // exact OriginalData age.  The ACK that first exposes a gap must
-            // not manufacture a retry epoch before that attempt exists.
+            // The first live-owner recovery still derives its cause deadline
+            // from exact OriginalData age. The ACK that first exposes a gap
+            // must not manufacture a successor observation before acceptance.
             return;
         };
         let progress_deadline = observed_at

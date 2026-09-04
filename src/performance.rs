@@ -38,14 +38,15 @@ const MAX_QUIC_VARINT: u128 = (1_u128 << 62) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MppPerformanceConfig {
-    /// Budget for optional reliable MPP payload reinjection, in percent.
+    /// Directional accounting and diagnostic target for accepted Product
+    /// recovery work, in percent. The field name is retained for configuration
+    /// compatibility.
     ///
-    /// 10 permits optional reinjected payload bytes up to 10% of acknowledged
-    /// original payload, plus a bounded startup floor. Path-failure recovery,
-    /// native TCP/QUIC retransmission, MPP control frames, carrier probes, and
-    /// liveness traffic remain outside this optional-work budget. It is not a
-    /// product-data throttle. 100 permits one optional duplicate of the
-    /// acknowledged payload; values above 100 permit more redundancy.
+    /// 10 sets the target to 10% of uniquely Data-ACKed Product payload plus a
+    /// bounded startup allowance. It never gates Product recovery eligibility,
+    /// wake time, extent, target reachability, or final admission. Exact
+    /// stable-slot/range publication, Product headroom, queue/flight limits,
+    /// and native admission remain authoritative.
     pub optional_reinjection_budget_percent: u16,
 }
 

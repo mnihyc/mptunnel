@@ -147,53 +147,59 @@ QUIC attachments are accepted with a zero maximum, which is credit-neutral
 because senders retain the greatest advertised offset; path demand can never
 widen the shared window.
 
-Optional reinjection, including persistent authoritative Data ACK-gap repair
-while the exact original carrier remains live, consumes a cumulative
-extra-traffic budget. A live gap's full target service window remains within
-that budget. At or after the original-owner boundary, either an authoritative
-gap or a contiguous tail may exceed remaining credit by only one exact
-frontier quantum. A target-bound ranked quantum is capped to the maximal
-lowest prefix with one exact live OriginalData owner and an unchanged exact
-copy-avoidance set; application/cache chunk boundaries alone do not divide
-that prefix. A pre-existing target-unbound tail instead retains its bounded
-unassigned prefix and is revalidated against the exact native target at
-dispatch. Both
-observations share one non-accumulating over-credit attempt token per stream
-send direction; accepting a batch at or after the owner boundary while that
-token is available consumes it, and target changes, queue expiry, or evidence
-transitions cannot renew it. Cumulative optional credit remains usable before
-the owner boundary and while the token is closed, and does not move its
-deadline. Exact
-terminal path failure retains separate bounded critical authority. The exact
-range must remain unacknowledged and retained; overlapping queued copies are
-suppressed, live-owner recovery uses a distinct output, and all exception
-bytes remain charged against later optional reinjection.
+Reliable Product recovery is structural. The range must remain retained and
+missing, its immutable cause clock must be due, and the selected target must be
+live, policy-eligible, distinct from every current owner, and vacant for that
+range in its authenticated configured member slot. Exact target Product
+headroom, shared receive credit, queue and flight limits, and the final native
+writer reservation remain hard bounds. The admitted extent is the minimum of
+the retained cause-specific service range and exact target headroom.
 
-Admission here means successful insertion into the serialized Product queue;
-an abandoned later writer attempt does not refund the token. A target-bound
-batch uses its selected alternate interval, while a target-unbound tail uses
-the observed original-owner interval. A multi-frame batch fixes its epoch to
-the maximum applicable interval across the frames actually admitted.
-Target selection ranks one common captured lowest-frontier quantum. Exact
-target capacity and repair quantum may shrink that same frontier during Apply,
-but cannot enlarge it or skip ahead. A funded suffix may continue only inside
-the same identity-uniform prefix on the frozen target, with per-slice Product
-and native revalidation. A response FIN tail ranked from target-specific
-capacity remains bound to that exact output incarnation through dispatch;
-target-unbound work remains conservatively bounded until native dispatch
-revalidates the exact target.
+`optional_reinjection_budget_percent` is a compatibility-named directional
+accepted-recovery accounting and diagnostic target. It does not change Product
+recovery eligibility, wake time, extent, target reachability, or final
+admission. Every accepted Product recovery byte remains in exact recovery-work
+accounting. The default and per-node override therefore express an observable
+traffic target, not another Product window or congestion controller.
+
+A target-bound ranked quantum is capped to the maximal lowest prefix with one
+exact live OriginalData owner and an unchanged exact copy-avoidance set;
+application/cache chunk boundaries alone do not divide that prefix. A suffix
+may fill only the same bounded structural target service window and must pass
+per-slice Product and native revalidation. A pre-existing target-unbound tail
+instead retains its bounded unassigned prefix and is revalidated against the
+exact target at dispatch. A response FIN tail ranked from target-specific
+capacity remains bound to that exact output incarnation through dispatch.
+
+Product-queue insertion does not consume final publication authority. At
+actual writer Apply, the actor reserves the exact native command, atomically
+revalidates target headroom, incarnation, and stable-slot vacancy, records the
+accepted range/slot publication, and commits. Product Data ACK clips or
+releases that publication; serialized removal of the owning exact attachment
+transfers the slot to its successor. Queue removal, native drain, metrics,
+port hopping, or incarnation churn cannot release it. Exact path failure is
+immediate, but uses the same retained-range, stable-slot, Product-capacity,
+queue, and native bounds.
 
 Recovery timing follows the evidence owner. Exact path-instance failure is
 immediate. A complete Data ACK establishes gaps; positive partial ACK ranges
 may extend that state but cannot infer omitted ranges. Fragmented request
 feedback waits until one owner RTO/PTO from the exact OriginalData assignment
 epoch. Response feedback may use a later-ACK TCP 5/4-SRTT or QUIC 9/8-SRTT
-time threshold, while ACK silence waits the owner RTO/PTO. Gap and tail recovery
-share one live-owner over-credit token; after acceptance while that token is
-available, another frontier-floor attempt requires a full recovery interval
-without contiguous unique Data-ACK frontier progress. Optional-funded service
-remains available while the token is closed and does not move its deadline.
-Sparse suffix ACK release does not restart that interval. A request
+time threshold, while ACK silence waits the owner RTO/PTO. Accepted recovery
+retains immutable cause clocks. Acceptance of eligible live-owner work into the
+Product queue may record a directional frontier-floor successor epoch `G_s`;
+`G_s` is a non-gating observation and wake, so an otherwise due cause remains
+actionable while `G_s` is in the future. Final writer Apply separately records
+an immutable suppression deadline `D` with each accepted recovery copy. While
+an overlapping copy's exact attachment remains in current Product membership
+and its `D` is in the future, the range is suppressed globally across all
+current Product slots. After expiry, another eligible vacant slot may be
+evaluated, but expiry never releases the accepted publication debt or makes its
+own slot vacant.
+Product Data ACK or serialized removal of the exact attachment remains the
+publication transition. Sparse suffix ACK release does not extend `G_s`, and no
+ACK or metric observation moves `D`. A request
 carrier with no exact Data ACK progress becomes stale for new placement after
 four TCP RTOs or three QUIC PTOs when an alternative exists, without stopping
 its native recovery.

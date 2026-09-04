@@ -1310,6 +1310,76 @@ async fn retained_in_order_fin_commits_after_reattachment_feedback() {
 }
 
 #[tokio::test]
+async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted() {
+    let stream_id = StreamId(614);
+    let limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: limits.max_stream_window_bytes,
+            lane: TrafficClass::Latency,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands.clone(),
+                limits,
+            ),
+            frames: frames_rx.into(),
+        },
+        0,
+    );
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    while try_recv_reliable_path_priority_command(&mut receivers).is_some() {}
+    commands
+        .try_enqueue_admitted_frame(Frame::Ping { nonce: 1 }, TrafficClass::Control)
+        .expect("occupy the exact control admission slot");
+
+    let recv_stream = ReliableRecvStream::new(stream_id, limits);
+    let mut state = ClientRelayState::new();
+    assert!(
+        receive_stream_fin(
+            &recv_stream,
+            &mut state.endpoint.pending_remote_fin_offset,
+            0,
+        )
+        .expect("in-order FIN")
+    );
+    let publication = remotes.publish_stream_ack(
+        1,
+        vec![Frame::StreamAck {
+            stream_id,
+            complete: true,
+            ranges: Vec::new(),
+        }],
+    );
+    assert!(!publication.published);
+    assert!(publication.pending);
+    assert!(state.endpoint.remote_open);
+
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 1 }))
+    ));
+    let (mut application, mut relay_side) = duplex(64);
+    retry_stream_ack_and_commit_ready_fin(&mut relay_side, &mut state, &recv_stream, &mut remotes)
+        .await
+        .expect("retry final ACK and commit retained FIN");
+
+    assert!(!state.endpoint.remote_open);
+    assert_eq!(state.endpoint.pending_remote_fin_offset, None);
+    assert!(!remotes.has_pending_stream_ack_publication());
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        application.read(&mut byte).await.expect("read half-close"),
+        0
+    );
+}
+
+#[tokio::test]
 async fn client_completion_retains_ack_until_every_live_attachment_accepts_it() {
     let stream_id = StreamId(615);
     let limits = MuxLimits::default();

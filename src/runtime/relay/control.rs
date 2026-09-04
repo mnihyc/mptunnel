@@ -151,6 +151,33 @@ where
     Ok(())
 }
 
+/// Completes the same remote-FIN transition after a retained receive ACK wins
+/// carrier admission that the immediate FIN path completes on first publish.
+async fn retry_stream_ack_and_commit_ready_fin<S>(
+    local: &mut S,
+    state: &mut ClientRelayState,
+    recv_stream: &ReliableRecvStream,
+    remotes: &mut ReliableRelayRemoteSet,
+) -> Result<(), RuntimeError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let publication = remotes.retry_pending_stream_ack();
+    if publication.published
+        && pending_stream_fin_ready(recv_stream, state.endpoint.pending_remote_fin_offset)
+    {
+        state.progress.sender_retry_at = None;
+        commit_pending_remote_fin(
+            local,
+            state,
+            recv_stream,
+            remotes.has_receive_feedback_output(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn client_relay_finished(
     state: &ClientRelayState,
     send_stream: &ReliableSendStream,
@@ -1497,9 +1524,15 @@ where
         } else if stream_ack_capacity_wait.is_none() {
             let capacity_wait =
                 arm_carrier_capacity_notifies(remotes.pending_stream_ack_capacity_notifies());
-            let publication = remotes.retry_pending_stream_ack();
-            if publication.published && pending_remote_fin_ready {
-                state.progress.sender_retry_at = None;
+            if let Err(err) = retry_stream_ack_and_commit_ready_fin(
+                &mut local,
+                &mut state,
+                &recv_stream,
+                &mut remotes,
+            )
+            .await
+            {
+                break Err(err);
             }
             if remotes.has_pending_stream_ack_publication() {
                 stream_ack_capacity_wait = capacity_wait;

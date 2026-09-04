@@ -40,6 +40,12 @@ that statistical gate must not be used to invent or tune the model.
 | `53d9ab5` | Restore one bounded live-owner frontier opportunity and preserve its exact owner, target, epoch, and wake lifecycle. | Exact target/epoch/wake ownership is useful, but the hard over-credit token and sequential percentage-gated service are not final under hint semantics. The 28-file change also weakens attribution. | Retain as an intermediary attribution checkpoint; redesign the authority model before release. Runtime acceptance is RED. |
 | `dc4853d` | Compare an alternate with projected owner delivery rather than with an unrelated authority timer. | The timer says when fallback authority exists, not when the accepted bytes will arrive. The comparator is advisory and aggregate; it is not an exact byte-position oracle. | Retain the local timing correction inside the authority redesign; runtime acceptance remains RED. |
 | `93e6284` | Do not charge the already accepted owner frontier as new payload a second time. | Both request and response exact tests proved duplicate Product/native debt. The diagnostic replay did not show this comparator winning, so no broad runtime gain is attributed to it. | Retain the accounting correction; affected runtime evidence remains pending. |
+| `ee237c5`, `655cb95` | Freeze exclusive directional service authority and keep portable TCP telemetry diagnostic. | Documentation/model decision only. The independent TCP adapter audit disproves `cwnd/SRTT` and current portable fields as gain-free service. | Retain the authority boundary; no performance claim. |
+| `1679968` | Represent startup/finite/Unlimited directional service without `f64` loss or a numeric Unlimited sentinel. | Pure typed component with arithmetic/scope tests; no owner consumes it by itself. | Retain as component groundwork. |
+| `b5b4b5a` | Publish the typed rate sidecar and fence QUIC Apply against the current native activation/shape. | Exact provenance/fence REDs are GREEN. The same checkpoint also projected typed startup into `PathSnapshot.delivery_rate_bps`, which the still-live legacy scorer consumes; because T03 runtime migration is rejected, that sequencing can replace dynamic legacy TCP evidence with 351,472 bit/s before its successor exists. | Split verdict: retain typed sidecars, direction/incarnation fences, and diagnostic separation; restore the complete pre-checkpoint scalar source, precedence, scope, and Unlimited behavior until a complete allocator consumes the sidecar. Selectively omitting generic, Product, peer, or carrier branches would be another unproved production change. This is transaction isolation, not endorsement of the legacy heuristic. |
+| `42bc328` | Freeze the exact one-action formula in RFC and internal design. | Checked component model was sound, but its first wording treated uniform `A=0` plus a static key as sufficient runtime placement. | Retain component definitions; correct RFC/runtime-completion claims with the sustained static-winner proof. |
+| `898c66e` | Implement checked normalized action work, score arithmetic, rankability, identity, and incumbent uncertainty. |  Exact component tests only; the module is not a sustained allocator. | Retain isolated; do not wire runtime owners. |
+| `d4b94e5` | Publish one coherent exact-direction timing tuple for a future score consumer. | Producer REDs caught and fixed an idle-fanout defect: an unchanged tuple now retains its epoch. Existing runtime rank remains unchanged. | Retain isolated timing provenance; no scheduling/performance claim. |
 
 There is no evidence for a blanket revert: that would restore exact placement,
 control-progress, priority, repair-renewal, and debt-accounting defects. There
@@ -115,18 +121,36 @@ ranks use the exact action/output/carrier/incarnation identity supplied by the
 caller, not a bare path number or input order. An incumbent changes only
 across `U_old + U_best`.
 
-This smaller model proves work conservation, no second congestion controller,
-deterministic ordering, monotonic response to lower `T/A` or higher `C`, no
-intentional double counting, and a timing-variation deadband. It does not
-claim a statistical rate-confidence bound, receiver-completion prediction,
-independent bottlenecks, restart-free rate recovery, or superiority to a
-baseline. In particular, `U = max(J, 1 ms)` alone cannot prove that an
-approximately ten-percent estimated-rate change is significant; T09 must
-either derive a typed duration-valued uncertainty or explicitly leave that
-stronger no-flap claim unmade. Those questions remain frozen gates. The
-unsupported all-stage/service-receipt text must be removed from the
-authoritative RFC as a rejected draft model, not implemented by stealth or
-left as a known code/RFC mismatch.
+This smaller model proves only the checked ordering of **one already chosen
+action**: no second congestion controller, deterministic base order,
+monotonic response to lower `T/A` or higher `C`, no intentional double
+counting inside that component, and a timing-variation deadband. It does not
+prove sustained work conservation. With `A=0`, fixed observations make the
+same path win every repeated action, while writer slots reopen at native
+write/flush rather than network delivery. A bounded 64-MiB Product envelope
+therefore bounds instantaneous ownership but does not give another ready path
+a finite service opportunity; each Data-ACK-released quantum can return to
+the same winner.
+
+The post-checkpoint audit consequently rejects runtime-owner migration to the
+component score. It also rejects shrinking the high-BDP writer queue or adding
+a one-action pull lease: those changes would undo intentional pipeline and
+shared-writer invariants without making native-buffer acceptance a network
+service observation. A future sustained allocator needs one atomic
+physical-carrier/direction owner, a remaining-work lifetime aligned with its
+rate, dynamic TCP service or explicit unknown-rate exploration, and exact
+replacement/refund semantics. Until those prerequisites exist, the current
+runtime scheduler remains unchanged.
+
+The component also does not claim a statistical rate-confidence bound,
+receiver-completion prediction, independent bottlenecks, restart-free rate
+recovery, or superiority to a baseline. In particular,
+`U = max(J, 1 ms)` alone cannot prove that an approximately ten-percent
+estimated-rate change is significant; T09 must either derive a typed
+duration-valued uncertainty or explicitly leave that stronger no-flap claim
+unmade. Those questions remain frozen gates. The unsupported all-stage/
+service-receipt text must be removed from the authoritative RFC as a rejected
+draft model, not implemented by stealth or left as a known code/RFC mismatch.
 
 The hard ECF/completion-horizon admission branches were introduced to protect
 receive-hole and reorder exposure. The current model now has explicit Product

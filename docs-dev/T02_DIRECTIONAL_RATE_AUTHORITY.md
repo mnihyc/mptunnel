@@ -1,14 +1,17 @@
 # T02 directional scheduling-rate authority
 
-Status: implementation checkpoint complete. The typed projection and exact
-publication fences are locally GREEN, but this checkpoint is not deployable or
-a release-acceptance claim until T03 consumes nonnumeric `Unlimited` directly
-and T04 removes inferred-rate admission coupling.
+Status: typed component checkpoint complete. The exact authority and
+publication fences are locally GREEN, but the checkpoint is not deployable or
+a release-acceptance claim. T03 runtime migration was rejected, so the legacy
+scalar consumer must retain its pre-`b5b4b5a` projection until a complete
+allocator consumes nonnumeric `Unlimited` and typed `C` directly. T04 separately owns
+inferred-rate admission coupling.
 
 ## Decision
 
-The rate input to the advisory action rank is an **exclusive typed authority
-automaton**, not a numeric lattice. Calling it a lattice would imply that two
+The rate input to the isolated Section 10.2 action-score component is an
+**exclusive typed authority automaton**, not a numeric lattice. No current
+runtime owner consumes that component. Calling it a lattice would imply that two
 independent rates can be joined, commonly by `max`; that operation has no
 proven meaning here and cannot represent the nonnumeric `Unlimited` startup
 form.
@@ -185,10 +188,10 @@ The model establishes:
 7. **No feedback collapse inside T02:** scheduler-supplied Product service is
    excluded from carrier-rate authority.
 
-Property 6 is a cross-transaction obligation. T03 must consume this already-
-reduced state without modifying it, and T04 must remove any inferred-rate
-admission denial. Until those transactions close, T02 GREEN is not a throughput
-acceptance claim.
+Property 6 is a cross-transaction obligation. The future sustained allocator
+must consume this already-reduced state without modifying it, and T04b must
+remove any inferred-rate admission denial. Until those transactions close,
+T02 GREEN is not a throughput acceptance claim.
 
 ## Disposition of `a4679b5`
 
@@ -317,6 +320,46 @@ existing owner transactions remain assigned to T04 or later.
 
 The response snapshot module is 33/35 only because the two exact Product
 confidence/rate-floor failures frozen for T12 remain unchanged. T02 introduces
-no new failure there. T02 must still be followed immediately by T03: the
-legacy scalar scorer cannot represent `UnlimitedStartup`, so this typed
-projection checkpoint is deliberately not a standalone runtime candidate.
+no new failure there.
+
+## Post-checkpoint transaction-order correction
+
+The first implementation checkpoint changed two surfaces at once. It correctly
+added the typed `DirectionalServiceRate` sidecar and exact QUIC Apply fences,
+but it also projected that sidecar back into `PathSnapshot.delivery_rate_bps`.
+The still-live legacy scorer reads only that scalar; it does not read the typed
+sidecar. Because T03 runtime-owner migration is rejected, this changed
+production scheduling before a complete replacement existed.
+
+The effect is not cosmetic. For TCP, qualified live Product/native diagnostics
+that previously supplied the legacy scalar were replaced by the immutable
+startup projection. Legacy `Unlimited` changed from its old one-terabit
+ordering sentinel to the portable 351,472-bit/s startup value, a factor of
+about 2.85 million. Existing fixtures were changed accordingly--for example,
+a fixed-output 500-Mbit/s Product observation remained at an 80-Mbit/s startup
+scalar, and a server TCP L3 120-Mbit/s observation remained at a 25-Mbit/s
+startup scalar. Those expectations prove typed exclusivity but also encode an
+unaccepted legacy behavior change.
+
+The bounded correction is projection-only and restores the complete scalar
+decision tree that existed immediately before `b5b4b5a`:
+
+1. retain typed startup/Unlimited/NativeOperational state;
+2. retain exact direction/incarnation scopes and current-shape QUIC commit
+   fences;
+3. restore every pre-checkpoint scalar source, precedence rule, rate scope,
+   and legacy Unlimited shim at still-live legacy consumers, including the
+   generic measured-rate fallback; changing only a subset would itself be an
+   unproved scheduling-policy transaction;
+4. test that changing a legacy diagnostic can change only the compatibility
+   scalar while the typed `C` remains unchanged; and
+5. delete the compatibility projection only when a complete runtime allocator
+   consumes the typed sidecar.
+
+This rollback does not endorse the old mixed scalar as the final model. It
+restores transaction isolation and prevents an unfinished component checkpoint
+from changing scheduling or performance. Any removal of a legacy Product,
+peer, generic, or carrier source requires its own reachable RED and isolated
+transaction after this checkpoint; the typed authority model alone is not that
+proof. Dynamic service discovery and the sustained allocator remain separate,
+later transactions.

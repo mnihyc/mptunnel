@@ -271,8 +271,8 @@ A locator-only migration preserves Product state, attachments, bounded MPP
 queues, and the current native-controller activation when QUIC reports that
 the same activation remains active. If QUIC installs or restores a different
 active `PathData` or controller within the same connection, the activation is
-fenced under Section 10.2 and only that activation's coherent native state may
-be used. A replacement connection inherits neither native evidence, the old
+fenced under Section 10.2.1 and only that activation's coherent native state
+may be used. A replacement connection inherits neither native evidence, the old
 carrier's MPP queue, nor an old exact-output flight. Logical stream-owned
 Product ranges remain retained for exact Data ACK and recovery; they can use a
 replacement only after the authenticated attachment procedure below.
@@ -1084,17 +1084,12 @@ Section 7.3 and may leave a redundant member idle. Pool membership never
 forces payload duplication and introduces no group-specific pacing or
 congestion controller.
 
-When eligible carriers otherwise have equal evidence during evidence-free
-startup, the client's configured-order coordinate visits one member ordinal
-across every configured endpoint before visiting the next member ordinal. This
-coordinate precedes only the final canonical exact-action key. It is computed
-as `(member ordinal, endpoint ordinal)` from stable configured values, never
-from the caller's input iteration order. This prevents redundant members of an
-earlier endpoint from displacing distinct configured endpoints during
-evidence-free startup.
-The order is not link identity, capacity evidence, a traffic share, or a
-common-bottleneck inference; current typed carrier service evidence remains
-authoritative.
+Core Profile 7 does not define a cross-group configured-order coordinate for
+otherwise equal evidence. The current placement owner retains its existing
+deterministic tie and retention behavior. A future sustained allocator may
+define a stable configured coordinate, but that coordinate would be neither
+link identity, capacity evidence, a traffic share, nor common-bottleneck
+inference.
 
 Because only `MAX` is effective, one group configured `3-3` and one group
 configured `1-3` expose the same three ready carriers. Three otherwise
@@ -1715,11 +1710,12 @@ count, reliable-stream window, or application-datagram admission rule.
 TCP and QUIC attachments are equally eligible after authentication,
 validation, readiness, usage, MTU, and queue admission. An implementation MUST
 NOT select a carrier family from protocol name alone. Each direction applies
-the structural policy tiers and advisory rank in Section 10 independently.
-Native loss, congestion, and queue state retain their transport evidence-
-validation and admission roles. Queue state enters the common advisory score
-only as exact comparable pre-native `A`; loss and congestion labels are not
-independent numeric score terms.
+the structural policy tiers and its current implementation-defined advisory
+rank independently. Native loss, congestion, queue state, and flow affinity
+remain advisory observations and never replace native transport or structural
+admission authority. A future allocator consuming the Section 10.2 component
+may use only exact comparable pre-native queue work as `A`; that restriction
+does not describe the current legacy rank.
 
 The packet scheduler SHOULD retain a healthy exact-carrier binding for one
 inner flow to avoid transport-damaging reordering. It MAY reselect immediately
@@ -1728,9 +1724,10 @@ loss, and MAY reselect at a flowlet boundary derived from current transport
 timing. A `Full` result drops the current packet, preserves the healthy flow
 binding, and does not prove path failure or authorize a duplicate. Opposite
 directions have independent affinity, so asymmetric carriers may be selected
-independently. Direction-local packet-flow load MAY govern affinity activity
-and flowlet reselection, but it is not an independent Section 10.2 score term.
-That evidence MUST age with actual flow activity and MUST NOT be borrowed from
+independently. Direction-local packet-flow load MAY govern affinity activity,
+flowlet reselection, and the current implementation-defined advisory rank. It
+is not an input to the isolated Section 10.2 component. That evidence MUST age
+with actual flow activity and MUST NOT be borrowed from
 Product flow accounting. IP packet admission and its queue evidence are
 independent of reliable-stream and application-datagram queues; changing them
 MUST NOT change L4 proxy admission, retry, scheduling, or transport behavior.
@@ -1743,10 +1740,12 @@ One scheduling action is scoped to an exact logical output, attachment
 incarnation, physical carrier instance, direction, command kind, and proposed
 encoded MPP work. The scheduler evaluates an immutable observation and proposes
 a finite order of actions. Before enqueue, the implementation revalidates the
-exact identities, stream frontier, output-admission epoch, complete rate-
-authority stamp, command priority and work, and queue reservation on which the
-proposal depends. Product range ownership is committed only in the same
-infallible publication transaction as the accepted enqueue.
+exact identities, stream frontier, output-admission epoch, command priority,
+work, queue reservation, and any activation/rate-authority stamp on which that
+proposal actually depends. A future consumer of Section 10.2 depends on its
+complete rate-authority stamp; the current legacy rank is not retroactively
+declared to consume the typed component. Product range ownership is committed
+only in the same infallible publication transaction as the accepted enqueue.
 
 An observation may contain:
 
@@ -1759,23 +1758,23 @@ An observation may contain:
 - current demand; and
 - evidence provenance and freshness.
 
-The implementation MUST discard and recompute a proposal when any revalidated
-identity, frontier, authoritative epoch, rate-authority stamp, or reservation
-is stale. Replacing a rate inside an old score is not revalidation. The
-coherent timing tuple used only for advisory order is frozen for that finite
-attempt pass; a later timing publication is consumed by the next pass and does
-not by itself invalidate an otherwise current exact commit. Turning every
-rank-only timing update into an Apply fence can prevent work conservation
-under continuously changing measurements.
+The implementation MUST discard and recompute a proposal when any authority
+that proposal depends on is stale. Replacing a depended-on rate inside an old
+score is not revalidation. For the isolated Section 10.2 component, the
+coherent timing tuple is frozen for one finite candidate evaluation; a future
+consumer would use a later publication in its next pass without turning every
+rank-only timing update into an Apply fence. The current legacy rank retains
+its existing observation and commit fences.
 
 Ranking is advisory. It cannot grant Product credit, queue capacity, native
 send credit, path proof, lifecycle eligibility, or recovery authority. The
-commit owner tries the frozen finite action order until one exact reservation
-succeeds or every structurally eligible action fails. An unrankable action sorts
-last within its structural tier; it is not thereby made ineligible. Failed and
-draining carriers, forbidden command classes, missing attachments, exhausted
-configured resources, and failed exact reservations remain structural
-ineligibility rather than score penalties.
+commit owner tries its captured finite action order until one exact reservation
+succeeds or every structurally eligible action fails. The Section 10.2
+component's `Unrankable` result and canonical fallback order constrain only a
+future consumer of that component; the current legacy rank has no such result.
+Failed and draining carriers, forbidden command classes, missing attachments,
+exhausted configured resources, and failed exact reservations remain
+structural ineligibility rather than score penalties.
 
 Peer AVAILABLE versus BACKUP and local backup policy form the structural
 regular-before-backup usage tier defined in Section 7.3. Reliable source
@@ -1787,7 +1786,7 @@ payload-scaled delay. A numeric/additive cost requires its own declared unit
 and deterministic policy order; a categorical boolean such as `expensive`
 instead requires the explicit tier in Section 7.3 and has no numeric unit.
 
-### 10.2 Evidence provenance and advisory rank
+### 10.2 Evidence provenance and advisory action-score component
 
 Transport queue/flight and MPP queue/Data-ACK flight overlap in one delivery
 pipeline. Sampled counters therefore cannot be added, maximized, divided by
@@ -1795,8 +1794,10 @@ flow count, or relabelled as one exact physical backlog. Product ownership,
 bounded MPP queues, native flight, and native send capacity retain their own
 owners and terminal rules.
 
-For one exact action a, at the Core millisecond service resolution, the
-advisory service score is:
+This section defines a typed score for one exact action. Core Profile 7 does
+not require the live candidate-order owner to consume this component, and this
+component alone is not a sustained allocator. An implementation or future
+profile that consumes it computes, at the Core millisecond service resolution:
 
     S_ms(a) = T_ms(a)
               + ceil(8000 * (A_bytes(a) + M_bytes(a)) / C_bps(a))
@@ -1820,10 +1821,30 @@ upward to a whole millisecond. T retains its validated duration precision.
 Every addition, multiplication, division, and duration conversion is checked.
 An unrepresentable score is unrankable rather than saturated into a win. A, M,
 and C MUST name the same direction and declared work domain. If comparable A
-cannot be proved for every candidate in one comparison, the comparison uses
-the formula without A, equivalently `A_bytes = 0` uniformly; a missing A on one
-candidate MUST NOT be interpreted as observed zero. Missing evidence is not
-measured zero.
+cannot be proved for every candidate in one comparison, the formula without A,
+equivalently `A_bytes = 0` uniformly, remains a valid score for one already
+chosen action; a missing A on one candidate MUST NOT be interpreted as observed
+zero. Missing evidence is not measured zero.
+
+Uniform omission does not make the one-action score a sustained allocator.
+With fixed observations and action size, repeated minimization selects the
+same score winner; the canonical identity key only makes that static result
+deterministic. A bounded writer slot does not supply allocation history because
+it can reopen after native buffer acceptance, before native or MPP
+acknowledgment, and the same winner can refill it.
+
+This Core revision therefore defines the formula only as a finite-candidate
+component when comparable A is absent; it makes no fairness or aggregate-
+capacity claim for repeated uniform-`A=0` dispatch. A future profile making
+such a claim must specify its allocation owner and bounded exploration. That
+owner must make reservations atomic across logical streams sharing one
+physical carrier and original-sender direction, align remaining-work lifetime
+with the service boundary represented by its rate, and preserve subordinate
+stream readiness. It cannot relabel native write/flush as network service,
+shrink a configured high-BDP resource queue to manufacture spillover, or
+interpret the canonical tie key as fairness state. A carrier known to share a
+saturated bottleneck may legitimately provide no marginal service; bounded
+exploration is required only while that marginal opportunity remains unknown.
 
 Core v10 has no synchronized one-way-delay authority. Its live timing input is
 therefore one exact local tuple `(timing epoch, validated RTT, optional J)`
@@ -1890,8 +1911,9 @@ but they do not add independent time to S. In particular, a Suspect label alone
 cannot override a finite current typed rank. Native controller and exact
 reservation state continue to constrain actual transmission.
 
-Equal scores use the complete exact action identity from Section 10.1 as a
-canonical lexicographic key, ordered by logical output identity, physical
+A future profile that consumes this component and claims a finite candidate
+order MUST use the complete exact action identity from Section 10.1 for equal
+scores as a canonical lexicographic key, ordered by logical output identity, physical
 carrier instance, attachment incarnation where applicable, original-sender
 direction, command kind, and exact proposed Product/command identity. A bare
 reusable PathId, configured vector position, cyclic cursor, and input order are
@@ -1917,7 +1939,7 @@ configured value is used with the startup RTT before live timing exists. Then:
 The absent case is a policy/timer-resolution floor, not measured zero.
 
 `U` MUST NOT participate in a general sort comparator: its pair-dependent
-relation need not be transitive across three candidates. The scheduler first
+relation need not be transitive across three candidates. That future consumer first
 builds the canonical base order by structural tier, rankability, S, the
 conditional evidence-free configured-order coordinate, and the complete
 action key. If the exact incumbent is still eligible in the base-best
@@ -1927,7 +1949,7 @@ Rankable challenger `c` displaces rankable incumbent `i` only when
 challenger displaces an unrankable incumbent; an unrankable challenger does not
 displace a rankable incumbent; two unrankable actions use the base order.
 
-When displacement fails, the incumbent is promoted to the first attempt and
+For such a consumer, when displacement fails, the incumbent is promoted to the first attempt and
 all other candidates remain in canonical base order. If the incumbent's exact
 commit fails, the owner continues that unmodified base order; retention cannot
 hide the challenger or terminate fallback. A better structural tier appearing,
@@ -1938,14 +1960,21 @@ may validate the typed `C`; it does not contribute to `U`. A percentage such
 as ten percent is a validation comparison band or operator hint, never a hidden
 path-swap threshold.
 
-The formula is an advisory local-service ordering, not an end-to-end
-application-completion estimate. It proves deterministic ordering, monotonic
-response to lower T or A and higher C, and no intentional double counting of
-the excluded stages. It does not prove receiver completion, independent
-bottlenecks, finite native service, restart-free recovery, or superiority to a
+The formula is an advisory local-service coordinate, not an end-to-end
+application-completion estimate or the shipped sustained allocation policy. It
+proves monotonic response to lower T or A and higher C, and no intentional
+double counting of the excluded stages. With the conditional consumer rules
+above it also defines deterministic finite ordering. It does not prove receiver
+completion, independent bottlenecks, finite native service, restart-free
+recovery, fair sustained allocation, aggregate service, or superiority to a
 baseline.
 
 #### 10.2.1 NativeOperational rate authority
+
+The authority reducer and activation fences in this subsection are live Core
+requirements independently of whether the Section 10.2 score component is
+consumed. They feed the typed sidecar and its legacy compatibility projection;
+they do not by themselves install the future sustained allocator.
 
 One exact (carrier instance, original-sender direction) owns one persistent
 native scheduling-rate reducer. A native transport rate is authoritative only
@@ -2552,11 +2581,16 @@ native TCP, QUIC, MPTCP, or HTTP/3 timers.
 ### 15.1 Original placement
 
 Within the regular or backup set selected by Section 7, ordinary original-data
-placement uses the advisory action rank in Section 10.2 subject to shared
-receive credit, configured Product resources, current attachment/output
-lifecycle, reorder bounds, and exact writer reservation. The rank does not
-claim receiver completion time and cannot deny the only action whose
-authoritative owners admit the command.
+placement uses the implementation's existing advisory candidate order subject
+to shared receive credit, configured Product resources, current attachment/
+output lifecycle, reorder bounds, and exact writer reservation. Core Profile 7
+does not require that candidate order to consume the Section 10.2 action-score
+component. That component has no sustained allocation owner in this revision
+and therefore cannot replace the existing order merely by repeatedly selecting
+its static minimum. The existing order likewise cannot deny the only action
+whose authoritative owners admit the command. Profile 7 makes no fairness or
+aggregate-capacity conformance claim for a sustained sequence; a future profile
+making either claim must supply the allocation owner required by Section 10.2.
 
 The output carrying the contiguous frontier is governed by shared MPP credit
 and its native carrier. Before an additional output in either stream direction
@@ -2584,7 +2618,7 @@ reaches the configured positive qualification floor, the output gains durable
 qualification `q_i = 1` and its configured `P_i` assignment authority.
 Duplicated Product bytes satisfy neither the volume floor nor a
 carrier-specific delivery sample. NativeOperational evidence remains
-independently scoped under Section 10.2. An application-limited native
+independently scoped under Section 10.2.1. An application-limited native
 observation has only the update effect
 declared by that native-controller adapter and neither creates nor revokes
 Product qualification.
@@ -2656,12 +2690,13 @@ records Product ownership before publishing the command. Failed revalidation
 refunds the uncommitted reservation and changes no Product range. Data ACK or
 terminal Product cleanup releases O and O_i exactly once; native ACK does not.
 
-Ordinary numeric order uses only the typed action terms in Section 10.2.
-Sampled native queue, flight, loss, ECN, confidence, application-limited state,
-active-flow count, and Suspect label may validate typed evidence or diagnose
-service, but do not add independent score penalties and MUST NOT multiply or
-divide a physical carrier rate. They neither shrink nor enlarge W, P_i, E_i, or
-shared receive credit.
+Core Profile 7 ordinary placement retains the implementation's existing legacy
+projected-path rank. That rank may use sampled native queue, flight, loss,
+confidence, application-limited state, active-flow count, Suspect state, and a
+compatibility scalar rate; it remains advisory and neither shrinks nor enlarges
+W, P_i, E_i, or shared receive credit. The exclusion of those fields from the
+typed Section 10.2 component constrains only a future consumer of that
+component; it is not a claim that the current legacy rank already disappeared.
 
 The selected TCP or QUIC writer, its bounded command admission, native socket
 or stream backpressure, pacing, congestion control, and recovery remain final
@@ -2723,15 +2758,25 @@ output; source admission is zero when the coherent selected tier contains no
 current eligible output with a positive Product envelope. Evidence from
 another carrier incarnation with the same path key MUST NOT be substituted.
 
-The Core startup score uses the following portable priors only where a more
-specific configured or typed observation is absent:
+The optional Section 10.2 component uses the following typed portable priors
+only where a more specific configured or valid typed observation is absent:
 
     M_0   = I_0 + 30 = 14,630 normalized MPP bytes
     RTT_0 = 333 ms
     T_0   = RTT_0 / 2
     J_0   = unavailable
     U_0   = 1 ms
-    C_0   = 8 * M_0 / RTT_0, approximately 351 kbit/s
+    C_0   = 8 * M_0 / RTT_0, exactly 351,472 bit/s after upward rounding
+
+The temporary legacy compatibility scalar is deliberately not normalized by
+that model checkpoint. Until a future allocator replaces it atomically, every
+current owner retains its complete pre-`b5b4b5a` source precedence, rate scope,
+and projection behavior. In particular, legacy Unknown uses 14,600 bytes over
+333 ms (approximately 350,751 bit/s), legacy Unlimited uses the 1-Tbit/s
+ordering sentinel, and owner-specific observed Product, carrier, peer, or
+generic branches retain their former precedence. These are compatibility
+values consumed by the shipped projected-path rank, not typed Section 10.2 C
+and not transport pacing or admission authority.
 
 A low or missing C orders alternatives but does not rate-limit, window-limit,
 or pace the sole admitting carrier. J is RTT variation, not unknown RTT; an
@@ -2827,15 +2872,15 @@ envelope reduction. Those transitions preserve exact debt under P_i, W, and
 reorder authority and admit no new unqualified-additional OriginalData until
 Data ACK or terminal cleanup restores current E_i headroom.
 
-Every ordinary positive quantum freezes a canonical finite base order by
-structural tier; rankable before unrankable; increasing Section 10.2 score; the
-conditional evidence-free configured-order coordinate; and canonical action
-identity. Incumbent uncertainty is then applied exactly once against the base-
-best same-tier challenger as specified in Section 10.2; it is not a sorting
-relation. If retained, the incumbent is attempted first, and an incumbent
-commit failure resumes the unchanged base order. The owner tries candidates
-until one real writer reservation and every Product authority succeed, then
-ends after that one commitment. It does not allocate equal shares.
+Every ordinary positive quantum freezes the current owner's implementation-
+defined finite candidate order. The owner tries candidates until one real
+writer reservation and every Product authority succeed, then ends after that
+one commitment. It does not allocate equal shares. Core Profile 7 does not
+claim the Section 10.2 canonical key, `Unrankable` order, or incumbent-
+uncertainty comparator as live placement behavior. A future T08b-style
+sustained allocator that consumes the component must define and prove those
+rules together with its allocation history rather than replacing the current
+owner piecemeal.
 Backup is considered only after every regular candidate in the current
 freshness class fails the exact commit. A backup uses the same L_i rule and one
 backup commitment never promotes it ahead of regular candidates for a
@@ -2946,9 +2991,11 @@ speculation is disabled. No earlier than `loss_at` and before `fallback_at`,
 a sender MAY offer the exact frontier as
 bounded speculative repair on a currently measured, distinct alternate, but
 only from already-funded optional credit and the existing target, queue,
-flight, and retained-range bounds defined below. Section 10.2 ranks eligible
-alternate repair actions using one common captured positive frontier payload,
-also defined below. That rank
+flight, and retained-range bounds defined below. The current recovery owner
+ranks eligible alternate repair actions with its existing legacy projected-
+path rank while using one common captured positive frontier payload, also
+defined below. A future allocator may substitute the Section 10.2 component
+only as one part of a proved sustained policy. The current rank
 neither scores the already-accepted owner with a zero-size action nor proves
 that an alternate will complete before the owner. Exercising or declining this
 optional opportunity is local policy and grants no additional traffic
@@ -3114,7 +3161,8 @@ floor only to exact `F_t^r`. A separately funded suffix may extend total service
 to `L_t` only under the rules below.
 The first committed repair frame has the same lowest offset, normalized
 frontier identity, output incarnation, and writer-capacity generation used by
-the frozen Section 10.2 target order, and its payload MUST NOT exceed `M_s`.
+the current owner's frozen advisory target order, and its payload MUST NOT
+exceed `M_s`.
 If that frame
 cannot be committed because it overlaps queued or recent
 repair work, the evaluation MUST stop without publishing later omitted ranges.
@@ -3161,8 +3209,10 @@ Once the sending application fixes a final offset, a remaining exact
 OriginalData range also has an immutable finite-drain age from its original
 assignment. After one owning-path MPP recovery interval, the sender MAY race
 one bounded over-credit frontier quantum of that range on a distinct output
-when both outputs have current carrier service evidence and the ordinary `S/U`
-rank favors the alternate outside its uncertainty deadband. A larger suffix is
+when both outputs have current carrier service evidence and the current
+ordinary advisory retention rule favors the alternate. A future Section 10.2
+consumer may use its `S/U` comparison only after the sustained allocator is
+specified. A larger suffix is
 permitted only when separately funded by cumulative optional credit and bounded
 by the same exact-target and identity-uniform-prefix rules above. Partial Data
 ACK progress shrinks the retained range but does not rewrite any remaining
@@ -3539,7 +3589,8 @@ A conforming implementation preserves all of the following:
 21. Carrier presence never forces payload placement or duplication. The
     ordinary scheduler revalidates exact carrier health, usage, Product
     authority, writer-capacity generation, writer reservation, credit,
-    output-admission epoch, and typed action rank before every commit.
+    output-admission epoch, and every captured authority on which its current
+    advisory ordering depends before every commit.
 22. Server `PATH_CLOSE` is the ordered aggregate acknowledgment of a matching
     client `PATH_DRAIN`; local emptiness or write completion cannot replace it.
 23. `SESSION_CLOSE` retires the complete `SessionId`; carrier drain does not.
@@ -3592,23 +3643,26 @@ A conforming implementation preserves all of the following:
 34. The PATH_CAPACITY transaction is diagnostic in Core Profile 7. It
     creates no Product, lifecycle, usage, health, congestion-control, or
     scheduling-rate authority and cannot gate unrelated Product work.
-35. Advisory action rank uses only a coherent RTT/2 propagation projection,
-    exact comparable pre-native predecessor work when available, the encoded
-    action work, and one typed directional rate authority. Finite-positive C
-    uses the millisecond service term
-    `ceil(8000*(A_bytes+M_bytes)/C_bps)`; declared `UnlimitedStartup` contributes
-    zero service duration. Both use checked arithmetic and never divide
-    capacity by active-flow count.
-36. Rank is not admission. Every finite candidate order is revalidated against
-    Product, lifecycle, queue, and native authorities; an unrankable action
-    sorts last but remains eligible for an exact commit attempt.
-37. Equal scores and all-unrankable ties use the complete canonical output,
+35. If an implementation computes the optional Section 10.2 action-score
+    component, that component uses only a coherent RTT/2 propagation
+    projection, exact comparable pre-native predecessor work when available,
+    encoded action work, and one typed directional rate authority. Its finite-
+    positive C uses `ceil(8000*(A_bytes+M_bytes)/C_bps)`; declared
+    `UnlimitedStartup` contributes zero service duration. Both use checked
+    arithmetic and never divide capacity by active-flow count. This does not
+    make the component Core Profile 7's live candidate order.
+36. Rank is not admission. Every current finite candidate order is revalidated
+    against Product, lifecycle, queue, and native authorities. If a future
+    owner consumes Section 10.2, an unrankable action sorts last but remains
+    eligible for an exact commit attempt.
+37. A future owner consuming Section 10.2 uses the complete canonical output,
     carrier-instance, attachment-incarnation, original-sender-direction,
-    command-kind, and Product/command identity. PathId and input order are
-    insufficient. Incumbent hysteresis is one same-tier comparison against the
-    base-best challenger, never a sort relation; it uses duration-valued
-    uncertainty separate from the score. A percentage hint is not a hidden
-    eligibility gate.
+    command-kind, and Product/command identity for equal-score and all-
+    unrankable ties. Its incumbent hysteresis is one same-tier comparison
+    against the base-best challenger, never a sort relation, and uses duration-
+    valued uncertainty separate from the score. Core Profile 7 does not claim
+    these as current placement behavior. A percentage hint is not a hidden
+    eligibility gate in either policy.
 38. Every active native PathData or controller installation and restoration is
     fenced by a distinct E_N, including same-identity restoration. Every
     accepted activation, basis, or NativeOperational rate change advances the
@@ -3683,12 +3737,14 @@ RFC 6356 documents why independently controlled subflows sharing a bottleneck
 can be less fair than one TCP flow. MPP cannot install coupled control above
 kernel TCP and does not claim coupled fairness or common-bottleneck detection.
 The configured pool maximum is therefore the explicit resource and concurrency
-policy; each member retains native TCP congestion-control authority and the
-usage-aware advisory action rank may leave redundant members idle.
+policy, and each member retains native TCP congestion-control authority. A
+member may remain idle because structural policy forbids it or because a
+separately justified allocation owner finds no marginal service opportunity;
+the static advisory tie key alone is not evidence of fairness or aggregation.
 
 This Core Profile declares no named TCP NativeOperational adapter. Kernel TCP
 delivery, pacing, congestion-window, and queue telemetry therefore remains
-diagnostic unless a separately typed evidence source satisfies Section 10.2.
+diagnostic unless a separately typed evidence source satisfies Section 10.2.1.
 A future profile may define a native TCP adapter only by declaring that full
 contract for a new carrier-incarnation and direction reducer.
 
@@ -3738,11 +3794,12 @@ After Section 10.2.1 qualification, or immediately for Unknown or Unlimited,
 the export changes whenever the active native controller changes this
 component. A source change resets predecessor-owned initialization and rate
 evidence and compare-applies only the coherent new active snapshot, as defined
-in Section 10.2. MPP adds no independent smoothing, cap, maximum with another
+in Section 10.2.1. MPP adds no independent smoothing, cap, maximum with another
 rate source, expiry, or recovery timer. If that complete changed observation
 remains current for `D_pub` in the adapter's declared stable environment,
-every live scheduling consumer receives its central-authority revision within
-`D_pub`. Publication MUST detect a `B_op` change directly and cannot depend
+every registered authority observer and compatibility projection receives its
+central-authority revision within `D_pub`. Publication MUST detect a `B_op`
+change directly and cannot depend
 on a detached wrapper sample-count change. This asynchronous adapter exposes
 transport `E_N` separately from central `G`; snapshots and precommits compare
 both, including switches completed between polls. A consumer MUST discard and
@@ -3751,8 +3808,8 @@ authority fence fails precommit equality.
 
 The preferred native BBR model retains raw minimum RTT for its internal
 propagation model, ProbeRTT, and ordinary BBR flight. This controller-internal
-value is not the Core scheduler's Section 10.2 timing tuple or its validated
-SRTT/2 projection. A larger packet-qualified "operational RTT" is not part of
+value is not the optional Section 10.2 action component's timing tuple or its
+validated SRTT/2 projection. A larger packet-qualified "operational RTT" is not part of
 the preferred profile. End-to-end low-flight observations cannot prove
 that delay above raw minimum RTT is propagation rather than an external shared
 queue.  If a candidate controller substitutes `R_op > R_min` at bandwidth `B`

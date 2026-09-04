@@ -165,6 +165,19 @@ identity-stable ties, and use a 20-ms/200-Mbit/s path with three active flows
 versus an 80-ms/200-Mbit/s path for 4 MiB. The corrected advisory scores are
 178 versus 208 ms; current `C/3` produces about 513 ms and reverses selection.
 
+The post-checkpoint sustained-owner audit narrows that result. The checked
+formula is a one-action component, not an allocator: with `A=0`, fixed inputs
+and a canonical key select the same path on every action. Writer capacity does
+not repair it because a slot reopens after native write/flush, before native or
+MPP acknowledgment, and the same path can refill every released quantum. The
+64-MiB Product envelope can therefore leave 53.7/134.2/268.4 seconds of
+wrong-owner work at 10/4/2 Mbit/s while another ready carrier receives none.
+Queue shrink and one-action stop-and-wait are rejected because the existing
+queue deliberately pipelines high-BDP service and its charge has a separately
+proved late-release invariant. T03 runtime migration is closed as NO-GO; the
+typed component remains isolated until dynamic service discovery and one
+physical-carrier/direction allocation owner are independently proved.
+
 T04 separately starts from `src/model/admission.rs:398` through `:510` and
 `:648` through `:775`. Its RED holds configured `W/P/E`, queue/headroom,
 Product debt, position, and payload fixed, changes only inferred ETA across
@@ -262,12 +275,15 @@ transaction.
 | T00 | Checkpoint | Freeze this production SHA, scope, verdicts, and 32-test inventory. | `93e6284`; 2,184/32/0 library result. | Documentation commit only. |
 | T01 | P4-model | Is an exact receipt-retained all-stage ledger necessary authority for ordinary placement? | Three owner audits prove it absent; symbolic `8*N^B/receipt_delay` disproves its neutrality; wire kinds 44--48 reject as unknown. | Remove the rejected mandatory ledger/service-receipt/observation dependency from Core RFC; retain Product/resource/native authority, and document implemented v10 return-plan fields plus kind 49. No production change or compatibility branch. |
 | T02 | P3-rate | What typed authority and normalized-MPP byte basis supply `C` and `M` for explicit-hint, omitted-hint, request, and fixed-output states? | Valid explicit-hint RED, 350.75-Kbit/s prior persistence, stale floor fixtures, current mixed rate scopes, and exact encoded-frame work. | One exclusive typed directional authority automaton and coherent work unit; split/supersede unproved `a4679b5` hunks. A rank consumes one already-reduced `C`, never selects or maximizes sources. |
-| T03 | P4-score | Does an established exact action rank contain only `T_ms + ceil(8000(A_bytes+M_bytes)/C_bps)`, with coherent exact-direction timing, comparable local pre-native `A`, jitter confined to timing deadband `U`, and a canonical complete action key? | Deterministic REDs for field mutation, divided capacity, action-specific encoded work, rounding, invalid effective scope, overflow, Suspect, bounded incumbent promotion, `expensive`/backup tiers, response credit/timing provenance, and permutation-invariant identity. | Introduce one typed exact-action rank for established reliable/L3 owners. It is not a delivery ETA or admission/deadline proof and does not alter the shared acquisition/datagram/zero-payload projection. Core Profile 7 uniformly omits `A` because no comparable producer exists; it never invents exact debt. |
-| T04 | P4-admission | Can inferred ETA, loss, confidence, flow count, or BDP deny ordinary Product work when lifecycle-valid resource headroom exists? | Exact `completion_horizon`/`ecf_no_completion_gain` admission flip; structural `W/P/E` and configured resource limits held constant. | Make inference ranking-only where reachable, or prove a branch structural/unreachable. |
+| T02b | P3-compatibility | Did the T02 sidecar alter the scalar still consumed by the legacy scorer before a replacement existed? | `score_path` ignores the sidecar; exact request/fixed/response/L3 cases changed live 90--200-Mbit/s evidence to startup, generic fallback was removed, and legacy Unlimited changed from 1 Tbit/s to 351,472 bit/s. | Restore the complete pre-`b5b4b5a` scalar source/precedence/scope behavior and legacy Unlimited shim at every still-live scalar consumer. Retain the parallel typed authority, normalized typed Unknown, diagnostic provenance, QUIC current-shape fences, Product/resource bounds, and request flow-local isolation. Removing any legacy source is a later independently proved transaction. |
+| T03 | P4-score-component | What does the exact score of one already chosen action contain? Can that score alone allocate a sustained sequence? | Arithmetic/timing component REDs are GREEN. A static-winner trace, exact writer release lifetime, 131-slot queue geometry, and 64-MiB Product bound disprove sustained allocation with uniform `A=0`; TCP has no valid dynamic `C`. | Retain the typed single-action arithmetic and coherent timing components. Reject every request/response/L3 runtime-owner migration; make no production selection change. A later allocator must follow dynamic service discovery and own atomic physical-carrier/direction reservations. |
+| T04a | P4-accounting | Does current response scoring count one dequeued writer charge twice? | `server_bulk_output_snapshot_at` includes total `commands.pending_bytes`; `response_completion_snapshot` then adds its `writer_pending_bytes` subset again. Request does not. | One exact RED/GREEN removing only the duplicate projection; preserve queue admission, charge lifetime, native metrics, and request behavior. |
+| T04b | P4-admission | Can inferred ETA, loss, confidence, flow count, or BDP deny ordinary Product work when lifecycle-valid resource headroom exists? | Exact `completion_horizon`/`ecf_no_completion_gain` admission flip; structural `W/P/E` and configured resource limits held constant. | Make inference ranking-only where reachable, or prove a branch structural/unreachable. |
 | T05 | P1-authority | How is renewable repair prevented without a cumulative percentage admission cap? | Proven 434,790,952-byte renewal versus 108,847,604-byte old budget, plus current hard denial sites. | Prove and implement stable live-copy identity, or reject candidate; percentage remains cost/rank only. |
 | T06 | P1-service | Which sequential, staggered, or concurrent action minimizes frontier time without assuming independent service? | Exact 1.064233-second sequential replay and coupled-service countermodel. | Choose only a symbolically safe policy and exact two-direction RED/GREEN, or reject it. |
 | T07 | P2-domain | Can latency/recovery work overtake native predecessor debt with current domains? | SEEN-6D1 TCP trace; any residual P1 QUIC lower bound. | No-change proof, one carrier-neutral domain design, or model-constrained candidate rejection. |
-| T08 | P3-requalify | Does fresh typed evidence restore 10-to-500 service without restart and preserve cold/warm startup? | User traces where restart immediately restored throughput. | One evidence-lifecycle correction or no-change proof; no initial-rate cap. |
+| T08a | P3-requalify | Does fresh typed evidence restore 10-to-500 service without restart and preserve cold/warm startup? | User traces where restart immediately restored throughput; current portable TCP startup has no valid dynamic replacement. | One evidence-lifecycle/service-discovery correction or no-change/impossibility proof; no initial-rate cap and no `cwnd/SRTT` authority. |
+| T08b | P4-allocation | After T08a, can one shared owner divide sustained work without starving a ready carrier or retaining phantom/catch-up debt? | T03 static-winner and early writer-release counterexamples; QUIC stream-local writers share one connection-wide native domain. | One atomic refundable physical-carrier/direction allocation model with rate-aligned remaining work and unknown-rate exploration, or reject runtime migration. Do not resize safety queues or serialize native service. |
 | T09 | P4-stability | Does the corrected L3 rule avoid statistically indistinguishable swaps while retaining materially better paths? | Alternating-evidence/deadband RED and mixed-path trajectory. | One RFC-aligned no-flap/work-conservation rule, or no-change proof. No fixed protocol preference/group. |
 | T10a | P5-MAX_DATA | Is `STREAM_MAX_DATA` publication cadence exact? | Current conformance debt; reachability not yet presumed. | Exact RED/GREEN, or unreachable proof plus RFC/test correction. |
 | T10b | P5-write | Is partial local-write consumption reflected at the correct Product frontier? | Current conformance debt; reachability not yet presumed. | Exact RED/GREEN, or unreachable proof plus RFC/test correction. |
@@ -386,9 +402,10 @@ completion edge can create a much larger ordering consequence; paths may
 share only some bottlenecks.
 
 Promoted scope: decide from first principles whether uncertainty/freshness is
-represented in the current completion score. A change must remain
-work-conserving, carrier-neutral, direction-specific, and responsive when UDP
-is degraded but TCP is healthy or vice versa. A fixed same-host grouping,
+represented in the current completion score. A change must not create
+scheduler-caused idle service, must remain carrier-neutral and direction-
+specific, and must respond when UDP is degraded but TCP is healthy or vice
+versa. A fixed same-host grouping,
 fixed protocol preference, fixed percentage switch margin, or transitive
 single-group bottleneck label is rejected in advance.
 
@@ -512,9 +529,11 @@ cohort, never an isolated cell rerun.
 1. Commit this reflection and promoted ledger; make no production change.
 2. The 32-failure inventory above is complete. Close T01's RFC authority
    correction; do not modify production while that model is ambiguous.
-3. Close T02 typed rate/unit authority, T03 advisory score, and T04 admission
-   separation in that order because recovery owner/alternate projections
-   consume those inputs.
+3. Close T02 typed rate/unit authority, then T02b's exact compatibility
+   projection before claiming transaction isolation. Close the T03
+   single-action component and record runtime migration as rejected; then
+   close T04a duplicate current accounting and T04b admission separation
+   independently.
 4. Close P1 as two sequential atomic transactions (T05 and T06): first replace
    or reject the hard percentage authority semantics while preserving exact non-renewal;
    then decide sequential versus concurrent distinct-domain service. Do not
@@ -524,9 +543,11 @@ cohort, never an isolated cell rerun.
    add at most two valid whole-cell realizations. Five valid results are the
    terminal decision set: repeated loss is RED and unresolved mixed evidence
    rejects the candidate. Neither permits rerunning until lucky.
-6. Close the remaining P3 work in provenance order (T08): omitted-hint
+6. Close the remaining P3 work in provenance order (T08a): omitted-hint
    discovery, then restart-free requalification. The cold/warm ladder is its
-   affected runtime gate, not a separate tuning transaction.
+   affected runtime gate, not a separate tuning transaction. Only afterward
+   may T08b attempt the separately proved sustained allocator; a NO-GO closes
+   without runtime migration rather than reopening T03.
 7. Close the remaining P4 no-flap behavior (T09). Preserve every earlier GREEN
    as a focused non-downgrade test. Do not add
    overlapping-factor inference unless the exact L3 proof requires it.

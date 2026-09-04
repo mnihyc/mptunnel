@@ -1952,7 +1952,7 @@ async fn tcp_path_session_multiplexes_multiple_single_path_interactive_streams()
     let (mut first_client, first_server) = duplex(4096);
     let (mut second_client, second_server) = duplex(4096);
     let first_handler = tokio::spawn(handle_socks5_client_stream(first_server, context.clone()));
-    let second_handler = tokio::spawn(handle_socks5_client_stream(second_server, context));
+    let second_handler = tokio::spawn(handle_socks5_client_stream(second_server, context.clone()));
 
     let first_client_task = tokio::spawn(async move {
         drive_socks5_echo_client(&mut first_client, target_addr).await;
@@ -1961,21 +1961,38 @@ async fn tcp_path_session_multiplexes_multiple_single_path_interactive_streams()
         drive_socks5_echo_client(&mut second_client, target_addr).await;
     });
 
-    first_client_task.await.expect("first client");
-    second_client_task.await.expect("second client");
-    first_handler
+    tokio::time::timeout(Duration::from_secs(10), async {
+        first_client_task.await.expect("first client");
+        second_client_task.await.expect("second client");
+        first_handler
+            .await
+            .expect("first join")
+            .expect("first handler");
+        second_handler
+            .await
+            .expect("second join")
+            .expect("second handler");
+    })
+    .await
+    .expect("multiplexed TCP stream data-plane deadline");
+
+    // This test owns a session-scoped carrier explicitly. Product stream
+    // completion does not define carrier lifetime, so terminate that session
+    // deliberately instead of making incidental Arc-drop order part of the
+    // multiplexing assertion.
+    assert_eq!(
+        context.retire_session(CloseReason::Normal),
+        CloseReason::Normal
+    );
+    tokio::time::timeout(Duration::from_secs(2), server_path)
         .await
-        .expect("first join")
-        .expect("first handler");
-    second_handler
-        .await
-        .expect("second join")
-        .expect("second handler");
-    server_path
-        .await
+        .expect("TCP carrier shutdown deadline")
         .expect("server join")
         .expect("server path");
-    target.await.expect("target join");
+    tokio::time::timeout(Duration::from_secs(2), target)
+        .await
+        .expect("TCP target shutdown deadline")
+        .expect("target join");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

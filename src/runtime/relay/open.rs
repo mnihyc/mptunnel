@@ -222,6 +222,8 @@ fn reserve_reliable_initial_plan_attempt(
     lane: TrafficClass,
     candidate: ReliableRelayReturnCandidate,
 ) -> Option<ReliableInitialOpenAttempt> {
+    #[cfg(test)]
+    context.record_reliable_selection_pass_for_test();
     let candidate_is_current = || {
         candidate.path_instance_id.is_none_or(|frozen| {
             context

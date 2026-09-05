@@ -732,6 +732,64 @@ pub(super) struct RelayAdditionalPathOpenTask {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// Test-only ingress seam: deliver one real additional-open result after the
+/// caller has blocked Product output, without setting up another encrypted
+/// carrier. It changes no receive/settlement branch in the relay actor.
+#[cfg(test)]
+pub(super) struct BlockedWriteOpenTestIngress {
+    pub(super) key: RelayPathKey,
+    pub(super) obsolete_generation: bool,
+    pub(super) release: Arc<tokio::sync::Notify>,
+    pub(super) consumed: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+impl BlockedWriteOpenTestIngress {
+    pub(super) fn install(
+        self,
+        pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+        tx: mpsc::Sender<RelayAdditionalPathOpenResult>,
+    ) {
+        let generation = next_relay_additional_path_open_generation();
+        let pending_generation = if self.obsolete_generation {
+            next_relay_additional_path_open_generation()
+        } else {
+            generation
+        };
+        let key = self.key;
+        let handle = tokio::spawn(async move {
+            self.release.notified().await;
+            tx.send(RelayAdditionalPathOpenResult {
+                key,
+                generation,
+                mode: ReliableRelayAttachMode::Recovery,
+                startup_ordinal: None,
+                startup_expected_instance: None,
+                result: Err(RuntimeError::RemoteReset(
+                    crate::protocol::ResetReason::RemoteClosed,
+                )),
+            })
+            .await
+            .expect("test reset delivered");
+            // Reserving every slot proves the actor consumed our result.
+            // Closure is also a valid result if terminal handling exits.
+            let _ = tx.reserve_many(tx.max_capacity()).await;
+            let _ = self.consumed.send(());
+        });
+        pending.insert(
+            key,
+            RelayAdditionalPathOpenTask {
+                generation: pending_generation,
+                startup_ordinal: None,
+                startup_expected_instance: None,
+                #[cfg(feature = "lab-diagnostics")]
+                lane: TrafficClass::Latency,
+                handle,
+            },
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RelayAdditionalPathOpenCandidate {
     key: RelayPathKey,

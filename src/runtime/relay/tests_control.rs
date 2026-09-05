@@ -317,6 +317,97 @@ async fn wait_for_buffered_remote_frame(remotes: &ReliableRelayRemoteSet) {
 }
 
 #[tokio::test]
+async fn restart_reset_terminates_during_blocked_product_write() {
+    for obsolete_generation in [false, true] {
+        restart_reset_during_blocked_product_write(obsolete_generation).await;
+    }
+}
+
+async fn restart_reset_during_blocked_product_write(obsolete_generation: bool) {
+    let stream_id = StreamId(621);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener");
+    let address = listener.local_addr().expect("test address");
+    let context = ClientPathContext::new(
+        vec![
+            format!("tcp://{address}")
+                .parse::<PathSpec>()
+                .expect("test path"),
+        ],
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let (commands, mut receivers) = reliable_path_command_channels(32);
+    let (frames_tx, frames_rx) = mpsc::channel(2);
+    let initial = test_opened_remote_stream(stream_id, 0, commands, frames_rx);
+    let (local, control) = BlockedLocalDelivery::new();
+    let release_reset = Arc::new(Notify::new());
+    let (consumed_tx, consumed_rx) = tokio::sync::oneshot::channel();
+    let ingress = super::super::lifecycle::BlockedWriteOpenTestIngress {
+        obsolete_generation,
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        release: release_reset.clone(),
+        consumed: consumed_tx,
+    };
+    let relay = tokio::spawn(async move {
+        relay_migrating_tcp_stream_active(
+            local,
+            &context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec::new(TargetAddr::Ip(address), TrafficClass::Latency),
+            initial,
+            None,
+            Some(ingress),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                recv_reliable_path_command(&mut receivers).await,
+                Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("relay initialized");
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: Bytes::from_static(b"blocked response"),
+        }))
+        .await
+        .expect("inject Product response");
+    control.wait_blocked().await;
+    release_reset.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(1), consumed_rx)
+        .await
+        .expect("actor consumes the reset or terminates its open-task owner");
+    let result = tokio::time::timeout(Duration::from_secs(1), relay)
+        .await
+        .expect("stream-terminal authority cannot wait for unrelated Product output")
+        .expect("relay task");
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::RemoteReset(
+                crate::protocol::ResetReason::RemoteClosed
+            ))
+        ),
+        "terminal reset survives blocked output and obsolete generation={obsolete_generation}"
+    );
+    assert_eq!(control.accepted_bytes(), b"b");
+}
+
+#[tokio::test]
 async fn response_startup_ack_open_and_final_progress_during_blocked_local_delivery() {
     const STARTUP_TRIGGER_BYTES: usize = 58_400;
     let stream_id = StreamId(58_400);

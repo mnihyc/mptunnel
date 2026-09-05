@@ -558,8 +558,16 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let retirement = context.session_retirement().wait();
-    let active =
-        relay_migrating_tcp_stream_active(local, context, performance, spec, remote, idle_timeout);
+    let active = relay_migrating_tcp_stream_active(
+        local,
+        context,
+        performance,
+        spec,
+        remote,
+        idle_timeout,
+        #[cfg(test)]
+        None,
+    );
     tokio::pin!(retirement);
     tokio::pin!(active);
     tokio::select! {
@@ -576,6 +584,7 @@ async fn relay_migrating_tcp_stream_active<S>(
     spec: ReliableRelayOpenSpec,
     remote: OpenedRemoteStream,
     idle_timeout: Option<std::time::Duration>,
+    #[cfg(test)] test_open_ingress: Option<super::lifecycle::BlockedWriteOpenTestIngress>,
 ) -> Result<PathDeliveryStats, RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -660,6 +669,13 @@ where
             .saturating_add(context.udp_paths.len())
             .max(1),
     );
+    #[cfg(test)]
+    if let Some(ingress) = test_open_ingress {
+        ingress.install(
+            &mut state.recovery.pending_additional_path_opens,
+            additional_path_open_tx.clone(),
+        );
+    }
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(TrafficClass, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
@@ -2942,6 +2958,11 @@ where
                                             );
                                             continue;
                                         };
+                                        // Stream-terminal authority is independent of local
+                                        // delivery and of the attachment attempt's generation.
+                                        if let Some(error) = additional_path_open.terminal_error() {
+                                            break Err(error);
+                                        }
                                         if additional_path_open.startup_ordinal.is_none() {
                                             if matching_additional_path_open_pending(
                                                 &state.recovery.pending_additional_path_opens,

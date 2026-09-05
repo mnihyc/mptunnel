@@ -38,10 +38,13 @@ tests, integration groups6/2/6, and450 native tests plus3 doctests.
 | 1 / 1C | Acquisition arbitration overrode ordinary completion ranking on response/request, assigning OriginalData to a worse eligible carrier. | Keep `38286aa` / `842a0cc`; real owner RED/GREEN. No universal speed gain inferred. |
 | 2; P3/T02/T02b | A configured TCP startup prior lost provenance. The subsequent typed-sidecar change also replaced live scalar evidence before a sustained successor existed. | Keep provenance and exact native QUIC scope; `b7961f3` restores the legacy scalar consumer. Do not describe the unused typed TCP startup-only model as a completed dynamic estimator. |
 | 4; R1 | Waiting on a local sink also delayed accepted Product/control progress; a nested startup-open path deferred terminal RESET, including an obsolete generation. | Keep `444fb38` / `0545610`. Real blocked-sink actor tests prove terminal/control progress without releasing the sink; successful-open ordering remains. |
+| Adjacent FIN/source wake | A successful retried ACK publication could leave an already retained FIN uncommitted; zero source admission did not revisit fresh path evidence. | Keep `f6a2df3` / `a3b706b`, with FIN/actor lifecycle controls in the full suite. These are progress corrections, not congestion tuning or permission to recreate targets. |
 | Server restart; R2 | CREATE, later STARTUP enrollment and ordinary reattachment were ambiguous when the server forgot the stream. Retrying later enrollment could incorrectly create state or repeatedly fail the initial-plan check. | `afbb75a` / `89037a8`: explicit phase, only CREATE allocates. TCP/QUIC absent/retained tests pass. Requires paired wire11 endpoints; not durable exactly-once target creation across state loss. |
 | 6A; P1/T05 | Live-owner repair authority renewed; the first safety fix then used a cumulative percentage as a hard recovery gate. | Flood prevention was justified; percentage authority was not. `72d1237` / `914b9b9` use authenticated configured-slot/range identity and finite structural copy ownership. Preserve non-renewal, not the old percentage guard. |
 | 6E; P1/T06 | Apply expanded a ranked one-quantum repair into a large unranked suffix, increasing duplicate load and ordered debt. | `bfac5b8` retains exact live frontier extent, with separate terminal-failure authority. Exact RED/GREEN and historical matched mixed/QUIC gate support this correction; not all failovers. |
 | 6B | HTTP/3 stream priority was reported but not applied to Quinn. | Keep `a9450d8`; actual native priority is tested. Cannot overtake an already accepted prefix in the same ordered stream. |
+| Earlier QUIC startup/rate authority | Mixed compensated/uncompensated plateau units and application-limited exit premises could terminate backlogged acquisition early; an MPP ACK-window wrapper could separately underfeed a live native controller. | Retain the exact unit/epoch and native authority corrections described in PERFORMANCE and native tests. They do not prove BBR's retained maximum is an accurate current service measurement; N1 is an explicit residual limitation. |
+| Response return-plan startup | The first TCP attachment could own a multi-MiB response prefix before a planned QUIC attachment was even opened. | Retain the explicit bounded pre-FINAL return-plan transaction. Readiness is not mandatory data allocation; later CREATE/STARTUP disambiguation completes its restart branch. No fixed QUIC preference. |
 | P4/T04a | Response completion snapshot added a writer-owned subset to its already-inclusive queue total. | Exact accounting correction; not a request bug. Queue/resource charge lifetime is unchanged. |
 | P4/T04b | Inferred ECF/BDP denied the only otherwise enqueueable Product action. | Keep `65edae3`; lifecycle, configured Product resources and actual writer/native credit still decide admission. The separate completion-horizon branch was unreachable, not a runtime failure. |
 | P5/T10a; C1 | Old quarter-window/payload batching withheld an already freed receive-prefix grant despite RFC8.4. | `5c1d288`,512-byte/4096-window RED/GREEN; latest-value coalescing remains. May add control frames; affected throughput/CPU must be measured, not assumed improved. |
@@ -68,6 +71,11 @@ tests, integration groups6/2/6, and450 native tests plus3 doctests.
 
 ## What remains practically open
 
+The [2026-09-05 experiments](REORDERING_PERFORMANCE_DIAGNOSIS.md) now reproduce
+a severe QUIC reordering deficit on both this tree and the last release.
+They supersede the prospective wording below where results exist, but do not
+close the complete release matrix. There is no new production patch yet.
+
 1. **QUIC deep-buffer latency (N1):** with old bandwidth400 Mbit/s and base
    RTT80ms, the old half-BDP probe allows2MB, but a new10-Mbit/s path's entire
    BDP is0.1MB. A queued RTT can enlarge later flight; the retained maximum
@@ -89,6 +97,9 @@ tests, integration groups6/2/6, and450 native tests plus3 doctests.
    under browser churn/backpressure is not closed by that fact. RSS includes
    live payload and allocator retention. Record live streams, owned queues,
    RSS/CPU and post-load recovery; do not lower concurrency to hide growth.
+   The current `SessionSendBuffer` charges unique source bytes once across
+   streams and releases them on Data ACK or cancellation. Treating its64MiB
+   session limit as4096 independent64MiB source allocations is a false positive.
 5. **Wider current evidence:** P8/T13 still lacks the complete ordinary-build
    six-way, repeated, bidirectional, single-stream/browser, shared/independent
    and combined-condition matrix. Historical charts cannot fill that gap.
@@ -154,3 +165,14 @@ applied transition; a changed rate label alone is not recovery evidence.
 
 Audit workers are unavailable under their usage limit. Root review and tests
 can proceed, but no new independent review is claimed or manufactured.
+
+### Historical wording must not restart completed work
+
+`CARRIER_NATIVE_AUTHORITY_PROOF.md`, `QUINN_BBR3_NATIVE_OPERATIONAL_V1.md`
+and `RESPONSE_STARTUP_READINESS_MODEL.md` contain original baseline verdicts
+and candidate obligations. They are not current defect inventories. Current
+active-controller coherence/fences have runtime tests, the return plan exists,
+and TCP ReceiptMode/new sustained allocation were not deployed. In particular,
+conditional symbolic up/down bounds are not empirically established recovery
+guarantees. Read the current source and this disposition before treating a
+historical sentence beginning "current" as a new bug.

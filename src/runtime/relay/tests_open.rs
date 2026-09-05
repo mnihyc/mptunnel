@@ -80,6 +80,58 @@ fn unsettled_initial_stream_for_test(
 }
 
 #[test]
+fn creation_permission_is_explicit_and_not_inferred_from_ordinal() {
+    let plan = Arc::new(
+        ReliableRelayReturnPlan::new(
+            58_400,
+            PathUsage::Available,
+            vec![
+                (
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index: 0,
+                    },
+                    None,
+                ),
+                (
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Udp,
+                        index: 0,
+                    },
+                    None,
+                ),
+            ],
+        )
+        .unwrap(),
+    );
+    let spec = ReliableRelayOpenSpec::for_initial_plan(
+        TargetAddr::Ip("192.0.2.1:443".parse().unwrap()),
+        TrafficClass::Throughput,
+        plan,
+    );
+    for ordinal in [0, 1] {
+        assert_eq!(
+            spec.for_creation_ordinal(ordinal).return_plan().phase,
+            StreamAttachmentPhase::Create
+        );
+        assert_eq!(
+            spec.for_startup_ordinal(ordinal).return_plan().phase,
+            StreamAttachmentPhase::Startup
+        );
+    }
+    assert_eq!(
+        spec.for_ordinary_attachment().return_plan().phase,
+        StreamAttachmentPhase::Ordinary
+    );
+    let singleton = ReliableRelayOpenSpec::new(spec.target.clone(), TrafficClass::Latency);
+    assert_eq!(singleton.return_plan().phase, StreamAttachmentPhase::Create);
+    assert_eq!(
+        singleton.for_ordinary_attachment().return_plan().phase,
+        StreamAttachmentPhase::Ordinary
+    );
+}
+
+#[test]
 fn return_plan_freezes_active_and_pending_configured_slots() {
     let context = ClientPathContext::new(
         [

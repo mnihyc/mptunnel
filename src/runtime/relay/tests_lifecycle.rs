@@ -60,6 +60,99 @@ fn relay_key(underlay: UnderlayProtocol, index: usize) -> RelayPathKey {
 }
 
 #[tokio::test]
+async fn restart_unbound_startup_candidate_cannot_recreate_missing_stream() {
+    use crate::protocol::{SessionId, StreamDemandHint};
+    use crate::runtime::path::{
+        ServerLocalPathProperties, ServerStreamOpenRequest, ServerStreamPathAttachment,
+    };
+    use crate::runtime::stream::{ServerReliableStreamOpen, ServerReliableStreamRegistry};
+
+    // An accepted stream has not reached h when its server loses all state.
+    // A configured but previously unbound candidate then becomes ready.
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let stream_id = StreamId(620);
+        let first_key = relay_key(UnderlayProtocol::Tcp, 0);
+        let later_key = relay_key(underlay, 1);
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let first = OpenedRemoteStream::pending(
+            test_stream(
+                stream_id,
+                first_key.underlay,
+                first_key.index,
+                commands,
+                TrafficClass::Latency,
+            ),
+            first_key.index,
+        );
+        let remotes = ReliableRelayRemoteSet::new(first, 8);
+        let first_instance = remotes.paths[0].instance();
+        let plan = Arc::new(
+            ReliableRelayReturnPlan::new(
+                58_400,
+                PathUsage::Available,
+                vec![
+                    (first_key, Some(first_instance.path_instance_id)),
+                    (later_key, None),
+                ],
+            )
+            .expect("frozen plan includes not-yet-bound configured slot"),
+        );
+        let mut startup = ClientReliableReturnPlan::from_initial_open(
+            ReliableRelayOpenedStartup {
+                plan: plan.clone(),
+                opening_ordinal: 0,
+                failed_ordinals: Vec::new(),
+            },
+            first_instance,
+        )
+        .expect("already accepted client stream");
+        assert!(!startup.observe_response_frontier(0));
+        drop(remotes);
+        let later_instance = RelayPathInstance {
+            key: later_key,
+            path_instance_id: next_carrier_path_instance_id(),
+            attachment_id: 2,
+        };
+        let ordinal = startup
+            .begin_candidate_for_open(later_key, Some(later_instance.path_instance_id))
+            .expect("disconnected recovery still assigns a STARTUP ordinal");
+        assert_eq!(ordinal, 1);
+
+        let registry = Arc::new(ServerReliableStreamRegistry::new(8));
+        let session_id = SessionId(620);
+        let registration = registry.path_port().register_test_carrier_path(
+            session_id,
+            underlay,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        );
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let outcome = registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
+                initial_demand: StreamDemandHint::Latency,
+                return_plan: plan.wire(StreamAttachmentPhase::Startup, ordinal),
+                attachment: ServerStreamPathAttachment {
+                    path_registration: registration,
+                    commands,
+                    max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+                },
+                mux_limits: MuxLimits::default(),
+            })
+            .expect("valid later enrollment returns a stream-local outcome");
+        assert!(
+            matches!(
+                outcome,
+                ServerReliableStreamOpen::Terminal(crate::protocol::ResetReason::RemoteClosed)
+            ),
+            "enrollment of an accepted stream requires retained server state"
+        );
+    }
+}
+
+#[tokio::test]
 async fn restart_terminal_reset_is_propagated_by_recovery_open() {
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
         let stream_id = StreamId(617);

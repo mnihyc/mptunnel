@@ -1591,9 +1591,10 @@ impl ServerReliableStreamRegistry {
             ));
         }
 
-        if return_plan.phase == StreamAttachmentPhase::Ordinary {
+        if return_plan.phase != StreamAttachmentPhase::Create {
             super::response::validate_return_plan_shape(return_plan)?;
-            // Recovery can only attach to retained byte and target state.
+            // Neither startup enrollment nor ordinary recovery can recreate
+            // absent byte/target state for an already accepted client stream.
             // Publish its terminal identity under the same membership lock as
             // creation so a delayed STARTUP cannot recreate this lost stream.
             self.closed_streams

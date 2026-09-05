@@ -990,6 +990,93 @@ fn restart_missing_ordinary_validates_shape_before_terminal_identity() {
 }
 
 #[test]
+fn creation_on_any_ordinal_and_enrollment_require_distinct_state_authority() {
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        for initial_ordinal in [0, 1] {
+            let registry = constrained_registry(4, 4);
+            let port = registry.path_port();
+            let session_id = SessionId(621);
+            let first = port.register_test_carrier_path(
+                session_id,
+                underlay,
+                PathId(0),
+                ServerLocalPathProperties::default(),
+            );
+            let second = port.register_test_carrier_path(
+                session_id,
+                underlay,
+                PathId(1),
+                ServerLocalPathProperties::default(),
+            );
+            let (commands, _receivers) = reliable_path_command_channels(8);
+            let request = |stream_id, phase, ordinal, registration| ServerStreamOpenRequest {
+                session_id,
+                stream_id: StreamId(stream_id),
+                target: TargetAddr::Ip("192.0.2.1:443".parse().unwrap()),
+                initial_demand: StreamDemandHint::Throughput,
+                return_plan: StreamReturnPlan {
+                    trigger_bytes: 58_400,
+                    candidate_total: 2,
+                    candidate_tier: PathUsage::Available,
+                    phase,
+                    candidate_ordinal: ordinal,
+                },
+                attachment: ServerStreamPathAttachment {
+                    path_registration: registration,
+                    commands: commands.clone(),
+                    max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+                },
+                mux_limits: MuxLimits::default(),
+            };
+            let accepted = registry
+                .open_or_attach(request(
+                    1,
+                    StreamAttachmentPhase::Create,
+                    initial_ordinal,
+                    first.clone(),
+                ))
+                .unwrap();
+            assert!(matches!(accepted, ServerReliableStreamOpen::New(_, _)));
+            assert!(matches!(
+                registry
+                    .open_or_attach(request(
+                        1,
+                        StreamAttachmentPhase::Startup,
+                        1 - initial_ordinal,
+                        second.clone(),
+                    ))
+                    .unwrap(),
+                ServerReliableStreamOpen::Existing(_)
+            ));
+            assert!(matches!(
+                registry
+                    .open_or_attach(request(
+                        2,
+                        StreamAttachmentPhase::Startup,
+                        initial_ordinal,
+                        second.clone(),
+                    ))
+                    .unwrap(),
+                ServerReliableStreamOpen::Terminal(ResetReason::RemoteClosed)
+            ));
+            assert!(matches!(
+                registry
+                    .open_or_attach(request(
+                        2,
+                        StreamAttachmentPhase::Create,
+                        initial_ordinal,
+                        second,
+                    ))
+                    .unwrap(),
+                ServerReliableStreamOpen::Terminal(ResetReason::RemoteClosed)
+            ));
+            assert_eq!(registry.management_snapshot().active_streams, 1);
+            drop(accepted);
+        }
+    }
+}
+
+#[test]
 fn accepted_stream_keeps_its_authenticated_opening_carrier_across_reattachment() {
     let registry = constrained_registry(2, 2);
     let port = registry.path_port();
@@ -3641,7 +3728,7 @@ async fn sibling_return_plan_final_transfers_recovery_before_ordered_detach_comp
             stream_id,
             target: target.clone(),
             initial_demand: StreamDemandHint::Throughput,
-            return_plan: return_plan(StreamAttachmentPhase::Startup, 0),
+            return_plan: return_plan(StreamAttachmentPhase::Create, 0),
             attachment: ServerStreamPathAttachment {
                 path_registration: opening.clone(),
                 commands: opening_commands,

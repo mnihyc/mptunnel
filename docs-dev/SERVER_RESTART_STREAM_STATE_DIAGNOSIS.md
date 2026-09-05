@@ -1,7 +1,10 @@
 # Server restart: lost stream state poisons recovery
 
 Date: 2026-09-05. Examined production revision: `d1a99ad` (v0.4.8).
-Status: bounded correction accepted locally; targeted transport and lifecycle tests pass.
+Status: original ORDINARY correction committed in `afbb75a`; R1 blocked-write
+and R2 late-STARTUP branches corrected and verified locally, using wire 11.
+The current root library suite passes 2,308 tests. Historical RED observations
+below explain the original failure and why the earlier correction was incomplete.
 
 ## Cause and failure sequence
 
@@ -121,3 +124,110 @@ sibling survival (including QUIC payload/ACK exchange), obsolete open
 generation, and terminal reset arriving after carrier replacement. Existing
 duplicate refusal, close ordering, admission, and carrier retirement controls
 remain green. These tests establish recovery/error scope, not a throughput claim.
+
+## Closure audit — 2026-09-05T16:20:00Z
+
+Examined HEAD: `6636091` (restart correction `afbb75a`). No further production
+behavior has been changed. Two diagnostic counterexamples pass by asserting
+the remaining defects; they are not acceptance tests for corrected behavior.
+
+### Terminal reset behind blocked Product output
+
+`control.rs` has a third additional-open receive site inside the local-write
+wait. Its non-STARTUP branch bypasses the common terminal-aware settler:
+matching results are deferred until the write finishes; obsolete-generation
+errors are discarded. The latter subcase is established by branch inspection,
+not a separate runtime reproduction.
+
+`diagnosis_restart_reset_waits_for_blocked_product_write` executes the actual
+relay actor and its nested select. A test-only ingress seam supplies an ordinary
+recovery result after the local sink blocks. Reserving the result channel's
+entire capacity proves the actor consumed the authenticated reset. The relay
+still cannot finish; releasing the sink immediately yields that same reset.
+There is no mock of the failing receive/settlement branch and no network delay.
+
+The branch originated in `444fb38` to let response-startup control progress
+while application delivery blocks. Deferring successful ordinary attachments
+has legitimate post-write ordering requirements; deferring terminal logical
+authority does not. The previous correction updated shared settlers but missed
+this bypass. Bounded correction: classify terminal results before either
+deferral or generation filtering at every ingress, preserving successful-open
+ordering and transient-error behavior. No new timeout is needed.
+
+### STARTUP enrollment reaches the restarted server first
+
+An accepted stream below its response trigger can still contain an unbound
+configured return candidate. After server state is lost, disconnected recovery
+can bind that candidate to a newly ready carrier and send STARTUP. An empty
+registry accepts it as `New`; the client's instance fence accepts the candidate
+too. No ORDINARY has arrived to install the previous fix's terminal-ID fence.
+
+`diagnosis_restart_unbound_startup_candidate_recreates_missing_stream` composes
+the real client plan transitions with the real empty server registry, for TCP
+and QUIC candidates. It reproduces a new server owner for an already accepted
+client stream. This is a component/model reproduction, not a full process-
+restart transfer. A new owner cannot restore destroyed target sockets or
+already-acknowledged bytes retained only by the old server.
+
+The v10 startup model (`3a6d0ea`) conflates permission to create a logical stream
+with enrollment of another return path. Freezing known instances correctly
+rejects their successors, but deliberately unbound slots are a legal branch.
+The earlier test exercised ORDINARY before delayed STARTUP; the opposite order
+was not covered. Rejecting every nonzero ordinal is invalid: ranking can select
+a nonzero ordinal for the genuine first open.
+
+Bounded model correction proposed, not implemented: make initial creation and
+later STARTUP enrollment distinguishable. Only an initial-creation operation
+may allocate absent target state; all attachments of an already accepted stream
+require retained state and otherwise return a stream-local terminal reset.
+Keep the frozen plan, ordinal settlement and FINAL semantics. This needs an
+explicit wire/RFC decision; it must not be implemented as an ordinal heuristic,
+blind stream-ID reset or an implicit conversion from recovery to creation.
+
+### Verification and remaining authority
+
+```sh
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test --locked --lib diagnosis_restart_ -j 4 -- --nocapture
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test --locked --lib restart_ -j 4
+```
+
+New diagnostics: 2/2, including both underlays in the unbound-slot case.
+The broader name-filter control run passes 11 tests (including two app restart
+tests, the two new defect assertions, and seven existing recovery controls).
+Passing defect assertions do not turn the two gaps green. No new runtime fix,
+wire change, commit, push or release is implied by this audit.
+
+## R1 correction — 2026-09-05T17:26Z
+
+The blocked-output ingress now classifies authenticated stream-terminal
+outcomes before either deferred-success ordering or task-generation checks.
+The exact actor test was changed to require termination while its sink stays
+blocked: it failed before the correction, then passed for both current and
+obsolete task generations. It still proves only one byte reached the sink.
+No timeout, gain, stream credit or successful attachment ordering changed.
+
+All28 relay-control tests and31 lifecycle tests pass. This includes blocked
+startup ACK/OPEN/FINAL progress and normal generation/suppression controls.
+The R2 diagnostic is still a defect assertion, not fixed behavior; R1's green
+result does not close R2 or the entire restart incident. Not yet committed.
+# R2 closure — 2026-09-05T17:52Z
+
+The unbound-candidate counterexample first failed the acceptance assertion for
+both carrier profiles: a later STARTUP could allocate a new server stream.
+Version 11 separates CREATE (initial attempts before acceptance) from STARTUP
+(enrollment after acceptance) and ORDINARY. The registry alone owns absent-state
+creation permission; the return-plan component owns ordinal membership only.
+This corrects v10's conflation, not its finite prefix or finalization model.
+
+Targeted controls cover missing STARTUP on either ordinal and either carrier,
+retained STARTUP, CREATE on either ordinal, terminal ID retention, and client
+phase construction. The complete root library suite passed 2,303 tests before
+the last registry control was added; the six creation controls then passed.
+Authentication vectors were independently recomputed from the documented v11
+contexts; the TCP carrier prelude remains its independent v1 protocol.
+
+Tradeoff: this is an intentional wire break requiring matching endpoints. It
+does not claim durable pre-acceptance CREATE deduplication across server state
+loss. No lost target socket or byte-offset state is silently reconstructed.

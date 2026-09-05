@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 10;
+const VERSION: u8 = 11;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 116;
@@ -1492,6 +1492,7 @@ fn stream_attachment_phase_to_u8(value: StreamAttachmentPhase) -> u8 {
     match value {
         StreamAttachmentPhase::Startup => 0,
         StreamAttachmentPhase::Ordinary => 1,
+        StreamAttachmentPhase::Create => 2,
     }
 }
 
@@ -1499,6 +1500,7 @@ fn stream_attachment_phase_from_u8(value: u8) -> Result<StreamAttachmentPhase, C
     match value {
         0 => Ok(StreamAttachmentPhase::Startup),
         1 => Ok(StreamAttachmentPhase::Ordinary),
+        2 => Ok(StreamAttachmentPhase::Create),
         _ => Err(CodecError::InvalidEnum),
     }
 }

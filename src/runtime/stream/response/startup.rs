@@ -73,7 +73,10 @@ impl ResponseStartupPlanState {
         opening: ResponseAcquisitionOutputId,
     ) -> Result<Self, RuntimeError> {
         validate_return_plan_shape(plan)?;
-        if plan.phase != StreamAttachmentPhase::Startup {
+        // This state owns return-plan membership, not target-creation
+        // permission. The registry exclusively validates CREATE before
+        // allocating a target owner; both enrolled phases have this shape.
+        if plan.phase == StreamAttachmentPhase::Ordinary {
             return Err(RuntimeError::Protocol(
                 "initial stream attachment must enroll in its return plan",
             ));
@@ -128,7 +131,9 @@ impl ResponseStartupPlanState {
                     StreamAttachmentPhase::Ordinary => {
                         Ok(ResponseStartupAttachmentCommit { binding: None })
                     }
-                    StreamAttachmentPhase::Startup if plan.candidate_ordinal == 0 => {
+                    StreamAttachmentPhase::Startup | StreamAttachmentPhase::Create
+                        if plan.candidate_ordinal == 0 =>
+                    {
                         if *opening != exact {
                             return Err(RuntimeError::Protocol(
                                 "return-plan ordinal reused by another exact attachment",
@@ -136,7 +141,9 @@ impl ResponseStartupPlanState {
                         }
                         Ok(ResponseStartupAttachmentCommit { binding: None })
                     }
-                    StreamAttachmentPhase::Startup => unreachable!("shape checked ordinal"),
+                    StreamAttachmentPhase::Startup | StreamAttachmentPhase::Create => {
+                        unreachable!("shape checked ordinal")
+                    }
                 }
             }
             ResponseStartupPlanPhase::Unresolved {
@@ -174,7 +181,7 @@ impl ResponseStartupPlanState {
                 _retained_bindings: _,
             } => {
                 validate_signature(plan, *trigger_bytes, *candidate_total, *candidate_tier)?;
-                if plan.phase == StreamAttachmentPhase::Startup {
+                if plan.phase != StreamAttachmentPhase::Ordinary {
                     return Err(RuntimeError::Protocol(
                         "startup attachment arrived after return-plan finalization",
                     ));

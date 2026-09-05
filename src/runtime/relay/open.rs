@@ -46,7 +46,7 @@ impl ReliableRelayOpenSpec {
                 trigger_bytes: 0,
                 candidate_total: 1,
                 candidate_tier: PathUsage::Available,
-                phase: StreamAttachmentPhase::Startup,
+                phase: StreamAttachmentPhase::Create,
                 candidate_ordinal: 0,
             },
             startup_plan: None,
@@ -87,11 +87,19 @@ impl ReliableRelayOpenSpec {
         spec
     }
 
+    fn for_creation_ordinal(&self, ordinal: u8) -> Self {
+        let mut spec = self.for_startup_ordinal(ordinal);
+        spec.return_plan.phase = StreamAttachmentPhase::Create;
+        spec
+    }
+
     pub(in crate::runtime) fn for_ordinary_attachment(&self) -> Self {
         let mut spec = self.clone();
         if let Some(plan) = &spec.startup_plan {
             spec.return_plan = plan.wire(StreamAttachmentPhase::Ordinary, 0);
         }
+        spec.return_plan.phase = StreamAttachmentPhase::Ordinary;
+        spec.return_plan.candidate_ordinal = 0;
         spec
     }
 
@@ -418,7 +426,7 @@ async fn open_remote_stream_active(
         };
         let key = candidate.key;
         let has_unattempted_alternative = position + 1 < opening_candidates.len();
-        let attempt_spec = base_spec.for_startup_ordinal(candidate.ordinal);
+        let attempt_spec = base_spec.for_creation_ordinal(candidate.ordinal);
         let open = open_reliable_initial_attempt(
             context,
             attempt,

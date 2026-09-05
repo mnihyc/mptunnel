@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 10
+# MPTunnel Multipath Proxy Protocol (MPP) Version 11
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 10: its wire format, carrier profiles,
+This document specifies MPP version 11: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,7 +21,7 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 10 is identified by the frame header in Section 12. A peer MUST
+Wire version 11 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
@@ -415,7 +415,7 @@ two frames before `PATH_JOIN`.
 The `SESSION_AUTH` transcript is:
 
 ```text
-"mptunnel session auth v10" ||
+"mptunnel session auth v11" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 nonce:16B ||
@@ -438,7 +438,7 @@ issued_at_unix_secs:u64
 The common `PATH_JOIN` transcript is:
 
 ```text
-"mptunnel path join v10" ||
+"mptunnel path join v11" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 path_id:u16 || configured_member_slot:u16 || underlay:u8 ||
@@ -1185,7 +1185,10 @@ demand are independent facts.
 ### 8.1 Open and attachment
 
 `OPEN_STREAM(stream_id, target, demand, return_plan)` has no permanent carrier
-role. The first accepted open creates the stream. A later open with the same
+role. Only a `CREATE` open may create absent stream state. Before observing
+initial acceptance, the requester uses `CREATE` for its initial open attempts.
+After acceptance, it MUST use `STARTUP` for further frozen-round enrollment
+or `ORDINARY` for other attachments, never `CREATE`. A later open with the same
 `StreamId` adds an attachment only when the target and initial demand hint
 exactly match the original values and its return-plan fields are valid for the
 retained one-shot response-startup transaction.
@@ -1199,15 +1202,19 @@ wire fields are:
 trigger_bytes       h:u64
 candidate_total     n:u8
 candidate_tier      AVAILABLE(0) | BACKUP(1)
-phase               STARTUP(0) | ORDINARY(1)
+phase               STARTUP(0) | ORDINARY(1) | CREATE(2)
 candidate_ordinal   o:u8
 ```
 
 Every plan has `n >= 1` and `o < n`. A canonical singleton has `n = 1`,
-`h = 0`, `phase = STARTUP`, `o = 0`, and is ready immediately without a finalization frame. A
+`h = 0`, `o = 0`, and is ready immediately without a finalization frame. Its
+creation uses `CREATE`; later enrollment uses `STARTUP`. A
 multipath startup plan has `n > 1` and `0 < h <= 58,400` bytes. Its initial
-attachment and every candidate enrolled in that frozen round use `STARTUP`, a
-distinct ordinal, and the same `(h, n, candidate_tier)` signature. An
+attachment uses `CREATE`; further candidates enrolled after acceptance use
+`STARTUP`. They use distinct ordinals and the same `(h, n, candidate_tier)`
+signature. Initial selection may choose any ordinal, not necessarily zero.
+A retried `CREATE` against retained state obeys the same enrollment checks;
+it cannot replace that state or its target. An
 `ORDINARY` attachment uses canonical ordinal zero, is not enrolled in the
 round, and cannot settle or alter it, but carries the retained signature while
 the stream exists.
@@ -1229,7 +1236,7 @@ The responder accepts the first finalization only when every retained ordinal
 is in range, strictly increasing, and enrolled by an exact accepted startup
 attachment. In one transaction it withdraws every omitted enrolled output from
 new Product placement before removing the prefix ceiling. An equal repeated
-finalization is idempotent; a different repetition or a new `STARTUP`
+finalization is idempotent; a different repetition or a new `CREATE`/`STARTUP`
 attachment after finalization is a protocol violation. The requester retains
 the finalization publication until the contiguous response frontier exceeds
 `h`, or until an exact terminal declaration proves either `final_offset > h`
@@ -1243,13 +1250,15 @@ fails a new logical open before publication rather than wrapping. Consequently
 a well-formed delayed frame for an absent or terminal `StreamId` is stale; it
 can never name a future Product stream.
 
-A valid `ORDINARY` open whose logical stream state is absent (for example,
+A valid `STARTUP` or `ORDINARY` open whose logical stream state is absent (for example,
 after the responder restarts) MUST terminate that stream with
 `STREAM_RESET(RemoteClosed)`. It MUST NOT create a replacement target socket
 or fail the shared carrier. The responder records the terminal stream ID
 atomically with the absent-state decision in its existing bounded closed-ID
-retention, so a delayed `STARTUP` cannot recreate it while that identity is
-retained. Opens for retained terminal IDs also receive a stream reset. Ordinary
+retention. Neither enrollment phase may allocate replacement target state,
+even when it is the first open observed after restart. Opens of any phase for
+retained terminal IDs also receive a stream reset. This is not durable replay
+deduplication of a pre-acceptance `CREATE` across responder state loss. Ordinary
 attachment refusal, duplicate output refusal, and physical carrier retirement
 remain attachment-local `STREAM_DETACH` outcomes.
 
@@ -1880,7 +1889,7 @@ interpret the canonical tie key as fairness state. A carrier known to share a
 saturated bottleneck may legitimately provide no marginal service; bounded
 exploration is required only while that marginal opportunity remains unknown.
 
-Core v10 has no synchronized one-way-delay authority. Its live timing input is
+Core v11 has no synchronized one-way-delay authority. Its live timing input is
 therefore one exact local tuple `(timing epoch, validated RTT, optional J)`
 bound to the carrier instance and original-sender direction. It projects
 `T = validated RTT / 2`. When J is present it MUST come from that same tuple; a
@@ -2365,7 +2374,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        10
+4      version        11
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -2473,7 +2482,7 @@ values are TCP `1` and UDP `2`. Directional wire fields use client-to-server
 `1` and server-to-client `2`. Boolean fields use `0` or `1`.
 
 Usage values are `AVAILABLE = 0` and `BACKUP = 1`.
-Return-plan phase values are `STARTUP = 0` and `ORDINARY = 1`.
+Return-plan phase values are `STARTUP = 0`, `ORDINARY = 1`, and `CREATE = 2`.
 
 Close reasons are normal `0`, protocol error `1`, authentication failed `2`,
 and policy rejected `3`. Stream-reset reasons are refused `1`, timed out `2`,
@@ -3781,7 +3790,7 @@ A conforming implementation preserves all of the following:
     ordinals, atomically withdraws omitted enrolled outputs before removing the
     ceiling, and is absorbing and idempotent only for an equal repetition.
 42. Kinds 44 through 48 are reserved and MUST be rejected as unknown under
-    version 10.
+    version 11.
 43. Stale requalification uses one finite cyclic exact-incarnation cursor and
     at most one pending proof and one stream-owned ACK publication per
     direction. The ACK carrier is authenticated return service only; the exact
@@ -3808,7 +3817,7 @@ A conforming implementation preserves all of the following:
     local NativeOperational chronology.
 49. PATH_PROOF, PATH_CAPACITY, and STREAM_REQUALIFY acknowledgments carry
     exactly the fields assigned in Section 12.2; trailing fields are invalid.
-50. Every new stream and attachment uses checked non-reused identity. The v10
+50. Every new stream and attachment uses checked non-reused identity. The v11
     return-plan transaction, Product ACK, lifecycle, and cleanup rules remain
     bounded by configured frame, path, stream, queue, and retention limits.
 

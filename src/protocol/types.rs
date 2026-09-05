@@ -110,6 +110,8 @@ pub enum PathUsage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamAttachmentPhase {
+    /// Initial target creation before the requester has accepted this stream.
+    Create,
     Startup,
     Ordinary,
 }
@@ -129,13 +131,13 @@ impl Default for StreamReturnPlan {
             trigger_bytes: 0,
             candidate_total: 1,
             candidate_tier: PathUsage::Available,
-            phase: StreamAttachmentPhase::Startup,
+            phase: StreamAttachmentPhase::Create,
             candidate_ordinal: 0,
         }
     }
 }
 
-/// Largest remaining delivery-rate authority representable by protocol v10.
+/// Largest remaining delivery-rate authority representable on the wire.
 ///
 /// This is the three-PTO horizon at the maximum wire RTT and RTT variance:
 /// `(u32::MAX + 4 * u32::MAX + 25_000us) * 3`. A receiver rejects larger

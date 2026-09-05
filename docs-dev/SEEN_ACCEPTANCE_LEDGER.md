@@ -1,5 +1,11 @@
 # SEEN acceptance ledger
 
+Historical ledger. Current disposition is recorded in
+`CURRENT_BATCH_CLOSURE.md` (2026-09-05T19:38Z). The baseline failures and OPEN
+labels below are preserved as history, not current test results. Later
+releases and the restart/retention/diagnostic batch resolve specific entries;
+they do not close the remaining broad performance matrix.
+
 Status: internal execution ledger; production baseline `93e6284` is
 release-RED, not a release or competitiveness claim.
 

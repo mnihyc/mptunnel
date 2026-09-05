@@ -1,5 +1,11 @@
 # v0.4.7 finite closure plan
 
+Historical release contract. Current disposition is in
+`CURRENT_BATCH_CLOSURE.md` (2026-09-05T19:38Z). The obsolete baseline and32
+failures below explain that earlier decision point; the current all-feature
+library suite passes2316 tests. Historical constraints and pending broader
+performance work are not erased by that result.
+
 Status: internal release-candidate contract. Production baseline `93e6284` is
 **release-RED**: hard percentage recovery admission, unresolved rate authority,
 32 library-test failures, and incomplete runtime acceptance remain. This

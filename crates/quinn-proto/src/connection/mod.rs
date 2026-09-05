@@ -671,7 +671,10 @@ impl Connection {
 
                 // Congestion control and pacing checks
                 // Tail loss probes must not be blocked by congestion, or a deadlock could arise
-                if ack_eliciting && self.spaces[space_id].loss_probes == 0 {
+                // Closing emits only ACK/CONNECTION_CLOSE, not the pending data
+                // used to compute ack_eliciting. The closed state cannot process
+                // ACKs to reopen this gate. Upstream Quinn #2787.
+                if ack_eliciting && self.spaces[space_id].loss_probes == 0 && !close {
                     // Assume the current packet will get padded to fill the segment
                     let untracked_bytes = if let Some(builder) = &builder_storage {
                         buf_capacity - builder.partial_encode.start

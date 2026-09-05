@@ -24,6 +24,14 @@ configured send buffer. The 0.11.17 tag is not an ancestor of current Quinn
 main, so this is an explicit retained upstream-main correction rather than an
 unrecorded local transport tweak.
 
+The close-only packet admission correction from upstream PR #2787,
+`e916f3e`, is also retained. Pending STREAM data must not congestion-gate a
+packet that actually contains only ACK and CONNECTION_CLOSE; closing stops
+ACK processing, so that gate cannot reopen. MPTUNNEL's local reproductions
+fail before the correction with both CUBIC and BBR3, then deliver the exact
+application close to the peer without advancing test time. Anti-amplification,
+ordinary data admission, pacing, loss recovery and close timers are unchanged.
+
 One bounded local correction completes that same memory invariant beyond the
 five-commit official-main chain. Main commit
 `35fe3379205ed2ace0e6a858f60f3a8a2ff6510e` intended the configured send
@@ -138,7 +146,7 @@ stateless reset, or a TLS certificate flight. The maintained surface is:
 The added BBR3, pacer, callback-ownership, late-ACK, path-lifecycle,
 endpoint-admission, assembler, and packet tests cover these changes. No
 unrelated upstream source file differs semantically from 0.11.17 except for
-the documented datagram and assembler corrections. Preserve the local private
+the documented datagram, assembler and close-admission corrections. Preserve the local private
 Initial, `SpaceId` and per-packet delivery hooks, and the matching `quinn`/H3
 surface when refreshing the controller source.
 
@@ -155,6 +163,7 @@ References:
 - <https://github.com/quinn-rs/quinn/security/advisories/GHSA-4w2j-m93h-cj5j>
 - <https://github.com/quinn-rs/quinn/pull/2694>
 - <https://github.com/quinn-rs/quinn/issues/981>
+- <https://github.com/quinn-rs/quinn/pull/2787>
 
 ## Updating the upstream baseline
 

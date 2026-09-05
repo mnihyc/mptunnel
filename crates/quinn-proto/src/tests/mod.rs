@@ -1239,6 +1239,53 @@ fn connection_close_sends_acks() {
 }
 
 #[test]
+fn connection_close_bypasses_pending_data_admission() {
+    check_close_bypasses_pending_data_admission(false);
+}
+
+#[test]
+fn connection_close_bypasses_bbr3_pending_data_admission() {
+    check_close_bypasses_pending_data_admission(true);
+}
+
+fn check_close_bypasses_pending_data_admission(use_bbr3: bool) {
+    let _guard = subscribe();
+    let mut config = client_config();
+    if use_bbr3 {
+        let mut transport = TransportConfig::default();
+        transport.congestion_controller_factory(Arc::new(congestion::Bbr3Config::default()));
+        config.transport_config(Arc::new(transport));
+    }
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(config);
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, stream)
+        .write(&vec![42; 1024 * 1024])
+        .unwrap();
+    // Ordinary STREAM work remains pending; do not return any ACKs.
+    pair.drive_client();
+    assert!(pair.client_conn_mut(client_ch).bytes_in_flight() > 0);
+    let time = pair.time;
+    pair.client_conn_mut(client_ch)
+        .close(time, VarInt(42), Bytes::from_static(b"finished"));
+    pair.drive_client();
+    pair.drive_server();
+    let mut closed = false;
+    while let Some(event) = pair.server_conn_mut(server_ch).poll() {
+        if let Event::ConnectionLost { reason } = event {
+            assert_matches!(reason, ConnectionError::ApplicationClosed(close)
+                    if close.error_code == VarInt(42) && close.reason == b"finished"[..]);
+            closed = true;
+        }
+    }
+    assert!(
+        closed,
+        "peer must receive the close without advancing time; bbr3={use_bbr3}"
+    );
+    assert_eq!(pair.time, time);
+}
+
+#[test]
 fn server_hs_retransmit() {
     let _guard = subscribe();
     let mut pair = Pair::default();

@@ -1,5 +1,6 @@
 //! Native QUIC congestion and ACK instrumentation.
 
+use crate::performance::DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES;
 use crate::transport::{LossPolicyPercent, PathMetadata, QuicStartupTarget};
 use std::any::Any;
 use std::num::NonZeroU64;
@@ -179,16 +180,27 @@ impl NativeControllerShapeSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct InstrumentedBbrConfig {
     loss_compensation: LossPolicyPercent,
+    loss_journal_max_bytes: usize,
     startup_target: Option<QuicStartupTarget>,
 }
 
+impl Default for InstrumentedBbrConfig {
+    fn default() -> Self {
+        Self::for_path(
+            &PathMetadata::default(),
+            DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
+        )
+    }
+}
+
 impl InstrumentedBbrConfig {
-    pub(super) fn for_path(metadata: &PathMetadata) -> Self {
+    pub(super) fn for_path(metadata: &PathMetadata, loss_journal_max_bytes: usize) -> Self {
         Self {
             loss_compensation: metadata.loss_compensation.unwrap_or_default(),
+            loss_journal_max_bytes,
             startup_target: metadata
                 .quic_startup_target()
                 .expect("QUIC path startup target must be validated during configuration"),
@@ -197,10 +209,12 @@ impl InstrumentedBbrConfig {
 
     fn bbr3_config(
         loss_compensation: LossPolicyPercent,
+        loss_journal_max_bytes: usize,
         startup_target: Option<QuicStartupTarget>,
     ) -> quinn::congestion::Bbr3Config {
         let mut config = quinn::congestion::Bbr3Config::default();
         config.loss_compensation_floor(f64::from(loss_compensation.ppm()) / 1_000_000.0);
+        config.loss_journal_max_bytes(loss_journal_max_bytes);
         if let Some(target) = startup_target {
             config.initial_window_and_pacing_rate(
                 target.window_bytes,
@@ -212,12 +226,17 @@ impl InstrumentedBbrConfig {
 
     fn build_bbr3(
         loss_compensation: LossPolicyPercent,
+        loss_journal_max_bytes: usize,
         startup_target: Option<QuicStartupTarget>,
         now: Instant,
         current_mtu: u16,
     ) -> Box<dyn quinn::congestion::Controller> {
         quinn::congestion::ControllerFactory::build(
-            Arc::new(Self::bbr3_config(loss_compensation, startup_target)),
+            Arc::new(Self::bbr3_config(
+                loss_compensation,
+                loss_journal_max_bytes,
+                startup_target,
+            )),
             now,
             current_mtu,
         )
@@ -304,6 +323,7 @@ pub(super) struct QuicCarrierTelemetrySnapshot {
 pub(super) struct InstrumentedController {
     inner: Box<dyn quinn::congestion::Controller>,
     loss_compensation: LossPolicyPercent,
+    loss_journal_max_bytes: usize,
     startup_target: Option<QuicStartupTarget>,
     pub(super) telemetry: Arc<QuicCarrierTelemetry>,
     path_telemetry: Arc<QuicPathTelemetry>,
@@ -577,6 +597,7 @@ impl InstrumentedController {
         Self::for_path(
             inner,
             LossPolicyPercent::default(),
+            DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
             None,
             telemetry,
             path_telemetry,
@@ -586,6 +607,7 @@ impl InstrumentedController {
     fn for_path(
         inner: Box<dyn quinn::congestion::Controller>,
         loss_compensation: LossPolicyPercent,
+        loss_journal_max_bytes: usize,
         startup_target: Option<QuicStartupTarget>,
         telemetry: Arc<QuicCarrierTelemetry>,
         path_telemetry: Arc<QuicPathTelemetry>,
@@ -611,6 +633,7 @@ impl InstrumentedController {
         Self {
             inner,
             loss_compensation,
+            loss_journal_max_bytes,
             startup_target,
             telemetry,
             path_telemetry,
@@ -916,6 +939,7 @@ impl quinn::congestion::ControllerFactory for InstrumentedBbrConfig {
         // packet pacing, loss recovery, and bytes in flight.
         let inner = Self::build_bbr3(
             self.loss_compensation,
+            self.loss_journal_max_bytes,
             self.startup_target,
             now,
             current_mtu,
@@ -925,6 +949,7 @@ impl quinn::congestion::ControllerFactory for InstrumentedBbrConfig {
         Box::new(InstrumentedController::for_path(
             inner,
             self.loss_compensation,
+            self.loss_journal_max_bytes,
             self.startup_target,
             telemetry,
             path_telemetry,
@@ -1158,6 +1183,7 @@ impl quinn::congestion::Controller for InstrumentedController {
         Box::new(Self {
             inner: self.inner.clone_box(),
             loss_compensation: self.loss_compensation,
+            loss_journal_max_bytes: self.loss_journal_max_bytes,
             startup_target: self.startup_target,
             telemetry: self.telemetry.clone(),
             path_telemetry: self.path_telemetry.clone(),
@@ -1188,6 +1214,7 @@ impl quinn::congestion::Controller for InstrumentedController {
         // connection-scoped evidence owner survives the network transition.
         let inner = InstrumentedBbrConfig::build_bbr3(
             self.loss_compensation,
+            self.loss_journal_max_bytes,
             self.startup_target,
             now,
             current_mtu,
@@ -1196,6 +1223,7 @@ impl quinn::congestion::Controller for InstrumentedController {
         Some(Box::new(Self::for_path(
             inner,
             self.loss_compensation,
+            self.loss_journal_max_bytes,
             self.startup_target,
             self.telemetry.clone(),
             path_telemetry,

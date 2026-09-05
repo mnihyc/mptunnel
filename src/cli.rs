@@ -1,20 +1,20 @@
 use crate::config::{
     AppConfig, ClientPathConfig, ClientSecurityConfig, CommandConfig,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_DATAGRAM_QUEUE_BYTES,
-    DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS, DEFAULT_MAX_REINJECTION_CACHE_CHUNKS,
-    DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES, DEFAULT_MAX_REORDER_BUFFER_CHUNKS,
-    DEFAULT_MAX_RETAINED_RECEIVE_RANGES, DEFAULT_MPP_TLS_SERVER_NAME,
-    DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
-    DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS,
-    DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS, DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS,
-    DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS,
-    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT_MS,
-    DEFAULT_STREAM_WINDOW_BYTES, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
-    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DnsPolicyConfig, LocalIngressConfig, LogFormat,
-    LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig, MppOutboundConfig,
-    MppPerformanceConfig, NamedPathConfig, NodeConfig, OutboundLeafConfig, ProductPolicyConfig,
-    ResourceLimits, ServerSecurityConfig, ServiceConfig, SessionConfig, SharedSecret,
-    normalize_secret_bytes, read_secret_environment, read_secret_file,
+    DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS, DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
+    DEFAULT_MAX_REINJECTION_CACHE_CHUNKS, DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
+    DEFAULT_MAX_REORDER_BUFFER_CHUNKS, DEFAULT_MAX_RETAINED_RECEIVE_RANGES,
+    DEFAULT_MPP_TLS_SERVER_NAME, DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT,
+    DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS,
+    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS,
+    DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS, DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES,
+    DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
+    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DEFAULT_STREAM_WINDOW_BYTES,
+    DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DnsPolicyConfig,
+    LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
+    MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NodeConfig, OutboundLeafConfig,
+    ProductPolicyConfig, ResourceLimits, ServerSecurityConfig, ServiceConfig, SessionConfig,
+    SharedSecret, normalize_secret_bytes, read_secret_environment, read_secret_file,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, ManagedVpnConfig, ManagedVpnPlatformConfig,
@@ -616,6 +616,15 @@ pub struct ResourceArgs {
     )]
     pub max_path_flight_bytes: usize,
 
+    /// Per-native-QUIC-path loss journal metadata ceiling; not preallocated.
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_MAX_QUIC_LOSS_JOURNAL_BYTES",
+        default_value_t = DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES
+    )]
+    pub max_quic_loss_journal_bytes: usize,
+
     #[arg(
         long,
         global = true,
@@ -666,6 +675,7 @@ impl ResourceArgs {
             max_paths: self.max_paths,
             max_streams: self.max_streams,
             max_quic_concurrent_bidi_streams: self.max_quic_concurrent_bidi_streams,
+            max_quic_loss_journal_bytes: self.max_quic_loss_journal_bytes,
             max_stream_window_bytes: self.max_stream_window_bytes,
             max_repair_bytes: self.max_repair_bytes,
             max_reorder_bytes: self.max_reorder_bytes,

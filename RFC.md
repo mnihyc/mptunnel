@@ -4123,6 +4123,25 @@ epoch starts fresh. Resource
 exhaustion therefore may conservatively lose compensation, but cannot panic,
 wrap, silently omit loss, manufacture credit, or make replay state unbounded.
 
+The implementation exposes `resources.max_quic_loss_journal_bytes` as an
+independent per-native-path retained-allocation authority (default 64 MiB,
+allocated only as needed). It counts record and epoch capacities, epoch ID
+arrays, current callback-batch IDs, and retained transaction capacity. Each
+stored item has nonzero size, so the byte authority also establishes a finite
+item bound without a separate traffic-rate limit. This is not a process-RSS
+limit: native transport buffers, allocator bookkeeping and temporary snapshots
+have separate ownership. Changing payload flight capacity does not change this
+metadata authority. Zero permits no journal: its first reservation enters
+`RawOnly`. A fresh native path epoch starts with the same configured resource
+policy.
+
+For the current replay recurrence, the mutable checkpoint operands are `(C,B)`.
+`E` is recoverable from `B = (1-theta) H p0 E` once initialized, and the cold
+anchor is taken from the first retained epoch only when `B = 0`. Consumed
+lifetime-counter frontiers and raw-authority generation are not rewound by
+prefix folding or replay. This representation preserves the complete logical
+checkpoint above without duplicating bookkeeping that is not a replay operand.
+
 The envelope bounds loss displacement, not response time. At constant volume
 and sustained loss fraction `r > theta`, a full bucket crosses after:
 

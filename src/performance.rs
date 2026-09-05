@@ -18,6 +18,9 @@ pub const DEFAULT_MAX_REORDER_BUFFER_CHUNKS: usize = 65_536;
 pub const DEFAULT_MAX_RETAINED_RECEIVE_RANGES: usize = 65_536;
 pub const DEFAULT_MAX_STREAMS: usize = 65_536;
 pub const DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS: usize = DEFAULT_MAX_STREAMS;
+/// Per-native-QUIC-path loss-reclassification metadata ceiling. This is not
+/// preallocated and is independent of the payload flight envelope.
+pub const DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL: Duration =
@@ -66,6 +69,7 @@ pub struct ResourceLimits {
     pub max_paths: usize,
     pub max_streams: usize,
     pub max_quic_concurrent_bidi_streams: usize,
+    pub max_quic_loss_journal_bytes: usize,
     pub max_stream_window_bytes: u64,
     pub max_repair_bytes: usize,
     pub max_reorder_bytes: usize,
@@ -90,6 +94,7 @@ impl Default for ResourceLimits {
             max_paths: 64,
             max_streams: DEFAULT_MAX_STREAMS,
             max_quic_concurrent_bidi_streams: DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS,
+            max_quic_loss_journal_bytes: DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
             max_stream_window_bytes: DEFAULT_STREAM_WINDOW_BYTES,
             max_repair_bytes: DEFAULT_REPAIR_BYTES,
             max_reorder_bytes: DEFAULT_REORDER_BYTES,

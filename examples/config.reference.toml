@@ -198,6 +198,16 @@ max_ack_ranges = 256
 max_paths = 64
 max_streams = 65536
 max_quic_concurrent_bidi_streams = 65536
+# Maximum retained loss-reclassification metadata per native QUIC path, in
+# bytes. This independent 64 MiB ceiling is not allocated in advance and does
+# not follow max_path_flight_bytes or reserve payload capacity. Finalized loss
+# history is reclaimed while newer late-ACK evidence remains live. If the
+# remaining mutable history cannot fit, that native path uses raw BBR3 loss
+# decisions for the rest of its lifetime; no buffered application data is
+# discarded. A new native path starts fresh with this same configured ceiling.
+# Zero permits no journal: its first reservation enters raw-only operation.
+# Omission uses the value shown here.
+max_quic_loss_journal_bytes = 67108864
 max_stream_window_bytes = 67108864
 max_repair_bytes = 67108864
 max_reorder_bytes = 67108864

@@ -1,4 +1,5 @@
 use super::*;
+use crate::performance::DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES;
 use quinn::congestion::Controller as _;
 
 #[derive(Clone)]
@@ -197,6 +198,7 @@ fn controlled_instrumented_controller(
     InstrumentedController::for_path(
         Box::new(inner),
         LossPolicyPercent::default(),
+        DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
         startup_target,
         telemetry,
         path_telemetry,
@@ -996,7 +998,10 @@ fn omitted_and_unlimited_startup_rate_preserve_exact_bbr3_defaults() {
             ..Default::default()
         };
         let controller = quinn::congestion::ControllerFactory::build(
-            Arc::new(InstrumentedBbrConfig::for_path(&metadata)),
+            Arc::new(InstrumentedBbrConfig::for_path(
+                &metadata,
+                DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
+            )),
             now,
             1200,
         )
@@ -1022,7 +1027,10 @@ fn finite_startup_rate_sets_exact_geometry_without_fabricating_bandwidth() {
         ..Default::default()
     };
     let controller = quinn::congestion::ControllerFactory::build(
-        Arc::new(InstrumentedBbrConfig::for_path(&metadata)),
+        Arc::new(InstrumentedBbrConfig::for_path(
+            &metadata,
+            DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
+        )),
         now,
         1200,
     )
@@ -1058,7 +1066,10 @@ fn finite_startup_rate_uses_333ms_default_and_never_shrinks_iw10() {
         ..Default::default()
     };
     let controller = quinn::congestion::ControllerFactory::build(
-        Arc::new(InstrumentedBbrConfig::for_path(&metadata)),
+        Arc::new(InstrumentedBbrConfig::for_path(
+            &metadata,
+            DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
+        )),
         now,
         1200,
     );
@@ -1072,7 +1083,10 @@ fn finite_startup_rate_uses_333ms_default_and_never_shrinks_iw10() {
         ..Default::default()
     };
     let tiny = quinn::congestion::ControllerFactory::build(
-        Arc::new(InstrumentedBbrConfig::for_path(&tiny)),
+        Arc::new(InstrumentedBbrConfig::for_path(
+            &tiny,
+            DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
+        )),
         now,
         1200,
     );
@@ -1109,7 +1123,10 @@ fn path_loss_compensation_and_startup_target_construct_initial_and_fresh_bbr3() 
     .parse::<crate::transport::PathSpec>()
     .expect("QUIC path metadata");
     let controller = quinn::congestion::ControllerFactory::build(
-        Arc::new(InstrumentedBbrConfig::for_path(&path.metadata)),
+        Arc::new(InstrumentedBbrConfig::for_path(
+            &path.metadata,
+            7 * 1024 * 1024,
+        )),
         now,
         1200,
     )
@@ -1117,7 +1134,16 @@ fn path_loss_compensation_and_startup_target_construct_initial_and_fresh_bbr3() 
     .downcast::<InstrumentedController>()
     .expect("instrumented production controller");
     assert_eq!(controller.loss_compensation.ppm(), 51_234);
+    assert_eq!(controller.loss_journal_max_bytes, 7 * 1024 * 1024);
+    let cloned = controller
+        .clone_box()
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("cloned instrumented controller");
+    assert_eq!(cloned.loss_journal_max_bytes, 7 * 1024 * 1024);
+    assert_bbr3_loss_compensation(&cloned, "loss_journal_max_bytes: 7340032");
     assert_bbr3_loss_compensation(&controller, "loss_compensation_floor: 0.051234");
+    assert_bbr3_loss_compensation(&controller, "loss_journal_max_bytes: 7340032");
     assert_eq!(controller.initial_window(), 1_040_625);
     assert_eq!(controller.metrics().pacing_rate, Some(3_125_000));
     assert_eq!(controller.metrics().bandwidth_estimate, None);
@@ -1128,7 +1154,9 @@ fn path_loss_compensation_and_startup_target_construct_initial_and_fresh_bbr3() 
         .downcast::<InstrumentedController>()
         .expect("fresh instrumented controller");
     assert_eq!(fresh.loss_compensation.ppm(), 51_234);
+    assert_eq!(fresh.loss_journal_max_bytes, 7 * 1024 * 1024);
     assert_bbr3_loss_compensation(&fresh, "loss_compensation_floor: 0.051234");
+    assert_bbr3_loss_compensation(&fresh, "loss_journal_max_bytes: 7340032");
     assert_eq!(fresh.initial_window(), 1_040_625);
     assert_eq!(fresh.metrics().pacing_rate, Some(3_125_000));
     assert_eq!(fresh.metrics().bandwidth_estimate, None);
@@ -1137,7 +1165,10 @@ fn path_loss_compensation_and_startup_target_construct_initial_and_fresh_bbr3() 
         ..Default::default()
     };
     let default_controller = quinn::congestion::ControllerFactory::build(
-        Arc::new(InstrumentedBbrConfig::for_path(&rate_only)),
+        Arc::new(InstrumentedBbrConfig::for_path(
+            &rate_only,
+            DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
+        )),
         now,
         1200,
     )
@@ -1145,6 +1176,10 @@ fn path_loss_compensation_and_startup_target_construct_initial_and_fresh_bbr3() 
     .downcast::<InstrumentedController>()
     .expect("default instrumented controller");
     assert_eq!(default_controller.loss_compensation.ppm(), 100_000);
+    assert_eq!(
+        default_controller.loss_journal_max_bytes,
+        DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
+    );
     assert_bbr3_loss_compensation(&default_controller, "loss_compensation_floor: 0.1");
     assert_eq!(default_controller.initial_window(), 1_040_625);
     assert_eq!(default_controller.metrics().pacing_rate, Some(3_125_000));
@@ -1154,7 +1189,10 @@ fn path_loss_compensation_and_startup_target_construct_initial_and_fresh_bbr3() 
         .parse::<crate::transport::PathSpec>()
         .expect("explicitly disabled QUIC loss compensation");
     let disabled_controller = quinn::congestion::ControllerFactory::build(
-        Arc::new(InstrumentedBbrConfig::for_path(&disabled.metadata)),
+        Arc::new(InstrumentedBbrConfig::for_path(
+            &disabled.metadata,
+            DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
+        )),
         now,
         1200,
     )

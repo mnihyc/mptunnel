@@ -1706,6 +1706,27 @@ fn resource_file_config_derives_path_flight_from_reinjection_envelope() {
 
     assert_eq!(limits.max_repair_bytes, 128 * 1024 * 1024);
     assert_eq!(limits.max_path_flight_bytes, limits.max_repair_bytes);
+    assert_eq!(
+        limits.max_quic_loss_journal_bytes,
+        ResourceLimits::default().max_quic_loss_journal_bytes,
+        "payload flight must not implicitly change the independent metadata ceiling",
+    );
+}
+
+#[test]
+fn resource_file_config_preserves_explicit_quic_loss_journal_limit() {
+    for bytes in [0, 7 * 1024 * 1024] {
+        let config: ResourceFileConfig =
+            toml::from_str(&format!("max_quic_loss_journal_bytes = {bytes}"))
+                .expect("explicit QUIC loss journal byte ceiling");
+        let limits = config.into_limits();
+        limits.validate().expect("independent metadata limit");
+        assert_eq!(limits.max_quic_loss_journal_bytes, bytes);
+        assert_eq!(
+            crate::mux::MuxLimits::from(limits).max_quic_loss_journal_bytes,
+            bytes,
+        );
+    }
 }
 
 #[test]

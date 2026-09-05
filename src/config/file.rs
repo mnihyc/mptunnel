@@ -745,6 +745,7 @@ struct ResourceFileConfig {
     max_paths: Option<usize>,
     max_streams: Option<usize>,
     max_quic_concurrent_bidi_streams: Option<usize>,
+    max_quic_loss_journal_bytes: Option<usize>,
     max_stream_window_bytes: Option<u64>,
     max_repair_bytes: Option<usize>,
     max_reorder_bytes: Option<usize>,
@@ -890,6 +891,9 @@ impl ResourceFileConfig {
             max_quic_concurrent_bidi_streams: self
                 .max_quic_concurrent_bidi_streams
                 .unwrap_or(defaults.max_quic_concurrent_bidi_streams),
+            max_quic_loss_journal_bytes: self
+                .max_quic_loss_journal_bytes
+                .unwrap_or(defaults.max_quic_loss_journal_bytes),
             max_stream_window_bytes: self
                 .max_stream_window_bytes
                 .unwrap_or(defaults.max_stream_window_bytes),

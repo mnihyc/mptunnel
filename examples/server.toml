@@ -19,6 +19,10 @@ level = "info" # all levels are good
 # Sender-side QUIC loss correction with a bounded 3-round burst envelope; path URI wins.
 # quic_loss_compensation_percent = 10
 
+[resources]
+# Per-QUIC-path loss metadata ceiling, not preallocated; exhaustion uses raw BBR3 loss decisions.
+# max_quic_loss_journal_bytes = 67108864
+
 [admission]
 max_live_flows = 4096
 max_concurrent_work = 4096

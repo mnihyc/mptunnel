@@ -90,6 +90,13 @@ deviations from upstream 0.11.17 are:
   exit only for an exact epoch that was and remains application-limited;
   backlogged acquisition uses the compensated full-bandwidth plateau, while
   raw signals, zero policy, and ProbeBW retain native behavior;
+- the compensation journal folds finalized chronological prefixes into its
+  exact checkpoint while younger late-ACK transactions remain live. Its
+  independently configured retained-memory ceiling includes collection slack
+  and epoch record-ID arrays. Exhaustion discards compensation and undo
+  authority for that native path epoch, preserving the connection and current
+  native controller state with raw loss handling. A configured zero loss
+  policy retains the ordinary draft behavior; it is not this exhaustion state;
 - an opt-in controller hook lets a genuinely new network path start fresh
   congestion state while retaining a connection-scoped instrumentation owner;
   controllers that do not implement the hook retain Quinn's factory-reset

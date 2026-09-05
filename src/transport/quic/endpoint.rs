@@ -594,7 +594,10 @@ fn quic_transport_config_for_path(
         .datagram_receive_buffer_size(Some(mux_limits.max_datagram_queue_bytes))
         .datagram_send_buffer_size(mux_limits.max_datagram_queue_bytes)
         .max_idle_timeout(Some(mux_limits.quic_path_idle_timeout.try_into()?))
-        .congestion_controller_factory(Arc::new(InstrumentedBbrConfig::for_path(path_metadata)));
+        .congestion_controller_factory(Arc::new(InstrumentedBbrConfig::for_path(
+            path_metadata,
+            mux_limits.max_quic_loss_journal_bytes,
+        )));
     if client_keep_alive {
         let maximum = mux_limits.quic_path_keep_alive_interval;
         transport.keep_alive_interval_range(maximum - maximum / 5, maximum);

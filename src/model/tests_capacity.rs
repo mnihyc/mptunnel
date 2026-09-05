@@ -6,8 +6,8 @@ use super::{
     reliable_product_feedback_window_bytes, reliable_product_measurement_session_envelope_bytes,
     reliable_product_recovery_window_bytes, reliable_relay_buffer_len,
     reliable_relay_scheduler_quantum_cap, reliable_relay_sender_dispatch_budget,
-    reliable_stream_ack_update_bytes, reliable_stream_advertised_window_bytes,
-    reliable_stream_initial_advertised_window_bytes, reliable_stream_max_data_update_bytes,
+    reliable_stream_ack_batch_limit_bytes, reliable_stream_ack_update_bytes,
+    reliable_stream_advertised_window_bytes, reliable_stream_initial_advertised_window_bytes,
     reliable_stream_source_admission, reliable_unproven_path_startup_flight_limit_bytes,
     valid_tcp_capacity_proof_candidate_at,
 };
@@ -768,7 +768,7 @@ fn reliable_recv_progress_default_bulk_ack_step_tracks_service_quantum() {
     assert_eq!(ack_step, MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64);
     let window =
         reliable_stream_advertised_window_bytes(None, TrafficClass::Throughput, mux_limits);
-    assert!(ack_step < reliable_stream_max_data_update_bytes(window, mux_limits));
+    assert!(ack_step < reliable_stream_ack_batch_limit_bytes(window, mux_limits));
     assert_eq!(
         reliable_stream_ack_update_bytes(None, TrafficClass::Latency, mux_limits),
         1

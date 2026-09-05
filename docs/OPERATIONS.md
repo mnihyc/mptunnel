@@ -1134,6 +1134,11 @@ independent limits. Each MPP direction has independent DSN, Data ACK, and
 grants no offset; `STREAM_MAX_DATA` grants offsets but acknowledges no byte. A
 native transport ACK does neither at the MPP data level.
 
+Receive credit advances after the receive owner releases each completed local
+delivery batch. It does not wait for a byte threshold. Blocked attachments
+retain one latest grant and retry on capacity; partial sink writes retain the
+same batch and write cursor until completion, without granting its storage twice.
+
 ## Traffic and failover expectations
 
 MPP may reinject an exact missing data-level range after causal stall/failure

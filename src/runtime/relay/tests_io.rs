@@ -30,17 +30,27 @@ struct VectoredWriteProbe {
     scalar_writes: usize,
     vectored_writes: usize,
     flushes: usize,
+    max_write_bytes: Option<usize>,
+    yield_between_writes: bool,
+    yield_next: bool,
 }
 
 impl AsyncWrite for VectoredWriteProbe {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        if self.yield_next {
+            self.yield_next = false;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.yield_next = self.yield_between_writes;
         self.scalar_writes = self.scalar_writes.saturating_add(1);
-        self.bytes.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
+        let written = self.max_write_bytes.unwrap_or(buf.len()).min(buf.len());
+        self.bytes.extend_from_slice(&buf[..written]);
+        Poll::Ready(Ok(written))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -54,19 +64,53 @@ impl AsyncWrite for VectoredWriteProbe {
 
     fn poll_write_vectored(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
+        if self.yield_next {
+            self.yield_next = false;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.yield_next = self.yield_between_writes;
         self.vectored_writes = self.vectored_writes.saturating_add(1);
-        let written = bufs.iter().map(|slice| slice.len()).sum();
+        let total: usize = bufs.iter().map(|slice| slice.len()).sum();
+        let written = self.max_write_bytes.unwrap_or(total).min(total);
+        let mut remaining = written;
         for slice in bufs {
-            self.bytes.extend_from_slice(slice);
+            let take = remaining.min(slice.len());
+            self.bytes.extend_from_slice(&slice[..take]);
+            remaining -= take;
         }
         Poll::Ready(Ok(written))
     }
 
     fn is_write_vectored(&self) -> bool {
         true
+    }
+}
+
+#[tokio::test]
+async fn delivered_payload_write_preserves_partial_cursor_across_pending() {
+    for chunks in [
+        vec![Bytes::from_static(b"abcdefghijkl")],
+        vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"efghijkl")],
+    ] {
+        let mut writer = VectoredWriteProbe {
+            max_write_bytes: Some(3),
+            yield_between_writes: true,
+            ..VectoredWriteProbe::default()
+        };
+        assert_eq!(
+            write_delivered_payloads(&mut writer, &chunks)
+                .await
+                .unwrap(),
+            12
+        );
+        assert_eq!(writer.bytes, b"abcdefghijkl");
+        assert_eq!(writer.scalar_writes + writer.vectored_writes, 4);
+        // Partial sink acceptance does not mutate/release the owned batch.
+        assert_eq!(chunks.iter().map(Bytes::len).sum::<usize>(), 12);
     }
 }
 

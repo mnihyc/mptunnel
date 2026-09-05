@@ -182,7 +182,7 @@ pub(crate) fn reliable_stream_advertised_window_bytes(
     reliable_bulk_product_windows(mux_limits).stream_resource_limit_bytes
 }
 
-pub(crate) fn reliable_stream_max_data_update_bytes(
+pub(crate) fn reliable_stream_ack_batch_limit_bytes(
     advertised_window_bytes: u64,
     mux_limits: MuxLimits,
 ) -> u64 {
@@ -202,7 +202,7 @@ pub(crate) fn reliable_stream_ack_update_bytes(
         return 1;
     }
     let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
-    let resource_ceiling = reliable_stream_max_data_update_bytes(advertised_window, mux_limits)
+    let resource_ceiling = reliable_stream_ack_batch_limit_bytes(advertised_window, mux_limits)
         .min(
             (mux_limits.max_repair_bytes as u64)
                 .saturating_div(4)

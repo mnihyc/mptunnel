@@ -5,7 +5,7 @@
 
 use crate::model::capacity::{
     QUIC_TIMER_GRANULARITY, reliable_stream_ack_update_bytes,
-    reliable_stream_advertised_window_bytes, reliable_stream_max_data_update_bytes,
+    reliable_stream_advertised_window_bytes,
 };
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
@@ -158,7 +158,6 @@ impl StreamAckPublicationCursor {
 #[derive(Debug, Clone, Default)]
 pub(in crate::runtime) struct ReliableRecvProgress {
     last_max_data_offset: u64,
-    last_max_data_window_bytes: u64,
     ack_generation: u64,
     last_ack_offset: u64,
     last_ack_reorder_bytes: usize,
@@ -254,16 +253,11 @@ impl ReliableRecvProgress {
     ) -> bool {
         let window_bytes = reliable_stream_advertised_window_bytes(path, traffic_class, mux_limits);
         let max_offset = recv_stream.max_data_offset_with_window(window_bytes);
-        let update_step = reliable_stream_max_data_update_bytes(window_bytes, mux_limits);
-        let window_changed = self.last_max_data_window_bytes != 0
-            && window_bytes.abs_diff(self.last_max_data_window_bytes) >= update_step;
-        if force
-            || self.last_max_data_offset == 0
-            || window_changed
-            || max_offset.saturating_sub(self.last_max_data_offset) >= update_step
-        {
+        // RFC 8.4: every freed prefix advances the retained grant. Attachment
+        // publication already coalesces blocked updates into one latest value;
+        // a byte threshold here would withhold usable receive credit.
+        if force || self.last_max_data_offset == 0 || max_offset > self.last_max_data_offset {
             self.last_max_data_offset = max_offset;
-            self.last_max_data_window_bytes = window_bytes;
             true
         } else {
             false

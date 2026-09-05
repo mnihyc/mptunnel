@@ -3897,7 +3897,7 @@ fn sender_service_retry_delay_is_ack_paced_not_one_millisecond_spin() {
 }
 
 #[test]
-fn reliable_recv_progress_batches_max_data_updates() {
+fn reliable_recv_progress_slides_max_data_on_every_consumed_prefix() {
     let mux_limits = MuxLimits {
         max_payload_bytes: 1024,
         max_reliable_relay_chunk_bytes: 1024,
@@ -3909,11 +3909,6 @@ fn reliable_recv_progress_batches_max_data_updates() {
     };
     let mut recv_stream = ReliableRecvStream::new(StreamId(22), mux_limits);
     let mut progress = ReliableRecvProgress::default();
-    let window =
-        reliable_stream_advertised_window_bytes(None, TrafficClass::Throughput, mux_limits);
-    let step = reliable_stream_max_data_update_bytes(window, mux_limits);
-
-    assert_eq!(step, 1024);
     assert!(progress.should_send_max_data(
         &recv_stream,
         None,
@@ -3931,8 +3926,8 @@ fn reliable_recv_progress_batches_max_data_updates() {
 
     recv_stream
         .receive_data(0, Bytes::from(vec![0x11; 512]))
-        .expect("half-step data");
-    assert!(!progress.should_send_max_data(
+        .expect("released prefix smaller than the old batching threshold");
+    assert!(progress.should_send_max_data(
         &recv_stream,
         None,
         TrafficClass::Throughput,
@@ -3942,7 +3937,7 @@ fn reliable_recv_progress_batches_max_data_updates() {
 
     recv_stream
         .receive_data(512, Bytes::from(vec![0x22; 512]))
-        .expect("full-step data");
+        .expect("next released prefix");
     assert!(progress.should_send_max_data(
         &recv_stream,
         None,

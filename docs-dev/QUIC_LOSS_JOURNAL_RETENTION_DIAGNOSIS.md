@@ -1,7 +1,11 @@
 # QUIC loss journal: rolling retention grows RAM and CPU
 
 Date: 2026-09-05. Examined production revision: `d1a99ad` (v0.4.8).
-Status: correction and resource boundary tests pass; independent review accepted.
+Status (2026-09-05T19:23Z): prefix/resource correction is in6636091;
+migration-rollback terminal ownership and clone identity are corrected in
+this batch. The complete native suite passes450 tests plus3 doctests.
+The historical RED observations below explain the defects; they are not
+current test failures. The uncaptured deployed RSS incident is not conclusively attributed.
 
 ## Cause
 
@@ -225,3 +229,94 @@ BBR raw-response condition). Both source forms are unchanged by this work.
 The standalone warnings-denied check therefore remains non-green on this
 pre-existing lint baseline; no unrelated source cleanup is included. This is
 separate from the passing project Clippy gate and targeted runtime/model tests.
+
+## Closure audit — 2026-09-05T16:20:00Z
+
+The collector remains correct when native transaction-finalization callbacks
+reach each live owner. That premise fails across native migration rollback.
+
+1. `PathData::from_previous` clones a same-IP controller, including its undo
+   transactions and journal, while preserving its controller epoch. A different
+   network instead creates a new epoch. Either way the original can be parked
+   in `prev_path` for rollback.
+2. Native retained-loss expiry removes packet evidence after two PTOs, but
+   reports abandonment only to the currently active controller. Different-
+   epoch expiry does not even return the parked epoch's transaction ID.
+3. Path validation can fail after three PTOs and restore the parked controller.
+   The restored controller still considers the expired transaction undo-eligible;
+   native packet evidence that could produce its final callback is already gone.
+
+`diagnosis_migration_rollback_restores_abandoned_loss_transaction` reproduces
+this for same-IP port migration and a fresh-network candidate. It uses actual
+BBR3 send/loss/congestion callbacks with MPP's 10% policy, actual `PathData`
+clone/install/restore and the native retained-evidence expiry function. An
+inspection clone accepts undo after restoration although the native loss map
+is empty; the candidate does not. The test intentionally asserts the defect.
+It is a transport-component reproduction, not a packet-level migration or RSS
+stress test. Existing packet-level migration tests separately exercise these
+install/rollback operations and their activation identity changes.
+
+This leaves a stale journal owner, not an unbounded-RSS claim on the corrected
+build: the finite retained allocation ceiling still applies. A stale owner can
+pin old history until another terminal event or RawOnly exhaustion, increasing
+work and potentially disabling compensation. Neither that performance effect
+nor the user's current slow download was measured by this counterexample.
+
+## M1 correction — 2026-09-05T17:30Z
+
+Retained proof outcomes now retain `(controller_epoch, transaction)` through
+expiry and ACK matching. Finalization reaches every extant owning controller
+copy, active or parked. Full late-ACK proof still waits for all packet spaces;
+one expired member disqualifies younger members of the same exact transaction.
+The CE revocation branch returns its disqualified owners before clearing their
+record tokens, so rollback cannot revive those either. Ordinary rate/RTT/ACK
+and attributable congestion processing remain active-path operations.
+
+The ownership correction exposed a necessary related identity invariant:
+cloning a controller copied its current transaction number, so candidate and
+restored predecessor both allocated transaction2 for different new recovery
+episodes. An exact clone/enter-recovery test failed with both IDs equal2.
+BBR3 now shares only a checked atomic identity allocator across its lineage;
+existing model/undo state remains separately cloned. Exhaustion enters the
+existing RawOnly outcome without identity reuse. No controller gains, rate
+allowance, RTT thresholds or payload resources changed.
+
+Focused controls pass:15 connection tests including six rollback combinations
+(same-IP/fresh-network × expiry/final ACK/CE revocation), three transaction
+tests, three journal-prefix/oracle tests,18 spurious-loss tests, and three
+migration tests including real packet-level install/rollback. Counts overlap;
+they are not summed into a unique suite total. The retained journal resource
+bound and exact replay mechanism remain intact. These are correctness and
+ownership proofs, not a whole-process RSS or throughput claim.
+
+RFC17.2 and the maintained Quinn delta now state terminal ownership and
+non-reusing lineage identity. No independent review is claimed because the
+existing reviewers are quota-unavailable. Batch integration remains pending.
+
+The active-only producer predates the collector correction: `d5a7413` introduced
+the controller-epoch-aware undo callbacks, with transaction refinements in
+`3a6d0ea`. Protecting a new controller from another epoch's congestion evidence
+is correct. Treating a parked owner as destroyed is not. Previous tests covered
+collector replay and activation rollback separately, not their composition.
+
+### Historical proposal and RED observation, before the M1 correction
+
+Bounded correction proposed: preserve terminal transaction ownership across
+active and parked controllers, keyed by controller epoch and exact transaction.
+Expiry/ambiguity must invalidate all live copies that own the transaction;
+partial expiry must not leave surviving records eligible for complete undo.
+Late ACK completion needs the same lifetime accounting, without applying old-
+path rate/RTT samples to a different active controller. Do not indiscriminately
+clear journals on migration, duplicate normal ACK processing, reset native
+bandwidth, or let an equal numeric transaction ID cross an epoch boundary.
+Reconcile this ownership explicitly in the RFC and maintained Quinn delta when
+implemented. Ordinary prefix folding and the finite resource boundary remain.
+
+```sh
+CARGO_TARGET_DIR=./target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test --locked --manifest-path crates/quinn-proto/Cargo.toml \
+  --lib diagnosis_migration_rollback -j 4 -- --nocapture
+```
+
+Observed: 1/1 diagnostic passes, covering both migration types. No new production
+correction, upstream update, performance acceptance or release in this audit.

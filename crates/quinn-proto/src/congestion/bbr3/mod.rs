@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg32;
@@ -431,6 +432,9 @@ pub struct Bbr3 {
     undo_state: Option<BbrState>,
     /// Monotonic identity of the current RFC 9002 recovery episode.
     recovery_transaction: Option<RecoveryTransactionId>,
+    /// Cloned migration candidates share the allocator, not mutable model
+    /// state. Rollback must not reuse an identity issued by a discarded copy.
+    recovery_transaction_sequence: Arc<AtomicU64>,
     /// Transaction that exclusively owns the current loss-undo snapshot.
     undo_transaction: Option<RecoveryTransactionId>,
     /// equivalent to BBR.round_count: Count of packet-timed round trips elapsed so far.
@@ -763,6 +767,7 @@ impl Bbr3 {
             state: BbrState::Startup,
             undo_state: None,
             recovery_transaction: None,
+            recovery_transaction_sequence: Arc::new(AtomicU64::new(0)),
             undo_transaction: None,
             round_count: 0,
             round_start: true,
@@ -1945,11 +1950,13 @@ impl Bbr3 {
         self.recovery_start_round = self.round_count;
         self.in_recovery = true;
         if !self.loss_journal_raw_only {
-            let next = self
-                .recovery_transaction
-                .map_or(Some(1), |transaction| transaction.0.checked_add(1));
-            if let Some(next) = next {
-                self.recovery_transaction = Some(RecoveryTransactionId::new(next));
+            let next = self.recovery_transaction_sequence.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |last| last.checked_add(1),
+            );
+            if let Ok(last) = next {
+                self.recovery_transaction = Some(RecoveryTransactionId::new(last + 1));
             } else {
                 self.enter_loss_journal_raw_only();
                 self.recovery_transaction = None;
@@ -5387,6 +5394,33 @@ mod test {
             }
             panic!("simulation exceeded {max_iters} iterations without reaching the target state");
         }
+    }
+
+    #[test]
+    fn recovery_transaction_identity_does_not_rewind_across_clones() {
+        let now = Instant::now();
+        let mut original = Bbr3::new(Arc::new(Bbr3Config::default()), 1200);
+        assert!(original.enter_recovery(now, now));
+        let common = original.recovery_transaction.unwrap();
+        let mut candidate = original.clone();
+        assert_eq!(candidate.recovery_transaction, Some(common));
+        assert!(
+            candidate.enter_recovery(now + Duration::from_secs(1), now + Duration::from_millis(1))
+        );
+        assert!(original.enter_recovery(now + Duration::from_secs(2), now + Duration::from_secs(1)));
+        assert_ne!(
+            candidate.recovery_transaction, original.recovery_transaction,
+            "rollback must not reuse a transaction still retained from a candidate"
+        );
+        candidate
+            .recovery_transaction_sequence
+            .store(u64::MAX, Ordering::Relaxed);
+        assert!(original.enter_recovery(now + Duration::from_secs(3), now + Duration::from_secs(3)));
+        assert!(original.loss_journal_raw_only);
+        assert_eq!(
+            original.recovery_transaction, None,
+            "lineage identity exhaustion cannot wrap and revive old proof"
+        );
     }
 
     #[derive(Clone, Copy, Debug, PartialEq)]

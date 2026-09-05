@@ -248,7 +248,9 @@ impl Drop for ControllerActivationTransition<'_> {
 pub struct RecoveryTransactionId(pub(crate) u64);
 
 impl RecoveryTransactionId {
-    /// Construct an identity unique within one controller instance.
+    /// Construct an identity unique within one controller lineage, including
+    /// migration clones that may later be restored. Cloning preserves existing
+    /// transaction identity but must not reuse IDs for divergent new episodes.
     pub const fn new(id: u64) -> Self {
         Self(id)
     }

@@ -53,6 +53,11 @@ deviations from upstream 0.11.17 are:
   can restore the model. Expired evidence or transport-valid CE abandons that
   undo identity, and a fresh controller cannot consume feedback from the prior
   network path;
+- retained-loss terminal facts are dispatched by controller epoch to both
+  the active controller and any parked rollback owner. Expiry, final late ACK,
+  and CE disqualification cannot leave dead proof in a restored clone.
+  Divergent recovery episodes allocate checked identities from a shared
+  lineage sequence, so rollback cannot reuse a candidate's transaction number;
 - actual on-wire ECT provenance is retained with lost packets. Transport ECN
   counters still advance on ambiguous cumulative feedback, while a controller
   CE callback requires an exact, wholly current-epoch cohort and a live packet

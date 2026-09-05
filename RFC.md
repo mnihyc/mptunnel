@@ -4086,6 +4086,17 @@ classes from the checkpoint, including overlapping transactions. This equality
 does not claim rollback of native BBR state; the conservative native-undo rule
 below may retain an earlier native response.
 
+Retained recovery proof is identified by controller lineage and transaction,
+not by whichever path is active when the proof terminates. Expiry, complete
+late-ACK proof, and explicit disqualification MUST reach every extant owning
+controller copy, including a parked migration rollback state. Partial expiry
+disqualifies the whole exact transaction; final late-ACK completion still
+requires all its packet-space evidence. Controller clones preserve existing
+transaction identities but allocate divergent new episodes from a shared
+non-reusing lineage sequence. Restoring a clone MUST NOT rewind that sequence.
+These ownership notifications do not authorize delivery, RTT, or congestion
+samples for another path, and cannot modify an unrelated controller lineage.
+
 The journal has finite immutable byte and item authorities `J^B` and `J^I`.
 After every insertion, reclassification, and recovery-transaction terminal,
 the sender MUST advance the checkpoint through the maximal chronological

@@ -1572,9 +1572,12 @@ impl Connection {
 
         let retained_ack = self.detect_spurious_loss(now, &ack, space);
         for &transaction in &retained_ack.abandoned_transactions {
-            self.path
-                .congestion
-                .on_recovery_transaction_abandoned(transaction);
+            settle_retained_loss_owners(
+                &mut self.path,
+                self.prev_path.as_mut().map(|(_, path)| path),
+                transaction,
+                RetainedLossTerminal::Abandoned,
+            );
         }
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
@@ -1747,16 +1750,16 @@ impl Connection {
     }
 
     fn finish_spurious_loss_detection(&mut self, detection: &SpuriousLossDetection) {
-        let controller_epoch = self.path.controller_epoch();
-        for &transaction in &detection.matched_transactions {
+        for &(controller_epoch, transaction) in &detection.matched_transactions {
             if has_retained_loss_for_transaction(&self.spaces, controller_epoch, transaction) {
                 continue;
             }
-            if self
-                .path
-                .congestion
-                .on_spurious_congestion_event(transaction)
-            {
+            if settle_retained_loss_owners(
+                &mut self.path,
+                self.prev_path.as_mut().map(|(_, path)| path),
+                (controller_epoch, transaction),
+                RetainedLossTerminal::Spurious,
+            ) {
                 self.stats.path.spurious_congestion_events =
                     self.stats.path.spurious_congestion_events.saturating_add(1);
             }
@@ -1766,13 +1769,15 @@ impl Connection {
     /// Expire retained loss evidence after two PTOs, matching current-main Quinn.
     fn drain_lost_packets(&mut self, now: Instant) {
         let two_pto = 2 * self.path.rtt.pto_base();
-        let controller_epoch = self.path.controller_epoch();
         let abandoned =
-            expire_retained_losses_in_spaces(&mut self.spaces, now, two_pto, controller_epoch);
+            expire_retained_losses_in_spaces(&mut self.spaces, now, two_pto);
         for transaction in abandoned {
-            self.path
-                .congestion
-                .on_recovery_transaction_abandoned(transaction);
+            settle_retained_loss_owners(
+                &mut self.path,
+                self.prev_path.as_mut().map(|(_, path)| path),
+                transaction,
+                RetainedLossTerminal::Abandoned,
+            );
         }
     }
 
@@ -1826,7 +1831,16 @@ impl Connection {
                     // after an attributable controller response so even a CE-created snapshot is
                     // ineligible, while invalid ECN feedback above does not taint anything.
                     let controller_epoch = self.path.controller_epoch();
-                    abandon_retained_transactions_for_epoch(&mut self.spaces, controller_epoch);
+                    for transaction in abandon_retained_transactions_for_epoch(
+                        &mut self.spaces, controller_epoch,
+                    ) {
+                        settle_retained_loss_owners(
+                            &mut self.path,
+                            self.prev_path.as_mut().map(|(_, path)| path),
+                            transaction,
+                            RetainedLossTerminal::Abandoned,
+                        );
+                    }
                     self.path.congestion.on_validated_ecn_congestion_event();
                 }
             }
@@ -4368,17 +4382,51 @@ fn ecn_congestion_controller_ack(
         .flatten()
 }
 
+type RetainedRecoveryTransaction = (u64, RecoveryTransactionId);
+
+#[derive(Clone, Copy)]
+enum RetainedLossTerminal {
+    Abandoned,
+    Spurious,
+}
+
+/// Native evidence belongs to a controller epoch, not only the active path.
+/// A parked rollback copy must observe the same terminal fact. Ordinary ACK,
+/// RTT and delivery callbacks remain strictly on their existing active owner.
+fn settle_retained_loss_owners(
+    active: &mut PathData,
+    parked: Option<&mut PathData>,
+    (controller_epoch, transaction): RetainedRecoveryTransaction,
+    outcome: RetainedLossTerminal,
+) -> bool {
+    let mut undone = false;
+    for path in std::iter::once(active).chain(parked) {
+        if path.controller_epoch() != controller_epoch {
+            continue;
+        }
+        match outcome {
+            RetainedLossTerminal::Abandoned => {
+                path.congestion.on_recovery_transaction_abandoned(transaction);
+            }
+            RetainedLossTerminal::Spurious => {
+                undone |= path.congestion.on_spurious_congestion_event(transaction);
+            }
+        }
+    }
+    undone
+}
+
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 struct RetainedAckMatch {
-    matched_transactions: BTreeSet<RecoveryTransactionId>,
+    matched_transactions: BTreeSet<RetainedRecoveryTransaction>,
     ecn_marked_packets: u64,
     ecn_marked_noncurrent_epoch: bool,
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 struct SpuriousLossDetection {
-    matched_transactions: Vec<RecoveryTransactionId>,
-    abandoned_transactions: Vec<RecoveryTransactionId>,
+    matched_transactions: Vec<RetainedRecoveryTransaction>,
+    abandoned_transactions: Vec<RetainedRecoveryTransaction>,
     ecn_marked_packets: u64,
     ecn_marked_noncurrent_epoch: bool,
 }
@@ -4404,10 +4452,8 @@ fn acknowledge_retained_losses(
             .collect();
         for packet_number in acknowledged {
             if let Some(info) = lost_packets.remove(&packet_number) {
-                if info.controller_epoch == current_controller_epoch {
-                    if let Some(transaction) = info.recovery_transaction {
-                        matched.matched_transactions.insert(transaction);
-                    }
+                if let Some(transaction) = info.recovery_transaction {
+                    matched.matched_transactions.insert((info.controller_epoch, transaction));
                 }
                 if info.ecn_marked {
                     matched.ecn_marked_packets = matched.ecn_marked_packets.saturating_add(1);
@@ -4433,7 +4479,7 @@ fn detect_spurious_loss_in_spaces(
     // Expiry must precede matching in the same ACK transaction. Any expired member makes the
     // transaction unproven, while younger records remain available for transport ECN accounting.
     let abandoned_transactions =
-        expire_retained_losses_in_spaces(spaces, now, retention, current_controller_epoch);
+        expire_retained_losses_in_spaces(spaces, now, retention);
     let acknowledged = acknowledge_retained_losses(
         &mut spaces[space].lost_packets,
         ack,
@@ -4461,29 +4507,35 @@ fn has_retained_loss_for_transaction(
     })
 }
 
-fn abandon_retained_transactions_for_epoch(spaces: &mut [PacketSpace; 3], controller_epoch: u64) {
+fn abandon_retained_transactions_for_epoch(
+    spaces: &mut [PacketSpace; 3],
+    controller_epoch: u64,
+) -> Vec<RetainedRecoveryTransaction> {
+    let mut abandoned = BTreeSet::new();
     for space in SpaceId::iter() {
         for info in spaces[space].lost_packets.values_mut() {
             if info.controller_epoch == controller_epoch {
-                info.recovery_transaction = None;
+                if let Some(transaction) = info.recovery_transaction.take() {
+                    abandoned.insert((controller_epoch, transaction));
+                }
             }
         }
     }
+    abandoned.into_iter().collect()
 }
 
 fn expire_retained_losses_in_spaces(
     spaces: &mut [PacketSpace; 3],
     now: Instant,
     retention: Duration,
-    current_controller_epoch: u64,
-) -> Vec<RecoveryTransactionId> {
+) -> Vec<RetainedRecoveryTransaction> {
     let mut abandoned = BTreeSet::new();
     for space in SpaceId::iter() {
         spaces[space].lost_packets.retain(|_, info| {
             let retained = now.saturating_duration_since(info.time_sent) <= retention;
-            if !retained && info.controller_epoch == current_controller_epoch {
+            if !retained {
                 if let Some(transaction) = info.recovery_transaction {
-                    abandoned.insert(transaction);
+                    abandoned.insert((info.controller_epoch, transaction));
                 }
             }
             retained
@@ -4495,11 +4547,9 @@ fn expire_retained_losses_in_spaces(
         // ever-growing transport-side transaction set.
         for space in SpaceId::iter() {
             for info in spaces[space].lost_packets.values_mut() {
-                if info.controller_epoch == current_controller_epoch
-                    && info
-                        .recovery_transaction
-                        .is_some_and(|transaction| abandoned.contains(&transaction))
-                {
+                if info.recovery_transaction.is_some_and(|transaction| {
+                    abandoned.contains(&(info.controller_epoch, transaction))
+                }) {
                     info.recovery_transaction = None;
                 }
             }
@@ -4574,6 +4624,142 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 mod tests {
     use super::*;
 
+    #[test]
+    fn migration_rollback_does_not_restore_settled_loss_transaction() {
+        use crate::congestion::Bbr3Config;
+
+        // Exercise the native PathData clone/replace operations, real BBR3
+        // callbacks, and the retained-evidence expiry producer. This is a
+        // component counterexample, not a packet-level migration benchmark.
+        for same_ip in [true, false] {
+            for (outcome, ecn_revocation) in [
+                (RetainedLossTerminal::Abandoned, false),
+                (RetainedLossTerminal::Spurious, false),
+                (RetainedLossTerminal::Abandoned, true),
+            ] {
+                let sent = Instant::now();
+                let lost_at = sent + Duration::from_millis(100);
+                let mut bbr = Bbr3Config::default();
+                bbr.loss_compensation_floor(0.10);
+                let mut config = TransportConfig::default();
+                config.congestion_controller_factory(Arc::new(bbr));
+                let old_remote = "127.0.0.1:41000".parse().unwrap();
+                let mut active = PathData::new(old_remote, false, None, 0, sent, &config);
+                active
+                    .congestion
+                    .on_packet_sent(sent, 1200, 0, 1, SpaceId::Data, false);
+                let transaction = active
+                    .congestion
+                    .on_packet_lost(1200, 1, SpaceId::Data, lost_at)
+                    .expect("ordinary loss opens a real BBR3 transaction");
+                active.congestion.on_congestion_event(
+                    lost_at,
+                    sent,
+                    false,
+                    false,
+                    1200,
+                    1,
+                    SpaceId::Data,
+                );
+                assert!(
+                    active
+                        .congestion
+                        .clone_box()
+                        .on_spurious_congestion_event(transaction),
+                    "the original controller owns recoverable undo before migration"
+                );
+                let mut spaces = packet_spaces(sent);
+                retain_loss_with_transaction(
+                    &mut spaces[SpaceId::Data].lost_packets,
+                    1,
+                    sent,
+                    active.controller_epoch(),
+                    Some(transaction),
+                );
+
+                let candidate = if same_ip {
+                    PathData::from_previous("127.0.0.1:41001".parse().unwrap(), &active, 1, lost_at)
+                } else {
+                    PathData::for_new_network_path(
+                        "127.0.0.2:41001".parse().unwrap(),
+                        &active,
+                        false,
+                        None,
+                        1,
+                        lost_at,
+                        &config,
+                    )
+                };
+                let mut parked = active
+                    .replace_with_activated(candidate)
+                    .expect("install candidate");
+                let retention = 2 * active.rtt.pto_base();
+                let settled = if ecn_revocation {
+                    abandon_retained_transactions_for_epoch(&mut spaces, parked.controller_epoch())
+                } else {
+                    match outcome {
+                        RetainedLossTerminal::Abandoned => expire_retained_losses_in_spaces(
+                            &mut spaces,
+                            sent + retention + Duration::from_millis(1),
+                            retention,
+                        ),
+                        RetainedLossTerminal::Spurious => {
+                            detect_spurious_loss_in_spaces(
+                                &mut spaces,
+                                lost_at,
+                                retention,
+                                &single_packet_ack(1),
+                                SpaceId::Data,
+                                active.controller_epoch(),
+                            )
+                            .matched_transactions
+                        }
+                    }
+                };
+                assert_eq!(settled, vec![(parked.controller_epoch(), transaction)]);
+                let candidate_window = active.congestion.window();
+                for terminal in settled {
+                    assert!(!has_retained_loss_for_transaction(
+                        &spaces, terminal.0, terminal.1
+                    ));
+                    let undone = settle_retained_loss_owners(
+                        &mut active,
+                        Some(&mut parked),
+                        terminal,
+                        outcome,
+                    );
+                    assert_eq!(undone, matches!(outcome, RetainedLossTerminal::Spurious));
+                }
+                if !same_ip {
+                    assert_eq!(
+                        active.congestion.window(),
+                        candidate_window,
+                        "old-epoch terminal evidence cannot modify the fresh controller"
+                    );
+                }
+                assert!(!has_retained_loss_for_transaction(
+                    &spaces,
+                    parked.controller_epoch(),
+                    transaction
+                ));
+                assert!(!active
+                    .congestion
+                    .clone_box()
+                    .on_spurious_congestion_event(transaction));
+                active
+                    .replace_with_activated(parked)
+                    .expect("restore parked controller");
+                assert!(
+                    !active
+                        .congestion
+                        .clone_box()
+                        .on_spurious_congestion_event(transaction),
+                    "rollback cannot resurrect terminal transaction authority; same_ip={same_ip}"
+                );
+            }
+        }
+    }
+
     fn single_packet_ack(packet_number: u64) -> frame::Ack {
         frame::Ack {
             largest: packet_number,
@@ -4638,9 +4824,13 @@ mod tests {
         outcome: &SpuriousLossDetection,
         controller_epoch: u64,
     ) -> bool {
-        outcome.matched_transactions.iter().any(|&transaction| {
-            !has_retained_loss_for_transaction(spaces, controller_epoch, transaction)
-        })
+        outcome
+            .matched_transactions
+            .iter()
+            .any(|&(epoch, transaction)| {
+                epoch == controller_epoch
+                    && !has_retained_loss_for_transaction(spaces, epoch, transaction)
+            })
     }
 
     fn sent_packet(
@@ -4882,7 +5072,7 @@ mod tests {
         assert!(!completes_transaction(&spaces, &outcome, 3));
         assert_eq!(
             outcome.abandoned_transactions,
-            vec![RecoveryTransactionId(1)]
+            vec![(3, RecoveryTransactionId(1))]
         );
         assert!(spaces[SpaceId::Data].lost_packets.is_empty());
     }
@@ -4918,7 +5108,7 @@ mod tests {
             SpaceId::Data,
             3,
         );
-        assert_eq!(outcome.abandoned_transactions, vec![transaction]);
+        assert_eq!(outcome.abandoned_transactions, vec![(3, transaction)]);
         assert!(outcome.matched_transactions.is_empty());
         assert!(!completes_transaction(&spaces, &outcome, 3));
         assert!(spaces[SpaceId::Data].lost_packets.is_empty());
@@ -4986,7 +5176,7 @@ mod tests {
             SpaceId::Data,
             3,
         );
-        assert_eq!(outcome.matched_transactions, vec![first, second]);
+        assert_eq!(outcome.matched_transactions, vec![(3, first), (3, second)]);
         assert!(completes_transaction(&spaces, &outcome, 3));
     }
 

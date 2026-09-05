@@ -50,6 +50,7 @@ pub(super) enum RelayPathLoadOwner {
 
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientPathHealthRecord {
+    pub(in crate::runtime) native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
     data_plane_failure_instance_id: Option<CarrierPathInstanceId>,
@@ -269,6 +270,7 @@ impl Default for ClientPathHealthRecord {
             carrier_queue_bytes_observed: false,
             carrier_inflight_limit_bytes: 0,
             carrier_native_window_sample: None,
+            native_delivery: None,
             native_drain_observed: false,
             carrier_delivery_samples: 0,
             carrier_delivery_sample_bytes: 0,
@@ -827,6 +829,7 @@ impl ClientPathHealthRecord {
         }
         self.mark_liveness_success();
         self.native_drain_observed = observation.has_native_drain_evidence();
+        self.native_delivery = observation.native_delivery();
         // TCP owns congestion and delivery measurement. MPP retains these
         // same-socket samples for ranking without turning them into Data ACKs.
         if let Some(srtt_us) = observation.srtt_us() {
@@ -960,6 +963,7 @@ impl ClientPathHealthRecord {
             0
         };
         ClientPathObservation {
+            native_delivery: self.native_delivery,
             state,
             manual_disabled: self.manual_disabled,
             wire_path_id: self.wire_path_id,
@@ -1592,6 +1596,7 @@ impl ClientPathHealthRecord {
         // physical publication prevents cold-start aliasing; later polls may
         // only preserve it or publish a genuine controller reset/migration.
         self.native_capacity_epoch = metrics.controller_path_epoch;
+        self.native_delivery = metrics.native_delivery;
         self.mark_liveness_success();
         if metrics.rtt_observed {
             self.carrier_srtt_ms = Some(metrics.srtt.as_secs_f64() * 1000.0);
@@ -1687,6 +1692,7 @@ impl ClientPathHealthRecord {
         }
 
         self.native_authority_stamp = Some(shape.stamp());
+        self.native_delivery = metrics.native_delivery;
         self.native_authority_basis = Some(shape.basis());
         self.native_scheduling_shape = Some(shape);
         self.native_authority_rate_bps = shape.finite_rate_bps().map(|rate| rate as f64);
@@ -1787,6 +1793,7 @@ impl ClientPathHealthRecord {
     }
 
     fn clear_native_carrier_state(&mut self) {
+        self.native_delivery = None;
         self.native_authority_stamp = None;
         self.native_authority_basis = None;
         self.native_authority_rate_bps = None;

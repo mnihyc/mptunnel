@@ -930,8 +930,28 @@ advisory observations and are not reclassified from numeric zero. Native carrier
 Product goodput, MPP feedback, configured-prior, and scheduler-default values
 are labeled by source and rate scope. On client-local rows, a native pacing
 value is shown only when the carrier actually supplied one;
-scheduler-normalized delivery is not called native pacing. Measured delivery
-and pacing values remain visible after their shared three-PTO freshness window,
+scheduler-normalized delivery is not called native pacing. A path's Rate cell
+shows interval native ACK delivery first (`↑` C→S or `↓` S→C), its retained
+bandwidth estimate as `E`, and literal native pacing as `P`. Native acknowledged
+bytes include transport accounting overhead and are not unique Product bytes.
+An idle sender can show zero delivery while retaining a large estimate; an
+unobserved counter shows `-`, not zero. An estimate does not measure an ISP
+plan, current throughput or the capacity of the complete application route.
+The summary's Path estimates is a sum of observed estimates, not aggregate
+capacity: paths can share bottlenecks.
+
+Quality is the share of measured native ACK rates among measured paths
+in the same session and sender direction. Its following lines show bytes and
+sampling interval, then serialization time for 64 KiB at that measured rate.
+This excludes setup, propagation, queued work and application delivery; no
+one-way delay is inferred from half an RTT. Socket sampling is asynchronous:
+byte deltas are normalized by their intervals, and multi-path shares use `~`
+because their windows need not coincide. An interval with no acknowledged bytes has no
+defined share. The first observation, changed counter epoch or missing sample
+cannot establish a rate. Repeated snapshots cannot make old counters fresh.
+Measured interval rates use the dashboard refresh window for their `~` marker.
+
+Retained estimates and pacing values remain visible after their three-PTO freshness window,
 prefixed with `~`; effective sample age includes time the management snapshot
 has resided in the browser. RTT, loss, queue, flight, and other instantaneous
 snapshot fields use API-result residence instead of the age of the most recent

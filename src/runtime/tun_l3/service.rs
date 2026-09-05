@@ -1867,6 +1867,7 @@ mod packet_metric_authority_tests {
         carrier_delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     ) -> ServerCarrierPathStatusSnapshot {
         ServerCarrierPathStatusSnapshot {
+            native_delivery: None,
             session_id: SessionId(11),
             underlay,
             path_id: PathId(7),

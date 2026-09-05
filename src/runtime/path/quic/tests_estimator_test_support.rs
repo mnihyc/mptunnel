@@ -19,6 +19,7 @@ pub(super) fn quic_congestion(
         lost_bytes: 0,
         ecn_ppm: None,
         newly_acked_bytes: None,
+        total_acked_bytes: 0,
         non_app_limited_acked_bytes: None,
         timed_non_app_limited_acked_bytes: None,
         non_app_limited_ack_elapsed: None,

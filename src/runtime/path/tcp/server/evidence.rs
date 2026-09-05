@@ -105,6 +105,9 @@ impl ServerTcpEvidenceState {
         }) else {
             return;
         };
+        context
+            .reliable_streams
+            .record_native_delivery(path_registration, observation.native_delivery());
         #[cfg(feature = "lab-diagnostics")]
         {
             if observation.retransmission_advanced() == Some(true) {

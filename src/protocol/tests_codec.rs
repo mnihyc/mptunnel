@@ -47,6 +47,7 @@ fn peer_status_metrics(
 
 fn peer_path_status(state: PeerPathState, usage: PathUsage) -> PeerPathStatus {
     PeerPathStatus {
+        native_delivery: None,
         state,
         usage,
         metrics: peer_status_metrics(
@@ -875,7 +876,7 @@ fn peer_status_frames_round_trip_with_bounded_fixed_entries() {
     };
     let encoded = encode_frame(&response, CodecLimits::default()).expect("encode");
     assert_eq!(encoded[5], 37);
-    assert_eq!(encoded.len(), FRAME_HEADER_LEN + 11 + 4 * 118);
+    assert_eq!(encoded.len(), FRAME_HEADER_LEN + 11 + 4 * 143);
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode"),
         response
@@ -1004,10 +1005,50 @@ fn peer_status_response_limit_follows_the_configured_frame_size() {
     );
     assert_eq!(
         peer_status_response_path_limit(CodecLimits {
-            max_frame_bytes: fixed_bytes + 118,
+            max_frame_bytes: fixed_bytes + 143,
             ..CodecLimits::default()
         }),
         1
+    );
+}
+
+#[test]
+fn peer_native_delivery_counter_distinguishes_absence_zero_and_both_directions() {
+    for direction in [
+        PathMetricDirection::ClientToServer,
+        PathMetricDirection::ServerToClient,
+    ] {
+        for bytes in [0, 1_250_000, u64::MAX] {
+            let mut path = peer_path_status(PeerPathState::Active, PathUsage::Available);
+            path.native_delivery = Some(NativeDeliverySnapshot {
+                epoch: 17,
+                sampled_at_us: 1_000_000,
+                acked_bytes: bytes,
+                direction,
+            });
+            round_trip(Frame::PeerStatusResponse {
+                request_id: 7,
+                code: PeerStatusCode::Ok,
+                paths: vec![path],
+            });
+        }
+    }
+    let mut wire = encode_frame(
+        &Frame::PeerStatusResponse {
+            request_id: 7,
+            code: PeerStatusCode::Ok,
+            paths: vec![peer_path_status(
+                PeerPathState::Active,
+                PathUsage::Available,
+            )],
+        },
+        CodecLimits::default(),
+    )
+    .unwrap();
+    *wire.last_mut().unwrap() = 1;
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(wire), CodecLimits::default()),
+        Err(CodecError::InvalidPathMetrics)
     );
 }
 

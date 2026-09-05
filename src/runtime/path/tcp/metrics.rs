@@ -41,6 +41,7 @@ impl TcpSenderQueueSnapshot {
 /// projection; delivery and pacing remain deliberately distinct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) struct TcpNativeObservation {
+    native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     path_id: PathId,
     direction: PathMetricDirection,
     timing_epoch: Option<DirectionalTimingEpoch>,
@@ -63,6 +64,12 @@ pub(in crate::runtime) struct TcpNativeObservation {
 }
 
 impl TcpNativeObservation {
+    pub(in crate::runtime) fn native_delivery(
+        self,
+    ) -> Option<crate::protocol::NativeDeliverySnapshot> {
+        self.native_delivery
+    }
+
     pub(in crate::runtime) fn path_id(self) -> PathId {
         self.path_id
     }
@@ -369,6 +376,7 @@ fn warn_portable_tcp_capacity_fallback(error: Option<&std::io::Error>) {
 /// Deltas one exact TCP sender from a post-authentication baseline.
 #[derive(Debug)]
 pub(in crate::runtime) struct TcpSenderMetricTracker {
+    native_delivery: crate::runtime::path::traffic::NativeDeliveryTracker,
     bytes_acked_baseline: Option<u64>,
     previous_bytes_acked: Option<u64>,
     previous_retransmission_counter: Option<u64>,
@@ -395,6 +403,7 @@ impl TcpSenderMetricTracker {
             .unwrap_or(PATH_OPEN_SCORE_BYTES as u64)
             .max(PATH_OPEN_SCORE_BYTES as u64);
         Self {
+            native_delivery: crate::runtime::path::traffic::NativeDeliveryTracker::default(),
             bytes_acked_baseline: baseline.bytes_acked,
             previous_bytes_acked: baseline.bytes_acked,
             previous_retransmission_counter: baseline.retransmission_counter,
@@ -412,6 +421,7 @@ impl TcpSenderMetricTracker {
     /// Restarts cumulative delivery evidence for the same physical socket
     /// without reusing its timing publication identities.
     fn begin_delivery_epoch(&mut self, baseline: TcpNativeSnapshot) {
+        let native_delivery = std::mem::take(&mut self.native_delivery);
         #[cfg(test)]
         {
             let timing_epochs = std::mem::take(&mut self.timing_epochs);
@@ -422,6 +432,7 @@ impl TcpSenderMetricTracker {
         {
             *self = Self::new(baseline);
         }
+        self.native_delivery = native_delivery;
     }
 
     #[cfg(test)]
@@ -504,6 +515,11 @@ impl TcpSenderMetricTracker {
         }
 
         TcpNativeObservation {
+            native_delivery: self.native_delivery.observe(
+                current.bytes_acked,
+                direction,
+                Instant::now(),
+            ),
             path_id,
             direction,
             timing_epoch,

@@ -23,6 +23,7 @@ mod server_context;
 mod set;
 mod state;
 pub(in crate::runtime) mod tcp;
+pub(in crate::runtime) mod traffic;
 
 pub(in crate::runtime) use carrier_inventory::{
     AuthenticatedCarrierAvailability, AuthenticatedCarrierInventory,

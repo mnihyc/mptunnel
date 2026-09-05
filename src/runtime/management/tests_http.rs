@@ -352,14 +352,14 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("return stale ? \"~\" + formatted : formatted;"));
     assert!(DASHBOARD_JS.contains("function effectivePeerMetricAgeMs(path, result)"));
     assert!(DASHBOARD_JS.contains("function peerResultResidenceMs(result)"));
-    assert!(DASHBOARD_JS.contains("function observedDeliveryRate(path)"));
-    assert!(DASHBOARD_JS.contains("path.delivery_rate_observed !== true"));
-    assert!(DASHBOARD_JS.contains("function pathQualities(paths, result)"));
-    assert!(DASHBOARD_JS.contains("QUALITY_PAYLOAD_BYTES * 8 / rate * 1000"));
     assert!(
-        DASHBOARD_JS
-            .contains("quality.sharePpm = Math.round(quality.rate / group.totalRate * 1000000);")
+        DASHBOARD_JS.contains("function nativeRateCell(path, quality, rateStale, pacingStale)")
     );
+    assert!(DASHBOARD_JS.contains("path.delivery_rate_observed === true"));
+    assert!(DASHBOARD_JS.contains("function pathQualities(paths, result, tableKey)"));
+    assert!(DASHBOARD_JS.contains("QUALITY_PAYLOAD_BYTES * 8 / rate * 1000"));
+    assert!(DASHBOARD_JS.contains("quality.sharePpm = quality.rate * 1000000 / group.totalRate;"));
+    assert!(DASHBOARD_JS.contains("quality.shareApproximate = group.count > 1;"));
     assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.lastReceivedAt)"));
     assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.peerResultReceivedAt)"));
     assert!(DASHBOARD_JS.contains("Math.max(0, generatedAt - receivedAt)"));
@@ -549,7 +549,8 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(peer < connections && connections < outbound);
     assert!(DASHBOARD_JS.contains("identityDetail.join(\" · \")"));
     assert!(DASHBOARD_JS.contains("\"Usage direction: \" + directionLabel(path.usage_direction)"));
-    assert!(DASHBOARD_JS.contains("\"Metric direction: \" + directionLabel(path.direction)"));
+    assert!(DASHBOARD_JS.contains("\"Estimate direction: \" + directionLabel(path.direction)"));
+    assert!(DASHBOARD_JS.contains("\"Delivery direction: \" + directionLabel(quality.direction)"));
     assert_eq!(
         DASHBOARD_JS
             .matches("\"Sample direction: \" + directionLabel(path.direction)")

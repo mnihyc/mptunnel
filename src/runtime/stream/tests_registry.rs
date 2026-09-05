@@ -196,6 +196,66 @@ fn assert_stable_server_carrier_status_eq(
 }
 
 #[test]
+fn native_delivery_updates_only_exact_diagnostic_owner_without_path_authority() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(8));
+    let port = registry.path_port();
+    let backend = ServerReliableStreamPortBackend {
+        registry: registry.clone(),
+    };
+    let session = SessionId(575);
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let first = port.register_test_carrier_path(
+            session,
+            underlay,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        );
+        let sibling = port.register_test_carrier_path(
+            session,
+            underlay,
+            PathId(2),
+            ServerLocalPathProperties::default(),
+        );
+        let identity = server_carrier_path_identity(&first);
+        let sibling_identity = server_carrier_path_identity(&sibling);
+        let before = port.carrier_path_statuses(&[identity, sibling_identity]);
+        let sample = crate::protocol::NativeDeliverySnapshot {
+            epoch: 17,
+            sampled_at_us: 1_000_000,
+            acked_bytes: 1_250_000,
+            direction: PathMetricDirection::ServerToClient,
+        };
+        port.record_native_delivery(&first, Some(sample));
+        let after = port.carrier_path_statuses(&[identity, sibling_identity]);
+        assert_eq!(after[0].unwrap().native_delivery, Some(sample));
+        assert_eq!(after[1].unwrap().native_delivery, None);
+        for index in 0..2 {
+            assert_stable_server_carrier_status_eq(&before[index].unwrap(), &after[index].unwrap());
+        }
+        backend.record_native_delivery(
+            ServerCarrierPathIdentity {
+                path_instance_id: crate::model::path::next_carrier_path_instance_id(),
+                ..identity
+            },
+            None,
+        );
+        assert_eq!(
+            port.carrier_path_statuses(&[identity])[0]
+                .unwrap()
+                .native_delivery,
+            Some(sample)
+        );
+        port.record_native_delivery(&first, None);
+        assert_eq!(
+            port.carrier_path_statuses(&[identity])[0]
+                .unwrap()
+                .native_delivery,
+            None
+        );
+    }
+}
+
+#[test]
 fn carrier_path_statuses_preserve_input_order_duplicates_and_exact_misses() {
     let registry = Arc::new(ServerReliableStreamRegistry::new(8));
     let port = registry.path_port();
@@ -1359,6 +1419,7 @@ fn repeated_session_retirement_resweeps_an_exact_late_path_instance() {
         paths.instances.insert(
             server_physical_path_key(identity),
             ServerRegisteredPath {
+                native_delivery: None,
                 configured_slot: ConfiguredMemberSlot(identity.path_id.0),
                 local: ServerLocalPathProperties::default(),
                 state: PeerPathState::Active,
@@ -2958,6 +3019,7 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
         .insert(
             server_physical_path_key(stale_identity),
             ServerRegisteredPath {
+                native_delivery: None,
                 configured_slot: ConfiguredMemberSlot(stale_identity.path_id.0),
                 local: ServerLocalPathProperties::default(),
                 state: PeerPathState::Draining,

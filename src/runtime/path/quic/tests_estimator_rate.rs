@@ -2,6 +2,64 @@ use super::super::estimator_test_support::*;
 use super::*;
 
 #[test]
+fn quic_rate_projection_keeps_capacity_and_literal_pacing_distinct() {
+    let mut congestion = quic_congestion(10 * 1024 * 1024, Some(469_000_000));
+    congestion.bandwidth_estimate_bps = Some(474_000_000);
+    let mut stats = quinn::ConnectionStats::default();
+    stats.path.rtt = Duration::from_millis(80);
+    stats.path.cwnd = congestion.congestion_window;
+    stats.path.current_mtu = 1400;
+    let mut tracker = QuicPathMetricTracker::default();
+    let _ = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
+
+    // A concrete 8 Mbps native ACK interval does not replace the retained
+    // controller model. Neither quantity is Product/socket goodput.
+    let observed = tracker.observe(
+        stats,
+        with_acked_bytes_elapsed(congestion, 1_000_000, 100, Duration::from_secs(1)),
+        PathMetricDirection::ServerToClient,
+    );
+    assert_eq!(
+        observed.latest_carrier_ack_elapsed,
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(observed.delivery_rate_bps.round() as u64, 474_000_000);
+    assert_eq!(
+        observed.pacing_rate_bps.round() as u64,
+        469_000_000,
+        "native pacing below the capacity model must remain literal"
+    );
+}
+
+#[test]
+fn native_delivery_counter_does_not_substitute_the_bandwidth_model() {
+    let mut tracker = QuicPathMetricTracker::default();
+    let now = Instant::now();
+    let mut congestion = quic_congestion(10 * 1024 * 1024, Some(391_000_000));
+    congestion.bandwidth_estimate_bps = Some(400_000_000);
+    let stats = quinn::ConnectionStats::default();
+    let first = tracker.observe_at(stats, congestion, PathMetricDirection::ServerToClient, now);
+    congestion.total_acked_bytes = 1_250_000;
+    let current = tracker.observe_at(
+        stats,
+        congestion,
+        PathMetricDirection::ServerToClient,
+        now + Duration::from_secs(1),
+    );
+    let first = first.native_delivery.unwrap();
+    let sample = current.native_delivery.unwrap();
+    assert_eq!(sample.epoch, first.epoch);
+    assert_eq!(sample.sampled_at_us - first.sampled_at_us, 1_000_000);
+    assert_eq!((sample.acked_bytes - first.acked_bytes) * 8, 10_000_000);
+    assert_eq!(current.controller_bandwidth_bps, Some(400_000_000));
+    assert_eq!(current.pacing_rate_bps, 391_000_000.0);
+    assert!(
+        !current.ack_derived_data_seen,
+        "diagnostic counters do not create scheduling proof"
+    );
+}
+
+#[test]
 fn full_window_native_ack_qualifies_carrier_rate_without_product_proof() {
     let mut tracker = UdpPathMetricTracker::default();
     let mut congestion = quic_congestion(4 * 1024 * 1024, Some(550_000_000));

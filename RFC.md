@@ -2236,7 +2236,21 @@ the record start are respectively `rate_observed`, `pacing_rate_observed`,
 `bytes_in_flight_observed`, and `queue_observed`; the corresponding flight and
 queue 64-bit values begin at offsets 66 and 74. A peer-status path entry is
 exactly `state:u8`, then `usage:u8`, then the 116-byte `PATH_METRICS` record,
-and is therefore 118 bytes.
+then the 25-byte native delivery counter defined below: 143 bytes total.
+
+The native delivery counter is `direction:u8, epoch:u64, sampled_at_us:u64,
+acked_bytes:u64`. Direction zero means absence and MUST have all three
+integers zero. Directions 1 (C→S) and 2 (S→C) identify the native sender;
+a present zero byte count is measured zero. Epoch is an opaque counter-owner
+identity, not a capacity epoch or a timestamp. `sampled_at_us` is elapsed
+monotonic time within that owner. A replaced/reset byte counter MUST start a
+new epoch. Counter values are exact cumulative native acknowledged bytes,
+including transport accounting overhead, not unique Product goodput.
+Comparable observations require equal owner and direction, advancing sample
+time and nondecreasing bytes. Repeated snapshots MUST NOT refresh measured
+delivery or create a new interval. Unavailable observations MUST NOT be
+substituted with zero. These counters are diagnostic only: they MUST NOT
+grant scheduling, congestion-control, admission or liveness authority.
 
 Metrics are advisory and scoped to the authenticated carrier instance and
 direction. `bytes_in_flight_observed` and `queue_observed` independently state
@@ -2351,8 +2365,10 @@ answers on the same carrier with
 `PEER_STATUS_RESPONSE(request_id, code, paths)`, where `code` is `OK`,
 `DISABLED`, or `UNAVAILABLE`. A non-`OK` response contains no paths.
 
-Each path entry uses the exact 118-byte order defined in Section 11.1: local
-`state:u8`, directional `usage:u8`, then one `PATH_METRICS` record. A response:
+Each path entry uses the exact 143-byte order defined in Section 11.1: local
+`state:u8`, directional `usage:u8`, one `PATH_METRICS` record, then one native
+delivery counter. Usage direction and measured sender direction are independent.
+A response:
 
 - MUST include only the authenticated requester's session;
 - MUST NOT contain endpoints, targets, service labels, credentials, or local
@@ -2419,7 +2435,7 @@ frames.
 | 34 | `PATH_CAPACITY_FINISH` | `path_id:u16, measurement_id:u64, payload_bytes:u64` |
 | 35 | `PATH_CAPACITY_RECEIPT` | `path_id:u16, measurement_id:u64, received_payload_bytes:u64` |
 | 36 | `PEER_STATUS_REQUEST` | `request_id:u64` |
-| 37 | `PEER_STATUS_RESPONSE` | `request_id:u64, code:u8, count:u16, paths[count]`, each path `state:u8, usage:u8, PATH_METRICS:116B` |
+| 37 | `PEER_STATUS_RESPONSE` | `request_id:u64, code:u8, count:u16, paths[count]`, each path `state:u8, usage:u8, PATH_METRICS:116B, native_delivery:25B` |
 | 38 | `OPEN_IP_TUNNEL` | `tunnel_id:u64` |
 | 39 | `IP_TUNNEL_READY` | `tunnel_id:u64, mtu:u16, address_count:u8, addresses[address_count]` |
 | 40 | `IP_PACKET` | `tunnel_id:u64, packet_id:u64, length:u32, bytes` |
@@ -2483,6 +2499,9 @@ values are TCP `1` and UDP `2`. Directional wire fields use client-to-server
 
 Usage values are `AVAILABLE = 0` and `BACKUP = 1`.
 Return-plan phase values are `STARTUP = 0`, `ORDINARY = 1`, and `CREATE = 2`.
+
+The diagnostic `native_delivery` tuple and its canonical absence/epoch rules
+are defined in Section 11.1.
 
 Close reasons are normal `0`, protocol error `1`, authentication failed `2`,
 and policy rejected `3`. Stream-reset reasons are refused `1`, timed out `2`,

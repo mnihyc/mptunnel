@@ -236,6 +236,7 @@ fn t03_current_quic_shape_atomically_supersedes_stale_scalar_timing() {
 
 fn request_quic_path_metrics(now: Instant, deadline: Instant) -> UdpPathMetrics {
     UdpPathMetrics {
+        native_delivery: None,
         controller_path_epoch: 1,
         direction: PathMetricDirection::ClientToServer,
         srtt: Duration::from_millis(180),

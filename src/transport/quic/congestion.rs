@@ -40,6 +40,9 @@ pub struct CongestionMetrics {
     pub ecn_ppm: Option<u32>,
     /// Path-lineage ACK diagnostic since the preceding consuming read.
     pub newly_acked_bytes: Option<u64>,
+    /// Cumulative native ACK bytes in this path lineage, including app-limited
+    /// traffic. Non-consuming diagnostic counter; not a bandwidth estimate.
+    pub total_acked_bytes: u64,
     /// Path-lineage non-app-limited ACK diagnostic since the preceding read.
     pub non_app_limited_acked_bytes: Option<u64>,
     /// Path-lineage timed ACK bytes within `delivery_clock_epoch`.
@@ -308,6 +311,7 @@ pub(super) struct QuicCarrierTelemetrySnapshot {
     #[cfg(test)]
     pub(super) bytes_in_flight: Option<u64>,
     pub(super) newly_acked_bytes: Option<u64>,
+    pub(super) total_acked_bytes: u64,
     pub(super) non_app_limited_acked_bytes: Option<u64>,
     pub(super) timed_non_app_limited_acked_bytes: Option<u64>,
     pub(super) non_app_limited_ack_elapsed: Option<Duration>,
@@ -507,6 +511,7 @@ impl QuicPathTelemetry {
             #[cfg(test)]
             bytes_in_flight: self.bytes_in_flight(),
             newly_acked_bytes: (newly_acked_bytes > 0).then_some(newly_acked_bytes),
+            total_acked_bytes: totals.acked_bytes,
             non_app_limited_acked_bytes: (non_app_limited_acked_bytes > 0)
                 .then_some(non_app_limited_acked_bytes),
             timed_non_app_limited_acked_bytes: (timed_non_app_limited_acked_bytes > 0)

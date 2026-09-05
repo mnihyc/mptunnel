@@ -102,6 +102,7 @@ struct ServerPathUsageEntry {
 
 #[derive(Clone)]
 struct ServerRegisteredPath {
+    native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     /// Authenticated peer configuration identity, stable across a physical
     /// replacement which receives a new PathId and instance identity.
     configured_slot: ConfiguredMemberSlot,
@@ -122,6 +123,7 @@ struct ServerRegisteredPath {
 
 #[derive(Debug, Clone, Copy)]
 struct ServerCarrierPathStatusBasis {
+    native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     identity: ServerCarrierPathIdentity,
     local: crate::runtime::path::ServerLocalPathProperties,
     state: PeerPathState,
@@ -137,6 +139,7 @@ impl ServerCarrierPathStatusBasis {
         let apply = path.apply_authority.snapshot();
         Self {
             identity,
+            native_delivery: path.native_delivery,
             local: path.local,
             state: path.state,
             usage: path.peer_usage.map(|entry| entry.usage),
@@ -1004,6 +1007,7 @@ impl ServerReliableStreamRegistry {
                 continue;
             };
             let candidate = PeerPathStatus {
+                native_delivery: registered_path.native_delivery,
                 state: registered_path.state,
                 usage: if registered_path.local.policy.backup {
                     PathUsage::Backup
@@ -1200,6 +1204,7 @@ impl ServerReliableStreamRegistry {
             .insert(
                 server_physical_path_key(identity),
                 ServerRegisteredPath {
+                    native_delivery: None,
                     configured_slot,
                     local,
                     state: PeerPathState::Active,
@@ -2572,6 +2577,21 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         self.registry.record_path_metrics(identity, metrics);
     }
 
+    fn record_native_delivery(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        sample: Option<crate::protocol::NativeDeliverySnapshot>,
+    ) {
+        let mut paths = self
+            .registry
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        if let Some(path) = paths.instances.get_mut(&server_physical_path_key(identity)) {
+            path.native_delivery = sample;
+        }
+    }
+
     fn record_peer_path_usage(
         &self,
         identity: ServerCarrierPathIdentity,
@@ -2692,6 +2712,7 @@ fn project_carrier_path_status(
         },
     );
     ServerCarrierPathStatusSnapshot {
+        native_delivery: basis.native_delivery,
         session_id,
         underlay,
         path_id,

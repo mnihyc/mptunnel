@@ -861,6 +861,7 @@ fn peer_path_status_from_snapshot(
     observation: ClientPathObservation,
 ) -> PeerPathStatus {
     PeerPathStatus {
+        native_delivery: observation.native_delivery,
         state: match snapshot.state {
             crate::scheduler::PathState::Active => PeerPathState::Active,
             crate::scheduler::PathState::Suspect => PeerPathState::Suspect,

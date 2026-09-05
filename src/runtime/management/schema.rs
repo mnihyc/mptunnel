@@ -238,7 +238,27 @@ pub(super) struct ManagementTrendSample {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(super) struct ManagementNativeDelivery {
+    pub(super) epoch: String,
+    pub(super) sampled_at_us: String,
+    pub(super) acked_bytes: String,
+    pub(super) direction: &'static str,
+}
+
+impl From<crate::protocol::NativeDeliverySnapshot> for ManagementNativeDelivery {
+    fn from(sample: crate::protocol::NativeDeliverySnapshot) -> Self {
+        Self {
+            epoch: sample.epoch.to_string(),
+            sampled_at_us: sample.sampled_at_us.to_string(),
+            acked_bytes: sample.acked_bytes.to_string(),
+            direction: metric_direction_name(sample.direction),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementPathStatus {
+    pub(super) native_delivery: Option<ManagementNativeDelivery>,
     pub(super) service: &'static str,
     pub(super) service_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -378,6 +398,7 @@ pub(super) struct ManagementPeerStatusResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementPeerPathStatus {
+    pub(super) native_delivery: Option<ManagementNativeDelivery>,
     pub(super) state: &'static str,
     pub(super) usage: &'static str,
     pub(super) usage_direction: &'static str,

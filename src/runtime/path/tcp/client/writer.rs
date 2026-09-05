@@ -34,6 +34,7 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::commands::{TcpCapacityProbeCommand, reliable_path_writer_frame_queue};
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
+#[cfg(any(test, feature = "lab-diagnostics"))]
 use std::time::Instant;
 use tokio::sync::mpsc;
 

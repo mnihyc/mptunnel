@@ -454,6 +454,7 @@ pub(super) fn peer_status_result(
                     });
                 let latency_observed = path.metrics.srtt_us > 0;
                 ManagementPeerPathStatus {
+                    native_delivery: path.native_delivery.map(Into::into),
                     state: peer_path_state_name(path.state),
                     usage: path_usage_name(path.usage),
                     usage_direction: opposite_metric_direction_name(path.metrics.direction),
@@ -814,6 +815,7 @@ fn client_path_status(
         authoritative_pacing_rate_bps,
     );
     ManagementPathStatus {
+        native_delivery: record.native_delivery.map(Into::into),
         service: "mpp_outbound",
         service_index,
         service_name,
@@ -909,6 +911,7 @@ fn collect_server(
             .expect("server path names align with configured path inventory")
             .clone();
         paths.push(ManagementPathStatus {
+            native_delivery: None,
             service: "mpp_inbound",
             service_index,
             service_name: service_name.clone(),
@@ -1023,6 +1026,7 @@ fn collect_server(
             .expect("server session path refers to configured path inventory")
             .clone();
         paths.push(ManagementPathStatus {
+            native_delivery: path.native_delivery.map(Into::into),
             service: "mpp_inbound",
             service_index,
             service_name: service_name.clone(),
@@ -1568,6 +1572,7 @@ mod tests {
 
     fn local_sender_status(metrics: PathMetrics) -> ServerCarrierPathStatusSnapshot {
         ServerCarrierPathStatusSnapshot {
+            native_delivery: None,
             session_id: SessionId(1),
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(2),

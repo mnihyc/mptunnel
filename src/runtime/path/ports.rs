@@ -493,6 +493,7 @@ impl std::fmt::Debug for ServerDatagramPort {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ServerCarrierPathStatusSnapshot {
+    pub(in crate::runtime) native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) underlay: UnderlayProtocol,
     pub(in crate::runtime) path_id: PathId,
@@ -1123,6 +1124,12 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
 
     fn record_peer_path_metrics(&self, identity: ServerCarrierPathIdentity, metrics: PathMetrics);
 
+    fn record_native_delivery(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        sample: Option<crate::protocol::NativeDeliverySnapshot>,
+    );
+
     fn record_peer_path_usage(
         &self,
         identity: ServerCarrierPathIdentity,
@@ -1532,6 +1539,18 @@ impl ServerStreamPort {
         if registration.belongs_to(self) {
             self.backend
                 .record_peer_path_metrics(registration.inner.identity, metrics);
+        }
+    }
+
+    /// O(1) diagnostic update; never fans out to Product scheduling owners.
+    pub(in crate::runtime) fn record_native_delivery(
+        &self,
+        registration: &ServerCarrierPathRegistration,
+        sample: Option<crate::protocol::NativeDeliverySnapshot>,
+    ) {
+        if registration.belongs_to(self) {
+            self.backend
+                .record_native_delivery(registration.inner.identity, sample);
         }
     }
 

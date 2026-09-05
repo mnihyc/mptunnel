@@ -76,6 +76,7 @@ impl UdpPathMetricTracker {
 
 #[derive(Debug, Default)]
 struct QuicPathMetricTracker {
+    native_delivery: crate::runtime::path::traffic::NativeDeliveryTracker,
     path_epoch: Option<u64>,
     delivery_rate_bps: Option<f64>,
     native_delivery_seen: bool,
@@ -281,6 +282,9 @@ impl QuicPathMetricTracker {
         now: Instant,
     ) -> UdpPathMetrics {
         self.enter_path_epoch(congestion);
+        let native_delivery =
+            self.native_delivery
+                .observe(Some(congestion.total_acked_bytes), direction, now);
         #[cfg(feature = "lab-diagnostics")]
         let newly_lost_bytes = {
             let delta = self
@@ -445,9 +449,10 @@ impl QuicPathMetricTracker {
         } else {
             estimated_rate
         };
-        let pacing_rate_bps = usable_pacing_rate
-            .unwrap_or(delivery_rate_bps)
-            .max(delivery_rate_bps);
+        // Native pacing is an independent control output. During draining it
+        // legitimately falls below the bandwidth model; a display projection
+        // must not raise it to that model or to the startup prior.
+        let pacing_rate_bps = raw_pacing_rate.unwrap_or(delivery_rate_bps);
 
         #[cfg(feature = "lab-diagnostics")]
         let newly_acked_bytes = congestion.newly_acked_bytes.unwrap_or(0);
@@ -458,6 +463,7 @@ impl QuicPathMetricTracker {
             .min(newly_acked_bytes);
 
         UdpPathMetrics {
+            native_delivery,
             controller_path_epoch: congestion.path_epoch,
             direction,
             srtt: rtt,

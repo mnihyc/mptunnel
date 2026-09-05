@@ -30,6 +30,7 @@ pub(in crate::runtime) struct QuicAckPollDiagnostics {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct UdpPathMetrics {
+    pub(in crate::runtime) native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     pub(in crate::runtime) controller_path_epoch: u64,
     pub(in crate::runtime) direction: PathMetricDirection,
     pub(in crate::runtime) srtt: Duration,
@@ -146,6 +147,9 @@ pub(super) async fn run_server_quic_path_metrics(
             }
         }
         let controller_state_changed = controller_publication.changed(metrics);
+        context
+            .reliable_streams
+            .record_native_delivery(&path_registration, metrics.native_delivery);
         let previous_delivery_rate_sample = delivery_rate_sample;
         delivery_rate_sample = retained_quic_delivery_rate_sample(delivery_rate_sample, metrics);
         #[cfg(feature = "lab-diagnostics")]

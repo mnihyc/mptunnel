@@ -3,6 +3,7 @@ use super::*;
 
 fn quic_metrics_for_polling() -> UdpPathMetrics {
     UdpPathMetrics {
+        native_delivery: None,
         controller_path_epoch: 1,
         direction: PathMetricDirection::ServerToClient,
         srtt: Duration::from_millis(180),
@@ -156,6 +157,7 @@ fn connection_wide_native_queue_is_reported_without_product_attribution() {
 #[test]
 fn quic_loss_unknown_is_not_reported_as_observed_zero() {
     let metrics = UdpPathMetrics {
+        native_delivery: None,
         controller_path_epoch: 1,
         direction: PathMetricDirection::ServerToClient,
         srtt: Duration::from_millis(20),
@@ -196,6 +198,7 @@ fn quic_loss_unknown_is_not_reported_as_observed_zero() {
 #[test]
 fn quic_server_metrics_publish_native_ack_qualification_even_when_currently_app_limited() {
     let metrics = UdpPathMetrics {
+        native_delivery: None,
         controller_path_epoch: 1,
         direction: PathMetricDirection::ServerToClient,
         srtt: Duration::from_millis(50),

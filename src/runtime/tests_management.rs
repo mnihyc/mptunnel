@@ -930,6 +930,7 @@ fn peer_status_projects_local_path_identity_for_a_draining_authenticated_assignm
         request_id: 9,
         code: crate::protocol::PeerStatusCode::Ok,
         paths: vec![crate::protocol::PeerPathStatus {
+            native_delivery: None,
             state: crate::protocol::PeerPathState::Draining,
             usage: crate::protocol::PathUsage::Available,
             metrics: crate::protocol::PathMetrics {

@@ -1356,6 +1356,7 @@ pub(in crate::runtime) fn default_path_rate_bps() -> f64 {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ClientPathObservation {
+    pub(in crate::runtime) native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
     pub(in crate::runtime) wire_path_id: Option<PathId>,
@@ -1416,6 +1417,7 @@ pub(in crate::runtime) struct ClientPathObservation {
 impl Default for ClientPathObservation {
     fn default() -> Self {
         Self {
+            native_delivery: None,
             state: SchedulerPathState::Suspect,
             manual_disabled: false,
             wire_path_id: None,

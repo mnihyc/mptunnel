@@ -5,6 +5,7 @@ use crate::protocol::{
 
 fn status(path_id: u16) -> PeerPathStatus {
     PeerPathStatus {
+        native_delivery: None,
         state: PeerPathState::Active,
         usage: PathUsage::Available,
         metrics: PathMetrics {

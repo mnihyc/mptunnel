@@ -1,9 +1,9 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, ConfiguredMemberSlot, DatagramFlowId, DatagramId, Frame,
-    IpPacketId, IpTunnelId, OffsetRange, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId,
-    PathMetricDirection, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode,
-    ResetReason, SessionId, StreamAttachmentPhase, StreamDemandHint, StreamId, StreamReturnPlan,
-    TargetAddr, UnderlayProtocol,
+    IpPacketId, IpTunnelId, NativeDeliverySnapshot, OffsetRange,
+    PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics, PathUsage,
+    PeerPathState, PeerPathStatus, PeerStatusCode, ResetReason, SessionId, StreamAttachmentPhase,
+    StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -13,7 +13,7 @@ const VERSION: u8 = 11;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 116;
-const PEER_PATH_STATUS_ENCODED_LEN: usize = 2 + PATH_METRICS_ENCODED_LEN;
+const PEER_PATH_STATUS_ENCODED_LEN: usize = 2 + PATH_METRICS_ENCODED_LEN + 25;
 const PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN: usize = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,6 +526,7 @@ fn encode_payload(
                 put_u8(out, peer_path_state_to_u8(path.state));
                 put_u8(out, path_usage_to_u8(path.usage));
                 encode_path_metrics(out, path.metrics);
+                encode_native_delivery(out, path.native_delivery);
             }
             Ok(FrameKind::PeerStatusResponse)
         }
@@ -830,6 +831,7 @@ fn decode_payload(
                     state: peer_path_state_from_u8(reader.get_u8()?)?,
                     usage: path_usage_from_u8(reader.get_u8()?)?,
                     metrics: decode_path_metrics(reader)?,
+                    native_delivery: decode_native_delivery(reader)?,
                 });
             }
             Ok(Frame::PeerStatusResponse {
@@ -1090,6 +1092,40 @@ fn encode_path_metrics(out: &mut Vec<u8>, metrics: PathMetrics) {
     put_u8(out, u8::from(metrics.has_ack_derived_data_sample));
     put_u32(out, metrics.data_sample_count);
     put_u64(out, metrics.data_sample_bytes);
+}
+
+fn encode_native_delivery(out: &mut Vec<u8>, sample: Option<NativeDeliverySnapshot>) {
+    // Zero direction is canonical absence; both real directions preserve a
+    // measured zero byte count. Fixed width retains pre-allocation bounds.
+    put_u8(
+        out,
+        sample.map_or(0, |sample| path_metric_direction_to_u8(sample.direction)),
+    );
+    put_u64(out, sample.map_or(0, |sample| sample.epoch));
+    put_u64(out, sample.map_or(0, |sample| sample.sampled_at_us));
+    put_u64(out, sample.map_or(0, |sample| sample.acked_bytes));
+}
+
+fn decode_native_delivery(
+    reader: &mut Reader<'_>,
+) -> Result<Option<NativeDeliverySnapshot>, CodecError> {
+    let direction = reader.get_u8()?;
+    let epoch = reader.get_u64()?;
+    let sampled_at_us = reader.get_u64()?;
+    let acked_bytes = reader.get_u64()?;
+    if direction == 0 {
+        return if epoch == 0 && sampled_at_us == 0 && acked_bytes == 0 {
+            Ok(None)
+        } else {
+            Err(CodecError::InvalidPathMetrics)
+        };
+    }
+    Ok(Some(NativeDeliverySnapshot {
+        epoch,
+        sampled_at_us,
+        acked_bytes,
+        direction: path_metric_direction_from_u8(direction)?,
+    }))
 }
 
 fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecError> {

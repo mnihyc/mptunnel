@@ -1182,6 +1182,7 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
         health.udp[0].mark_quic_path_metrics(
             path_instance_id,
             UdpPathMetrics {
+                native_delivery: None,
                 controller_path_epoch: 1,
                 direction: PathMetricDirection::ClientToServer,
                 srtt: Duration::from_millis(42),
@@ -1227,6 +1228,7 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
         health.udp[0].mark_quic_path_metrics(
             path_instance_id,
             UdpPathMetrics {
+                native_delivery: None,
                 controller_path_epoch: 1,
                 direction: PathMetricDirection::ClientToServer,
                 srtt: Duration::from_millis(42),

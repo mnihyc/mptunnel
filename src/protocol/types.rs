@@ -210,6 +210,19 @@ pub struct PeerPathStatus {
     pub state: PeerPathState,
     pub usage: PathUsage,
     pub metrics: PathMetrics,
+    /// Diagnostic counter only: never scheduling or Product-delivery authority.
+    pub native_delivery: Option<NativeDeliverySnapshot>,
+}
+
+/// Sender-native acknowledged bytes sampled on one monotonic counter clock.
+/// Deltas require equal epoch and direction and increasing sample time. These
+/// bytes include carrier framing and are not unique application payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeDeliverySnapshot {
+    pub epoch: u64,
+    pub sampled_at_us: u64,
+    pub acked_bytes: u64,
+    pub direction: PathMetricDirection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

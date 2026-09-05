@@ -493,6 +493,7 @@ impl Connection {
             lost_bytes: snapshot.lost_bytes,
             ecn_ppm: None,
             newly_acked_bytes: snapshot.newly_acked_bytes,
+            total_acked_bytes: snapshot.total_acked_bytes,
             non_app_limited_acked_bytes: snapshot.non_app_limited_acked_bytes,
             timed_non_app_limited_acked_bytes: snapshot.timed_non_app_limited_acked_bytes,
             non_app_limited_ack_elapsed: snapshot.non_app_limited_ack_elapsed,

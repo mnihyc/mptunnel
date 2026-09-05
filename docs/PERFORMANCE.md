@@ -10,6 +10,37 @@ No current-release time-series ranking is published. Publication requires
 matched repetitions that pass the complete measurement gate; individual
 diagnostic runs do not update the historical scalar tables below.
 
+## Current reordering and recovery
+
+Current development QUIC has a reproducible performance limitation under deep
+packet reordering, also present in v0.4.8. This prevents a competitive release
+verdict; passing component correctness tests does not resolve it.
+
+[![Current MPP QUIC and Hysteria2 bulk speed and echo latency when packet jitter ends](assets/performance/quic-reordering-recovery.svg)](assets/performance/quic-reordering-recovery.svg)
+
+This focused comparison uses a forwarding router with 500 Mbps downstream,
+100 Mbps upstream, 100 ms base RTT and unequal directional jitter, removed
+after about eight seconds. No packet loss is injected. Both products keep the
+same download connection throughout. MPP discovers bandwidth dynamically;
+Hysteria2 2.10.0 uses configured 500/100-Mbps Brutal rates.
+
+MPP reached about 450 Mbps roughly eight seconds after jitter ended; Hysteria2
+did so in roughly two seconds. Full-run receiver averages were 294 and
+363 Mbps, respectively. Hysteria2 had the longer bulk pause during reordering
+(5.36 versus 1.80 seconds), but completed all 80 concurrent echo checks. MPP's
+echo request timed out after four successful checks; later samples are missing,
+not zero latency. One run per product establishes a counterexample, not a
+general ranking or a statistically established recovery bound.
+
+Separate router runs with sustained jitter and no injected loss measured
+0.74 Mbps for current MPP QUIC, 0.67 Mbps for v0.4.8 QUIC and 9.39 Mbps for raw
+TCP. All router queue-drop counters stayed zero in the current QUIC run.
+The low current throughput is therefore not explained simply by injected
+packet loss or by a regression introduced after v0.4.8. The exact native
+loss/reordering correction and its wider performance effects remain under
+investigation. Independent-link aggregation and complete bidirectional browser
+comparisons have not yet been rerun for this development candidate.
+
 ## Historical ordered diagnostic series
 
 [![Receiver goodput and persistent application-echo latency over 40 seconds](assets/performance/diagnostic-random-internet-series.svg)](assets/performance/diagnostic-random-internet-series.svg)

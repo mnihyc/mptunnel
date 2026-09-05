@@ -76,6 +76,14 @@ chart is a historical two-run diagnostic series, not a current-release ranking.
 See the [performance methodology](docs/PERFORMANCE.md) for measurement details
 and the accepted v0.4.7 startup and v0.4.8 mixed-path recovery corrections.
 
+Current development testing has also exposed an unresolved QUIC weakness under
+strong packet reordering: throughput can collapse with no injected loss or
+router queue drops,
+and recovery can lag Hysteria2. This is not release-ready. The latest
+[recovery curves and limitations](docs/PERFORMANCE.md#current-reordering-and-recovery)
+include both bulk speed and interrupted interactive service; historical results
+below must not be read as evidence that this case is solved.
+
 ### Historical diagnostic series
 
 [![Receiver goodput and persistent application-echo latency over 40 seconds for MPTUNNEL TCP, QUIC, default TCP+QUIC, Xray, and Hysteria2](docs/assets/performance/diagnostic-random-internet-series.svg)](docs/assets/performance/diagnostic-random-internet-series.svg)

@@ -453,6 +453,9 @@ fn settle_matching_client_additional_path_open(
     output_lane: TrafficClass,
     additional_path_open: RelayAdditionalPathOpenResult,
 ) -> Result<Option<ReliableRelayAttachMode>, RuntimeError> {
+    if let Some(error) = additional_path_open.terminal_error() {
+        return Err(error);
+    }
     if super::lifecycle::take_matching_additional_path_open(
         &mut state.recovery.pending_additional_path_opens,
         additional_path_open.key,

@@ -20,7 +20,8 @@ use crate::product::PrincipalPermit;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{
     ConfiguredMemberSlot, Frame, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus,
-    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+    ResetReason, SessionId, StreamAttachmentPhase, StreamDemandHint, StreamId, TargetAddr,
+    UnderlayProtocol,
 };
 use crate::runtime::RuntimeError;
 #[cfg(test)]
@@ -402,6 +403,7 @@ pub(in crate::runtime) enum ServerReliableStreamOpen {
     New(Box<AcceptedServerReliableStream>, TrafficClass),
     Existing(TrafficClass),
     DuplicateLiveIgnored,
+    Terminal(ResetReason),
     Rejected,
 }
 
@@ -1522,7 +1524,9 @@ impl ServerReliableStreamRegistry {
                         session_id.0, stream_id.0, underlay, path_id.0, response_lane,
                     ),
                 );
-                return Ok(ServerReliableStreamOpen::Rejected);
+                return Ok(ServerReliableStreamOpen::Terminal(
+                    ResetReason::RemoteClosed,
+                ));
             }
             if matches!(
                 attach_outcome,
@@ -1582,7 +1586,23 @@ impl ServerReliableStreamRegistry {
                     session_id.0, stream_id.0, underlay, path_id.0, initial_demand,
                 ),
             );
-            return Ok(ServerReliableStreamOpen::Rejected);
+            return Ok(ServerReliableStreamOpen::Terminal(
+                ResetReason::RemoteClosed,
+            ));
+        }
+
+        if return_plan.phase == StreamAttachmentPhase::Ordinary {
+            super::response::validate_return_plan_shape(return_plan)?;
+            // Recovery can only attach to retained byte and target state.
+            // Publish its terminal identity under the same membership lock as
+            // creation so a delayed STARTUP cannot recreate this lost stream.
+            self.closed_streams
+                .lock()
+                .expect("server reliable stream closed cache lock")
+                .insert((session_id, stream_id));
+            return Ok(ServerReliableStreamOpen::Terminal(
+                ResetReason::RemoteClosed,
+            ));
         }
 
         if streams.len() >= self.max_streams {
@@ -2508,6 +2528,9 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
                 }
                 ServerReliableStreamOpen::DuplicateLiveIgnored => {
                     Ok(ServerStreamOpenOutcome::DuplicateLiveIgnored)
+                }
+                ServerReliableStreamOpen::Terminal(reason) => {
+                    Ok(ServerStreamOpenOutcome::Terminal(reason))
                 }
                 ServerReliableStreamOpen::Rejected => Ok(ServerStreamOpenOutcome::Rejected),
             }

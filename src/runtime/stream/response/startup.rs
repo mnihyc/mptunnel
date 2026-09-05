@@ -426,7 +426,9 @@ impl ResponseStreamBinding {
     }
 }
 
-fn validate_return_plan_shape(plan: StreamReturnPlan) -> Result<(), RuntimeError> {
+pub(in crate::runtime::stream) fn validate_return_plan_shape(
+    plan: StreamReturnPlan,
+) -> Result<(), RuntimeError> {
     if plan.candidate_total == 0 || plan.candidate_ordinal >= plan.candidate_total {
         return Err(RuntimeError::Protocol(
             "return-plan candidate ordinal is outside its declared total",

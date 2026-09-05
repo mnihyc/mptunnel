@@ -59,6 +59,112 @@ fn relay_key(underlay: UnderlayProtocol, index: usize) -> RelayPathKey {
     RelayPathKey { underlay, index }
 }
 
+#[tokio::test]
+async fn restart_terminal_reset_is_propagated_by_recovery_open() {
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let stream_id = StreamId(617);
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let initial = OpenedRemoteStream::pending(
+            test_stream(stream_id, underlay, 0, commands, TrafficClass::Latency),
+            0,
+        );
+        let mut remotes = ReliableRelayRemoteSet::new(initial, 8);
+        let old_instance = remotes.paths[0].instance();
+        drop(
+            remotes
+                .remove_path_instance(old_instance)
+                .expect("carrier lost"),
+        );
+        assert!(remotes.is_empty());
+        let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+        let mut last_progress = Instant::now();
+        let terminal = RuntimeError::RemoteReset(crate::protocol::ResetReason::RemoteClosed);
+        assert!(!relay_path_open_error_is_retryable(underlay, &terminal));
+
+        let result = try_handle_additional_path_open_result(
+            stream_id,
+            &mut remotes,
+            &mut send_stream,
+            false,
+            TrafficClass::Latency,
+            RelayAdditionalPathOpenResult {
+                key: relay_key(underlay, 0),
+                generation: next_relay_additional_path_open_generation(),
+                mode: ReliableRelayAttachMode::Recovery,
+                startup_ordinal: None,
+                startup_expected_instance: None,
+                result: Err(terminal),
+            },
+            0,
+            &mut last_progress,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::RemoteReset(
+                    crate::protocol::ResetReason::RemoteClosed
+                ))
+            ),
+            "terminal stream reset must stop recovery for {underlay:?}"
+        );
+        assert!(
+            remotes.is_empty(),
+            "terminal result does not attach a new path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restart_terminal_reset_survives_obsolete_open_generation() {
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let stream_id = StreamId(618);
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let initial = OpenedRemoteStream::pending(
+            test_stream(stream_id, underlay, 0, commands, TrafficClass::Latency),
+            0,
+        );
+        let mut remotes = ReliableRelayRemoteSet::new(initial, 8);
+        let mut startup = singleton_return_plan(&remotes);
+        let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+        let mut last_progress = Instant::now();
+        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(RelayAdditionalPathOpenResult {
+            key: relay_key(underlay, 0),
+            generation: next_relay_additional_path_open_generation(),
+            mode: ReliableRelayAttachMode::Recovery,
+            startup_ordinal: None,
+            startup_expected_instance: None,
+            result: Err(RuntimeError::RemoteReset(
+                crate::protocol::ResetReason::RemoteClosed,
+            )),
+        })
+        .await
+        .expect("completed cancelled-generation result");
+        assert!(matches!(
+            try_drain_completed_additional_path_opens(
+                stream_id,
+                &mut startup,
+                &mut remotes,
+                &mut send_stream,
+                false,
+                TrafficClass::Latency,
+                &mut pending,
+                &mut rx,
+                &mut last_progress,
+            ),
+            Err(RuntimeError::RemoteReset(
+                crate::protocol::ResetReason::RemoteClosed
+            ))
+        ));
+        assert_eq!(
+            remotes.paths.len(),
+            1,
+            "reset does not fabricate carrier failure"
+        );
+    }
+}
+
 fn accepted_two_candidate_return_plan(
     stream_id: StreamId,
 ) -> (

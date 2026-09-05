@@ -13,8 +13,8 @@ use crate::mux::MuxLimits;
 use crate::outbound::OutboundConfig;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    Frame, OffsetRange, PathId, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
-    UnderlayProtocol,
+    Frame, OffsetRange, PathId, ResetReason, SessionId, StreamAttachmentPhase, StreamDemandHint,
+    StreamId, StreamReturnPlan, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::ReliableSendStream;
 use crate::runtime::error::RuntimeError;
@@ -1300,6 +1300,140 @@ async fn server_quic_duplicate_refusal_preserves_live_attachment() {
         1,
         "refusing a duplicate must preserve the existing live attachment",
     );
+}
+
+#[tokio::test]
+async fn server_quic_restart_reset_preserves_fresh_sibling_on_same_carrier() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let fresh_id = StreamId(489);
+        let lost_id = StreamId(488);
+        // This new registry has admitted a fresh STARTUP stream, but has no
+        // retained state for the client's pre-restart logical stream.
+        let mut fixture = ServerUdpTerminalWriterFixture::open(fresh_id).await;
+        fixture.drain_zero_credit_admission().await;
+        let mut product_stream = fixture.accepted.take_stream();
+        let actor = tokio::spawn(run_server_udp_reliable_stream_loop(
+            fixture.server_send.take().expect("fresh sibling sender"),
+            fixture.server_recv.take().expect("fresh sibling receiver"),
+            ServerUdpReliableStreamLoop {
+                context: fixture.context.clone(),
+                session_id: fixture.session_id,
+                path_id: fixture.path_id,
+                path_registration: fixture._path_registration.clone(),
+                stream_id: fresh_id,
+                target: fixture.target.clone(),
+                commands_tx: fixture.commands_tx.clone(),
+                commands_rx: fixture.commands_rx.take().expect("fresh sibling commands"),
+                path_proofs: PathProofTracker::default(),
+            },
+        ));
+        for phase in [
+            StreamAttachmentPhase::Ordinary,
+            StreamAttachmentPhase::Startup,
+        ] {
+            let (mut send, mut recv) = fixture
+                ._client_connection
+                .open_bi()
+                .await
+                .expect("open lost stream recovery request");
+            udp_path_write_frame(
+                &mut send,
+                &Frame::OpenStream {
+                    stream_id: lost_id,
+                    target: fixture.target.clone(),
+                    demand: StreamDemandHint::Throughput,
+                    return_plan: StreamReturnPlan {
+                        phase,
+                        ..Default::default()
+                    },
+                },
+                fixture.context.codec_limits,
+            )
+            .await
+            .expect("publish recovery or delayed startup");
+            let (server_send, server_recv) = fixture
+                ._server_connection
+                .accept_bi()
+                .await
+                .expect("accept lost stream request");
+            handle_server_udp_bidi_stream(
+                server_send,
+                server_recv,
+                fixture.context.clone(),
+                fixture.session_id,
+                fixture.path_id,
+                fixture._path_registration.clone(),
+            )
+            .await
+            .expect("lost logical stream is terminal without failing its carrier");
+            assert_eq!(
+                udp_path_read_frame(&mut recv, fixture.context.codec_limits)
+                    .await
+                    .expect("read lost stream terminal response"),
+                Frame::StreamReset {
+                    stream_id: lost_id,
+                    reason: ResetReason::RemoteClosed,
+                }
+            );
+            assert!(matches!(
+                udp_path_read_frame(&mut recv, fixture.context.codec_limits).await,
+                Err(RuntimeError::QuicCarrier(
+                    crate::transport::quic::QuicCarrierError::StreamFinished
+                ))
+            ));
+            let snapshot = fixture.context.reliable_streams.management_snapshot();
+            assert_eq!(snapshot.active_streams, 1, "no replacement target owner");
+            assert_eq!(snapshot.paths.len(), 1, "same carrier remains registered");
+            assert!(!fixture._client_connection.is_closed());
+        }
+
+        let payload = Bytes::from_static(b"fresh-sibling-after-restart");
+        let data = Frame::StreamData {
+            stream_id: fresh_id,
+            offset: 0,
+            payload: payload.clone(),
+        };
+        fixture
+            .commands_tx
+            .send_stream_ordered_frame(data.clone(), TrafficClass::Throughput)
+            .await
+            .expect("send fresh sibling payload after stale recovery");
+        let client_recv = fixture
+            .client_recv
+            .as_mut()
+            .expect("fresh sibling receiver");
+        while udp_path_read_frame(client_recv, fixture.context.codec_limits)
+            .await
+            .expect("fresh sibling continues receiving")
+            != data
+        {}
+        let ack = Frame::StreamAck {
+            stream_id: fresh_id,
+            complete: false,
+            ranges: vec![
+                OffsetRange::new(0, payload.len() as u64).expect("fresh sibling payload range"),
+            ],
+        };
+        udp_path_write_frame(
+            fixture.client_send.as_mut().expect("fresh sibling sender"),
+            &ack,
+            fixture.context.codec_limits,
+        )
+        .await
+        .expect("acknowledge fresh sibling on same carrier");
+        assert_eq!(
+            product_stream
+                .recv_frame()
+                .await
+                .expect("fresh sibling ACK"),
+            ack
+        );
+        assert!(!fixture._server_connection.is_closed());
+        actor.abort();
+        let _ = actor.await;
+    })
+    .await
+    .expect("lost QUIC stream and healthy sibling settle promptly");
 }
 
 #[tokio::test]

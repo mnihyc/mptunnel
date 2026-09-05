@@ -12,8 +12,8 @@ use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;
 use crate::protocol::{
     CloseReason, ConfiguredMemberSlot, Frame, OffsetRange, PathId, PathMetrics, PathUsage,
-    PeerPathState, PeerPathStatus, SessionId, StreamDemandHint, StreamId, StreamReturnPlan,
-    TargetAddr, UnderlayProtocol,
+    PeerPathState, PeerPathStatus, ResetReason, SessionId, StreamDemandHint, StreamId,
+    StreamReturnPlan, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
@@ -1023,6 +1023,7 @@ pub(in crate::runtime) enum ServerStreamOpenOutcome {
     New(TrafficClass),
     Existing(TrafficClass),
     DuplicateLiveIgnored,
+    Terminal(ResetReason),
     Rejected,
     Dropped,
 }

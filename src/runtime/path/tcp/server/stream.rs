@@ -79,6 +79,9 @@ impl ServerTcpStreamState {
                     max_offset: RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET,
                 })
             }
+            ServerStreamOpenOutcome::Terminal(reason) => {
+                Some(Frame::StreamReset { stream_id, reason })
+            }
             // OPEN_STREAM rejection is attachment-local. STREAM_RESET is
             // reserved for terminating the logical MPP stream, while
             // STREAM_DETACH retires only this carrier's attachment.

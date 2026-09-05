@@ -363,6 +363,9 @@ impl ClientTcpPathSessionHandle {
                     cancellation.disarm();
                     return Err(err);
                 }
+                ClientTcpOpenResponse::FailedAfterOpen(err @ RuntimeError::RemoteReset(_)) => {
+                    return Err(err);
+                }
                 ClientTcpOpenResponse::FailedAfterOpen(_)
                     if !self.session_slot_is_current(session.path_id) =>
                 {

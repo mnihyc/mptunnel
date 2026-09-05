@@ -46,6 +46,7 @@ pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 pub(in crate::runtime) use session::{ServerSessionRegistration, ServerSessionTracker};
 pub(in crate::runtime) use startup::ResponseStartupFinalOutcome;
+pub(super) use startup::validate_return_plan_shape;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

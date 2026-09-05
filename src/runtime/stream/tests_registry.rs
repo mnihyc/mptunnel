@@ -946,6 +946,50 @@ fn forwarding_decrements_only_remaining_authority_and_preserves_provenance() {
 }
 
 #[test]
+fn restart_missing_ordinary_validates_shape_before_terminal_identity() {
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let registry = constrained_registry(1, 1);
+        let session_id = SessionId(619);
+        let registration = registry.path_port().register_test_carrier_path(
+            session_id,
+            underlay,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+        );
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let request = |return_plan| ServerStreamOpenRequest {
+            session_id,
+            stream_id: StreamId(1),
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            initial_demand: StreamDemandHint::Latency,
+            return_plan,
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration.clone(),
+                commands: commands.clone(),
+                max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+            },
+            mux_limits: MuxLimits::default(),
+        };
+        assert!(matches!(
+            registry.open_or_attach(request(StreamReturnPlan {
+                phase: StreamAttachmentPhase::Ordinary,
+                candidate_total: 0,
+                ..Default::default()
+            })),
+            Err(RuntimeError::Protocol(_))
+        ));
+        assert_eq!(registry.management_snapshot().active_streams, 0);
+        assert!(
+            matches!(
+                registry.open_or_attach(request(Default::default())),
+                Ok(ServerReliableStreamOpen::New(_, _))
+            ),
+            "invalid plan must not create terminal identity"
+        );
+    }
+}
+
+#[test]
 fn accepted_stream_keeps_its_authenticated_opening_carrier_across_reattachment() {
     let registry = constrained_registry(2, 2);
     let port = registry.path_port();

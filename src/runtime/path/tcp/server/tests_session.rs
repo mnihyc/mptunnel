@@ -12,8 +12,9 @@ use crate::config::{
 };
 use crate::outbound::OutboundConfig;
 use crate::protocol::{
-    CloseReason, Frame, PathId, PathUsage, PeerPathState, ResetReason, SessionId, StreamDemandHint,
-    StreamId, TargetAddr, UnderlayProtocol,
+    CloseReason, Frame, PathId, PathUsage, PeerPathState, ResetReason, SessionId,
+    StreamAttachmentPhase, StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr,
+    UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
@@ -388,6 +389,206 @@ async fn server_tcp_test_session_with_mode(
         path_frames_tx,
         reliable_relay,
     )
+}
+
+#[tokio::test]
+async fn restart_missing_stream_resets_without_retiring_tcp_carrier() {
+    // Reconnecting authenticates the retained client SessionId into the new
+    // server's empty registry. Its old logical stream no longer exists there.
+    let (session, mut client, _commands, path_frames, _relay) =
+        server_tcp_test_session(SessionId(611), PathId(0)).await;
+    let context = session.context.clone();
+    assert_eq!(
+        context.reliable_streams.management_snapshot().paths.len(),
+        1
+    );
+    assert_eq!(
+        context
+            .reliable_streams
+            .management_snapshot()
+            .active_streams,
+        0
+    );
+    let actor = tokio::spawn(session.run());
+    for phase in [
+        StreamAttachmentPhase::Ordinary,
+        StreamAttachmentPhase::Startup,
+    ] {
+        path_frames
+            .send(Ok(Frame::OpenStream {
+                stream_id: StreamId(17),
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                demand: StreamDemandHint::Latency,
+                return_plan: StreamReturnPlan {
+                    phase,
+                    ..Default::default()
+                },
+            }))
+            .await
+            .expect("deliver retained stream recovery after server restart");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), client.read_frame())
+                .await
+                .expect("terminal reply is prompt")
+                .expect("stream reset"),
+            Frame::StreamReset {
+                stream_id: StreamId(17),
+                reason: ResetReason::RemoteClosed
+            }
+        );
+    }
+    let snapshot = context.reliable_streams.management_snapshot();
+    assert_eq!(
+        snapshot.paths.len(),
+        1,
+        "missing stream does not retire carrier"
+    );
+    assert_eq!(snapshot.active_streams, 0, "no target owner was created");
+    path_frames
+        .send(Ok(Frame::Ping { nonce: 19 }))
+        .await
+        .expect("carrier remains usable");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), client.read_frame())
+            .await
+            .expect("pong prompt")
+            .expect("pong"),
+        Frame::Pong { nonce: 19 }
+    );
+    actor.abort();
+    let _ = actor.await;
+}
+
+#[tokio::test]
+async fn restart_stale_ordinary_open_preserves_new_startup_sibling() {
+    let (mut session, mut client, _commands, _path_frames, _relay) =
+        server_tcp_test_session(SessionId(612), PathId(0)).await;
+    let context = session.context.clone();
+    let fresh_id = StreamId(18);
+    session
+        .handle_frame(Frame::OpenStream {
+            stream_id: fresh_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
+        })
+        .await
+        .expect("fresh STARTUP is accepted by the restarted server");
+    let admission = tokio::time::timeout(
+        Duration::from_secs(2),
+        recv_reliable_path_command(&mut session.commands_rx),
+    )
+    .await
+    .expect("fresh stream zero-credit admission is queued")
+    .expect("fresh stream admission");
+    session
+        .drain_commands(admission)
+        .await
+        .expect("write admission");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), client.read_frame())
+            .await
+            .expect("read admission promptly")
+            .expect("admission frame"),
+        Frame::StreamMaxData {
+            stream_id: fresh_id,
+            max_offset: 0
+        }
+    );
+    assert_eq!(
+        context
+            .reliable_streams
+            .management_snapshot()
+            .active_streams,
+        1
+    );
+
+    session
+        .handle_frame(Frame::OpenStream {
+            stream_id: StreamId(17),
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            demand: StreamDemandHint::Latency,
+            return_plan: StreamReturnPlan {
+                phase: StreamAttachmentPhase::Ordinary,
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("old browser stream retries beside new stream");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), client.read_frame())
+            .await
+            .expect("prompt reset")
+            .expect("reset frame"),
+        Frame::StreamReset {
+            stream_id: StreamId(17),
+            reason: ResetReason::RemoteClosed
+        }
+    );
+    let snapshot = context.reliable_streams.management_snapshot();
+    assert_eq!(snapshot.paths.len(), 1);
+    assert_eq!(
+        snapshot.active_streams, 1,
+        "fresh sibling owner remains intact"
+    );
+}
+
+#[tokio::test]
+async fn restart_retained_stream_accepts_ordinary_on_a_new_carrier() {
+    let (mut session, _client, _commands, _path_frames, _relay) =
+        server_tcp_test_session(SessionId(613), PathId(0)).await;
+    let stream_id = StreamId(17);
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    session
+        .handle_frame(Frame::OpenStream {
+            stream_id,
+            target: target.clone(),
+            demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
+        })
+        .await
+        .expect("initial stream exists while server state is retained");
+    let registration = session.context.reliable_streams.register_test_carrier_path(
+        session.session_id,
+        UnderlayProtocol::Tcp,
+        PathId(1),
+        ServerLocalPathProperties::default(),
+    );
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let result = session
+        .context
+        .reliable_streams
+        .open_or_attach(crate::runtime::path::ServerStreamOpenRequest {
+            session_id: session.session_id,
+            stream_id,
+            target,
+            initial_demand: StreamDemandHint::Latency,
+            return_plan: StreamReturnPlan {
+                phase: StreamAttachmentPhase::Ordinary,
+                ..Default::default()
+            },
+            attachment: crate::runtime::path::ServerStreamPathAttachment {
+                path_registration: registration,
+                commands,
+                max_frame_payload_bytes: session.context.mux_limits.max_payload_bytes,
+            },
+            mux_limits: session.context.mux_limits,
+        })
+        .await
+        .expect("same recovery is legal while its target state survives");
+    assert!(matches!(
+        result,
+        crate::runtime::path::ServerStreamOpenOutcome::Existing(_)
+    ));
+    assert_eq!(
+        session
+            .context
+            .reliable_streams
+            .management_snapshot()
+            .active_streams,
+        1
+    );
 }
 
 #[tokio::test]

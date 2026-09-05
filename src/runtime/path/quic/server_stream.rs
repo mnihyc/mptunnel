@@ -256,6 +256,16 @@ pub(super) async fn handle_server_udp_reliable_stream(
             send.set_traffic_class(response_lane)?;
             true
         }
+        ServerStreamOpenOutcome::Terminal(reason) => {
+            udp_path_write_frame(
+                &mut send,
+                &Frame::StreamReset { stream_id, reason },
+                context.codec_limits,
+            )
+            .await?;
+            let _ = udp_path_finish_stream(&mut send).await;
+            return Ok(());
+        }
         ServerStreamOpenOutcome::DuplicateLiveIgnored => {
             udp_path_write_frame(
                 &mut send,
@@ -644,6 +654,16 @@ async fn run_server_udp_reliable_stream_loop(
                                 return Err(RuntimeError::Protocol(
                                     "QUIC UDP path reannouncement opened duplicate stream",
                                 ));
+                            }
+                            ServerStreamOpenOutcome::Terminal(reason) => {
+                                udp_path_write_frame(
+                                    &mut send,
+                                    &Frame::StreamReset { stream_id, reason },
+                                    context.codec_limits,
+                                )
+                                .await?;
+                                let _ = udp_path_finish_stream(&mut send).await;
+                                return Ok(());
                             }
                             ServerStreamOpenOutcome::DuplicateLiveIgnored
                             | ServerStreamOpenOutcome::Rejected => {

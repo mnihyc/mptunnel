@@ -511,7 +511,9 @@ pub(super) fn try_handle_additional_path_open_result(
                 }
             }
         }
-        Err(err @ RuntimeError::ExactIdentityExhausted) => Err(err),
+        Err(err @ (RuntimeError::ExactIdentityExhausted | RuntimeError::RemoteReset(_))) => {
+            Err(err)
+        }
         Err(RuntimeError::ReliablePathAttachmentRefused) => {
             // Attachment refusal is stream-local and says nothing about the
             // health of the authenticated carrier.
@@ -610,6 +612,9 @@ pub(super) fn try_drain_completed_additional_path_opens(
 ) -> Result<bool, RuntimeError> {
     let mut attached = false;
     while let Ok(additional_path_open) = additional_path_open_rx.try_recv() {
+        if let Some(error) = additional_path_open.terminal_error() {
+            return Err(error);
+        }
         if take_matching_additional_path_open(
             pending,
             additional_path_open.key,
@@ -703,6 +708,17 @@ pub(super) struct RelayAdditionalPathOpenResult {
     pub(super) startup_ordinal: Option<u8>,
     pub(super) startup_expected_instance: Option<CarrierPathInstanceId>,
     pub(super) result: Result<OpenedRemoteStream, RuntimeError>,
+}
+
+impl RelayAdditionalPathOpenResult {
+    pub(super) fn terminal_error(&self) -> Option<RuntimeError> {
+        // Authenticated STREAM_RESET terminates this logical stream even if
+        // another attachment attempt has replaced the one carrying it.
+        match &self.result {
+            Err(RuntimeError::RemoteReset(reason)) => Some(RuntimeError::RemoteReset(*reason)),
+            _ => None,
+        }
+    }
 }
 
 pub(super) struct RelayAdditionalPathOpenTask {

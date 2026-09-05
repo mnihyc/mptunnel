@@ -2,7 +2,9 @@ use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SharedSecret};
 use crate::outbound::OutboundConfig;
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
-use crate::protocol::{CloseReason, PathUsage, StreamAttachmentPhase, StreamDemandHint};
+use crate::protocol::{
+    CloseReason, PathUsage, ResetReason, StreamAttachmentPhase, StreamDemandHint,
+};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
     reliable_path_command_queue_for_payload, reliable_path_priority_headroom_frames,
@@ -4525,7 +4527,9 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
         ServerReliableStreamOpen::DuplicateLiveIgnored => {
             panic!("new active stream must not be treated as duplicate")
         }
-        ServerReliableStreamOpen::Rejected => panic!("active stream open should not be rejected"),
+        ServerReliableStreamOpen::Terminal(_) | ServerReliableStreamOpen::Rejected => {
+            panic!("active stream open should not be rejected")
+        }
     };
     let mut stream = accepted.take_stream();
     assert_eq!(stream.current_lane(), TrafficClass::Latency);
@@ -4643,7 +4647,9 @@ fn server_response_output_inherits_open_path_startup_prior_and_metrics() {
         ServerReliableStreamOpen::DuplicateLiveIgnored => {
             panic!("new active stream must not be treated as duplicate")
         }
-        ServerReliableStreamOpen::Rejected => panic!("active stream open should not be rejected"),
+        ServerReliableStreamOpen::Terminal(_) | ServerReliableStreamOpen::Rejected => {
+            panic!("active stream open should not be rejected")
+        }
     };
     let stream = accepted.stream();
     let snapshot = stream
@@ -4774,7 +4780,10 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
             mux_limits: MuxLimits::default(),
         })
         .expect("closed-stream reopen should be handled");
-    assert!(matches!(reopened, ServerReliableStreamOpen::Rejected));
+    assert!(matches!(
+        reopened,
+        ServerReliableStreamOpen::Terminal(ResetReason::RemoteClosed)
+    ));
     assert_eq!(registry.management_snapshot().active_streams, 0);
 }
 

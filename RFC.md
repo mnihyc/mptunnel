@@ -1243,6 +1243,22 @@ fails a new logical open before publication rather than wrapping. Consequently
 a well-formed delayed frame for an absent or terminal `StreamId` is stale; it
 can never name a future Product stream.
 
+A valid `ORDINARY` open whose logical stream state is absent (for example,
+after the responder restarts) MUST terminate that stream with
+`STREAM_RESET(RemoteClosed)`. It MUST NOT create a replacement target socket
+or fail the shared carrier. The responder records the terminal stream ID
+atomically with the absent-state decision in its existing bounded closed-ID
+retention, so a delayed `STARTUP` cannot recreate it while that identity is
+retained. Opens for retained terminal IDs also receive a stream reset. Ordinary
+attachment refusal, duplicate output refusal, and physical carrier retirement
+remain attachment-local `STREAM_DETACH` outcomes.
+
+An authenticated stream reset remains terminal when its carrier slot or
+attachment-attempt generation has changed before the requester observes it.
+The requester ends the lost logical stream and allows applications to open
+fresh streams through the recovered carrier. Reconnecting carriers cannot
+restore target sockets or byte-offset state destroyed by a responder restart.
+
 The wire demand value is an immutable admission hint. A sender's live
 throughput, latency, or realtime objective may change from local Product and
 queue state without a wire update. That sender-local state controls its

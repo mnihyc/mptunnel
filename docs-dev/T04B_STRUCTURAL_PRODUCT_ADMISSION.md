@@ -2,6 +2,18 @@
 
 Status: focused implementation GREEN; independently audited GO (2026-09-04)
 
+Review qualification (2026-09-06): that historical component verdict is not
+an ordered-performance non-regression proof. Current mixed traces expose the
+missing allocation contract; see ORDERED_REPAIR_SERVICE_BOUNDARY. Resource
+admission invariance remains valid, but it does not imply invariant dispatch
+choice or an obligation to immediately use the sole queue-admitting output.
+The old `None` result conflated unavailable resources with an advisory wait;
+removing it without a typed wait/discovery owner leaves the performance
+question unresolved. The argument below bounds the same configured envelope,
+not the actual amount or residence time of debt within it. Do not use this
+historical GO to waive the current ordered-delivery gate or restore the old
+BDP-derived resource limit wholesale.
+
 ## Exact defect
 
 Two production-owner tests hold all exact/configured authority constant and

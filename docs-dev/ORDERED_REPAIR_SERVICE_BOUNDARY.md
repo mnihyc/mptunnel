@@ -22,6 +22,42 @@ different loss thresholds, or a fixed QUIC preference does not repair this
 boundary. Changing the allocation contract requires an explicit RFC revision;
 the accepted exact ACK/copy/lifecycle rules are not the defect to remove.
 
+## Introduction history and the incomplete acceptance argument
+
+Commit65edae3 (2026-09-04) removed the ordinary response ECF completion veto
+and inference-derived reorder budget while introducing the structural
+`BulkProductResourceCheck`. Its purpose was legitimate: low or stale rate
+predictions must not shrink configured Product resources or keep a recovered
+singleton idle. The request-side BDP limit and response-side placement wait
+were nevertheless different behaviors handled in one transaction.
+
+T04B_STRUCTURAL_PRODUCT_ADMISSION proved invariance of resource permission
+under changed estimates. It then treated the absence of immediate dispatch
+as an admission defect. That inference is too strong: a scheduler can have
+permission to publish and still choose a finite advisory wait. The old `None`
+result did not represent that distinction or independently prove discovery
+and wake liveness. Removing the veto fixed that ambiguous denial but supplied
+no replacement ordered allocator. Existing rank compares only admitted
+outputs; it cannot select a busy faster output as an alternative action.
+
+Formally, resource permission A depends on structural state sigma, not
+prediction e: `A(sigma,N,e1)=A(sigma,N,e2)`. Dispatch choice D may and should
+differ with e while remaining subject to A. The former does not imply
+`D(sigma,N,e1)=D(sigma,N,e2)` or mandate immediate publication whenever A is
+nonempty. The former acceptance argument also confused preservation of the
+configured exposure ceiling with preservation of actual exposure and latency.
+More committed work can remain beneath the same64-MiB ceiling and still
+delay a frontier by seconds. This is an incomplete performance model, not a
+reason to weaken exact debt accounting or revive a fake inferred window.
+
+The historical component tests and independent audit are retained as scoped
+evidence. This review does not retrospectively claim all old performance was
+caused by this single commit; no same-build parent/current comparison was
+performed here. It identifies the exact removed decision and the obligation
+the non-regression argument failed to cover. Bounded wait/discovery must
+replace that obligation explicitly rather than reverting every structural
+admission correction.
+
 ## Current candidate trace, without deliberate QoS or outage
 
 `mixed-combined-down-cooperative-frontier-trace-0906` runs the current native,

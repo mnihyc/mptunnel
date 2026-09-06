@@ -119,6 +119,11 @@ and closed component invariants are not repeatedly reopened as new defects.
   contract; its unknown-capacity and reversed-quality cases must be settled
   before implementation. Two diagnostic-only hunks are archived and removed;
   no additional runtime behavior changed. Resource cost remains open.
+  History review identifies65edae3/T04b's incomplete argument: resource
+  permission invariance does not mandate immediate dispatch or establish
+  ordered-latency non-regression. Keep exact resource separation, but replace
+  the missing allocation choice explicitly; do not restore all old ETA/BDP
+  gates or claim this single commit explains every previous regression.
 - Native outage trace shows ordinary exponential PTO backoff, not a stuck
   timer in that capture. Physical queue drain, native reordering tolerance and
   Product-prefix stalls remain separate causes; do not collapse them into the

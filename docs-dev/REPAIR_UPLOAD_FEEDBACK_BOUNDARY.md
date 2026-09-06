@@ -1,6 +1,6 @@
 # Upload feedback lag after the paired repair experiment
 
-2026-09-06 15:12 UTC. Focused continuation, not an accepted runtime fix.
+2026-09-06 15:22 UTC. Focused continuation, not an accepted runtime fix.
 
 ## Practical result and exact boundary
 
@@ -78,6 +78,34 @@ to exact native accepted/unsent/contiguously-ACKed offsets and observes the
 held native reordering candidate's learned deadlines. That candidate may be
 part of the problem and must not be protected from the same causal standard.
 No scheduling preference, queue limit, congestion gain or deadline is changed.
+
+## Native receipt separates the remaining delay
+
+REPAIR_UPLOAD_NATIVE_RECEIPT_EVIDENCE_20260906.json captures a decisive witness:
+ACK contents `[0,159705431)` are accepted at Unix1788707715368ms in native
+stream4, batch offsets470108..470182. At1788707715694653us the native contiguous
+ACK prefix reaches470537, covering the whole batch. MPP decodes those contents
+at1788707759793ms:44.425s after handoff and44.098s after confirmed native receipt.
+The largest observed native loss deadlines are.376s client and.389s server.
+Do not attribute this delay to native loss policy, network QoS or a BBR gain.
+
+Client CPU stays near one full core while RSS rises from343580KiB at5s to
+505648KiB at50s. Server load declines while already-delivered Product bytes
+await processing at the client. These are lifetime-average CPU samples and
+live RSS, not a proven leak or CPU-hot-function profile. The long native delay
+is ruled out for these exact batches; processing cost remains to be attributed.
+
+Correction to the earlier queue interpretation: small *individual enqueue
+waits* do not exclude long accumulated FIFO backlog age. Repeated40ms service
+waits across a thousand accepted ACK records can age later records by40s.
+The native-offset witness, not per-frame queue-wait maxima, identifies which
+side of native delivery owns this delay. A sampling/aggregation error must not
+be turned into a false protocol or congestion correction.
+
+Next use aggregate synchronous-owner timings with all per-frame logs disabled.
+Profile the ACK transaction, ACK-derived recovery evaluation and path recovery
+pass, retaining ordinary-build controls. Distinguish algorithmic work from
+observer overhead. No gain/queue/timeout adjustment or unvalidated ACK dropping.
 
 Diagnostic binaries and raw records remain under .tmp/reflection/. Wider
 acceptance is paused at this failure; no release or runtime acceptance.

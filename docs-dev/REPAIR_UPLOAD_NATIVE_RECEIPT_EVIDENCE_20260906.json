@@ -1,0 +1,4833 @@
+Warning: truncated output (original token count: 49828)
+Total output lines: 7260
+
+{
+  "date": "2026-09-06",
+  "status": "diagnostic attribution, not acceptance",
+  "case": ".tmp/reflection/results/mixed-combined-up-repair-ack-native-progress-0906",
+  "interpretation": "The whole native ACK batch is contiguously acknowledged before MPP decodes it. Queue per-frame wait maxima do not bound accumulated FIFO backlog age. Native recovery deadlines are not the measured 44-second delay.",
+  "probe": {
+    "bytes": 226885632,
+    "case": "mixed-combined-up-repair-ack-native-progress-0906",
+    "complete": true,
+    "complete_streams": 1,
+    "completion_timeout_s": 50,
+    "exit_code": 0,
+    "failed_streams": 0,
+    "failover_after_s": -1,
+    "failover_trigger_source": "timer",
+    "first_delivery_s": 0.433142,
+    "first_write_s": 0.13084,
+    "goodput_mbps": 27.432,
+    "interval_goodput_avg_mbps": 17.891,
+    "interval_goodput_max_mbps": 306.088,
+    "interval_goodput_mbps": [
+      81.937,
+      118.533,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      185.029,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      306.088,
+      134.55,
+      8.248,
+      27.403,
+      33.126,
+      14.348,
+      21.636,
+      18.21,
+      96.469,
+      11.438,
+      17.538,
+      16.777
+    ],
+    "interval_goodput_min_mbps": 0,
+    "interval_goodput_raw_mbps": [
+      5.765,
+      24.117,
+      571.046,
+      81.937,
+      118.533,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      185.029,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      306.088,
+      134.55,
+      8.248,
+      27.403,
+      33.126,
+      14.348,
+      21.636,
+      18.21,
+      96.469,
+      11.438,
+      17.538,
+      16.777,
+      18.542,
+      26.879,
+      77.405
+    ],
+    "interval_seconds": 1,
+    "interval_trim_discard_each_end": 3,
+    "load_duration_s": 40,
+    "local_accepted_bytes": 226885632,
+    "local_accepted_goodput_mbps": 27.432,
+    "local_recovery_gap_s": 0,
+    "max_delivery_gap_s": 33.616452,
+    "max_write_gap_s": 1.169502,
+    "mode": "duration-upload",
+    "parallel_uploads": 1,
+    "protocol": "tcp-upload",
+    "recovery_gap_s": 0,
+    "status": "ok",
+    "streams": 1,
+    "streams_with_delivery": 1,
+    "target_confirmed_bytes": 226885632,
+    "time_s": 66.165871,
+    "upload_accounting_exact": true,
+    "upload_accounting_lower_bound": false,
+    "upload_accounting_source": "target_sink_ack",
+    "upload_ack_accounting_valid": true,
+    "upload_goodput_mbps": 27.432,
+    "upload_metric_version": 2,
+    "upload_probe_errors": []
+  },
+  "largest_native_receipt_to_decode_witnesses": [
+    {
+      "ts_unix_ms": "1788707716329",
+      "t_mono_ms": "5049",
+      "seq": "12421",
+      "pid": "66380",
+      "role": "server",
+      "event": "quic_ack_native_handoff",
+      "stream_id": "0",
+      "native_id": "4",
+      "complete": "true",
+      "ranges": "1",
+      "first_start": "0",
+      "first_end": "171752055",
+      "largest_end": "171752055",
+      "native_before": "500239",
+      "native_after": "500343",
+      "native_unsent": "500239",
+      "native_ack_prefix": "494247",
+      "decoded_unix_ms": 1788707764380,
+      "handoff_decode_ms": 48051,
+      "native_ack": {
+        "ts_unix_us": "1788707716474714",
+        "event": "stream_progress",
+        "side": "Server",
+        "stream_id": "4",
+        "accepted": "500787",
+        "unsent": "500787",
+        "ack_prefix": "500417"
+      },
+      "decode_after_native_ack_ms": 47905.285888671875
+    },
+    {
+      "ts_unix_ms": "1788707716301",
+      "t_mono_ms": "5020",
+      "seq": "12350",
+      "pid": "66380",
+      "role": "server",
+      "event": "quic_ack_native_handoff",
+      "stream_id": "0",
+      "native_id": "4",
+      "complete": "false",
+      "ranges": "1",
+      "first_start": "169917047",
+      "first_end": "169982583",
+      "largest_end": "169982583",
+      "native_before": "499094",
+      "native_after": "499288",
+      "native_unsent": "499094",
+      "native_ack_prefix": "492080",
+      "decoded_unix_ms": 1788707764344,
+      "handoff_decode_ms": 48043,
+      "native_ack": {
+        "ts_unix_us": "1788707716428365",
+        "event": "stream_progress",
+        "side": "Server",
+        "stream_id": "4",
+        "accepted": "500639",
+        "unsent": "500639",
+        "ack_prefix": "499288"
+      },
+      "decode_after_native_ack_ms": 47915.635009765625
+    },
+    {
+      "ts_unix_ms": "1788707716300",
+      "t_mono_ms": "5020",
+      "seq": "12345",
+      "pid": "66380",
+      "role": "server",
+      "event": "quic_ack_native_handoff",
+      "stream_id": "0",
+      "native_id": "4",
+      "complete": "false",
+      "ranges": "1",
+      "first_start": "169702903",
+      "first_end": "169768439",
+      "largest_end": "169768439",
+      "native_before": "499020",
+      "native_after": "499094",
+      "native_unsent": "499020",
+      "native_ack_prefix": "492080",
+      "decoded_unix_ms": 1788707764325,
+      "handoff_decode_ms": 48025,
+      "native_ack": {
+        "ts_unix_us": "1788707716428365",
+        "event": "stream_progress",
+        "side": "Server",
+        "stream_id": "4",
+        "accepted": "500639",
+        "unsent": "500639",
+        "ack_prefix": "499288"
+      },
+      "decode_after_native_ack_ms": 47896.635009765625
+    },
+    {
+      "ts_unix_ms": "1788707716366",
+      "t_mono_ms": "5085",
+      "seq": "12426",
+      "pid": "66380",
+      "role": "server",
+      "event": "quic_ack_native_handoff",
+      "stream_id": "0",
+      "native_id": "4",
+      "complete": "true",
+      "ranges": "1",
+      "first_start": "0",
+      "first_end": "171931127",
+      "largest_end": "171931127",
+      "native_before": "500343",
+      "native_after": "500417",
+      "native_unsent": "500343",
+      "native_ack_prefix": "494247",
+      "decoded_unix_ms": 1788707764385,
+      "handoff_decode_ms": 48019,
+      "native_ack": {
+        "ts_unix_us": "1788707716474714",
+        "event": "stream_progress",
+        "side": "Server",
+        "stream_id": "4",
+        "accepted": "500787",
+        "unsent": "500787",
+        "ack_prefix": "500417"
+      },
+      "decode_after_native_ack_ms": 47910.285888671875
+    },
+    {
+      "ts_unix_ms": "1788707715689",
+      "t_mono_ms": "4408",
+      "seq": "11958",
+      "pid": "66380",
+      "role": "server",
+      "event": "quic_ack_native_handoff",
+      "stream_id": "0",
+      "native_id": "4",
+      "complete": "true",
+      "ranges": "1",
+      "first_start": "0",
+      "first_end": "165407063",
+      "largest_end": "165407063",
+      "native_before": "490012",
+      "native_after": "490086",
+      "native_unsent": "490012",
+      "native_ack_prefix": "470033",
+      "decoded_unix_ms": 1788707763706,
+      "handoff_decode_ms": 48017,
+      "native_ack": {
+        "ts_unix_us": "1788707715990308",
+        "event": "stream_progress",
+        "side": "Server",
+        "stream_id": "4",
+        "accepted": "491364",
+        "unsent": "491364",
+        "ack_prefix": "491364"
+      },
+      "decode_after_native_ack_ms": 47715.69189453125
+    },
+    {
+      "ts_unix_ms": "1788707716238",
+      "t_mono_ms": "4958",
+      "seq": "12311",
+      "pid": "66380",
+      "role": "server",
+      "event": "quic_ack_native_handoff",
+      "stream_id": "0",
+      "native_id": "4",
+      "complete": "false",
+      "ranges": "1",
+      "first_start": "169232151",
+      "first_end": "169297687",
+      "largest_end": "169297687",
+      "native_before": "496475",
+      "native_after": "498227",
+      "native_unsent": "496475",
+      "native_ack_prefix": "492080",
+      "decoded_unix_ms": 1788707764254,
+      "handoff_decode_ms": 48016,
+      "native_ack": {
+        "ts_unix_us": "1788707716395436",
+        "event": "stream_progress",
+        "side": "Server",
+        "stream_id": "4",
+        "accepted": "500491",
+        "unsent": "500491",
+        "ack_prefix": "498227"
+      },
+      "decode_after_native_ack_ms": 47858.56396484375
+    },
+    {
+      "ts_unix_ms": "1788707716300",
+      "t_mono_ms": "5019",
+      "seq": "12339",
+      "pid": "66380",
+      "role": "server",
+      "event": "quic_ack_native_handoff",
+      "stream_id": "0",
+      "native_id": "4",
+      "complete": "false",
+      "ranges": "1",
+      "first_start": "169494295",
+      "first_end": "169559831",
+      "largest_end": "169559831",
+      "native_before": "498492",
+      "native_after": "498895",
+      "native_unsent": "498492",
+      "native_ack_prefix": "492080",
+      "decoded_unix_ms": 1788707764309,
+      "handoff_decode_ms": 48009,
+      "native_ack": {
+        "ts_unix_us": "1788707716428365",
+        "event": "stream_progress",
+        "side": "Server",
+        "stream_id": "4",
+        "accepted": "500639",
+        "unsent": "500639",
+        "ack_prefix": "499288"
+      },
+      "decode_after_native_ack_ms": 47880.635009765625
+    },
+    {
+      "ts_unix_ms": "1788707716384",
+      "t_mono_ms": "5104",
+      "seq": "12431",
+      "pid": "66380",
+      "role": "server",
+      "event": "quic_ack_native_handoff",
+      "stream_id": "0",
+      "native_id": "4",
+      "complete": "true",
+      "ranges": "1",
+      "first_start": "0",
+      "first_end": "172329879",
+      "largest_end": "172329879",
+      "native_before": "500417",
+      "native_after": "500491",
+      "native_unsent": "500417",
+      "native_ack_prefix": "494247",
+      "decoded_unix_ms": 1788707764388,
+      "handoff_decode_ms": 48004,
+      "native_ack": {
+        "ts_unix_us": "1788707716664802",
+        "event": "stream_progress",
+        "side": "Server",
+        "stream_id": "4",
+        "accepted": "501608",
+        "unsent": "501608",
+        "ack_prefix": "501238"
+      },
+      "decode_after_native_ack_ms": 47723.197998046875
+    }
+  ],
+  "native_recovery_deadlines": {
+    "client": {
+      "count": 589,
+      "largest": [
+        {
+          "ts_unix_us": "1788707715117081",
+          "event": "loss",
+          "side": "Client",
+          "count": "3",
+          "bytes": "3600",
+          "rtt_us": "275279",
+          "delay_us": "376143",
+          "pto_us": "338203",
+          "packet_detector": "false"
+        },
+        {
+          "ts_unix_us": "1788707715123612",
+          "event": "loss",
+          "side": "Client",
+          "count": "5",
+          "bytes": "6000",
+          "rtt_us": "275279",
+          "delay_us": "376143",
+          "pto_us": "338203",
+          "packet_detector": "false"
+        },
+        {
+          "ts_unix_us": "1788707715133324",
+          "event": "loss",
+          "side": "Client",
+          "count": "10",
+          "bytes": "12000",
+          "rtt_us": "275279",
+          "delay_us": "376143",
+          "pto_us": "338203",
+          "packet_detector": "false"
+        },
+        {
+          "ts_unix_us": "1788707715136933",
+          "event": "loss",
+          "side": "Client",
+          "count": "6",
+          "bytes": "7200",
+          "rtt_us": "275279",
+          "delay_us": "376143",
+          "pto_us": "338203",
+          "packet_detector": "false"
+        },
+        {
+          "ts_unix_us": "1788707715076730",
+          "event": "loss",
+          "side": "Client",
+          "count": "1",
+          "bytes": "1200",
+          "rtt_us": "269260",
+          "delay_us": "370123",
+          "pto_us": "317769",
+          "packet_detector": "false"
+        }
+      ]
+    },
+    "server": {
+      "count": 1409,
+      "largest": [
+        {
+          "ts_unix_us": "1788707712672537",
+          "event": "loss",
+          "side": "Server",
+          "count": "1",
+          "bytes": "0",
+          "rtt_us": "311220",
+          "delay_us": "388781",
+          "pto_us": "418610",
+          "packet_detector": "false"
+        },
+        {
+          "ts_unix_us": "1788707712674679",
+          "event": "loss",
+          "side": "Server",
+          "count": "1",
+          "bytes": "0",
+          "rtt_us": "311220",
+          "delay_us": "388781",
+          "pto_us": "418610",
+          "packet_detector": "false"
+        },
+        {
+          "ts_unix_us": "1788707712674916",
+          "event": "loss",
+          "side": "Server",
+          "count": "1",
+          "bytes": "0",
+          "rtt_us": "311220",
+          "delay_us": "388781",
+          "pto_us": "418610",
+          "packet_detector": "false"
+        },
+        {
+          "ts_unix_us": "1788707712675119",
+          "event": "loss",
+          "side": "Server",
+          "count": "2",
+          "bytes": "0",
+          "rtt_us": "311220",
+          "delay_us": "388781",
+          "pto_us": "418610",
+          "packet_detector": "false"
+        },
+        {
+          "ts_unix_us": "1788707712675254",
+          "event": "loss",
+          "side": "Server",
+          "count": "1",
+          "bytes": "0",
+          "rtt_us": "311220",
+          "delay_us": "388781",
+          "pto_us": "418610",
+          "packet_detector": "false"
+        }
+      ]
+    }
+  },
+  "process_and_native_series": [
+    {
+      "elapsed_s": 0.00005376001354306936,
+      "client_process": "  66795 mptunnel        54604  5.5",
+      "server_process": "  66380 mptunnel        30340  3.3",
+      "client_traffic": {
+        "to_peer_bytes": "0",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "0",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "0",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "0",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "635672",
+            "acked_bytes": "7480",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "743485",
+            "acked_bytes": "7693",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 1.0008955869125202,
+      "client_process": "  66795 mptunnel        155740 35.3",
+      "server_process": "  66380 mptunnel        46476 13.1",
+      "client_traffic": {
+        "to_peer_bytes": "68484855",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "32",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "32",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "2031351",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "965886",
+            "acked_bytes": "1927817",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "791458",
+            "acked_bytes": "746250",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "826944",
+            "acked_bytes": "317756",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "1766228",
+            "acked_bytes": "7529401",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "802064",
+            "acked_bytes": "11405",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "939300",
+            "acked_bytes": "13760",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "810109",
+            "acked_bytes": "12859",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "1818227",
+            "acked_bytes": "22281",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 2.0010013909777626,
+      "client_process": "  66795 mptunnel        162948 57.5",
+      "server_process": "  66380 mptunnel        111148 37.0",
+      "client_traffic": {
+        "to_peer_bytes": "71958263",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "56",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "68",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "5308151",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "1922643",
+            "acked_bytes": "4885041",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "1658217",
+            "acked_bytes": "3240338",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "1820254",
+            "acked_bytes": "1196981",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "2691624",
+            "acked_bytes": "52698457",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "1809656",
+            "acked_bytes": "28775",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "1947381",
+            "acked_bytes": "34588",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "1818184",
+            "acked_bytes": "34072",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "2778410",
+            "acked_bytes": "70873",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 3.0011130679631606,
+      "client_process": "  66795 mptunnel        260676 79.2",
+      "server_process": "  66380 mptunnel        114452 44.2",
+      "client_traffic": {
+        "to_peer_bytes": "145775799",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "94",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "107",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "80824087",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "2947829",
+            "acked_bytes": "12483737",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "2829682",
+            "acked_bytes": "7015736",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "2833365",
+            "acked_bytes": "6501477",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "3768738",
+            "acked_bytes": "83428562",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "2810151",
+            "acked_bytes": "140149",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "2947485",
+            "acked_bytes": "139809",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "2818324",
+            "acked_bytes": "141846",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "3852221",
+            "acked_bytes": "151545",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 4.001176713965833,
+      "client_process": "  66795 mptunnel        295632 93.0",
+      "server_process": "  66380 mptunnel        114452 53.4",
+      "client_traffic": {
+        "to_peer_bytes": "157251063",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "120",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "147",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "123291415",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "3944655",
+            "acked_bytes": "12560976",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "3842970",
+            "acked_bytes": "9919447",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "3744970",
+            "acked_bytes": "14506459",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "4749415",
+            "acked_bytes": "127102562",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "3810188",
+            "acked_bytes": "291170",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "3947509",
+            "acked_bytes": "259048",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "3818085",
+            "acked_bytes": "286159",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "4831142",
+            "acked_bytes": "285619",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 5.001309482962824,
+      "client_process": "  66795 mptunnel        343580 99.8",
+      "server_process": "  66380 mptunnel        114452 53.0",
+      "client_traffic": {
+        "to_peer_bytes": "169232151",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "203",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "167462679",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "4966949",
+            "acked_bytes": "12751598",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "4798142",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "4843917",
+            "acked_bytes": "16233381",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "5725629",
+            "acked_bytes": "153720537",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "4804366",
+            "acked_bytes": "599445",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "4946227",
+            "acked_bytes": "614822",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "4814659",
+            "acked_bytes": "570164",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "5829118",
+            "acked_bytes": "568898",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 6.001430045929737,
+      "client_process": "  66795 mptunnel        355044 101",
+      "server_process": "  66380 mptunnel        114460 49.3",
+      "client_traffic": {
+        "to_peer_bytes": "179402231",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "5959142",
+            "acked_bytes": "16348148",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "5820757",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "5832482",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "6754786",
+            "acked_bytes": "162905249",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "5794955",
+            "acked_bytes": "630198",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "5940491",
+            "acked_bytes": "629757",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "5803076",
+            "acked_bytes": "629779",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "6829527",
+            "acked_bytes": "585690",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 7.001526379957795,
+      "client_process": "  66795 mptunnel        357616 101",
+      "server_process": "  66380 mptunnel        114460 43.3",
+      "client_traffic": {
+        "to_peer_bytes": "180402807",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "6953781",
+            "acked_bytes": "20719122",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "6834019",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "6841106",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "7735580",
+            "acked_bytes": "162935486",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "6787780",
+            "acked_bytes": "631699",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "6923007",
+            "acked_bytes": "631866",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "6793806",
+            "acked_bytes": "631900",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "7823223",
+            "acked_bytes": "586116",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 8.001637125969864,
+      "client_process": "  66795 mptunnel        362092 101",
+      "server_process": "  66380 mptunnel        114460 38.5",
+      "client_traffic": {
+        "to_peer_bytes": "181016631",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "7966088",
+            "acked_bytes": "24702020",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "7805555",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "7812689",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "8607227",
+            "acked_bytes": "162950562",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "7461996",
+            "acked_bytes": "631811",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "7934012",
+            "acked_bytes": "631978",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "7460899",
+            "acked_bytes": "632012",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "8733620",
+            "acked_bytes": "586272",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 9.00173640192952,
+      "client_process": "  66795 mptunnel        363932 101",
+      "server_process": "  66380 mptunnel        114460 34.9",
+      "client_traffic": {
+        "to_peer_bytes": "181713527",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "8953780",
+            "acked_bytes": "27908562",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "8806910",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "8796475",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "9768023",
+            "acked_bytes": "162965638",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "8784301",
+            "acked_bytes": "631867",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "8921634",
+            "acked_bytes": "632034",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "8792371",
+            "acked_bytes": "632068",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "9702360",
+            "acked_bytes": "586410",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 10.002024960005656,
+      "client_process": "  66795 mptunnel        369620 101",
+      "server_process": "  66380 mptunnel        114460 31.2",
+      "client_traffic": {
+        "to_peer_bytes": "182422423",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "9958937",
+            "acked_bytes": "30769810",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "9796395",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "9820249",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "10672894",
+            "acked_bytes": "162995790",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "9798590",
+            "acked_bytes": "631923",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "9853255",
+            "acked_bytes": "632146",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "9525630",
+            "acked_bytes": "632180",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "10813405",
+            "acked_bytes": "586566",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 11.002131597022526,
+      "client_process": "  66795 mptunnel        373216 102",
+      "server_process": "  66380 mptunnel        114460 29.2",
+      "client_traffic": {
+        "to_peer_bytes": "183322391",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "10967830",
+            "acked_bytes": "33454402",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "10817304",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "10825679",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "11627430",
+            "acked_bytes": "163025942",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "10722065",
+            "acked_bytes": "632091",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "10855245",
+            "acked_bytes": "632258",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "10719846",
+            "acked_bytes": "632292",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "11713164",
+            "acked_bytes": "586722",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 12.002242745016702,
+      "client_process": "  66795 mptunnel        377588 102",
+      "server_process": "  66380 mptunnel        114460 27.0",
+      "client_traffic": {
+        "to_peer_bytes": "184448503",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "11961071",
+            "acked_bytes": "36078178",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "11822524",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "11830695",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "12749844",
+            "acked_bytes": "163056094",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "11783260",
+            "acked_bytes": "632203",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "11920482",
+            "acked_bytes": "632370",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "11780061",
+            "acked_bytes": "632348",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "12829005",
+            "acked_bytes": "586800",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 13.002342473017052,
+      "client_process": "  66795 mptunnel        382372 102",
+      "server_process": "  66380 mptunnel        114460 25.1",
+      "client_traffic": {
+        "to_peer_bytes": "185735223",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "12962887",
+            "acked_bytes": "38646930",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "12829139",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "12789498",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "13754053",
+            "acked_bytes": "163083170",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "12777599",
+            "acked_bytes": "632259",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "12916982",
+            "acked_bytes": "632426",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "12781479",
+            "acked_bytes": "632460",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "13829408",
+            "acked_bytes": "586956",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 14.002456069923937,
+      "client_process": "  66795 mptunnel        385176 102",
+      "server_process": "  66380 mptunnel        114460 23.5",
+      "client_traffic": {
+        "to_peer_bytes": "186795799",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "13965003",
+            "acked_bytes": "41515418",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "13811485",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "13810968",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "14761650",
+            "acked_bytes": "163101322",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "13773842",
+            "acked_bytes": "632371",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "13911106",
+            "acked_bytes": "632538",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "13781916",
+            "acked_bytes": "632572",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "14818863",
+            "acked_bytes": "587112",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 15.00255625799764,
+      "client_process": "  66795 mptunnel        389228 102",
+      "server_process": "  66380 mptunnel        114460 21.9",
+      "client_traffic": {
+        "to_peer_bytes": "187725303",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "14966806",
+            "acked_bytes": "44941386",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "14836023",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "14800493",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "15717453",
+            "acked_bytes": "163131474",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "14463473",
+            "acked_bytes": "632483",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "14911739",
+            "acked_bytes": "632650",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "14431384",
+            "acked_bytes": "632684",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "15717072",
+            "acked_bytes": "587268",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 16.00265318492893,
+      "client_process": "  66795 mptunnel        393632 102",
+      "server_process": "  66380 mptunnel        114460 20.9",
+      "client_traffic": {
+        "to_peer_bytes": "188582807",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "15949704",
+            "acked_bytes": "46984514",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "15818916",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "15810587",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "16749063",
+            "acked_bytes": "163161626",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "15386024",
+            "acked_bytes": "632595",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "15782331",
+            "acked_bytes": "632762",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "15401448",
+            "acked_bytes": "632796",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "16682391",
+            "acked_bytes": "587424",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 17.003036904963665,
+      "client_process": "  66795 mptunnel        396208 102",
+      "server_process": "  66380 mptunnel        114460 19.8",
+      "client_traffic": {
+        "to_peer_bytes": "189446775",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "16962771",
+            "acked_bytes": "49715442",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "16797452",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "16797951",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "17612537",
+            "acked_bytes": "163191778",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "16557264",
+            "acked_bytes": "632707",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "16895697",
+            "acked_bytes": "632874",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "16572517",
+            "acked_bytes": "632908",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "17807177",
+            "acked_bytes": "587580",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 18.00314265594352,
+      "client_process": "  66795 mptunnel        399032 102",
+      "server_process": "  66380 mptunnel        114460 18.8",
+      "client_traffic": {
+        "to_peer_bytes": "190298743",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "147",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "17965076",
+            "acked_bytes": "53455914",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "17820641",
+            "acked_bytes": "12092513",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "17815169",
+            "acked_bytes": "18428658",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "18678149",
+            "acked_bytes": "163221930",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "17754026",
+            "acked_bytes": "632819",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "17893538",
+            "acked_bytes": "632986",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "17764345",
+            "acked_bytes": "633020",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "18809123",
+            "acked_bytes": "587736",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 19.003241266007535,
+      "client_process": "  66795 mptunnel        402240 102",
+      "server_process": "  66380 mptunnel        114460 17.9",
+      "client_traffic": {
+        "to_peer_bytes": "191002103",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "18968224",
+            "acked_bytes": "54302573",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "18834774",
+            "acked_bytes": "12092612",
+            "direction": "client_to_server"
+          }…16828 tokens truncated…  "epoch": "10930376025259083713",
+            "sampled_at_us": "42833668",
+            "acked_bytes": "25021607",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "43750900",
+            "acked_bytes": "163915595",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "42789265",
+            "acked_bytes": "635525",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "42944342",
+            "acked_bytes": "635692",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "42793148",
+            "acked_bytes": "635602",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "43839073",
+            "acked_bytes": "591444",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 44.00587391993031,
+      "client_process": "  66795 mptunnel        484132 102",
+      "server_process": "  66380 mptunnel        114460 8.5",
+      "client_traffic": {
+        "to_peer_bytes": "207910391",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "43922262",
+            "acked_bytes": "73450957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "43826848",
+            "acked_bytes": "12092612",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "43842684",
+            "acked_bytes": "26314389",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "44613023",
+            "acked_bytes": "163930671",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "43770074",
+            "acked_bytes": "635637",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "43590994",
+            "acked_bytes": "635804",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "43443666",
+            "acked_bytes": "635714",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "44728333",
+            "acked_bytes": "591522",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 45.00598168000579,
+      "client_process": "  66795 mptunnel        487952 102",
+      "server_process": "  66380 mptunnel        114460 8.4",
+      "client_traffic": {
+        "to_peer_bytes": "208636823",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "44949261",
+            "acked_bytes": "73450957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "44796096",
+            "acked_bytes": "12092612",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "44838594",
+            "acked_bytes": "27201173",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "45766436",
+            "acked_bytes": "163960823",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "44761388",
+            "acked_bytes": "635749",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "44799740",
+            "acked_bytes": "635916",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "44705337",
+            "acked_bytes": "635826",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "45747015",
+            "acked_bytes": "591678",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 46.006103048915975,
+      "client_process": "  66795 mptunnel        491568 102",
+      "server_process": "  66380 mptunnel        114460 8.2",
+      "client_traffic": {
+        "to_peer_bytes": "209345719",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "45941610",
+            "acked_bytes": "73450957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "45805589",
+            "acked_bytes": "12092612",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "45839814",
+            "acked_bytes": "27966709",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "46716926",
+            "acked_bytes": "163990975",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "45792588",
+            "acked_bytes": "635805",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "45896464",
+            "acked_bytes": "636028",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "45755088",
+            "acked_bytes": "635938",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "46843368",
+            "acked_bytes": "591834",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 47.00620793795679,
+      "client_process": "  66795 mptunnel        493508 102",
+      "server_process": "  66380 mptunnel        114460 8.0",
+      "client_traffic": {
+        "to_peer_bytes": "210072151",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "46942787",
+            "acked_bytes": "73450957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "46800806",
+            "acked_bytes": "12092612",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "46836219",
+            "acked_bytes": "28821957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "47749866",
+            "acked_bytes": "164021187",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "46791669",
+            "acked_bytes": "635917",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "46918873",
+            "acked_bytes": "636084",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "46785604",
+            "acked_bytes": "635994",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "47829310",
+            "acked_bytes": "591912",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 48.0063093790086,
+      "client_process": "  66795 mptunnel        495980 102",
+      "server_process": "  66380 mptunnel        114460 7.9",
+      "client_traffic": {
+        "to_peer_bytes": "211359799",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "47956457",
+            "acked_bytes": "73450957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "47794048",
+            "acked_bytes": "12092612",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "47835269",
+            "acked_bytes": "29760885",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "48745552",
+            "acked_bytes": "164036263",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "47772212",
+            "acked_bytes": "636029",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "47909472",
+            "acked_bytes": "636196",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "47780289",
+            "acked_bytes": "636106",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "48723582",
+            "acked_bytes": "592128",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 49.0064044399187,
+      "client_process": "  66795 mptunnel        502808 102",
+      "server_process": "  66380 mptunnel        114460 7.8",
+      "client_traffic": {
+        "to_peer_bytes": "212134231",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "48920756",
+            "acked_bytes": "73450957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "48800313",
+            "acked_bytes": "12092612",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "48834539",
+            "acked_bytes": "30687605",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "49774793",
+            "acked_bytes": "164066415",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "48795508",
+            "acked_bytes": "636085",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "48932845",
+            "acked_bytes": "636308",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "48803585",
+            "acked_bytes": "636218",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "49740325",
+            "acked_bytes": "592344",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 50.007116874912754,
+      "client_process": "  66795 mptunnel        505648 102",
+      "server_process": "  66380 mptunnel        114460 7.6",
+      "client_traffic": {
+        "to_peer_bytes": "212837591",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "49953530",
+            "acked_bytes": "73450957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "49801829",
+            "acked_bytes": "12092612",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "49840673",
+            "acked_bytes": "31482629",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "50699224",
+            "acked_bytes": "164087239",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "49768727",
+            "acked_bytes": "636253",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "49587037",
+            "acked_bytes": "636420",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "49406022",
+            "acked_bytes": "636330",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "50834844",
+            "acked_bytes": "592500",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 51.00722838402726,
+      "client_process": "  66795 mptunnel        508780 102",
+      "server_process": "  66380 mptunnel        114460 7.5",
+      "client_traffic": {
+        "to_peer_bytes": "213510487",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "50959338",
+            "acked_bytes": "73450957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "50833730",
+            "acked_bytes": "12265988",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "50833872",
+            "acked_bytes": "32162069",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "51776883",
+            "acked_bytes": "164117391",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "50778263",
+            "acked_bytes": "636365",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "50915500",
+            "acked_bytes": "636532",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "50786312",
+            "acked_bytes": "636442",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "51799419",
+            "acked_bytes": "592656",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 52.0073431719793,
+      "client_process": "  66795 mptunnel        513076 102",
+      "server_process": "  66380 mptunnel        114460 7.4",
+      "client_traffic": {
+        "to_peer_bytes": "222798135",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "161",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "51916071",
+            "acked_bytes": "73450957",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "51843965",
+            "acked_bytes": "13355316",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "51800468",
+            "acked_bytes": "32162069",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "52761944",
+            "acked_bytes": "164135549",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "51783487",
+            "acked_bytes": "636477",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "51920751",
+            "acked_bytes": "636644",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "51791555",
+            "acked_bytes": "636554",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "52731233",
+            "acked_bytes": "592812",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 53.00743760296609,
+      "client_process": "  66795 mptunnel        513076 102",
+      "server_process": "  66380 mptunnel        114460 7.3",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "189",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "52955630",
+            "acked_bytes": "73451155",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "52843568",
+            "acked_bytes": "16205711",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "52802837",
+            "acked_bytes": "32162267",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "53769109",
+            "acked_bytes": "164153959",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "52779606",
+            "acked_bytes": "636589",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "52916924",
+            "acked_bytes": "636756",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "52787696",
+            "acked_bytes": "636666",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "53647997",
+            "acked_bytes": "592968",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 54.007533594965935,
+      "client_process": "  66795 mptunnel        513336 102",
+      "server_process": "  66380 mptunnel        114460 7.2",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "259",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "259",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "179402231",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "53909904",
+            "acked_bytes": "73451353",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "53783758",
+            "acked_bytes": "19885079",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "53823227",
+            "acked_bytes": "32162520",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "54769255",
+            "acked_bytes": "164181663",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "53783188",
+            "acked_bytes": "636701",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "53920453",
+            "acked_bytes": "636868",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "53791239",
+            "acked_bytes": "636778",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "54700108",
+            "acked_bytes": "593154",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 55.00764710898511,
+      "client_process": "  66795 mptunnel        513348 102",
+      "server_process": "  66380 mptunnel        114460 7.9",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "273",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "315",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "180480343",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "54969039",
+            "acked_bytes": "74006167",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "54816476",
+            "acked_bytes": "25457003",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "53890689",
+            "acked_bytes": "32237959",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "55689007",
+            "acked_bytes": "176948807",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "54798725",
+            "acked_bytes": "752656",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "54936008",
+            "acked_bytes": "775197",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "54806794",
+            "acked_bytes": "759465",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "55834829",
+            "acked_bytes": "743528",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 56.0080891699763,
+      "client_process": "  66795 mptunnel        513348 102",
+      "server_process": "  66380 mptunnel        114460 7.8",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "343",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "357",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "185973367",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "55945069",
+            "acked_bytes": "74006464",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "55818779",
+            "acked_bytes": "29213913",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "53890689",
+            "acked_bytes": "32237959",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "56725642",
+            "acked_bytes": "176949168",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "55779380",
+            "acked_bytes": "809848",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "55916700",
+            "acked_bytes": "812022",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "55787579",
+            "acked_bytes": "807979",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "56825244",
+            "acked_bytes": "758779",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 57.00818649295252,
+      "client_process": "  66795 mptunnel        513348 100",
+      "server_process": "  66380 mptunnel        114460 7.8",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "413",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "413",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "187361623",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "56909906",
+            "acked_bytes": "74006915",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "56783613",
+            "acked_bytes": "29214507",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "53890689",
+            "acked_bytes": "32237959",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "57760383",
+            "acked_bytes": "177255023",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "56775154",
+            "acked_bytes": "816143",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "56912407",
+            "acked_bytes": "816309",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "56783236",
+            "acked_bytes": "817418",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "57783184",
+            "acked_bytes": "765265",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 58.00828715600073,
+      "client_process": "  66795 mptunnel        513348 99.2",
+      "server_process": "  66380 mptunnel        114460 7.7",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "455",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "469",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "189696919",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "57919604",
+            "acked_bytes": "74007454",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "57786369",
+            "acked_bytes": "29214903",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "53890689",
+            "acked_bytes": "32237959",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "58762244",
+            "acked_bytes": "177745730",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "57770811",
+            "acked_bytes": "822783",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "57909184",
+            "acked_bytes": "823653",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "57778914",
+            "acked_bytes": "823625",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "58850524",
+            "acked_bytes": "772241",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 59.008392778923735,
+      "client_process": "  66795 mptunnel        513348 97.8",
+      "server_process": "  66380 mptunnel        114460 7.7",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "525",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "539",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "192026679",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "58812350",
+            "acked_bytes": "74007850",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "58685996",
+            "acked_bytes": "29215299",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "58710461",
+            "acked_bytes": "39658335",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "59715240",
+            "acked_bytes": "178214448",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "58773487",
+            "acked_bytes": "828883",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "58910790",
+            "acked_bytes": "829148",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "58781552",
+            "acked_bytes": "827921",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "59799494",
+            "acked_bytes": "778500",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 60.00849067396484,
+      "client_process": "  66795 mptunnel        513348 96.2",
+      "server_process": "  66380 mptunnel        114460 7.6",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "581",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "595",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "194266903",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "59837313",
+            "acked_bytes": "74008246",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "59648381",
+            "acked_bytes": "29215596",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "58710461",
+            "acked_bytes": "39658335",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "60774271",
+            "acked_bytes": "178719660",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "59790171",
+            "acked_bytes": "834470",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "59927492",
+            "acked_bytes": "834724",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "59798230",
+            "acked_bytes": "834615",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "60834955",
+            "acked_bytes": "783985",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 61.00859299802687,
+      "client_process": "  66795 mptunnel        513348 94.8",
+      "server_process": "  66380 mptunnel        114460 7.6",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "637",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "651",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "206009847",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "60790837",
+            "acked_bytes": "74008642",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "60784373",
+            "acked_bytes": "29216190",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "58710461",
+            "acked_bytes": "39658335",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "61764945",
+            "acked_bytes": "179242512",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "60804839",
+            "acked_bytes": "841225",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "60942062",
+            "acked_bytes": "841085",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "60812899",
+            "acked_bytes": "841443",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "61817205",
+            "acked_bytes": "789810",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 62.00870754395146,
+      "client_process": "  66795 mptunnel        513348 93.4",
+      "server_process": "  66380 mptunnel        114460 7.5",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "693",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "693",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "208226071",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "61929069",
+            "acked_bytes": "74009038",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "61802843",
+            "acked_bytes": "29216487",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "61842423",
+            "acked_bytes": "46893691",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "62715336",
+            "acked_bytes": "179695926",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "61796861",
+            "acked_bytes": "846191",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "61933068",
+            "acked_bytes": "846544",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "61797142",
+            "acked_bytes": "846294",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "62843097",
+            "acked_bytes": "794686",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 63.00880676996894,
+      "client_process": "  66795 mptunnel        513348 92.1",
+      "server_process": "  66380 mptunnel        114460 7.5",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "735",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "749",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "210072151",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "62711059",
+            "acked_bytes": "74009335",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "62729576",
+            "acked_bytes": "29216883",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "62832198",
+            "acked_bytes": "48671903",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "63757204",
+            "acked_bytes": "180179656",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "62799752",
+            "acked_bytes": "850993",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "62937051",
+            "acked_bytes": "851337",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "62807949",
+            "acked_bytes": "851827",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "63817683",
+            "acked_bytes": "800368",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 64.00890247395728,
+      "client_process": "  66795 mptunnel        513348 90.8",
+      "server_process": "  66380 mptunnel        114460 7.4",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "777",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "791",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "212151767",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "63925478",
+            "acked_bytes": "74009731",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "63663596",
+            "acked_bytes": "29217180",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "63824299",
+            "acked_bytes": "50617811",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "64779492",
+            "acked_bytes": "180569600",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "63763157",
+            "acked_bytes": "854011",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "63900442",
+            "acked_bytes": "856010",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "63822396",
+            "acked_bytes": "855109",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "64864030",
+            "acked_bytes": "804371",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 65.00899899902288,
+      "client_process": "  66795 mptunnel        482788 89.5",
+      "server_process": "  66380 mptunnel        114460 7.4",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "847",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "861",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "214513663",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "64966118",
+            "acked_bytes": "74010127",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "64841310",
+            "acked_bytes": "29217576",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "64839753",
+            "acked_bytes": "53217927",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "65768192",
+            "acked_bytes": "181071575",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "64809209",
+            "acked_bytes": "860823",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "64946549",
+            "acked_bytes": "861641",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "64817291",
+            "acked_bytes": "860662",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "65846884",
+            "acked_bytes": "810022",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    },
+    {
+      "elapsed_s": 66.00911371398252,
+      "client_process": "  66795 mptunnel        452412 88.6",
+      "server_process": "  66380 mptunnel        114460 7.6",
+      "client_traffic": {
+        "to_peer_bytes": "226885632",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "903",
+        "from_peer_packets": "0"
+      },
+      "server_traffic": {
+        "to_peer_bytes": "916",
+        "to_peer_packets": "0",
+        "from_peer_bytes": "226885632",
+        "from_peer_packets": "0"
+      },
+      "client_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "5317008314671398146",
+            "sampled_at_us": "65961921",
+            "acked_bytes": "74181432",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "5175644192202205940",
+            "sampled_at_us": "65815353",
+            "acked_bytes": "29279013",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "10930376025259083713",
+            "sampled_at_us": "65810845",
+            "acked_bytes": "55826435",
+            "direction": "client_to_server"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "770443287441759806",
+            "sampled_at_us": "66712903",
+            "acked_bytes": "189337687",
+            "direction": "client_to_server"
+          }
+        }
+      ],
+      "server_native": [
+        {
+          "underlay": "tcp",
+          "path_id": "0",
+          "native": {
+            "epoch": "5495748214506669832",
+            "sampled_at_us": "65804323",
+            "acked_bytes": "867245",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "1",
+          "native": {
+            "epoch": "7654218713685851400",
+            "sampled_at_us": "65945853",
+            "acked_bytes": "871205",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "tcp",
+          "path_id": "2",
+          "native": {
+            "epoch": "171166952510679411",
+            "sampled_at_us": "65767940",
+            "acked_bytes": "870058",
+            "direction": "server_to_client"
+          }
+        },
+        {
+          "underlay": "udp",
+          "path_id": "0",
+          "native": {
+            "epoch": "583949690254636809",
+            "sampled_at_us": "66861492",
+            "acked_bytes": "831405",
+            "direction": "server_to_client"
+          }
+        }
+      ]
+    }
+  ]
+}

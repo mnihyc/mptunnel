@@ -1,0 +1,111 @@
+diff --git a/crates/quinn-proto/src/connection/send_buffer.rs b/crates/quinn-proto/src/connection/send_buffer.rs
+index 53a7416..9f5c11c 100644
+--- a/crates/quinn-proto/src/connection/send_buffer.rs
++++ b/crates/quinn-proto/src/connection/send_buffer.rs
+@@ -172,6 +172,11 @@ impl SendBuffer {
+         self.offset
+     }
+ 
++    /// Temporary read-only lab observation: accepted, first unsent, ACK prefix.
++    pub(super) fn mpp_diagnostic_progress(&self) -> (u64, u64, u64) {
++        (self.offset, self.unsent, self.offset - self.unacked_len as u64)
++    }
++
+     /// Whether all sent data has been acknowledged
+     pub(super) fn is_fully_acked(&self) -> bool {
+         self.unacked_len == 0
+diff --git a/crates/quinn-proto/src/connection/streams/mod.rs b/crates/quinn-proto/src/connection/streams/mod.rs
+index 3e769c7..f32a23f 100644
+--- a/crates/quinn-proto/src/connection/streams/mod.rs
++++ b/crates/quinn-proto/src/connection/streams/mod.rs
+@@ -224,6 +224,12 @@ impl<'a> SendStream<'a> {
+         Ok(self.write_source(&mut ByteSlice::from_slice(data))?.bytes)
+     }
+ 
++    /// Temporary read-only lab observation: accepted, first unsent, ACK prefix.
++    pub fn mpp_diagnostic_progress(&self) -> Option<(u64, u64, u64)> {
++        self.state.send.get(&self.id)?.as_ref()
++            .map(|stream| stream.pending.mpp_diagnostic_progress())
++    }
++
+     /// Send data on the given stream
+     ///
+     /// Returns the number of bytes and chunks successfully written.
+diff --git a/crates/quinn-proto/src/connection/streams/state.rs b/crates/quinn-proto/src/connection/streams/state.rs
+index 619ff34..80724b9 100644
+--- a/crates/quinn-proto/src/connection/streams/state.rs
++++ b/crates/quinn-proto/src/connection/streams/state.rs
+@@ -657,7 +657,20 @@ impl StreamsState {
+         }
+         let id = frame.id;
+         self.unacked_data -= frame.offsets.end - frame.offsets.start;
+-        if !stream.ack(frame) {
++        let before = stream.pending.mpp_diagnostic_progress().2;
++        let finished = stream.ack(frame);
++        let (accepted, unsent, ack_prefix) = stream.pending.mpp_diagnostic_progress();
++        if before != ack_prefix {
++            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++            if *ENABLED.get_or_init(|| std::env::var_os("MPTUNNEL_NATIVE_PROGRESS_TRACE").is_some()) {
++                eprintln!(
++                    "mptunnel_native_progress ts_unix_us={} side={:?} stream_id={} accepted={} unsent={} ack_prefix={}",
++                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros(),
++                    self.side, u64::from(id), accepted, unsent, ack_prefix,
++                );
++            }
++        }
++        if !finished {
+             // The stream is unfinished or may still need retransmits
+             return;
+         }
+diff --git a/crates/quinn/src/connection.rs b/crates/quinn/src/connection.rs
+index febf4ac..7a6fd06 100644
+--- a/crates/quinn/src/connection.rs
++++ b/crates/quinn/src/connection.rs
+@@ -688,6 +688,12 @@ impl Connection {
+             .priority()
+     }
+ 
++    /// Temporary read-only lab observation: accepted, first unsent, ACK prefix.
++    pub fn mpp_diagnostic_send_progress(&self, stream: StreamId) -> Option<(u64, u64, u64)> {
++        self.0.state.lock("mpp_diagnostic_send_progress")
++            .inner.send_stream(stream).mpp_diagnostic_progress()
++    }
++
+     /// See [`proto::TransportConfig::receive_window()`]
+     pub fn set_receive_window(&self, receive_window: VarInt) {
+         let mut conn = self.0.state.lock("set_receive_window");
+diff --git a/src/transport/quic/stream.rs b/src/transport/quic/stream.rs
+index 416e1bc..ad1e5d5 100644
+--- a/src/transport/quic/stream.rs
++++ b/src/transport/quic/stream.rs
+@@ -633,8 +633,30 @@ async fn write_reliable_frame_bytes(
+         send.telemetry.record_write_activity();
+     }
+     let _transaction = QuicWriteTransaction::new(send.write_backlog.clone(), packet_len);
++    #[cfg(feature = "lab-diagnostics")]
++    let native_before = send.connection.mpp_diagnostic_send_progress(send.request_stream_id);
+     send.stream.send_data(Bytes::from(packet)).await?;
+     #[cfg(feature = "lab-diagnostics")]
++    if crate::lab_diagnostics::lab_diagnostic_event_enabled("quic_native_handoff") {
++        if let (Some((before, _, _)), Some((after, unsent, ack_prefix))) = (
++            native_before,
++            send.connection.mpp_diagnostic_send_progress(send.request_stream_id),
++        ) {
++            if let [Frame::StreamData { stream_id, offset, payload }] = frames {
++                crate::lab_diagnostics::lab_diagnostic(
++                    "quic_native_handoff",
++                    format_args!(
++                        "stream_id={} native_stream_id={:?} offset={} end={} payload_bytes={} encoded_bytes={} native_before={} native_after={} native_unsent={} native_ack_prefix={} write_us={}",
++                        stream_id.0, send.request_stream_id, offset,
++                        offset.saturating_add(payload.len() as u64), payload.len(),
++                        packet_len, before, after, unsent, ack_prefix,
++                        write_started.elapsed().as_micros(),
++                    ),
++                );
++            }
++        }
++    }
++    #[cfg(feature = "lab-diagnostics")]
+     lab_perf_record(
+         "transport.quic.write_frames_wait",
+         write_started.elapsed(),

@@ -982,6 +982,10 @@ pub(super) fn get_or_insert_recv(
 }
 
 #[cfg(test)]
+#[path = "tests_repair_ordering.rs"]
+mod tests_repair_ordering;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

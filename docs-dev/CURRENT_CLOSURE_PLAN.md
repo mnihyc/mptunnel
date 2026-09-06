@@ -4,6 +4,41 @@ Updated: 2026-09-06 12:17 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
+## Active transaction — 2026-09-06 14:02 UTC
+
+The historical execution entries below are evidence, not simultaneous tasks.
+Latest owner: exact native service position is PROVEN. The full batch trace
+finds49.326MB unsent predecessors,49.259MB attributable to new originals, before
+one frontier repair. Its native first-record send cursor takes2.553--2.742s to
+cross; the application gap is3.280s. Three actual Quinn priority/credit tests
+pass. QUIC_REPAIR_ORDERING_MODEL defines a bounded paired-attachment candidate,
+not a runtime acceptance. The simple response ECF rollback is already rejected;
+do not repeat it. Current next action is exact queue-transfer and pair-lifetime
+proof followed by integration, with no new native gain or queue-cap tuning.
+
+1. COMPLETE: read-only native offsets distinguish accepted, first-unsent and contiguous
+   acknowledged bytes of the exact H3 stream. Map its first repair record to
+   native offsets and to Product receipt. No controller, threshold, writer
+   credit or topology change. This resolves whether repair service is blocked
+   before transmission or only by native/receiver ordering.
+2. Specify the smallest allocation/repair change that addresses that measured
+   boundary. State independent permission, placement, discovery and committed
+   native-work owners. Prove singleton, unknown-path, preferred failure,
+   direction/identity, concurrent ownership and high-BDP counterexamples
+   before runtime policy changes; revise affected RFC sections explicitly.
+3. Component RED/GREEN then ordinary before/after timing comparisons close
+   this transaction, or explain a failed candidate and remove its policy.
+   Do not declare all issues fixed based on this component.
+4. Continue the existing fixed order below through both-direction timing,
+   aggregation, browser, sustainability and final baseline comparisons.
+   Preserve500-Mbps single cuts,200-Mbps independent cuts and asymmetric
+   impairments. No release until material identified deficits are resolved.
+
+Only new evidence needed for those existing issues enters this batch. An
+unsupported theoretical concern is not another production fix. Audit workers
+remain unavailable; root analysis and tests do not substitute for independent
+sign-off. Intermediate evidence commits preserve exact unresolved owners.
+
 ## Fixed order and closure obligations
 
 | Order | Identified issue | Required evidence / disposition |

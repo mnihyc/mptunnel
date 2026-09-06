@@ -1,7 +1,7 @@
 # Evidence review and practical acceptance
 
-Updated: 2026-09-06 20:54 UTC. Original reviewed production tree: `7189e69`
-(wire11); latest evidence checkpoint: `beac795`. This is a review/experiment
+Updated: 2026-09-06 21:46 UTC. Original reviewed production tree: `7189e69`
+(wire11); latest correction checkpoint: `b37bacb`. This is a review/experiment
 plan, not a release verdict. Historical SEEN/UNSEEN labels are mapped below;
 an old OPEN label is not a newly found bug.
 
@@ -17,22 +17,24 @@ The ordinary executable `packet-class-proof` includes the committed component
 corrections AND explicitly held receive-history/reordering, Product qualification,
 mailbox, actor-service and companion-stream changes. Its results describe that
 composition, not pristine HEAD or an accepted release. No temporary diagnostic
-hook or startup-exemption deletion is present in that executable. There has
-been no intervening runtime change since the latest ordinary comparisons.
+hook or startup-exemption deletion is present in that executable. The ordinary
+`no-target-recovery` executable adds only the request producer correction in
+`b37bacb`; its composition controls are recorded separately. The older held
+stack has not been silently merged into that isolated commit.
 
 | Priority / remaining owner | What is established | What is not established / next decision |
 | --- | --- | --- |
-| 0. Existing mid-transfer reset | Fresh mixed upload ends at4.996s with unconfirmed accepted bytes, before QoS/outage; the client reports ReliablePathSessionClosed. | Locate the actual error owner before changing lifecycle or fallback. A later normal QUIC teardown is not causal evidence. This immediate correctness failure precedes allocation optimization. |
+| 0. Existing mid-transfer reset | Unbound repair without a new target becomes a duplicate publication or session-close result. Exact production RED/GREEN,642 focused controls and strict Clippy pass; b37bacb removes the fallback. Two ordinary mixed uploads now settle without reset. | This specific producer is corrected, not every possible reset. Confirmation gaps and mixed download remain poor. REQUEST_NO_TARGET_RECOVERY preserves the complete boundary and tradeoff. |
 | 1. Mixed ordered allocation and recovery | Exact originals can enter a slow TCP ordering domain while a faster QUIC writer is temporarily queue-full. Two observed TCP frontiers take2.940/3.248s to close. Conversely another slow frontier belongs to QUIC, and some TCP spillovers arrive in time. | Do not blame every TCP choice. Replace mandatory immediate allocation only with a contract that preserves finite discovery, failure progress and real resource ownership. Restoring old ECF waiting or deleting the startup exemption alone did not close timing. |
 | 2. Native QUIC QoS/reordering history | Packet history, sender evidence lifetime and per-packet loss classification each have reachable counterexamples. Component corrections preserve native congestion authority rather than raising gains. | Better average recovery is not uniform gap/latency non-regression. Recheck native ACK service versus ordered application progress before attributing another bound reduction to a bug. |
-| 3. Request/upload service and TCP startup | Full-mailbox wake loss, input-priority starvation and two quadratic scans have distinct proofs. The scans are corrected in isolated commits; held actor/wake changes have component tests. | Ordinary adverse upload/drain and one mid-transfer reset remain open. TCP's portable startup value is not measured capacity; no invented native-rate authority or new probe subsystem is bundled. |
+| 3. Request/upload service and TCP startup | Full-mailbox wake loss, input-priority starvation and two quadratic scans have distinct proofs. The scans and no-target reset are corrected in isolated commits; held actor/wake changes have component tests. | Adverse upload timing/drain remain open. TCP's portable startup value is not measured capacity; no invented native-rate authority or new probe subsystem is bundled. Fresh unchanged TCP51.6Mbps and candidate76.5Mbps both settle but show why the older214.2Mbps point cannot prove a new regression. |
 | 4. Lifecycle and sustainability | CREATE/STARTUP disambiguation, blocked-sink terminal progress, native close and finalized journal ownership have tests. Live source bytes have a shared session owner, not4096 independent64MiB reservations. | These facts do not attribute the uncaptured deployed RAM incident. Churn, backpressure, post-load live ownership and CPU/RSS still require a sustained run. Do not lower concurrency or add arbitrary expiry to hide it. |
-| 5. Full experience/comparison | Earlier matched cells and plots are historical evidence, not current coverage. A new ordinary six-way bidirectional combined cohort is running. | Independent200-Mbps links, shared-cut controls, cold/warm short/concurrent work and actual Cloudflare browser remain gates. No current README performance headline or release is authorized. |
+| 5. Full experience/comparison | Six-way asymmetric combined down/up cohort completes; mirrored raw/Xray/H2/TCP observations and five no-target correction/control cases are archived. Mirrored mixed and QUIC now also settle; complete series are retained. | Independent200-Mbps links, shared-cut controls, cold/warm short/concurrent work and actual Cloudflare browser remain gates. No current README performance headline or release is authorized. |
 
-The next production transaction is attribution of the already-open mid-transfer
-reset, reproduced in the fresh mixed upload before the scheduled QoS/outage;
-the demonstrated allocation/service boundary follows it. The fresh cohort is
-a bounded practical inventory, not permission
+The next production transaction is the demonstrated allocation/service boundary,
+now that the reproduced no-target reset has an isolated correction. No new
+allocator is implementation-ready yet. The fresh cohort is a bounded practical
+inventory, not permission
 to expand into all plausible model improvements. A newly observed symptom is
 first assigned to one of these existing owners or explicitly left unattributed;
 it does not automatically create a patch.

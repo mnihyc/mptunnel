@@ -72,8 +72,18 @@ prove a TCP regression or gain from the correction. Full evidence is
 REQUEST_NO_TARGET_ORDINARY_20260906.json; proof/provenance is
 REQUEST_NO_TARGET_RECOVERY. Checkpoint this isolated producer correction, not
 the held composition or a release. Next return to the existing allocation/
-discovery and ordered-progress defect, with mirrored upload still explicitly
-incomplete. No more controller/timeout/resource threshold experiments.
+discovery and ordered-progress defect. No more controller/timeout/resource
+threshold experiments.
+
+Follow-up21:47UTC: both previously deferred mirrored upload cases complete on
+the same ordinary correction composition. Mixed confirms433651712bytes at
+78.719Mbps/44.071s,firstconfirmation0.484s,maxgap8.304s;QUIC confirms667549696
+at119.983Mbps/44.510s,first1.592s,maxgap4.229s. Direction-swapped forward-QoS
+therefore does not reset these streams, but timing remains unacceptable.
+REVIEW_MIRRORED_COMPLETION_20260906.json preserves both complete probes/series.
+This completes the missing observations, not the release matrix or statistical
+comparability; earlier H2/TCP mirrored observations were censored. No compiler
+or network lab remains active. Component checkpoint is b37bacb, not a release.
 
 REVIEW_AND_PRACTICAL_ACCEPTANCE now maps old SEEN/UNSEEN entries, real versus
 unsupported claims and each held candidate's tradeoff. The review cohort uses

@@ -1,7 +1,7 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 11:37 UTC. Baseline source: `7189e69`; evidence checkpoints:
-`282b71f`, `5d52914`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
+Updated: 2026-09-06 11:57 UTC. Baseline source: `7189e69`; evidence checkpoints:
+`282b71f`, `5d52914`, `9f15ffd`, `c44ecee`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Fixed order and closure obligations
@@ -107,6 +107,18 @@ and closed component invariants are not repeatedly reopened as new defects.
   fixed source-service invariant to waive ordered-frontier/resource concerns.
   The completed-proof fixture correction is test-only and independently green;
   it is not counted as a deployed performance fix. No additional native tuning.
+- The next mixed loss/jitter traces establish a post-submission ordering
+  obstruction, not absent QUIC service. An original frontier is assigned to
+  TCP; its QUIC repair returns from H3 write in134us but first appears at
+  Product receive2.376s later, after44.24MB of preceding QUIC Product payload.
+  ORDERED_REPAIR_SERVICE_BOUNDARY records exact events, interpretation limits
+  and the RFC boundary. Current15.1 immediate-admission and10.4 native
+  nonpreemption can both be obeyed while producing this bad ordered outcome.
+  Do not tune BBR, shrink buffers, force QUIC preference or erase copy slots.
+  The next transaction is the allocation/discovery and irreversible-handoff
+  contract; its unknown-capacity and reversed-quality cases must be settled
+  before implementation. Two diagnostic-only hunks are archived and removed;
+  no additional runtime behavior changed. Resource cost remains open.
 - Native outage trace shows ordinary exponential PTO backoff, not a stuck
   timer in that capture. Physical queue drain, native reordering tolerance and
   Product-prefix stalls remain separate causes; do not collapse them into the

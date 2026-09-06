@@ -84,6 +84,9 @@ and recovery can lag Hysteria2. This is not release-ready. The latest
 include both bulk speed and interrupted interactive service; historical results
 below must not be read as evidence that this case is solved.
 
+Acceptance includes sustained speed, read gaps, loaded latency and recovery in
+both directions. A higher average alone does not qualify a release.
+
 ### Historical diagnostic series
 
 [![Receiver goodput and persistent application-echo latency over 40 seconds for MPTUNNEL TCP, QUIC, default TCP+QUIC, Xray, and Hysteria2](docs/assets/performance/diagnostic-random-internet-series.svg)](docs/assets/performance/diagnostic-random-internet-series.svg)

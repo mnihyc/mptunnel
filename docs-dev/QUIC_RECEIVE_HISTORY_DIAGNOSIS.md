@@ -5,6 +5,12 @@
 The [23-case continuation evidence](reordering-continuation-evidence-20260906.json)
 preserves application time series, individual echo outcomes and case caveats.
 
+Update: the subsequent [34-run composition review](QUIC_REORDERING_EXCESS_DELAY_MODEL.md)
+implements and tests the bounded receive/codec model, identifies the separate
+absolute-delay history defect, and tests its excess-delay replacement. These
+steps are no longer merely prospective. Exact candidates remain archived and
+unaccepted; mixed combined stability is the next unresolved owner.
+
 ## Confirmed mechanism
 
 Quinn's `connection/spaces.rs::Dedup` stores128 bits plus the highest packet

@@ -85,6 +85,19 @@ next reordering model must cover sender loss tolerance, receiver history and
 packet-number encoding together, preserving duplicate safety and bounded
 memory. This supersedes starting another sender-threshold-only attempt.
 
+The [34-run composition review](QUIC_REORDERING_EXCESS_DELAY_MODEL.md) now
+provides that experiment. Correcting receive history/encoding and sender
+reordering together raises jitter-only QUIC from 0.585 to 185.313 Mbps with
+shorter gaps and complete echoes. But the first sender model retained old
+common queue delay; actual native loss declarations kept a 2.015-second delay
+after RTT recovered below 100 ms. That experimental model is rejected.
+Learning excess delay instead passes the exact RED/GREEN counterexample and
+461 native tests, and improves same-connection recovery, but combined mixed
+stability is still unaccepted. These are not additional claimed production
+fixes. Exact candidate patches and full series are archived; production code
+remains the reviewed 7189e69 state. The next owner is the existing mixed
+QoS-history/ordered-progress interaction, not a new allocator or threshold.
+
 1. **QUIC deep-buffer latency (N1):** with old bandwidth400 Mbit/s and base
    RTT80ms, the old half-BDP probe allows2MB, but a new10-Mbit/s path's entire
    BDP is0.1MB. A queued RTT can enlarge later flight; the retained maximum

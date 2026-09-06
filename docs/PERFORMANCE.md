@@ -10,6 +10,12 @@ No current-release time-series ranking is published. Publication requires
 matched repetitions that pass the complete measurement gate; individual
 diagnostic runs do not update the historical scalar tables below.
 
+The gate includes TCP, QUIC and mixed traffic, sudden QoS and outages, both
+directions, short/concurrent browser requests and sustained transfers. It also
+requires independent-versus-shared link checks and long-lived resource checks.
+Improved bulk throughput cannot substitute for missing interactive service or
+poor recovery after the link improves.
+
 ## Current reordering and recovery
 
 Current development QUIC has a reproducible performance limitation under deep

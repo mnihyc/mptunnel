@@ -1,10 +1,47 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 20:40 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 21:09 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Current checkpoint and next decision
+
+Review continuation21:02UTC: the fresh ordinary six-way down/up combined
+cohort is complete. Download mean alone favors MPP QUIC/mixed80.751/62.288Mbps
+over raw4.808/Xray3.701/H29.974, but QUIC/mixed have5.885/4.785s read gaps and
+lose their echo connection. Raw/Xray keep all80 echoes. Do not call this a
+competitive pass. Raw upload confirms all bytes at274.677Mbps; QUIC confirms
+all at306.984Mbps but has a6.031s gap. Same-profile upload places the QoS on
+the ACK direction; a separate mirrored upload pass has four observed cases.
+The small runner change swaps only the shaper direction and records that fact;
+mocked shaper arguments and unchanged default mapping pass. No production
+setting, threshold or impairment value was changed.
+
+Most importantly, the EXISTING unattributed mid-transfer reset recurs in
+ordinary mixed upload at4.996s, before the15s QoS step and30s UDP outage:
+100,859,639 target-confirmed versus190,316,544 locally accepted bytes. Client
+reports ReliablePathSessionClosed; the later H3_NO_ERROR is during teardown
+and cannot be named its cause. This supersedes allocation as the immediate
+transaction. Mirrored H2/TCP exceed the existing85s observation guard; their
+teardown resets are censored, not spontaneous product defects. Mirrored
+QUIC/mixed are not run yet. All16 observed cases and complete series are in
+REVIEW_COMBINED_COHORT_20260906.json; no public ranking follows.
+
+Failure-only tracing covers57 client relay exits and four relevant request
+planning/exhaustion branches. It builds successfully in1m23s after labs stop;
+the frozen diagnostic is .tmp/reflection/bin/closed-origin/mptunnel. Both
+temporary source overlays are now restored, and their exact patch is archived
+under .tmp/reflection/closed-origin-overlay.patch. The first diagnostic mixed
+upload is running49079; only actual error origins can justify a correction.
+No throughput conclusion from this diagnostic. Other held runtime changes
+remain untouched. No independent audit is currently available.
+
+REVIEW_AND_PRACTICAL_ACCEPTANCE now maps old SEEN/UNSEEN entries, real versus
+unsupported claims and each held candidate's tradeoff. All experiments use
+the frozen packet-class-proof composition, not pristine HEAD or an accepted
+release. After attributing and closing the reset, resume the already-proven
+mixed allocation/discovery contract below. No duplicate old prefilter or
+startup-deletion experiment, new controller knob or public performance claim.
 
 The live-send lifetime correction is committed in9f522b2;8433c6d preserves
 actual removal of the unknown-evidence reduction class. The individual

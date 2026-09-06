@@ -1,8 +1,113 @@
 # Evidence review and practical acceptance
 
-Date: 2026-09-05. Reviewed production tree: `7189e69` (wire11).
-This is the current review/experiment plan, not a release verdict. Historical
-SEEN/UNSEEN labels are mapped below; an old OPEN label is not a newly found bug.
+Updated: 2026-09-06 20:54 UTC. Original reviewed production tree: `7189e69`
+(wire11); latest evidence checkpoint: `beac795`. This is a review/experiment
+plan, not a release verdict. Historical SEEN/UNSEEN labels are mapped below;
+an old OPEN label is not a newly found bug.
+
+## Current verdict and fixed priority
+
+The former UNSEEN batch was already promoted for investigation, not automatic
+implementation. Its useful results are the concrete ownership, qualification,
+work-complexity and ordering findings below. A theoretical suggestion does not
+become a defect merely because it appears in the old plan. Disproved items and
+rejected approaches are terminal dispositions, not a queue to implement later.
+
+The ordinary executable `packet-class-proof` includes the committed component
+corrections AND explicitly held receive-history/reordering, Product qualification,
+mailbox, actor-service and companion-stream changes. Its results describe that
+composition, not pristine HEAD or an accepted release. No temporary diagnostic
+hook or startup-exemption deletion is present in that executable. There has
+been no intervening runtime change since the latest ordinary comparisons.
+
+| Priority / remaining owner | What is established | What is not established / next decision |
+| --- | --- | --- |
+| 0. Existing mid-transfer reset | Fresh mixed upload ends at4.996s with unconfirmed accepted bytes, before QoS/outage; the client reports ReliablePathSessionClosed. | Locate the actual error owner before changing lifecycle or fallback. A later normal QUIC teardown is not causal evidence. This immediate correctness failure precedes allocation optimization. |
+| 1. Mixed ordered allocation and recovery | Exact originals can enter a slow TCP ordering domain while a faster QUIC writer is temporarily queue-full. Two observed TCP frontiers take2.940/3.248s to close. Conversely another slow frontier belongs to QUIC, and some TCP spillovers arrive in time. | Do not blame every TCP choice. Replace mandatory immediate allocation only with a contract that preserves finite discovery, failure progress and real resource ownership. Restoring old ECF waiting or deleting the startup exemption alone did not close timing. |
+| 2. Native QUIC QoS/reordering history | Packet history, sender evidence lifetime and per-packet loss classification each have reachable counterexamples. Component corrections preserve native congestion authority rather than raising gains. | Better average recovery is not uniform gap/latency non-regression. Recheck native ACK service versus ordered application progress before attributing another bound reduction to a bug. |
+| 3. Request/upload service and TCP startup | Full-mailbox wake loss, input-priority starvation and two quadratic scans have distinct proofs. The scans are corrected in isolated commits; held actor/wake changes have component tests. | Ordinary adverse upload/drain and one mid-transfer reset remain open. TCP's portable startup value is not measured capacity; no invented native-rate authority or new probe subsystem is bundled. |
+| 4. Lifecycle and sustainability | CREATE/STARTUP disambiguation, blocked-sink terminal progress, native close and finalized journal ownership have tests. Live source bytes have a shared session owner, not4096 independent64MiB reservations. | These facts do not attribute the uncaptured deployed RAM incident. Churn, backpressure, post-load live ownership and CPU/RSS still require a sustained run. Do not lower concurrency or add arbitrary expiry to hide it. |
+| 5. Full experience/comparison | Earlier matched cells and plots are historical evidence, not current coverage. A new ordinary six-way bidirectional combined cohort is running. | Independent200-Mbps links, shared-cut controls, cold/warm short/concurrent work and actual Cloudflare browser remain gates. No current README performance headline or release is authorized. |
+
+The next production transaction is attribution of the already-open mid-transfer
+reset, reproduced in the fresh mixed upload before the scheduled QoS/outage;
+the demonstrated allocation/service boundary follows it. The fresh cohort is
+a bounded practical inventory, not permission
+to expand into all plausible model improvements. A newly observed symptom is
+first assigned to one of these existing owners or explicitly left unattributed;
+it does not automatically create a patch.
+
+### Held candidates are not accepted fixes
+
+| Candidate | Evidence and intended benefit | Tradeoff / why still held |
+| --- | --- | --- |
+| Native receive history, packet-number encoding and excess-delay reordering | The129-packet history discarded timely reordered originals; sender-only changes could not repair that. The integrated model improves the jitter-only cell from0.585 to185.313Mbps, with actual duplicate/encoding and late-original tests. | Must preserve duplicate safety and finite history. The earlier absolute-delay variant retained common queue delay and was rejected. The excess model still lacks full combined timing acceptance; ordinary loss detection changes are not merely diagnostic. |
+| Native snapshot preserves Product qualification | A native-rate projection reset an independently established Product-qualified boolean, making a correct later check unreachable. Exact binding RED/GREEN. | Restored eligibility changes allocation. Keep the correctness proof, but do not retain the old bug as an implicit path preference or claim the projection alone improves speed. |
+| Mailbox capacity wake | A pending native write masked the independent wake of a full Product mailbox, delaying an accepted ACK12.173s. Real interlock tests cover write/input/cancellation outcomes. | Cross-layer service timing changes; first ordinary composition exposed additional actor starvation. Component GREEN alone is insufficient. |
+| Cyclic Product service with executor cooperation | Drain-input-to-empty could postpone a ready source/dispatch indefinitely. Fair service among input, dispatch and read removes that dependency. | Each class can wait for the other finite work quanta. The first candidate omitted executor cooperation and failed; the revised candidate is tested but broader timing/RSS remains open. |
+| Paired QUIC repair ordering stream | A frontier repair had49.326MB of actual unsent native predecessors. A second stream removes that serialization prerequisite without new carrier/copy/CC credit. Actual native ordering and pair-lifecycle tests pass. | Deliberate wire12 mapping and two native streams per attachment; shared connection credit can still block it. Initial download improves but upload does not pass. Not an accepted protocol expansion. |
+
+The evidence boundary is explicit: classification/lifetime and scan commits
+are intermediate tracked corrections, not proof that every assembled behavior
+is non-regressing. Preserve tests of old problems when simplifying; prefer
+deleting invalid duplicate ownership/policy over adding another compensator.
+
+## Fresh ordinary comparison — 2026-09-06 21:07 UTC
+
+[Complete probes and one-second observations](REVIEW_COMBINED_COHORT_20260906.json)
+contain12 original-profile cases and4 mirrored-upload cases, including failed
+and censored outcomes. All use the same frozen composition and owned routed
+cut; there was no compilation overlap. This is one realization per cell,
+not a repeated ranking or an acceptance verdict. Physical capacity is500Mbps
+in each direction; forward/reverse base delay70/30ms, per-packet jitter20/5ms,
+and unequal loss epochs. Forward loss is3/8/5/6/10/3/5/8% at five-second epochs
+(mean6%); forward service drops to10Mbps at15--25s; UDP is blocked at30--33s.
+H2 has its explicit500Mbps prior; MPP has no configured rate prior.
+
+| Mode | Download mean / max closed read gap | Download echo successes | Upload exact completion / max confirmation gap |
+| --- | --- | --- | --- |
+| Raw TCP |4.808Mbps /0.478s |80/80 |274.677Mbps, all bytes /0.781s |
+| Xray/VMess |3.701Mbps /0.566s |80/80 |Incomplete terminal acknowledgement; no accepted rate |
+| Hysteria2 |9.974Mbps /15.011s |29, then one I/O failure |Incomplete terminal acknowledgement; no accepted rate |
+| MPP TCP |8.905Mbps /4.433s |3, then one I/O failure |214.232Mbps, all bytes /0.638s;10.796s drain after load |
+| MPP QUIC |80.751Mbps /5.885s |30, then one I/O failure |306.984Mbps, all bytes /6.031s |
+| MPP TCP+QUIC |62.288Mbps /4.785s |30, then one I/O failure |Reset at4.996s;100,859,639 of190,316,544 bytes confirmed |
+
+After an echo connection fails, remaining unavailable slots are not independent
+network failures and success-only p95 is not a whole-run latency verdict.
+Upload bins record target-confirmation arrival, not wire departure. Likewise a
+download bin above500Mbps can be release of an already buffered ordered suffix;
+the physical service counters must be checked separately. Raw's low download
+and high upload are real directional results here, not one scalar link quality.
+
+The mirrored pass swaps whole directional impairment profiles, because reversing
+the application alone leaves the QoS in its ACK direction. Mocked shaper calls
+verify the swap and unchanged default mapping. Raw mirrored upload completes
+at4.279Mbps. Xray lacks its final acknowledgement. H2 and MPP TCP exceed the
+existing85-second runner observation guard; the teardown then resets their
+probes. Those are censored draining tails, NOT independently observed spontaneous
+runtime resets. TCP has84.804MB confirmed versus135.463MB locally accepted at
+the end. Mirrored QUIC/mixed are deliberately not yet run: the early ordinary
+mixed reset is now the higher-priority existing failure. Do not relax a timeout
+to relabel these cases or infer their missing bytes were permanently lost.
+
+This stress profile's packet-by-packet jitter can create deep reordering; it
+is not equivalent to every real network whose ping jitter is20ms. Current
+offload flags were not verified because ethtool is absent in the owned router;
+configured loss probability alone is not proof of equal per-wire-packet loss
+across transports. These limits forbid a public superiority headline, but do
+not erase the separately traced Product-prefix, feedback-work and native-owner
+defects. Do not modify the impairment to make the current candidate pass.
+
+Decision: current timing and reset gates are RED. The next isolated diagnosis
+locates the client's ReliablePathSessionClosed exit before any change. Its
+subsequent server H3_NO_ERROR happens during teardown, so is not its cause.
+The15-second QoS step and30-second outage did not cause a five-second
+reset. Retain this distinction from the censored baseline/TCP tails. Only
+after the reset has a root-cause correction and affected controls should the
+allocation/discovery transaction resume. Browser, independent200Mbps links,
+shared bottlenecks, cold/warm work and sustainability remain unclosed; README
+historical qualifiers remain unchanged and no release is authorized.
 
 ## Reflection: the actual process failure
 
@@ -30,8 +135,11 @@ matched application results. No speculative redesign is a release prerequisite.
 
 "Component-proved" below is deliberately weaker than "current end-to-end
 performance accepted." Exact test and source references are in the linked
-diagnosis documents and commits; the latest full suite passed2316 library
-tests, integration groups6/2/6, and450 native tests plus3 doctests.
+diagnosis documents and commits. The previous complete production batch passed
+2316 library tests, integration groups6/2/6, and450 native tests plus3 doctests;
+the later native packet-class composition passed469 native tests,25 adapter
+tests and strict all-target/all-feature Clippy. These are different checkpoints,
+not a newly completed full-suite run of every held component together.
 
 | SEEN / current item | Root cause and practical effect | Disposition / regression boundary |
 | --- | --- | --- |
@@ -50,7 +158,7 @@ tests, integration groups6/2/6, and450 native tests plus3 doctests.
 | P5/T10a; C1 | Old quarter-window/payload batching withheld an already freed receive-prefix grant despite RFC8.4. | `5c1d288`,512-byte/4096-window RED/GREEN; latest-value coalescing remains. May add control frames; affected throughput/CPU must be measured, not assumed improved. |
 | 7; P7/T11 | Retired path lifetime/identity, port projection, absent/stale values and delivery direction were conflated. Native retained bandwidth was presented like current traffic; pacing was raised to the model. | Keep retirement/identity fixes and `6545270`. Current ACK deltas, retained E and literal P are separate. Browser precision/reset/idle/unequal-window/sort controls pass. Presentation cannot fix a controller. |
 | M1 retention | Overlapping recovery transactions prevented finalized journal collection; clone/rollback could leave terminal proof in its parked owner or reuse its identity. | `6636091` / `42d1b86`: prefix compaction, exact owner dispatch and lineage IDs. Removes lifetime-growing finalized history and associated scanning. Does not conclusively attribute the uncaptured deployed RSS incident. |
-| Mixed upload feedback processing | Every recovery candidate rescanned the existing repair queue. Quiet profiling attributes 34.143 s to the overlap/enqueue loop; an exact native ACK arrived 44 s before MPP decoded it in a separate capture. | `614dc73` snapshots occupied byte intervals once per request batch. Disjoint-candidate equivalence and 2,098,176-to-2,048 inspection RED/GREEN pass, with all 243 affected sender tests. Ordinary timing/resource comparison remains pending. No controller, copy limit, or wake-policy change. |
+| Mixed upload feedback processing | Every recovery candidate rescanned the existing repair queue. Quiet profiling attributes 34.143 s to the overlap/enqueue loop; an exact native ACK arrived 44 s before MPP decoded it in a separate capture. | `614dc73` snapshots occupied byte intervals once per request batch. Disjoint-candidate equivalence and 2,098,176-to-2,048 inspection RED/GREEN pass, with all 243 affected sender tests. Ordinary comparisons are preserved in the overlap evidence checkpoint; their conflicting throughput signs do not establish global non-regression. No controller, copy limit, or wake-policy change. |
 | Mixed reply drain / uniform ownership scan | The chunk-independent ownership calculation introduced in `53d9ab5` rescans N spans at N boundaries. Preparation profiling and a live worker stack locate it in the post-source reply stall. | LIVE_OWNER_FRONTIER_WORK_BOUND preserves the same sets, order and assignment maxima through an endpoint sweep: RED4,196,352 to GREEN12,286 visits for2,048 chunks, plus sorting. Seven model and743 caller tests pass. Ten ordinary comparisons show shorter upload drain; adverse QoS interactive failure predates and survives the change. Component work correction only; no global throughput/retention acceptance. |
 | Native send-evidence lifetime | Imported ten-round collection deletes an original still owned by QUIC, so a later valid loss callback is incorrectly treated as unknown raw evidence. |9f522b2 deletes the independent expiry and uses actual transport terminals. Delayed-loss/ACK RED/GREEN and native tests pass; ordinary diagnostic follow-up finds zero of the previously observed62 unknown-evidence bound actions. Other compensated responses and mixed stalls remain separate. |
 | Individual loss class versus native undo | Whole-episode undo correctly requires all declared losses to be disproven, but compensation reused that guard for each packet's classification. An actual late original stayed charged because its episode also contained a genuinely lost packet. |QUIC_PACKET_LOSS_CLASSIFICATION_REVIEW documents actual-engine RED/GREEN, batched exact packet terminals, deletion of duplicate transaction retention and unchanged native undo.8,192-round retention remains bounded. Ten ordinary comparisons do not establish timing non-regression; intermediate candidate only, no release claim. |
@@ -169,7 +277,7 @@ applied transition; a changed rate label alone is not recovery evidence.
 
 1. Six-way asymmetric same-link run: raw Linux TCP, Xray VMess/TCP,
    Hysteria2 Brutal, MPP TCP, QUIC, default TCP+QUIC.100ms base RTT split70/30,
-   unequal jitter20/5ms,500/100Mbit/s directional service, forward loss3--10%
+   unequal jitter20/5ms,500/500Mbit/s directional service, forward loss3--10%
    (eight epochs mean6%), unequal reverse loss. Add500→10→500 forward service
    and a short UDP blackhole. One continuous download plus independent echo
    exposes collapse and loaded latency. Each product starts fresh; no restart
@@ -177,9 +285,12 @@ applied transition; a changed rate label alone is not recovery evidence.
 2. Reverse/upload, short-object/concurrent and healthy/loss-only ablations.
    Distinguish request/feedback direction, native service and Product gaps.
    Verify recovery with the same application request, not a replacement.
-3. Two independent links versus the same aggregate shared capacity; asymmetric
-   fast directions; mixed-carrier removal ablations. Do not call multiple
-   connections on one NIC independent bandwidth.
+3. Two independent200-Mbit/s links versus a shared cut, including a matched
+   total-capacity control; asymmetric fast directions and mixed-carrier removal
+   ablations. Do not call multiple connections on one NIC independent bandwidth.
+   The old aggregate runner's300/200 split is not this gate and must not be
+   relabelled as such. Direction reversal on the same asymmetric profile is
+   informative but is not a mirrored forward-QoS experiment.
 4. At the first material reproducible failure, isolate its owner before any
    production change. Exact counterexample → model justification → RED/GREEN
    → affected ordinary comparisons → isolated commit. No lucky rerun selection.

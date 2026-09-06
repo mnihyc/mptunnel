@@ -1,0 +1,22 @@
+diff --git a/src/runtime/relay/control.rs b/src/runtime/relay/control.rs
+index 8baafa6..2117a2e 100644
+--- a/src/runtime/relay/control.rs
++++ b/src/runtime/relay/control.rs
+@@ -682 +682 @@ where
+-    let mut last_reported_read_block: Option<(usize, usize, usize, usize, usize)> = None;
++    let mut last_reported_read_block = None;
+@@ -1698,0 +1699,4 @@ where
++                    sender_queue.bytes(),
++                    has_source_output,
++                    queued_send_blocked,
++                    inbound_frame_ready,
+@@ -1704 +1708 @@ where
+-                            "stream_id={} lane={:?} reinjection_bytes={} send_credit_bytes={} inflight_limit={} request_outstanding_limit={} request_outstanding_headroom={} sent_offset={} received_offset={}",
++                            "stream_id={} lane={:?} reinjection_bytes={} send_credit_bytes={} inflight_limit={} request_outstanding_limit={} request_outstanding_headroom={} sent_offset={} received_offset={} sender_queue_bytes={} has_source_output={} queued_send_blocked={} inbound_frame_ready={} prospective_read_budget={} buffered_frames={}",
+@@ -1713,0 +1718,6 @@ where
++                            blocked_state.5,
++                            blocked_state.6,
++                            blocked_state.7,
++                            blocked_state.8,
++                            prospective_read_budget,
++                            remotes.ready_frame_count(),

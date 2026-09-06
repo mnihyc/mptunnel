@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 10:12 UTC. Baseline source: `7189e69`; evidence checkpoint:
+Updated: 2026-09-06 10:38 UTC. Baseline source: `7189e69`; evidence checkpoint:
 `3d216a8`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -63,12 +63,22 @@ and closed component invariants are not repeatedly reopened as new defects.
   unacceptable: mixed loss/jitter download still has sustained trickle, and
   two mixed-upload candidates give165--169 Mbps against237--260 Mbps controls.
   Endpoint isolation gives148 Mbps for old client/new server versus296 Mbps
-  for new client/old server. Next trace that server-side receive/feedback
-  interaction using existing diagnostics before another model change.
+  for new client/old server. The next trace covers every original byte and
+  identifies pre-assignment gaps. Input-state tracing then captures2.633 s
+  with a live source output, positive read budget and no sender retry blockage,
+  but buffered input disables source reads and sender service. Next is the
+  bounded/fair Product input-service model in MIXED_UPLOAD_SOURCE_GAP_DIAGNOSIS;
+  preserve per-frame ACK validation, incarnation/lifecycle ordering and actual
+  Product/native admission. Do not merely remove guards or tune a deadline.
   MAILBOX_WRITE_WAKE_MODEL and its full-series evidence retain the results.
   Preserve one retained frame,
   exact recipient, partial-write ownership and terminal/requalification
   barriers. Component success is not an isolated throughput improvement.
+- Per-range recovery logging heavily perturbs the first upload traces; those
+  rates are not acceptance numbers. Large line counts count range attempts,
+  not actor iterations, and do not prove a busy loop or attribute the deployed
+  RAM incident. Quieter gate traces preserve the source-read obstruction.
+  Diagnostic fields are archived and removed from active runtime source.
 - Native outage trace shows ordinary exponential PTO backoff, not a stuck
   timer in that capture. Physical queue drain, native reordering tolerance and
   Product-prefix stalls remain separate causes; do not collapse them into the

@@ -1,6 +1,6 @@
 # Upload feedback lag after the paired repair experiment
 
-2026-09-06 14:49 UTC. Focused continuation, not an accepted runtime fix.
+2026-09-06 15:12 UTC. Focused continuation, not an accepted runtime fix.
 
 ## Practical result and exact boundary
 
@@ -54,6 +54,30 @@ independent-ordering capability.
   The current quic_read site observes only buffered decoder output, not the
   zero-copy decoder. Absence at that site cannot prove absent native receipt;
   positive observations and write/production stages remain usable.
+
+## Subsequent stage results
+
+The partial-decoder trace completes157.707Mbps with6.261s confirmation gaps;
+server actual delivery gaps peak.536s. Publication and native write acceptance
+advance together, while Product input trails for many seconds. Full probe and
+two-second stage series are in REPAIR_UPLOAD_ACK_STAGE_EVIDENCE_20260906.json.
+
+The all-decoder trace completes206.492Mbps with3.962s confirmation gaps. Exact
+single-range ACK contents take up to9.375s from server native handoff to client
+decode. The follow-up reader-queue trace completes245.798Mbps and again finds
+5.333s handoff-to-decode delay. Its maximum matched decode-to-reader-queue wait
+is14ms, queue-to-ordinary actor305ms, and decode-to-earliest Product input634ms.
+Product matching may observe the same contents via TCP first; it is not exact
+QUIC-copy attribution. There are no nonterminal writer-barrier events in this
+follow-up. Records are in REPAIR_UPLOAD_ACK_RECEIVER_EVIDENCE_20260906.json.
+
+These runs weigh against a local mailbox-only explanation for the multi-second
+delay. Neither a paired-task scheduling defect nor native loss-policy defect
+is accepted from these observations. The next discriminator maps the ACK batch
+to exact native accepted/unsent/contiguously-ACKed offsets and observes the
+held native reordering candidate's learned deadlines. That candidate may be
+part of the problem and must not be protected from the same causal standard.
+No scheduling preference, queue limit, congestion gain or deadline is changed.
 
 Diagnostic binaries and raw records remain under .tmp/reflection/. Wider
 acceptance is paused at this failure; no release or runtime acceptance.

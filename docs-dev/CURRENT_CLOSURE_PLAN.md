@@ -1,10 +1,10 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 14:38 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 15:12 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
-## Active transaction — 2026-09-06 14:38 UTC
+## Active transaction — 2026-09-06 15:12 UTC
 
 The historical execution entries below are evidence, not simultaneous tasks.
 Latest owner: native FIFO obstruction is PROVEN and committed in e99694d.
@@ -29,11 +29,18 @@ The lighter trace now proves49.324s without new original assignment while the
 server has already delivered208.786MB and client feedback lags near146MB.
 REPAIR_UPLOAD_FEEDBACK_BOUNDARY owns the next exact ACK-stage discriminator;
 do not reinterpret the absent next assignment as native loss of that byte.
+Subsequent ACK-stage traces locate5--9s before client decode, with millisecond
+reader-queue handoff and subsecond Product handling in the latest follow-up.
+Next: map exact ACK batches to native accepted/unsent/contiguously-ACKed offsets
+and observe learned native loss deadlines. Publication is not the measured
+blockage. Neither paired-task starvation nor native reordering-policy failure
+is yet proven. Evidence is retained in REPAIR_UPLOAD_ACK_STAGE_EVIDENCE and
+REPAIR_UPLOAD_ACK_RECEIVER_EVIDENCE dated20260906; rates are diagnostic only.
 REPAIR_COMPANION_UPLOAD_EVIDENCE_20260906.json preserves both outcomes and
 1Hz native/Product/RSS series. No native gain, queue-cap or protocol-preference change. The simple
 response ECF rollback is already rejected; do not repeat it.
 
-1. COMPLETE: read-only native offsets distinguish accepted, first-unsent and contiguous
+1. COMPLETE for download repair; ACTIVE for upload feedback: read-only native offsets distinguish accepted, first-unsent and contiguous
    acknowledged bytes of the exact H3 stream. Map its first repair record to
    native offsets and to Product receipt. No controller, threshold, writer
    credit or topology change. This resolves whether repair service is blocked

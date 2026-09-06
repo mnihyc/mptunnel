@@ -1,10 +1,54 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 15:46 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 16:13 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
-## Active transaction — 2026-09-06 15:46 UTC
+## Active transaction and process correction — 2026-09-06 16:13 UTC
+
+The user correctly challenges the slow and apparently expanding fix process.
+Knowing the reported symptoms is not knowing all their causal owners. Several
+pending runtime corrections have component proofs but lack accepted end-to-end
+composition. Treating those proofs as overall resolution makes each subsequent
+failed comparison look like a new regression. That distinction must be explicit.
+Diagnostic builds and serial attribution have also consumed substantial time;
+more instrumentation is justified only by a specific discriminating question.
+
+Current evidence and next actions, in order:
+
+1. The quadratic request-recovery queue scan is proven and its equivalent
+   snapshot implementation is committed in `614dc73`. All 243 affected sender
+   tests pass. This closes that component's work-bound proof, not practical
+   mixed-path acceptance. Ordinary candidate uploads of 266.185 and 127.882 Mbps
+   versus controls of 272.832 and 250.306 Mbps are not stable acceptance.
+2. The next diagnostic run, `mixed-combined-up-live-gap-service-0906`, resets
+   its application connection after 19.872 seconds. It confirms only
+   191,919,271 of 277,741,568 locally accepted bytes. Its rate is an incomplete
+   lower bound, not a completed performance result. Identify the first close
+   owner before interpreting the failure as a new bug, a pending-change
+   regression, or a diagnostic artifact. Do not add another runtime fix until
+   that classification has evidence.
+3. The same partial trace contains 822 accepted live-gap repair decisions.
+   Large TCP-owned holes receive 14,600-byte batches despite larger computed
+   target service. That establishes batch geometry, not yet the hypothesized
+   feedback-cycle throughput ceiling. Finish the exact ownership/timing proof;
+   preserve T06's ranked-extent and anti-amplification protections. No quantum,
+   gain, timeout or buffer tuning is authorized by this observation alone.
+4. Keep the current ordinary control and candidate binaries fixed. Any next
+   behavioral change must isolate one established cause, have its own RED/GREEN
+   and affected ordinary timing comparison, and retain a separate acceptance
+   verdict. Failed comparisons do not justify accumulating speculative fixes.
+5. Resume the unchanged global gates below only after this active transaction
+   closes. Restart, retention, browser, aggregation and final baseline gates
+   are not silently waived. No release or README performance claim is accepted.
+
+The deterministic commitment is scope, evidence requirements and stop/advance
+rules, not a promise that all unknown causes or completion time are already
+known. A reset observed during the existing mixed-path investigation is not
+automatically a new SEEN issue. If it is an interaction in the pending stack,
+attribute that interaction rather than opening an unrelated audit.
+
+## Previous transaction checkpoint — 2026-09-06 15:46 UTC
 
 The historical execution entries below are evidence, not simultaneous tasks.
 Latest owner: native FIFO obstruction is PROVEN and committed in e99694d.

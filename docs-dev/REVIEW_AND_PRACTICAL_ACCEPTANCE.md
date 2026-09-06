@@ -76,6 +76,15 @@ a severe QUIC reordering deficit on both this tree and the last release.
 They supersede the prospective wording below where results exist, but do not
 close the complete release matrix. There is no new production patch yet.
 
+The [2026-09-06 continuation](QUIC_RECEIVE_HISTORY_DIAGNOSIS.md) proves a second
+native owner: bounded129-packet receive history discards timely reordered
+originals, with4,948 exact matches to sender loss in a zero-router-drop trace.
+Sender-only adaptive candidates remain unaccepted and are withdrawn from the
+production tree. Their higher averages did not close timing stability. The
+next reordering model must cover sender loss tolerance, receiver history and
+packet-number encoding together, preserving duplicate safety and bounded
+memory. This supersedes starting another sender-threshold-only attempt.
+
 1. **QUIC deep-buffer latency (N1):** with old bandwidth400 Mbit/s and base
    RTT80ms, the old half-BDP probe allows2MB, but a new10-Mbit/s path's entire
    BDP is0.1MB. A queued RTT can enlarge later flight; the retained maximum

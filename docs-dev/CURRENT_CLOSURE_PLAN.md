@@ -54,6 +54,13 @@ and closed component invariants are not repeatedly reopened as new defects.
   their complete series; a poor baseline result cannot waive MPP's own gap.
   Next exact trace identifies the deferred TCP input kind during a long write,
   separating actual native delay from actor-level feedback obstruction.
+- That trace now identifies Product mailbox pressure: TCP1 retains STREAM_ACK
+  for 12.173 seconds until native write completion. Corresponding TCP and QUIC
+  interlocks conflate mailbox capacity with an actor-ordering barrier. Next
+  bounded transaction is MAILBOX_WRITE_WAKE_MODEL, with the exact production
+  interlock RED building first. Preserve one retained frame, exact recipient,
+  partial-write ownership and terminal/requalification barriers. Attribution
+  and RED are not yet a fixed runtime or an isolated throughput improvement.
 - Native outage trace shows ordinary exponential PTO backoff, not a stuck
   timer in that capture. Physical queue drain, native reordering tolerance and
   Product-prefix stalls remain separate causes; do not collapse them into the

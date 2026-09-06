@@ -1,0 +1,81 @@
+diff --git a/src/runtime/stream/response/snapshot.rs b/src/runtime/stream/response/snapshot.rs
+index f38a309..0926435 100644
+--- a/src/runtime/stream/response/snapshot.rs
++++ b/src/runtime/stream/response/snapshot.rs
+@@ -621,6 +621,9 @@ pub(super) fn server_native_bulk_output_snapshot_at(
+     snapshot.queue_bytes = entry.commands.pending_bytes();
+     snapshot.data_level_queue_bytes = data_level_queue_bytes;
+     snapshot.data_level_bytes_in_flight = entry.original_data_in_flight_bytes;
++    // Native rate authority excludes Product rate samples, not the independent
++    // exact-output qualification that permits mature additional-path admission.
++    snapshot.has_durable_product_progress = entry.product_qualification.qualified();
+     if let Some(shape) = shape {
+         let finite_rate_bps = shape.finite_rate_bps();
+         snapshot.carrier_delivery_rate_bps = (shape.basis()
+diff --git a/src/runtime/stream/response/tests_snapshot.rs b/src/runtime/stream/response/tests_snapshot.rs
+index b2eb81a..5b84030 100644
+--- a/src/runtime/stream/response/tests_snapshot.rs
++++ b/src/runtime/stream/response/tests_snapshot.rs
+@@ -11,7 +11,8 @@ use super::super::evidence::{
+ };
+ use super::super::next_server_carrier_path_instance_id;
+ use super::super::test_support::{
+-    qualify_product_assignment, stream_data_frame, stream_data_frame_at,
++    native_response_binding_fixture, qualify_product_assignment, stream_data_frame,
++    stream_data_frame_at, with_output_entry_for_key_mut,
+ };
+ use super::{
+     confidence_sample_denominator, server_bulk_output_snapshot, server_bulk_output_snapshot_at,
+@@ -1041,6 +1042,52 @@ fn expired_product_rate_retains_durable_product_progress() {
+     );
+ }
+ 
++#[test]
++fn native_response_snapshot_preserves_product_qualification_without_borrowing_its_rate() {
++    let fixture = native_response_binding_fixture(8, Some(200_000_000));
++    let snapshot = || {
++        fixture
++            .binding
++            .sender_path_targets(TrafficClass::Throughput, 65_536)
++            .into_iter()
++            .find(|target| target.observation.key == fixture.key)
++            .expect("live native output")
++            .observation
++    };
++    let unqualified = snapshot();
++    assert!(!unqualified.product_assignment_qualified);
++    assert!(!unqualified.snapshot.has_durable_product_progress);
++    with_output_entry_for_key_mut(&fixture.binding, fixture.key, |entry| {
++        qualify_product_assignment(entry, MuxLimits::default());
++        install_product_rate(entry, 900_000_000.0);
++    });
++    let qualified = snapshot();
++    assert!(qualified.product_assignment_qualified);
++    assert!(
++        qualified.snapshot.has_durable_product_progress,
++        "native rate projection must not demote a Product-qualified additional output to startup",
++    );
++    assert_eq!(qualified.snapshot.delivery_rate_bps, 200_000_000.0);
++    assert_eq!(qualified.snapshot.product_progress_rate_bps, None);
++    assert_eq!(
++        qualified.snapshot.scheduling_service_rate(),
++        unqualified.snapshot.scheduling_service_rate(),
++    );
++    with_output_entry_for_key_mut(&fixture.binding, fixture.key, |entry| {
++        entry.product_rate_epoch = None;
++    });
++    assert!(
++        snapshot().snapshot.has_durable_product_progress,
++        "numeric Product evidence expiry is not qualification revocation",
++    );
++    with_output_entry_for_key_mut(&fixture.binding, fixture.key, |entry| {
++        entry.product_qualification.revoke();
++    });
++    let revoked = snapshot();
++    assert!(!revoked.product_assignment_qualified);
++    assert!(!revoked.snapshot.has_durable_product_progress);
++}
++
+ #[test]
+ fn udp_native_snapshot_fails_closed_without_an_exact_carrier_direction_shape() {
+     let key = CarrierPathKey {

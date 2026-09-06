@@ -2700,6 +2700,11 @@ observation has only the update effect
 declared by that native-controller adapter and neither creates nor revokes
 Product qualification.
 
+Every scheduling projection, including a NativeOperational projection, MUST
+preserve this exact output's Product qualification independently of its rate
+basis. Selecting a native-only rate source MUST NOT reset `q_i` or demote a
+qualified additional output to the startup envelope.
+
 Reliable OriginalData uses separate Product-resource, lifecycle, and native-
 transport authorities. Its Product byte authority is independent of traffic
 class and TCP or QUIC underlay. Let:

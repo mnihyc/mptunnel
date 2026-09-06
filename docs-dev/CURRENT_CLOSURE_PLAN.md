@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 07:40 UTC. Baseline source: `7189e69`; evidence checkpoint:
+Updated: 2026-09-06 08:09 UTC. Baseline source: `7189e69`; evidence checkpoint:
 `fb01c1a`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -32,10 +32,17 @@ and closed component invariants are not repeatedly reopened as new defects.
   direction; multiple independent links are 200 Mbps each. Keep directional
   delay/loss and temporary QoS asymmetric. Earlier 500/100 runs remain labelled
   historical diagnostics, not matched measurements for this new cohort.
-- Next experiment: existing routed mixed/QUIC candidate versus control,
-  QoS-only and QoS-with-jitter/loss ablations, using existing management
-  snapshots alongside receiver gaps and router dequeue counters.
-- No production patch or new policy before attribution. Independent audit
+- The initial QoS/jitter/loss/outage ablations and owner traces identify one
+  exact response projection defect: native snapshots erase existing Product
+  qualification, making faster QUIC fail the additional-output startup check.
+  NATIVE_PRODUCT_QUALIFICATION_CLOSURE records the counterexample, original
+  isolation intent, bounded correction and RED/GREEN obligations. Close this
+  before considering an allocator redesign or changing native recovery policy.
+- Native outage trace shows ordinary exponential PTO backoff, not a stuck
+  timer in that capture. Physical queue drain, native reordering tolerance and
+  Product-prefix stalls remain separate causes; do not collapse them into the
+  newly identified qualification defect or waive the other gates.
+- No new policy before attribution. Independent audit
   workers remain unavailable under their recorded usage limit; no substitute
   independent sign-off is claimed.
 - Persist every verdict, exact executable/configuration, series and next owner

@@ -10,7 +10,8 @@ use crate::model::capacity::{
 use crate::mux::MuxLimits;
 use crate::protocol::OffsetRange;
 use crate::scheduler::{PathSnapshot, TrafficClass};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,8 +70,24 @@ pub(crate) struct ReliableLiveOwnerFrontier<I> {
     pub(crate) owner_assignments: Vec<(I, Instant)>,
 }
 
-fn identity_set_eq<I: Eq>(left: &[I], right: &[I]) -> bool {
-    left.len() == right.len() && left.iter().all(|identity| right.contains(identity))
+#[derive(Default)]
+struct FrontierCoverage {
+    originals: usize,
+    copies: usize,
+    owner_index: Option<usize>,
+    initially_avoided: bool,
+}
+
+impl FrontierCoverage {
+    fn membership_changes(&self) -> usize {
+        usize::from((self.originals != 0) != self.owner_index.is_some())
+            + usize::from((self.copies != 0) != self.initially_avoided)
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FRONTIER_SPAN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Sweeps every flight boundary from the exact lowest missing byte and stops
@@ -79,8 +96,9 @@ fn identity_set_eq<I: Eq>(left: &[I], right: &[I]) -> bool {
 /// Flight storage and retransmission-cache chunking are deliberately absent
 /// from this model.  Thin direction-specific wrappers supply only flights
 /// still owned by their actor; the cache is verified independently before a
-/// resulting prefix is scored or applied.
-pub(crate) fn reliable_live_owner_uniform_frontier<I: Copy + Eq>(
+/// resulting prefix is scored or applied. Sorted endpoints and incremental
+/// membership counts avoid rescanning N spans at each of O(N) boundaries.
+pub(crate) fn reliable_live_owner_uniform_frontier<I: Copy + Eq + Hash>(
     range: OffsetRange,
     spans: impl IntoIterator<Item = ReliableFlightSpan<I>>,
 ) -> Option<ReliableLiveOwnerFrontier<I>> {
@@ -90,6 +108,8 @@ pub(crate) fn reliable_live_owner_uniform_frontier<I: Copy + Eq>(
     let spans = spans
         .into_iter()
         .filter_map(|span| {
+            #[cfg(test)]
+            FRONTIER_SPAN_VISITS.with(|visits| visits.set(visits.get() + 1));
             let clipped = OffsetRange {
                 start: span.range.start.max(range.start),
                 end: span.range.end.min(range.end),
@@ -104,81 +124,91 @@ pub(crate) fn reliable_live_owner_uniform_frontier<I: Copy + Eq>(
         return None;
     }
 
-    let mut boundaries = Vec::with_capacity(spans.len().saturating_mul(2).saturating_add(2));
-    boundaries.push(range.start);
-    boundaries.push(range.end);
-    for span in &spans {
-        boundaries.push(span.range.start);
-        boundaries.push(span.range.end);
+    // Preserve input order within each boundary, including first-segment
+    // owner/avoid vector order. Hash-map iteration never determines output.
+    let mut events = Vec::with_capacity(spans.len().saturating_mul(2));
+    for (index, span) in spans.iter().enumerate() {
+        #[cfg(test)]
+        FRONTIER_SPAN_VISITS.with(|visits| visits.set(visits.get() + 1));
+        events.push((span.range.start, index, true));
+        events.push((span.range.end, index, false));
     }
-    boundaries.sort_unstable();
-    boundaries.dedup();
+    events.sort_unstable();
+    if events[0].0 != range.start {
+        return None;
+    }
 
-    let mut frontier_owners = None::<Vec<I>>;
-    let mut frontier_avoid = None::<Vec<I>>;
+    let mut coverage = HashMap::<I, FrontierCoverage>::new();
+    let mut owners = Vec::new();
+    let mut avoid = Vec::new();
     let mut owner_assignments = Vec::<(I, Instant)>::new();
     let mut frontier_end = range.start;
-    for boundary in boundaries.windows(2) {
-        let start = boundary[0];
-        let end = boundary[1];
-        if start < range.start || start >= range.end || start != frontier_end || start >= end {
-            continue;
-        }
-        let mut owners = Vec::<I>::new();
-        let mut avoid = Vec::<I>::new();
-        let mut segment_assignments = Vec::<(I, Instant)>::new();
-        for span in spans
-            .iter()
-            .filter(|span| span.range.start <= start && span.range.end >= end)
-        {
-            if !avoid.contains(&span.identity) {
-                avoid.push(span.identity);
+    let mut membership_changes = 0;
+    let mut cursor = 0;
+    while cursor < events.len() && events[cursor].0 < range.end {
+        let boundary = events[cursor].0;
+        let first = boundary == range.start;
+        let group_start = cursor;
+        // Apply simultaneous ends/starts before testing membership. Adjacent
+        // chunks of the same exact owner must not manufacture a coverage hole.
+        while cursor < events.len() && events[cursor].0 == boundary {
+            #[cfg(test)]
+            FRONTIER_SPAN_VISITS.with(|visits| visits.set(visits.get() + 1));
+            let (_, index, starts) = events[cursor];
+            let span = &spans[index];
+            let state = coverage.entry(span.identity).or_default();
+            if !first {
+                membership_changes -= state.membership_changes();
             }
-            if span.kind.is_original_transmission() {
-                if !owners.contains(&span.identity) {
+            let original = span.kind.is_original_transmission();
+            if starts {
+                if first && state.copies == 0 {
+                    state.initially_avoided = true;
+                    avoid.push(span.identity);
+                }
+                if first && original && state.originals == 0 {
+                    state.owner_index = Some(owners.len());
                     owners.push(span.identity);
+                    owner_assignments.push((span.identity, span.sent_at));
                 }
-                if let Some((_, latest)) = segment_assignments
-                    .iter_mut()
-                    .find(|(identity, _)| *identity == span.identity)
-                {
-                    *latest = (*latest).max(span.sent_at);
-                } else {
-                    segment_assignments.push((span.identity, span.sent_at));
-                }
-            }
-        }
-        if owners.is_empty() || avoid.is_empty() {
-            break;
-        }
-        if let (Some(expected_owners), Some(expected_avoid)) = (&frontier_owners, &frontier_avoid)
-            && (!identity_set_eq(expected_owners, &owners)
-                || !identity_set_eq(expected_avoid, &avoid))
-        {
-            break;
-        }
-        frontier_owners.get_or_insert_with(|| owners.clone());
-        frontier_avoid.get_or_insert_with(|| avoid.clone());
-        for (identity, sent_at) in segment_assignments {
-            if let Some((_, latest)) = owner_assignments
-                .iter_mut()
-                .find(|(owner, _)| *owner == identity)
-            {
-                *latest = (*latest).max(sent_at);
+                state.copies += 1;
+                state.originals += usize::from(original);
             } else {
-                owner_assignments.push((identity, sent_at));
+                state.copies -= 1;
+                state.originals -= usize::from(original);
+            }
+            if !first {
+                membership_changes += state.membership_changes();
+            }
+            cursor += 1;
+        }
+        if owners.is_empty() || membership_changes != 0 {
+            break;
+        }
+        // A start contributes its immutable assignment exactly once, and only
+        // if its segment belongs to the accepted prefix. Ends cannot erase
+        // assignment history; starts at a rejected boundary cannot extend it.
+        for &(_, index, starts) in &events[group_start..cursor] {
+            #[cfg(test)]
+            FRONTIER_SPAN_VISITS.with(|visits| visits.set(visits.get() + 1));
+            let span = &spans[index];
+            if starts && span.kind.is_original_transmission() {
+                let owner = coverage[&span.identity]
+                    .owner_index
+                    .expect("unchanged owner set retains initial owner index");
+                owner_assignments[owner].1 = owner_assignments[owner].1.max(span.sent_at);
             }
         }
-        frontier_end = end;
+        frontier_end = events[cursor].0;
     }
 
-    (frontier_end > range.start).then(|| ReliableLiveOwnerFrontier {
+    (frontier_end > range.start).then_some(ReliableLiveOwnerFrontier {
         range: OffsetRange {
             start: range.start,
             end: frontier_end,
         },
-        owners: frontier_owners.expect("non-empty uniform frontier has owners"),
-        avoid: frontier_avoid.expect("non-empty uniform frontier has avoidance identities"),
+        owners,
+        avoid,
         owner_assignments,
     })
 }
@@ -422,6 +452,162 @@ mod live_owner_reinjection_tests {
     use crate::mux::MuxLimits;
     use crate::protocol::OffsetRange;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn uniform_frontier_span_visits_do_not_multiply_storage_boundaries() {
+        const CHUNKS: usize = 2048;
+        let sent_at = Instant::now();
+        super::FRONTIER_SPAN_VISITS.with(|visits| visits.set(0));
+        let frontier = reliable_live_owner_uniform_frontier(
+            OffsetRange {
+                start: 0,
+                end: CHUNKS as u64,
+            },
+            (0..CHUNKS as u64).map(|start| ReliableFlightSpan {
+                range: OffsetRange {
+                    start,
+                    end: start + 1,
+                },
+                identity: 1_u8,
+                kind: CarrierWorkKind::OriginalData,
+                sent_at,
+            }),
+        )
+        .expect("one owner across every adjacent storage chunk");
+        assert_eq!(frontier.range.end, CHUNKS as u64);
+        let visits = super::FRONTIER_SPAN_VISITS.with(|visits| visits.get());
+        println!("{CHUNKS} spans: {visits} span/event visits (sorting excluded)");
+        assert!(
+            visits <= 6 * CHUNKS,
+            "{CHUNKS} spans required {visits} span/event visits; coverage must not be rescanned at every boundary"
+        );
+    }
+
+    // Independent byte-cell oracle: no endpoint events or incremental counts.
+    // Small integer coordinates make exact sets and accepted assignment maxima
+    // directly enumerable, including invalid/empty and clipped input spans.
+    fn frontier_by_byte(
+        range: OffsetRange,
+        spans: &[ReliableFlightSpan<u8>],
+    ) -> Option<super::ReliableLiveOwnerFrontier<u8>> {
+        let mut result = None::<super::ReliableLiveOwnerFrontier<u8>>;
+        for byte in range.start..range.end {
+            let mut owners = Vec::new();
+            let mut avoid = Vec::new();
+            for span in spans
+                .iter()
+                .filter(|s| s.range.start <= byte && byte < s.range.end)
+            {
+                if !avoid.contains(&span.identity) {
+                    avoid.push(span.identity);
+                }
+                if span.kind.is_original_transmission() && !owners.contains(&span.identity) {
+                    owners.push(span.identity);
+                }
+            }
+            if owners.is_empty() {
+                break;
+            }
+            if let Some(first) = &result
+                && (owners.len() != first.owners.len()
+                    || avoid.len() != first.avoid.len()
+                    || owners.iter().any(|i| !first.owners.contains(i))
+                    || avoid.iter().any(|i| !first.avoid.contains(i)))
+            {
+                break;
+            }
+            let frontier = result.get_or_insert_with(|| super::ReliableLiveOwnerFrontier {
+                range: OffsetRange {
+                    start: range.start,
+                    end: byte,
+                },
+                owner_assignments: owners
+                    .iter()
+                    .map(|&identity| {
+                        let latest = spans
+                            .iter()
+                            .filter(|s| {
+                                s.identity == identity
+                                    && s.kind.is_original_transmission()
+                                    && s.range.start <= byte
+                                    && byte < s.range.end
+                            })
+                            .map(|s| s.sent_at)
+                            .max()
+                            .unwrap();
+                        (identity, latest)
+                    })
+                    .collect(),
+                owners,
+                avoid,
+            });
+            for (identity, latest) in &mut frontier.owner_assignments {
+                for span in spans.iter().filter(|s| {
+                    s.identity == *identity
+                        && s.kind.is_original_transmission()
+                        && s.range.start <= byte
+                        && byte < s.range.end
+                }) {
+                    *latest = (*latest).max(span.sent_at);
+                }
+            }
+            frontier.range.end = byte + 1;
+        }
+        result
+    }
+
+    #[test]
+    fn uniform_frontier_matches_byte_oracle_with_overlap_clipping_and_input_order() {
+        let now = Instant::now();
+        let mut seed = 0x1a72_64ef_u64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..4096 {
+            let range = OffsetRange {
+                start: random() % 8,
+                end: 8 + random() % 17,
+            };
+            let mut spans = (0..12)
+                .map(|_| ReliableFlightSpan {
+                    range: OffsetRange {
+                        start: random() % 25,
+                        end: random() % 25,
+                    },
+                    identity: (random() % 4) as u8,
+                    kind: if random() & 1 == 0 {
+                        CarrierWorkKind::OriginalData
+                    } else {
+                        CarrierWorkKind::ReinjectedData
+                    },
+                    sent_at: now + Duration::from_millis(random() % 100),
+                })
+                .collect::<Vec<_>>();
+            if case % 2 == 0 {
+                // Ensure many nonempty prefixes, including future spans whose
+                // earlier input position must not reorder the initial vectors.
+                spans.push(ReliableFlightSpan {
+                    range,
+                    identity: 0,
+                    kind: CarrierWorkKind::OriginalData,
+                    sent_at: now,
+                });
+            }
+            let expected = frontier_by_byte(range, &spans);
+            let actual = reliable_live_owner_uniform_frontier(range, spans.iter().copied());
+            let project = |f: super::ReliableLiveOwnerFrontier<u8>| {
+                (f.range, f.owners, f.avoid, f.owner_assignments)
+            };
+            assert_eq!(
+                actual.map(project),
+                expected.map(project),
+                "case {case}: {spans:?}"
+            );
+        }
+    }
 
     #[test]
     fn live_gap_authority_preserves_the_ranked_frontier_when_due() {

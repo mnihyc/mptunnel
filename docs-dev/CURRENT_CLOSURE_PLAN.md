@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 16:58 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 17:44 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -15,6 +15,30 @@ Diagnostic builds and serial attribution have also consumed substantial time;
 more instrumentation is justified only by a specific discriminating question.
 
 Current evidence and next actions, in order:
+
+Active refinement (17:44 UTC): after complete ACK/queue/source costs were
+excluded as owners of the long reply tail, relay-stage timing and an owned
+native stack locate the uniform live-owner frontier's repeated full-span
+scans. LIVE_OWNER_FRONTIER_WORK_BOUND proves the equivalent endpoint sweep:
+RED4,196,352 versus GREEN12,286 visits for2,048 chunks, plus endpoint sorting.
+Seven model tests and244 sender/246 relay/253 stream tests pass. Ten ordinary
+optimized comparisons are complete: healthy upload drain28.775/28.633s versus
+nearby control39.613s; max gaps2.628/1.274s versus5.185s. Bulk speed remains
+variable. Healthy download is398.836 versus408.541Mbps with shorter read gaps.
+Adverse downloads still stall and time out interactive service in both old
+control and sweep; the repeated control also fails during QoS, disproving
+that this timing failure is newly introduced by the sweep. No blanket
+non-regression or release acceptance. Preserve exact ownership, timestamps
+and T06 ranked extent; no congestion/timeout/queue knob changes. Temporary
+profiling hooks are archived and removed. Local Clippy clears this component
+after two syntax cleanups but still reports four lints in the separate held
+companion stack; these are build obligations, not four new runtime defects.
+After the isolated component checkpoint, the next exact question is whether
+the remaining QoS-era interactive stall is native/physical service or Product
+ordered progress, first comparing the existing mixed and QUIC-only ablations.
+Do not start an ACK-ledger optimization or a new congestion tweak by intuition.
+Global gates below remain intact; independent audit workers remain unavailable
+under their recorded usage limit.
 
 1. The quadratic request-recovery queue scan is proven and its equivalent
    snapshot implementation is committed in `614dc73`. All 243 affected sender

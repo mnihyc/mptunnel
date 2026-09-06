@@ -68,3 +68,55 @@ Do not call it the new dominant root cause without measuring the current build.
 The global closure gates remain unchanged. No performance acceptance, README
 claim or release follows from this localization. The earlier unexplained
 mid-transfer reset is retained separately and is not attributed to this trace.
+
+## First profile rejects direct flight-cost attribution — 2026-09-06 17:03 UTC
+
+The healthy diagnostic completes 1,008,140,288 bytes in 41.041 s with a
+9.039-second reply gap. Flight ACK release totals 9.085 s inside the 9.275 s
+Product ACK subtransaction. ACK-gap evaluation totals 1.945 s and path recovery
+0.733 s. However, one-second intervals ending after 26 s contain only 0.380 s
+of flight release and 0.396 s of that ACK subtransaction, while the reply tail
+is still stalled. The old function-level label does not include the caller's
+queued-repair pruning, authoritative ACK update, or staleness work.
+
+Therefore optimizing flight rebuilding alone is not a demonstrated fix for
+the observed post-source stall. Preserve it as a measured bulk CPU cost, not
+the current causal conclusion. The next bounded profile includes the complete
+ACK handler, queued-repair pruning and source-admission observation. No runtime
+policy or ledger algorithm has been changed. The first profile's exact probe
+and per-second counters are REQUEST_FEEDBACK_DRAIN_PROFILE_20260906.json.
+
+The second healthy diagnostic completes in 41.237 s (191.067 Mbps, 4.198 s
+maximum reply gap). Its full ACK handler is 8.823 s overall but only 0.270 s
+in intervals ending at or after 27 s. Repair-queue pruning is 0.029 s overall
+and 0.002 s in those tail intervals. Source admission is 0.953 s overall and
+0.051 s in the tail. These measurements reject queue cloning/pruning and
+source-admission cost as dominant explanations of this post-source stall too.
+No such algorithms are patched. Exact interval counters are retained in
+REQUEST_FEEDBACK_HANDLER_PROFILE_20260906.json.
+
+The next stage discriminator measures relay preparation before event selection
+and per-kind input handling. Preparation includes any control/topology awaits
+in that region: its duration must not be mislabeled CPU time. This separates
+remaining relay work from time below the relay. Existing native flight samples
+alone still do not establish the exact native receipt boundary.
+
+## Preparation owner and equivalent correction — 2026-09-06 17:31 UTC
+
+The third profile records 21.533 s of relay preparation. Intervals ending at
+process-profile elapsed time >=28 s contain 11.771 s of preparation versus
+0.383 s of input ACK handling, after the 25 s source phase. A repeated run's
+native stack catches the busy worker in the uniform live-owner frontier
+calculation called by completion-tail recovery. See
+REQUEST_RELAY_STAGE_PROFILE_20260906.json for interval counts, complete probes
+and the native stack; debugger-paused runs are diagnostic only.
+
+LIVE_OWNER_FRONTIER_WORK_BOUND records the symbolic equivalence argument,
+history, RED 4,196,352 visits and GREEN 12,286 visits for 2,048 chunks. The sweep
+removes repeated coverage scans while preserving exact sets, vector order,
+assignment maxima and ranked range authority. Seven model tests pass,
+including 4,096 independent byte-oracle cases. Both direction callers still
+need integration verification; this is not full mixed-path acceptance.
+
+All temporary profiling scopes are removed from active runtime source. The
+exact overlay is preserved in REQUEST_FEEDBACK_DIAGNOSTIC_OVERLAY_20260906.json.

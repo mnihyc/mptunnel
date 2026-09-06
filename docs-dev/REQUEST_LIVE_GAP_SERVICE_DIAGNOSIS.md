@@ -53,3 +53,63 @@ model until those invariants and the observed failure are connected.
 All wider CURRENT_CLOSURE_PLAN gates remain open. The complete ordinary
 comparison is in REQUEST_RECOVERY_OVERLAP_COMPARISON_20260906.json. No new
 README result, release acceptance, congestion gain or protocol preference.
+
+## Follow-up attribution, 2026-09-06 16:28 UTC
+
+The first `live-gap-service-0906` diagnostic is incomplete: an application
+reset ends it at 19.872 s, with 191,919,271 target-confirmed bytes versus
+277,741,568 locally accepted. Its 822 accepted repair events establish the
+14,600-byte geometry, not completed throughput or the initiating close owner.
+Client reports `reliable path session closed`; subsequent server H3_NO_ERROR
+alone cannot identify why the Product relay ended.
+
+Five follow-ups did not reproduce that reset. All completed with exact target
+confirmation, but gaps remain unacceptable. They are diagnostics, not release
+measurements:
+
+| Suffix of `mixed-combined-up-` | Deliberate QoS/outage | Mbps | Max confirmation gap s | Total s |
+| --- | --- | ---: | ---: | ---: |
+| `live-gap-close-0906` | Off | 176.011 | 3.948136 | 58.996587 |
+| `live-gap-close2-0906` | Off | 209.406 | 4.737695 | 41.065452 |
+| `output-unavailable-0906` | Off | 204.623 | 3.487076 | 42.460993 |
+| `output-unavailable-combined2-0906` | On | 197.119 | 2.808189 | 41.284680 |
+| `output-unavailable-original-events-0906` | Off | 190.013 | 11.205387 | 45.096797 |
+
+All retain routed 500/500 Mbps service and asymmetric variable loss/jitter.
+The last follow-up restores the first run's per-dispatch/ACK diagnostics as
+well as terminal events; logging changes timing and these means must not be
+compared as performance improvements. Raw probes, logs and one-second service
+observations remain under `.tmp/reflection/results/` with the names above.
+
+The `request_output_unavailable` event establishes that a previously selected
+persistent-repair target can become stale before dispatch while every carrier
+remains active. Existing dispatch correctly cancels that exact queued batch;
+both traced occurrences complete normally. Do not patch that expected branch.
+Another hypothesis is ruled out statically: absent measured alternate
+completion produces no ready cause deadline, so it cannot newly enqueue the
+speculated unbound ACK-gap fallback through this evaluator.
+
+The initial reset remains unattributed, not fixed or excused as instrumentation.
+The current narrow lifecycle check tests FIN selection when all still-live
+attachments have stale payload evidence. Existing coverage checks a remaining
+fresh output and a sole stale OriginalData fallback, not that terminal case.
+The bounded FIN correction is subsequently proven and committed in `8e27abb`;
+it does not attribute the initial reset or change live-gap recovery policy.
+
+One attempted run failed during router setup, before any product started:
+`tc qdisc replace` attempted to change an existing HTB root. The shell used
+`grep -q` under `pipefail`; early consumer exit can make the producer fail and
+skip deletion. The local setup check now consumes its complete input. This is
+not an MPP failure, and that setup-only attempt has no performance result.
+
+## Boundary refinement, 2026-09-06 16:58 UTC
+
+Do not conflate the first-gap quantum with every confirmation gap. Many
+consecutive trace frontiers advance by 65,536 bytes, exceeding the 14,600-byte
+repair and establishing concurrent native progress. The 11.205-second gap in
+the last diagnostic includes continued server target writes and reply reads;
+its client return stream is stalled. Ordinary healthy uploads reproduce a
+long reply tail after every upload byte reaches the target, without per-frame
+diagnostics. REQUEST_FEEDBACK_DRAIN_WORK_MODEL owns the next focused CPU/stage
+discriminator. Live-gap service remains unresolved, not a reason to enlarge
+the ranked repair extent or to call the return-stream delay a probe artifact.

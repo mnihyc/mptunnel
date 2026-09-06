@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 16:13 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 16:58 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -47,6 +47,42 @@ rules, not a promise that all unknown causes or completion time are already
 known. A reset observed during the existing mixed-path investigation is not
 automatically a new SEEN issue. If it is an interaction in the pending stack,
 attribute that interaction rather than opening an unrelated audit.
+
+User clarification, 2026-09-06 16:28 UTC: deletion and simplification are
+first-class correction options. Before adding a mechanism, identify whether
+an existing rule conflates independent authorities and can be removed or
+narrowed while preserving the established invariant. Temporary diagnostics
+are not accepted model code and must be archived and removed after attribution.
+
+Follow-up status: five diagnostic uploads complete without the initial reset,
+but retain 2.8--11.2 s confirmation gaps. A stale queued persistent-repair target
+is correctly cancelled and is not a new defect. The absent-target fallback
+hypothesis is also ruled out. The original reset remains open. One focused
+production test proves FIN fails when a stale attachment survives the later
+removal of its fresh alternate. A minimal eligibility correction now passes
+244 sender, 246 relay and 253 stream tests. It preserves fresh-output preference
+and all payload/repair rules. See REQUEST_STALE_SURVIVOR_FIN_MODEL; ordinary
+timing verification is next. This does not attribute the earlier mid-transfer
+reset or close the mixed-path timing gate. The two temporary diagnostic hooks
+are archived and removed before the ordinary candidate build.
+
+Latest component checkpoint: `8e27abb` commits the stale-survivor FIN
+eligibility correction, production regression test and only its RFC paragraph.
+The held companion, actor-service and native-reordering changes are not swept
+into that commit. Five ordinary uploads complete exactly, but mixed timing is
+still unacceptable (healthy reply gaps 1.25/8.43 s in controls, 13.07 s in the
+candidate; adverse gaps 4.09/4.43 s). REQUEST_FIN_COMPARISON_20260906 preserves
+full probes and one-second application/process/flight observations.
+
+The next owner is now narrower than the small-repair-quantum hypothesis:
+the target has already received the full ordinary healthy upload while its
+tiny replies and client Product accounting drain for many seconds. The earlier
+11.2-second diagnostic gap also contains continued server target writes and
+target reply reads. REQUEST_FEEDBACK_DRAIN_WORK_MODEL documents exact boundaries
+and remaining attribution limits. Profile synchronous Product ACK, flight
+release, path recovery and ACK-gap work without new transport policy. The
+temporary duration scopes must be removed after this discriminator. Do not
+increase repair size, native gains, timers or queue bounds from these symptoms.
 
 ## Previous transaction checkpoint — 2026-09-06 15:46 UTC
 

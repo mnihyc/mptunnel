@@ -1,0 +1,74 @@
+diff --git a/src/runtime/relay/client.rs b/src/runtime/relay/client.rs
+index 9c37ad6..402b501 100644
+--- a/src/runtime/relay/client.rs
++++ b/src/runtime/relay/client.rs
+@@ -689,6 +689,8 @@ pub(super) fn evaluate_client_data_ack_reinjection(
+         persistent_ack_gap_reinjection_ready && !reinjection_frames.is_empty();
+     let mut accepted_copy_deadline = None::<Instant>;
+     let mut accepted_live_owner_reinjection = false;
++    #[cfg(feature = "lab-diagnostics")]
++    let mut accepted_bytes = 0usize;
+     for frame in reinjection_frames {
+         let live_copy_deadline = sender.reinjection_suppression_deadline_for_frame(&frame, remotes);
+         accepted_copy_deadline = match (accepted_copy_deadline, live_copy_deadline) {
+@@ -706,6 +708,10 @@ pub(super) fn evaluate_client_data_ack_reinjection(
+             } else {
+                 RelaySendCause::AckGapReinjection
+             };
++            #[cfg(feature = "lab-diagnostics")]
++            {
++                accepted_bytes += crate::protocol::frame::reliable_stream_frame_accounted_bytes(&frame);
++            }
+             sender.enqueue_reinjection_frame_with_priority(sender_queue, frame, cause, true);
+             true
+         };
+@@ -725,6 +731,18 @@ pub(super) fn evaluate_client_data_ack_reinjection(
+         }
+     }
+     if accepted_live_owner_reinjection {
++        #[cfg(feature = "lab-diagnostics")]
++        lab_diagnostic("request_ack_gap_commit", format_args!(
++            "stream_id={} gap={:?} uniform_bytes={} base_quantum={} target_quantum={} frontier_limit={} target_service={} planned_limit={} accepted_bytes={} owner_underlay={:?} owner_age_ms={:?} owner_due={} target={:?} reference={:?}",
++            stream_id.0, normalized_stream_ack_first_gap(authoritative_ack_ranges),
++            reinjection.uniform_frontier_extent_bytes, base_reinjection_limit,
++            target_reinjection_quantum, frontier_limit, target_service_limit,
++            reinjection_limit, accepted_bytes, reinjection.original_underlay,
++            reinjection.original_assignment_at.map(|sent| observed_at.saturating_duration_since(sent).as_millis()),
++            owner_recovery_deadline.is_some_and(|deadline| observed_at >= deadline),
++            reinjection_target.map(|(target, snapshot)| (target.instance(), snapshot.delivery_rate_bps, snapshot.srtt_ms)),
++            path_snapshot.map(|snapshot| (snapshot.id, snapshot.underlay, snapshot.delivery_rate_bps, snapshot.srtt_ms)),
++        ));
+         // L/D/target/F were fixed by the observation above; acceptance is the
+         // linearization point for the retained epoch observation. A due cause
+         // remains independently actionable; this clock does not gate it.
+diff --git a/src/runtime/sender/request.rs b/src/runtime/sender/request.rs
+index 4e39698..216c547 100644
+--- a/src/runtime/sender/request.rs
++++ b/src/runtime/sender/request.rs
+@@ -1041,6 +1041,26 @@ impl RequestSenderService {
+                     return Err(RuntimeError::SenderServiceBlocked);
+                 }
+                 Err(RequestMultipathPlanError::OutputUnavailable) => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    lab_diagnostic(
++                        "request_output_unavailable",
++                        format_args!(
++                            "stream_id={} cause={:?} range={:?} avoid={:?} paths={:?}",
++                            self.multipath.stream_id().0,
++                            cause,
++                            match &frame {
++                                Frame::StreamData { offset, payload, .. } => Some((*offset, payload.len())),
++                                _ => None,
++                            },
++                            avoid_instances,
++                            remotes.paths.iter().map(|path| (
++                                path.instance(),
++                                path.stream.product_admission_active(),
++                                self.multipath.path_is_stale(path.instance()),
++                                context.reliable_path_snapshot_for_instance(path.instance()).map(|s| (s.state, s.delivery_rate_bps)),
++                            )).collect::<Vec<_>>(),
++                        ),
++                    );
+                     return Err(last_error.unwrap_or(RuntimeError::ReliablePathSessionClosed));
+                 }
+             };

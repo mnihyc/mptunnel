@@ -1,6 +1,6 @@
 # Upload feedback lag after the paired repair experiment
 
-2026-09-06 15:22 UTC. Focused continuation, not an accepted runtime fix.
+2026-09-06 15:38 UTC. Focused continuation, not an accepted runtime fix.
 
 ## Practical result and exact boundary
 
@@ -109,3 +109,30 @@ observer overhead. No gain/queue/timeout adjustment or unvalidated ACK dropping.
 
 Diagnostic binaries and raw records remain under .tmp/reflection/. Wider
 acceptance is paused at this failure; no release or runtime acceptance.
+
+## Quiet owner profile reproduces the failure
+
+Per-frame diagnostics and native traces are disabled; existing one-second
+aggregate timers alone are enabled. Two independent realizations retain the
+same500/500Mbps asymmetric variable loss/jitter topology and no deliberate QoS
+or outage. REPAIR_UPLOAD_OWNER_PROFILE_EVIDENCE_20260906.json saves both full
+probes and synchronous component timing series.
+
+| Observation | First profile | Repeat |
+| --- | ---: | ---: |
+| Exact completed upload Mbps |230.989|45.407|
+| Confirmation gap seconds |2.064|14.616|
+| Profile lifetime seconds |44.039|46.699|
+| Path recovery total seconds |3.371|30.639|
+| Within it, recovery enqueue seconds |2.374|29.233|
+| Product ACK transaction seconds |5.560|2.418|
+| ACK-derived recovery evaluation seconds |7.136|1.756|
+
+The scopes nest; these totals cannot be summed as CPU. No single call exceeds
+12.542ms in the failed repeat, so accumulated processing/backlog, not a single
+blocking function, remains the interpretation. The repeated recovery enqueue
+operation dominates the failed run and is the next bounded owner to split.
+It currently extracts ranges, selects a target, rebuilds payload frames and
+linearly checks each against queued repairs. Establish which suboperation
+dominates before optimizing it; merely suppressing dirty wakes or treating all
+zero-byte ACK outcomes as unchanged would alter valid recovery semantics.

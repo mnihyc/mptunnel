@@ -1,10 +1,10 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 15:12 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 15:38 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
-## Active transaction — 2026-09-06 15:12 UTC
+## Active transaction — 2026-09-06 15:38 UTC
 
 The historical execution entries below are evidence, not simultaneous tasks.
 Latest owner: native FIFO obstruction is PROVEN and committed in e99694d.
@@ -31,16 +31,25 @@ REPAIR_UPLOAD_FEEDBACK_BOUNDARY owns the next exact ACK-stage discriminator;
 do not reinterpret the absent next assignment as native loss of that byte.
 Subsequent ACK-stage traces locate5--9s before client decode, with millisecond
 reader-queue handoff and subsecond Product handling in the latest follow-up.
-Next: map exact ACK batches to native accepted/unsent/contiguously-ACKed offsets
-and observe learned native loss deadlines. Publication is not the measured
-blockage. Neither paired-task starvation nor native reordering-policy failure
-is yet proven. Evidence is retained in REPAIR_UPLOAD_ACK_STAGE_EVIDENCE and
-REPAIR_UPLOAD_ACK_RECEIVER_EVIDENCE dated20260906; rates are diagnostic only.
+That discriminator is complete: an exact ACK batch is contiguously acknowledged
+natively44.098s before client MPP decode, while observed native loss deadlines
+remain below.4s. This exact delay is client processing, not native recovery.
+Small per-frame queue waits cannot exclude accumulated FIFO backlog age; the
+earlier queue inference is corrected explicitly. Quiet aggregate profiles then
+give230.989Mbps/gap2.064s and45.407Mbps/gap14.616s. Recovery enqueue processing
+grows from2.374s to29.233s, against a46.7s second run; Product ACK transaction
+cost is only2.418s there. Nested scopes overlap and must not be added.
+Next split recovery frontier lookup, target selection, frame extraction and
+queued-overlap/enqueue cost before selecting the algorithmic correction. No
+ACK thinning, congestion gain, copy-budget, dirty-wake or timeout change is
+justified yet. Exact cost, original intent and preserved semantics must lead
+RED/GREEN and ordinary comparisons. Native receipt and owner-profile evidence
+are committed separately; all profile rates remain diagnostic only.
 REPAIR_COMPANION_UPLOAD_EVIDENCE_20260906.json preserves both outcomes and
 1Hz native/Product/RSS series. No native gain, queue-cap or protocol-preference change. The simple
 response ECF rollback is already rejected; do not repeat it.
 
-1. COMPLETE for download repair; ACTIVE for upload feedback: read-only native offsets distinguish accepted, first-unsent and contiguous
+1. COMPLETE for download repair and upload native boundary; ACTIVE for upload processing: read-only native offsets distinguish accepted, first-unsent and contiguous
    acknowledged bytes of the exact H3 stream. Map its first repair record to
    native offsets and to Product receipt. No controller, threshold, writer
    credit or topology change. This resolves whether repair service is blocked

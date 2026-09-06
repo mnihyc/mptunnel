@@ -1,6 +1,6 @@
 # Ordered repair is not native queue admission
 
-2026-09-06 11:57 UTC. Focused continuation of MIXED_RECOVERY_QUEUE_DIAGNOSIS and
+2026-09-06 12:17 UTC. Focused continuation of MIXED_RECOVERY_QUEUE_DIAGNOSIS and
 CURRENT_CLOSURE_PLAN. No new runtime policy or release acceptance.
 
 ## Architecture finding
@@ -190,3 +190,94 @@ owner and require busy-fast/free-slow, unknown-fast, reversed TCP/QUIC quality,
 shared/independent capacity, singleton and abrupt-failure counterexamples.
 Ordinary mixed/QUIC timing comparisons follow; the unchanged global upload,
 browser, aggregation, sustainability and baseline gates remain required.
+
+## Response-only placement ablation: insufficient, not an accepted rollback
+
+The next bounded comparison restores only the former response ECF completion
+comparison after unchanged structural resource checks. It uses the retained
+measurement-start predicate; the old inference-derived BDP resource gate is
+not restored. Native controllers, configured limits, request scheduling,
+mailbox and cooperative actor candidates remain unchanged. No new parameter
+or TCP/QUIC preference is added. Both ordinary binaries use the same routed
+500/500-Mbps cut and asymmetric variable loss/jitter, without deliberate QoS
+or outage. Runs are sequential, with no compilation overlapping traffic.
+
+| Ordinary executable | Mean Mbps | First body s | Maximum read gap s | Echo successes / failures | Echo p95 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Current cooperative candidate |135.348|.728|3.523|80 /0|261.115|
+| Response ECF comparison restored |136.161|.612|1.494|80 /0|300.308|
+
+The restoration does not remove multi-second-scale ordered stalls or the
+trickle/buffer-release pattern. These are different random loss realizations;
+the smaller maximum gap in one run is not a statistical improvement or a
+no-downgrade proof. The ablation's server peak RSS340016 KiB exceeds the
+control303128 KiB; no leak attribution follows from those short snapshots.
+Do not accept this rollback on its almost unchanged mean.
+
+A separate diagnostic build confirms the restored predicate actually executes.
+Its first rejection at server730ms is QUIC, not TCP: predicted candidate ETA
+4022.275ms versus TCP lead1587.674ms, both with zero original flight. These are
+the implementation's advisory coordinates, not measured service times. That
+event does not prove QUIC physically slower at startup, or itself attribute
+startup delay; it demonstrates why merely reinstating the legacy comparison
+is not a protocol-neutral service proof.
+
+The same diagnostic run still stalls1.633s at Product frontier166667194:
+
+| Common Unix ms | Event |
+| --- | --- |
+|1788696780913|Original65,536 bytes assigned to TCP path0.|
+|1788696785033|Stale-owner recovery accepts the frontier copy on QUIC, with0ms Product queue delay.|
+|1788696785121|A further copy is accepted on TCP path1.|
+|1788696787216|A TCP frame advances the frontier;59,995,968 bytes of reordered suffix were already held.|
+
+The client path index is not the server PathId, so the winning TCP copy is
+not uniquely identified here. The first diagnostic trace's H3 handoff proof
+remains separate; this run does not add a new native residence measurement.
+The145.670-Mbps diagnostic mean is not an ordinary acceptance result.373
+logged no-target evaluations are attempts, not evidence of a busy-loop rate
+or justification for removing occupied-copy checks.
+
+RESPONSE_ECF_PLACEMENT_ABLATION_EVIDENCE_20260906.json retains all three complete
+probe/interactive and process series plus the exact events. The ordinary and
+diagnostic patches are archived separately. Both temporary source variants
+were removed with apply_patch after saving their executables; the scheduling
+file is unchanged in the active runtime worktree. No new production fix or
+regression-suite acceptance is claimed for this experiment.
+
+## Architectural scope after the failed simple restoration
+
+The next transaction is a replacement allocation/repair contract, not another
+completion constant. Its four distinct questions are:
+
+1. **Permission:** do exact Product, attachment and native owners allow this
+   action? Keep W/P/E, Data ACK, copies and cancellation semantics unchanged.
+2. **Placement:** which permitted action improves the ordered prefix, including
+   a finite wait for a live busy alternative? Permission is not an obligation
+   to dispatch immediately. Unknown service is not a fabricated low rate.
+3. **Discovery:** who owns a finite opportunity to learn useful untested
+   service across successive source heads? A per-head timeout alone cannot
+   prove this. Probe or duplicated bytes cannot silently become unique
+   Product goodput, qualification or unambiguous carrier delivery evidence.
+4. **Repair service:** what earlier work is irreversibly ahead of this repair?
+   Pre-native priority cannot bypass existing same-stream native ordering.
+   Either the placement/handoff model accounts for that dependency, or an
+   explicit independent repair ordering domain is required. The latter is
+   only a design alternative: attachment, connection credit, native scheduling,
+   cross-stream fairness, duplicate and terminal ownership must be proved
+   before any implementation. It is not permission to mint native credit.
+
+Rewrite the affected15.1 allocation contract and refine10.4/15.2's service
+boundary when that model is complete. A wholesale rewrite of unrelated wire,
+authentication, ACK or lifecycle rules is not supported by these traces.
+Do not preserve a poor policy solely because the RFC currently permits it,
+but do not publish an unimplemented performance promise as a completed RFC.
+
+Before code, resolve compatible service evidence and exact irreversible-work
+ownership. Then check busy-fast/free-slow, unknown-fast/known-slow, reversed
+protocol quality, immediate preferred failure, repeated estimate changes,
+singleton, concurrent streams and high-BDP pipelining. A controller with only
+past observations cannot guarantee optimal decisions under arbitrary future
+QoS changes. State that nonclaim without using it to excuse the demonstrated
+software/ordering stalls. The existing asymmetric up/down,500-Mbps shared,
+200-Mbps independent, browser, recovery and sustainability gates remain intact.

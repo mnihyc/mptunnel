@@ -1,7 +1,7 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 11:57 UTC. Baseline source: `7189e69`; evidence checkpoints:
-`282b71f`, `5d52914`, `9f15ffd`, `c44ecee`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
+Updated: 2026-09-06 12:17 UTC. Baseline source: `7189e69`; evidence checkpoints:
+`282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Fixed order and closure obligations
@@ -124,6 +124,19 @@ and closed component invariants are not repeatedly reopened as new defects.
   ordered-latency non-regression. Keep exact resource separation, but replace
   the missing allocation choice explicitly; do not restore all old ETA/BDP
   gates or claim this single commit explains every previous regression.
+- The response-only ECF restoration ablation is now complete and insufficient:
+  ordinary136.161 Mbps/gap1.494s versus matched current135.348/gap3.523s, both
+  80echo successes. Different random realizations do not establish a stable
+  gain; both retain stalls/buffer-release bursts. A diagnostic confirms the
+  restored predicate executes and still reproduces a TCP-owned hole with
+  about60MB of reordered suffix. All ablation source hunks are removed; full
+  series, patches and attribution are retained in ORDERED_REPAIR_SERVICE_BOUNDARY
+  and RESPONSE_ECF_PLACEMENT_ABLATION_EVIDENCE_20260906.json. No simple rollback
+  is accepted. Next work is the four-way permission/placement/discovery/repair
+  service contract, compatible evidence and irreversible-work ownership proof.
+  Revise affected RFC15.1/10.4/15.2 explicitly only after that proof; do not
+  rewrite unrelated accepted ACK/lifecycle semantics or start another gain,
+  queue-cap or protocol-preference sweep. Global gates above remain open.
 - Native outage trace shows ordinary exponential PTO backoff, not a stuck
   timer in that capture. Physical queue drain, native reordering tolerance and
   Product-prefix stalls remain separate causes; do not collapse them into the

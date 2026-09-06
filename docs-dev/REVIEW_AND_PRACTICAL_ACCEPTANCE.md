@@ -183,6 +183,19 @@ not a newly completed full-suite run of every held component together.
 
 ## What remains practically open
 
+The 2026-09-06 no-target request-recovery transaction is now separately proved
+in [REQUEST_NO_TARGET_RECOVERY](REQUEST_NO_TARGET_RECOVERY.md): an ordinary
+mixed upload reset maps from unbound repair OutputUnavailable while four
+attachments remain registered. Production-sender RED tests show both a second
+copy on an existing owner and the matching session-close result after a stale
+transition. Removing that producer fallback passes642 focused controls and
+strict Clippy; two ordinary mixed uploads now confirm every byte without
+reset. This corrects code to existing RFC owner/slot predicates. It does not
+justify loosening those predicates or classify all earlier resets alike.
+Full ordinary series preserve mixed4.2/3.3s confirmation gaps, a5.3s download
+gap/interactive timeout, and large TCP control variability. The reset component
+is not acceptance of the pending composition or of overall performance.
+
 The [2026-09-05 experiments](REORDERING_PERFORMANCE_DIAGNOSIS.md) now reproduce
 a severe QUIC reordering deficit on both this tree and the last release.
 They supersede the prospective wording below where results exist, but do not

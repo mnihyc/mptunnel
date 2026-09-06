@@ -1956,21 +1956,14 @@ impl RequestSenderService {
                 excluded_targets.push(instance);
             }
         }
-        let (reinjection_path, target_service_exhausted) =
-            self.multipath.reinjection_path_snapshot(
-                context,
-                remotes,
-                &excluded_targets,
-                sender_queue,
-                send_stream.reinjection_bytes(),
-                context.mux_limits,
-            );
-        if target_service_exhausted && send_stream.reinjection_bytes() > 0 {
-            return RequestPathRecoveryEnqueueOutcome {
-                blocked_for_carrier_capacity: true,
-                ..RequestPathRecoveryEnqueueOutcome::default()
-            };
-        }
+        let (reinjection_path, _) = self.multipath.reinjection_path_snapshot(
+            context,
+            remotes,
+            &excluded_targets,
+            sender_queue,
+            send_stream.reinjection_bytes(),
+            context.mux_limits,
+        );
         let (reinjection_limit, cause) = match reinjection_path {
             Some((target_instance, _, reinjection_limit)) => {
                 let bound_cause = match cause {
@@ -1993,14 +1986,17 @@ impl RequestSenderService {
                 };
                 (reinjection_limit, bound_cause)
             }
-            None => (
-                reliable_reinjection_service_limit_bytes(
-                    ReliableReinjectionTargetWork::new(None, sender_queue.reinjection_bytes(), 0),
-                    send_stream.reinjection_bytes(),
-                    context.mux_limits,
-                ),
-                cause,
-            ),
+            None => {
+                // The retained source/flight ledger already owns this repair.
+                // No target is not a closed session, nor authority to retry a
+                // copy on an attachment that already owns the range. Existing
+                // membership, Product-model, receipt and capacity wakes retry
+                // selection without materializing target-unbound queue work.
+                return RequestPathRecoveryEnqueueOutcome {
+                    blocked_for_carrier_capacity: true,
+                    ..RequestPathRecoveryEnqueueOutcome::default()
+                };
+            }
         };
         if reinjection_limit == 0 {
             return RequestPathRecoveryEnqueueOutcome::default();

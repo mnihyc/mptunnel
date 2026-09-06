@@ -718,6 +718,132 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
 }
 
 #[tokio::test]
+async fn request_path_recovery_waits_when_every_attachment_already_owns_the_range() {
+    request_path_recovery_without_a_new_target(false).await;
+}
+
+#[tokio::test]
+async fn request_path_recovery_does_not_close_when_last_target_becomes_stale() {
+    request_path_recovery_without_a_new_target(true).await;
+}
+
+async fn request_path_recovery_without_a_new_target(stale_before_dispatch: bool) {
+    let stream_id = StreamId(233);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10321?initial-srtt-s=0.08&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10322?initial-srtt-s=0.02&initial-rate-mbps=500",
+        "tcp://127.0.0.1:10323?initial-srtt-s=0.04&initial-rate-mbps=200",
+    ]);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (copy_commands, mut copy_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, copy_commands));
+    let copy = remotes.paths[1].instance();
+    for receivers in [&mut owner_receivers, &mut copy_receivers] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [owner, copy] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let original = send_stream
+        .send_data(Bytes::from(vec![0x6e; 4096]))
+        .expect("retained original data");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &original);
+    sender.record_reinjected_frame_for_test(copy, &original);
+    assert!(sender.multipath.mark_path_stale(owner));
+    let deadline = sender
+        .earliest_reinjection_suppression_deadline(&remotes)
+        .expect("accepted copy has an immutable retry deadline");
+    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    let mut queue = ReliableRelaySenderQueue::default();
+    let outcome = sender.drive_request_path_recovery(
+        &mut queue,
+        &context,
+        &remotes,
+        &send_stream,
+        TrafficClass::Throughput,
+    );
+    if stale_before_dispatch {
+        assert!(sender.multipath.mark_path_stale(copy));
+    }
+    if outcome.queued {
+        let dispatch = sender
+            .dispatch_client_queued_work(
+                &context,
+                TrafficClass::Throughput,
+                &mut remotes,
+                &mut send_stream,
+                &mut queue,
+                4096,
+                ReliableDataAckFrontierState::Live,
+            )
+            .await;
+        panic!("no new target must not create a command that can close the relay: {dispatch:?}");
+    }
+    assert!(outcome.blocked_for_carrier_capacity);
+    assert!(
+        outcome.retry_deadline.is_none(),
+        "no expired timer busy loop"
+    );
+    assert!(queue.is_empty());
+    assert_eq!(send_stream.reinjection_bytes(), 4096);
+    assert_eq!(sender.multipath.accepted_reinjected_data_bytes(copy), 4096);
+    assert_eq!(remotes.paths.len(), 2);
+    assert!(try_recv_reliable_path_command(&mut owner_receivers).is_none());
+    assert!(try_recv_reliable_path_command(&mut copy_receivers).is_none());
+
+    let generation_before = remotes.membership_generation();
+    let (fresh_commands, mut fresh_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, fresh_commands));
+    consume_client_path_proof_for_test(&mut fresh_receivers);
+    let fresh = remotes.paths[2].instance();
+    context.install_relay_path_instance_for_test(fresh);
+    assert_ne!(remotes.membership_generation(), generation_before);
+    assert!(
+        sender
+            .drive_request_path_recovery(
+                &mut queue,
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .queued
+    );
+    assert!(matches!(
+        sender
+            .dispatch_client_queued_work(
+                &context,
+                TrafficClass::Throughput,
+                &mut remotes,
+                &mut send_stream,
+                &mut queue,
+                4096,
+                ReliableDataAckFrontierState::Live,
+            )
+            .await
+            .expect("membership publication reselects a real target"),
+        ClientQueuedDispatch::Reinjection {
+            payload_bytes: 4096,
+            ..
+        }
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fresh_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+    assert!(queue.is_empty());
+    assert_eq!(sender.multipath.accepted_reinjected_data_bytes(copy), 4096);
+    assert_eq!(sender.multipath.accepted_reinjected_data_bytes(fresh), 4096);
+    assert_eq!(send_stream.reinjection_bytes(), 4096);
+}
+
+#[tokio::test]
 async fn disappeared_bound_path_recovery_target_is_cancelled_and_reselected() {
     let stream_id = StreamId(232);
     let context = client_test_context_with_paths(&[

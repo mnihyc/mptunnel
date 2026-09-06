@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 21:09 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 21:38 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -32,14 +32,54 @@ planning/exhaustion branches. It builds successfully in1m23s after labs stop;
 the frozen diagnostic is .tmp/reflection/bin/closed-origin/mptunnel. Both
 temporary source overlays are now restored, and their exact patch is archived
 under .tmp/reflection/closed-origin-overlay.patch. The first diagnostic mixed
-upload is running49079; only actual error origins can justify a correction.
+upload49079 reproduces the reset at26.512s. At Unix1788728959080,
+StalePathReinjection has no planned output while four attachments remain
+registered; this becomes ReliablePathSessionClosed, then the relay aborts at
+the queued-dispatch error branch. Six earlier bound-target cancellations do
+not abort. The later server H3 close is teardown, not the initiating event.
 No throughput conclusion from this diagnostic. Other held runtime changes
 remain untouched. No independent audit is currently available.
 
+The focused RED exercises an actual reachable exhaustion state: a stale
+OriginalData owner plus an already accepted alternate copy, whose immutable
+retry deadline expires without a Data ACK. Range recovery becomes due, but
+both exact attachments already own the bytes and therefore neither may take
+another copy. The old no-target fallback queues unbound work despite that
+absence of target authority. The correction retains the original source
+obligation and wait for existing membership/model/capacity/receipt events,
+rather than materialize an impossible command. This deletes a duplicate
+obligation; it does not relax copy identity, stale qualification, native
+congestion control or genuine terminal errors. Both RED variants reproduce: the
+unbound fallback republishes4096bytes on an existing copy owner while it stays
+eligible, or returns PathAttachmentRequired(ReliablePathSessionClosed) if that
+owner becomes stale between queueing and dispatch. The fallback is deleted;
+no-target returns pending service while source/flight debt remains retained.
+Both tests pass and resume on a new exact target;143 request,246 relay and253
+stream controls pass. Strict all-target/all-feature Clippy passes after making
+the now-unused aggregate queue accessor test-only (no warning suppression).
+Exact all-target exhaustion is proven reachable by the sender fixture, not
+separately instrumented in the network capture. Release build48685 passes in
+1m21s and is frozen as .tmp/reflection/bin/no-target-recovery/mptunnel. A final
+two-variant test rerun keeps the dispatch-time stale transition on the GREEN
+path too, before ordinary mixed upload/download controls. No network lab overlap.
+
+Five ordinary controls are now complete: two mixed uploads confirm every byte
+without reset at204.435/185.927Mbps, but retain4.213/3.305s confirmation gaps.
+Mixed download66.271Mbps retains5.319s read gap and an interactive timeout.
+TCP candidate76.490Mbps and fresh unchanged51.627Mbps both settle exactly;
+both differ greatly from the older unchanged214.232Mbps sample. This does not
+prove a TCP regression or gain from the correction. Full evidence is
+REQUEST_NO_TARGET_ORDINARY_20260906.json; proof/provenance is
+REQUEST_NO_TARGET_RECOVERY. Checkpoint this isolated producer correction, not
+the held composition or a release. Next return to the existing allocation/
+discovery and ordered-progress defect, with mirrored upload still explicitly
+incomplete. No more controller/timeout/resource threshold experiments.
+
 REVIEW_AND_PRACTICAL_ACCEPTANCE now maps old SEEN/UNSEEN entries, real versus
-unsupported claims and each held candidate's tradeoff. All experiments use
-the frozen packet-class-proof composition, not pristine HEAD or an accepted
-release. After attributing and closing the reset, resume the already-proven
+unsupported claims and each held candidate's tradeoff. The review cohort uses
+the frozen packet-class-proof composition; the five-case correction cohort
+adds only the no-target producer deletion. Neither is pristine HEAD or an
+accepted release. After this reset correction, resume the already-proven
 mixed allocation/discovery contract below. No duplicate old prefilter or
 startup-deletion experiment, new controller knob or public performance claim.
 

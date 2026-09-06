@@ -77,11 +77,11 @@ impl ReliableRelaySenderQueue {
         self.data_bytes
     }
 
-    /// All queued ReinjectedData, regardless of whether it is target-bound.
+    /// Test-only aggregate of queued ReinjectedData, bound or unbound.
     ///
-    /// This aggregate remains appropriate for connection resource and repair
-    /// budgets. Exact-target recovery admission must instead use
-    /// `request_target_queued_reinjection_bytes`.
+    /// Production recovery admission uses the exact target's queued debt via
+    /// `request_target_queued_reinjection_bytes`, not this cross-target sum.
+    #[cfg(test)]
     pub(in crate::runtime) fn reinjection_bytes(&self) -> usize {
         self.critical_reinjection
             .iter()

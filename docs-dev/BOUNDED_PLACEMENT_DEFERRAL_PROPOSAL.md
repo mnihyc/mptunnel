@@ -35,6 +35,40 @@ recreate the earlier restoration deadlock and is expressly excluded.
 
 ## Reference boundary
 
+### Why a better QUIC estimate does not isolate it from TCP
+
+There are distinct dependency mechanisms; none licenses an arbitrary protocol
+preference or a claim that all observed stalls are unavoidable:
+
+- Ordered Product dependency is demonstrated here: a TCP-owned missing prefix
+  prevents delivery of later QUIC bytes even if QUIC itself supplies service.
+  Native controllers remain independent, but the logical stream is not.
+- Shared physical service can couple otherwise independent carriers. The
+  single-link experiments deliberately share a routed cut. A larger QUIC rate
+  estimate does not reserve that cut or make the two offered loads independent.
+  This mechanism alone does not attribute the observed application gaps.
+- An MPP execution dependency can couple progress without any physical outage.
+  MAILBOX_WRITE_WAKE_MODEL separately proves that a full Product mailbox lost
+  its capacity wake while the carrier write remained pending. That is an
+  implementation defect, not a consequence of either native controller.
+
+The architecture must distinguish transport service, exact ordered-prefix
+ownership, and software resource readiness. It must not collapse them into a
+single path-quality scalar. Native congestion-control separation in Section
+10 does not establish ordered-stream noninterference. Conversely, Section
+15.1's immediate-admission policy can be obeyed exactly and still make a poor
+ordered-completion decision: changing that policy requires an explicit RFC
+revision with discovery and failure liveness, not merely changing a score.
+
+The clean redesign boundary is therefore the typed allocation/wake contract,
+not wholesale replacement of proven ACK, ownership or lifecycle mechanisms.
+Do not call a complete RFC rewrite necessary before proving which obligations
+conflict; do not preserve a demonstrated bad policy merely because it is
+already written in the RFC. The missing discovery proof below is a real
+pre-implementation blocker for this proposal, not a reason to tune a wait.
+
+### Existing research
+
 [ECF](https://api.repository.cam.ac.uk/server/api/core/bitstreams/9f216be1-4124-4f10-bbad-137e912cc7ff/content)
 explicitly considers waiting for an unavailable fast MPTCP subflow instead of
 using an available slower one, with remaining work and variation in its model.

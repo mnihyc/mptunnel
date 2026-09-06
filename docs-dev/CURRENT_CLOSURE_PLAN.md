@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 09:13 UTC. Baseline source: `7189e69`; evidence checkpoint:
+Updated: 2026-09-06 10:12 UTC. Baseline source: `7189e69`; evidence checkpoint:
 `3d216a8`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -57,10 +57,18 @@ and closed component invariants are not repeatedly reopened as new defects.
 - That trace now identifies Product mailbox pressure: TCP1 retains STREAM_ACK
   for 12.173 seconds until native write completion. Corresponding TCP and QUIC
   interlocks conflate mailbox capacity with an actor-ordering barrier. Next
-  bounded transaction is MAILBOX_WRITE_WAKE_MODEL, with the exact production
-  interlock RED building first. Preserve one retained frame, exact recipient,
-  partial-write ownership and terminal/requalification barriers. Attribution
-  and RED are not yet a fixed runtime or an isolated throughput improvement.
+  bounded transaction is MAILBOX_WRITE_WAKE_MODEL. Its production-interlock
+  RED now turns GREEN, along with cancellation/closed-recipient checks, all
+  297 carrier tests and 253 stream tests. The ordinary comparison remains
+  unacceptable: mixed loss/jitter download still has sustained trickle, and
+  two mixed-upload candidates give165--169 Mbps against237--260 Mbps controls.
+  Endpoint isolation gives148 Mbps for old client/new server versus296 Mbps
+  for new client/old server. Next trace that server-side receive/feedback
+  interaction using existing diagnostics before another model change.
+  MAILBOX_WRITE_WAKE_MODEL and its full-series evidence retain the results.
+  Preserve one retained frame,
+  exact recipient, partial-write ownership and terminal/requalification
+  barriers. Component success is not an isolated throughput improvement.
 - Native outage trace shows ordinary exponential PTO backoff, not a stuck
   timer in that capture. Physical queue drain, native reordering tolerance and
   Product-prefix stalls remain separate causes; do not collapse them into the

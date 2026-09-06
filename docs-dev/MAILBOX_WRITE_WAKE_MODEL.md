@@ -88,8 +88,8 @@ require that exact feedback to arrive before releasing the write. RED is
 confirmed: `routed=0, retained=true` after the recipient slot was freed while
 the write remained pinned. The focused release test failed in 0.10 s after
 the 7m38s test build. It depends on no packet-loss or congestion assumption.
-The pre-fix test is archived in MAILBOX_WRITE_WAKE_RED.patch. No runtime
-correction or GREEN result is claimed yet.
+The pre-fix test is archived in MAILBOX_WRITE_WAKE_RED.patch. The candidate's
+later GREEN result is recorded below; this remains the pre-fix counterexample.
 
 The implementation must also test write-wins cancellation, receiver closure,
 original input order, terminal-before-EOF, and requalification reply-credit
@@ -119,8 +119,86 @@ does not fail a shared carrier. The test-only capacity-probe branch uses the
 same mailbox wake, without changing its diagnostic authority.
 
 The first `cargo check --tests --locked` completes, with only the existing
-default-feature dead-code warnings. The final cancellation/closed-recipient
-tests were added afterward and the focused release test build is pending.
-The prior production-interlock RED, now adapted to the typed outcome, remains
-the GREEN obligation. No isolated performance benefit, no independent audit
-sign-off, no accepted runtime commit and no release are claimed at this point.
+default-feature dead-code warnings. At 09:50 UTC, the focused release build
+reports four GREEN tests: the exact production-interlock RED, write-wins frame
+preservation, reservation cancellation with no slot leak, and both existing
+closed-recipient policies. The native write remains pending during the mailbox
+delivery test; delivery does not achieve progress by cancelling that write.
+
+The cached release test artifact then passes all 297 `runtime::path::` tests
+and all 253 `runtime::stream::` tests. This includes existing terminal-before-
+EOF, writer transactions, requalification, registry teardown and restart
+guards. These checks preserve the affected component contracts; they are not
+proof that the broader performance cases pass. The ordinary, non-diagnostic
+binary is rebuilding for mixed/QUIC comparisons and affected upload cases.
+No isolated performance benefit, no independent audit sign-off, no accepted
+runtime commit and no release are claimed at this point.
+
+## Ordinary comparison: acceptance held
+
+The ordinary binary builds in 3m19s and is retained as
+`.tmp/reflection/bin/qualified-mailbox/mptunnel`. The before executable is
+`bin/excess-qualified/mptunnel` under the same directory. Both include the
+same still-unaccepted native receive/excess and qualification changes; only
+MAILBOX_WRITE_WAKE_CANDIDATE.patch differs. No feature-enabled diagnostics,
+compilation or competing experiment runs during these measurements.
+
+At 10:05 UTC, the shared routed cut remains500 Mbps in each direction, with
+asymmetric loss/jitter. Combined cases additionally restrict downstream to
+10 Mbps at15..25 s and blackhole UDP at30..33 s. Thus the upload experiment
+also tests restricted reverse feedback; it is not a symmetric500-to10 upload
+capacity step. Full results, timing bins, echo attempts and upload confirmation
+semantics are retained in MAILBOX_WRITE_WAKE_EVIDENCE_20260906.json.
+
+| Workload | Before mean Mbps / max gap s | Candidate mean Mbps / max gap s |
+| --- | --- | --- |
+| Mixed download, combined | 71.374 / 13.519 | 69.782 / 5.357 |
+| QUIC download, combined | 86.002 / 7.054 | 74.906 / 4.387 |
+| Mixed download, loss/jitter only | 150.994 / 3.442 | 129.597 / .655 |
+| QUIC download, loss/jitter only | 164.407 / .507 | 160.994 / .376 |
+| Mixed upload, combined, first pair | 237.239 / 2.228 | 168.749 / 3.753 |
+| Mixed upload, combined, reverse-order pair | 259.990 / 3.922 | 164.741 / 3.948 |
+| QUIC upload, combined | 328.260 / 5.451 | 305.905 / 4.498 |
+
+These are sequential random trials, not confidence intervals or identical
+packet histories. Nevertheless the two mixed-upload differences prevent
+acceptance. A shorter maximum read gap is also insufficient: the candidate
+mixed download spends several loss/jitter-only seconds near3--5 Mbps before
+recovering. Its mean hides that sustained slowdown. No scalar metric is a
+substitute for ordered progress, confirmation gaps and loaded latency.
+
+The exact mailbox wake defect remains proved. It does not follow that this
+composition is a practical improvement, or that the endpoint interaction
+causing the worse upload result has been attributed. Next isolate the endpoint
+change with the same saved binaries: old client/new server, then new client/old
+server. The local runner only gains per-endpoint binary selection; wire,
+configuration, impairment schedule and workload are unchanged. Do not tune a
+buffer or deadline, or waive the comparison because the component tests pass.
+
+### Endpoint isolation and excluded leads
+
+The endpoint-only pair gives147.976 Mbps with old client/new server and
+295.989 Mbps with new client/old server. Their maximum confirmation gaps are
+6.746 and1.195 seconds respectively. This narrows the observed interaction to
+the changed server in this mixed-upload workload, without proving which
+carrier or receive/feedback event causes it. Both transfers complete with
+exact final target-confirmed accounting. The full ordinary cases remain
+archived, including the less favorable runs.
+
+Static review excludes two tempting but unsupported fixes:
+
+- The legacy frame selector prefers an ingress hint for ACK/MAX_DATA, but
+  current cumulative ACK and shared-credit publication use the separate
+  per-attachment broadcast in `response/attachment.rs`. Do not remove that
+  preference and claim to have fixed this modern publication path.
+- A pending ACK capacity subscription is an independent select branch; it
+  does not guard the main server Product input branch. It is not evidence of
+  an all-attachments publication barrier stopping ordinary input.
+
+Next use existing opt-in diagnostics to join client original/repair assignment,
+server receive holes and delivered prefixes, client Data ACK progress, and
+TCP writer/observation state. The candidate feature build changes no runtime
+model and adds no diagnostic source patch. Use old client/new server versus
+old client/old server for this attribution; diagnostic throughput is not a new
+ordinary acceptance number. No speculative ACK or allocator correction is
+authorized by endpoint localization alone.

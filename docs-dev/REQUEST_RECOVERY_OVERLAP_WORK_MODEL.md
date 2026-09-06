@@ -89,3 +89,36 @@ test now visits exactly 2,048 queued extents. Tests used root-package opt0 to
 avoid the previously observed test-build SIGKILL; ordinary comparisons use an
 optimized release executable. Those comparisons remain pending; no runtime
 or global acceptance yet.
+
+## Ordinary comparison: component cost fixed, stability remains open
+
+REQUEST_RECOVERY_OVERLAP_COMPARISON_20260906.json retains all six ordinary
+probes, full throughput/interactive series, and one-second path/process/traffic
+observations. Both binaries use the held companion/native composition. Only
+the request overlap algorithm differs; diagnostic hooks are absent.
+
+| Run | Mbps | Maximum gap seconds |
+| --- | ---: | ---: |
+| Control upload 1 |272.832|3.431|
+| Candidate upload 1 |266.185|4.374|
+| Control upload 2 |250.306|2.104|
+| Candidate upload 2 |127.882|4.582|
+| Control download |146.291|0.481|
+| Candidate download |152.281|0.449|
+
+Upload gaps are sink-confirmation arrival gaps, not exact target read gaps.
+Download echoes all succeed; p95 is311.352/319.892ms, maximum1359.957/854.279ms
+for control/candidate. This is not proof of complete latency non-regression.
+The second candidate upload is unacceptable as a stability result. Earlier
+ordinary and quiet-profile controls also collapse, so this pair alone does
+not prove that snapshot setup caused a new regression. The setup cost can be
+larger than an early-exit linear check for tiny batches; this tradeoff remains
+part of the practical comparison, not a reason for another magic threshold.
+
+The second candidate's5--11s slowdown has declining client lifetime-average
+CPU and almost idle native QUIC despite12--18MiB native window. Target bytes
+advance81.355MB to82.346MB while one TCP original flight shrinks524288 to57416
+bytes. QUIC native ACKed bytes already exceed151MB, consistent with substantial
+received suffix. Exact-range repair service, not renewed CPU saturation alone,
+is the next discriminator. Keep the structural correction as an intermediate
+component commit; do not claim the complete stalled-upload family fixed.

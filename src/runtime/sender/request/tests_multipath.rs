@@ -4348,6 +4348,53 @@ async fn requalification_skips_draining_and_full_stale_attachments() {
 }
 
 #[tokio::test]
+async fn stale_survivor_can_finish_after_fresh_attachment_is_removed() {
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "tcp://127.0.0.1:10252"]);
+    let stream_id = StreamId(184);
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, first_commands), 8);
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, second_commands));
+    consume_client_path_proof_for_test(&mut first_receivers);
+    consume_client_path_proof_for_test(&mut second_receivers);
+    let mut sender = crate::runtime::sender::RequestSenderService::new(stream_id);
+    for instance in remotes.path_instances() {
+        seed_client_bulk_evidence_for_test(&context, instance);
+    }
+    let survivor = remotes.paths[0].instance();
+    let removed = remotes.paths[1].instance();
+    sender.record_original_frame_for_test(survivor, &data_frame(stream_id, 0, 4096));
+    assert!(
+        sender.mark_request_path_stale(&context, &remotes, survivor, TrafficClass::Throughput,)
+    );
+    // The production stale-entry guard has a fresh alternate at entry. That
+    // alternate can subsequently terminate; it is not a permanent invariant.
+    drop(
+        remotes
+            .remove_path_instance(removed)
+            .expect("exact terminal removal"),
+    );
+    let fin = Frame::StreamFin {
+        stream_id,
+        final_offset: 4096,
+    };
+    sender
+        .send_control_frame(&context, &mut remotes, fin, RelaySendCause::StreamFin)
+        .await
+        .expect("stale payload evidence must not manufacture a session close at FIN");
+    assert!(sender.request_path_is_stale(survivor));
+    assert!(remotes.contains_path_instance(survivor));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut first_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamFin {
+            stream_id: actual, final_offset: 4096,
+        })) if actual == stream_id
+    ));
+}
+
+#[tokio::test]
 async fn all_full_stale_requalification_returns_bounded_backpressure() {
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "tcp://127.0.0.1:10252"]);

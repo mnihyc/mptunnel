@@ -3444,6 +3444,15 @@ alternative. Completion of exact detach transfers any remaining range to
 exact-failure recovery without creating a Data ACK gap. The carrier remains
 connected and native recovery continues throughout its owned lifetime.
 
+Stale or requalifying payload evidence MUST NOT by itself suppress terminal
+control such as `STREAM_FIN` on an otherwise eligible sole-survivor fallback.
+An available non-stale active policy-eligible output retains preference over
+that stale fallback; queue pressure alone does not remove the preference.
+Terminal publication retains exact carrier admission and stream ordering; it
+does not clear stale evidence, grant payload credit, or establish delivery of
+the declared final offset. Losing the last fresh attachment therefore cannot
+turn the remaining stale attachment's valid FIN operation into session closure.
+
 Requalification arbitration owns one bounded cyclic cursor per stream
 direction and never changes ordinary Product order or an attachment's
 configured Regular/Backup usage. With no transaction pending, stale entry,

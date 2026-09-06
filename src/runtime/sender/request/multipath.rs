@@ -3230,11 +3230,20 @@ impl RequestMultipathController {
             RelaySendCause::TailReinjection | RelaySendCause::CompletionTailReinjection(_)
         );
         let requires_distinct_output = live_tail_recovery || ack_gap_reinjection;
+        // Terminal control shares OriginalData's existing sole-survivor
+        // fallback, without clearing stale evidence or preferring it over a
+        // fresh output. Repair still requires its qualified distinct target.
+        let stale_control_fallback = !cause.is_reinjection()
+            && !remotes
+                .paths
+                .iter()
+                .any(|path| self.path_is_payload_schedulable(context, path, lane));
         let operation_path_in_scope = |path: &ReliableRelayRemotePath| {
-            !self
-                .request
-                .requalification
-                .stale_for_original_data(path.instance())
+            (stale_control_fallback
+                || !self
+                    .request
+                    .requalification
+                    .stale_for_original_data(path.instance()))
                 && !invalid_persistent_target
                 && required_client_target.is_none_or(|required| path.instance() == required)
                 && (!requires_distinct_output || !avoid_instances.contains(&path.instance()))

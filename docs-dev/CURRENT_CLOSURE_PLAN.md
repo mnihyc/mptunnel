@@ -1,10 +1,10 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 15:38 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 15:46 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
-## Active transaction — 2026-09-06 15:38 UTC
+## Active transaction — 2026-09-06 15:46 UTC
 
 The historical execution entries below are evidence, not simultaneous tasks.
 Latest owner: native FIFO obstruction is PROVEN and committed in e99694d.
@@ -39,12 +39,18 @@ earlier queue inference is corrected explicitly. Quiet aggregate profiles then
 give230.989Mbps/gap2.064s and45.407Mbps/gap14.616s. Recovery enqueue processing
 grows from2.374s to29.233s, against a46.7s second run; Product ACK transaction
 cost is only2.418s there. Nested scopes overlap and must not be added.
-Next split recovery frontier lookup, target selection, frame extraction and
-queued-overlap/enqueue cost before selecting the algorithmic correction. No
-ACK thinning, congestion gain, copy-budget, dirty-wake or timeout change is
-justified yet. Exact cost, original intent and preserved semantics must lead
-RED/GREEN and ordinary comparisons. Native receipt and owner-profile evidence
-are committed separately; all profile rates remain diagnostic only.
+The subowner profile completes33.012Mbps/gap14.965s and isolates34.143s in
+queued-overlap/enqueue, versus.879s frame extraction and.383s target selection.
+The actual batch helper's RED visits2,098,176 extents for2,048 queued repairs.
+614dc73 replaces repeated scans with one normalized occupied-interval snapshot;
+the disjoint mux-candidate proof preserves sequential overlap outcomes. All243
+affected sender tests pass. REQUEST_RECOVERY_OVERLAP_WORK_MODEL records history,
+proof and tradeoff. This intermediate component commit is not global runtime
+acceptance. Next ordinary optimized before/after upload/download comparisons
+must examine gap series, interactive latency and RSS, not only mean throughput.
+No ACK thinning, congestion gain, copy-budget, dirty-wake or timeout change.
+All temporary native getters, ACK-stage hooks and profiling scopes are archived
+and removed from active runtime source. Remaining held candidates stay open.
 REPAIR_COMPANION_UPLOAD_EVIDENCE_20260906.json preserves both outcomes and
 1Hz native/Product/RSS series. No native gain, queue-cap or protocol-preference change. The simple
 response ECF rollback is already rejected; do not repeat it.

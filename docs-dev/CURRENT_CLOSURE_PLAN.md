@@ -1,20 +1,37 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 12:17 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 14:38 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
-## Active transaction — 2026-09-06 14:02 UTC
+## Active transaction — 2026-09-06 14:38 UTC
 
 The historical execution entries below are evidence, not simultaneous tasks.
-Latest owner: exact native service position is PROVEN. The full batch trace
-finds49.326MB unsent predecessors,49.259MB attributable to new originals, before
-one frontier repair. Its native first-record send cursor takes2.553--2.742s to
-cross; the application gap is3.280s. Three actual Quinn priority/credit tests
-pass. QUIC_REPAIR_ORDERING_MODEL defines a bounded paired-attachment candidate,
-not a runtime acceptance. The simple response ECF rollback is already rejected;
-do not repeat it. Current next action is exact queue-transfer and pair-lifetime
-proof followed by integration, with no new native gain or queue-cap tuning.
+Latest owner: native FIFO obstruction is PROVEN and committed in e99694d.
+The bounded companion candidate is integrated but UNACCEPTED. Three actual
+Quinn ordering/credit tests, queue-transfer/binding checks, 302 carrier tests,
+53 codec tests and the actual bidirectional companion/half-close/sibling test
+pass. Functional root tests used root-only opt0 after opt3/opt1 test builds
+were SIGKILLed; the compared executables are ordinary optimized release builds.
+First mixed loss/jitter down comparison: control141.918Mbps/gap2.689s versus
+candidate155.674Mbps/gap.384s, no failed interactive requests. Candidate still
+has uneven delivery and a1.015s interactive maximum (control.685s), so this
+does NOT establish non-regression. Full series/RSS are saved separately in
+REPAIR_COMPANION_COMPARISON_20260906.json. The next upload comparison is
+UNACCEPTABLE: control fails to drain before the existing85s runner guard;
+candidate completes211,419,136bytes in63.487s with a32.816s confirmation gap.
+Do not rank the control's149.007Mbps lower-bound/teardown result as a complete
+transfer. Candidate26.641Mbps is not accepted. Native pair-credit cancellation
+passes an actual low-limit test. Wider comparisons pause at this observed
+failure: trace client original/repair assignment and exact server prefix,
+distinguishing Product accounting, native service and target ACK return.
+The lighter trace now proves49.324s without new original assignment while the
+server has already delivered208.786MB and client feedback lags near146MB.
+REPAIR_UPLOAD_FEEDBACK_BOUNDARY owns the next exact ACK-stage discriminator;
+do not reinterpret the absent next assignment as native loss of that byte.
+REPAIR_COMPANION_UPLOAD_EVIDENCE_20260906.json preserves both outcomes and
+1Hz native/Product/RSS series. No native gain, queue-cap or protocol-preference change. The simple
+response ECF rollback is already rejected; do not repeat it.
 
 1. COMPLETE: read-only native offsets distinguish accepted, first-unsent and contiguous
    acknowledged bytes of the exact H3 stream. Map its first repair record to

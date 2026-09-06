@@ -46,7 +46,7 @@ tests, integration groups6/2/6, and450 native tests plus3 doctests.
 | Earlier QUIC startup/rate authority | Mixed compensated/uncompensated plateau units and application-limited exit premises could terminate backlogged acquisition early; an MPP ACK-window wrapper could separately underfeed a live native controller. | Retain the exact unit/epoch and native authority corrections described in PERFORMANCE and native tests. They do not prove BBR's retained maximum is an accurate current service measurement; N1 is an explicit residual limitation. |
 | Response return-plan startup | The first TCP attachment could own a multi-MiB response prefix before a planned QUIC attachment was even opened. | Retain the explicit bounded pre-FINAL return-plan transaction. Readiness is not mandatory data allocation; later CREATE/STARTUP disambiguation completes its restart branch. No fixed QUIC preference. |
 | P4/T04a | Response completion snapshot added a writer-owned subset to its already-inclusive queue total. | Exact accounting correction; not a request bug. Queue/resource charge lifetime is unchanged. |
-| P4/T04b | Inferred ECF/BDP denied the only otherwise enqueueable Product action. | Keep `65edae3`; lifecycle, configured Product resources and actual writer/native credit still decide admission. The separate completion-horizon branch was unreachable, not a runtime failure. |
+| P4/T04b | Inferred ECF/BDP denied the only otherwise enqueueable Product action. | Preserve structural resource permission, but revise the prior blanket keep/non-regression claim: `65edae3` also removed a response placement choice without replacing its ordered-service obligation. Permission invariance does not require immediate dispatch. ORDERED_REPAIR_SERVICE_BOUNDARY records the history and insufficient rollback ablation; no wholesale restoration of inferred windows. |
 | P5/T10a; C1 | Old quarter-window/payload batching withheld an already freed receive-prefix grant despite RFC8.4. | `5c1d288`,512-byte/4096-window RED/GREEN; latest-value coalescing remains. May add control frames; affected throughput/CPU must be measured, not assumed improved. |
 | 7; P7/T11 | Retired path lifetime/identity, port projection, absent/stale values and delivery direction were conflated. Native retained bandwidth was presented like current traffic; pacing was raised to the model. | Keep retirement/identity fixes and `6545270`. Current ACK deltas, retained E and literal P are separate. Browser precision/reset/idle/unequal-window/sort controls pass. Presentation cannot fix a controller. |
 | M1 retention | Overlapping recovery transactions prevented finalized journal collection; clone/rollback could leave terminal proof in its parked owner or reuse its identity. | `6636091` / `42d1b86`: prefix compaction, exact owner dispatch and lineage IDs. Removes lifetime-growing finalized history and associated scanning. Does not conclusively attribute the uncaptured deployed RSS incident. |
@@ -65,7 +65,7 @@ tests, integration groups6/2/6, and450 native tests plus3 doctests.
 | P5/T10b partial local write | Scalar/vectored cursors survive Pending and the batch retains its Bytes until completion. No demonstrated duplicate/lost prefix. Finer-grained ownership/credit release would be an optimization requiring evidence, not an automatic correctness repair. |
 | P5/T10c target-bound final tail | Current exact-target enqueue plus ranked frontier already implements the relevant authority. No duplicate tail rewrite. |
 | N1 monotone probe target / minimum probe flight / probe fairness | Three diagnostic changes did not correct the complete downshift trajectory. All were removed. Passing a local invariant was insufficient reason to accumulate them. |
-| P2/T07 extra ordering domains | Could reduce native head-of-line debt, but has handshake, resource and fairness costs. Necessary only if the current loaded-latency deficit is reproduced and attributed to that debt; not an arbitrary extra carrier per test. |
+| P2/T07 extra ordering domains | Its prerequisite is now observed: a frontier repair had49.326MB of actual unsent native predecessors, almost all new bulk. QUIC_REPAIR_ORDERING_MODEL promotes only a companion ordering stream inside the same physical attachment for investigation, preserving queue/copy/CC ownership. Broad multi-domain allocation remains outside this transaction; the companion is not yet accepted. |
 | T09 significance / no-flap formula | A jitter deadband alone is not statistical confidence and cannot prove that a10% rate advantage is real. A stronger formula remains a proposal, not an accepted fix. |
 | L3 optimization | Correctness is retained. Experimental L3 performance is not a dependency for fixing L4 browsing/download/upload. |
 
@@ -74,7 +74,7 @@ tests, integration groups6/2/6, and450 native tests plus3 doctests.
 The [2026-09-05 experiments](REORDERING_PERFORMANCE_DIAGNOSIS.md) now reproduce
 a severe QUIC reordering deficit on both this tree and the last release.
 They supersede the prospective wording below where results exist, but do not
-close the complete release matrix. There is no new production patch yet.
+close the complete release matrix. No new runtime candidate is accepted.
 
 The [2026-09-06 continuation](QUIC_RECEIVE_HISTORY_DIAGNOSIS.md) proves a second
 native owner: bounded129-packet receive history discards timely reordered
@@ -94,8 +94,9 @@ after RTT recovered below 100 ms. That experimental model is rejected.
 Learning excess delay instead passes the exact RED/GREEN counterexample and
 461 native tests, and improves same-connection recovery, but combined mixed
 stability is still unaccepted. These are not additional claimed production
-fixes. Exact candidate patches and full series are archived; production code
-remains the reviewed 7189e69 state. The next owner is the existing mixed
+fixes. Exact candidate patches and full series are archived; the release
+baseline remains7189e69 while the working tree contains explicitly held
+candidates. The next owner is the existing mixed
 QoS-history/ordered-progress interaction, not a new allocator or threshold.
 
 1. **QUIC deep-buffer latency (N1):** with old bandwidth400 Mbit/s and base

@@ -1,6 +1,6 @@
 # Independent repair ordering within a QUIC attachment
 
-2026-09-06 14:02 UTC. Design candidate, not an accepted runtime change.
+2026-09-06 13:56 UTC. Design candidate, not an accepted runtime change.
 Continues ORDERED_REPAIR_SERVICE_BOUNDARY and CURRENT_CLOSURE_PLAN.
 
 ## Exact causal evidence
@@ -71,8 +71,12 @@ This is not a new carrier, return-plan enrollment, target, native controller,
 capacity estimate, Product qualification or copy slot. TCP/L3/datagram mappings
 are not changed by this transaction.
 
-The client opens the companion after ordinary attachment acceptance, without
-waiting for the companion on the ordinary-open completion path. Its opening
+The client allocates the two native request streams before publishing the
+Product OPEN_STREAM. A connection-local pair-allocation mutex prevents many
+concurrent opens from each retaining half a pair and exhausting native stream
+credit. It does not protect native I/O or wait for peer acceptance. The
+companion's MPP opening frame is sent after ordinary attachment acceptance,
+without waiting for companion acceptance on the ordinary-open completion path. Its opening
 frame identifies the existing Product stream and the exact parent native
 request-stream ID. The server's connection-local registry contains only live
 accepted parents and transfers a companion to its parent at most once.
@@ -97,8 +101,14 @@ queue charge once. A premature companion error is an attachment-local failure,
 not physical-carrier or session retirement. A normal half-close of the Product
 or ordinary native receive side must not retire a still-needed send half.
 No child task may outlive its parent. Operation stream-count geometry must
-account for the pair without halving configured logical concurrency; this is
-mapping arithmetic, not a higher Product admission limit.
+account for two native requests per reliable attachment plus carrier control;
+this is mapping arithmetic, not a higher Product admission limit. An explicit
+max_quic_concurrent_bidi_streams remains an actual native ceiling. Defaults
+and the cap derived from max_streams must account for this mapping to retain
+the former logical concurrency. Native credit shortage remains backpressure,
+not permission to exceed the configured ceiling. Pair allocation remains
+under existing Product-open cancellation/deadline ownership; cancellation must
+dispose of both native halves even when only the first was allocated.
 
 ## Foreseen counterexamples / required proofs
 
@@ -119,6 +129,17 @@ mapping arithmetic, not a higher Product admission limit.
    overload cannot be advertised as starvation-free ordinary bulk service.
 
 ## Acceptance / next action
+
+2026-09-06 14:38 UTC: integration is an UNACCEPTED candidate. Queue transfer,
+connection-local binding, codec mapping and actual QUIC half-close/sibling
+isolation tests pass. A native ceiling of2 (control+one incomplete pair half)
+also verifies cancellation returns the half's native credit without closing
+the carrier. Ordinary download first comparison reduces maximum gap2.689s to
+.384s, but upload has a32.816s confirmation gap and26.641Mbps overall despite
+eventual exact completion. The control also fails to drain before observation
+ends. This is not a usable or non-regressing composition. Next trace the exact
+upload prefix and original/repair assignment; no tuning or acceptance from
+the better download number. Full comparison JSONs retain every outcome.
 
 The precondition for historical P2/T07 investigation is now observed, so it is
 in scope. Do not implement the broader speculative multi-domain allocator.

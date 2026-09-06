@@ -1,11 +1,29 @@
 # Evidence review and practical acceptance
 
-Updated: 2026-09-06 22:52 UTC. Original reviewed production tree: `7189e69`
+Updated: 2026-09-06 23:44 UTC. Original reviewed production tree: `7189e69`
 (wire11); latest correction checkpoint: `b37bacb`. This is a review/experiment
 plan, not a release verdict. Historical SEEN/UNSEEN labels are mapped below;
 an old OPEN label is not a newly found bug.
 
 ## Current verdict and fixed priority
+
+Latest bounded decision: the relative ACK representation is semantically
+proved but not a network pass (clean 500/10 mixed 175 Mbps, 1.67 s read gap).
+Aggregate runtime tracing verifies the dictionary is used; about 175,000 tiny
+ACKs and 100,000 credit updates still pass through native writes. The existing
+TCP rule separately writes/flushes each command. An actual server-session RED
+and protected TLS/Noise byte comparison justify a ready-feedback packetization
+candidate, not a new congestion policy. It preserves every Frame, existing
+fanout, immediate publication, priority barriers and exact write debt. All 74
+TCP controls pass; ordinary timing comparison remains next. See
+FEEDBACK_PACKETIZATION_MODEL and the full-series evidence archives. No held
+candidate is silently accepted and no public README/release claim follows.
+
+Reflection correction: the earlier credit-cadence unit proof established
+RFC/code alignment, not end-to-end performance benefit. Pre-admission latest
+state is bounded, but already queued records still incur physical overhead.
+That distinction must be reflected in future model acceptance, rather than
+declaring every code/RFC mismatch a practically useful optimization.
 
 The former UNSEEN batch was already promoted for investigation, not automatic
 implementation. Its useful results are the concrete ownership, qualification,

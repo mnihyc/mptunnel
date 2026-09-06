@@ -181,3 +181,70 @@ logical ACK history, alter negative-gap policy, assume callbacks are atomic,
 or hide a cancelled-write desynchronization with path restart. The criterion
 is exact Frame-sequence preservation plus removal of repeated wire ranges;
 ordinary500/10 and prior controls still decide practical usefulness.
+
+Native premise check: H3SendOperation already retires a cancelled request stream
+(not its QUIC connection), with an actual constrained-write/replacement test.
+Split TLS writers already poison uncertain writes; Noise retains nonce/partial
+record poison state through splitting. Preserve all these existing semantics.
+The codec basis reset is not permission to reuse an invalid native byte stream.
+TLS/Noise helpers encode before their awaited write; H3 encodes a batch before
+send_data. These are the correct prospective-state/clear/commit boundaries.
+Both H3 buffered receive paths own complete records before decoding, while its
+StreamData coalescing lookahead must remain non-mutating for dictionary state.
+
+One complete basis, not a per-logical-stream map, bounds lifetime retention.
+Interleaved TCP logical streams can miss/evict the basis and use full frames;
+this is an explicit compression-efficiency limitation, not missing ACK state
+or an excuse to add an unbounded cache. H3 already has per-request stream
+ownership, including separate ordinary/repair requests. Full/nonmonotone/
+noncanonical frames preserve exact input order via independent representation;
+only canonical complete snapshots with monotone positive coverage are eligible
+for relative encoding. Delta reconstruction must validate positive-set union,
+expanded range count and all arithmetic before committing its one basis.
+
+Actual transport RED23:02UTC: repeated_complete_ack_wire_cost_remains_delta_sized
+sends200 monotonically growing complete snapshots while checking every received
+Frame for exact equality. Current packed-only TLS spends84,724bytes and Noise
+84,628bytes. Both deliver correct Frames but exceed the16KiB regression bound;
+relative one-range updates plus the initial full basis fit below that bound.
+This is production encrypted framing over an in-memory byte stream, not a
+standalone ideal codec simulation. No runtime dictionary is implemented yet.
+
+## Relative candidate integration — 23:17 UTC
+
+The codec now has one bounded encoder/decoder basis. Relative flags are accepted
+only by ordered contextual decoders, never stateless single/batch decoding.
+Both decode paths share the structural ACK parser; native datagrams remain
+stateless. Encrypted TCP (including admission writes and split transfer) and
+both H3 consumed-record paths are integrated; peek/coalescing stays stateless.
+Codec failure leaves live encoder/decoder basis untouched. Prospective changes
+commit after successful writes; uncertain writes clear the encoder basis without
+changing existing TLS/Noise poison or H3 request-retirement semantics.
+
+Actual protected sequence GREEN: TLS6,007bytes and Noise6,003bytes versus
+84,724/84,628 packed-only bytes, while every decoded complete Frame is identical.
+126transport tests pass, including split-basis transfer, actual H3 multi-frame/
+multi-write roundtrip and existing cancelled-request/healthy-connection test.
+287ACK-filtered controls and strict all-target/all-feature Clippy pass; earlier
+43codec controls include context/missing-basis, expanded limits, failed decode
+nonmutation, interleaving/nonmonotone full frames and uncertain-write reset.
+This is component proof, not a network result. Optimized relative-ack build
+is next; no public performance claim, source commit or release is accepted.
+
+## Network verdict and bounded next discriminator — 23:37 UTC
+
+The first ordinary relative candidate on the unchanged 500/10 Mbps return-cut
+case gives 174.755 Mbps, a 1.666 s read gap, and 1,335 ms echo p95. It is an
+improvement over 46.249 Mbps but NOT an accepted fix. Its 39 echo attempts all
+succeed; serial slowdown prevents the intended 50 attempts. The separate
+ACK-origin diagnostic remains complete (maximum 245 ranges), so incomplete
+chunking is not the reason compression is insufficient in that capture.
+
+An opt-in aggregate encoding trace verifies that the dictionary works in the
+actual runtime: about 175 thousand relative frames against only 144 full ones.
+About 100 thousand small credit updates accompany them. There are no partial
+ACKs in that capture. Feedback packetization is the next bounded discriminator;
+see FEEDBACK_PACKETIZATION_MODEL. The temporary aggregate trace hook is archived
+under .tmp/reflection and removed from active source. No logical publication,
+fanout, negative authority or controller policy has changed. Source remains
+uncommitted, with all ordinary and diagnostic records preserved separately.

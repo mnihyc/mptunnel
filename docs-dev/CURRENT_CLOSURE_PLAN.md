@@ -1,10 +1,39 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 22:29 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 23:37 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Current checkpoint and next decision
+
+**Active verdict:** no release pass. The relative ACK candidate preserves
+every logical snapshot and materially improves the reproduced clean 500/10
+Mbps mixed case (46 -> 175 Mbps), but retains a 1.67 s gap and 1.34 s echo p95.
+Raw/QUIC-only are about 444/432 Mbps. It remains uncommitted. The native
+encoding trace proves relative encoding is used; remaining tiny frames include
+about 175,000 ACKs and 100,000 credit updates. See ACK_RELATIVE_ENCODING and
+FEEDBACK_PACKETIZATION_EVIDENCE for complete records, not just means.
+
+**Next exact transaction:** determine whether the inherited one-frame TCP
+write/flush rule unnecessarily packetizes already-ready feedback separately.
+FEEDBACK_PACKETIZATION_MODEL states the priority, ordering, cancellation and
+bounded-debt proof first. The actual protected server-writer regression is
+running against the unchanged writer before any packetization implementation.
+If proved, batch only ready contiguous ACK/credit heads without waiting,
+dropping snapshots, crossing barriers, changing fanout or adding thresholds.
+Repeat the same ordinary 500/10 case before broader controls. Reject an
+ineffective candidate; do not tune the test or call efficiency a timing pass.
+
+**Global order stays fixed:** mixed feedback/allocation and bidirectional
+startup/recovery; native QUIC/TCP QoS recovery; restart/churn/post-load resource
+ownership; independent 200 Mbps aggregation and shared-cut controls; cold/warm
+single/concurrent browser work and raw/Xray/H2 comparisons; only then truthful
+README curves and release. Existing unit-proved fixes are component evidence,
+not blanket acceptance of the held runtime stack. Uncaptured deployed RAM
+exhaustion is still unattributed. Independent auditors remain usage-limited.
+
+The entries below preserve checkpoint history; their earlier “next” statements
+are superseded by the active verdict above.
 
 Current decision22:29UTC: six unchanged clean-link controls isolate an existing
 mixed timing cost even without deliberate loss/jitter. MeanMbps/loaded-echo
@@ -59,6 +88,17 @@ write-cancellation reset and consumed-record-only decode rules. Audit actual
 TCP Noise/TLS and H3 cancellation before implementing. No logical ACK cadence/
 negative-authority change, no new controller/allocator/threshold. After this
 branch closes, return to allocation/discovery and the unchanged global gates.
+
+23:17UTC: relative ACK candidate now integrates the bounded codec into TLS,
+Noise and H3 (ordinary and companion share the same implementation). Complete
+Frames are reconstructed before Product coalescing; no negative-info/cadence/
+controller change. Actual encrypted sequence RED84,724/84,628bytes becomes
+GREEN6,007/6,003 with all200 Frames equal.126transport/287ACK controls plus
+43codec controls and strict Clippy pass. H3 lookahead, split-basis transfer,
+missing basis, limits, failed transactions, actual native batch roundtrip and
+existing cancellation semantics are covered. Source/RFC remain uncommitted.
+Optimized relative-ack binary builds next, then repeat500/10 first; do not
+interpret the codec byte proof as global timing or allocation closure.
 
 Review continuation21:02UTC: the fresh ordinary six-way down/up combined
 cohort is complete. Download mean alone favors MPP QUIC/mixed80.751/62.288Mbps

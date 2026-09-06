@@ -9,7 +9,9 @@ use crate::model::path::RelayPathInstance;
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
-use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
+use crate::protocol::frame::{
+    normalize_offset_ranges, reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent,
+};
 use crate::protocol::{Frame, OffsetRange};
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
@@ -341,6 +343,25 @@ impl ReliableRelaySenderQueue {
                 };
                 queued_start < end && start < queued_end
             })
+    }
+
+    /// Snapshot overlap decisions against repairs already queued in either lane.
+    /// Callers that enqueue the accepted batch must supply disjoint candidates,
+    /// so accepting an earlier candidate cannot change a later decision.
+    pub(in crate::runtime) fn queued_reinjection_overlaps(&self, frames: &[Frame]) -> Vec<bool> {
+        queued_reinjection_overlaps_for_ranges(
+            frames,
+            self.critical_reinjection
+                .iter()
+                .chain(self.reinjection.iter())
+                .filter_map(|work| {
+                    let ReliableRelayQueuedWorkKind::Reinjection { frame, .. } = &work.kind else {
+                        return None;
+                    };
+                    let (start, end, _) = reliable_stream_frame_extent(frame)?;
+                    Some(OffsetRange { start, end })
+                }),
+        )
     }
 
     pub(in crate::runtime) fn release_normalized_acked_reinjections(
@@ -758,6 +779,23 @@ pub(in crate::runtime) fn reliable_relay_sender_queue_read_budget(
                 .saturating_sub(sender_queue.data_bytes()),
         )
         .min(buffer_len)
+}
+
+fn queued_reinjection_overlaps_for_ranges(
+    frames: &[Frame],
+    ranges: impl Iterator<Item = OffsetRange>,
+) -> Vec<bool> {
+    let ranges = normalize_offset_ranges(ranges.collect());
+    frames
+        .iter()
+        .map(|frame| {
+            let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+                return false;
+            };
+            let index = ranges.partition_point(|range| range.end <= start);
+            ranges.get(index).is_some_and(|range| range.start < end)
+        })
+        .collect()
 }
 
 #[cfg(test)]

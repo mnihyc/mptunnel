@@ -1,0 +1,113 @@
+*** Begin Patch
+*** Update File: ./crates/quinn-proto/src/connection/mod.rs
+@@
+-// Temporary opt-in observation, never a native recovery decision.
+-fn mpp_native_recovery_trace(event: &str, fields: std::fmt::Arguments<'_>) {
+-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    if *ENABLED.get_or_init(|| std::env::var_os("MPTUNNEL_NATIVE_RECOVERY_TRACE").is_some()) {
+-        eprintln!("mptunnel_native_recovery ts_unix_us={} event={} {}",
+-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros(),
+-            event, fields,
+-        );
+-    }
+-}
+-
+@@
+-            mpp_native_recovery_trace("late_original", format_args!(
+-                "side={:?} elapsed_us={} rtt_us={} delay_us={} pto_us={}",
+-                self.side(), now.saturating_duration_since(sent).as_micros(),
+-                self.path.rtt.conservative().as_micros(),
+-                self.path.reordering.loss_delay(Duration::ZERO, self.path.rtt.conservative()).as_micros(),
+-                self.pto(SpaceId::Data).as_micros(),
+-            ));
+@@
+-            mpp_native_recovery_trace("loss", format_args!(
+-                "side={:?} count={} bytes={} rtt_us={} delay_us={} pto_us={} packet_detector={}",
+-                self.side(), lost_packets.len(), size_of_lost_packets, rtt.as_micros(),
+-                loss_delay.as_micros(), self.pto(SpaceId::Data).as_micros(), packet_threshold_enabled,
+-            ));
+*** Update File: ./src/runtime/path/quic/client_writer.rs
+@@
+-    #[cfg(feature = "lab-diagnostics")]
+-    if let Frame::StreamAck { stream_id, complete, ranges } = &frame {
+-        crate::lab_diagnostics::lab_stream_ack_stage("client_interlock_input", *stream_id, *complete, ranges, None);
+-    }
+@@
+-        _ => {
+-            #[cfg(feature = "lab-diagnostics")]
+-            lab_diagnostic("client_quic_write_barrier", format_args!(
+-                "stream_id={} kind={}", stream_id.0,
+-                match &frame {
+-                    Frame::Ping { .. } => "ping",
+-                    Frame::Pong { .. } => "pong",
+-                    Frame::PathProofData { .. } => "path_proof_data",
+-                    Frame::PathProofAck { .. } => "path_proof_ack",
+-                    Frame::PathStatus { .. } => "path_status",
+-                    Frame::StreamDetach { .. } => "stream_detach",
+-                    Frame::SessionClose { .. } => "session_close",
+-                    _ => "other",
+-                },
+-            ));
+-            return Ok(CarrierInputRoute::Barrier(frame));
+-        }
++        _ => return Ok(CarrierInputRoute::Barrier(frame)),
+*** Update File: ./src/runtime/path/quic/io.rs
+@@
+-            #[cfg(feature = "lab-diagnostics")]
+-            let ack_trace = if crate::lab_diagnostics::lab_diagnostic_event_enabled("stream_ack_stage") {
+-                match &frame {
+-                    Ok(Frame::StreamAck { stream_id, complete, ranges }) => Some((*stream_id, *complete, ranges.clone())),
+-                    _ => None,
+-                }
+-            } else { None };
+-            let sent = frames_tx.send(frame).await;
+-            #[cfg(feature = "lab-diagnostics")]
+-            if let Some((stream_id, complete, ranges)) = ack_trace {
+-                crate::lab_diagnostics::lab_stream_ack_stage("quic_reader_enqueued", stream_id, complete, &ranges, None);
+-            }
+-            if sent.is_err() || done {
++            if frames_tx.send(frame).await.is_err() || done {
+*** Update File: ./src/runtime/sender/request.rs
+@@
+-        #[cfg(feature = "lab-diagnostics")]
+-        let _profile = crate::lab_diagnostics::LabPerfScope::new("request.product_ack_transaction");
+@@
+-        #[cfg(feature = "lab-diagnostics")]
+-        let _profile = crate::lab_diagnostics::LabPerfScope::new("request.path_recovery");
+@@
+-        #[cfg(feature = "lab-diagnostics")]
+-        let _profile = crate::lab_diagnostics::LabPerfScope::new("request.path_recovery_enqueue");
+@@
+-        let frontier = {
+-            #[cfg(feature = "lab-diagnostics")]
+-            let _profile = crate::lab_diagnostics::LabPerfScope::new("request.recovery_frontier");
+-            send_stream.retransmission_frames_for_ranges(&ranges, 1).into_iter().next()
+-        };
+-        let Some(frontier) = frontier
++        let Some(frontier) = send_stream
++            .retransmission_frames_for_ranges(&ranges, 1)
++            .into_iter()
++            .next()
+@@
+-        let (reinjection_path, target_service_exhausted) = {
+-            #[cfg(feature = "lab-diagnostics")]
+-            let _profile = crate::lab_diagnostics::LabPerfScope::new("request.recovery_target");
+-            self.multipath.reinjection_path_snapshot(
++        let (reinjection_path, target_service_exhausted) =
++            self.multipath.reinjection_path_snapshot(
+@@
+-            )
+-        };
++            );
+@@
+-        let reinjection_frames = {
+-            #[cfg(feature = "lab-diagnostics")]
+-            let _profile = crate::lab_diagnostics::LabPerfScope::new("request.recovery_frames");
+-            send_stream.retransmission_frames_for_ranges(&ranges, reinjection_limit)
+-        };
++        let reinjection_frames =
++            send_stream.retransmission_frames_for_ranges(&ranges, reinjection_limit);
+@@
+-        #[cfg(feature = "lab-diagnostics")]
+-        let _profile = crate::lab_diagnostics::LabPerfScope::new("request.recovery_queue");
+*** End Patch

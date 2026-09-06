@@ -1,0 +1,55 @@
+*** Begin Patch
+*** Update File: ./src/transport/quic/stream.rs
+@@
+         send.telemetry.record_write_activity();
+     }
+     let _transaction = QuicWriteTransaction::new(send.write_backlog.clone(), packet_len);
+-    #[cfg(feature = "lab-diagnostics")]
+-    let native_before = if crate::lab_diagnostics::lab_diagnostic_event_enabled("quic_ack_native_handoff")
+-        && frames.iter().any(|frame| matches!(frame, Frame::StreamAck { .. })) {
+-        send.connection.mpp_diagnostic_send_progress(send.request_stream_id)
+-    } else { None };
+-    #[cfg(feature = "lab-diagnostics")]
+-    for frame in frames {
+-        if let Frame::StreamAck { stream_id, complete, ranges } = frame {
+-            crate::lab_diagnostics::lab_stream_ack_stage("quic_write_begin", *stream_id, *complete, ranges, Some(send.request_stream_id.into()));
+-        }
+-    }
+     send.stream.send_data(Bytes::from(packet)).await?;
+     #[cfg(feature = "lab-diagnostics")]
+-    if let Some((before, _, _)) = native_before {
+-        if let Some((after, unsent, ack_prefix)) = send.connection.mpp_diagnostic_send_progress(send.request_stream_id) {
+-            for frame in frames {
+-                if let Frame::StreamAck { stream_id, complete, ranges } = frame {
+-                    crate::lab_diagnostics::lab_diagnostic("quic_ack_native_handoff", format_args!(
+-                        "stream_id={} native_id={} complete={} ranges={} first_start={} first_end={} largest_end={} native_before={} native_after={} native_unsent={} native_ack_prefix={}",
+-                        stream_id.0, u64::from(send.request_stream_id), complete, ranges.len(),
+-                        ranges.first().map_or(0, |r| r.start), ranges.first().map_or(0, |r| r.end),
+-                        ranges.iter().map(|r| r.end).max().unwrap_or(0), before, after, unsent, ack_prefix,
+-                    ));
+-                }
+-            }
+-        }
+-    }
+-    #[cfg(feature = "lab-diagnostics")]
+-    for frame in frames {
+-        if let Frame::StreamAck { stream_id, complete, ranges } = frame {
+-            crate::lab_diagnostics::lab_stream_ack_stage("quic_write_accepted", *stream_id, *complete, ranges, Some(send.request_stream_id.into()));
+-        }
+-    }
+-    #[cfg(feature = "lab-diagnostics")]
+     lab_perf_record(
+         "transport.quic.write_frames_wait",
+         write_started.elapsed(),
+@@
+     }
+ 
+     fn accept_reliable_frame(&mut self, frame: Frame) -> Result<Option<Frame>, QuicCarrierError> {
+-        #[cfg(feature = "lab-diagnostics")]
+-        if let Frame::StreamAck { stream_id, complete, ranges } = &frame {
+-            crate::lab_diagnostics::lab_stream_ack_stage("quic_read", *stream_id, *complete, ranges, None);
+-        }
+         let suppress = match &frame {
+             Frame::OpenDatagramFlow { flow_id, .. } => {
+                 self.known_datagram_flows
+*** End Patch

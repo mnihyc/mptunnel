@@ -2011,8 +2011,9 @@ impl RequestSenderService {
             return RequestPathRecoveryEnqueueOutcome::default();
         }
         let mut queued = false;
-        for frame in reinjection_frames {
-            let queued_frame = if sender_queue.has_queued_reinjection_overlap(&frame) {
+        let overlaps = sender_queue.queued_reinjection_overlaps(&reinjection_frames);
+        for (frame, overlaps_queued) in reinjection_frames.into_iter().zip(overlaps) {
+            let queued_frame = if overlaps_queued {
                 false
             } else {
                 self.enqueue_critical_reinjection_frame(sender_queue, frame, cause);

@@ -1,7 +1,7 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 10:38 UTC. Baseline source: `7189e69`; evidence checkpoint:
-`3d216a8`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
+Updated: 2026-09-06 11:18 UTC. Baseline source: `7189e69`; evidence checkpoint:
+`282b71f`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Fixed order and closure obligations
@@ -70,6 +70,24 @@ and closed component invariants are not repeatedly reopened as new defects.
   bounded/fair Product input-service model in MIXED_UPLOAD_SOURCE_GAP_DIAGNOSIS;
   preserve per-frame ACK validation, incarnation/lifecycle ordering and actual
   Product/native admission. Do not merely remove guards or tune a deadline.
+  PRODUCT_ACTOR_SERVICE_MODEL now states cyclic ready service across input,
+  dispatch and source reads, not a carrier-selection policy. The production
+  arbitration RED retains the legacy empty-queue veto and selects Input six
+  times despite all three classes being ready. Candidate removes that veto,
+  preserves all three handler bodies and adds explicit RFC 10.4 separation
+  from final-writer priority. Four service checks and240 other relay tests
+  pass; one server FIN fixture fails before the asserted operation because its
+  synthetic completed proof can be future-dated. A test-only timestamp
+  correction awaits the next full verification; no production timing change.
+  The first ordinary actor candidate is unacceptable:20.818 Mbps and61.501 s
+  confirmation gap versus228.118 Mbps and2.280 s in its matched mailbox control.
+  Wider comparison is paused. A second exact RED shows its synchronous dispatch
+  bypassing exhausted executor budget when mpsc input asks to yield. The proof
+  omitted executor fairness. The revision uses Tokio's existing cooperative
+  boundary, not a new MPP budget or timer; five production-module tests pass.
+  Ordinary revised binary is building; practical attribution remains open.
+  The live trace measured resource eligibility, not the
+  application socket's readable-byte count; do not overstate that observation.
   MAILBOX_WRITE_WAKE_MODEL and its full-series evidence retain the results.
   Preserve one retained frame,
   exact recipient, partial-write ownership and terminal/requalification

@@ -2,7 +2,7 @@
 
 2026-09-06 10:33 UTC. Continuation of MAILBOX_WRITE_WAKE_MODEL, not a new
 optimization scope or accepted runtime correction. Ordinary endpoint
-isolation follows the changed server; the source-ready/input-priority
+isolation follows the changed server; the source-eligible/input-priority
 obstruction is now captured below. This identifies one real sender-service
 defect, not every remaining stall. No congestion-controller change is
 authorized by this document.
@@ -99,6 +99,10 @@ Thus a delivery-rate increase cannot release these still-unassigned bytes.
 The sampled sender gate prevented even attempting their assignment while
 the Product credit and source-read resources were available. This does not
 claim that every hypothetical attempted writer reservation would succeed.
+Nor was the application socket's readable-byte count sampled throughout the
+interval: the saved `ss` filter covered carrier sockets. Resource eligibility
+must not be described as a measured successful read. The focused production
+arbitration RED supplies an actually ready source to test that missing case.
 
 The same diagnostic client with the old server gives297.557 Mbps versus
 228.481 Mbps with the changed server. These are diagnostic random trials, not

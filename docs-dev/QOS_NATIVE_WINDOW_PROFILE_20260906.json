@@ -1,0 +1,718 @@
+{
+  "run": ".tmp/reflection/results/quic-combined-down-native-window-profile-0906",
+  "purpose": "Diagnostic-only native state attribution; not an acceptance performance record",
+  "probe": {
+    "case": "quic-combined-down-native-window-profile-0906",
+    "protocol": "bulk-interactive",
+    "status": "loss",
+    "workload_mode": "bulk-interactive",
+    "mode": "socks5",
+    "target": "127.0.0.1:8080",
+    "udp_target": null,
+    "tcp_echo_target": "127.0.0.1:10022",
+    "interactive_interval_ms": 500,
+    "interactive_timeout_ms": 3000,
+    "interactive_payload_bytes": 64,
+    "failover_after_s": -1,
+    "test_duration_s": 40,
+    "bulk_status": "ok",
+    "bulk_http_code": 200,
+    "bulk_content_length": 8589934592,
+    "bulk_bytes": 456738022,
+    "bulk_time_s": 40.1008640070213,
+    "bulk_load_duration_s": 40,
+    "bulk_requests": 1,
+    "bulk_complete_requests": 0,
+    "bulk_partial_requests": 1,
+    "bulk_goodput_mbps": 91.1178416345402,
+    "bulk_first_body_s": 0.5232751560397446,
+    "bulk_bytes_at_failover": null,
+    "bulk_max_read_gap_s": 3.592948568984866,
+    "bulk_max_gap_start_s": 18.3592894540634,
+    "bulk_max_gap_end_s": 21.952238023048267,
+    "bulk_max_gap_start_bytes": 285436358,
+    "bulk_max_gap_end_bytes": 285501894,
+    "bulk_recovery_gap_s": 0,
+    "bulk_recovery_gap_start_s": null,
+    "bulk_recovery_gap_end_s": null,
+    "bulk_recovery_gap_start_bytes": null,
+    "bulk_recovery_gap_end_bytes": null,
+    "bulk_interval_seconds": 1,
+    "bulk_interval_trim_discard_each_end": 3,
+    "bulk_interval_goodput_raw_mbps": [
+      4.193,
+      184.429,
+      147.133,
+      180.547,
+      190.317,
+      103.956,
+      142.223,
+      151.711,
+      131.5,
+      154.096,
+      159.332,
+      178.886,
+      150.987,
+      204.997,
+      136.833,
+      33.116,
+      0,
+      0,
+      29.236,
+      0,
+      0,
+      21.977,
+      4.623,
+      0,
+      0,
+      93.925,
+      111.927,
+      90.547,
+      108.138,
+      183.403,
+      74.419,
+      128.118,
+      21.034,
+      162.472,
+      91.765,
+      36.156,
+      42.164,
+      56.925,
+      58.487,
+      83.807
+    ],
+    "bulk_interval_goodput_mbps": [
+      180.547,
+      190.317,
+      103.956,
+      142.223,
+      151.711,
+      131.5,
+      154.096,
+      159.332,
+      178.886,
+      150.987,
+      204.997,
+      136.833,
+      33.116,
+      0,
+      0,
+      29.236,
+      0,
+      0,
+      21.977,
+      4.623,
+      0,
+      0,
+      93.925,
+      111.927,
+      90.547,
+      108.138,
+      183.403,
+      74.419,
+      128.118,
+      21.034,
+      162.472,
+      91.765,
+      36.156,
+      42.164
+    ],
+    "bulk_interval_goodput_avg_mbps": 91.718,
+    "bulk_interval_goodput_max_mbps": 204.997,
+    "bulk_interval_goodput_min_mbps": 0,
+    "interactive_connected": true,
+    "interactive_attempt_series": [
+      {
+        "index": 0,
+        "start_offset_s": 0.11357496900018305,
+        "end_offset_s": 0.2337302800733596,
+        "latency_ms": 120.15531107317656,
+        "outcome": "success"
+      },
+      {
+        "index": 1,
+        "start_offset_s": 0.5005100010894239,
+        "end_offset_s": 0.5791049090912566,
+        "latency_ms": 78.59490800183266,
+        "outcome": "success"
+      },
+      {
+        "index": 2,
+        "start_offset_s": 1.0006054510595277,
+        "end_offset_s": 1.1242278640856966,
+        "latency_ms": 123.62241302616894,
+        "outcome": "success"
+      },
+      {
+        "index": 3,
+        "start_offset_s": 1.5006927400827408,
+        "end_offset_s": 1.6147556630894542,
+        "latency_ms": 114.06292300671339,
+        "outcome": "success"
+      },
+      {
+        "index": 4,
+        "start_offset_s": 2.000798271037638,
+        "end_offset_s": 2.1435999050736427,
+        "latency_ms": 142.80163403600454,
+        "outcome": "success"
+      },
+      {
+        "index": 5,
+        "start_offset_s": 2.50087529909797,
+        "end_offset_s": 2.618981748004444,
+        "latency_ms": 118.10644890647382,
+        "outcome": "success"
+      },
+      {
+        "index": 6,
+        "start_offset_s": 3.000978099065833,
+        "end_offset_s": 3.1374670040095225,
+        "latency_ms": 136.4889049436897,
+        "outcome": "success"
+      },
+      {
+        "index": 7,
+        "start_offset_s": 3.5010997490026057,
+        "end_offset_s": 3.6233188930200413,
+        "latency_ms": 122.21914401743561,
+        "outcome": "success"
+      },
+      {
+        "index": 8,
+        "start_offset_s": 4.001195218064822,
+        "end_offset_s": 4.0853951630415395,
+        "latency_ms": 84.19994497671723,
+        "outcome": "success"
+      },
+      {
+        "index": 9,
+        "start_offset_s": 4.501300419098698,
+        "end_offset_s": 4.632755332044326,
+        "latency_ms": 131.45491294562817,
+        "outcome": "success"
+      },
+      {
+        "index": 10,
+        "start_offset_s": 5.001372168073431,
+        "end_offset_s": 5.11843591008801,
+        "latency_ms": 117.06374201457947,
+        "outcome": "success"
+      },
+      {
+        "index": 11,
+        "start_offset_s": 5.501473076990806,
+        "end_offset_s": 5.784345970023423,
+        "latency_ms": 282.87289303261787,
+        "outcome": "success"
+      },
+      {
+        "index": 12,
+        "start_offset_s": 6.001561757060699,
+        "end_offset_s": 6.183237559045665,
+        "latency_ms": 181.6758019849658,
+        "outcome": "success"
+      },
+      {
+        "index": 13,
+        "start_offset_s": 6.501648886012845,
+        "end_offset_s": 6.638622714090161,
+        "latency_ms": 136.97382807731628,
+        "outcome": "success"
+      },
+      {
+        "index": 14,
+        "start_offset_s": 7.001747535075992,
+        "end_offset_s": 7.073308499995619,
+        "latency_ms": 71.56096491962671,
+        "outcome": "success"
+      },
+      {
+        "index": 15,
+        "start_offset_s": 7.5018324960255995,
+        "end_offset_s": 7.594908386003226,
+        "latency_ms": 93.0758899776265,
+        "outcome": "success"
+      },
+      {
+        "index": 16,
+        "start_offset_s": 8.001929216086864,
+        "end_offset_s": 8.108102297992446,
+        "latency_ms": 106.17308190558106,
+        "outcome": "success"
+      },
+      {
+        "index": 17,
+        "start_offset_s": 8.50200041406788,
+        "end_offset_s": 8.64725753501989,
+        "latency_ms": 145.25712095201015,
+        "outcome": "success"
+      },
+      {
+        "index": 18,
+        "start_offset_s": 9.002065473003313,
+        "end_offset_s": 9.244555942015722,
+        "latency_ms": 242.49046901240945,
+        "outcome": "success"
+      },
+      {
+        "index": 19,
+        "start_offset_s": 9.502145134028979,
+        "end_offset_s": 9.608007675036788,
+        "latency_ms": 105.86254100780934,
+        "outcome": "success"
+      },
+      {
+        "index": 20,
+        "start_offset_s": 10.002277772990055,
+        "end_offset_s": 10.244251077994704,
+        "latency_ms": 241.97330500464886,
+        "outcome": "success"
+      },
+      {
+        "index": 21,
+        "start_offset_s": 10.50241973309312,
+        "end_offset_s": 10.747800288023427,
+        "latency_ms": 245.38055493030697,
+        "outcome": "success"
+      },
+      {
+        "index": 22,
+        "start_offset_s": 11.002499322057702,
+        "end_offset_s": 11.12762183509767,
+        "latency_ms": 125.12251303996891,
+        "outcome": "success"
+      },
+      {
+        "index": 23,
+        "start_offset_s": 11.502577002043836,
+        "end_offset_s": 11.680458659073338,
+        "latency_ms": 177.8816570295021,
+        "outcome": "success"
+      },
+      {
+        "index": 24,
+        "start_offset_s": 12.002656991011463,
+        "end_offset_s": 12.128607470076531,
+        "latency_ms": 125.95047906506807,
+        "outcome": "success"
+      },
+      {
+        "index": 25,
+        "start_offset_s": 12.502726741018705,
+        "end_offset_s": 12.60461219609715,
+        "latency_ms": 101.88545507844537,
+        "outcome": "success"
+      },
+      {
+        "index": 26,
+        "start_offset_s": 13.002820120076649,
+        "end_offset_s": 13.113886904087849,
+        "latency_ms": 111.06678401120007,
+        "outcome": "success"
+      },
+      {
+        "index": 27,
+        "start_offset_s": 13.503000749042258,
+        "end_offset_s": 13.601602873997763,
+        "latency_ms": 98.60212495550513,
+        "outcome": "success"
+      },
+      {
+        "index": 28,
+        "start_offset_s": 14.003164919093251,
+        "end_offset_s": 14.112667523091659,
+        "latency_ms": 109.50260399840772,
+        "outcome": "success"
+      },
+      {
+        "index": 29,
+        "start_offset_s": 14.505159249994904,
+        "end_offset_s": 14.63274537899997,
+        "latency_ms": 127.58612900506705,
+        "outcome": "success"
+      },
+      {
+        "index": 30,
+        "start_offset_s": 15.005296320072375,
+        "end_offset_s": 17.489877104060724,
+        "latency_ms": 2484.580783988349,
+        "outcome": "success"
+      },
+      {
+        "index": 31,
+        "start_offset_s": 17.489905555034056,
+        "end_offset_s": 18.293981402064674,
+        "latency_ms": 804.0758470306173,
+        "outcome": "success"
+      },
+      {
+        "index": 32,
+        "start_offset_s": 18.293997752014548,
+        "end_offset_s": 19.330869542085566,
+        "latency_ms": 1036.871790071018,
+        "outcome": "success"
+      },
+      {
+        "index": 33,
+        "start_offset_s": 19.330891432007775,
+        "end_offset_s": 22.331149906036444,
+        "latency_ms": null,
+        "outcome": "io_error"
+      },
+      {
+        "index": 34,
+        "start_offset_s": 22.33124019706156,
+        "end_offset_s": 22.33124085702002,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 35,
+        "start_offset_s": 22.83134738507215,
+        "end_offset_s": 22.831349945045076,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 36,
+        "start_offset_s": 23.331453444086947,
+        "end_offset_s": 23.331454604049213,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 37,
+        "start_offset_s": 23.831560104037635,
+        "end_offset_s": 23.831561234081164,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 38,
+        "start_offset_s": 24.331663663033396,
+        "end_offset_s": 24.33166477305349,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 39,
+        "start_offset_s": 24.8317693520803,
+        "end_offset_s": 24.831771061988547,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 40,
+        "start_offset_s": 25.331853181007318,
+        "end_offset_s": 25.33185398101341,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 41,
+        "start_offset_s": 25.83195376105141,
+        "end_offset_s": 25.831954871071503,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 42,
+        "start_offset_s": 26.332056330051273,
+        "end_offset_s": 26.332057680003345,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 43,
+        "start_offset_s": 26.832182169076987,
+        "end_offset_s": 26.8321837290423,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 44,
+        "start_offset_s": 27.33229326806031,
+        "end_offset_s": 27.332295028027147,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 45,
+        "start_offset_s": 27.83240571699571,
+        "end_offset_s": 27.832406787085347,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 46,
+        "start_offset_s": 28.332497126073577,
+        "end_offset_s": 28.332498966017738,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 47,
+        "start_offset_s": 28.832598234992474,
+        "end_offset_s": 28.832599455025047,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 48,
+        "start_offset_s": 29.33279776503332,
+        "end_offset_s": 29.332799245021306,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 49,
+        "start_offset_s": 29.83290700300131,
+        "end_offset_s": 29.832908382988535,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 50,
+        "start_offset_s": 30.33300433307886,
+        "end_offset_s": 30.333005533088,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 51,
+        "start_offset_s": 30.833103722077794,
+        "end_offset_s": 30.83310548204463,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 52,
+        "start_offset_s": 31.33320116100367,
+        "end_offset_s": 31.333202531095594,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 53,
+        "start_offset_s": 31.833308470086195,
+        "end_offset_s": 31.833310370100662,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 54,
+        "start_offset_s": 32.333413219079375,
+        "end_offset_s": 32.33341438905336,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 55,
+        "start_offset_s": 32.83350998698734,
+        "end_offset_s": 32.833511437056586,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 56,
+        "start_offset_s": 33.33361488603987,
+        "end_offset_s": 33.33361611608416,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 57,
+        "start_offset_s": 33.83371572603937,
+        "end_offset_s": 33.833717546076514,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 58,
+        "start_offset_s": 34.333821004023775,
+        "end_offset_s": 34.333822894026525,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 59,
+        "start_offset_s": 34.833937963005155,
+        "end_offset_s": 34.833939833100885,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 60,
+        "start_offset_s": 35.3340371530503,
+        "end_offset_s": 35.33403864305001,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 61,
+        "start_offset_s": 35.8341432310408,
+        "end_offset_s": 35.83414467109833,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 62,
+        "start_offset_s": 36.3342574700946,
+        "end_offset_s": 36.33425864006858,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 63,
+        "start_offset_s": 36.83437788905576,
+        "end_offset_s": 36.8343797189882,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 64,
+        "start_offset_s": 37.33447598898783,
+        "end_offset_s": 37.33447719900869,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 65,
+        "start_offset_s": 37.83459039707668,
+        "end_offset_s": 37.83459223702084,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 66,
+        "start_offset_s": 38.33469581604004,
+        "end_offset_s": 38.33469714608509,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 67,
+        "start_offset_s": 38.83480337506626,
+        "end_offset_s": 38.83480486506596,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 68,
+        "start_offset_s": 39.33489733398892,
+        "end_offset_s": 39.33489802409895,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      },
+      {
+        "index": 69,
+        "start_offset_s": 39.834994052071124,
+        "end_offset_s": 39.834995622048154,
+        "latency_ms": null,
+        "outcome": "unavailable_after_disconnect"
+      }
+    ],
+    "interactive_start_s": 0.00039230205584317446,
+    "interactive_time_s": 39.999755545984954,
+    "interactive_count": 70,
+    "interactive_ok": 33,
+    "interactive_fail": 37,
+    "interactive_request_bytes": 2176,
+    "interactive_response_bytes": 2112,
+    "interactive_p50_ms": 125.12251303996891,
+    "interactive_p95_ms": 804.0758470306173,
+    "interactive_max_ms": 2484.580783988349,
+    "interactive_max_success_gap_s": 2.8571317250607535,
+    "interactive_failover_gap_s": 0,
+    "interactive_disconnected_at_s": 22.331149906036444,
+    "interactive_error": "timed out",
+    "mixed_app_payload_bytes": 456742310
+  },
+  "server_native_events": [
+    "mptunnel_native_model ts_unix_ms=1788717999770 phase=Startup ack_phase=Init cwnd=12000 flight=0 max_inflight=0 inflight_short=18446744073709551615 inflight_long=18446744073709551615 bw=0 max_bw=0 bw_short=inf min_rtt_us=18446744073709551615000000 operational_rtt_us=18446744073709551615000000 round=0 cwnd_limited=false full_bw=false loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788717999870 ordinary_us=90743 current_rtt_us=80660 excess_us=0 selected_us=90743 seen=false recoveries=0",
+    "mptunnel_native_model ts_unix_ms=1788718000832 phase=Startup ack_phase=Init cwnd=19747 flight=0 max_inflight=33749 inflight_short=18446744073709551615 inflight_long=18446744073709551615 bw=18919 max_bw=18919 bw_short=inf min_rtt_us=53066 operational_rtt_us=103897 round=6 cwnd_limited=false full_bw=false loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718000940 ordinary_us=120821 current_rtt_us=107397 excess_us=16849 selected_us=124246 seen=true recoveries=15",
+    "mptunnel_native_model ts_unix_ms=1788718001770 phase=Startup ack_phase=Init cwnd=715309 flight=638812 max_inflight=819069 inflight_short=18446744073709551615 inflight_long=18446744073709551615 bw=3573953 max_bw=3573953 bw_short=inf min_rtt_us=36927 operational_rtt_us=103897 round=16 cwnd_limited=true full_bw=false loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718001874 ordinary_us=69184 current_rtt_us=61497 excess_us=67571 selected_us=129069 seen=true recoveries=16",
+    "mptunnel_native_model ts_unix_ms=1788718002770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=3926518 flight=3115177 max_inflight=13223067 inflight_short=3926518 inflight_long=18446744073709551615 bw=28619373.94429128 max_bw=59935312 bw_short=28619373.94429128 min_rtt_us=18556 operational_rtt_us=103897 round=35 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718002870 ordinary_us=44838 current_rtt_us=39856 excess_us=109443 selected_us=149299 seen=true recoveries=12",
+    "mptunnel_native_model ts_unix_ms=1788718003770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=3323976 flight=2129993 max_inflight=12786928 inflight_short=3323976 inflight_long=18446744073709551615 bw=22901353.866864547 max_bw=59935312 bw_short=22901353.866864547 min_rtt_us=17896 operational_rtt_us=103897 round=56 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718003871 ordinary_us=61784 current_rtt_us=54919 excess_us=118637 selected_us=173557 seen=true recoveries=10",
+    "mptunnel_native_model ts_unix_ms=1788718004770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=3323976 flight=2209200 max_inflight=12746160 inflight_short=3323976 inflight_long=18446744073709551615 bw=22901353.866864547 max_bw=59935312 bw_short=22901353.866864547 min_rtt_us=17896 operational_rtt_us=103897 round=75 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718004870 ordinary_us=48599 current_rtt_us=43199 excess_us=118637 selected_us=161837 seen=true recoveries=4",
+    "mptunnel_native_model ts_unix_ms=1788718005770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=2605866 flight=1646400 max_inflight=12728569 inflight_short=2605866 inflight_long=7087200 bw=18581378.073837247 max_bw=59935312 bw_short=18581378.073837247 min_rtt_us=17896 operational_rtt_us=103897 round=96 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718005873 ordinary_us=59850 current_rtt_us=53200 excess_us=108353 selected_us=161554 seen=true recoveries=15",
+    "mptunnel_native_model ts_unix_ms=1788718006770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=2605866 flight=1822800 max_inflight=12789647 inflight_short=2605866 inflight_long=7087200 bw=18581378.073837247 max_bw=59935312 bw_short=18581378.073837247 min_rtt_us=17896 operational_rtt_us=103897 round=115 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718006871 ordinary_us=48548 current_rtt_us=43153 excess_us=118179 selected_us=161333 seen=true recoveries=12",
+    "mptunnel_native_model ts_unix_ms=1788718007770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=2605866 flight=1700400 max_inflight=12678223 inflight_short=2605866 inflight_long=7087200 bw=18581378.073837247 max_bw=59935312 bw_short=18581378.073837247 min_rtt_us=17896 operational_rtt_us=103897 round=134 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718007871 ordinary_us=49117 current_rtt_us=43660 excess_us=118179 selected_us=161840 seen=true recoveries=6",
+    "mptunnel_native_model ts_unix_ms=1788718008771 phase=ProbeRtt ack_phase=Init cwnd=257695 flight=256770 max_inflight=746254 inflight_short=3642544 inflight_long=6466734 bw=28798794.144690644 max_bw=41821274 bw_short=28798794.144690644 min_rtt_us=17896 operational_rtt_us=70843 round=149 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718008874 ordinary_us=59281 current_rtt_us=52694 excess_us=96825 selected_us=149519 seen=true recoveries=16",
+    "mptunnel_native_model ts_unix_ms=1788718009770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=2930640 flight=2053140 max_inflight=8113713 inflight_short=2930640 inflight_long=6466734 bw=21535894.849185474 max_bw=42806234 bw_short=21535894.849185474 min_rtt_us=17896 operational_rtt_us=92397 round=168 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718009871 ordinary_us=47297 current_rtt_us=42042 excess_us=109724 selected_us=151766 seen=true recoveries=14",
+    "mptunnel_native_model ts_unix_ms=1788718010770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=2930640 flight=1910400 max_inflight=8220224 inflight_short=2930640 inflight_long=6466734 bw=21535894.849185474 max_bw=42806234 bw_short=21535894.849185474 min_rtt_us=17896 operational_rtt_us=92397 round=187 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718010871 ordinary_us=64507 current_rtt_us=57340 excess_us=120395 selected_us=177735 seen=true recoveries=15",
+    "mptunnel_native_model ts_unix_ms=1788718011770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=4635906 flight=3410189 max_inflight=8266783 inflight_short=4635906 inflight_long=5663915 bw=35520784.01796125 max_bw=42806234 bw_short=35520784.01796125 min_rtt_us=17896 operational_rtt_us=92397 round=205 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718011870 ordinary_us=42099 current_rtt_us=37422 excess_us=127797 selected_us=165219 seen=true recoveries=16",
+    "mptunnel_native_model ts_unix_ms=1788718012770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=3101311 flight=2298000 max_inflight=8194672 inflight_short=3101311 inflight_long=5663915 bw=22813679.94398198 max_bw=42806234 bw_short=22813679.94398198 min_rtt_us=17896 operational_rtt_us=92397 round=225 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718012870 ordinary_us=57228 current_rtt_us=50869 excess_us=127797 selected_us=178666 seen=true recoveries=10",
+    "mptunnel_native_model ts_unix_ms=1788718013770 phase=ProbeBw(Up) ack_phase=ProbeFeedback cwnd=5663915 flight=5202000 max_inflight=9145204 inflight_short=18446744073709551615 inflight_long=5663915 bw=42806234 max_bw=42806234 bw_short=inf min_rtt_us=18402 operational_rtt_us=92397 round=247 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718013870 ordinary_us=37842 current_rtt_us=33637 excess_us=127797 selected_us=161434 seen=true recoveries=4",
+    "mptunnel_native_model ts_unix_ms=1788718014770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=2401003 flight=1729108 max_inflight=7909305 inflight_short=3114667 inflight_long=5617200 bw=23623466.485110007 max_bw=41058872 bw_short=23623466.485110007 min_rtt_us=18402 operational_rtt_us=92397 round=269 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718014871 ordinary_us=58913 current_rtt_us=52367 excess_us=103107 selected_us=155475 seen=true recoveries=15",
+    "mptunnel_native_model ts_unix_ms=1788718015770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=3098667 flight=2578800 max_inflight=7912505 inflight_short=3098667 inflight_long=5617200 bw=23764175.047261897 max_bw=41058872 bw_short=23764175.047261897 min_rtt_us=18402 operational_rtt_us=92397 round=287 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718015879 ordinary_us=166197 current_rtt_us=147731 excess_us=106939 selected_us=254671 seen=true recoveries=16",
+    "mptunnel_native_model ts_unix_ms=1788718016773 phase=ProbeRtt ack_phase=ProbeStopping cwnd=377789 flight=2982000 max_inflight=702794 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=18402 operational_rtt_us=92397 round=287 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718016876 ordinary_us=1146551 current_rtt_us=1019156 excess_us=403104 selected_us=1422261 seen=true recoveries=15",
+    "mptunnel_native_model ts_unix_ms=1788718017778 phase=ProbeRtt ack_phase=ProbeStopping cwnd=377789 flight=1778400 max_inflight=702794 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=18402 operational_rtt_us=92397 round=287 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718017874 ordinary_us=2201567 current_rtt_us=1956948 excess_us=403104 selected_us=2360053 seen=true recoveries=16",
+    "mptunnel_native_model ts_unix_ms=1788718018775 phase=ProbeRtt ack_phase=ProbeStopping cwnd=377789 flight=517200 max_inflight=702794 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=18402 operational_rtt_us=92397 round=287 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718018875 ordinary_us=2871611 current_rtt_us=2552543 excess_us=403104 selected_us=2955648 seen=true recoveries=16",
+    "mptunnel_native_model ts_unix_ms=1788718019770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=4074267 flight=4050000 max_inflight=31985435 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=18402 operational_rtt_us=385549 round=289 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718019875 ordinary_us=504653 current_rtt_us=448580 excess_us=403104 selected_us=851685 seen=true recoveries=15",
+    "mptunnel_native_model ts_unix_ms=1788718020770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=4581867 flight=4581433 max_inflight=34221551 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=18402 operational_rtt_us=412779 round=289 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718020967 ordinary_us=1807448 current_rtt_us=1606620 excess_us=669849 selected_us=2276470 seen=true recoveries=16",
+    "mptunnel_native_model ts_unix_ms=1788718021770 phase=ProbeBw(Refill) ack_phase=Refilling cwnd=5193420 flight=5182633 max_inflight=34221551 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=218809 operational_rtt_us=412779 round=289 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718021875 ordinary_us=2930323 current_rtt_us=2604731 excess_us=669849 selected_us=3274580 seen=true recoveries=16",
+    "mptunnel_native_model ts_unix_ms=1788718022775 phase=ProbeBw(Refill) ack_phase=Refilling cwnd=5617200 flight=5590633 max_inflight=34221551 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=218809 operational_rtt_us=412779 round=289 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718022879 ordinary_us=3447043 current_rtt_us=3064038 excess_us=669849 selected_us=3733887 seen=true recoveries=15",
+    "mptunnel_native_model ts_unix_ms=1788718023778 phase=ProbeBw(Refill) ack_phase=Refilling cwnd=5617200 flight=5605097 max_inflight=34221551 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=218809 operational_rtt_us=412779 round=289 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718023873 ordinary_us=4158565 current_rtt_us=3696502 excess_us=669849 selected_us=4366351 seen=true recoveries=15",
+    "mptunnel_native_model ts_unix_ms=1788718024770 phase=ProbeRtt ack_phase=ProbeStopping cwnd=4492040 flight=5033982 max_inflight=4817045 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=218809 operational_rtt_us=412779 round=289 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718024877 ordinary_us=4227716 current_rtt_us=3757970 excess_us=669849 selected_us=4427819 seen=true recoveries=15",
+    "mptunnel_native_model ts_unix_ms=1788718025774 phase=ProbeRtt ack_phase=ProbeStopping cwnd=4492040 flight=4426782 max_inflight=4817045 inflight_short=18446744073709551615 inflight_long=5617200 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=218809 operational_rtt_us=412779 round=289 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718025873 ordinary_us=848671 current_rtt_us=754374 excess_us=669849 selected_us=1424223 seen=true recoveries=14",
+    "mptunnel_native_model ts_unix_ms=1788718026770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=1738639 flight=1527450 max_inflight=10962693 inflight_short=1738639 inflight_long=5617200 bw=15383940.04561796 max_bw=41058872 bw_short=15383940.04561796 min_rtt_us=18173 operational_rtt_us=122548 round=306 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718026873 ordinary_us=58991 current_rtt_us=52436 excess_us=669849 selected_us=722286 seen=true recoveries=12",
+    "mptunnel_native_model ts_unix_ms=1788718027772 phase=ProbeBw(Cruise) ack_phase=Init cwnd=1825200 flight=1579200 max_inflight=10352900 inflight_short=1825200 inflight_long=5617200 bw=15965778.946621891 max_bw=41058872 bw_short=15965778.946621891 min_rtt_us=18173 operational_rtt_us=122548 round=324 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718027871 ordinary_us=67200 current_rtt_us=59734 excess_us=669849 selected_us=729583 seen=true recoveries=11",
+    "mptunnel_native_model ts_unix_ms=1788718028770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=2064000 flight=1780550 max_inflight=10340453 inflight_short=2064000 inflight_long=5617200 bw=15830177.805783996 max_bw=41058872 bw_short=15830177.805783996 min_rtt_us=18173 operational_rtt_us=122548 round=343 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718028870 ordinary_us=56142 current_rtt_us=49904 excess_us=669849 selected_us=719753 seen=true recoveries=9",
+    "mptunnel_native_model ts_unix_ms=1788718029770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=2418000 flight=2219985 max_inflight=10329822 inflight_short=2966400 inflight_long=2979600 bw=22066193.63262741 max_bw=41058872 bw_short=22066193.63262741 min_rtt_us=18173 operational_rtt_us=122548 round=363 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718029870 ordinary_us=50712 current_rtt_us=45077 excess_us=669849 selected_us=714926 seen=true recoveries=8",
+    "mptunnel_native_model ts_unix_ms=1788718030770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=2472000 flight=2329200 max_inflight=10376510 inflight_short=2472000 inflight_long=2979600 bw=18852760.0877753 max_bw=41058872 bw_short=18852760.0877753 min_rtt_us=18173 operational_rtt_us=122548 round=382 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718030875 ordinary_us=62941 current_rtt_us=55948 excess_us=669849 selected_us=725797 seen=true recoveries=7",
+    "mptunnel_native_model ts_unix_ms=1788718031773 phase=ProbeRtt ack_phase=Init cwnd=210055 flight=202800 max_inflight=747670 inflight_short=2801978 inflight_long=2979600 bw=23116968.707497574 max_bw=41058872 bw_short=23116968.707497574 min_rtt_us=18173 operational_rtt_us=88387 round=389 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718031872 ordinary_us=88122 current_rtt_us=78330 excess_us=669849 selected_us=748179 seen=true recoveries=5",
+    "mptunnel_native_model ts_unix_ms=1788718032771 phase=ProbeBw(Cruise) ack_phase=Init cwnd=1883466 flight=1940394 max_inflight=8514200 inflight_short=1883466 inflight_long=2979600 bw=13666374.189062579 max_bw=41058872 bw_short=13666374.189062579 min_rtt_us=18173 operational_rtt_us=100351 round=408 cwnd_limited=false full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718032870 ordinary_us=75450 current_rtt_us=67067 excess_us=669849 selected_us=736916 seen=true recoveries=4",
+    "mptunnel_native_model ts_unix_ms=1788718033770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=982800 flight=824376 max_inflight=8363742 inflight_short=982800 inflight_long=2979600 bw=7671122.049893291 max_bw=41058872 bw_short=7671122.049893291 min_rtt_us=18173 operational_rtt_us=100351 round=422 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718033872 ordinary_us=66007 current_rtt_us=58673 excess_us=669849 selected_us=728522 seen=true recoveries=3",
+    "mptunnel_native_model ts_unix_ms=1788718034771 phase=ProbeBw(Refill) ack_phase=Refilling cwnd=696000 flight=662400 max_inflight=8319951 inflight_short=18446744073709551615 inflight_long=2979600 bw=41058872 max_bw=41058872 bw_short=inf min_rtt_us=18173 operational_rtt_us=100351 round=437 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718034873 ordinary_us=64109 current_rtt_us=56986 excess_us=669849 selected_us=726835 seen=true recoveries=1",
+    "mptunnel_native_model ts_unix_ms=1788718035770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=528360 flight=528000 max_inflight=6159164 inflight_short=528360 inflight_long=1032000 bw=20118847.279999997 max_bw=30096177 bw_short=20118847.279999997 min_rtt_us=18173 operational_rtt_us=100351 round=451 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718035870 ordinary_us=73840 current_rtt_us=65635 excess_us=79421 selected_us=145057 seen=true recoveries=16",
+    "mptunnel_native_model ts_unix_ms=1788718036773 phase=ProbeBw(Cruise) ack_phase=Init cwnd=528360 flight=528000 max_inflight=6141164 inflight_short=528360 inflight_long=1032000 bw=20118847.279999997 max_bw=30096177 bw_short=20118847.279999997 min_rtt_us=23745 operational_rtt_us=100351 round=465 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718036871 ordinary_us=66525 current_rtt_us=59134 excess_us=87676 selected_us=146810 seen=true recoveries=14",
+    "mptunnel_native_model ts_unix_ms=1788718037771 phase=ProbeBw(Cruise) ack_phase=ProbeStopping cwnd=911604 flight=873600 max_inflight=5630640 inflight_short=18446744073709551615 inflight_long=1072475 bw=30096177 max_bw=30096177 bw_short=inf min_rtt_us=23745 operational_rtt_us=91131 round=476 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718037870 ordinary_us=76000 current_rtt_us=67555 excess_us=97388 selected_us=164944 seen=true recoveries=11",
+    "mptunnel_native_model ts_unix_ms=1788718038772 phase=ProbeBw(Cruise) ack_phase=Init cwnd=911604 flight=850800 max_inflight=6782794 inflight_short=18446744073709551615 inflight_long=1072475 bw=30096177 max_bw=30096177 bw_short=inf min_rtt_us=23745 operational_rtt_us=110153 round=492 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718038870 ordinary_us=80042 current_rtt_us=71148 excess_us=99487 selected_us=170635 seen=true recoveries=14",
+    "mptunnel_native_model ts_unix_ms=1788718039770 phase=ProbeBw(Cruise) ack_phase=Init cwnd=911604 flight=898778 max_inflight=6738394 inflight_short=18446744073709551615 inflight_long=1072475 bw=30096177 max_bw=30096177 bw_short=inf min_rtt_us=23745 operational_rtt_us=110153 round=507 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718039870 ordinary_us=88503 current_rtt_us=78669 excess_us=99487 selected_us=178156 seen=true recoveries=8",
+    "mptunnel_native_model ts_unix_ms=1788718040770 phase=ProbeBw(Up) ack_phase=ProbeFeedback cwnd=5638758 flight=3488400 max_inflight=8819409 inflight_short=18446744073709551615 inflight_long=5638758 bw=34209110 max_bw=34209110 bw_short=inf min_rtt_us=23745 operational_rtt_us=110153 round=522 cwnd_limited=true full_bw=true loss_high=false raw_loss_authority=false compensation=0.1",
+    "mptunnel_native_reordering ts_unix_ms=1788718040870 ordinary_us=45536 current_rtt_us=40477 excess_us=101526 selected_us=142004 seen=true recoveries=15"
+  ]
+}

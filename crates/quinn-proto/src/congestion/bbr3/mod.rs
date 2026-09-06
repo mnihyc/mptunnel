@@ -32,11 +32,6 @@ const STARTUP_EXTRA_ACKED_FILTER_LEN: usize = 1;
 /// operational RTT. Three votes give a strict majority while bounding state.
 const OPERATIONAL_RTT_FILTER_SAMPLES: usize = 3;
 
-/// safety mechanism to flag packets as stale within our tracking VecDeque. rounds refer to <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.1>.
-/// The value of 10 rounds is picked because normally after max(kTimeThreshold * max(smoothed_rtt, latest_rtt), kGranularity) <https://datatracker.ietf.org/doc/html/rfc9002#section-6.1.2>
-/// the packet should have been declared lost already, this is just to guarantee that the VecDeque doesn't grow indefinitely.
-const ROUND_COUNT_WINDOW: u64 = 10;
-
 /// the minimum for the maximum datagram size <https://datatracker.ietf.org/doc/html/rfc9000#section-14>
 const MIN_MAX_DATAGRAM_SIZE: u16 = 1200;
 
@@ -241,7 +236,7 @@ struct BbrPacket {
     acknowledged: bool,
     /// once a packet has been acknowledged on a given round it is marked for removal on the next round.
     stale: bool,
-    /// used to mark packets stale if they're far from the current round <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.1>
+    /// Source delivery round, retained for bandwidth-sample provenance.
     round_count: u64,
 }
 
@@ -3116,11 +3111,13 @@ impl Controller for Bbr3 {
             if app_limited {
                 self.app_limited = Ord::max(self.delivered.saturating_add(self.inflight), 1);
             }
-            let round_count = self.round_count;
             for packets in self.packets.iter_mut() {
                 packets.retain(|&p| !p.stale);
                 for p in packets.iter_mut() {
-                    if p.acknowledged || round_count - p.round_count > ROUND_COUNT_WINDOW {
+                    // Keep this ACK's snapshots for subsequent same-ACK ECN
+                    // processing. Only transport terminals retire live work;
+                    // younger delivery rounds do not invalidate its evidence.
+                    if p.acknowledged {
                         p.stale = true;
                     }
                 }
@@ -3270,6 +3267,14 @@ impl Controller for Bbr3 {
             }
         }
         None
+    }
+
+    fn on_packet_discarded(&mut self, packet_number: u64, space: SpaceId) {
+        let packets = &mut self.packets[space as usize];
+        if let Ok(index) = packets.binary_search_by_key(&packet_number, |packet| packet.packet_number)
+        {
+            packets.remove(index);
+        }
     }
 
     /// equivalent to BBRHandleSpuriousLossDetection:
@@ -3563,6 +3568,50 @@ mod test {
     type UndoSnapshot = (Option<BbrState>, f64, u64, u64);
     /// A loss episode: (pre-loss undo snapshot, post-loss state, post-loss inflight_longterm).
     type LossEpisode = (UndoSnapshot, BbrState, u64);
+
+    #[test]
+    fn live_packet_evidence_survives_younger_delivery_rounds() {
+        let base = Instant::now();
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut config = Bbr3Config::default();
+        config.loss_compensation_floor(0.1);
+        let mut bbr = Bbr3::new(Arc::new(config), smss as u16);
+        let rtt = RttEstimator::new(Duration::from_millis(40));
+        bbr.on_packet_sent(base, smss as u16, 0, SpaceId::Data);
+
+        // One original stays in transport flight while younger originals are
+        // delivered. A learned >640ms loss deadline permits this sequence;
+        // neither a terminal callback nor a loss decision exists for packet 0.
+        // Each send fits even the minimum congestion window. Rounds advance
+        // only through ordinary send/ACK callbacks, never by editing the clock.
+        for number in 1..=16 {
+            let sent = base + Duration::from_millis(40 * (number - 1));
+            let acked = sent + Duration::from_millis(40);
+            bbr.on_packet_sent(sent, smss as u16, number, SpaceId::Data);
+            bbr.on_ack(acked, sent, smss, number, SpaceId::Data, false, &rtt);
+            bbr.on_end_acks(acked, smss, false, Some(number), SpaceId::Data);
+        }
+        assert!(bbr.round_count >= 16);
+
+        let mut delayed_ack = bbr.clone();
+        let lost_at = base + Duration::from_millis(700);
+        let transaction = bbr.on_packet_lost(smss as u16, 0, SpaceId::Data, lost_at);
+        assert!(
+            transaction.is_some() && !bbr.loss_round_evidence_unknown,
+            "still-live send evidence was deleted by delivery-round age: transaction={transaction:?}, unknown={}",
+            bbr.loss_round_evidence_unknown,
+        );
+        let record = bbr.loss_budget_records.back().expect("exact loss record");
+        assert_eq!(record.send_time, Some(base));
+        assert_eq!(record.packet_number, 0);
+
+        delayed_ack.on_ack(lost_at, base, smss, 0, SpaceId::Data, false, &rtt);
+        assert_eq!(
+            delayed_ack.rs.map(|sample| sample.last_packet.packet_number),
+            Some(0),
+            "a late but still-live ACK also requires its original send snapshot",
+        );
+    }
 
     #[test]
     fn controller_metrics_report_current_bounded_bandwidth() {

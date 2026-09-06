@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 17:44 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 19:04 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -30,15 +30,71 @@ control and sweep; the repeated control also fails during QoS, disproving
 that this timing failure is newly introduced by the sweep. No blanket
 non-regression or release acceptance. Preserve exact ownership, timestamps
 and T06 ranked extent; no congestion/timeout/queue knob changes. Temporary
-profiling hooks are archived and removed. Local Clippy clears this component
-after two syntax cleanups but still reports four lints in the separate held
-companion stack; these are build obligations, not four new runtime defects.
-After the isolated component checkpoint, the next exact question is whether
+profiling hooks are archived and removed. Component checkpoint1817f6d is
+committed. The four companion-stack Clippy lints are now cleared with two
+equivalent-expression cleanups and two documented, function-local arity
+exemptions; independent stream/attachment/connection authorities remain
+explicit. Local all-target/all-feature Clippy passes with warnings denied.
+These syntax/annotation changes remain with the held companion stack, not
+in the frontier commit, and are not counted as runtime performance fixes.
+After this isolated component checkpoint, the next exact question is whether
 the remaining QoS-era interactive stall is native/physical service or Product
 ordered progress, first comparing the existing mixed and QUIC-only ablations.
 Do not start an ACK-ledger optimization or a new congestion tweak by intuition.
 Global gates below remain intact; independent audit workers remain unavailable
 under their recorded usage limit.
+
+QoS follow-up18:06UTC: five ordinary ablations are complete and preserved in
+QOS_NATIVE_WINDOW_EVIDENCE_20260906. QUIC alone also has the recovery collapse
+with jitter; its window falls304560→45740bytes while RTT recovers and the
+router queue drains. Removing only jitter restores immediate400--480Mbps
+post-QoS service in that MPP run. H2 also recovers without jitter but is poor
+even beforeQoS with this jitter trace; do not exploit that as a headline win.
+All variants still hit the3s echo timeout with the initial physical queue.
+QOS_NATIVE_WINDOW_DIAGNOSIS keeps that initial queue, later native-window
+collapse and other mixed Product stalls distinct. Build5203 adds temporary
+1Hz native bound/phase and reordering-deadline observations only. The exact
+branch lowering the window is not yet identified; no new BBR/reordering fix
+is justified. Archive/remove those hooks after attribution. Existing global
+gates and no-release verdict stand.
+
+Native follow-up18:22UTC: the snapshot identifies short-term bounds followed
+by long-term/headroom bounds, not only ProbeRTT. Refill does execute. Learned
+reordering excess remains about670ms for roughly ten seconds after current
+RTT recovers, then ages away. This does not prove incorrect renewal or justify
+a cap. QOS_NATIVE_WINDOW_PROFILE preserves all84 events and the full probe.
+One diagnostic build adds exact completed-budget inputs and bound-action
+causes; it changes no policy. Next decision depends on whether that evidence
+supports the reductions, not on another headline Mbps comparison. All source
+trace hunks must be removed after attribution. No new unrelated issue batch.
+
+Exact cause18:38UTC: the action trace finds62 raw/unknown-evidence lower-bound
+calls,45 with strict short-bound reductions, in addition to62 budget calls.
+BBR3's imported ten-delivery-round cleanup can erase a packet still owned by
+QUIC's delayed detector. Actual send/ACK callbacks advance16 younger rounds;
+the old original then has no send snapshot (RED). The lifetime correction
+deletes that expiry and makes non-feedback transport terminals settle metadata
+in active and parked copies without invented ACK/loss. Both delayed ACK/loss
+are GREEN;466 native tests and targeted wrapper forwarding pass. See
+NATIVE_PACKET_EVIDENCE_LIFETIME_MODEL for origin, symbolic storage argument,
+discard coverage and tradeoff. Native diagnostic overlays are archived and
+removed. Ordinary recovery comparison is next; compensated-budget responses
+are a separate decision class and not automatically defects. No global gate
+is waived and no code-policy knob was raised.
+
+Ordinary comparison19:04UTC: all25 adapter tests, ordinary optimized build
+and all-target/all-feature Clippy pass. Fifteen full probes plus one-second
+observations are preserved in NATIVE_PACKET_LIFETIME_COMPARISON_20260906.
+QUIC post-QoS recovery improves in both candidates, but startup is variable,
+mixed mode still stalls, and the direction of the steady rate difference
+reverses across repeats. All scheduled steady echoes succeed; mixed latency
+is not uniformly better. No general non-regression or release acceptance.
+Checkpoint the isolated lifetime correction as an unaccepted candidate.
+Next reuse the existing bound-action trace to verify disappearance of the
+specific unknown-evidence reduction class; separately classify remaining
+budget responses and mixed ordered-progress stalls before changing policy.
+Do not optimize the packet container or adjust congestion settings from
+variable average Mbps alone. Independent workers remain usage-limited.
 
 1. The quadratic request-recovery queue scan is proven and its equivalent
    snapshot implementation is committed in `614dc73`. All 243 affected sender

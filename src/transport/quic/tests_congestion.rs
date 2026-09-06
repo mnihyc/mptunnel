@@ -275,6 +275,7 @@ struct ForwardedCallbacks {
     sent_space: Option<quinn::congestion::SpaceId>,
     end_ack_space: Option<quinn::congestion::SpaceId>,
     lost_space: Option<quinn::congestion::SpaceId>,
+    discarded: Vec<(u64, quinn::congestion::SpaceId)>,
     congestion: Vec<(bool, quinn::congestion::SpaceId)>,
     spurious: u64,
     abandoned: u64,
@@ -324,6 +325,10 @@ impl quinn::congestion::Controller for RecordingController {
     ) -> Option<quinn::congestion::RecoveryTransactionId> {
         self.0.lock().unwrap().lost_space = Some(space);
         Some(quinn::congestion::RecoveryTransactionId::new(packet_number))
+    }
+
+    fn on_packet_discarded(&mut self, number: u64, space: quinn::congestion::SpaceId) {
+        self.0.lock().unwrap().discarded.push((number, space));
     }
 
     fn on_congestion_event(
@@ -1254,6 +1259,11 @@ fn instrumented_controller_forwards_packet_space_and_recovery_callbacks_once() {
     controller.on_validated_ecn_congestion_event();
     controller.on_cwnd_limited();
     controller.on_ack_frequency_update(4, Duration::from_millis(25));
+    let before_discard = controller.snapshot();
+    controller.on_packet_discarded(10, quinn::congestion::SpaceId::Data);
+    let after_discard = controller.snapshot();
+    assert_eq!(after_discard.lost_bytes, before_discard.lost_bytes);
+    assert_eq!(after_discard.total_acked_bytes, before_discard.total_acked_bytes);
 
     assert_eq!(controller.snapshot().lost_bytes, 1200);
     let callbacks = recorded.lock().unwrap();
@@ -1279,6 +1289,7 @@ fn instrumented_controller_forwards_packet_space_and_recovery_callbacks_once() {
     assert_eq!(callbacks.spurious, 1);
     assert_eq!(callbacks.abandoned, 1);
     assert_eq!(callbacks.validated_ecn, 1);
+    assert_eq!(callbacks.discarded, [(10, quinn::congestion::SpaceId::Data)]);
     assert_eq!(callbacks.cwnd_limited, 1);
     assert_eq!(
         callbacks.ack_frequency,

@@ -1877,6 +1877,7 @@ impl Connection {
                 &self.path.rtt,
             );
         }
+        self.discard_packet_metadata(packet_number, space, &info, current_controller_owned);
 
         // Update state for confirmed delivery of frames
         if let Some(retransmits) = info.retransmits.get() {
@@ -2060,6 +2061,7 @@ impl Connection {
                     self.orig_rem_cid,
                 );
                 self.remove_in_flight(&info);
+                self.discard_packet_metadata(packet, pn_space, &info, false);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
                 }
@@ -2108,6 +2110,7 @@ impl Connection {
         if let Some(packet) = lost_mtu_probe {
             let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
             self.remove_in_flight(&info);
+            self.discard_packet_metadata(packet, SpaceId::Data, &info, false);
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
         }
@@ -2512,8 +2515,9 @@ impl Connection {
         space.time_of_last_ack_eliciting_packet = None;
         space.loss_time = None;
         let sent_packets = mem::take(&mut space.sent_packets);
-        for packet in sent_packets.into_values() {
+        for (number, packet) in sent_packets {
             self.remove_in_flight(&packet);
+            self.discard_packet_metadata(number, space_id, &packet, false);
         }
         self.set_loss_detection_timer(now)
     }
@@ -2831,8 +2835,9 @@ impl Connection {
 
                 // Retransmit all 0-RTT data
                 let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                for info in zero_rtt.into_values() {
+                for (number, info) in zero_rtt {
                     self.remove_in_flight(&info);
+                    self.discard_packet_metadata(number, SpaceId::Data, &info, false);
                     self.spaces[SpaceId::Data].pending |= info.retransmits;
                 }
                 self.streams.retransmit_all_for_0rtt();
@@ -2897,8 +2902,9 @@ impl Connection {
                             // Discard 0-RTT packets
                             let sent_packets =
                                 mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                            for packet in sent_packets.into_values() {
+                            for (number, packet) in sent_packets {
                                 self.remove_in_flight(&packet);
+                                self.discard_packet_metadata(number, SpaceId::Data, &packet, false);
                             }
                         } else {
                             self.accepted_0rtt = true;
@@ -4026,6 +4032,26 @@ impl Connection {
         }
     }
 
+    /// Retire send metadata in every extant owner that receives no feedback.
+    /// The active ACK recipient keeps its snapshot through same-ACK ECN; its
+    /// existing ACK-batch reclamation owns that terminal. Parked copies never
+    /// receive synthetic delivery/loss or retain the dead packet until rollback.
+    fn discard_packet_metadata(
+        &mut self,
+        packet_number: u64,
+        space: SpaceId,
+        packet: &SentPacket,
+        keep_active_ack: bool,
+    ) {
+        discard_packet_metadata_owners(
+            (!keep_active_ack).then_some(&mut self.path),
+            self.prev_path.as_mut().map(|(_, path)| path),
+            packet,
+            packet_number,
+            space,
+        );
+    }
+
     /// Terminate the connection instantly, without sending a close packet
     fn kill(&mut self, reason: ConnectionError) {
         self.close_common();
@@ -4348,6 +4374,20 @@ const MAX_BACKOFF_EXPONENT: u32 = 16;
 /// packet is when packet space changes).
 fn controller_owns_packet(packet: &SentPacket, controller_epoch: u64) -> bool {
     packet.ack_eliciting && packet.controller_epoch == controller_epoch
+}
+
+fn discard_packet_metadata_owners(
+    active: Option<&mut PathData>,
+    previous: Option<&mut PathData>,
+    packet: &SentPacket,
+    packet_number: u64,
+    space: SpaceId,
+) {
+    for path in active.into_iter().chain(previous) {
+        if controller_owns_packet(packet, path.controller_epoch()) {
+            path.congestion.on_packet_discarded(packet_number, space);
+        }
+    }
 }
 
 fn ecn_controller_ack(
@@ -4857,6 +4897,66 @@ mod tests {
             largest_acked: None,
             retransmits: ThinRetransmits::default(),
             stream_frames: StreamMetaVec::default(),
+        }
+    }
+
+    #[test]
+    fn packet_metadata_discard_settles_clones_but_preserves_ack_and_other_epochs() {
+        use crate::congestion::Bbr3Config;
+        let now = Instant::now();
+        let mut bbr = Bbr3Config::default();
+        bbr.loss_compensation_floor(0.1);
+        let mut config = TransportConfig::default();
+        config.congestion_controller_factory(Arc::new(bbr));
+        let old_remote = "127.0.0.1:41000".parse().unwrap();
+        let new_remote = "127.0.0.1:41001".parse().unwrap();
+
+        for same_lineage in [true, false] {
+            let mut parked = PathData::new(old_remote, false, None, 0, now, &config);
+            for space in [SpaceId::Initial, SpaceId::Data] {
+                parked
+                    .congestion
+                    .on_packet_sent(now, 1200, 0, 7, space, false);
+            }
+            let mut active = if same_lineage {
+                PathData::from_previous(new_remote, &parked, 1, now)
+            } else {
+                let mut path = PathData::new(new_remote, false, None, 1, now, &config);
+                path.congestion
+                    .on_packet_sent(now, 1200, 0, 7, SpaceId::Data, false);
+                path
+            };
+            let packet = sent_packet(now, 0, 0, true);
+            let tracks = |path: &PathData, space| {
+                path.congestion
+                    .clone_box()
+                    .on_packet_lost(1200, 7, space, now + Duration::from_millis(100))
+                    .is_some()
+            };
+            let before = active.congestion.window();
+
+            // The active ACK recipient still needs its packet for same-ACK
+            // ECN. Its parked copy must not retain that terminal packet.
+            discard_packet_metadata_owners(None, Some(&mut parked), &packet, 7, SpaceId::Data);
+            assert!(tracks(&active, SpaceId::Data));
+            assert!(!tracks(&parked, SpaceId::Data));
+            assert!(tracks(&parked, SpaceId::Initial));
+
+            // Non-feedback terminals reach both extant owners, exactly by
+            // controller epoch and packet-number space. Duplicate cleanup is
+            // a no-op and cannot mutate congestion state or another lineage.
+            for _ in 0..2 {
+                discard_packet_metadata_owners(
+                    Some(&mut active),
+                    Some(&mut parked),
+                    &packet,
+                    7,
+                    SpaceId::Data,
+                );
+            }
+            assert_eq!(tracks(&active, SpaceId::Data), !same_lineage);
+            assert!(tracks(&parked, SpaceId::Initial));
+            assert_eq!(active.congestion.window(), before);
         }
     }
 

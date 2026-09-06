@@ -55,6 +55,11 @@ deviations from upstream 0.11.17 are:
 - each ack-eliciting packet records packet-space and controller-epoch
   provenance, and the connection forwards per-packet send, ACK, loss, ECN,
   ACK-batch, ACK-frequency, cwnd-limited, and spurious-loss callbacks;
+- live BBR3 send snapshots survive younger delivery rounds. Transport discard
+  removes metadata without inventing ACK/loss evidence and also settles parked
+  migration copies; current ACK snapshots remain available for same-ACK ECN.
+  This replaces the imported PR's ten-round cleanup heuristic, which can
+  discard evidence before an adaptive native loss detector finishes with it;
 - controller-owned loss evidence is retained for two PTOs with an opaque,
   recovery-scoped undo identity. Expiry precedes late-ACK matching, completion
   spans all packet-number spaces, and only the exact still-current transaction

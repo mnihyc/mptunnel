@@ -409,6 +409,13 @@ pub trait Controller: Send + Sync {
         None
     }
 
+    /// Release a packet's send metadata without asserting delivery or loss.
+    ///
+    /// The transport has retired the exact packet without supplying feedback
+    /// to this controller copy. This also settles parked migration copies.
+    /// Implementations must not synthesize congestion or delivery evidence.
+    fn on_packet_discarded(&mut self, _packet_number: u64, _space: SpaceId) {}
+
     /// All retained packets from one recovery transaction were acknowledged late.
     #[allow(unused_variables)]
     fn on_spurious_congestion_event(&mut self, transaction: RecoveryTransactionId) -> bool {

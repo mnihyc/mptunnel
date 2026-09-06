@@ -3899,6 +3899,19 @@ RFC 9000 and RFC 9002 govern each QUIC carrier's connection identity, network
 paths, address validation, migration, congestion control, loss recovery, RTT,
 ECN, and PMTU behavior. MPP does not redefine those mechanisms.
 
+Native send metadata follows the transport packet's lifetime, not a fixed
+number of younger delivery rounds. A controller MUST retain the paired send
+evidence of a still-live packet until its owning transport supplies ACK, loss,
+or discard. An ACK snapshot MAY remain through that ACK's ECN transaction;
+discard is storage-only and MUST NOT synthesize delivery or congestion.
+Every extant matching migration copy receives terminal cleanup even when
+that copy cannot consume timing feedback. Key-space discard, Retry/0-RTT
+rejection, lost MTU probes and validation-suppressed feedback therefore cannot
+leave lifetime-growing packet metadata. A learned recovery deadline does not
+authorize an independent cleanup clock to turn known live evidence into
+unknown-loss authority. Native flight and the current ACK batch bound this
+retention; the compensation journal has separate retained-proof authority.
+
 A proposed speed fix is to give a model-based native QUIC controller separate
 propagation and service-window delay estimates: raw minimum RTT would retain
 minimum-delay and ProbeRTT duties, while a larger estimate would size ordinary

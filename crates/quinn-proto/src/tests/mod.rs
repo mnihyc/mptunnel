@@ -3924,6 +3924,10 @@ fn preferred_address() {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ControllerTraceEvent {
     ApplicationReady,
+    Discard {
+        space: SpaceId,
+        packet_number: u64,
+    },
     Ack {
         space: SpaceId,
         packet_number: u64,
@@ -3942,6 +3946,13 @@ struct ControllerTrace {
 }
 
 impl Controller for ControllerTrace {
+    fn on_packet_discarded(&mut self, packet_number: u64, space: SpaceId) {
+        self.events.lock().unwrap().push(ControllerTraceEvent::Discard {
+            space,
+            packet_number,
+        });
+    }
+
     fn on_application_ready(&mut self) {
         self.events
             .lock()
@@ -4038,6 +4049,40 @@ fn traced_client_config(events: Arc<Mutex<Vec<ControllerTraceEvent>>>) -> Client
     let mut config = client_config();
     config.transport = Arc::new(transport);
     config
+}
+
+#[test]
+fn discarded_mtu_probes_release_controller_metadata() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut pair = Pair::default();
+    pair.mtu = 1200;
+    let (client, _) = pair.connect_with(traced_client_config(events.clone()));
+    pair.drive();
+    let abandoned = pair.client_conn_mut(client).stats().path.lost_plpmtud_probes;
+    assert!(
+        abandoned > 0,
+        "the real packet engine must abandon MTU probes"
+    );
+    let events = events.lock().unwrap();
+    let discarded: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ControllerTraceEvent::Discard {
+                space: SpaceId::Data,
+                packet_number,
+            } => Some(*packet_number),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(discarded.len() as u64, abandoned);
+    for packet in discarded {
+        assert!(
+            !events.iter().any(|event| matches!(event,
+                ControllerTraceEvent::Ack { space: SpaceId::Data, packet_number, .. } if *packet_number == packet
+            )),
+            "discard cannot manufacture ACK evidence"
+        );
+    }
 }
 
 #[test]

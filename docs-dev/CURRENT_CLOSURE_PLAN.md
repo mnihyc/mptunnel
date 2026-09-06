@@ -1,10 +1,33 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 21:38 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 22:29 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Current checkpoint and next decision
+
+Current decision22:29UTC: six unchanged clean-link controls isolate an existing
+mixed timing cost even without deliberate loss/jitter. MeanMbps/loaded-echo
+p95ms: raw445/127, Xray435/203, H2464/112, MPP TCP353/953, QUIC428/166,
+mixed401/548. These are single observations, not a final ranking. Mixed sends
+348MB on the reverse cut versus about24MB for either single carrier mode.
+An opt-in ACK-origin trace on the unchanged binary records69,170 complete
+snapshots and4,815,231 repeated range entries for one download. All observed
+snapshots are complete (at most234 ranges); blindly switching to existing
+positive-only ACK deltas would discard negative-gap authority used by repair.
+This is a bounded attribution branch of the already-SEEN mixed/asymmetric
+feedback/timing issue, not a new speculative allocator or controller batch.
+
+Next gates: (1) preserve this evidence and establish exact publication/encoding
+cost; (2) prove any reduced representation preserves ACK information, order,
+late-join and cancellation semantics before implementation; (3) focused codec/
+publication regressions and ordinary clean/mixed/asymmetric timing controls.
+Do not treat feedback cost as the sole cause of the multi-second stalls or
+claim a throughput fix from byte-count calculations. Allocation/discovery,
+recovery, browser, independent aggregation and sustainability remain open.
+Full probes, untrimmed series and router/process counters are archived in
+CLEAN_SERVICE_ACK_EVIDENCE_20260906.json. No source change follows yet; the
+working composition and unavailable independent auditors remain unaccepted.
 
 Review continuation21:02UTC: the fresh ordinary six-way down/up combined
 cohort is complete. Download mean alone favors MPP QUIC/mixed80.751/62.288Mbps

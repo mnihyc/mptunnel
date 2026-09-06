@@ -29,6 +29,37 @@ Full probes, untrimmed series and router/process counters are archived in
 CLEAN_SERVICE_ACK_EVIDENCE_20260906.json. No source change follows yet; the
 working composition and unavailable independent auditors remain unaccepted.
 
+22:38UTC:2252c67 checkpoints the six clean controls and model proposal. A
+stateless per-frame packed ACK candidate is now compiled: exact full/partial
+Frame equality, no dictionary or actor changes, no-larger wire-size bound.
+58protocol/123transport/29feedback tests and strict Clippy pass. RED was3765
+bytes for234ranges, GREEN956; five new boundary/wide/malformed tests cover
+16,384 complete/partial randomized vectors. RFC wire13 explicitly describes
+the representation and unchanged Section8.3 semantics. Ordinary clean mixed,
+QUIC,TCP comparisons start only after build90156 completes (2m05s), using
+.tmp/reflection/bin/packed-ack/mptunnel with diagnostics off. This remains an
+uncommitted efficiency candidate, not closure of mixed stalls or release.
+
+22:52UTC decision: integer packing alone is insufficient. Two clean pairs save
+53--62% mixed reverse bytes but have inconsistent latency ordering. Four
+adverse controls settle upload exactly but retain download echo failure and
+multi-second gaps. A direct clean500Mbps/10Mbps return cut reproduces raw444,
+QUIC432, mixed46Mbps/echo-p952.47s; compact mixed82Mbps/2.03s still fails.
+Return queue3.095MB directly accounts for about2.48s of10Mbps service. Full
+ACK_ENCODING_COMPARISON, ACK_ENCODING_ADVERSE and ACK_RETURN_BOTTLENECK
+archives retain all series. The minimal runner change is optional return-rate
+substitution; existing omitted behavior is unchanged. No compiler/lab remains
+active. Compact source/RFC changes remain UNCOMMITTED and unaccepted as a root
+fix; no release or public performance claim.
+
+Next bounded transaction remains mixed/asymmetric feedback: prove a single
+bounded ordered-transport ACK dictionary can reconstruct identical full Frames
+while eliminating repeated snapshots. ACK_ENCODING_MODEL records the required
+write-cancellation reset and consumed-record-only decode rules. Audit actual
+TCP Noise/TLS and H3 cancellation before implementing. No logical ACK cadence/
+negative-authority change, no new controller/allocator/threshold. After this
+branch closes, return to allocation/discovery and the unchanged global gates.
+
 Review continuation21:02UTC: the fresh ordinary six-way down/up combined
 cohort is complete. Download mean alone favors MPP QUIC/mixed80.751/62.288Mbps
 over raw4.808/Xray3.701/H29.974, but QUIC/mixed have5.885/4.785s read gaps and

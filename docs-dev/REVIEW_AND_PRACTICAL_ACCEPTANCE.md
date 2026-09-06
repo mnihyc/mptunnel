@@ -1,6 +1,6 @@
 # Evidence review and practical acceptance
 
-Updated: 2026-09-06 21:46 UTC. Original reviewed production tree: `7189e69`
+Updated: 2026-09-06 22:52 UTC. Original reviewed production tree: `7189e69`
 (wire11); latest correction checkpoint: `b37bacb`. This is a review/experiment
 plan, not a release verdict. Historical SEEN/UNSEEN labels are mapped below;
 an old OPEN label is not a newly found bug.
@@ -21,6 +21,27 @@ hook or startup-exemption deletion is present in that executable. The ordinary
 `no-target-recovery` executable adds only the request producer correction in
 `b37bacb`; its composition controls are recorded separately. The older held
 stack has not been silently merged into that isolated commit.
+
+Follow-up:2252c67 preserves six clean500Mbps/100ms controls without deliberate
+loss/jitter. Mixed401Mbps/echo-p95548ms versus QUIC428/166, raw445/127,
+Xray435/203,H2464/112 (explicit500Mbps H2 hint). Mixed reverse traffic348MB
+versus about24MB single-carrier, with69,170 complete ACK generations carrying
+4.82million repeated range entries. This is real feedback encoding cost under
+the existing mixed timing owner, not proof it causes every stall. A stateless
+packed-range candidate preserves decoded ACKs and passes focused tests; its
+first ordinary run cuts mixed reverse traffic to165MB but echo-p95 worsens to
+910ms at398Mbps. Matched repeats are required. Do not accept efficiency-only
+evidence as a timing fix or release gate, or discard negative ACK authority.
+
+The completed direct500/10Mbps control is decisive: without deliberate loss or
+jitter raw444Mbps and QUIC432Mbps retain echo, while mixed46Mbps loses it with
+p952.47s and a3.095MB return queue. Compact ACKs improve82Mbps but retain2.03s
+p95/failure. The representation alone is not accepted as a root fix. Next
+verify a bounded native ordered-stream dictionary and cancellation-resync proof
+before implementation; preserve identical decoded full ACKs and all negative
+authority. This remains the existing mixed/asymmetric feedback owner. No new
+controller, negative-information policy or allocator is bundled. Evidence and
+full series are ACK_RETURN_BOTTLENECK_20260906; global timing remains open.
 
 | Priority / remaining owner | What is established | What is not established / next decision |
 | --- | --- | --- |
@@ -48,6 +69,7 @@ it does not automatically create a patch.
 | Mailbox capacity wake | A pending native write masked the independent wake of a full Product mailbox, delaying an accepted ACK12.173s. Real interlock tests cover write/input/cancellation outcomes. | Cross-layer service timing changes; first ordinary composition exposed additional actor starvation. Component GREEN alone is insufficient. |
 | Cyclic Product service with executor cooperation | Drain-input-to-empty could postpone a ready source/dispatch indefinitely. Fair service among input, dispatch and read removes that dependency. | Each class can wait for the other finite work quanta. The first candidate omitted executor cooperation and failed; the revised candidate is tested but broader timing/RSS remains open. |
 | Paired QUIC repair ordering stream | A frontier repair had49.326MB of actual unsent native predecessors. A second stream removes that serialization prerequisite without new carrier/copy/CC credit. Actual native ordering and pair-lifecycle tests pass. | Deliberate wire12 mapping and two native streams per attachment; shared connection credit can still block it. Initial download improves but upload does not pass. Not an accepted protocol expansion. |
+| Stateless ACK range encoding | Fixed16-byte range pairs repeat across fragmented full snapshots. Packed per-frame gaps/lengths preserve exact logical snapshots, arbitrary fixed representations and all gap authority; selected only when smaller.58protocol/123transport/29feedback tests and strict Clippy pass. | Explicit wire13, additional O(n) integer work but no dictionary/actor state. First mixed run saves53% reverse bytes per body byte without improving timing. Repeat/comparison gate pending; not an accepted fix for mixed stalls or snapshot-generation CPU. |
 
 The evidence boundary is explicit: classification/lifetime and scan commits
 are intermediate tracked corrections, not proof that every assembled behavior

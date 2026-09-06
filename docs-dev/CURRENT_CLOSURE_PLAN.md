@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 19:04 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 19:14 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -95,6 +95,18 @@ specific unknown-evidence reduction class; separately classify remaining
 budget responses and mixed ordered-progress stalls before changing policy.
 Do not optimize the packet container or adjust congestion settings from
 variable average Mbps alone. Independent workers remain usage-limited.
+
+Causal follow-up19:14UTC:9f522b2 is the isolated lifetime checkpoint. Reused
+diagnostics find zero raw/unknown lower-bound actions in both QUIC and mixed,
+confirming removal of that observed failure class; all remaining actions are
+compensated-budget driven. Full749/585 event records and probes are preserved
+in NATIVE_PACKET_LIFETIME_CAUSAL_FOLLOWUP_20260906. Temporary source hooks are
+removed. Mixed timing remains unaccepted. The next exact counterexample checks
+whether native whole-transaction undo eligibility is incorrectly shared by
+individual compensation-record reclassification when actual loss and late
+originals coexist. That source hypothesis is not yet a proven performance
+cause or another accepted fix. Do not change the two-PTO retention authority,
+loss thresholds, delay thresholds or gains on this evidence alone.
 
 1. The quadratic request-recovery queue scan is proven and its equivalent
    snapshot implementation is committed in `614dc73`. All 243 affected sender

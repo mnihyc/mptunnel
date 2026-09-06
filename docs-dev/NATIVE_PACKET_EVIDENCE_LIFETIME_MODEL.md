@@ -163,3 +163,30 @@ to check whether unknown-evidence reductions disappear after the correction.
 It must separately classify remaining compensated-budget actions and mixed
 ordered-progress stalls. No packet-container, gain, timeout or compensation
 change is justified by the variable steady averages alone.
+
+## Causal follow-up — 2026-09-06 19:14 UTC
+
+Reusing the archived BBR3-only observations on the candidate yields zero raw
+or unknown-evidence lower-bound actions in both runs: 141 budget-only actions
+in QUIC and 95 in mixed mode, versus 62 raw/unknown actions in the old QUIC
+trace. This confirms removal of the observed missing-send-evidence decision
+class in the tested composition. NATIVE_PACKET_LIFETIME_CAUSAL_FOLLOWUP_20260906
+preserves all 749/585 server events and full probes. The diagnostic binary is
+separate; all temporary source hooks are removed again.
+
+These diagnostic runs still have 3.771/3.597-second maximum read gaps; mixed
+delivery remains uneven after recovery. Their throughput is not an acceptance
+comparison. Among completed QUIC budget epochs at model-clock seconds 2--15,
+ordinary declared loss is 18.33% of delivered-plus-lost volume; at seconds
+27--41 it is 14.08%. Those are controller declaration populations, not measured
+physical erasure fractions. They cannot alone establish false loss: packet
+timing, bursts and qdisc aggregation must not be silently equated.
+
+The remaining classification question is narrower: the transport recognizes
+individual late originals, while compensation reclassification is notified
+only when an entire recovery transaction completes. Keeping native undo
+transaction-wide protects genuine coexisting loss. Whether applying that
+same condition to each compensation record discards useful packet truth
+requires a mixed real-loss/late-original counterexample. No new policy is
+accepted from this source observation alone. Retained-proof expiry is another
+existing authority; do not extend it speculatively.

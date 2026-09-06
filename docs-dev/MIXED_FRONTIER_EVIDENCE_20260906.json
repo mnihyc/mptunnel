@@ -1,0 +1,4303 @@
+{
+  "recorded_at": "2026-09-06T09:13:00Z",
+  "status": "diagnostic evidence; no accepted runtime or release",
+  "baseline_source": "7189e69",
+  "mpp_composition": "archived QUIC receive/excess candidate + archived Native/Product qualification correction",
+  "service": {
+    "topology": "owned routed shared cut; endpoint-host shaping absent",
+    "down_mbps": 500,
+    "up_mbps": 500,
+    "down_delay_ms": 70,
+    "down_jitter_ms": 20,
+    "up_delay_ms": 30,
+    "up_jitter_ms": 5,
+    "epoch_s": 5,
+    "down_loss_percent": [
+      3,
+      8,
+      5,
+      6,
+      10,
+      3,
+      5,
+      8
+    ],
+    "up_loss_percent": [
+      1,
+      2,
+      0.5,
+      3,
+      2,
+      0.5,
+      1,
+      2
+    ],
+    "qos_when_enabled": "downstream 10 Mbps from 15 to 25 s",
+    "outage_when_enabled": "UDP only from 30 to 33 s",
+    "tcp_congestion_control": "Linux kernel reports bbr",
+    "hysteria_requested_bandwidth_mbps": {
+      "up": 500,
+      "down": 500
+    }
+  },
+  "cautions": [
+    "The variable-loss-only case tag retains asymmetric jitter; it disables only QoS and outage.",
+    "Sequential single random trials, not identical packet realizations or confidence intervals.",
+    "Instrumented runs attribute ownership and cannot establish uninstrumented speed acceptance.",
+    "One-second application bins above 500 Mbps are buffered ordered release, not physical-cut throughput.",
+    "Echo non-success after the first timeout includes later unavailable slots; inspect each attempt outcome.",
+    "Hysteria2 stalls here; this result is not a general claim against Hysteria2 or a waiver of MPP's mixed-path gap.",
+    "MPP's native and qualification candidates remain unaccepted."
+  ],
+  "cases": [
+    {
+      "binary": "excess-qualified-diag",
+      "diagnostics": true,
+      "qos_step": true,
+      "udp_outage": true,
+      "case": "mixed-combined-down-qualified-frontier-trace-0906",
+      "status": "loss",
+      "bulk_status": "ok",
+      "bulk_bytes": 323917512,
+      "bulk_time_s": 40.015507602947764,
+      "bulk_goodput_mbps": 64.75839621260002,
+      "bulk_first_body_s": 0.5838365439558402,
+      "bulk_max_read_gap_s": 5.541906435973942,
+      "bulk_max_gap_start_s": 29.563469305983745,
+      "bulk_max_gap_end_s": 35.10537574195769,
+      "bulk_interval_goodput_raw_mbps": [
+        0.466,
+        13.743,
+        25.166,
+        25.166,
+        15.204,
+        14.156,
+        539.588,
+        104.139,
+        142.51,
+        157.811,
+        188.219,
+        166.31,
+        78.547,
+        198.105,
+        173.106,
+        0,
+        0,
+        0,
+        0,
+        40.082,
+        29.552,
+        1.145,
+        0,
+        20.447,
+        1.477,
+        45.458,
+        104.047,
+        197.573,
+        39.278,
+        56.195,
+        0,
+        0,
+        0,
+        0,
+        0,
+        3.714,
+        147.266,
+        35.512,
+        6.151,
+        21.112
+      ],
+      "interactive_attempt_series": [
+        {
+          "index": 0,
+          "start_offset_s": 0.10717705800198019,
+          "end_offset_s": 0.20822506595868617,
+          "latency_ms": 101.04800795670599,
+          "outcome": "success"
+        },
+        {
+          "index": 1,
+          "start_offset_s": 0.5003646450350061,
+          "end_offset_s": 0.720620785956271,
+          "latency_ms": 220.2561409212649,
+          "outcome": "success"
+        },
+        {
+          "index": 2,
+          "start_offset_s": 1.0004571169847623,
+          "end_offset_s": 1.9260995589429513,
+          "latency_ms": 925.642441958189,
+          "outcome": "success"
+        },
+        {
+          "index": 3,
+          "start_offset_s": 1.926121638971381,
+          "end_offset_s": 2.049798029009253,
+          "latency_ms": 123.6763900378719,
+          "outcome": "success"
+        },
+        {
+          "index": 4,
+          "start_offset_s": 2.4262075920123607,
+          "end_offset_s": 2.5315821280237287,
+          "latency_ms": 105.37453601136804,
+          "outcome": "success"
+        },
+        {
+          "index": 5,
+          "start_offset_s": 2.926298475009389,
+          "end_offset_s": 3.0443388200365007,
+          "latency_ms": 118.04034502711147,
+          "outcome": "success"
+        },
+        {
+          "index": 6,
+          "start_offset_s": 3.4268478410085663,
+          "end_offset_s": 3.5623197640525177,
+          "latency_ms": 135.4719230439514,
+          "outcome": "success"
+        },
+        {
+          "index": 7,
+          "start_offset_s": 3.9269206930184737,
+          "end_offset_s": 4.031617784989066,
+          "latency_ms": 104.69709197059274,
+          "outcome": "success"
+        },
+        {
+          "index": 8,
+          "start_offset_s": 4.426993216038682,
+          "end_offset_s": 4.538820873014629,
+          "latency_ms": 111.82765697594732,
+          "outcome": "success"
+        },
+        {
+          "index": 9,
+          "start_offset_s": 4.927087879972532,
+          "end_offset_s": 5.048839317052625,
+          "latency_ms": 121.75143708009273,
+          "outcome": "success"
+        },
+        {
+          "index": 10,
+          "start_offset_s": 5.427161353058182,
+          "end_offset_s": 5.54261481098365,
+          "latency_ms": 115.45345792546868,
+          "outcome": "success"
+        },
+        {
+          "index": 11,
+          "start_offset_s": 5.927248005056754,
+          "end_offset_s": 6.025218165013939,
+          "latency_ms": 97.97015995718539,
+          "outcome": "success"
+        },
+        {
+          "index": 12,
+          "start_offset_s": 6.42733787803445,
+          "end_offset_s": 6.5787798500387,
+          "latency_ms": 151.4419720042497,
+          "outcome": "success"
+        },
+        {
+          "index": 13,
+          "start_offset_s": 6.927451601950452,
+          "end_offset_s": 7.008383993990719,
+          "latency_ms": 80.93239204026759,
+          "outcome": "success"
+        },
+        {
+          "index": 14,
+          "start_offset_s": 7.427515184041113,
+          "end_offset_s": 7.521158645977266,
+          "latency_ms": 93.64346193615347,
+          "outcome": "success"
+        },
+        {
+          "index": 15,
+          "start_offset_s": 7.9276021759724244,
+          "end_offset_s": 8.049599595949985,
+          "latency_ms": 121.99741997756064,
+          "outcome": "success"
+        },
+        {
+          "index": 16,
+          "start_offset_s": 8.427685749949887,
+          "end_offset_s": 8.52863160695415,
+          "latency_ms": 100.9458570042625,
+          "outcome": "success"
+        },
+        {
+          "index": 17,
+          "start_offset_s": 8.92777811200358,
+          "end_offset_s": 9.016368133947253,
+          "latency_ms": 88.59002194367349,
+          "outcome": "success"
+        },
+        {
+          "index": 18,
+          "start_offset_s": 9.427859465009533,
+          "end_offset_s": 9.52933660603594,
+          "latency_ms": 101.47714102640748,
+          "outcome": "success"
+        },
+        {
+          "index": 19,
+          "start_offset_s": 9.927947747986764,
+          "end_offset_s": 10.05781238595955,
+          "latency_ms": 129.86463797278702,
+          "outcome": "success"
+        },
+        {
+          "index": 20,
+          "start_offset_s": 10.428032191004604,
+          "end_offset_s": 10.588630439946428,
+          "latency_ms": 160.59824894182384,
+          "outcome": "success"
+        },
+        {
+          "index": 21,
+          "start_offset_s": 10.928112644003704,
+          "end_offset_s": 11.047222896013409,
+          "latency_ms": 119.11025200970471,
+          "outcome": "success"
+        },
+        {
+          "index": 22,
+          "start_offset_s": 11.428207217017189,
+          "end_offset_s": 11.695480320951901,
+          "latency_ms": 267.2731039347127,
+          "outcome": "success"
+        },
+        {
+          "index": 23,
+          "start_offset_s": 11.928290160023607,
+          "end_offset_s": 12.268670729012229,
+          "latency_ms": 340.38056898862123,
+          "outcome": "success"
+        },
+        {
+          "index": 24,
+          "start_offset_s": 12.42837892298121,
+          "end_offset_s": 12.675223330035806,
+          "latency_ms": 246.84440705459565,
+          "outcome": "success"
+        },
+        {
+          "index": 25,
+          "start_offset_s": 12.928446765989065,
+          "end_offset_s": 13.085610106005333,
+          "latency_ms": 157.1633400162682,
+          "outcome": "success"
+        },
+        {
+          "index": 26,
+          "start_offset_s": 13.428538099047728,
+          "end_offset_s": 13.526438778964803,
+          "latency_ms": 97.90067991707474,
+          "outcome": "success"
+        },
+        {
+          "index": 27,
+          "start_offset_s": 13.928593843011186,
+          "end_offset_s": 14.098082587006502,
+          "latency_ms": 169.48874399531633,
+          "outcome": "success"
+        },
+        {
+          "index": 28,
+          "start_offset_s": 14.428671404952183,
+          "end_offset_s": 14.540559081011452,
+          "latency_ms": 111.88767605926841,
+          "outcome": "success"
+        },
+        {
+          "index": 29,
+          "start_offset_s": 14.928748238016851,
+          "end_offset_s": 16.909380128025077,
+          "latency_ms": 1980.631890008226,
+          "outcome": "success"
+        },
+        {
+          "index": 30,
+          "start_offset_s": 16.90940500900615,
+          "end_offset_s": 19.91085483401548,
+          "latency_ms": null,
+          "outcome": "io_error"
+        },
+        {
+          "index": 31,
+          "start_offset_s": 19.910935383988544,
+          "end_offset_s": 19.910935914027505,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 32,
+          "start_offset_s": 20.411025976995006,
+          "end_offset_s": 20.41102802695241,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 33,
+          "start_offset_s": 20.911106980987824,
+          "end_offset_s": 20.91110753105022,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 34,
+          "start_offset_s": 21.411196334054694,
+          "end_offset_s": 21.411197404027916,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 35,
+          "start_offset_s": 21.91129872703459,
+          "end_offset_s": 21.911300207022578,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 36,
+          "start_offset_s": 22.411396150942892,
+          "end_offset_s": 22.41139743104577,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 37,
+          "start_offset_s": 22.91150284395553,
+          "end_offset_s": 22.91150398401078,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 38,
+          "start_offset_s": 23.411607078043744,
+          "end_offset_s": 23.411608497961424,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 39,
+          "start_offset_s": 23.911698161973618,
+          "end_offset_s": 23.911698671989143,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 40,
+          "start_offset_s": 24.41179610497784,
+          "end_offset_s": 24.411797414999455,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 41,
+          "start_offset_s": 24.911893225973472,
+          "end_offset_s": 24.91189463599585,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 42,
+          "start_offset_s": 25.412000320968218,
+          "end_offset_s": 25.41200267104432,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 43,
+          "start_offset_s": 25.912097582942806,
+          "end_offset_s": 25.91209880297538,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 44,
+          "start_offset_s": 26.412205597036518,
+          "end_offset_s": 26.412206856999546,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 45,
+          "start_offset_s": 26.912299638963304,
+          "end_offset_s": 26.91230042895768,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 46,
+          "start_offset_s": 27.412400351953693,
+          "end_offset_s": 27.41240165196359,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 47,
+          "start_offset_s": 27.912500935955904,
+          "end_offset_s": 27.912502106046304,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 48,
+          "start_offset_s": 28.412600370007567,
+          "end_offset_s": 28.41260159004014,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 49,
+          "start_offset_s": 28.912701632943936,
+          "end_offset_s": 28.912702803034335,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 50,
+          "start_offset_s": 29.41282990796026,
+          "end_offset_s": 29.412831097957678,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 51,
+          "start_offset_s": 29.91292578098364,
+          "end_offset_s": 29.912926821038127,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 52,
+          "start_offset_s": 30.41301935503725,
+          "end_offset_s": 30.413020565058105,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 53,
+          "start_offset_s": 30.913114149007015,
+          "end_offset_s": 30.913115649018437,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 54,
+          "start_offset_s": 31.41322158498224,
+          "end_offset_s": 31.413223284995183,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 55,
+          "start_offset_s": 31.913314637029544,
+          "end_offset_s": 31.91331551701296,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 56,
+          "start_offset_s": 32.41342989099212,
+          "end_offset_s": 32.41343119100202,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 57,
+          "start_offset_s": 32.91352540603839,
+          "end_offset_s": 32.91352693596855,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 58,
+          "start_offset_s": 33.41364224802237,
+          "end_offset_s": 33.413643797975965,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 59,
+          "start_offset_s": 33.91374291002285,
+          "end_offset_s": 33.91374394996092,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 60,
+          "start_offset_s": 34.41386610502377,
+          "end_offset_s": 34.41386751504615,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 61,
+          "start_offset_s": 34.91397771798074,
+          "end_offset_s": 34.9139789280016,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 62,
+          "start_offset_s": 35.41407746297773,
+          "end_offset_s": 35.41407859302126,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 63,
+          "start_offset_s": 35.91417792602442,
+          "end_offset_s": 35.91417883604299,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 64,
+          "start_offset_s": 36.414279959048145,
+          "end_offset_s": 36.41428132902365,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 65,
+          "start_offset_s": 36.91438457299955,
+          "end_offset_s": 36.914385683019646,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 66,
+          "start_offset_s": 37.41448095894884,
+          "end_offset_s": 37.41448262904305,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 67,
+          "start_offset_s": 37.91458000196144,
+          "end_offset_s": 37.91458088194486,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 68,
+          "start_offset_s": 38.414675744017586,
+          "end_offset_s": 38.41467751399614,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 69,
+          "start_offset_s": 38.91477443801705,
+          "end_offset_s": 38.91477547795512,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 70,
+          "start_offset_s": 39.41491947299801,
+          "end_offset_s": 39.414920713054016,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 71,
+          "start_offset_s": 39.91500335803721,
+          "end_offset_s": 39.9150039680535,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        }
+      ],
+      "interactive_ok": 30,
+      "interactive_fail": 42,
+      "interactive_p95_ms": 925.642441958189,
+      "interactive_max_ms": 1980.631890008226
+    },
+    {
+      "binary": "excess-qualified-repair-diag",
+      "diagnostics": true,
+      "qos_step": true,
+      "udp_outage": true,
+      "case": "mixed-combined-down-qualified-repair-refusal-0906",
+      "status": "loss",
+      "bulk_status": "ok",
+      "bulk_bytes": 325180506,
+      "bulk_time_s": 40.156305629061535,
+      "bulk_goodput_mbps": 64.78295269566102,
+      "bulk_first_body_s": 0.5141363070579246,
+      "bulk_max_read_gap_s": 7.153010979061946,
+      "bulk_max_gap_start_s": 27.101403768989258,
+      "bulk_max_gap_end_s": 34.254414748051204,
+      "bulk_interval_goodput_raw_mbps": [
+        0.466,
+        5.276,
+        9.006,
+        95.088,
+        463.663,
+        179.831,
+        144.083,
+        124.781,
+        85.695,
+        210.195,
+        221.442,
+        176.36,
+        153.321,
+        73.112,
+        0.524,
+        0,
+        0,
+        0,
+        0.524,
+        0,
+        0,
+        2.858,
+        0.237,
+        0,
+        0,
+        1.956,
+        507.946,
+        22.825,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0.641,
+        2.077,
+        3.146,
+        3.146,
+        78.311,
+        34.411
+      ],
+      "interactive_attempt_series": [
+        {
+          "index": 0,
+          "start_offset_s": 0.13897105504292995,
+          "end_offset_s": 0.2652881470276043,
+          "latency_ms": 126.31709198467433,
+          "outcome": "success"
+        },
+        {
+          "index": 1,
+          "start_offset_s": 0.5011480300454423,
+          "end_offset_s": 0.8162196250632405,
+          "latency_ms": 315.07159501779824,
+          "outcome": "success"
+        },
+        {
+          "index": 2,
+          "start_offset_s": 1.001236004056409,
+          "end_offset_s": 2.2541881849756464,
+          "latency_ms": 1252.9521809192374,
+          "outcome": "success"
+        },
+        {
+          "index": 3,
+          "start_offset_s": 2.254416426992975,
+          "end_offset_s": 2.360705416998826,
+          "latency_ms": 106.28899000585079,
+          "outcome": "success"
+        },
+        {
+          "index": 4,
+          "start_offset_s": 2.7545317200710997,
+          "end_offset_s": 2.8683421390596777,
+          "latency_ms": 113.81041898857802,
+          "outcome": "success"
+        },
+        {
+          "index": 5,
+          "start_offset_s": 3.2546000130241737,
+          "end_offset_s": 3.399296806077473,
+          "latency_ms": 144.6967930532992,
+          "outcome": "success"
+        },
+        {
+          "index": 6,
+          "start_offset_s": 3.75467449601274,
+          "end_offset_s": 3.84399798407685,
+          "latency_ms": 89.32348806411028,
+          "outcome": "success"
+        },
+        {
+          "index": 7,
+          "start_offset_s": 4.254765709047206,
+          "end_offset_s": 4.377136053983122,
+          "latency_ms": 122.37034493591636,
+          "outcome": "success"
+        },
+        {
+          "index": 8,
+          "start_offset_s": 4.754832691047341,
+          "end_offset_s": 4.8794133310439065,
+          "latency_ms": 124.58063999656588,
+          "outcome": "success"
+        },
+        {
+          "index": 9,
+          "start_offset_s": 5.2548945230664685,
+          "end_offset_s": 5.563112732023001,
+          "latency_ms": 308.2182089565322,
+          "outcome": "success"
+        },
+        {
+          "index": 10,
+          "start_offset_s": 5.754980024998076,
+          "end_offset_s": 5.9095004830742255,
+          "latency_ms": 154.52045807614923,
+          "outcome": "success"
+        },
+        {
+          "index": 11,
+          "start_offset_s": 6.255068217054941,
+          "end_offset_s": 6.5019338430138305,
+          "latency_ms": 246.86562595888972,
+          "outcome": "success"
+        },
+        {
+          "index": 12,
+          "start_offset_s": 6.755142679088749,
+          "end_offset_s": 6.883393074036576,
+          "latency_ms": 128.25039494782686,
+          "outcome": "success"
+        },
+        {
+          "index": 13,
+          "start_offset_s": 7.255228332011029,
+          "end_offset_s": 7.421670638024807,
+          "latency_ms": 166.44230601377785,
+          "outcome": "success"
+        },
+        {
+          "index": 14,
+          "start_offset_s": 7.755322044016793,
+          "end_offset_s": 7.878566227038391,
+          "latency_ms": 123.24418302159756,
+          "outcome": "success"
+        },
+        {
+          "index": 15,
+          "start_offset_s": 8.25539110507816,
+          "end_offset_s": 8.38927374605555,
+          "latency_ms": 133.8826409773901,
+          "outcome": "success"
+        },
+        {
+          "index": 16,
+          "start_offset_s": 8.755485226982273,
+          "end_offset_s": 8.87558984698262,
+          "latency_ms": 120.1046200003475,
+          "outcome": "success"
+        },
+        {
+          "index": 17,
+          "start_offset_s": 9.255642738076858,
+          "end_offset_s": 9.358350494061597,
+          "latency_ms": 102.70775598473847,
+          "outcome": "success"
+        },
+        {
+          "index": 18,
+          "start_offset_s": 9.755705947987735,
+          "end_offset_s": 9.876937667024322,
+          "latency_ms": 121.23171903658658,
+          "outcome": "success"
+        },
+        {
+          "index": 19,
+          "start_offset_s": 10.255829000030644,
+          "end_offset_s": 10.340949060977437,
+          "latency_ms": 85.12006094679236,
+          "outcome": "success"
+        },
+        {
+          "index": 20,
+          "start_offset_s": 10.755888332030736,
+          "end_offset_s": 10.860390730085783,
+          "latency_ms": 104.5023980550468,
+          "outcome": "success"
+        },
+        {
+          "index": 21,
+          "start_offset_s": 11.256121254060417,
+          "end_offset_s": 11.346217547077686,
+          "latency_ms": 90.09629301726818,
+          "outcome": "success"
+        },
+        {
+          "index": 22,
+          "start_offset_s": 11.756191504071467,
+          "end_offset_s": 11.873106134007685,
+          "latency_ms": 116.91462993621826,
+          "outcome": "success"
+        },
+        {
+          "index": 23,
+          "start_offset_s": 12.256277163978666,
+          "end_offset_s": 12.360042709042318,
+          "latency_ms": 103.7655450636521,
+          "outcome": "success"
+        },
+        {
+          "index": 24,
+          "start_offset_s": 12.75635531404987,
+          "end_offset_s": 12.950912285014056,
+          "latency_ms": 194.5569709641859,
+          "outcome": "success"
+        },
+        {
+          "index": 25,
+          "start_offset_s": 13.257524842978455,
+          "end_offset_s": 13.549918057047762,
+          "latency_ms": 292.39321406930685,
+          "outcome": "success"
+        },
+        {
+          "index": 26,
+          "start_offset_s": 13.757610562024638,
+          "end_offset_s": 13.867452996084467,
+          "latency_ms": 109.84243405982852,
+          "outcome": "success"
+        },
+        {
+          "index": 27,
+          "start_offset_s": 14.257710742997006,
+          "end_offset_s": 14.371262809028849,
+          "latency_ms": 113.55206603184342,
+          "outcome": "success"
+        },
+        {
+          "index": 28,
+          "start_offset_s": 14.757791802985594,
+          "end_offset_s": 14.871907683089375,
+          "latency_ms": 114.11588010378182,
+          "outcome": "success"
+        },
+        {
+          "index": 29,
+          "start_offset_s": 15.257877373020165,
+          "end_offset_s": 18.259584587067366,
+          "latency_ms": null,
+          "outcome": "io_error"
+        },
+        {
+          "index": 30,
+          "start_offset_s": 18.259684348013252,
+          "end_offset_s": 18.259685068042018,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 31,
+          "start_offset_s": 18.759772477089427,
+          "end_offset_s": 18.759774366975762,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 32,
+          "start_offset_s": 19.25987015501596,
+          "end_offset_s": 19.25987107504625,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 33,
+          "start_offset_s": 19.759967165067792,
+          "end_offset_s": 19.759968455065973,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 34,
+          "start_offset_s": 20.26006384298671,
+          "end_offset_s": 20.260065073031,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 35,
+          "start_offset_s": 20.760155081981793,
+          "end_offset_s": 20.76015617197845,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 36,
+          "start_offset_s": 21.26024708908517,
+          "end_offset_s": 21.260248139034957,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 37,
+          "start_offset_s": 21.76033765799366,
+          "end_offset_s": 21.76033871807158,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 38,
+          "start_offset_s": 22.260459345998242,
+          "end_offset_s": 22.26046075602062,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 39,
+          "start_offset_s": 22.760557504021563,
+          "end_offset_s": 22.760558524052612,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 40,
+          "start_offset_s": 23.26066227199044,
+          "end_offset_s": 23.260663542081602,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 41,
+          "start_offset_s": 23.760766500025056,
+          "end_offset_s": 23.76076782005839,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 42,
+          "start_offset_s": 24.26086965808645,
+          "end_offset_s": 24.260871108039282,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 43,
+          "start_offset_s": 24.760972605086863,
+          "end_offset_s": 24.760973885073327,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 44,
+          "start_offset_s": 25.2610729719745,
+          "end_offset_s": 25.261074232053943,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 45,
+          "start_offset_s": 25.761187540018,
+          "end_offset_s": 25.761188780074008,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 46,
+          "start_offset_s": 26.261297176009975,
+          "end_offset_s": 26.261298826080747,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 47,
+          "start_offset_s": 26.76138573407661,
+          "end_offset_s": 26.761386434081942,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 48,
+          "start_offset_s": 27.261485610040836,
+          "end_offset_s": 27.26151772006415,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 49,
+          "start_offset_s": 27.761627687024884,
+          "end_offset_s": 27.761629036976956,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 50,
+          "start_offset_s": 28.2617404430639,
+          "end_offset_s": 28.261741723050363,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 51,
+          "start_offset_s": 28.761857590056024,
+          "end_offset_s": 28.761859160033055,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 52,
+          "start_offset_s": 29.261965167010203,
+          "end_offset_s": 29.261966667021625,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 53,
+          "start_offset_s": 29.76207251206506,
+          "end_offset_s": 29.76207377202809,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 54,
+          "start_offset_s": 30.262173858005553,
+          "end_offset_s": 30.262175078038126,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 55,
+          "start_offset_s": 30.762276635039598,
+          "end_offset_s": 30.76227801607456,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 56,
+          "start_offset_s": 31.262381302076392,
+          "end_offset_s": 31.262383062043227,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 57,
+          "start_offset_s": 31.76251484907698,
+          "end_offset_s": 31.762516019050963,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 58,
+          "start_offset_s": 32.26262696401682,
+          "end_offset_s": 32.262629014090635,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 59,
+          "start_offset_s": 32.762738908990286,
+          "end_offset_s": 32.76274059899151,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 60,
+          "start_offset_s": 33.262901715002954,
+          "end_offset_s": 33.26290314504877,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 61,
+          "start_offset_s": 33.76304483006243,
+          "end_offset_s": 33.76304648001678,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 62,
+          "start_offset_s": 34.26313908502925,
+          "end_offset_s": 34.26313996501267,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 63,
+          "start_offset_s": 34.7632297599921,
+          "end_offset_s": 34.763231139979325,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 64,
+          "start_offset_s": 35.26333201501984,
+          "end_offset_s": 35.26333380502183,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 65,
+          "start_offset_s": 35.76345281000249,
+          "end_offset_s": 35.76345446007326,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 66,
+          "start_offset_s": 36.2635619440116,
+          "end_offset_s": 36.26356316404417,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 67,
+          "start_offset_s": 36.763665908016264,
+          "end_offset_s": 36.763667458086275,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 68,
+          "start_offset_s": 37.26377131207846,
+          "end_offset_s": 37.26377263199538,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 69,
+          "start_offset_s": 37.76386733702384,
+          "end_offset_s": 37.76386853703298,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 70,
+          "start_offset_s": 38.26396362204105,
+          "end_offset_s": 38.26396536198445,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 71,
+          "start_offset_s": 38.764018214074895,
+          "end_offset_s": 38.764018974034116,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 72,
+          "start_offset_s": 39.26411689806264,
+          "end_offset_s": 39.2641182980733,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        },
+        {
+          "index": 73,
+          "start_offset_s": 39.76421840302646,
+          "end_offset_s": 39.7642201629933,
+          "latency_ms": null,
+          "outcome": "unavailable_after_disconnect"
+        }
+      ],
+      "interactive_ok": 29,
+      "interactive_fail": 45,
+      "interactive_p95_ms": 315.07159501779824,
+      "interactive_max_ms": 1252.9521809192374
+    },
+    {
+      "binary": "excess-qualified",
+      "diagnostics": false,
+      "qos_step": false,
+      "udp_outage": false,
+      "case": "mixed-combined-down-qualified-variable-loss-only-0906",
+      "status": "ok",
+      "bulk_status": "ok",
+      "bulk_bytes": 755777838,
+      "bulk_time_s": 40.04269166989252,
+      "bulk_goodput_mbps": 150.9944125096381,
+      "bulk_first_body_s": 0.5742484069196507,
+      "bulk_max_read_gap_s": 3.4421297339722514,
+      "bulk_max_gap_start_s": 20.948941294918768,
+      "bulk_max_gap_end_s": 24.39107102889102,
+      "bulk_interval_goodput_raw_mbps": [
+        0.466,
+        17.385,
+        221.154,
+        168.008,
+        129.403,
+        243.462,
+        24.642,
+        27.595,
+        304.445,
+        63.439,
+        58.196,
+        473.956,
+        122.854,
+        180.926,
+        167.924,
+        154.867,
+        162.644,
+        189.833,
+        153.314,
+        162.869,
+        147.725,
+        0,
+        0,
+        0,
+        2.673,
+        668.816,
+        202.212,
+        145.015,
+        148.549,
+        165.872,
+        167.636,
+        158.134,
+        180.521,
+        151.453,
+        188.171,
+        116.448,
+        156.789,
+        121.441,
+        158.446,
+        138.417
+      ],
+      "interactive_attempt_series": [
+        {
+          "index": 0,
+          "start_offset_s": 0.10727812792174518,
+          "end_offset_s": 0.3226403199369088,
+          "latency_ms": 215.3621920151636,
+          "outcome": "success"
+        },
+        {
+          "index": 1,
+          "start_offset_s": 0.500370685942471,
+          "end_offset_s": 0.811798473005183,
+          "latency_ms": 311.427787062712,
+          "outcome": "success"
+        },
+        {
+          "index": 2,
+          "start_offset_s": 1.000454110908322,
+          "end_offset_s": 1.1308896499685943,
+          "latency_ms": 130.43553906027228,
+          "outcome": "success"
+        },
+        {
+          "index": 3,
+          "start_offset_s": 1.5005367359844968,
+          "end_offset_s": 2.2022563529899344,
+          "latency_ms": 701.7196170054376,
+          "outcome": "success"
+        },
+        {
+          "index": 4,
+          "start_offset_s": 2.2022780429106206,
+          "end_offset_s": 2.3510082908906043,
+          "latency_ms": 148.7302479799837,
+          "outcome": "success"
+        },
+        {
+          "index": 5,
+          "start_offset_s": 2.702357836998999,
+          "end_offset_s": 2.7765902099199593,
+          "latency_ms": 74.23237292096019,
+          "outcome": "success"
+        },
+        {
+          "index": 6,
+          "start_offset_s": 3.2045407749246806,
+          "end_offset_s": 3.2889245139667764,
+          "latency_ms": 84.38373904209584,
+          "outcome": "success"
+        },
+        {
+          "index": 7,
+          "start_offset_s": 3.704650709987618,
+          "end_offset_s": 3.776875068899244,
+          "latency_ms": 72.22435891162604,
+          "outcome": "success"
+        },
+        {
+          "index": 8,
+          "start_offset_s": 4.2047619939548895,
+          "end_offset_s": 4.287439170992002,
+          "latency_ms": 82.67717703711241,
+          "outcome": "success"
+        },
+        {
+          "index": 9,
+          "start_offset_s": 4.70484347792808,
+          "end_offset_s": 4.8324154779547825,
+          "latency_ms": 127.57200002670288,
+          "outcome": "success"
+        },
+        {
+          "index": 10,
+          "start_offset_s": 5.204940841998905,
+          "end_offset_s": 5.311027291929349,
+          "latency_ms": 106.08644993044436,
+          "outcome": "success"
+        },
+        {
+          "index": 11,
+          "start_offset_s": 5.70501787494868,
+          "end_offset_s": 5.992906388943084,
+          "latency_ms": 287.8885139944032,
+          "outcome": "success"
+        },
+        {
+          "index": 12,
+          "start_offset_s": 6.205107849906199,
+          "end_offset_s": 6.307922108913772,
+          "latency_ms": 102.81425900757313,
+          "outcome": "success"
+        },
+        {
+          "index": 13,
+          "start_offset_s": 6.705200123949908,
+          "end_offset_s": 6.830353076918982,
+          "latency_ms": 125.15295296907425,
+          "outcome": "success"
+        },
+        {
+          "index": 14,
+          "start_offset_s": 7.205300987930968,
+          "end_offset_s": 7.337998390896246,
+          "latency_ms": 132.69740296527743,
+          "outcome": "success"
+        },
+        {
+          "index": 15,
+          "start_offset_s": 7.705381070962176,
+          "end_offset_s": 7.816262861946598,
+          "latency_ms": 110.88179098442197,
+          "outcome": "success"
+        },
+        {
+          "index": 16,
+          "start_offset_s": 8.20547386398539,
+          "end_offset_s": 8.522094533895142,
+          "latency_ms": 316.6206699097529,
+          "outcome": "success"
+        },
+        {
+          "index": 17,
+          "start_offset_s": 8.70555782795418,
+          "end_offset_s": 8.956783561967313,
+          "latency_ms": 251.22573401313275,
+          "outcome": "success"
+        },
+        {
+          "index": 18,
+          "start_offset_s": 9.20562565990258,
+          "end_offset_s": 9.291714749997482,
+          "latency_ms": 86.08909009490162,
+          "outcome": "success"
+        },
+        {
+          "index": 19,
+          "start_offset_s": 9.705717833945528,
+          "end_offset_s": 9.828751893946901,
+          "latency_ms": 123.03406000137329,
+          "outcome": "success"
+        },
+        {
+          "index": 20,
+          "start_offset_s": 10.205813426990062,
+          "end_offset_s": 10.28167404991109,
+          "latency_ms": 75.86062292102724,
+          "outcome": "success"
+        },
+        {
+          "index": 21,
+          "start_offset_s": 10.705865648924373,
+          "end_offset_s": 10.83210193994455,
+          "latency_ms": 126.2362910201773,
+          "outcome": "success"
+        },
+        {
+          "index": 22,
+          "start_offset_s": 11.205954783945344,
+          "end_offset_s": 11.279705551918596,
+          "latency_ms": 73.75076797325164,
+          "outcome": "success"
+        },
+        {
+          "index": 23,
+          "start_offset_s": 11.706007894943468,
+          "end_offset_s": 11.748380180913955,
+          "latency_ms": 42.3722859704867,
+          "outcome": "success"
+        },
+        {
+          "index": 24,
+          "start_offset_s": 12.206132326973602,
+          "end_offset_s": 12.371459532994777,
+          "latency_ms": 165.3272060211748,
+          "outcome": "success"
+        },
+        {
+          "index": 25,
+          "start_offset_s": 12.70619725889992,
+          "end_offset_s": 12.881342339911498,
+          "latency_ms": 175.14508101157844,
+          "outcome": "success"
+        },
+        {
+          "index": 26,
+          "start_offset_s": 13.206273610936478,
+          "end_offset_s": 13.30236154596787,
+          "latency_ms": 96.08793503139168,
+          "outcome": "success"
+        },
+        {
+          "index": 27,
+          "start_offset_s": 13.706363303936087,
+          "end_offset_s": 13.814545426983386,
+          "latency_ms": 108.18212304729968,
+          "outcome": "success"
+        },
+        {
+          "index": 28,
+          "start_offset_s": 14.206454035942443,
+          "end_offset_s": 14.454186657909304,
+          "latency_ms": 247.7326219668612,
+          "outcome": "success"
+        },
+        {
+          "index": 29,
+          "start_offset_s": 14.70654730789829,
+          "end_offset_s": 14.829891750938259,
+          "latency_ms": 123.34444303996861,
+          "outcome": "success"
+        },
+        {
+          "index": 30,
+          "start_offset_s": 15.206637960975058,
+          "end_offset_s": 15.311763643985614,
+          "latency_ms": 105.1256830105558,
+          "outcome": "success"
+        },
+        {
+          "index": 31,
+          "start_offset_s": 15.706886042957194,
+          "end_offset_s": 15.838233247981407,
+          "latency_ms": 131.3472050242126,
+          "outcome": "success"
+        },
+        {
+          "index": 32,
+          "start_offset_s": 16.206973095890135,
+          "end_offset_s": 16.436369866947643,
+          "latency_ms": 229.3967710575089,
+          "outcome": "success"
+        },
+        {
+          "index": 33,
+          "start_offset_s": 16.707063635927625,
+          "end_offset_s": 16.814142152899876,
+          "latency_ms": 107.07851697225124,
+          "outcome": "success"
+        },
+        {
+          "index": 34,
+          "start_offset_s": 17.2071531789843,
+          "end_offset_s": 17.28773015399929,
+          "latency_ms": 80.57697501499206,
+          "outcome": "success"
+        },
+        {
+          "index": 35,
+          "start_offset_s": 17.70723746996373,
+          "end_offset_s": 17.80451603292022,
+          "latency_ms": 97.27856295648962,
+          "outcome": "success"
+        },
+        {
+          "index": 36,
+          "start_offset_s": 18.207327669952065,
+          "end_offset_s": 18.31584444595501,
+          "latency_ms": 108.51677600294352,
+          "outcome": "success"
+        },
+        {
+          "index": 37,
+          "start_offset_s": 18.70739885198418,
+          "end_offset_s": 18.8240877809003,
+          "latency_ms": 116.68892891611904,
+          "outcome": "success"
+        },
+        {
+          "index": 38,
+          "start_offset_s": 19.207605834002607,
+          "end_offset_s": 19.285665901959874,
+          "latency_ms": 78.06006795726717,
+          "outcome": "success"
+        },
+        {
+          "index": 39,
+          "start_offset_s": 19.707687445916235,
+          "end_offset_s": 19.83172614092473,
+          "latency_ms": 124.03869500849396,
+          "outcome": "success"
+        },
+        {
+          "index": 40,
+          "start_offset_s": 20.20783154689707,
+          "end_offset_s": 20.401552666909993,
+          "latency_ms": 193.72112001292408,
+          "outcome": "success"
+        },
+        {
+          "index": 41,
+          "start_offset_s": 20.707879817928188,
+          "end_offset_s": 20.814074707916006,
+          "latency_ms": 106.1948899878189,
+          "outcome": "success"
+        },
+        {
+          "index": 42,
+          "start_offset_s": 21.207966188900173,
+          "end_offset_s": 21.282068279921077,
+          "latency_ms": 74.10209102090448,
+          "outcome": "success"
+        },
+        {
+          "index": 43,
+          "start_offset_s": 21.708066019928083,
+          "end_offset_s": 21.823599310941063,
+          "latency_ms": 115.53329101298004,
+          "outcome": "success"
+        },
+        {
+          "index": 44,
+          "start_offset_s": 22.208182790898718,
+          "end_offset_s": 22.333612595917657,
+          "latency_ms": 125.42980501893908,
+          "outcome": "success"
+        },
+        {
+          "index": 45,
+          "start_offset_s": 22.70827111089602,
+          "end_offset_s": 22.817720972932875,
+          "latency_ms": 109.44986203685403,
+          "outcome": "success"
+        },
+        {
+          "index": 46,
+          "start_offset_s": 23.210701228003018,
+          "end_offset_s": 23.295747880940326,
+          "latency_ms": 85.04665293730795,
+          "outcome": "success"
+        },
+        {
+          "index": 47,
+          "start_offset_s": 23.71078312699683,
+          "end_offset_s": 23.80238292296417,
+          "latency_ms": 91.59979596734047,
+          "outcome": "success"
+        },
+        {
+          "index": 48,
+          "start_offset_s": 24.21086768794339,
+          "end_offset_s": 24.536226601921953,
+          "latency_ms": 325.35891397856176,
+          "outcome": "success"
+        },
+        {
+          "index": 49,
+          "start_offset_s": 24.710946077946573,
+          "end_offset_s": 24.82817452994641,
+          "latency_ms": 117.22845199983567,
+          "outcome": "success"
+        },
+        {
+          "index": 50,
+          "start_offset_s": 25.211035648942925,
+          "end_offset_s": 25.359264100901783,
+          "latency_ms": 148.22845195885748,
+          "outcome": "success"
+        },
+        {
+          "index": 51,
+          "start_offset_s": 25.71109862800222,
+          "end_offset_s": 25.897699330933392,
+          "latency_ms": 186.60070293117315,
+          "outcome": "success"
+        },
+        {
+          "index": 52,
+          "start_offset_s": 26.211190898902714,
+          "end_offset_s": 26.321676306892186,
+          "latency_ms": 110.48540798947215,
+          "outcome": "success"
+        },
+        {
+          "index": 53,
+          "start_offset_s": 26.711295107961632,
+          "end_offset_s": 26.81111146695912,
+          "latency_ms": 99.81635899748653,
+          "outcome": "success"
+        },
+        {
+          "index": 54,
+          "start_offset_s": 27.21138420794159,
+          "end_offset_s": 27.329773857956752,
+          "latency_ms": 118.38965001516044,
+          "outcome": "success"
+        },
+        {
+          "index": 55,
+          "start_offset_s": 27.712144821998663,
+          "end_offset_s": 27.819843571982346,
+          "latency_ms": 107.69874998368323,
+          "outcome": "success"
+        },
+        {
+          "index": 56,
+          "start_offset_s": 28.212226032977924,
+          "end_offset_s": 28.343319093924947,
+          "latency_ms": 131.09306094702333,
+          "outcome": "success"
+        },
+        {
+          "index": 57,
+          "start_offset_s": 28.712315701995976,
+          "end_offset_s": 28.79174603894353,
+          "latency_ms": 79.43033694755286,
+          "outcome": "success"
+        },
+        {
+          "index": 58,
+          "start_offset_s": 29.21240754192695,
+          "end_offset_s": 29.303177841939032,
+          "latency_ms": 90.77030001208186,
+          "outcome": "success"
+        },
+        {
+          "index": 59,
+          "start_offset_s": 29.71249032090418,
+          "end_offset_s": 29.851750275003724,
+          "latency_ms": 139.2599540995434,
+          "outcome": "success"
+        },
+        {
+          "index": 60,
+          "start_offset_s": 30.21262308990117,
+          "end_offset_s": 30.317593371961266,
+          "latency_ms": 104.97028206009418,
+          "outcome": "success"
+        },
+        {
+          "index": 61,
+          "start_offset_s": 30.713172031915747,
+          "end_offset_s": 30.807743695913814,
+          "latency_ms": 94.57166399806738,
+          "outcome": "success"
+        },
+        {
+          "index": 62,
+          "start_offset_s": 31.213255570968613,
+          "end_offset_s": 31.32571724092122,
+          "latency_ms": 112.46166995260864,
+          "outcome": "success"
+        },
+        {
+          "index": 63,
+          "start_offset_s": 31.713330789934844,
+          "end_offset_s": 31.7695970259374,
+          "latency_ms": 56.26623600255698,
+          "outcome": "success"
+        },
+        {
+          "index": 64,
+          "start_offset_s": 32.21343904000241,
+          "end_offset_s": 32.33086856093723,
+          "latency_ms": 117.42952093482018,
+          "outcome": "success"
+        },
+        {
+          "index": 65,
+          "start_offset_s": 32.715193308889866,
+          "end_offset_s": 32.8318409769563,
+          "latency_ms": 116.64766806643456,
+          "outcome": "success"
+        },
+        {
+          "index": 66,
+          "start_offset_s": 33.21526827698108,
+          "end_offset_s": 33.31423223891761,
+          "latency_ms": 98.96396193653345,
+          "outcome": "success"
+        },
+        {
+          "index": 67,
+          "start_offset_s": 33.71537464496214,
+          "end_offset_s": 33.823443777975626,
+          "latency_ms": 108.06913301348686,
+          "outcome": "success"
+        },
+        {
+          "index": 68,
+          "start_offset_s": 34.215474023949355,
+          "end_offset_s": 34.30595080193598,
+          "latency_ms": 90.47677798662335,
+          "outcome": "success"
+        },
+        {
+          "index": 69,
+          "start_offset_s": 34.71556748193689,
+          "end_offset_s": 34.81085785094183,
+          "latency_ms": 95.29036900494248,
+          "outcome": "success"
+        },
+        {
+          "index": 70,
+          "start_offset_s": 35.21565385092981,
+          "end_offset_s": 35.32079255289864,
+          "latency_ms": 105.13870196882635,
+          "outcome": "success"
+        },
+        {
+          "index": 71,
+          "start_offset_s": 35.71571833791677,
+          "end_offset_s": 35.79398979595862,
+          "latency_ms": 78.2714580418542,
+          "outcome": "success"
+        },
+        {
+          "index": 72,
+          "start_offset_s": 36.21580086799804,
+          "end_offset_s": 36.342651299899444,
+          "latency_ms": 126.85043190140277,
+          "outcome": "success"
+        },
+        {
+          "index": 73,
+          "start_offset_s": 36.71588976494968,
+          "end_offset_s": 36.82460741093382,
+          "latency_ms": 108.71764598414302,
+          "outcome": "success"
+        },
+        {
+          "index": 74,
+          "start_offset_s": 37.21595494297799,
+          "end_offset_s": 37.30949332099408,
+          "latency_ms": 93.53837801609188,
+          "outcome": "success"
+        },
+        {
+          "index": 75,
+          "start_offset_s": 37.71604138996918,
+          "end_offset_s": 37.82109837292228,
+          "latency_ms": 105.0569829531014,
+          "outcome": "success"
+        },
+        {
+          "index": 76,
+          "start_offset_s": 38.21611974888947,
+          "end_offset_s": 38.48465400189161,
+          "latency_ms": 268.5342530021444,
+          "outcome": "success"
+        },
+        {
+          "index": 77,
+          "start_offset_s": 38.71621642599348,
+          "end_offset_s": 38.84262367791962,
+          "latency_ms": 126.407251926139,
+          "outcome": "success"
+        },
+        {
+          "index": 78,
+          "start_offset_s": 39.21708496892825,
+          "end_offset_s": 39.298210026929155,
+          "latency_ms": 81.1250580009073,
+          "outcome": "success"
+        },
+        {
+          "index": 79,
+          "start_offset_s": 39.71717211592477,
+          "end_offset_s": 39.83860251388978,
+          "latency_ms": 121.43039796501398,
+          "outcome": "success"
+        }
+      ],
+      "interactive_ok": 80,
+      "interactive_fail": 0,
+      "interactive_p95_ms": 287.8885139944032,
+      "interactive_max_ms": 701.7196170054376
+    },
+    {
+      "binary": "excess-qualified",
+      "diagnostics": false,
+      "qos_step": false,
+      "udp_outage": false,
+      "case": "quic-combined-down-qualified-variable-loss-only-0906",
+      "status": "ok",
+      "bulk_status": "ok",
+      "bulk_bytes": 822316612,
+      "bulk_time_s": 40.01372002903372,
+      "bulk_goodput_mbps": 164.40693070343508,
+      "bulk_first_body_s": 0.5639607219491154,
+      "bulk_max_read_gap_s": 0.5065884980140254,
+      "bulk_max_gap_start_s": 1.367469758959487,
+      "bulk_max_gap_end_s": 1.8740582569735125,
+      "bulk_interval_goodput_raw_mbps": [
+        5.837,
+        142.08,
+        434.686,
+        218.008,
+        173.731,
+        167.728,
+        100.996,
+        189.644,
+        123.023,
+        232.585,
+        164.914,
+        174.927,
+        151.327,
+        154.543,
+        161.526,
+        214.892,
+        178.41,
+        207.948,
+        154.33,
+        108.552,
+        130.112,
+        155.736,
+        140.994,
+        172.739,
+        128.612,
+        202.385,
+        162.454,
+        175.215,
+        127.292,
+        184.321,
+        149.785,
+        159.342,
+        132.951,
+        192.965,
+        165.949,
+        148.771,
+        172.928,
+        182.82,
+        137.021,
+        95.929
+      ],
+      "interactive_attempt_series": [
+        {
+          "index": 0,
+          "start_offset_s": 0.13395253103226423,
+          "end_offset_s": 0.25190313602797687,
+          "latency_ms": 117.95060499571264,
+          "outcome": "success"
+        },
+        {
+          "index": 1,
+          "start_offset_s": 0.5003592600114644,
+          "end_offset_s": 0.5637624410446733,
+          "latency_ms": 63.403181033208966,
+          "outcome": "success"
+        },
+        {
+          "index": 2,
+          "start_offset_s": 1.000451895990409,
+          "end_offset_s": 1.1653584060259163,
+          "latency_ms": 164.90651003550738,
+          "outcome": "success"
+        },
+        {
+          "index": 3,
+          "start_offset_s": 1.500532103003934,
+          "end_offset_s": 1.7392534019891173,
+          "latency_ms": 238.72129898518324,
+          "outcome": "success"
+        },
+        {
+          "index": 4,
+          "start_offset_s": 2.00062311894726,
+          "end_offset_s": 2.226099102990702,
+          "latency_ms": 225.4759840434417,
+          "outcome": "success"
+        },
+        {
+          "index": 5,
+          "start_offset_s": 2.5007041359785944,
+          "end_offset_s": 2.75261257099919,
+          "latency_ms": 251.9084350205958,
+          "outcome": "success"
+        },
+        {
+          "index": 6,
+          "start_offset_s": 3.000794832012616,
+          "end_offset_s": 3.1044802350224927,
+          "latency_ms": 103.68540300987661,
+          "outcome": "success"
+        },
+        {
+          "index": 7,
+          "start_offset_s": 3.500830458011478,
+          "end_offset_s": 3.633027656003833,
+          "latency_ms": 132.19719799235463,
+          "outcome": "success"
+        },
+        {
+          "index": 8,
+          "start_offset_s": 4.0009150030091405,
+          "end_offset_s": 4.126409378950484,
+          "latency_ms": 125.4943759413436,
+          "outcome": "success"
+        },
+        {
+          "index": 9,
+          "start_offset_s": 4.500989489955828,
+          "end_offset_s": 4.620112973032519,
+          "latency_ms": 119.12348307669163,
+          "outcome": "success"
+        },
+        {
+          "index": 10,
+          "start_offset_s": 5.001086415955797,
+          "end_offset_s": 5.13401810801588,
+          "latency_ms": 132.93169206008315,
+          "outcome": "success"
+        },
+        {
+          "index": 11,
+          "start_offset_s": 5.501183321932331,
+          "end_offset_s": 5.617460347013548,
+          "latency_ms": 116.27702508121729,
+          "outcome": "success"
+        },
+        {
+          "index": 12,
+          "start_offset_s": 6.001260997960344,
+          "end_offset_s": 6.122802776983008,
+          "latency_ms": 121.54177902266383,
+          "outcome": "success"
+        },
+        {
+          "index": 13,
+          "start_offset_s": 6.50134179298766,
+          "end_offset_s": 6.818903503939509,
+          "latency_ms": 317.5617109518498,
+          "outcome": "success"
+        },
+        {
+          "index": 14,
+          "start_offset_s": 7.001446319045499,
+          "end_offset_s": 7.111618964001536,
+          "latency_ms": 110.1726449560374,
+          "outcome": "success"
+        },
+        {
+          "index": 15,
+          "start_offset_s": 7.501508574001491,
+          "end_offset_s": 7.735037510981783,
+          "latency_ms": 233.5289369802922,
+          "outcome": "success"
+        },
+        {
+          "index": 16,
+          "start_offset_s": 8.001594519941136,
+          "end_offset_s": 8.106988132931292,
+          "latency_ms": 105.39361299015582,
+          "outcome": "success"
+        },
+        {
+          "index": 17,
+          "start_offset_s": 8.501685714931227,
+          "end_offset_s": 8.610595252015628,
+          "latency_ms": 108.90953708440065,
+          "outcome": "success"
+        },
+        {
+          "index": 18,
+          "start_offset_s": 9.001768560963683,
+          "end_offset_s": 9.103113017976284,
+          "latency_ms": 101.3444570126012,
+          "outcome": "success"
+        },
+        {
+          "index": 19,
+          "start_offset_s": 9.501844075042754,
+          "end_offset_s": 9.637155554024503,
+          "latency_ms": 135.31147898174822,
+          "outcome": "success"
+        },
+        {
+          "index": 20,
+          "start_offset_s": 10.001937760971487,
+          "end_offset_s": 10.096364813041873,
+          "latency_ms": 94.42705207038671,
+          "outcome": "success"
+        },
+        {
+          "index": 21,
+          "start_offset_s": 10.502010555937886,
+          "end_offset_s": 10.606826446019113,
+          "latency_ms": 104.81589008122683,
+          "outcome": "success"
+        },
+        {
+          "index": 22,
+          "start_offset_s": 11.003469249932095,
+          "end_offset_s": 11.25158340902999,
+          "latency_ms": 248.11415909789503,
+          "outcome": "success"
+        },
+        {
+          "index": 23,
+          "start_offset_s": 11.503552334033884,
+          "end_offset_s": 11.60636733204592,
+          "latency_ms": 102.81499801203609,
+          "outcome": "success"
+        },
+        {
+          "index": 24,
+          "start_offset_s": 12.003623779979534,
+          "end_offset_s": 12.110691005014814,
+          "latency_ms": 107.06722503527999,
+          "outcome": "success"
+        },
+        {
+          "index": 25,
+          "start_offset_s": 12.50370030500926,
+          "end_offset_s": 12.609162439941429,
+          "latency_ms": 105.46213493216783,
+          "outcome": "success"
+        },
+        {
+          "index": 26,
+          "start_offset_s": 13.003809090005234,
+          "end_offset_s": 13.166852797032334,
+          "latency_ms": 163.04370702710003,
+          "outcome": "success"
+        },
+        {
+          "index": 27,
+          "start_offset_s": 13.503883264027536,
+          "end_offset_s": 13.614461631979793,
+          "latency_ms": 110.5783679522574,
+          "outcome": "success"
+        },
+        {
+          "index": 28,
+          "start_offset_s": 14.004001128021628,
+          "end_offset_s": 14.072876885998994,
+          "latency_ms": 68.87575797736645,
+          "outcome": "success"
+        },
+        {
+          "index": 29,
+          "start_offset_s": 14.504066852969117,
+          "end_offset_s": 14.577984942006879,
+          "latency_ms": 73.91808903776109,
+          "outcome": "success"
+        },
+        {
+          "index": 30,
+          "start_offset_s": 15.004174727015197,
+          "end_offset_s": 15.116636335966177,
+          "latency_ms": 112.46160895098001,
+          "outcome": "success"
+        },
+        {
+          "index": 31,
+          "start_offset_s": 15.504254780011252,
+          "end_offset_s": 15.634995169006288,
+          "latency_ms": 130.74038899503648,
+          "outcome": "success"
+        },
+        {
+          "index": 32,
+          "start_offset_s": 16.004479064955376,
+          "end_offset_s": 16.116124739986844,
+          "latency_ms": 111.64567503146827,
+          "outcome": "success"
+        },
+        {
+          "index": 33,
+          "start_offset_s": 16.504541979986243,
+          "end_offset_s": 16.623128709034063,
+          "latency_ms": 118.58672904781997,
+          "outcome": "success"
+        },
+        {
+          "index": 34,
+          "start_offset_s": 17.004635044024326,
+          "end_offset_s": 17.15658352896571,
+          "latency_ms": 151.9484849413857,
+          "outcome": "success"
+        },
+        {
+          "index": 35,
+          "start_offset_s": 17.50469588697888,
+          "end_offset_s": 17.626699759042822,
+          "latency_ms": 122.00387206394225,
+          "outcome": "success"
+        },
+        {
+          "index": 36,
+          "start_offset_s": 18.00478112103883,
+          "end_offset_s": 18.12732552504167,
+          "latency_ms": 122.54440400283784,
+          "outcome": "success"
+        },
+        {
+          "index": 37,
+          "start_offset_s": 18.5048546140315,
+          "end_offset_s": 18.60725799796637,
+          "latency_ms": 102.40338393487036,
+          "outcome": "success"
+        },
+        {
+          "index": 38,
+          "start_offset_s": 19.00494451704435,
+          "end_offset_s": 19.13632965902798,
+          "latency_ms": 131.38514198362827,
+          "outcome": "success"
+        },
+        {
+          "index": 39,
+          "start_offset_s": 19.50502324104309,
+          "end_offset_s": 19.618521686992608,
+          "latency_ms": 113.49844594951719,
+          "outcome": "success"
+        },
+        {
+          "index": 40,
+          "start_offset_s": 20.005119074950926,
+          "end_offset_s": 20.315221884986386,
+          "latency_ms": 310.1028100354597,
+          "outcome": "success"
+        },
+        {
+          "index": 41,
+          "start_offset_s": 20.505144455935806,
+          "end_offset_s": 20.79071319894865,
+          "latency_ms": 285.5687430128455,
+          "outcome": "success"
+        },
+        {
+          "index": 42,
+          "start_offset_s": 21.00709631294012,
+          "end_offset_s": 21.329250621027313,
+          "latency_ms": 322.1543080871925,
+          "outcome": "success"
+        },
+        {
+          "index": 43,
+          "start_offset_s": 21.50687456293963,
+          "end_offset_s": 21.627289535012096,
+          "latency_ms": 120.41497207246721,
+          "outcome": "success"
+        },
+        {
+          "index": 44,
+          "start_offset_s": 22.006959464983083,
+          "end_offset_s": 22.254063408006914,
+          "latency_ms": 247.10394302383065,
+          "outcome": "success"
+        },
+        {
+          "index": 45,
+          "start_offset_s": 22.507052868022583,
+          "end_offset_s": 22.625621446990408,
+          "latency_ms": 118.56857896782458,
+          "outcome": "success"
+        },
+        {
+          "index": 46,
+          "start_offset_s": 23.007133490988053,
+          "end_offset_s": 23.110221188981086,
+          "latency_ms": 103.08769799303263,
+          "outcome": "success"
+        },
+        {
+          "index": 47,
+          "start_offset_s": 23.50721951504238,
+          "end_offset_s": 23.646281815948896,
+          "latency_ms": 139.0623009065166,
+          "outcome": "success"
+        },
+        {
+          "index": 48,
+          "start_offset_s": 24.007310285931453,
+          "end_offset_s": 24.131257349974476,
+          "latency_ms": 123.94706404302269,
+          "outcome": "success"
+        },
+        {
+          "index": 49,
+          "start_offset_s": 24.50741437904071,
+          "end_offset_s": 24.792414888041094,
+          "latency_ms": 285.0005090003833,
+          "outcome": "success"
+        },
+        {
+          "index": 50,
+          "start_offset_s": 25.007513251970522,
+          "end_offset_s": 25.091074554016814,
+          "latency_ms": 83.56130204629153,
+          "outcome": "success"
+        },
+        {
+          "index": 51,
+          "start_offset_s": 25.507599123986438,
+          "end_offset_s": 25.621780673973262,
+          "latency_ms": 114.1815499868244,
+          "outcome": "success"
+        },
+        {
+          "index": 52,
+          "start_offset_s": 26.00764510699082,
+          "end_offset_s": 26.12576258298941,
+          "latency_ms": 118.1174759985879,
+          "outcome": "success"
+        },
+        {
+          "index": 53,
+          "start_offset_s": 26.507718047942035,
+          "end_offset_s": 26.769899917999282,
+          "latency_ms": 262.1818700572476,
+          "outcome": "success"
+        },
+        {
+          "index": 54,
+          "start_offset_s": 27.00778701994568,
+          "end_offset_s": 27.126732381992042,
+          "latency_ms": 118.94536204636097,
+          "outcome": "success"
+        },
+        {
+          "index": 55,
+          "start_offset_s": 27.50787130300887,
+          "end_offset_s": 27.629792772000656,
+          "latency_ms": 121.92146899178624,
+          "outcome": "success"
+        },
+        {
+          "index": 56,
+          "start_offset_s": 28.00795105402358,
+          "end_offset_s": 28.102371686021797,
+          "latency_ms": 94.4206319982186,
+          "outcome": "success"
+        },
+        {
+          "index": 57,
+          "start_offset_s": 28.50803809601348,
+          "end_offset_s": 28.63754079595674,
+          "latency_ms": 129.50269994325936,
+          "outcome": "success"
+        },
+        {
+          "index": 58,
+          "start_offset_s": 29.008135749027133,
+          "end_offset_s": 29.121986425947398,
+          "latency_ms": 113.85067692026496,
+          "outcome": "success"
+        },
+        {
+          "index": 59,
+          "start_offset_s": 29.50820326001849,
+          "end_offset_s": 29.627592623932287,
+          "latency_ms": 119.38936391379684,
+          "outcome": "success"
+        },
+        {
+          "index": 60,
+          "start_offset_s": 30.008365561952814,
+          "end_offset_s": 30.17155377997551,
+          "latency_ms": 163.18821802269667,
+          "outcome": "success"
+        },
+        {
+          "index": 61,
+          "start_offset_s": 30.508456893032417,
+          "end_offset_s": 30.633806964964606,
+          "latency_ms": 125.35007193218917,
+          "outcome": "success"
+        },
+        {
+          "index": 62,
+          "start_offset_s": 31.008518944960088,
+          "end_offset_s": 31.105100410990417,
+          "latency_ms": 96.58146603032947,
+          "outcome": "success"
+        },
+        {
+          "index": 63,
+          "start_offset_s": 31.508598246029578,
+          "end_offset_s": 31.608593613957055,
+          "latency_ms": 99.99536792747676,
+          "outcome": "success"
+        },
+        {
+          "index": 64,
+          "start_offset_s": 32.008694657008164,
+          "end_offset_s": 32.26261374296155,
+          "latency_ms": 253.91908595338464,
+          "outcome": "success"
+        },
+        {
+          "index": 65,
+          "start_offset_s": 32.50876739900559,
+          "end_offset_s": 32.64344042097218,
+          "latency_ms": 134.67302196659148,
+          "outcome": "success"
+        },
+        {
+          "index": 66,
+          "start_offset_s": 33.00886120996438,
+          "end_offset_s": 33.12772382993717,
+          "latency_ms": 118.8626199727878,
+          "outcome": "success"
+        },
+        {
+          "index": 67,
+          "start_offset_s": 33.508947141002864,
+          "end_offset_s": 33.7034250110155,
+          "latency_ms": 194.4778700126335,
+          "outcome": "success"
+        },
+        {
+          "index": 68,
+          "start_offset_s": 34.009047031984664,
+          "end_offset_s": 34.12989722494967,
+          "latency_ms": 120.85019296500832,
+          "outcome": "success"
+        },
+        {
+          "index": 69,
+          "start_offset_s": 34.509111822000705,
+          "end_offset_s": 34.7270393850049,
+          "latency_ms": 217.9275630041957,
+          "outcome": "success"
+        },
+        {
+          "index": 70,
+          "start_offset_s": 35.009215484024025,
+          "end_offset_s": 35.25555051898118,
+          "latency_ms": 246.33503495715559,
+          "outcome": "success"
+        },
+        {
+          "index": 71,
+          "start_offset_s": 35.50930018397048,
+          "end_offset_s": 35.60446179204155,
+          "latency_ms": 95.16160807106644,
+          "outcome": "success"
+        },
+        {
+          "index": 72,
+          "start_offset_s": 36.00937782402616,
+          "end_offset_s": 36.12250652804505,
+          "latency_ms": 113.12870401889086,
+          "outcome": "success"
+        },
+        {
+          "index": 73,
+          "start_offset_s": 36.50945266499184,
+          "end_offset_s": 36.60820647503715,
+          "latency_ms": 98.75381004530936,
+          "outcome": "success"
+        },
+        {
+          "index": 74,
+          "start_offset_s": 37.00953222496901,
+          "end_offset_s": 37.29725379997399,
+          "latency_ms": 287.72157500497997,
+          "outcome": "success"
+        },
+        {
+          "index": 75,
+          "start_offset_s": 37.509617225965485,
+          "end_offset_s": 37.71188495703973,
+          "latency_ms": 202.26773107424378,
+          "outcome": "success"
+        },
+        {
+          "index": 76,
+          "start_offset_s": 38.0097132360097,
+          "end_offset_s": 38.130023816018365,
+          "latency_ms": 120.31058000866324,
+          "outcome": "success"
+        },
+        {
+          "index": 77,
+          "start_offset_s": 38.509790215990506,
+          "end_offset_s": 38.749038964975625,
+          "latency_ms": 239.24874898511916,
+          "outcome": "success"
+        },
+        {
+          "index": 78,
+          "start_offset_s": 39.00986939598806,
+          "end_offset_s": 39.285417611012235,
+          "latency_ms": 275.54821502417326,
+          "outcome": "success"
+        },
+        {
+          "index": 79,
+          "start_offset_s": 39.50994743593037,
+          "end_offset_s": 39.642976798000745,
+          "latency_ms": 133.0293620703742,
+          "outcome": "success"
+        }
+      ],
+      "interactive_ok": 80,
+      "interactive_fail": 0,
+      "interactive_p95_ms": 285.5687430128455,
+      "interactive_max_ms": 322.1543080871925
+    },
+    {
+      "binary": "raw",
+      "diagnostics": false,
+      "qos_step": false,
+      "udp_outage": false,
+      "case": "raw-combined-down-matched-variable-loss-controls-0906",
+      "status": "ok",
+      "bulk_status": "ok",
+      "bulk_bytes": 17175104,
+      "bulk_time_s": 40.139566011028364,
+      "bulk_goodput_mbps": 3.423077169350786,
+      "bulk_first_body_s": 0.5613365810131654,
+      "bulk_max_read_gap_s": 0.36443917301949114,
+      "bulk_max_gap_start_s": 39.42078186001163,
+      "bulk_max_gap_end_s": 39.78522103303112,
+      "bulk_interval_goodput_raw_mbps": [
+        1.402,
+        4.715,
+        4.379,
+        4.054,
+        3.753,
+        3.498,
+        4.193,
+        3.081,
+        2.711,
+        2.85,
+        2.317,
+        2.803,
+        2.803,
+        2.548,
+        3.637,
+        2.919,
+        2.78,
+        3.035,
+        2.826,
+        2.734,
+        2.386,
+        3.058,
+        2.525,
+        2.34,
+        2.826,
+        2.386,
+        2.525,
+        3.174,
+        4.124,
+        5.074,
+        3.939,
+        4.703,
+        4.054,
+        4.819,
+        4.147,
+        2.595,
+        3.846,
+        4.703,
+        4.286,
+        6.325
+      ],
+      "interactive_attempt_series": [
+        {
+          "index": 0,
+          "start_offset_s": 0.1040639040293172,
+          "end_offset_s": 0.22384423797484487,
+          "latency_ms": 119.78033394552767,
+          "outcome": "success"
+        },
+        {
+          "index": 1,
+          "start_offset_s": 0.5004790520761162,
+          "end_offset_s": 0.5964167739730328,
+          "latency_ms": 95.93772189691663,
+          "outcome": "success"
+        },
+        {
+          "index": 2,
+          "start_offset_s": 1.0005634530680254,
+          "end_offset_s": 1.0657761379843578,
+          "latency_ms": 65.21268491633236,
+          "outcome": "success"
+        },
+        {
+          "index": 3,
+          "start_offset_s": 1.5006137420423329,
+          "end_offset_s": 1.6055192910134792,
+          "latency_ms": 104.90554897114635,
+          "outcome": "success"
+        },
+        {
+          "index": 4,
+          "start_offset_s": 2.0007133510662243,
+          "end_offset_s": 2.079607794061303,
+          "latency_ms": 78.89444299507886,
+          "outcome": "success"
+        },
+        {
+          "index": 5,
+          "start_offset_s": 2.5007849710527807,
+          "end_offset_s": 2.6025660700397566,
+          "latency_ms": 101.78109898697585,
+          "outcome": "success"
+        },
+        {
+          "index": 6,
+          "start_offset_s": 3.00088546006009,
+          "end_offset_s": 3.1073484889930114,
+          "latency_ms": 106.46302893292159,
+          "outcome": "success"
+        },
+        {
+          "index": 7,
+          "start_offset_s": 3.500980030046776,
+          "end_offset_s": 3.5885192790301517,
+          "latency_ms": 87.53924898337573,
+          "outcome": "success"
+        },
+        {
+          "index": 8,
+          "start_offset_s": 4.001042279996909,
+          "end_offset_s": 4.091656896984205,
+          "latency_ms": 90.61461698729545,
+          "outcome": "success"
+        },
+        {
+          "index": 9,
+          "start_offset_s": 4.501140499021858,
+          "end_offset_s": 4.616651716060005,
+          "latency_ms": 115.51121703814715,
+          "outcome": "success"
+        },
+        {
+          "index": 10,
+          "start_offset_s": 5.001226190011948,
+          "end_offset_s": 5.110710086999461,
+          "latency_ms": 109.48389698751271,
+          "outcome": "success"
+        },
+        {
+          "index": 11,
+          "start_offset_s": 5.501313969027251,
+          "end_offset_s": 5.593769418075681,
+          "latency_ms": 92.45544904842973,
+          "outcome": "success"
+        },
+        {
+          "index": 12,
+          "start_offset_s": 6.001397627056576,
+          "end_offset_s": 6.087290265015326,
+          "latency_ms": 85.89263795875013,
+          "outcome": "success"
+        },
+        {
+          "index": 13,
+          "start_offset_s": 6.501502176048234,
+          "end_offset_s": 6.567368787014857,
+          "latency_ms": 65.86661096662283,
+          "outcome": "success"
+        },
+        {
+          "index": 14,
+          "start_offset_s": 7.001579986070283,
+          "end_offset_s": 7.099361289059743,
+          "latency_ms": 97.78130298946053,
+          "outcome": "success"
+        },
+        {
+          "index": 15,
+          "start_offset_s": 7.501659985049628,
+          "end_offset_s": 8.234858231036924,
+          "latency_ms": 733.1982459872961,
+          "outcome": "success"
+        },
+        {
+          "index": 16,
+          "start_offset_s": 8.234878691029735,
+          "end_offset_s": 8.373147933045402,
+          "latency_ms": 138.26924201566726,
+          "outcome": "success"
+        },
+        {
+          "index": 17,
+          "start_offset_s": 8.734966270043515,
+          "end_offset_s": 8.851922016008757,
+          "latency_ms": 116.95574596524239,
+          "outcome": "success"
+        },
+        {
+          "index": 18,
+          "start_offset_s": 9.235055650002323,
+          "end_offset_s": 9.316791311022826,
+          "latency_ms": 81.73566102050245,
+          "outcome": "success"
+        },
+        {
+          "index": 19,
+          "start_offset_s": 9.735150239081122,
+          "end_offset_s": 10.168434011982754,
+          "latency_ms": 433.2837729016319,
+          "outcome": "success"
+        },
+        {
+          "index": 20,
+          "start_offset_s": 10.235238846973516,
+          "end_offset_s": 10.345662150997669,
+          "latency_ms": 110.42330402415246,
+          "outcome": "success"
+        },
+        {
+          "index": 21,
+          "start_offset_s": 10.735347095993347,
+          "end_offset_s": 11.141975680016913,
+          "latency_ms": 406.62858402356505,
+          "outcome": "success"
+        },
+        {
+          "index": 22,
+          "start_offset_s": 11.235449846019037,
+          "end_offset_s": 11.33790642907843,
+          "latency_ms": 102.45658305939287,
+          "outcome": "success"
+        },
+        {
+          "index": 23,
+          "start_offset_s": 11.735543254995719,
+          "end_offset_s": 11.823353933985345,
+          "latency_ms": 87.81067898962647,
+          "outcome": "success"
+        },
+        {
+          "index": 24,
+          "start_offset_s": 12.235614213044755,
+          "end_offset_s": 12.331016111071222,
+          "latency_ms": 95.40189802646637,
+          "outcome": "success"
+        },
+        {
+          "index": 25,
+          "start_offset_s": 12.735698132077232,
+          "end_offset_s": 12.826561352005228,
+          "latency_ms": 90.8632199279964,
+          "outcome": "success"
+        },
+        {
+          "index": 26,
+          "start_offset_s": 13.235770871047862,
+          "end_offset_s": 13.334241759032011,
+          "latency_ms": 98.47088798414916,
+          "outcome": "success"
+        },
+        {
+          "index": 27,
+          "start_offset_s": 13.735851290053688,
+          "end_offset_s": 13.860179563052952,
+          "latency_ms": 124.3282729992643,
+          "outcome": "success"
+        },
+        {
+          "index": 28,
+          "start_offset_s": 14.235928968992084,
+          "end_offset_s": 14.333277969039045,
+          "latency_ms": 97.34900004696101,
+          "outcome": "success"
+        },
+        {
+          "index": 29,
+          "start_offset_s": 14.736018168041483,
+          "end_offset_s": 14.822719520074315,
+          "latency_ms": 86.7013520328328,
+          "outcome": "success"
+        },
+        {
+          "index": 30,
+          "start_offset_s": 15.236084716045298,
+          "end_offset_s": 15.319965971983038,
+          "latency_ms": 83.8812559377402,
+          "outcome": "success"
+        },
+        {
+          "index": 31,
+          "start_offset_s": 15.736183435074054,
+          "end_offset_s": 15.809083880041726,
+          "latency_ms": 72.90044496767223,
+          "outcome": "success"
+        },
+        {
+          "index": 32,
+          "start_offset_s": 16.236267494037747,
+          "end_offset_s": 16.35121589701157,
+          "latency_ms": 114.94840297382325,
+          "outcome": "success"
+        },
+        {
+          "index": 33,
+          "start_offset_s": 16.73635656305123,
+          "end_offset_s": 16.81203845597338,
+          "latency_ms": 75.68189292214811,
+          "outcome": "success"
+        },
+        {
+          "index": 34,
+          "start_offset_s": 17.236445692018606,
+          "end_offset_s": 17.30646343808621,
+          "latency_ms": 70.01774606760591,
+          "outcome": "success"
+        },
+        {
+          "index": 35,
+          "start_offset_s": 17.736544511048123,
+          "end_offset_s": 17.815075381076895,
+          "latency_ms": 78.53087002877146,
+          "outcome": "success"
+        },
+        {
+          "index": 36,
+          "start_offset_s": 18.236628098995425,
+          "end_offset_s": 18.32394318608567,
+          "latency_ms": 87.31508709024638,
+          "outcome": "success"
+        },
+        {
+          "index": 37,
+          "start_offset_s": 18.736711138975807,
+          "end_offset_s": 18.82205287204124,
+          "latency_ms": 85.3417330654338,
+          "outcome": "success"
+        },
+        {
+          "index": 38,
+          "start_offset_s": 19.236797617049888,
+          "end_offset_s": 19.350001967977732,
+          "latency_ms": 113.20435092784464,
+          "outcome": "success"
+        },
+        {
+          "index": 39,
+          "start_offset_s": 19.73688341502566,
+          "end_offset_s": 19.82718724105507,
+          "latency_ms": 90.30382602941245,
+          "outcome": "success"
+        },
+        {
+          "index": 40,
+          "start_offset_s": 20.236965273041278,
+          "end_offset_s": 20.304153061006218,
+          "latency_ms": 67.18778796494007,
+          "outcome": "success"
+        },
+        {
+          "index": 41,
+          "start_offset_s": 20.73704781208653,
+          "end_offset_s": 21.133667040034197,
+          "latency_ms": 396.61922794766724,
+          "outcome": "success"
+        },
+        {
+          "index": 42,
+          "start_offset_s": 21.23713431006763,
+          "end_offset_s": 21.380286923027597,
+          "latency_ms": 143.15261295996606,
+          "outcome": "success"
+        },
+        {
+          "index": 43,
+          "start_offset_s": 21.737225288990885,
+          "end_offset_s": 21.840445006033406,
+          "latency_ms": 103.21971704252064,
+          "outcome": "success"
+        },
+        {
+          "index": 44,
+          "start_offset_s": 22.237308407085948,
+          "end_offset_s": 22.332331542042084,
+          "latency_ms": 95.02313495613635,
+          "outcome": "success"
+        },
+        {
+          "index": 45,
+          "start_offset_s": 22.73738744505681,
+          "end_offset_s": 22.853138413047418,
+          "latency_ms": 115.75096799060702,
+          "outcome": "success"
+        },
+        {
+          "index": 46,
+          "start_offset_s": 23.237475843983702,
+          "end_offset_s": 23.325826587039046,
+          "latency_ms": 88.35074305534363,
+          "outcome": "success"
+        },
+        {
+          "index": 47,
+          "start_offset_s": 23.737567931995727,
+          "end_offset_s": 23.83928893005941,
+          "latency_ms": 101.72099806368351,
+          "outcome": "success"
+        },
+        {
+          "index": 48,
+          "start_offset_s": 24.237651249975897,
+          "end_offset_s": 24.351610325975344,
+          "latency_ms": 113.95907599944621,
+          "outcome": "success"
+        },
+        {
+          "index": 49,
+          "start_offset_s": 24.737741628079675,
+          "end_offset_s": 25.17494240507949,
+          "latency_ms": 437.2007769998163,
+          "outcome": "success"
+        },
+        {
+          "index": 50,
+          "start_offset_s": 25.237800335977226,
+          "end_offset_s": 25.335959771065973,
+          "latency_ms": 98.15943508874625,
+          "outcome": "success"
+        },
+        {
+          "index": 51,
+          "start_offset_s": 25.737892184057273,
+          "end_offset_s": 25.823129657073878,
+          "latency_ms": 85.23747301660478,
+          "outcome": "success"
+        },
+        {
+          "index": 52,
+          "start_offset_s": 26.237981592072174,
+          "end_offset_s": 26.346773726050742,
+          "latency_ms": 108.79213397856802,
+          "outcome": "success"
+        },
+        {
+          "index": 53,
+          "start_offset_s": 26.73805684002582,
+          "end_offset_s": 26.81703302299138,
+          "latency_ms": 78.97618296556175,
+          "outcome": "success"
+        },
+        {
+          "index": 54,
+          "start_offset_s": 27.238139467081055,
+          "end_offset_s": 27.359875363996252,
+          "latency_ms": 121.73589691519737,
+          "outcome": "success"
+        },
+        {
+          "index": 55,
+          "start_offset_s": 27.738226145971566,
+          "end_offset_s": 27.814813783043064,
+          "latency_ms": 76.58763707149774,
+          "outcome": "success"
+        },
+        {
+          "index": 56,
+          "start_offset_s": 28.238302053068765,
+          "end_offset_s": 28.34550732607022,
+          "latency_ms": 107.20527300145477,
+          "outcome": "success"
+        },
+        {
+          "index": 57,
+          "start_offset_s": 28.73839139007032,
+          "end_offset_s": 28.80922571301926,
+          "latency_ms": 70.8343229489401,
+          "outcome": "success"
+        },
+        {
+          "index": 58,
+          "start_offset_s": 29.238474459038116,
+          "end_offset_s": 29.316132493084297,
+          "latency_ms": 77.65803404618055,
+          "outcome": "success"
+        },
+        {
+          "index": 59,
+          "start_offset_s": 29.738581437035464,
+          "end_offset_s": 29.816761936061084,
+          "latency_ms": 78.18049902562052,
+          "outcome": "success"
+        },
+        {
+          "index": 60,
+          "start_offset_s": 30.238666753983125,
+          "end_offset_s": 30.318635364994407,
+          "latency_ms": 79.96861101128161,
+          "outcome": "success"
+        },
+        {
+          "index": 61,
+          "start_offset_s": 30.73876925208606,
+          "end_offset_s": 30.82658536208328,
+          "latency_ms": 87.81610999722034,
+          "outcome": "success"
+        },
+        {
+          "index": 62,
+          "start_offset_s": 31.238851341069676,
+          "end_offset_s": 31.34684577898588,
+          "latency_ms": 107.99443791620433,
+          "outcome": "success"
+        },
+        {
+          "index": 63,
+          "start_offset_s": 31.738917167996988,
+          "end_offset_s": 31.852874394040555,
+          "latency_ms": 113.95722604356706,
+          "outcome": "success"
+        },
+        {
+          "index": 64,
+          "start_offset_s": 32.23901968507562,
+          "end_offset_s": 32.34585343603976,
+          "latency_ms": 106.83375096414238,
+          "outcome": "success"
+        },
+        {
+          "index": 65,
+          "start_offset_s": 32.73909442301374,
+          "end_offset_s": 32.86437393305823,
+          "latency_ms": 125.27951004449278,
+          "outcome": "success"
+        },
+        {
+          "index": 66,
+          "start_offset_s": 33.23916395998094,
+          "end_offset_s": 33.31156219204422,
+          "latency_ms": 72.39823206327856,
+          "outcome": "success"
+        },
+        {
+          "index": 67,
+          "start_offset_s": 33.73925575905014,
+          "end_offset_s": 33.87422079802491,
+          "latency_ms": 134.9650389747694,
+          "outcome": "success"
+        },
+        {
+          "index": 68,
+          "start_offset_s": 34.23933325603139,
+          "end_offset_s": 34.32932596898172,
+          "latency_ms": 89.99271295033395,
+          "outcome": "success"
+        },
+        {
+          "index": 69,
+          "start_offset_s": 34.73943729302846,
+          "end_offset_s": 34.811374281998724,
+          "latency_ms": 71.93698897026479,
+          "outcome": "success"
+        },
+        {
+          "index": 70,
+          "start_offset_s": 35.23953150107991,
+          "end_offset_s": 35.31658950203564,
+          "latency_ms": 77.05800095573068,
+          "outcome": "success"
+        },
+        {
+          "index": 71,
+          "start_offset_s": 35.739615548052825,
+          "end_offset_s": 35.823147491086274,
+          "latency_ms": 83.53194303344935,
+          "outcome": "success"
+        },
+        {
+          "index": 72,
+          "start_offset_s": 36.23969282605685,
+          "end_offset_s": 36.33302999101579,
+          "latency_ms": 93.33716495893896,
+          "outcome": "success"
+        },
+        {
+          "index": 73,
+          "start_offset_s": 36.73979248304386,
+          "end_offset_s": 37.150085838045925,
+          "latency_ms": 410.293355002068,
+          "outcome": "success"
+        },
+        {
+          "index": 74,
+          "start_offset_s": 37.23988812207244,
+          "end_offset_s": 37.34856156306341,
+          "latency_ms": 108.67344099096954,
+          "outcome": "success"
+        },
+        {
+          "index": 75,
+          "start_offset_s": 37.73996481706854,
+          "end_offset_s": 37.857241215067916,
+          "latency_ms": 117.27639799937606,
+          "outcome": "success"
+        },
+        {
+          "index": 76,
+          "start_offset_s": 38.24005236499943,
+          "end_offset_s": 38.35340399807319,
+          "latency_ms": 113.35163307376206,
+          "outcome": "success"
+        },
+        {
+          "index": 77,
+          "start_offset_s": 38.74014959204942,
+          "end_offset_s": 38.81453772704117,
+          "latency_ms": 74.38813499175012,
+          "outcome": "success"
+        },
+        {
+          "index": 78,
+          "start_offset_s": 39.2402116790181,
+          "end_offset_s": 39.335068933083676,
+          "latency_ms": 94.85725406557322,
+          "outcome": "success"
+        },
+        {
+          "index": 79,
+          "start_offset_s": 39.740317277028225,
+          "end_offset_s": 39.87255013897084,
+          "latency_ms": 132.23286194261163,
+          "outcome": "success"
+        }
+      ],
+      "interactive_ok": 80,
+      "interactive_fail": 0,
+      "interactive_p95_ms": 406.62858402356505,
+      "interactive_max_ms": 733.1982459872961
+    },
+    {
+      "binary": "xray",
+      "diagnostics": false,
+      "qos_step": false,
+      "udp_outage": false,
+      "case": "xray-combined-down-matched-variable-loss-controls-0906",
+      "status": "ok",
+      "bulk_status": "ok",
+      "bulk_bytes": 22976674,
+      "bulk_time_s": 40.04660986003,
+      "bulk_goodput_mbps": 4.589986334485251,
+      "bulk_first_body_s": 0.44634793302975595,
+      "bulk_max_read_gap_s": 0.9988820150028914,
+      "bulk_max_gap_start_s": 0.8208009999943897,
+      "bulk_max_gap_end_s": 1.8196830149972811,
+      "bulk_interval_goodput_raw_mbps": [
+        1.237,
+        6.505,
+        8.444,
+        7.764,
+        6.322,
+        6.6,
+        5.428,
+        5.561,
+        6.842,
+        4.005,
+        3.374,
+        2.967,
+        2.318,
+        3.049,
+        3.032,
+        3.745,
+        5.822,
+        5.886,
+        7.102,
+        5.746,
+        3.551,
+        3.94,
+        3.146,
+        3.114,
+        3.875,
+        4.783,
+        4.524,
+        6.211,
+        5.739,
+        5.951,
+        4.005,
+        4.524,
+        3.049,
+        3.226,
+        3.616,
+        3.81,
+        2.595,
+        4.589,
+        3.745,
+        4.005
+      ],
+      "interactive_attempt_series": [
+        {
+          "index": 0,
+          "start_offset_s": 0.002006612019613385,
+          "end_offset_s": 0.22096997709013522,
+          "latency_ms": 218.96336507052183,
+          "outcome": "success"
+        },
+        {
+          "index": 1,
+          "start_offset_s": 0.5004281779984012,
+          "end_offset_s": 0.6048459130106494,
+          "latency_ms": 104.41773501224816,
+          "outcome": "success"
+        },
+        {
+          "index": 2,
+          "start_offset_s": 1.0004800450988114,
+          "end_offset_s": 1.1142035000957549,
+          "latency_ms": 113.72345499694347,
+          "outcome": "success"
+        },
+        {
+          "index": 3,
+          "start_offset_s": 1.5005607010098174,
+          "end_offset_s": 1.6123933740891516,
+          "latency_ms": 111.8326730793342,
+          "outcome": "success"
+        },
+        {
+          "index": 4,
+          "start_offset_s": 2.000651988084428,
+          "end_offset_s": 2.115068659069948,
+          "latency_ms": 114.41667098551989,
+          "outcome": "success"
+        },
+        {
+          "index": 5,
+          "start_offset_s": 2.5007332250243053,
+          "end_offset_s": 2.6158447980415076,
+          "latency_ms": 115.11157301720232,
+          "outcome": "success"
+        },
+        {
+          "index": 6,
+          "start_offset_s": 3.000816471991129,
+          "end_offset_s": 3.0715376330772415,
+          "latency_ms": 70.72116108611226,
+          "outcome": "success"
+        },
+        {
+          "index": 7,
+          "start_offset_s": 3.5008897890802473,
+          "end_offset_s": 3.5909671230474487,
+          "latency_ms": 90.07733396720141,
+          "outcome": "success"
+        },
+        {
+          "index": 8,
+          "start_offset_s": 4.000958806020208,
+          "end_offset_s": 4.096887847059406,
+          "latency_ms": 95.92904103919864,
+          "outcome": "success"
+        },
+        {
+          "index": 9,
+          "start_offset_s": 4.5010524820536375,
+          "end_offset_s": 4.60562252800446,
+          "latency_ms": 104.57004595082253,
+          "outcome": "success"
+        },
+        {
+          "index": 10,
+          "start_offset_s": 5.001142568071373,
+          "end_offset_s": 5.074957269011065,
+          "latency_ms": 73.81470093969256,
+          "outcome": "success"
+        },
+        {
+          "index": 11,
+          "start_offset_s": 5.501217896002345,
+          "end_offset_s": 5.917898411047645,
+          "latency_ms": 416.6805150453001,
+          "outcome": "success"
+        },
+        {
+          "index": 12,
+          "start_offset_s": 6.001305172103457,
+          "end_offset_s": 6.097432575072162,
+          "latency_ms": 96.1274029687047,
+          "outcome": "success"
+        },
+        {
+          "index": 13,
+          "start_offset_s": 6.501393369049765,
+          "end_offset_s": 6.563034231076017,
+          "latency_ms": 61.64086202625185,
+          "outcome": "success"
+        },
+        {
+          "index": 14,
+          "start_offset_s": 7.001482076011598,
+          "end_offset_s": 7.121588740032166,
+          "latency_ms": 120.10666402056813,
+          "outcome": "success"
+        },
+        {
+          "index": 15,
+          "start_offset_s": 7.501581192016602,
+          "end_offset_s": 7.615662579075433,
+          "latency_ms": 114.08138705883175,
+          "outcome": "success"
+        },
+        {
+          "index": 16,
+          "start_offset_s": 8.001658938010223,
+          "end_offset_s": 8.122884101001546,
+          "latency_ms": 121.22516299132258,
+          "outcome": "success"
+        },
+        {
+          "index": 17,
+          "start_offset_s": 8.50176311400719,
+          "end_offset_s": 8.91024241806008,
+          "latency_ms": 408.47930405288935,
+          "outcome": "success"
+        },
+        {
+          "index": 18,
+          "start_offset_s": 9.001846261089668,
+          "end_offset_s": 9.12432138202712,
+          "latency_ms": 122.47512093745172,
+          "outcome": "success"
+        },
+        {
+          "index": 19,
+          "start_offset_s": 9.50192232709378,
+          "end_offset_s": 9.563146227039397,
+          "latency_ms": 61.22389994561672,
+          "outcome": "success"
+        },
+        {
+          "index": 20,
+          "start_offset_s": 10.002017653081566,
+          "end_offset_s": 10.149214542005211,
+          "latency_ms": 147.19688892364502,
+          "outcome": "success"
+        },
+        {
+          "index": 21,
+          "start_offset_s": 10.50211958005093,
+          "end_offset_s": 10.62849430507049,
+          "latency_ms": 126.37472501955926,
+          "outcome": "success"
+        },
+        {
+          "index": 22,
+          "start_offset_s": 11.00220803602133,
+          "end_offset_s": 11.084251929074526,
+          "latency_ms": 82.04389305319637,
+          "outcome": "success"
+        },
+        {
+          "index": 23,
+          "start_offset_s": 11.50229394203052,
+          "end_offset_s": 11.587119314004667,
+          "latency_ms": 84.82537197414786,
+          "outcome": "success"
+        },
+        {
+          "index": 24,
+          "start_offset_s": 12.002545921015553,
+          "end_offset_s": 12.099484327016398,
+          "latency_ms": 96.93840600084513,
+          "outcome": "success"
+        },
+        {
+          "index": 25,
+          "start_offset_s": 12.50249706406612,
+          "end_offset_s": 12.618719066027552,
+          "latency_ms": 116.2220019614324,
+          "outcome": "success"
+        },
+        {
+          "index": 26,
+          "start_offset_s": 13.002588271046989,
+          "end_offset_s": 13.133404844091274,
+          "latency_ms": 130.81657304428518,
+          "outcome": "success"
+        },
+        {
+          "index": 27,
+          "start_offset_s": 13.502670427085832,
+          "end_offset_s": 13.593703377991915,
+          "latency_ms": 91.03295090608299,
+          "outcome": "success"
+        },
+        {
+          "index": 28,
+          "start_offset_s": 14.00275387300644,
+          "end_offset_s": 14.142909186077304,
+          "latency_ms": 140.15531307086349,
+          "outcome": "success"
+        },
+        {
+          "index": 29,
+          "start_offset_s": 14.50284381909296,
+          "end_offset_s": 14.589326480054297,
+          "latency_ms": 86.48266096133739,
+          "outcome": "success"
+        },
+        {
+          "index": 30,
+          "start_offset_s": 15.00291600509081,
+          "end_offset_s": 15.121362880105153,
+          "latency_ms": 118.44687501434237,
+          "outcome": "success"
+        },
+        {
+          "index": 31,
+          "start_offset_s": 15.502999672084115,
+          "end_offset_s": 15.584483350045048,
+          "latency_ms": 81.48367796093225,
+          "outcome": "success"
+        },
+        {
+          "index": 32,
+          "start_offset_s": 16.003090028068982,
+          "end_offset_s": 16.086688111070544,
+          "latency_ms": 83.59808300156146,
+          "outcome": "success"
+        },
+        {
+          "index": 33,
+          "start_offset_s": 16.503178273094818,
+          "end_offset_s": 16.602486256044358,
+          "latency_ms": 99.30798294954002,
+          "outcome": "success"
+        },
+        {
+          "index": 34,
+          "start_offset_s": 17.003261839039624,
+          "end_offset_s": 17.110826824093238,
+          "latency_ms": 107.56498505361378,
+          "outcome": "success"
+        },
+        {
+          "index": 35,
+          "start_offset_s": 17.503363035037182,
+          "end_offset_s": 17.599988911068067,
+          "latency_ms": 96.62587603088468,
+          "outcome": "success"
+        },
+        {
+          "index": 36,
+          "start_offset_s": 18.00345478102099,
+          "end_offset_s": 18.11656362202484,
+          "latency_ms": 113.1088410038501,
+          "outcome": "success"
+        },
+        {
+          "index": 37,
+          "start_offset_s": 18.503537327051163,
+          "end_offset_s": 18.588207717053592,
+          "latency_ms": 84.67039000242949,
+          "outcome": "success"
+        },
+        {
+          "index": 38,
+          "start_offset_s": 19.00362432305701,
+          "end_offset_s": 19.08014183107298,
+          "latency_ms": 76.5175080159679,
+          "outcome": "success"
+        },
+        {
+          "index": 39,
+          "start_offset_s": 19.50371238903608,
+          "end_offset_s": 19.6500246420037,
+          "latency_ms": 146.3122529676184,
+          "outcome": "success"
+        },
+        {
+          "index": 40,
+          "start_offset_s": 20.003799244994298,
+          "end_offset_s": 20.08633419009857,
+          "latency_ms": 82.53494510427117,
+          "outcome": "success"
+        },
+        {
+          "index": 41,
+          "start_offset_s": 20.503893900080584,
+          "end_offset_s": 20.61311875609681,
+          "latency_ms": 109.22485601622611,
+          "outcome": "success"
+        },
+        {
+          "index": 42,
+          "start_offset_s": 21.0039765360998,
+          "end_offset_s": 21.117384758079425,
+          "latency_ms": 113.40822197962552,
+          "outcome": "success"
+        },
+        {
+          "index": 43,
+          "start_offset_s": 21.504056862089783,
+          "end_offset_s": 21.59683697205037,
+          "latency_ms": 92.78010996058583,
+          "outcome": "success"
+        },
+        {
+          "index": 44,
+          "start_offset_s": 22.004144288017415,
+          "end_offset_s": 22.14736463909503,
+          "latency_ms": 143.22035107761621,
+          "outcome": "success"
+        },
+        {
+          "index": 45,
+          "start_offset_s": 22.50423627300188,
+          "end_offset_s": 22.92771326005459,
+          "latency_ms": 423.47698705270886,
+          "outcome": "success"
+        },
+        {
+          "index": 46,
+          "start_offset_s": 23.004320699023083,
+          "end_offset_s": 23.061258111032657,
+          "latency_ms": 56.93741200957447,
+          "outcome": "success"
+        },
+        {
+          "index": 47,
+          "start_offset_s": 23.50440965499729,
+          "end_offset_s": 23.59298216807656,
+          "latency_ms": 88.57251307927072,
+          "outcome": "success"
+        },
+        {
+          "index": 48,
+          "start_offset_s": 24.00449257902801,
+          "end_offset_s": 24.09415430109948,
+          "latency_ms": 89.66172207146883,
+          "outcome": "success"
+        },
+        {
+          "index": 49,
+          "start_offset_s": 24.50455532502383,
+          "end_offset_s": 24.942931437049992,
+          "latency_ms": 438.37611202616245,
+          "outcome": "success"
+        },
+        {
+          "index": 50,
+          "start_offset_s": 25.00461558008101,
+          "end_offset_s": 25.0994674640242,
+          "latency_ms": 94.85188394319266,
+          "outcome": "success"
+        },
+        {
+          "index": 51,
+          "start_offset_s": 25.50468441506382,
+          "end_offset_s": 25.617965157027356,
+          "latency_ms": 113.28074196353555,
+          "outcome": "success"
+        },
+        {
+          "index": 52,
+          "start_offset_s": 26.00478621001821,
+          "end_offset_s": 26.108900574035943,
+          "latency_ms": 104.11436401773244,
+          "outcome": "success"
+        },
+        {
+          "index": 53,
+          "start_offset_s": 26.50487426610198,
+          "end_offset_s": 26.58740154199768,
+          "latency_ms": 82.52727589569986,
+          "outcome": "success"
+        },
+        {
+          "index": 54,
+          "start_offset_s": 27.004964791005477,
+          "end_offset_s": 27.102931706001982,
+          "latency_ms": 97.96691499650478,
+          "outcome": "success"
+        },
+        {
+          "index": 55,
+          "start_offset_s": 27.505059546092525,
+          "end_offset_s": 27.579029818065464,
+          "latency_ms": 73.97027197293937,
+          "outcome": "success"
+        },
+        {
+          "index": 56,
+          "start_offset_s": 28.00514420203399,
+          "end_offset_s": 28.130581491044722,
+          "latency_ms": 125.43728901073337,
+          "outcome": "success"
+        },
+        {
+          "index": 57,
+          "start_offset_s": 28.50523560703732,
+          "end_offset_s": 28.572818398009986,
+          "latency_ms": 67.58279097266495,
+          "outcome": "success"
+        },
+        {
+          "index": 58,
+          "start_offset_s": 29.00532248208765,
+          "end_offset_s": 29.08525406208355,
+          "latency_ms": 79.93157999590039,
+          "outcome": "success"
+        },
+        {
+          "index": 59,
+          "start_offset_s": 29.50538485706784,
+          "end_offset_s": 29.59954932599794,
+          "latency_ms": 94.16446893010288,
+          "outcome": "success"
+        },
+        {
+          "index": 60,
+          "start_offset_s": 30.005502442014404,
+          "end_offset_s": 30.12517413403839,
+          "latency_ms": 119.67169202398509,
+          "outcome": "success"
+        },
+        {
+          "index": 61,
+          "start_offset_s": 30.505585157079622,
+          "end_offset_s": 30.611828064080328,
+          "latency_ms": 106.2429070007056,
+          "outcome": "success"
+        },
+        {
+          "index": 62,
+          "start_offset_s": 31.00565187202301,
+          "end_offset_s": 31.08561659208499,
+          "latency_ms": 79.96472006198019,
+          "outcome": "success"
+        },
+        {
+          "index": 63,
+          "start_offset_s": 31.505729548051022,
+          "end_offset_s": 31.616552643012255,
+          "latency_ms": 110.82309496123344,
+          "outcome": "success"
+        },
+        {
+          "index": 64,
+          "start_offset_s": 32.00581623206381,
+          "end_offset_s": 32.105131456046365,
+          "latency_ms": 99.31522398255765,
+          "outcome": "success"
+        },
+        {
+          "index": 65,
+          "start_offset_s": 32.50590389803983,
+          "end_offset_s": 32.59281177108642,
+          "latency_ms": 86.90787304658443,
+          "outcome": "success"
+        },
+        {
+          "index": 66,
+          "start_offset_s": 33.0059898220934,
+          "end_offset_s": 33.111214033095166,
+          "latency_ms": 105.22421100176871,
+          "outcome": "success"
+        },
+        {
+          "index": 67,
+          "start_offset_s": 33.506064078072086,
+          "end_offset_s": 33.628923490061425,
+          "latency_ms": 122.8594119893387,
+          "outcome": "success"
+        },
+        {
+          "index": 68,
+          "start_offset_s": 34.00613679306116,
+          "end_offset_s": 34.10215747402981,
+          "latency_ms": 96.02068096864969,
+          "outcome": "success"
+        },
+        {
+          "index": 69,
+          "start_offset_s": 34.506209388026036,
+          "end_offset_s": 34.620955438003875,
+          "latency_ms": 114.746049977839,
+          "outcome": "success"
+        },
+        {
+          "index": 70,
+          "start_offset_s": 35.00631829199847,
+          "end_offset_s": 35.129723118036054,
+          "latency_ms": 123.40482603758574,
+          "outcome": "success"
+        },
+        {
+          "index": 71,
+          "start_offset_s": 35.50641545699909,
+          "end_offset_s": 35.61246210208628,
+          "latency_ms": 106.04664508718997,
+          "outcome": "success"
+        },
+        {
+          "index": 72,
+          "start_offset_s": 36.006440441007726,
+          "end_offset_s": 36.076619398081675,
+          "latency_ms": 70.17895707394928,
+          "outcome": "success"
+        },
+        {
+          "index": 73,
+          "start_offset_s": 36.50650991604198,
+          "end_offset_s": 36.9829334000824,
+          "latency_ms": 476.4234840404242,
+          "outcome": "success"
+        },
+        {
+          "index": 74,
+          "start_offset_s": 37.006600050022826,
+          "end_offset_s": 37.10407378105447,
+          "latency_ms": 97.47373103164136,
+          "outcome": "success"
+        },
+        {
+          "index": 75,
+          "start_offset_s": 37.506656965008005,
+          "end_offset_s": 37.597561834030785,
+          "latency_ms": 90.90486902277917,
+          "outcome": "success"
+        },
+        {
+          "index": 76,
+          "start_offset_s": 38.00675489008427,
+          "end_offset_s": 38.11969088902697,
+          "latency_ms": 112.93599894270301,
+          "outcome": "success"
+        },
+        {
+          "index": 77,
+          "start_offset_s": 38.50681298400741,
+          "end_offset_s": 38.62080452009104,
+          "latency_ms": 113.99153608363122,
+          "outcome": "success"
+        },
+        {
+          "index": 78,
+          "start_offset_s": 39.00688623904716,
+          "end_offset_s": 39.080161186051555,
+          "latency_ms": 73.27494700439274,
+          "outcome": "success"
+        },
+        {
+          "index": 79,
+          "start_offset_s": 39.506951943039894,
+          "end_offset_s": 39.59994802600704,
+          "latency_ms": 92.99608296714723,
+          "outcome": "success"
+        }
+      ],
+      "interactive_ok": 80,
+      "interactive_fail": 0,
+      "interactive_p95_ms": 408.47930405288935,
+      "interactive_max_ms": 476.4234840404242
+    },
+    {
+      "binary": "h2",
+      "diagnostics": false,
+      "qos_step": false,
+      "udp_outage": false,
+      "case": "h2-combined-down-matched-variable-loss-controls-0906",
+      "status": "ok",
+      "bulk_status": "ok",
+      "bulk_bytes": 50931428,
+      "bulk_time_s": 40.60585124103818,
+      "bulk_goodput_mbps": 10.034303223477567,
+      "bulk_first_body_s": 0.3989603309892118,
+      "bulk_max_read_gap_s": 25.008618319989182,
+      "bulk_max_gap_start_s": 15.597232921048999,
+      "bulk_max_gap_end_s": 40.60585124103818,
+      "bulk_interval_goodput_raw_mbps": [
+        65.415,
+        78.438,
+        53.44,
+        50.374,
+        53.06,
+        8.683,
+        62.995,
+        0,
+        0,
+        0,
+        0,
+        5.434,
+        0,
+        0,
+        0,
+        29.613,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "interactive_attempt_series": [
+        {
+          "index": 0,
+          "start_offset_s": 0.0787057620473206,
+          "end_offset_s": 0.18444381502922624,
+          "latency_ms": 105.73805298190564,
+          "outcome": "success"
+        },
+        {
+          "index": 1,
+          "start_offset_s": 0.5005892879562452,
+          "end_offset_s": 0.6557712960056961,
+          "latency_ms": 155.18200804945081,
+          "outcome": "success"
+        },
+        {
+          "index": 2,
+          "start_offset_s": 1.0030373079935089,
+          "end_offset_s": 1.2987744599813595,
+          "latency_ms": 295.73715198785067,
+          "outcome": "success"
+        },
+        {
+          "index": 3,
+          "start_offset_s": 1.503177231992595,
+          "end_offset_s": 1.890970302047208,
+          "latency_ms": 387.79307005461305,
+          "outcome": "success"
+        },
+        {
+          "index": 4,
+          "start_offset_s": 2.0032627870095894,
+          "end_offset_s": 2.4180960869416595,
+          "latency_ms": 414.8332999320701,
+          "outcome": "success"
+        },
+        {
+          "index": 5,
+          "start_offset_s": 2.503340890049003,
+          "end_offset_s": 2.999727220973,
+          "latency_ms": 496.38633092399687,
+          "outcome": "success"
+        },
+        {
+          "index": 6,
+          "start_offset_s": 3.0033883140422404,
+          "end_offset_s": 3.483628112007864,
+          "latency_ms": 480.23979796562344,
+          "outcome": "success"
+        },
+        {
+          "index": 7,
+          "start_offset_s": 3.503493038006127,
+          "end_offset_s": 4.096767895971425,
+          "latency_ms": 593.274857965298,
+          "outcome": "success"
+        },
+        {
+          "index": 8,
+          "start_offset_s": 4.096787426969968,
+          "end_offset_s": 4.6996913040056825,
+          "latency_ms": 602.9038770357147,
+          "outcome": "success"
+        },
+        {
+          "index": 9,
+          "start_offset_s": 4.6997119640000165,
+          "end_offset_s": 5.415798714966513,
+          "latency_ms": 716.0867509664968,
+          "outcome": "success"
+        },
+        {
+          "index": 10,
+          "start_offset_s": 5.415820635040291,
+          "end_offset_s": 7.054394667036831,
+          "latency_ms": 1638.5740319965407,
+          "outcome": "success"
+        },
+        {
+          "index": 11,
+          "start_offset_s": 7.054421626962721,
+          "end_offset_s": 7.214965109014884,
+          "latency_ms": 160.5434820521623,
+          "outcome": "success"
+        },
+        {
+          "index": 12,
+          "start_offset_s": 7.554513741983101,
+          "end_offset_s": 7.716584063018672,
+          "latency_ms": 162.0703210355714,
+          "outcome": "success"
+        },
+        {
+          "index": 13,
+          "start_offset_s": 8.054727526032366,
+          "end_offset_s": 8.149073516018689,
+          "latency_ms": 94.34598998632282,
+          "outcome": "success"
+        },
+        {
+          "index": 14,
+          "start_offset_s": 8.554822240024805,
+          "end_offset_s": 8.63916362693999,
+          "latency_ms": 84.34138691518456,
+          "outcome": "success"
+        },
+        {
+          "index": 15,
+          "start_offset_s": 9.054953263956122,
+          "end_offset_s": 9.125598293961957,
+          "latency_ms": 70.645030005835,
+          "outcome": "success"
+        },
+        {
+          "index": 16,
+          "start_offset_s": 9.554998756968416,
+          "end_offset_s": 9.71978321694769,
+          "latency_ms": 164.78445997927338,
+          "outcome": "success"
+        },
+        {
+          "index": 17,
+          "start_offset_s": 10.055098211043514,
+          "end_offset_s": 10.152271328959614,
+          "latency_ms": 97.17311791609973,
+          "outcome": "success"
+        },
+        {
+          "index": 18,
+          "start_offset_s": 10.555228214012459,
+          "end_offset_s": 10.69694170600269,
+          "latency_ms": 141.71349199023098,
+          "outcome": "success"
+        },
+        {
+          "index": 19,
+          "start_offset_s": 11.055287298047915,
+          "end_offset_s": 11.14980720798485,
+          "latency_ms": 94.51990993693471,
+          "outcome": "success"
+        },
+        {
+          "index": 20,
+          "start_offset_s": 11.555377303040586,
+          "end_offset_s": 11.63964789698366,
+          "latency_ms": 84.27059394307435,
+          "outcome": "success"
+        },
+        {
+          "index": 21,
+          "start_offset_s": 12.055422495002858,
+          "end_offset_s": 12.167663919040933,
+          "latency_ms": 112.24142403807491,
+          "outcome": "success"
+        },
+        {
+          "index": 22,
+          "start_offset_s": 12.55551811796613,
+          "end_offset_s": 12.632699648966081,
+          "latency_ms": 77.18153099995106,
+          "outcome": "success"
+        },
+        {
+          "index": 23,
+          "start_offset_s": 13.055603660992347,
+          "end_offset_s": 13.148381202947348,
+          "latency_ms": 92.77754195500165,
+          "outcome": "success"
+        },
+        {
+          "index": 24,
+          "start_offset_s": 13.555661284946837,
+          "end_offset_s": 13.655935073038563,
+          "latency_ms": 100.2737880917266,
+          "outcome": "success"
+        },
+        {
+          "index": 25,
+          "start_offset_s": 14.05573928100057,
+          "end_offset_s": 14.160532325971872,
+          "latency_ms": 104.79304497130215,
+          "outcome": "success"
+        },
+        {
+          "index": 26,
+          "start_offset_s": 14.555829631979577,
+          "end_offset_s": 14.647751827025786,
+          "latency_ms": 91.9221950462088,
+          "outcome": "success"
+        },
+        {
+          "index": 27,
+          "start_offset_s": 15.055916295037605,
+          "end_offset_s": 15.163485600962304,
+          "latency_ms": 107.56930592469871,
+          "outcome": "success"
+        },
+        {
+          "index": 28,
+          "start_offset_s": 15.556020471034572,
+          "end_offset_s": 15.671558034955524,
+          "latency_ms": 115.53756392095238,
+          "outcome": "success"
+        },
+        {
+          "index": 29,
+          "start_offset_s": 16.056104472954758,
+          "end_offset_s": 16.170070547959767,
+          "latency_ms": 113.96607500500977,
+          "outcome": "success"
+        },
+        {
+          "index": 30,
+          "start_offset_s": 16.556220407946967,
+          "end_offset_s": 16.654994804994203,
+          "latency_ms": 98.77439704723656,
+          "outcome": "success"
+        },
+        {
+          "index": 31,
+          "start_offset_s": 17.056257429998368,
+          "end_offset_s": 17.158923843991943,
+          "latency_ms": 102.66641399357468,
+          "outcome": "success"
+        },
+        {
+          "index": 32,
+          "start_offset_s": 17.55634787294548,
+          "end_offset_s": 17.66108482098207,
+          "latency_ms": 104.73694803658873,
+          "outcome": "success"
+        },
+        {
+          "index": 33,
+          "start_offset_s": 18.056421337998472,
+          "end_offset_s": 18.166020835051313,
+          "latency_ms": 109.59949705284089,
+          "outcome": "success"
+        },
+        {
+          "index": 34,
+          "start_offset_s": 18.556497739977203,
+          "end_offset_s": 18.6898104789434,
+          "latency_ms": 133.31273896619678,
+          "outcome": "success"
+        },
+        {
+          "index": 35,
+          "start_offset_s": 19.056580713018775,
+          "end_offset_s": 19.176353145972826,
+          "latency_ms": 119.7724329540506,
+          "outcome": "success"
+        },
+        {
+          "index": 36,
+          "start_offset_s": 19.556673335959204,
+          "end_offset_s": 19.62495184096042,
+          "latency_ms": 68.27850500121713,
+          "outcome": "success"
+        },
+        {
+          "index": 37,
+          "start_offset_s": 20.056748109986074,
+          "end_offset_s": 20.15463953302242,
+          "latency_ms": 97.89142303634435,
+          "outcome": "success"
+        },
+        {
+          "index": 38,
+          "start_offset_s": 20.556838772958145,
+          "end_offset_s": 20.636363580008037,
+          "latency_ms": 79.52480704989284,
+          "outcome": "success"
+        },
+        {
+          "index": 39,
+          "start_offset_s": 21.05709051794838,
+          "end_offset_s": 21.140652399044484,
+          "latency_ms": 83.5618810961023,
+          "outcome": "success"
+        },
+        {
+          "index": 40,
+          "start_offset_s": 21.557175270980224,
+          "end_offset_s": 21.65264580899384,
+          "latency_ms": 95.47053801361471,
+          "outcome": "success"
+        },
+        {
+          "index": 41,
+          "start_offset_s": 22.058942515053786,
+          "end_offset_s": 22.174039455945604,
+          "latency_ms": 115.09694089181721,
+          "outcome": "success"
+        },
+        {
+          "index": 42,
+          "start_offset_s": 22.55902543698903,
+          "end_offset_s": 22.6443073899718,
+          "latency_ms": 85.28195298276842,
+          "outcome": "success"
+        },
+        {
+          "index": 43,
+          "start_offset_s": 23.05912658001762,
+          "end_offset_s": 23.18189499201253,
+          "latency_ms": 122.76841199491173,
+          "outcome": "success"
+        },
+        {
+          "index": 44,
+          "start_offset_s": 23.559211582993157,
+          "end_offset_s": 23.652824589051306,
+          "latency_ms": 93.61300605814904,
+          "outcome": "success"
+        },
+        {
+          "index": 45,
+          "start_offset_s": 24.05929370597005,
+          "end_offset_s": 24.17821261403151,
+          "latency_ms": 118.91890806145966,
+          "outcome": "success"
+        },
+        {
+          "index": 46,
+          "start_offset_s": 24.55940632999409,
+          "end_offset_s": 24.659868818940595,
+          "latency_ms": 100.46248894650489,
+          "outcome": "success"
+        },
+        {
+          "index": 47,
+          "start_offset_s": 25.059498762944713,
+          "end_offset_s": 25.153629841981456,
+          "latency_ms": 94.13107903674245,
+          "outcome": "success"
+        },
+        {
+          "index": 48,
+          "start_offset_s": 25.559577955049463,
+          "end_offset_s": 25.65664551302325,
+          "latency_ms": 97.06755797378719,
+          "outcome": "success"
+        },
+        {
+          "index": 49,
+          "start_offset_s": 26.059708148939535,
+          "end_offset_s": 26.147544807987288,
+          "latency_ms": 87.83665904775262,
+          "outcome": "success"
+        },
+        {
+          "index": 50,
+          "start_offset_s": 26.55977899103891,
+          "end_offset_s": 26.734737004968338,
+          "latency_ms": 174.95801392942667,
+          "outcome": "success"
+        },
+        {
+          "index": 51,
+          "start_offset_s": 27.05986114498228,
+          "end_offset_s": 27.133878635941073,
+          "latency_ms": 74.01749095879495,
+          "outcome": "success"
+        },
+        {
+          "index": 52,
+          "start_offset_s": 27.55994558800012,
+          "end_offset_s": 27.642854814999737,
+          "latency_ms": 82.90922699961811,
+          "outcome": "success"
+        },
+        {
+          "index": 53,
+          "start_offset_s": 28.060777795035392,
+          "end_offset_s": 28.125570976990275,
+          "latency_ms": 64.79318195488304,
+          "outcome": "success"
+        },
+        {
+          "index": 54,
+          "start_offset_s": 28.56080676696729,
+          "end_offset_s": 28.687334332964383,
+          "latency_ms": 126.52756599709392,
+          "outcome": "success"
+        },
+        {
+          "index": 55,
+          "start_offset_s": 29.060934280976653,
+          "end_offset_s": 29.155459051951766,
+          "latency_ms": 94.52477097511292,
+          "outcome": "success"
+        },
+        {
+          "index": 56,
+          "start_offset_s": 29.560952004045248,
+          "end_offset_s": 29.658915746957064,
+          "latency_ms": 97.96374291181564,
+          "outcome": "success"
+        },
+        {
+          "index": 57,
+          "start_offset_s": 30.061036807019264,
+          "end_offset_s": 30.175676896004006,
+          "latency_ms": 114.64008898474276,
+          "outcome": "success"
+        },
+        {
+          "index": 58,
+          "start_offset_s": 30.561161060002632,
+          "end_offset_s": 30.708070855005644,
+          "latency_ms": 146.90979500301182,
+          "outcome": "success"
+        },
+        {
+          "index": 59,
+          "start_offset_s": 31.061335482052527,
+          "end_offset_s": 31.159124115947634,
+          "latency_ms": 97.78863389510661,
+          "outcome": "success"
+        },
+        {
+          "index": 60,
+          "start_offset_s": 31.561447015032172,
+          "end_offset_s": 31.675526750972494,
+          "latency_ms": 114.07973594032228,
+          "outcome": "success"
+        },
+        {
+          "index": 61,
+          "start_offset_s": 32.06154204800259,
+          "end_offset_s": 32.21404771797825,
+          "latency_ms": 152.5056699756533,
+          "outcome": "success"
+        },
+        {
+          "index": 62,
+          "start_offset_s": 32.561645000008866,
+          "end_offset_s": 32.68702781898901,
+          "latency_ms": 125.38281898014247,
+          "outcome": "success"
+        },
+        {
+          "index": 63,
+          "start_offset_s": 33.06173266295809,
+          "end_offset_s": 33.25124523905106,
+          "latency_ms": 189.5125760929659,
+          "outcome": "success"
+        },
+        {
+          "index": 64,
+          "start_offset_s": 33.561839935020544,
+          "end_offset_s": 33.66135931899771,
+          "latency_ms": 99.51938397716731,
+          "outcome": "success"
+        },
+        {
+          "index": 65,
+          "start_offset_s": 34.06192169804126,
+          "end_offset_s": 34.14566613105126,
+          "latency_ms": 83.74443300999701,
+          "outcome": "success"
+        },
+        {
+          "index": 66,
+          "start_offset_s": 34.562033551046625,
+          "end_offset_s": 34.746039140969515,
+          "latency_ms": 184.00558992289007,
+          "outcome": "success"
+        },
+        {
+          "index": 67,
+          "start_offset_s": 35.062641376047395,
+          "end_offset_s": 35.13367096998263,
+          "latency_ms": 71.02959393523633,
+          "outcome": "success"
+        },
+        {
+          "index": 68,
+          "start_offset_s": 35.56275560997892,
+          "end_offset_s": 35.67071701795794,
+          "latency_ms": 107.96140797901899,
+          "outcome": "success"
+        },
+        {
+          "index": 69,
+          "start_offset_s": 36.062850791960955,
+          "end_offset_s": 36.27659629203845,
+          "latency_ms": 213.7455000774935,
+          "outcome": "success"
+        },
+        {
+          "index": 70,
+          "start_offset_s": 36.56293515395373,
+          "end_offset_s": 36.638601336977445,
+          "latency_ms": 75.66618302371353,
+          "outcome": "success"
+        },
+        {
+          "index": 71,
+          "start_offset_s": 37.06301976693794,
+          "end_offset_s": 37.138434057938866,
+          "latency_ms": 75.414291000925,
+          "outcome": "success"
+        },
+        {
+          "index": 72,
+          "start_offset_s": 37.563112118979916,
+          "end_offset_s": 37.65262301801704,
+          "latency_ms": 89.51089903712273,
+          "outcome": "success"
+        },
+        {
+          "index": 73,
+          "start_offset_s": 38.06319249095395,
+          "end_offset_s": 38.18275041296147,
+          "latency_ms": 119.55792200751603,
+          "outcome": "success"
+        },
+        {
+          "index": 74,
+          "start_offset_s": 38.56327329296619,
+          "end_offset_s": 38.670818177983165,
+          "latency_ms": 107.54488501697779,
+          "outcome": "success"
+        },
+        {
+          "index": 75,
+          "start_offset_s": 39.06333025498316,
+          "end_offset_s": 39.181288935942575,
+          "latency_ms": 117.95868095941842,
+          "outcome": "success"
+        },
+        {
+          "index": 76,
+          "start_offset_s": 39.56343164795544,
+          "end_offset_s": 39.69186116394121,
+          "latency_ms": 128.429515985772,
+          "outcome": "success"
+        }
+      ],
+      "interactive_ok": 77,
+      "interactive_fail": 0,
+      "interactive_p95_ms": 496.38633092399687,
+      "interactive_max_ms": 1638.5740319965407
+    }
+  ]
+}

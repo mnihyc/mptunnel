@@ -1,7 +1,7 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 08:09 UTC. Baseline source: `7189e69`; evidence checkpoint:
-`fb01c1a`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
+Updated: 2026-09-06 09:13 UTC. Baseline source: `7189e69`; evidence checkpoint:
+`3d216a8`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Fixed order and closure obligations
@@ -36,8 +36,24 @@ and closed component invariants are not repeatedly reopened as new defects.
   exact response projection defect: native snapshots erase existing Product
   qualification, making faster QUIC fail the additional-output startup check.
   NATIVE_PRODUCT_QUALIFICATION_CLOSURE records the counterexample, original
-  isolation intent, bounded correction and RED/GREEN obligations. Close this
-  before considering an allocator redesign or changing native recovery policy.
+  isolation intent, bounded correction and RED/GREEN obligations. Component
+  proof is green, but its practical composition remains unaccepted. The next
+  exact trace identifies a TCP-owned missing frontier, substantial stale-owner
+  repair backlog and a native observation blind spot. Continue
+  MIXED_RECOVERY_QUEUE_DIAGNOSIS before changing allocator or recovery policy.
+- Adjudicated recovery refusals match occupied-copy/stale/queue state; do not
+  remove those invariants to create apparent eligibility. The current RFC's
+  immediately-admissible-action rule permits busy-fast/free-slow placement that
+  can strand ordered progress. A model revision is possible, but the initial
+  bounded-wait proposal fails unknown-capacity exploration unless it obtains
+  a separate evidence/discovery owner. BOUNDED_PLACEMENT_DEFERRAL_PROPOSAL
+  explicitly records that pre-implementation constraint, not an accepted fix.
+- Mixed still exhibits a 3.442-second gap without the deliberate QoS or outage
+  (asymmetric variable loss and jitter retained). The matched QUIC-only case
+  has a .507-second gap. Raw TCP, Xray and Hysteria2 controls are archived with
+  their complete series; a poor baseline result cannot waive MPP's own gap.
+  Next exact trace identifies the deferred TCP input kind during a long write,
+  separating actual native delay from actor-level feedback obstruction.
 - Native outage trace shows ordinary exponential PTO backoff, not a stuck
   timer in that capture. Physical queue drain, native reordering tolerance and
   Product-prefix stalls remain separate causes; do not collapse them into the

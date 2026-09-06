@@ -281,3 +281,162 @@ past observations cannot guarantee optimal decisions under arbitrary future
 QoS changes. State that nonclaim without using it to excuse the demonstrated
 software/ordering stalls. The existing asymmetric up/down,500-Mbps shared,
 200-Mbps independent, browser, recovery and sustainability gates remain intact.
+
+## Exact mixed frontier after packet-class correction — 2026-09-06 20:16 UTC
+
+MIXED_PLACEMENT_FRONTIER_EVIDENCE_20260906.json preserves selected exact events,
+the full probe and dispatch totals from the existing diagnostic feature. The
+binary contains packet-class checkpoint7677fd9 plus the still-held composition;
+no temporary policy or new observation hook was added. This25-second steady
+mixed download uses the existing500-Mbps routed cut, asymmetric jitter and
+3% down /1% up loss, without deliberate QoS or outage. Its161.090-Mbps mean
+is **not** an ordinary performance comparison. All50echoes succeed, but the
+first six application seconds remain poor; maximum read gap alone hides this.
+
+Bulk StreamId1's first dispatch is Unix1788724756254 (relative time0). QUIC
+receives its first original at+.414s, before the large TCP suffix. First-second
+original assignment is12,244,918B TCP versus739,764B QUIC. At+.514s:
+
+| Candidate | Original flight B | Advisory completion ms | Decision |
+| --- | ---: | ---: | --- |
+| TCP1, live lower owner |10,551,296|242,299.737|Eligible; owns contiguous frontier|
+| TCP2, additional |521,110|13,586.471|Unproven startup flight reached|
+| TCP0, additional |524,288|13,591.169|Unproven startup flight reached|
+| QUIC0, additional |477,620|28,559.265|Unproven startup flight reached|
+
+The next65,536B range[12,132,714,12,198,250) goes to TCP1. The incumbent
+exception and additional-flight saturation together leave the much-worse
+advisory choice eligible. These ETAs are predictions, not physical service
+bounds or permissible wait budgets. QUIC's sparse operational sample is153
+Kbit/s versus266.208-Mbit/s pacing; neither absence of sustained evidence nor
+pacing alone proves achievable rate. Do not erase the earlier QoS rate-meaning
+correction to improve this comparison.
+
+The exact range is copied by stale-owner handoff at+5.176s to TCP0,+5.378s to
+TCP2,+5.833s to QUIC0. At+6.292s a QUIC frame containing its final5,536B closes
+the lower hole and releases64,516,960B of ordered data;64,511,424B was already
+reordered. This explains the544.927-Mbps application bin as buffered release,
+not wire service exceeding500Mbps. No persistent-gap repair event covers that
+final subrange before stale handoff. Earlier14,600-byte repairs often concern
+different frontiers: their small size alone does not justify enlarging T06's
+ranked service extent or rolling back exact-copy ownership.
+
+A second exact case demonstrates that the issue is not confined to startup.
+At+9.616s a51,616B original[215,519,722,215,571,338) is assigned to TCP0. The
+live QUIC lower-owner reference has advisory completion1,388.920ms but is
+absent from ready-candidate rows. The eligible TCP0/2 estimates are70,825.996
+and81,957.730ms. The original is repaired onto TCP2 at+13.303s; a TCP frame
+closes that range at+13.377s and releases19,410,656B, after3.761s of range
+residence. Client source_path_index is a configured group index, not server
+PathId, so this capture does not identify which TCP physical copy won.
+
+The ready-candidate prefilter checks staleness, Product admission lifecycle,
+command mailbox readiness, backup preference and rankability. The retained
+lower-owner reference is evaluated separately. The events establish omitted
+QUIC and admitted TCP, but do not log which particular prefilter removed
+QUIC at that instant; do not manufacture that missing causal detail.
+
+This strengthens the already-open T04b placement/discovery issue, not a new
+SEEN batch. Deleting the incumbent exemption alone could stall all unproven
+outputs and recreate a feedback-dependent pipeline cap. Deleting mailbox
+readiness without an actual wait owner could select an uncommittable output
+forever. Restoring the former ECF predicate already failed the ordinary timing
+gate. The next model must distinguish permission, allocation and independent
+discovery while preserving singleton service, high-BDP pipelines, exact
+Product/transport authority and finite failover. No new runtime fix is claimed.
+
+### Prefilter control and bounded deletion ablation — 2026-09-06 20:28 UTC
+
+The follow-up uses one temporary observation-only prefilter event. All27 UDP
+rejections are Throughput command-queue readiness, none lifecycle or stale.
+There are23 subsequent TCP commitments with UDP retained as the live reference.
+At+8.202s the QUIC mailbox is full; TCP2 receives65,536B; QUIC receives new
+originals again6ms later. This resolves the wake-owner question for this run.
+The temporary source hook was archived and removed immediately after freezing
+the diagnostic binary. All50echoes succeed, but this is not a performance gate.
+
+Do not overattribute: the first two TCP ranges were already buffered before
+an earlier QUIC original's final5,536B released them3.095s later. Immediate
+spillover is not universally the blocking range. Conversely,+18.660s commits
+[412,871,034,412,936,570) to TCP2 while QUIC is queue-blocked; that exact TCP
+frame closes the frontier2.940s later, with5.5MB still reordered. QUIC accepts
+new work198ms after the original commitment. A second TCP-owned range takes
+3.248s and leaves11.5MB reordered. The source does not identify which physical
+TCP copy won merely from the client group index. Exact observations are in
+MIXED_ADMISSION_REASON_EVIDENCE_20260906. Native queue and application receipt
+remain distinct; a large advisory score is not the measured elapsed service.
+
+Before any allocation redesign, one bounded **ablation, not production fix**
+will test the startup exemption already implicated by both traces. Delete only
+the multi-path live-contiguous exemption from the response selector's existing
+unproven-startup-flight predicate. Preserve the separate true-singleton gate,
+latency arbitration, qualification, all numeric envelopes, actual native
+write/flush and Product ACK ownership. Restore the source after freezing the
+executable, regardless of the result. No RFC change follows from an ablation.
+
+Why this particular deletion: without a delivery proof, being the lowest
+range's owner does not establish that accepting a large additional prefix
+avoids cross-path blocking. It allowed12.24MB and23.39MB of TCP originals in
+the two first-second observations. In the altered predicate, a multi-path
+unproven output instead retains at most the same existing startup allowance;
+Data ACK releases it and existing durable qualification ends that condition.
+This tests the exposure mechanism without changing a congestion gain or cap.
+
+Why it is not already an accepted clean fix: while qualification is absent,
+the unchanged allowance imposes the necessary ceiling8*E/tau. At512KiB and
+100ms feedback that is41.94Mbps per unproven output, not500Mbps. Qualification
+may be delayed by native loss, ambiguous repair coverage or a poor return path;
+the older high-BDP/singleton obligation cannot be waived. The change also does
+not solve discovery starvation of a path never selected, later qualified
+spillover, or native queue residence. A favorable bulk mean alone cannot justify
+shipping it. Compare full startup bins, gaps and loaded latency against the
+frozen ordinary packet-class candidate; reject or develop a different contract
+if it merely exchanges one timing failure for another.
+
+### Ordinary result: exposure deletion is not a standalone fix
+
+2026-09-06 20:40 UTC. The corrected ablation and fresh ordinary control finish
+without build overlap. MULTI_FRONTIER_ACQUISITION_ABLATION_20260906.json retains
+both complete probes,1Hz observations and the exact two-line predicate delta.
+The uncorrected first build was never used. The source was restored before
+running the frozen corrected binary; no trial runtime change remains.
+
+| Ordinary mixed steady | Mean Mbps | First body s | Maximum read gap s | Echo successes / failures | Echo p95 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Narrowed startup exemption |143.804|1.319|1.296|49 /0|172.269|
+| Fresh packet-class control |168.104|.617|.309|50 /0|509.630|
+
+The trial reaches an early buffered burst in its fourth application second,
+but seconds6--9 fall to4.835--6.175Mbps and second21 delivers effectively no
+bulk bytes. It does not close the timing gate. Echo p95 is better in this pair;
+different random realizations prevent claiming that the predicate caused every
+difference, including first-byte delay.49 versus50 successful echo attempts is
+not a lost request: both have zero explicit failures within the finite run.
+
+The failure is not simply an inability to drive QUIC. At trial6--9s native
+QUIC ACKed bytes advance87.4MB to126.2MB while ordered client receipt advances
+only62.3MB to64.4MB. QUIC flight drops to22.8KiB by8s while retaining a3.2MB
+native window; TCP still has1.20MB notsent and later607KiB. At20--21s QUIC
+ACKed bytes advance355.6MB to373.2MB while ordered client receipt advances
+only128B, consistent with the concurrent echo. These are1Hz layer-localization
+observations, not an attribution of a particular missing range in this ordinary
+run or unique Product credit derived from native ACKs.
+
+Why narrowing exposure is insufficient: it changes only the pre-qualification
+predicate. It leaves already accepted native queues, qualified-path allocation,
+queue-ready spillover and exact frontier recovery unchanged. Those service
+boundaries can still create long ordered residence; in this trial TCP notsent
+queues again reach roughly2.5MB. The earlier range-level controls establish
+both TCP- and QUIC-owned blockers, so protocol preference is not a clean answer.
+The ablation supplies no proof of general unknown-path exploration, high-BDP
+non-regression or useful sustained aggregation. It is **not accepted** as a
+production fix; do not repeat it with a different startup allowance.
+
+Next remains one contract, not another parameter experiment: ordinary source
+bytes may remain unassigned while a suitable live output is temporarily busy,
+but discovery and failover must have independent finite progress. Evaluate
+whether irreversible carrier binding is earlier than necessary without
+equating write/flush with delivery, shrinking native pipelines or introducing
+per-frame ACK stop-and-wait. Preserve the previously demonstrated unknown-fast
+counterexample and exact partial-write transaction. A proposal lacking those
+obligations is still not implementation-ready, even if it deletes more code.

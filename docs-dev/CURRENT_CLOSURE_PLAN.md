@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 19:53 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 20:40 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -11,17 +11,56 @@ actual removal of the unknown-evidence reduction class. The individual
 packet-class correction now has its actual-engine RED/GREEN, native/adapter
 controls, strict Clippy and8,192-round retention check. It deletes the
 duplicate transaction-retention list while retaining whole-episode native
-undo guards. Only its source/RFC hunks are staged for an intermediate commit;
+undo guards. Its isolated source/RFC/evidence checkpoint is committed7677fd9;
 the earlier reordering, companion, actor and qualification stack stays held.
 
 Ten ordinary comparisons are preserved in QUIC_PACKET_CLASS_COMPARISON_20260906.
 They do NOT establish global non-regression: mixed post-QoS service improves
 in these runs, but mixed startup/delivery is bursty, gaps persist and QUIC/latency
 differences are not uniformly favorable. No release or public headline follows.
-Next attribute the exact lower Product frontier: native QUIC can have ACKed
-54.1MB while ordered application delivery is only5.0MB. Existing1Hz data locate
-the layer but do not identify the particular blocked range or failed decision.
-No new congestion knob, receive-window clamp or protocol preference is justified.
+Exact-frontier follow-up now identifies both startup and a later stall. In the
+existing mixed steady diagnostic,12.24MB of originals enter TCP in the first
+second. At+.514s the live incumbent remains eligible while every additional
+output, including QUIC, reaches its unproven-flight allowance. One TCP prefix
+then holds64.5MB of received suffix until a QUIC repair at+6.292s. At+9.616s a
+new51,616-byte original goes to TCP while the live QUIC lower-owner reference
+is omitted from ready candidates; it releases19.4MB only3.761s later. Exact
+events are in MIXED_PLACEMENT_FRONTIER_EVIDENCE_20260906 and the interpretation
+is appended to ORDERED_REPAIR_SERVICE_BOUNDARY. Logging-enabled rates are not
+ordinary performance acceptance. Small repair size alone is not the cause.
+
+Next resolve the EXISTING T04b allocation/discovery contract: exact permission
+must not require immediate creation of slow ordered debt, but a wait must not
+starve unknown useful service or restore an inferred congestion window. The
+BOUNDED_PLACEMENT_DEFERRAL_PROPOSAL discovery counterexample still applies.
+Do not implement merely a queue-filter deletion, incumbent-exemption deletion,
+new timer, repair-size increase or TCP/QUIC preference. Prefer removing invalid
+duplicate policy once its replacement obligations are proved. No new defect
+batch, congestion knob or receive-window clamp is justified by this capture.
+
+The single prefilter follow-up confirms27 QUIC command-queue exclusions and
+23 subsequent TCP commitments; no QUIC stale/lifecycle rejection. First cases
+reopen QUIC in5--10ms, later cases157--207ms. Some chosen TCP ranges arrived
+before the preceding QUIC original, so not every spillover is harmful; other
+exact TCP frontiers take2.940/3.248s while holding received suffixes. Preserve
+that negative control in MIXED_ADMISSION_REASON_EVIDENCE_20260906. Temporary
+prefilter logging is archived and removed from runtime source.
+
+One ordinary startup-exposure ablation is now complete: narrow the old
+live-contiguous exemption to true singleton, preserving every other predicate
+and number. This is causal testing, NOT the missing allocation/discovery model
+or an accepted resource change. An initial broader deletion was caught before
+any run and corrected to preserve singleton with latency co-load as well.
+Exhaustive256 Boolean combinations isolate only the intended multi-path,
+unproven, over-allowance case. Ordinary trial143.804Mbps/1.296s maximum gap
+versus fresh control168.104Mbps/.309s does not close timing; echo p95 is better
+in the trial, so no blanket regression attribution. Full evidence is preserved
+in MULTI_FRONTIER_ACQUISITION_ABLATION_20260906. Source is restored. The trial
+still shows native QUIC progress while ordered receipt stalls and TCP retains
+native queues. It is NOT accepted as a standalone fix; do not tune its allowance.
+The41.94Mbps512KiB/100ms pre-qualification ceiling remains a real conditional
+tradeoff. Next resolve finite allocation/discovery and irreversible-work
+ownership before any further runtime candidate. No build or lab is active.
 
 Global gates stay: mixed and both-direction startup/recovery timing; unresolved
 mid-transfer reset; restart/churn/retention;500Mbps single/200Mbps independent

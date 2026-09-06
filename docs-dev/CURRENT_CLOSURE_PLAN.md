@@ -1,8 +1,35 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 19:14 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-06 19:53 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
+
+## Current checkpoint and next decision
+
+The live-send lifetime correction is committed in9f522b2;8433c6d preserves
+actual removal of the unknown-evidence reduction class. The individual
+packet-class correction now has its actual-engine RED/GREEN, native/adapter
+controls, strict Clippy and8,192-round retention check. It deletes the
+duplicate transaction-retention list while retaining whole-episode native
+undo guards. Only its source/RFC hunks are staged for an intermediate commit;
+the earlier reordering, companion, actor and qualification stack stays held.
+
+Ten ordinary comparisons are preserved in QUIC_PACKET_CLASS_COMPARISON_20260906.
+They do NOT establish global non-regression: mixed post-QoS service improves
+in these runs, but mixed startup/delivery is bursty, gaps persist and QUIC/latency
+differences are not uniformly favorable. No release or public headline follows.
+Next attribute the exact lower Product frontier: native QUIC can have ACKed
+54.1MB while ordered application delivery is only5.0MB. Existing1Hz data locate
+the layer but do not identify the particular blocked range or failed decision.
+No new congestion knob, receive-window clamp or protocol preference is justified.
+
+Global gates stay: mixed and both-direction startup/recovery timing; unresolved
+mid-transfer reset; restart/churn/retention;500Mbps single/200Mbps independent
+multi-link aggregation and shared/asymmetric controls; actual browser and
+short/concurrent plus single-stream service; repeated rawTCP/Xray/H2 matched
+series and loaded latency; only then README curves and release. L3 remains
+correctness-only experimental work. Independent auditors remain usage-limited.
+Historical entries below record the causal sequence, not additional open tasks.
 
 ## Active transaction and process correction — 2026-09-06 16:13 UTC
 
@@ -107,6 +134,19 @@ individual compensation-record reclassification when actual loss and late
 originals coexist. That source hypothesis is not yet a proven performance
 cause or another accepted fix. Do not change the two-PTO retention authority,
 loss thresholds, delay thresholds or gains on this evidence alone.
+
+Packet-class follow-up19:31UTC: the actual packet engine proves the hypothesis:
+Data7 is late-ACKed while genuinely missing Data8 shares its recovery episode;
+the old journal charges both ordinary. QUIC_PACKET_LOSS_CLASSIFICATION_REVIEW
+records RED, prior intent and the separate packet-proof/native-undo model
+before implementation. The candidate removes the duplicate transaction-
+retention list and uses exact batched native packet terminals. The original
+counterexample and468 native tests pass; a further matching-copy/ECN control
+passes. Root adapter build24825 is active. This candidate is not committed or
+accepted yet. Next ordinary comparisons use frozen transport-owned-metadata
+as control; no diagnostic hooks, no gain/percentage/expiry/queue/wire changes.
+Preserve the same loaded-latency and series gate. Packet class correctness
+does not prove attribution of every remaining mixed stall or speed deficit.
 
 1. The quadratic request-recovery queue scan is proven and its equivalent
    snapshot implementation is committed in `614dc73`. All 243 affected sender

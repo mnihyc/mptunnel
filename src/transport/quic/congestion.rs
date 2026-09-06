@@ -1139,6 +1139,10 @@ impl quinn::congestion::Controller for InstrumentedController {
         self.inner.on_packet_discarded(packet_number, space);
     }
 
+    fn on_lost_packets_retired(&mut self, packets: &[quinn::congestion::LostPacketTerminal]) {
+        self.inner.on_lost_packets_retired(packets);
+    }
+
     fn on_spurious_congestion_event(
         &mut self,
         transaction: quinn::congestion::RecoveryTransactionId,

@@ -19,7 +19,7 @@ use crate::{
     cid_queue::CidQueue,
     coding::BufMutExt,
     config::{ServerConfig, TransportConfig},
-    congestion::{self, RecoveryTransactionId},
+    congestion::{self, LostPacketOutcome, LostPacketTerminal, RecoveryTransactionId},
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
@@ -1574,6 +1574,11 @@ impl Connection {
         };
 
         let retained_ack = self.detect_spurious_loss(now, &ack, space);
+        settle_lost_packet_owners(
+            &mut self.path,
+            self.prev_path.as_mut().map(|(_, path)| path),
+            &retained_ack.retired_packets,
+        );
         for &transaction in &retained_ack.abandoned_transactions {
             settle_retained_loss_owners(
                 &mut self.path,
@@ -1772,9 +1777,14 @@ impl Connection {
     /// Expire retained loss evidence after two PTOs, matching current-main Quinn.
     fn drain_lost_packets(&mut self, now: Instant) {
         let two_pto = 2 * self.path.rtt.pto_base();
-        let abandoned =
+        let expired =
             expire_retained_losses_in_spaces(&mut self.spaces, now, two_pto);
-        for transaction in abandoned {
+        settle_lost_packet_owners(
+            &mut self.path,
+            self.prev_path.as_mut().map(|(_, path)| path),
+            &expired.retired_packets,
+        );
+        for transaction in expired.abandoned_transactions {
             settle_retained_loss_owners(
                 &mut self.path,
                 self.prev_path.as_mut().map(|(_, path)| path),
@@ -4459,8 +4469,35 @@ fn settle_retained_loss_owners(
     undone
 }
 
+fn settle_lost_packet_owners(
+    active: &mut PathData,
+    previous: Option<&mut PathData>,
+    packets: &[(u64, LostPacketTerminal)],
+) {
+    if packets.is_empty() {
+        return;
+    }
+    for path in std::iter::once(active).chain(previous) {
+        let epoch = path.controller_epoch();
+        let owned: Vec<_> = packets
+            .iter()
+            .filter_map(|(owner, terminal)| (*owner == epoch).then_some(*terminal))
+            .collect();
+        if !owned.is_empty() {
+            path.congestion.on_lost_packets_retired(&owned);
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+struct RetainedLossExpiry {
+    retired_packets: Vec<(u64, LostPacketTerminal)>,
+    abandoned_transactions: Vec<RetainedRecoveryTransaction>,
+}
+
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 struct RetainedAckMatch {
+    retired_packets: Vec<(u64, LostPacketTerminal)>,
     matched_transactions: BTreeSet<RetainedRecoveryTransaction>,
     ecn_marked_packets: u64,
     ecn_marked_noncurrent_epoch: bool,
@@ -4468,6 +4505,7 @@ struct RetainedAckMatch {
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 struct SpuriousLossDetection {
+    retired_packets: Vec<(u64, LostPacketTerminal)>,
     matched_transactions: Vec<RetainedRecoveryTransaction>,
     abandoned_transactions: Vec<RetainedRecoveryTransaction>,
     ecn_marked_packets: u64,
@@ -4481,6 +4519,7 @@ fn path_owns_rtt_sample(packet: &SentPacket, path_generation: u64, controller_ep
 fn acknowledge_retained_losses(
     lost_packets: &mut std::collections::BTreeMap<u64, LostPacket>,
     ack: &frame::Ack,
+    space: SpaceId,
     current_controller_epoch: u64,
 ) -> RetainedAckMatch {
     if lost_packets.is_empty() {
@@ -4495,6 +4534,14 @@ fn acknowledge_retained_losses(
             .collect();
         for packet_number in acknowledged {
             if let Some(info) = lost_packets.remove(&packet_number) {
+                matched.retired_packets.push((
+                    info.controller_epoch,
+                    LostPacketTerminal {
+                        space,
+                        packet_number,
+                        outcome: LostPacketOutcome::Acknowledged,
+                    },
+                ));
                 if let Some(transaction) = info.recovery_transaction {
                     matched.matched_transactions.insert((info.controller_epoch, transaction));
                 }
@@ -4521,17 +4568,21 @@ fn detect_spurious_loss_in_spaces(
 ) -> SpuriousLossDetection {
     // Expiry must precede matching in the same ACK transaction. Any expired member makes the
     // transaction unproven, while younger records remain available for transport ECN accounting.
-    let abandoned_transactions =
+    let mut expired =
         expire_retained_losses_in_spaces(spaces, now, retention);
     let acknowledged = acknowledge_retained_losses(
         &mut spaces[space].lost_packets,
         ack,
+        space,
         current_controller_epoch,
     );
 
+    expired.retired_packets.extend(acknowledged.retired_packets);
+
     SpuriousLossDetection {
+        retired_packets: expired.retired_packets,
         matched_transactions: acknowledged.matched_transactions.into_iter().collect(),
-        abandoned_transactions,
+        abandoned_transactions: expired.abandoned_transactions,
         ecn_marked_packets: acknowledged.ecn_marked_packets,
         ecn_marked_noncurrent_epoch: acknowledged.ecn_marked_noncurrent_epoch,
     }
@@ -4571,12 +4622,21 @@ fn expire_retained_losses_in_spaces(
     spaces: &mut [PacketSpace; 3],
     now: Instant,
     retention: Duration,
-) -> Vec<RetainedRecoveryTransaction> {
+) -> RetainedLossExpiry {
     let mut abandoned = BTreeSet::new();
+    let mut retired_packets = Vec::new();
     for space in SpaceId::iter() {
-        spaces[space].lost_packets.retain(|_, info| {
+        spaces[space].lost_packets.retain(|&packet_number, info| {
             let retained = now.saturating_duration_since(info.time_sent) <= retention;
             if !retained {
+                retired_packets.push((
+                    info.controller_epoch,
+                    LostPacketTerminal {
+                        space,
+                        packet_number,
+                        outcome: LostPacketOutcome::Expired,
+                    },
+                ));
                 if let Some(transaction) = info.recovery_transaction {
                     abandoned.insert((info.controller_epoch, transaction));
                 }
@@ -4599,7 +4659,10 @@ fn expire_retained_losses_in_spaces(
         }
     }
 
-    abandoned.into_iter().collect()
+    RetainedLossExpiry {
+        retired_packets,
+        abandoned_transactions: abandoned.into_iter().collect(),
+    }
 }
 
 #[cfg(test)]
@@ -4741,11 +4804,19 @@ mod tests {
                     abandon_retained_transactions_for_epoch(&mut spaces, parked.controller_epoch())
                 } else {
                     match outcome {
-                        RetainedLossTerminal::Abandoned => expire_retained_losses_in_spaces(
-                            &mut spaces,
-                            sent + retention + Duration::from_millis(1),
-                            retention,
-                        ),
+                        RetainedLossTerminal::Abandoned => {
+                            let expired = expire_retained_losses_in_spaces(
+                                &mut spaces,
+                                sent + retention + Duration::from_millis(1),
+                                retention,
+                            );
+                            settle_lost_packet_owners(
+                                &mut active,
+                                Some(&mut parked),
+                                &expired.retired_packets,
+                            );
+                            expired.abandoned_transactions
+                        }
                         RetainedLossTerminal::Spurious => {
                             detect_spurious_loss_in_spaces(
                                 &mut spaces,
@@ -4987,6 +5058,70 @@ mod tests {
     }
 
     #[test]
+    fn packet_class_terminals_settle_matching_migration_copies_after_ecn() {
+        use crate::congestion::{Bbr3, Bbr3Config};
+        let now = Instant::now();
+        let mut bbr = Bbr3Config::default();
+        bbr.loss_compensation_floor(0.1);
+        let mut config = TransportConfig::default();
+        config.congestion_controller_factory(Arc::new(bbr));
+        let old_remote = "127.0.0.1:41000".parse().unwrap();
+        let new_remote = "127.0.0.1:41001".parse().unwrap();
+        let classify = |path: &PathData, space| {
+            path.congestion
+                .clone_box()
+                .into_any()
+                .downcast::<Bbr3>()
+                .unwrap()
+                .loss_packet_classes_for_test()
+                .into_iter()
+                .find(|record| (record.0, record.1) == (space, 7))
+                .unwrap()
+                .3
+        };
+        for same_lineage in [true, false] {
+            let mut parked = PathData::new(old_remote, false, None, 0, now, &config);
+            for space in [SpaceId::Initial, SpaceId::Data] {
+                parked
+                    .congestion
+                    .on_packet_sent(now, 1200, 0, 7, space, false);
+                parked.congestion.on_packet_lost(1200, 7, space, now);
+            }
+            let mut active = if same_lineage {
+                PathData::from_previous(new_remote, &parked, 1, now)
+            } else {
+                let mut path = PathData::new(new_remote, false, None, 1, now, &config);
+                path.congestion
+                    .on_packet_sent(now, 1200, 0, 7, SpaceId::Data, false);
+                path.congestion.on_packet_lost(1200, 7, SpaceId::Data, now);
+                path
+            };
+            // ECN revokes native undo, not independently retained packet truth.
+            parked.congestion.on_validated_ecn_congestion_event();
+            active.congestion.on_validated_ecn_congestion_event();
+            let before = (parked.congestion.window(), active.congestion.window());
+            let terminal = [(
+                parked.controller_epoch(),
+                LostPacketTerminal {
+                    space: SpaceId::Data,
+                    packet_number: 7,
+                    outcome: LostPacketOutcome::Acknowledged,
+                },
+            )];
+            for _ in 0..2 {
+                settle_lost_packet_owners(&mut active, Some(&mut parked), &terminal);
+            }
+            assert!(classify(&parked, SpaceId::Data));
+            assert_eq!(classify(&active, SpaceId::Data), same_lineage);
+            assert!(!classify(&parked, SpaceId::Initial));
+            assert_eq!(
+                (parked.congestion.window(), active.congestion.window()),
+                before
+            );
+        }
+    }
+
+    #[test]
     fn mixed_epoch_ecn_cohort_cannot_notify_fresh_controller() {
         let now = Instant::now();
         let current_ack = Some((41, now));
@@ -5181,7 +5316,7 @@ mod tests {
     }
 
     #[test]
-    fn one_expired_member_abandons_younger_evidence_from_the_same_transaction() {
+    fn one_expired_member_disqualifies_undo_but_preserves_younger_packet_truth() {
         let sent = Instant::now();
         let retention = Duration::from_millis(100);
         let transaction = RecoveryTransactionId::new(7);
@@ -5202,7 +5337,7 @@ mod tests {
         );
 
         // Expiry runs before matching. The older missing member makes the transaction unproven,
-        // so the younger late ACK can still advance ECN accounting but cannot trigger undo.
+        // so the younger late ACK still owns its packet class and ECN accounting, not undo.
         let outcome = detect_spurious_loss_in_spaces(
             &mut spaces,
             sent + retention + Duration::from_nanos(1),
@@ -5213,6 +5348,27 @@ mod tests {
         );
         assert_eq!(outcome.abandoned_transactions, vec![(3, transaction)]);
         assert!(outcome.matched_transactions.is_empty());
+        assert_eq!(
+            outcome.retired_packets,
+            vec![
+                (
+                    3,
+                    LostPacketTerminal {
+                        space: SpaceId::Data,
+                        packet_number: 20,
+                        outcome: LostPacketOutcome::Expired,
+                    },
+                ),
+                (
+                    3,
+                    LostPacketTerminal {
+                        space: SpaceId::Data,
+                        packet_number: 21,
+                        outcome: LostPacketOutcome::Acknowledged,
+                    },
+                ),
+            ]
+        );
         assert!(!completes_transaction(&spaces, &outcome, 3));
         assert!(spaces[SpaceId::Data].lost_packets.is_empty());
     }

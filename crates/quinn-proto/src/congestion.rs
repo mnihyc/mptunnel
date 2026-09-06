@@ -416,6 +416,12 @@ pub trait Controller: Send + Sync {
     /// Implementations must not synthesize congestion or delivery evidence.
     fn on_packet_discarded(&mut self, _packet_number: u64, _space: SpaceId) {}
 
+    /// Settle individually retained loss proof without delivering bytes or undoing congestion.
+    ///
+    /// The transport dispatches one batch to every matching controller lineage copy.
+    /// Packet expiry and episode-wide undo disqualification are separate facts.
+    fn on_lost_packets_retired(&mut self, _packets: &[LostPacketTerminal]) {}
+
     /// All retained packets from one recovery transaction were acknowledged late.
     #[allow(unused_variables)]
     fn on_spurious_congestion_event(&mut self, transaction: RecoveryTransactionId) -> bool {
@@ -490,6 +496,26 @@ pub trait Controller: Send + Sync {
 
     /// Returns Self for use in down-casting to extract implementation details
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+/// Terminal fact for an individually retained native loss declaration.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LostPacketOutcome {
+    /// A valid late ACK proved that this original packet arrived.
+    Acknowledged,
+    /// The native proof lifetime ended without such proof.
+    Expired,
+}
+
+/// Exact packet identity within the receiving controller's lineage.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LostPacketTerminal {
+    /// Independent packet-number space.
+    pub space: SpaceId,
+    /// Original packet number, never a retransmission's number.
+    pub packet_number: u64,
+    /// Individual proof result; this is not a recovery-episode undo result.
+    pub outcome: LostPacketOutcome,
 }
 
 /// Per-packet state used by delivery-rate sampling.

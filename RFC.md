@@ -4074,8 +4074,10 @@ complete and no raw bypass condition owns its cohort. Missing or unalignable
 evidence, persistent congestion, or the `RawOnly` resource transition makes
 the affected exact cohort `raw-authority` before the native response; its
 checked raw-authority generation prevents that response from being applied a
-second time. A valid late ACK owned by the exact retained recovery transaction
-may change either loss class to `proven-spurious`. No unrelated record,
+second time. A valid late ACK owned by the exact retained native packet
+may change either loss class to `proven-spurious`, even if another packet in
+the same recovery transaction was genuinely lost. Individual packet-class
+truth MUST NOT require whole-transaction native undo eligibility. No unrelated record,
 packet-number space, callback batch, or later transaction can change it, and
 no `proven-spurious` record becomes loss again. Every permitted class change
 replays the bounded suffix before another controller decision observes it.
@@ -4151,6 +4153,17 @@ transaction identities but allocate divergent new episodes from a shared
 non-reusing lineage sequence. Restoring a clone MUST NOT rewind that sequence.
 These ownership notifications do not authorize delivery, RTT, or congestion
 samples for another path, and cannot modify an unrelated controller lineage.
+
+Packet-class proof and native-undo proof have distinct terminals. The exact
+retained packet's ACK or expiry MUST reach every owning controller copy in a
+batch before the next compensation decision. An acknowledged original changes
+only its loss class; no delivery counter, rate sample or native window credit
+is manufactured. Expiry finalizes its existing class without resurrection.
+Partial transaction expiry or ECN still disqualifies whole-transaction native
+undo, but MUST NOT finalize the individual proof of other retained packets.
+Journal mutability follows these packet terminals, open loss cohorts and the
+current callback batch, not a second transaction-retention list. Applying one
+ACK's packet terminals MUST NOT replay the whole journal once per packet.
 
 The journal has finite immutable byte and item authorities `J^B` and `J^I`.
 After every insertion, reclassification, and recovery-transaction terminal,

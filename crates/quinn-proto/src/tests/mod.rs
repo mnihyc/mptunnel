@@ -48,6 +48,102 @@ mod token;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
+#[test]
+fn partial_late_original_corrects_its_loss_class_without_undoing_real_loss() {
+    let mut config = client_config_with_deterministic_pns();
+    let transport = Arc::get_mut(&mut config.transport).unwrap();
+    transport.mtu_discovery_config(None);
+    let mut congestion = crate::congestion::Bbr3Config::default();
+    congestion.loss_compensation_floor(0.10);
+    transport.congestion_controller_factory(Arc::new(congestion));
+    let mut pair = Pair::default_with_deterministic_pns();
+    pair.latency = Duration::from_millis(50);
+    let (client, server) = pair.connect_with(config);
+    pair.drive();
+    let initial_lost = pair.client_conn_mut(client).stats().path.lost_packets;
+    let initial_received = pair.server_conn_mut(server).stats().frame_rx.ping;
+
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    assert_eq!(pair.server.inbound.len(), 1);
+    let mut held = pair.server.inbound.pop_front().unwrap();
+    pair.time += Duration::from_millis(1);
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    assert_eq!(pair.server.inbound.len(), 1);
+    pair.server.inbound.pop_front().unwrap(); // B really is lost.
+    for _ in 0..4 {
+        pair.time += Duration::from_millis(1);
+        pair.client_conn_mut(client).ping();
+        pair.drive_client();
+    }
+    assert_eq!(pair.server.inbound.len(), 4);
+    pair.time += pair.latency;
+    pair.drive_server();
+    pair.time += pair.latency;
+    pair.drive_client();
+    assert_eq!(
+        pair.client_conn_mut(client).stats().path.lost_packets - initial_lost,
+        2
+    );
+
+    let snapshot = |connection: &Connection| {
+        connection
+            .congestion_state()
+            .clone_box()
+            .into_any()
+            .downcast::<crate::congestion::Bbr3>()
+            .unwrap()
+            .loss_packet_classes_for_test()
+    };
+    let before = snapshot(pair.client_conn_mut(client));
+    assert_eq!(
+        before.len(),
+        2,
+        "exactly the two original loss records: {before:?}"
+    );
+    assert!(before[0].2.is_some());
+    assert_eq!(before[0].2, before[1].2, "one native recovery transaction");
+    assert!(!before[0].3 && !before[1].3);
+    let undos = pair
+        .client_conn_mut(client)
+        .stats()
+        .path
+        .spurious_congestion_events;
+
+    held.0 = pair.time;
+    pair.server.inbound.push_front(held);
+    pair.drive_server();
+    pair.time += pair.latency;
+    pair.drive_client();
+    assert_eq!(
+        pair.server_conn_mut(server).stats().frame_rx.ping - initial_received,
+        5
+    );
+    assert_eq!(
+        pair.client_conn_mut(client)
+            .stats()
+            .path
+            .spurious_congestion_events,
+        undos,
+        "one delivered original must not undo the coexisting genuine loss"
+    );
+    let after = snapshot(pair.client_conn_mut(client));
+    let original = after
+        .iter()
+        .find(|record| (record.0, record.1) == (before[0].0, before[0].1))
+        .expect("retained exact A record");
+    let genuinely_lost = after
+        .iter()
+        .find(|record| (record.0, record.1) == (before[1].0, before[1].1))
+        .expect("retained exact B record");
+    assert!(!genuinely_lost.3, "B remains a real loss");
+    assert!(
+        original.3,
+        "delivered A is still charged as ordinary loss merely because B is unresolved: {after:?}"
+    );
+}
+
 // Enable this if you want to run these tests in the browser.
 // Unfortunately it's either-or: Enable this and you can run in the browser, disable to run in nodejs.
 // #[cfg(all(target_family = "wasm", target_os = "unknown"))]

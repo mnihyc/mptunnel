@@ -60,6 +60,10 @@ deviations from upstream 0.11.17 are:
   migration copies; current ACK snapshots remain available for same-ACK ECN.
   This replaces the imported PR's ten-round cleanup heuristic, which can
   discard evidence before an adaptive native loss detector finishes with it;
+- individual retained packet ACK/expiry settles compensation classification
+  independently of whole-recovery native undo. Partial real loss and ECN keep
+  their native response without charging a proven-delivered original as loss;
+  per-record native proof replaces the journal's transaction-retention list;
 - controller-owned loss evidence is retained for two PTOs with an opaque,
   recovery-scoped undo identity. Expiry precedes late-ACK matching, completion
   spans all packet-number spaces, and only the exact still-current transaction

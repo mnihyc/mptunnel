@@ -1,7 +1,7 @@
 mod max_filter;
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -12,7 +12,8 @@ use rand_pcg::Pcg32;
 
 use crate::congestion::bbr3::max_filter::MaxFilter;
 use crate::congestion::{
-    BandwidthSample, Controller, ControllerFactory, ControllerMetrics, RecoveryTransactionId,
+    BandwidthSample, Controller, ControllerFactory, ControllerMetrics, LostPacketOutcome,
+    LostPacketTerminal, RecoveryTransactionId,
     SpaceId, BASE_DATAGRAM_SIZE,
 };
 use crate::RttEstimator;
@@ -273,6 +274,8 @@ struct LossBudgetRecord {
     tx_in_flight: u64,
     exempt: bool,
     budget_consumed: bool,
+    /// Native packet proof, independent of whether its whole episode can be undone.
+    late_ack_pending: bool,
     loss_round_open: bool,
     raw_explicit: bool,
     raw_unknown: bool,
@@ -293,11 +296,6 @@ struct LossBudgetEpoch {
     anonymous_lost: u64,
     record_ids: Vec<u64>,
     is_app_limited: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LossBudgetUndoTransaction {
-    transaction: RecoveryTransactionId,
 }
 
 /// Description of a per-ack rate sample state that will allow us to determine a short term evolution of the connection
@@ -613,8 +611,6 @@ pub struct Bbr3 {
     /// batch is delivered. Later declarations in that batch are covered by that one raw action
     /// and must not open or charge a second loss round.
     loss_budget_batch_raw_action_taken: bool,
-    /// Recovery transactions for which Quinn still retains one or more declared-loss packets.
-    loss_budget_undo_transactions: VecDeque<LossBudgetUndoTransaction>,
     /// Raw-authority generation and predecessor state captured by the current native BBR undo
     /// snapshot. Final older evidence is represented by the snapshot; an older cohort still
     /// awaiting its native response or later explicit/unknown attribution makes restoration unsafe.
@@ -695,6 +691,23 @@ pub struct Bbr3 {
 }
 
 impl Bbr3 {
+    #[cfg(test)]
+    pub(crate) fn loss_packet_classes_for_test(
+        &self,
+    ) -> Vec<(SpaceId, u64, Option<RecoveryTransactionId>, bool)> {
+        self.loss_budget_records
+            .iter()
+            .map(|record| {
+                (
+                    record.space,
+                    record.packet_number,
+                    record.transaction,
+                    record.exempt,
+                )
+            })
+            .collect()
+    }
+
     fn new(config: Arc<Bbr3Config>, current_mtu: u16) -> Self {
         let probe_rng: Pcg32;
         if let Some(probe_seed) = config.probe_rng_seed {
@@ -845,7 +858,6 @@ impl Bbr3 {
             loss_budget_next_record_id: 1,
             loss_budget_current_batch: Vec::new(),
             loss_budget_batch_raw_action_taken: false,
-            loss_budget_undo_transactions: VecDeque::new(),
             loss_budget_raw_authority_generation: 0,
             undo_loss_budget_raw_authority_generation: 0,
             undo_loss_budget_had_open_predecessor: false,
@@ -1048,10 +1060,6 @@ impl Bbr3 {
                 size_of::<LossBudgetEpoch>(),
             ),
             (self.loss_budget_current_batch.capacity(), size_of::<u64>()),
-            (
-                self.loss_budget_undo_transactions.capacity(),
-                size_of::<LossBudgetUndoTransaction>(),
-            ),
         ];
         let fixed = entries
             .into_iter()
@@ -1065,10 +1073,10 @@ impl Bbr3 {
             })
     }
 
-    /// Reserve one atomic insertion's record/epoch/batch/transaction storage. Geometric growth
+    /// Reserve one atomic insertion's record/epoch/batch storage. Geometric growth
     /// amortizes allocation, but its slack has no right to cross the configured memory authority:
     /// near the boundary reserve only the exact minimum. No traffic or congestion limit changes.
-    fn reserve_loss_journal(&mut self, additions: [usize; 4], epoch_id_bytes: usize) -> bool {
+    fn reserve_loss_journal(&mut self, additions: [usize; 3], epoch_id_bytes: usize) -> bool {
         self.maybe_compact_loss_budget_journal();
         if self.loss_compensation_floor == 0.0 {
             return false;
@@ -1077,32 +1085,29 @@ impl Bbr3 {
             self.loss_budget_records.len(),
             self.loss_budget_epochs.len(),
             self.loss_budget_current_batch.len(),
-            self.loss_budget_undo_transactions.len(),
         ];
         let capacities = [
             self.loss_budget_records.capacity(),
             self.loss_budget_epochs.capacity(),
             self.loss_budget_current_batch.capacity(),
-            self.loss_budget_undo_transactions.capacity(),
         ];
         let sizes = [
             size_of::<LossBudgetRecord>(),
             size_of::<LossBudgetEpoch>(),
             size_of::<u64>(),
-            size_of::<LossBudgetUndoTransaction>(),
         ];
         let plan = (|| {
             let current = self.loss_journal_retained_bytes()?;
             let mut minimum = capacities;
             let mut geometric = capacities;
-            for index in 0..4 {
+            for index in 0..3 {
                 let required = lengths[index].checked_add(additions[index])?;
                 minimum[index] = capacities[index].max(required);
                 if required > capacities[index] {
                     geometric[index] = minimum[index].max(capacities[index].saturating_mul(2));
                 }
             }
-            let fits = |targets: [usize; 4]| {
+            let fits = |targets: [usize; 3]| {
                 targets
                     .into_iter()
                     .enumerate()
@@ -1138,10 +1143,6 @@ impl Bbr3 {
             .and_then(|()| {
                 self.loss_budget_current_batch
                     .try_reserve_exact(targets[2] - lengths[2])
-            })
-            .and_then(|()| {
-                self.loss_budget_undo_transactions
-                    .try_reserve_exact(targets[3] - lengths[3])
             });
         // Allocators may provide more than requested. Validate actual reported capacity before
         // making the insertion visible; a failed reservation also discards all partial reserves.
@@ -1173,7 +1174,6 @@ impl Bbr3 {
         self.loss_budget_records = VecDeque::new();
         self.loss_budget_epochs = VecDeque::new();
         self.loss_budget_current_batch = Vec::new();
-        self.loss_budget_undo_transactions = VecDeque::new();
         self.loss_budget_checkpoint = None;
         self.loss_budget_balance = 0.0;
         self.loss_budget_capacity = 0.0;
@@ -1221,9 +1221,8 @@ impl Bbr3 {
         let Some(mut checkpoint) = self.loss_budget_checkpoint else {
             return;
         };
-        // A transaction identifier on a record is historical ownership, not proof that Quinn
-        // still retains its late-ACK evidence. An abandoned older transaction must not pin the
-        // journal merely because a younger transaction or loss round remains open.
+        // Individual native packet proof owns class mutability. Native episode
+        // undo can be disqualified while a younger packet's proof is still live.
         let mutable_frontier = self
             .loss_budget_records
             .iter()
@@ -1233,11 +1232,7 @@ impl Bbr3 {
                         .loss_budget_current_batch
                         .binary_search(&record.id)
                         .is_ok()
-                    || record.transaction.is_some_and(|transaction| {
-                        self.loss_budget_undo_transactions
-                            .iter()
-                            .any(|entry| entry.transaction == transaction)
-                    })
+                    || record.late_ack_pending
             })
             .map(|record| record.id);
         while let Some(epoch) = self.loss_budget_epochs.front() {
@@ -1272,15 +1267,12 @@ impl Bbr3 {
         }
         if self.loss_budget_records.is_empty() && self.loss_budget_epochs.is_empty() {
             self.loss_budget_checkpoint = None;
-            if self.loss_budget_current_batch.is_empty()
-                && self.loss_budget_undo_transactions.is_empty()
-            {
+            if self.loss_budget_current_batch.is_empty() {
                 // clear/pop_front retain allocation high-water marks. A fully finalized
                 // journal has no state that needs those allocations until a new loss arrives.
                 self.loss_budget_records = VecDeque::new();
                 self.loss_budget_epochs = VecDeque::new();
                 self.loss_budget_current_batch = Vec::new();
-                self.loss_budget_undo_transactions = VecDeque::new();
             }
         }
     }
@@ -1319,7 +1311,7 @@ impl Bbr3 {
             .filter(|record| !record.budget_consumed)
             .count();
         if self.loss_budget_checkpoint.is_some()
-            && !self.reserve_loss_journal([0, 1, 0, 0], record_count.checked_mul(size_of::<u64>())?)
+            && !self.reserve_loss_journal([0, 1, 0], record_count.checked_mul(size_of::<u64>())?)
         {
             return None;
         }
@@ -1445,23 +1437,6 @@ impl Bbr3 {
         self.loss_round_evidence_unknown = false;
     }
 
-    fn begin_loss_budget_transaction(&mut self, transaction: RecoveryTransactionId) {
-        if self.loss_compensation_floor == 0.0
-            || self
-                .loss_budget_undo_transactions
-                .iter()
-                .any(|entry| entry.transaction == transaction)
-        {
-            return;
-        }
-        if !self.reserve_loss_journal([0, 0, 0, 1], 0) {
-            return;
-        }
-        self.ensure_loss_budget_journal();
-        self.loss_budget_undo_transactions
-            .push_back(LossBudgetUndoTransaction { transaction });
-    }
-
     fn record_loss_budget_packet(
         &mut self,
         packet: Option<BbrPacket>,
@@ -1476,7 +1451,7 @@ impl Bbr3 {
             self.enter_loss_journal_raw_only();
             return None;
         };
-        if !self.reserve_loss_journal([1, 0, 1, 0], 0) {
+        if !self.reserve_loss_journal([1, 0, 1], 0) {
             return None;
         }
         self.ensure_loss_budget_journal();
@@ -1514,6 +1489,7 @@ impl Bbr3 {
             tx_in_flight,
             exempt,
             budget_consumed: false,
+            late_ack_pending: true,
             loss_round_open: !covered_by_raw_batch,
             raw_explicit,
             raw_unknown,
@@ -2799,9 +2775,6 @@ impl Bbr3 {
             .loss_budget_records
             .iter()
             .any(|record| record.loss_round_open);
-        if let Some(transaction) = self.undo_transaction {
-            self.begin_loss_budget_transaction(transaction);
-        }
     }
 
     /// equivalent to IsInflightTooHigh <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-1>
@@ -3277,6 +3250,37 @@ impl Controller for Bbr3 {
         }
     }
 
+    fn on_lost_packets_retired(&mut self, packets: &[LostPacketTerminal]) {
+        if self.loss_compensation_floor == 0.0 || packets.is_empty() {
+            return;
+        }
+        // One batch lookup and one journal walk, not a full replay per packet.
+        // Native removal is once-only; duplicates cannot resurrect finalized proof.
+        let mut outcomes = BTreeMap::new();
+        for packet in packets {
+            outcomes
+                .entry((packet.space as usize, packet.packet_number))
+                .or_insert(packet.outcome);
+        }
+        let mut acknowledged = Vec::new();
+        for record in &mut self.loss_budget_records {
+            if !record.late_ack_pending {
+                continue;
+            }
+            let Some(outcome) = outcomes.get(&(record.space as usize, record.packet_number)) else {
+                continue;
+            };
+            record.late_ack_pending = false;
+            if *outcome == LostPacketOutcome::Acknowledged {
+                acknowledged.push(record.id);
+                record.loss_round_open = false;
+            }
+        }
+        self.exempt_loss_budget_records(&acknowledged, LossBudgetExemption::Spurious);
+        self.recompute_open_loss_round();
+        self.maybe_compact_loss_budget_journal();
+    }
+
     /// equivalent to BBRHandleSpuriousLossDetection:
     /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.5.11.2>
     fn on_spurious_congestion_event(&mut self, transaction: RecoveryTransactionId) -> bool {
@@ -3284,9 +3288,9 @@ impl Controller for Bbr3 {
             return false;
         }
         let budget_transaction = self
-            .loss_budget_undo_transactions
+            .loss_budget_records
             .iter()
-            .any(|entry| entry.transaction == transaction);
+            .any(|record| record.transaction == Some(transaction));
         let unrelated_open_evidence = self
             .loss_budget_records
             .iter()
@@ -3305,10 +3309,9 @@ impl Controller for Bbr3 {
                 if record.transaction == Some(transaction) {
                     record.transaction = None;
                     record.loss_round_open = false;
+                    record.late_ack_pending = false;
                 }
             }
-            self.loss_budget_undo_transactions
-                .retain(|entry| entry.transaction != transaction);
             self.recompute_open_loss_round();
             self.maybe_compact_loss_budget_journal();
         }
@@ -3372,8 +3375,13 @@ impl Controller for Bbr3 {
     }
 
     fn on_recovery_transaction_abandoned(&mut self, transaction: RecoveryTransactionId) {
-        self.loss_budget_undo_transactions
-            .retain(|entry| entry.transaction != transaction);
+        // Native undo is disqualified. Individual packet proof still belongs
+        // to the transport and is finalized only by its packet terminal batch.
+        for record in &mut self.loss_budget_records {
+            if record.transaction == Some(transaction) {
+                record.transaction = None;
+            }
+        }
         self.maybe_compact_loss_budget_journal();
         if self.undo_transaction == Some(transaction) {
             self.undo_transaction = None;
@@ -3385,7 +3393,9 @@ impl Controller for Bbr3 {
         // CE is genuine congestion evidence, not proof that a packet-loss declaration was
         // spurious. This runs after any attributable ECN loss processing, so it also makes a
         // newly-created CE recovery snapshot ineligible for late-loss undo.
-        self.loss_budget_undo_transactions.clear();
+        for record in &mut self.loss_budget_records {
+            record.transaction = None;
+        }
         self.maybe_compact_loss_budget_journal();
         self.undo_transaction = None;
         self.undo_state = None;
@@ -3568,6 +3578,146 @@ mod test {
     type UndoSnapshot = (Option<BbrState>, f64, u64, u64);
     /// A loss episode: (pre-loss undo snapshot, post-loss state, post-loss inflight_longterm).
     type LossEpisode = (UndoSnapshot, BbrState, u64);
+
+    // These callback fixtures model expiry of every packet in a transaction.
+    // Native undo disqualification alone must not finalize individual proof.
+    fn retire_test_transaction(bbr: &mut Bbr3, transaction: RecoveryTransactionId) {
+        let packets: Vec<_> = bbr
+            .loss_budget_records
+            .iter()
+            .filter(|record| record.transaction == Some(transaction))
+            .map(|record| LostPacketTerminal {
+                space: record.space,
+                packet_number: record.packet_number,
+                outcome: LostPacketOutcome::Expired,
+            })
+            .collect();
+        bbr.on_lost_packets_retired(&packets);
+        bbr.on_recovery_transaction_abandoned(transaction);
+    }
+
+    #[test]
+    fn packet_class_proof_survives_undo_disqualification_but_not_packet_expiry() {
+        for (ecn, expire_packet) in [(false, false), (true, false), (false, true)] {
+            let mut bbr = loss_floor_test_controller();
+            let sent = Instant::now();
+            for number in [11, 12] {
+                bbr.on_packet_sent(sent, BASE_DATAGRAM_SIZE as u16, number, SpaceId::Data);
+            }
+            let lost_at = sent + Duration::from_millis(100);
+            let transaction = bbr
+                .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 11, SpaceId::Data, lost_at)
+                .unwrap();
+            assert_eq!(
+                bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 12, SpaceId::Data, lost_at),
+                Some(transaction)
+            );
+            bbr.on_congestion_event(
+                lost_at,
+                sent,
+                false,
+                false,
+                2 * BASE_DATAGRAM_SIZE,
+                12,
+                SpaceId::Data,
+            );
+            assert!(bbr.advance_compensated_loss_budget(false).is_some());
+            bbr.close_open_loss_round();
+            if ecn {
+                bbr.on_validated_ecn_congestion_event();
+            } else {
+                bbr.on_recovery_transaction_abandoned(transaction);
+            }
+            assert_eq!(
+                bbr.loss_budget_records.len(),
+                2,
+                "undo disqualification cannot erase live packet proof"
+            );
+            let prior_native = (
+                bbr.window(),
+                bbr.delivered,
+                bbr.lost,
+                bbr.metrics().bandwidth_estimate,
+            );
+            let packet = LostPacketTerminal {
+                space: SpaceId::Data,
+                packet_number: 11,
+                outcome: LostPacketOutcome::Acknowledged,
+            };
+            if expire_packet {
+                bbr.on_lost_packets_retired(&[LostPacketTerminal {
+                    outcome: LostPacketOutcome::Expired,
+                    ..packet
+                }]);
+            }
+            let mut oracle = bbr.clone();
+            if !expire_packet {
+                let id = oracle
+                    .loss_budget_records
+                    .iter()
+                    .find(|record| record.packet_number == 11)
+                    .unwrap()
+                    .id;
+                oracle.exempt_loss_budget_records(&[id], LossBudgetExemption::Spurious);
+            }
+            bbr.on_lost_packets_retired(&[packet, packet]);
+            let record_a = bbr
+                .loss_budget_records
+                .iter()
+                .find(|record| record.packet_number == 11);
+            // Expired A may already be folded; if present its class cannot change.
+            assert_eq!(record_a.is_some_and(|record| record.exempt), !expire_packet);
+            let record_b = bbr
+                .loss_budget_records
+                .iter()
+                .find(|record| record.packet_number == 12)
+                .unwrap();
+            assert!(
+                !record_b.exempt && record_b.late_ack_pending,
+                "genuine B and its proof remain unchanged"
+            );
+            assert_eq!(
+                bbr.loss_budget_balance.to_bits(),
+                oracle.loss_budget_balance.to_bits()
+            );
+            assert_eq!(
+                bbr.loss_budget_capacity.to_bits(),
+                oracle.loss_budget_capacity.to_bits()
+            );
+            assert_eq!(
+                (
+                    bbr.window(),
+                    bbr.delivered,
+                    bbr.lost,
+                    bbr.metrics().bandwidth_estimate
+                ),
+                prior_native
+            );
+            let budget = (
+                bbr.loss_budget_balance.to_bits(),
+                bbr.loss_budget_capacity.to_bits(),
+            );
+            bbr.on_lost_packets_retired(&[
+                packet,
+                LostPacketTerminal {
+                    space: SpaceId::Initial,
+                    packet_number: 12,
+                    ..packet
+                },
+            ]);
+            assert_eq!(
+                (
+                    bbr.loss_budget_balance.to_bits(),
+                    bbr.loss_budget_capacity.to_bits()
+                ),
+                budget
+            );
+            assert!(
+                !bbr.on_spurious_congestion_event(transaction),
+                "disqualified native undo cannot revive"
+            );
+        }
+    }
 
     #[test]
     fn live_packet_evidence_survives_younger_delivery_rounds() {
@@ -5080,7 +5230,7 @@ mod test {
             .expect("later loss in the same recovery remains in the transaction");
         assert_eq!(first, second);
 
-        bbr.on_recovery_transaction_abandoned(first);
+        retire_test_transaction(&mut bbr, first);
         bbr.on_packet_sent(
             now - Duration::from_nanos(1),
             BASE_DATAGRAM_SIZE as u16,
@@ -7524,10 +7674,9 @@ mod test {
     #[test]
     fn loss_journal_resource_exhaustion_drops_pinned_history_before_current_loss() {
         let mut config = mptunnel_loss_profile_config();
-        // Exactly one record, one epoch, one transaction, and the batch/epoch ID entries.
+        // Exactly one record, one epoch, and the batch/epoch ID entries.
         let limit = size_of::<LossBudgetRecord>()
             + size_of::<LossBudgetEpoch>()
-            + size_of::<LossBudgetUndoTransaction>()
             + 2 * size_of::<u64>();
         config.loss_journal_max_bytes(limit);
         let mut bbr = Bbr3::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
@@ -7765,8 +7914,8 @@ mod test {
 
         // Keep the oracle's two old transactions alive solely to retain the original full replay
         // history. Their final loss classifications are the same in both controllers.
-        bbr.on_recovery_transaction_abandoned(transactions[0]);
-        bbr.on_recovery_transaction_abandoned(transactions[1]);
+        retire_test_transaction(&mut bbr, transactions[0]);
+        retire_test_transaction(&mut bbr, transactions[1]);
         assert!(
             bbr.loss_in_round,
             "the newer open cohort must not pin older epochs"
@@ -7816,7 +7965,7 @@ mod test {
             )
             .expect("retained transaction");
         assert!(bbr.advance_compensated_loss_budget(true).is_some());
-        bbr.on_recovery_transaction_abandoned(transaction);
+        retire_test_transaction(&mut bbr, transaction);
         assert_eq!(bbr.loss_budget_records.len(), 1);
         assert_eq!(bbr.loss_budget_epochs.len(), 1);
 
@@ -7888,7 +8037,7 @@ mod test {
                 .is_some_and(|(at, _)| acked > *at + retention)
             {
                 let (_, transaction) = retained.pop_front().expect("expired transaction");
-                bbr.on_recovery_transaction_abandoned(transaction);
+                retire_test_transaction(&mut bbr, transaction);
             }
             for acknowledged in first_packet + 1..packet_number {
                 bbr.on_ack(
@@ -7925,7 +8074,13 @@ mod test {
                 first_packet,
                 SpaceId::Data,
             );
-            assert_eq!(bbr.loss_budget_undo_transactions.len(), retained.len());
+            assert_eq!(
+                bbr.loss_budget_records
+                    .iter()
+                    .filter(|record| record.late_ack_pending)
+                    .count(),
+                retained.len()
+            );
             assert!(
                 bbr.loss_budget_records.len() <= retained.len() + 1,
                 "expired prefix retained during rolling loss at round {round}"
@@ -7984,7 +8139,7 @@ mod test {
         // subsequent real ACK closes the final budget/loss round and releases
         // the journal's allocation high-water marks.
         for (_, transaction) in retained.drain(..) {
-            bbr.on_recovery_transaction_abandoned(transaction);
+            retire_test_transaction(&mut bbr, transaction);
         }
         let sent = cursor + 2 * rtt.pto_base();
         let acked = sent + Duration::from_millis(100);
@@ -8013,7 +8168,6 @@ mod test {
         assert_eq!(bbr.loss_budget_records.capacity(), 0);
         assert_eq!(bbr.loss_budget_epochs.capacity(), 0);
         assert_eq!(bbr.loss_budget_current_batch.capacity(), 0);
-        assert_eq!(bbr.loss_budget_undo_transactions.capacity(), 0);
         eprintln!(
             "after_clean_round records={} epochs={} record_capacity={} epoch_capacity={}",
             bbr.loss_budget_records.len(),
@@ -11855,7 +12009,7 @@ mod test {
                         SpaceId::Data,
                     );
                     if let Some(transaction) = transaction {
-                        bbr.on_recovery_transaction_abandoned(transaction);
+                        retire_test_transaction(&mut bbr, transaction);
                     }
                 } else {
                     rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
@@ -13781,7 +13935,7 @@ mod test {
                     SpaceId::Data,
                 );
                 for transaction in loss_transactions {
-                    bbr.on_recovery_transaction_abandoned(transaction);
+                    retire_test_transaction(&mut bbr, transaction);
                 }
             }
 

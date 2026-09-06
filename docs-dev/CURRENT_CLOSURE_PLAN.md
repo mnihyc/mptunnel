@@ -1,7 +1,7 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 11:18 UTC. Baseline source: `7189e69`; evidence checkpoint:
-`282b71f`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
+Updated: 2026-09-06 11:37 UTC. Baseline source: `7189e69`; evidence checkpoints:
+`282b71f`, `5d52914`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Fixed order and closure obligations
@@ -97,6 +97,16 @@ and closed component invariants are not repeatedly reopened as new defects.
   not actor iterations, and do not prove a busy loop or attribute the deployed
   RAM incident. Quieter gate traces preserve the source-read obstruction.
   Diagnostic fields are archived and removed from active runtime source.
+- The cooperative revision's ordinary comparisons and796 affected tests are
+  now complete. Mixed upload211.236 Mbps/gap3.125s, QUIC upload327.385/gap3.463s;
+  the first actor candidate's61.5s gap does not recur in that run. Mixed
+  loss/jitter-only download remains129.953/gap2.033 versus QUIC152.147/gap.659,
+  both80 successful interactive probes. Combined cases still have long gaps
+  and interactive failures. The cooperative client's40s RSS543148 KiB exceeds
+  control335424 KiB. Keep all runtime candidates UNACCEPTED; do not use the
+  fixed source-service invariant to waive ordered-frontier/resource concerns.
+  The completed-proof fixture correction is test-only and independently green;
+  it is not counted as a deployed performance fix. No additional native tuning.
 - Native outage trace shows ordinary exponential PTO backoff, not a stuck
   timer in that capture. Physical queue drain, native reordering tolerance and
   Product-prefix stalls remain separate causes; do not collapse them into the

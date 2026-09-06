@@ -158,3 +158,65 @@ its [cooperative future API](https://docs.rs/tokio/latest/tokio/task/coop/fn.coo
 The corrected candidate must pass both REDs and repeat the ordinary failing
 case before this is accepted as the practical stall cause. Retain the first
 candidate and its failing series, rather than overwriting the evidence.
+
+The cooperative ordinary build finishes in3m23s. Its first repeated mixed
+upload gives211.236 Mbps,3.125324s maximum confirmation gap and exact final
+byte accounting; the61.5s stall does not recur. This supports the
+missing executor-yield mechanism but is one random run, not final acceptance.
+Its40s client RSS543,148 KiB exceeds the matched control's335,424 KiB; do not
+declare memory sustainability fixed. Process %CPU samples are lifetime
+averages, not instantaneous thread traces. Full probes and process series
+are in PRODUCT_ACTOR_SERVICE_EVIDENCE_20260906.json. Other affected ordinary
+cases and full relay/stream tests, including the fixture correction, remain.
+
+The corresponding server queued-send branch already yields unconditionally
+after a dispatch attempt, including zero-progress blockage. It is therefore
+not the same missing-yield branch; do not add another server wrapper merely
+for visual symmetry. Native writer transactions remain unchanged.
+
+## Affected comparisons, still held
+
+| Cooperative candidate | Mean Mbps | Max gap s | Interactive outcome |
+| --- | --- | --- | --- |
+| Mixed upload, combined | 211.236 | 3.125 | Upload confirmation probe; no independent echo series. |
+| QUIC upload, combined | 327.385 | 3.463 | Exact upload confirmation. |
+| Mixed download, combined | 66.372 | 3.979 | 45 successful,16 failed/unavailable attempts. |
+| QUIC download, combined | 98.101 | 4.017 | 31 successful,41 failed/unavailable attempts. |
+| Mixed download, variable loss/jitter only | 129.953 | 2.033 | 80 successful,0 failed. |
+| QUIC download, variable loss/jitter only | 152.147 | .659 | 80 successful,0 failed. |
+
+Upload gaps are target-confirmation gaps; download gaps are application reads.
+These are individual random trials, not proof that every timing difference is
+caused by the actor change. In particular the previous mailbox-only mixed
+loss/jitter run has129.597 Mbps but a smaller.655s maximum gap. Do not claim
+strict timing non-downgrade from the essentially unchanged mean. Earlier
+pre-mailbox mixed results have150.994 Mbps and3.442s, illustrating the need to
+retain full owner evidence instead of choosing one convenient scalar control.
+
+Success-only interactive p95 is censored after disconnection. The mailbox
+mixed control's218.976ms p95 includes only its30 pre-QoS successes; it has no
+successes after15s. The cooperative mixed case retains6 successful requests
+during15--25s QoS and9 more before the outage, with slow QoS responses. Its
+overall1808.768ms success-only p95 is therefore not comparable to the control
+as though the control's45 failures were low latency. Even before QoS its
+p95 is286.254ms versus218.976ms in this pair; neither variation nor failures
+are erased. Both still miss the desired complete interactive acceptance.
+
+No CPU/RSS sustainability, global throughput competitiveness or browser
+acceptance follows. The actor/source counterexample is real; the cooperative
+candidate's practical benefit and resource cost remain held. Full affected
+tests are rebuilding with the corrected completed-proof fixture. The separate
+mixed ordered-frontier/native service issues retain priority afterward; no
+new congestion tweak or larger buffer is authorized by these results.
+
+## Full affected verification
+
+At11:36 UTC the release-lib build completes in6m45s. All246 relay tests pass,
+including the unchanged FIN-target assertions with the completed-proof
+timestamp corrected. The cached artifact also passes297 path and253 stream
+tests:796 total affected tests. This validates the fixture correction and
+affected ownership/ACK/lifecycle contracts, not strict performance or resource
+non-downgrade. Commit the test-only timestamp correction independently; keep
+the native, qualification, mailbox and Product-service runtime candidates
+held. The next practical owner remains mixed ordered delivery and the
+unexplained resource delta, not another congestion gain.

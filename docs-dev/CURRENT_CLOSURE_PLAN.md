@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 06:30 UTC. Historical baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 07:11 UTC. Historical baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -81,17 +81,46 @@ out missing enqueue/forgotten wake for this gap; no timer/gain/repair-quantum
 change follows. Mixed placement and precise carrier/native/wire residence
 remain separate open questions. No next run is queued.
 
-**Current implementation transaction:** legitimate late STARTUP after FINAL
-now has an explicit legal sender-order control plus TCP/QUIC adapter REDs.
-The sender control passes. QUIC returns the exact late-finalization Protocol
-error; the TCP actor closes its shared carrier instead of refusing the
-attachment. Correct only this refusal scope: typed obsolete enrollment after
-shape/signature checks, existing Rejected-to-STREAM_DETACH handling, unchanged
-FINAL membership and missing-state restart/reset semantics. Tests also cover
-trailing cancellation frames, sibling traffic and later valid Ordinary opens.
-No new thresholds or silent promotion to Ordinary. Independent review follows
-the focused GREEN build before acceptance. This is not the cause of every
-QoS stall, since two captures reproduce timing failures without that error.
+**Completed correction:**11d6f3a fixes legitimate late STARTUP after FINAL at
+attachment scope. The legal sender control was GREEN while TCP/QUIC adapters
+were RED; all34 distinct focused checks now pass, including FINAL immutability,
+no resource/evidence publication, trailing cancellation frames, sibling traffic,
+later Ordinary opens and existing restart/reset controls. Independent review
+passed. Only startup/attachment/registry logic and the matching RFC paragraph
+change; no timeout, rate, gain or scheduler mutation. LATE_STARTUP_FINALIZATION_SCOPE
+and its test JSON preserve origin, purpose, causal failure and tradeoff.
+
+The ordinary application builds in1m36s and is frozen at
+`./.tmp/reflection/bin/late-startup-scope-20260907/mptunnel`, without temporary
+native/registry observers. Both ordinary current-snapshot checks complete:
+mixed down85.556Mbps with4.423s QoS gap and one real echo timeout; whole-profile
+mirrored upload64.602Mbps confirms all478,806,016bytes but has19.293s post-load
+drain and5.054s confirmation gap. LATE_STARTUP_SCOPE_ORDINARY_20260907 preserves
+full series,100 compact samples and raw archive. This is neither fluent
+acceptance nor a causal A/B of the rare refusal branch. No release; products
+and probes are stopped. Native/controller constants remain unchanged.
+
+**Next exact model transaction:** common completion-evidence preparation has
+identified a concrete request-side sampling predicate, not a new inventory.
+The live RequestPathRateEvidence caller requires each cohort's earliest send
+to be after the previous ACK, then advances that ACK boundary even when it
+rejects the sample. After the first sample, the real acquisition Owner is
+cleared and ordinary pipelining is legal. For cohorts assigned at n*d and
+ACKed at n*d+R with d<R, every subsequent sample is rejected indefinitely.
+Default Product geometry admits overlapping actual coverage-sized cohorts.
+Two independent source reviews confirm there is no forced round barrier that
+invalidates this schedule. f4206d0 made the old staged predicate unconditional
+when removing its ordered-service branch; later expiry handling retained it.
+
+This can preserve the first request-rate estimate or let it expire despite
+continuing unique ACK progress. It maps to the existing TCP/upload first-second
+and stale-rate issue, not proof of the deployed server-download cause. Next
+prove the exact live producer RED and select a clean separation of staged
+acquisition/provenance from sustained achieved-service sampling, preserving
+compressed-ACK, expiry, copy and incarnation invariants. No boolean flip or
+new scalar/window is approved yet. The generic common-advisory and Defer
+proposals are deferred behind this concrete producer defect. Their unknown-
+path starvation counterexample still blocks automatic implementation.
 
 Both temporary native/registry observers are removed from source; their exact
 archive is NATIVE_PTO_AND_ATTACHMENT_DIAGNOSTIC_20260907.patch. The diagnostic

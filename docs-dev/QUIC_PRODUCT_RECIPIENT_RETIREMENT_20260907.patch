@@ -1,0 +1,427 @@
+--- a/src/runtime/path/quic/client.rs
++++ b/src/runtime/path/quic/client.rs
+@@ -1695,10 +1695,10 @@
+                 stream_id,
+                 stream_runtime.codec_limits,
+                 |frame| async {
+-                    frames_tx
+-                        .send(Ok(frame))
+-                        .await
+-                        .map_err(|_| RuntimeError::ReliablePathSessionClosed)
++                    // Retired Product input is not a repair transport failure:
++                    // the ordinary writer still owns queued FIN/detach work.
++                    let _ = frames_tx.send(Ok(frame)).await;
++                    Ok(())
+                 },
+             )
+             .await
+--- a/src/runtime/path/quic/client_stream.rs
++++ b/src/runtime/path/quic/client_stream.rs
+@@ -281,10 +281,9 @@
+             stream_id: received_stream_id,
+             ..
+         }) if received_stream_id == stream_id => {
+-            frames
+-                .send(Ok(frame))
+-                .await
+-                .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
++            // Product retirement closes its input before ordered FIN/detach
++            // work drains. Late input must not cancel that independent writer.
++            let _ = frames.send(Ok(frame)).await;
+         }
+         Frame::StreamDetach {
+             stream_id: detached_stream_id,
+--- a/src/runtime/path/quic/client_writer.rs
++++ b/src/runtime/path/quic/client_writer.rs
+@@ -16,7 +16,7 @@
+     reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
+     try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
+ };
+-use crate::runtime::path::input::{CarrierInputRoute, ClosedMailbox, PendingMailboxFrame};
++use crate::runtime::path::input::{CarrierInputRoute, PendingMailboxFrame};
+ use crate::runtime::path::proof::PathProofTracker;
+ #[cfg(feature = "lab-diagnostics")]
+ use std::time::Instant;
+@@ -364,15 +364,12 @@
+     }
+     match stream_frames.try_send(Ok(frame)) {
+         Ok(()) => Ok(CarrierInputRoute::Routed),
+-        Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
+-            Ok(CarrierInputRoute::Mailbox(PendingMailboxFrame::new(
+-                frame,
+-                stream_frames.clone(),
+-                Ok,
+-                ClosedMailbox::CarrierClosed,
+-            )))
+-        }
+-        Err(mpsc::error::TrySendError::Closed(_)) => Err(RuntimeError::ReliablePathSessionClosed),
++        Err(mpsc::error::TrySendError::Full(Ok(frame))) => Ok(CarrierInputRoute::Mailbox(
++            PendingMailboxFrame::new(frame, stream_frames.clone(), Ok),
++        )),
++        // The Product recipient can retire before this native write and its
++        // ordered terminal commands. Preserve their independent ownership.
++        Err(mpsc::error::TrySendError::Closed(_)) => Ok(CarrierInputRoute::Routed),
+         Err(mpsc::error::TrySendError::Full(Err(_))) => {
+             unreachable!("client QUIC interlock only routes successful frames")
+         }
+--- a/src/runtime/path/quic/tests_client_writer.rs
++++ b/src/runtime/path/quic/tests_client_writer.rs
+@@ -55,6 +55,47 @@
+     ));
+ }
+ 
++#[test]
++fn quic_write_interlock_closed_product_recipient_is_retired_input() {
++    let stream_id = StreamId(46);
++    let (frames_tx, frames_rx) = mpsc::channel(1);
++    drop(frames_rx);
++    assert!(matches!(
++        try_route_client_udp_stream_frame_during_write(
++            Frame::StreamAck {
++                stream_id,
++                complete: true,
++                ranges: Vec::new(),
++            },
++            stream_id,
++            &frames_tx,
++        ),
++        Ok(CarrierInputRoute::Routed)
++    ));
++}
++
++#[tokio::test]
++async fn quic_write_interlock_pending_product_recipient_retires_without_error() {
++    let stream_id = StreamId(47);
++    let (frames_tx, frames_rx) = mpsc::channel(1);
++    frames_tx.try_send(Ok(Frame::Ping { nonce: 1 })).unwrap();
++    let route = try_route_client_udp_stream_frame_during_write(
++        Frame::StreamAck {
++            stream_id,
++            complete: true,
++            ranges: Vec::new(),
++        },
++        stream_id,
++        &frames_tx,
++    )
++    .unwrap();
++    let CarrierInputRoute::Mailbox(mut pending) = route else {
++        panic!("full recipient must retain the exact frame");
++    };
++    drop(frames_rx);
++    assert!(!pending.deliver().await);
++}
++
+ #[tokio::test]
+ async fn quic_write_wait_retries_full_product_mailbox_before_write_completion() {
+     let stream_id = StreamId(44);
+--- a/src/runtime/path/quic/tests_server_stream.rs
++++ b/src/runtime/path/quic/tests_server_stream.rs
+@@ -1007,6 +1007,90 @@
+ }
+ 
+ #[tokio::test]
++async fn client_quic_closed_product_recipient_preserves_ordered_terminal_writer() {
++    tokio::time::timeout(Duration::from_secs(5), async {
++        let stream_id = StreamId(406);
++        let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
++        let mut server_send = fixture.server_send.take().expect("server sender");
++        let mut server_recv = fixture.server_recv.take().expect("server receiver");
++        let (commands_tx, commands_rx) = reliable_path_command_channels(8);
++        let (frames_tx, frames_rx) = mpsc::channel(1);
++        let state = ClientPathState::new(ClientPathHealth::new(
++            Vec::new(),
++            vec![ClientPathHealthRecord::default()],
++        ));
++        let limits = fixture.context.codec_limits;
++        drop(frames_rx);
++        let actor = tokio::spawn(run_client_udp_stream(
++            fixture.client_send.take().expect("client sender"),
++            fixture.client_recv.take().expect("client receiver"),
++            stream_id,
++            0,
++            next_carrier_path_instance_id(),
++            limits,
++            fixture.context.mux_limits,
++            8,
++            state,
++            commands_rx,
++            frames_tx,
++        ));
++        assert_eq!(
++            udp_path_read_frame(&mut server_recv, limits).await.unwrap(),
++            Frame::Ping { nonce: 1 }
++        );
++        udp_path_write_frame(
++            &mut server_send,
++            &Frame::StreamAck {
++                stream_id,
++                complete: true,
++                ranges: Vec::new(),
++            },
++            limits,
++        )
++        .await
++        .unwrap();
++        // Same-native-stream ordering makes Pong proof that the late ACK was
++        // processed after Product retirement without cancelling the writer.
++        udp_path_write_frame(&mut server_send, &Frame::Ping { nonce: 406 }, limits)
++            .await
++            .unwrap();
++        assert_eq!(
++            udp_path_read_frame(&mut server_recv, limits)
++                .await
++                .expect("retired Product input must preserve the independent writer"),
++            Frame::Pong { nonce: 406 }
++        );
++        let terminal = [
++            Frame::StreamFin {
++                stream_id,
++                final_offset: 0,
++            },
++            Frame::StreamDetach { stream_id },
++        ];
++        for frame in &terminal {
++            commands_tx
++                .send_stream_ordered_frame(frame.clone(), TrafficClass::Throughput)
++                .await
++                .unwrap();
++        }
++        commands_tx
++            .send_stream_ordered_close(stream_id, TrafficClass::Throughput)
++            .await
++            .unwrap();
++        for frame in terminal {
++            assert_eq!(
++                udp_path_read_frame(&mut server_recv, limits).await.unwrap(),
++                frame
++            );
++        }
++        actor.await.unwrap();
++        assert!(!fixture._client_connection.is_closed());
++    })
++    .await
++    .expect("retired input and ordered terminal writer must complete");
++}
++
++#[tokio::test]
+ async fn client_quic_terminal_input_keeps_feedback_writer_until_owner_close() {
+     let stream_id = StreamId(405);
+     let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+--- a/src/runtime/path/input.rs
++++ b/src/runtime/path/input.rs
+@@ -4,7 +4,6 @@
+ //! not: it may need that writer's completion or a lifecycle transition first.
+ 
+ use crate::protocol::Frame;
+-use crate::runtime::RuntimeError;
+ use std::future::Future;
+ use std::pin::Pin;
+ use tokio::sync::mpsc;
+@@ -15,12 +14,6 @@
+     Mailbox(PendingMailboxFrame),
+ }
+ 
+-#[derive(Clone, Copy)]
+-pub(in crate::runtime) enum ClosedMailbox {
+-    StreamRetired,
+-    CarrierClosed,
+-}
+-
+ type FramePermit = Box<dyn FnOnce(Frame) + Send>;
+ 
+ /// Holds one frame until its exact recipient grants a real slot. Erasing only
+@@ -28,7 +21,6 @@
+ pub(in crate::runtime) struct PendingMailboxFrame {
+     frame: Option<Frame>,
+     permit: Pin<Box<dyn Future<Output = Option<FramePermit>> + Send>>,
+-    closed: ClosedMailbox,
+ }
+ 
+ impl PendingMailboxFrame {
+@@ -36,7 +28,6 @@
+         frame: Frame,
+         recipient: mpsc::Sender<T>,
+         wrap: fn(Frame) -> T,
+-        closed: ClosedMailbox,
+     ) -> Self {
+         let permit = Box::pin(async move {
+             recipient.reserve_owned().await.ok().map(|permit| {
+@@ -48,24 +39,21 @@
+         Self {
+             frame: Some(frame),
+             permit,
+-            closed,
+         }
+     }
+ 
+     /// Cancellation before transfer leaves the frame here. Once the permit is
+     /// ready, taking the frame and sending have no intervening await.
+-    pub(in crate::runtime) async fn deliver(&mut self) -> Result<bool, RuntimeError> {
++    /// False means the Product recipient retired, not carrier failure or delivery.
++    pub(in crate::runtime) async fn deliver(&mut self) -> bool {
+         let permit = self.permit.as_mut().await;
+         let frame = self.frame.take().expect("pending mailbox owns one frame");
+         match permit {
+             Some(send) => {
+                 send(frame);
+-                Ok(true)
++                true
+             }
+-            None => match self.closed {
+-                ClosedMailbox::StreamRetired => Ok(false),
+-                ClosedMailbox::CarrierClosed => Err(RuntimeError::ReliablePathSessionClosed),
+-            },
++            None => false,
+         }
+     }
+ 
+@@ -87,12 +75,7 @@
+         let (sender, mut receiver) = mpsc::channel(1);
+         sender.try_send(Frame::Ping { nonce: 1 }).unwrap();
+         let frame = Frame::Ping { nonce: 2 };
+-        let mut pending = PendingMailboxFrame::new(
+-            frame.clone(),
+-            sender.clone(),
+-            |frame| frame,
+-            ClosedMailbox::StreamRetired,
+-        );
++        let mut pending = PendingMailboxFrame::new(frame.clone(), sender.clone(), |frame| frame);
+         let mut delivery = Box::pin(pending.deliver());
+         std::future::poll_fn(|cx| {
+             assert!(delivery.as_mut().poll(cx).is_pending());
+@@ -119,21 +102,10 @@
+     }
+ 
+     #[tokio::test]
+-    async fn mailbox_wait_preserves_closed_recipient_policy() {
+-        for policy in [ClosedMailbox::StreamRetired, ClosedMailbox::CarrierClosed] {
+-            let (sender, receiver) = mpsc::channel(1);
+-            let mut pending =
+-                PendingMailboxFrame::new(Frame::Ping { nonce: 4 }, sender, |frame| frame, policy);
+-            drop(receiver);
+-            match policy {
+-                ClosedMailbox::StreamRetired => {
+-                    assert!(matches!(pending.deliver().await, Ok(false)))
+-                }
+-                ClosedMailbox::CarrierClosed => assert!(matches!(
+-                    pending.deliver().await,
+-                    Err(RuntimeError::ReliablePathSessionClosed)
+-                )),
+-            }
+-        }
++    async fn mailbox_wait_closed_recipient_retires_without_delivery() {
++        let (sender, receiver) = mpsc::channel(1);
++        let mut pending = PendingMailboxFrame::new(Frame::Ping { nonce: 4 }, sender, |frame| frame);
++        drop(receiver);
++        assert!(!pending.deliver().await);
+     }
+ }
+--- a/src/runtime/path/tcp/client/writer.rs
++++ b/src/runtime/path/tcp/client/writer.rs
+@@ -32,7 +32,7 @@
+ };
+ #[cfg(test)]
+ use crate::runtime::path::commands::{TcpCapacityProbeCommand, reliable_path_writer_frame_queue};
+-use crate::runtime::path::input::{ClosedMailbox, PendingMailboxFrame};
++use crate::runtime::path::input::PendingMailboxFrame;
+ use crate::runtime::recent_ids::RecentIdCache;
+ use std::collections::HashMap;
+ #[cfg(any(test, feature = "lab-diagnostics"))]
+@@ -479,9 +479,8 @@
+                     }
+                     break result?;
+                 }
+-                result = async { mailbox.as_mut().expect("pending mailbox").0.deliver().await },
++                delivered = async { mailbox.as_mut().expect("pending mailbox").0.deliver().await },
+                     if mailbox.is_some() => {
+-                    let delivered = result?;
+                     let (_, stream_id, retires_attachment) = mailbox.take().expect("pending mailbox");
+                     if !delivered || retires_attachment {
+                         streams.remove(&stream_id);
+@@ -647,9 +646,8 @@
+                 }
+                 break result;
+             }
+-            result = async { mailbox.as_mut().expect("pending mailbox").0.deliver().await },
++            delivered = async { mailbox.as_mut().expect("pending mailbox").0.deliver().await },
+                 if mailbox.is_some() => {
+-                let delivered = result?;
+                 let (_, stream_id, retires_attachment) = mailbox.take().expect("pending mailbox");
+                 if !delivered || retires_attachment {
+                     streams.remove(&stream_id);
+@@ -876,12 +874,7 @@
+             Ok(ClientTcpWriteFrameRoute::Routed)
+         }
+         Err(mpsc::error::TrySendError::Full(Ok(frame))) => Ok(ClientTcpWriteFrameRoute::Mailbox {
+-            pending: PendingMailboxFrame::new(
+-                frame,
+-                state.frames.clone(),
+-                Ok,
+-                ClosedMailbox::StreamRetired,
+-            ),
++            pending: PendingMailboxFrame::new(frame, state.frames.clone(), Ok),
+             stream_id,
+             retires_attachment,
+         }),
+--- a/src/runtime/stream/registry.rs
++++ b/src/runtime/stream/registry.rs
+@@ -32,7 +32,7 @@
+ use crate::runtime::path::commands::{
+     ReliablePathCommandSender, reliable_stream_frame_queue_for_payload,
+ };
+-use crate::runtime::path::input::{ClosedMailbox, PendingMailboxFrame};
++use crate::runtime::path::input::PendingMailboxFrame;
+ use crate::runtime::path::proof::PathProofObservation;
+ use crate::runtime::path::{
+     CarrierDeliveryRateSample, CarrierNativeWindowSample, ServerCarrierPathApplyAuthority,
+@@ -2212,7 +2212,6 @@
+                     frame,
+                     target.events,
+                     ServerReliableStreamEvent::Frame,
+-                    ClosedMailbox::StreamRetired,
+                 )))
+             }
+             // See `route_frame`: retirement owns this short closed-receiver
+--- a/src/runtime/path/quic/io.rs
++++ b/src/runtime/path/quic/io.rs
+@@ -526,13 +526,10 @@
+                 }
+                 return (result, routed_frames);
+             }
+-            result = async { mailbox.as_mut().expect("pending mailbox").deliver().await },
++            _ = async { mailbox.as_mut().expect("pending mailbox").deliver().await },
+                 if mailbox.is_some() => {
+                 mailbox = None;
+-                match result {
+-                    Ok(_) => routed_frames = routed_frames.saturating_add(1),
+-                    Err(error) => *deferred_input = Some(Err(error)),
+-                }
++                routed_frames = routed_frames.saturating_add(1);
+             }
+             incoming = carrier_frames.recv(), if deferred_input.is_none() && mailbox.is_none() => {
+                 match incoming {
+--- a/src/runtime/path/tcp/server/session.rs
++++ b/src/runtime/path/tcp/server/session.rs
+@@ -984,9 +984,8 @@
+                         }
+                         break result?;
+                     }
+-                    result = async { mailbox.as_mut().expect("pending mailbox").deliver().await },
++                    _ = async { mailbox.as_mut().expect("pending mailbox").deliver().await },
+                         if mailbox.is_some() => {
+-                        result?;
+                         mailbox = None;
+                         routed_frames = routed_frames.saturating_add(1);
+                     }
+--- a/RFC.md
++++ b/RFC.md
+@@ -1553,6 +1553,9 @@
+ its exact-instance transition may be required to release carrier retirement
+ while the remaining Product direction stays open.
+ 
++Retiring a Product input recipient MUST NOT cancel still-owned ordered terminal
++output on its attachment; actual native transport failure remains independent.
++
+ `STREAM_RESET(stream_id, reason)` terminates the MPP stream.
+ 
+ Product FIN, detach, reset, or logical-stream terminal cancels only work

@@ -1,40 +1,39 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 02:50 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 03:23 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Current checkpoint and next decision
 
-**Active next transaction, superseding older next-action text:** identify the
-ordinary completed-request lifecycle failure reproduced in the held stack.
-Two clean 500 Mbps churn cycles complete all 1,932 requests, but retain 779
-then 1,571 server logical/admission owners after the client returns to zero.
-The latter persists 67 seconds with zero server queue/Product/native flight;
-server RSS grows from about 30 to 352 MiB. Eleven component ownership tests
-pass, so their scope does not cover the assembled terminal transition. See
-SUSTAINABILITY_CHURN_20260907. Trace terminal/half-close propagation before
-changing anything; no arbitrary expiry, lowered concurrency, or attribution
-of the uncaptured deployed incident follows.
+**Current practical result:** the reproduced completed-request retention now
+clears in ordinary same-process churn. All958 then983 requests complete; both
+endpoints reach zero logical/admission/path-flow owners after about4.5s per
+cycle and remain zero after68.0s final quiet. RSS stays flat through the final
+interval. TERMINAL_RETIREMENT_ORDINARY_CHURN_20260907 preserves exact PIDs,
+flow lists, probes, resource observations and limitations. Final TCP-only and
+QUIC-only32-request controls also complete and reclaim; no mixed repetition.
 
-**02:50 UTC refinement:** clean repair receive EOF was wrongly treated as a
-whole attachment error, cancelling independently ordered ordinary FIN/ACK.
-The exact-H3 correction and nine other focused controls pass. Fixed32-request
-TCP/QUIC/mixed ablations now all reclaim; longer1930-request ordinary churn
-still leaves3 server owners after37.4s. Do not call this complete. An exact
-per-PID/session diagnostic repeat completes1934 and leaves13:12 received
-request FIN, one coincides with client mailbox closure and missing server FIN.
-Eleven captured states already have target EOF, response FIN sent/replayed,
-empty queues and response ACK=sent, but unreconciled output membership.
-Two independent agents now own separate focused RED tests: server terminal
-predicate before ACK/membership reconciliation; QUIC retired Product recipient
-incorrectly cancelling the outgoing ordered writer. Preserve all final-ACK,
-half-close and real native-error constraints. No timeout or target lookahead.
-REPAIR_HALF_CLOSE_RETENTION and REPAIR_TERMINAL_CHURN_TRACE preserve evidence.
+Three separate lifetime/order defects were proved and corrected: clean repair
+receive EOF cancelling its ordinary parent; client retired input cancelling
+its still-owned terminal writer; server completion checked before final
+membership/ACK reconciliation. Six terminal fixtures distinguish real RED
+from the already-GREEN half-close control, and30 selected final guards pass.
+The unused mailbox-failure policy was deleted. No timeout, rate, admission,
+copy, congestion or target-read rule changed. Exact origin, intended purpose,
+tradeoff and checks are in REPAIR_HALF_CLOSE_RETENTION,
+QUIC_PRODUCT_RECIPIENT_RETIREMENT, SERVER_TERMINAL_RECONCILIATION and
+TERMINAL_RETIREMENT_CHECKS_20260907. The initial EOF-only correction was
+explicitly partial; its residual owners were not waived. No uncaptured
+deployed-incident sole-cause or whole-performance claim follows.
+
+**Active next model transaction:** allocation/discovery for the already-proved
+busy-fast/free-slow choice. Read-only producer/evidence audits establish that
+no existing physical-carrier owner tracks recurring discovery opportunities;
+current TCP/UDP Product-rate estimators also have different time denominators.
+Do not substitute those values for native capacity or invent discovery from
+durable qualification. No allocator or new numeric parameter is yet approved.
 All temporary diagnostic hooks are removed; allocation code remains untouched.
-
-**Next after this concrete sustainability blocker:** close the allocation/
-discovery model for the already-proved busy-fast/free-slow choice.
 The held native ACK-transaction ordering correction has eight ordinary
 before/after observations, not a release pass. Mirrored mixed upload58.093 ->
 76.652Mbps retains4.752 ->4.772s gaps; mixed download68.070 ->92.443 retains

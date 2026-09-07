@@ -151,3 +151,20 @@ timeout, target-read lookahead or native error suppression follows.
 All temporary diagnostic source hooks were removed after freezing the trace
 binary; saved overlays and full logs remain under./.tmp/reflection. The frozen
 ordinary repair-half-close binary remains available for the before comparison.
+
+## 03:23 UTC bounded lifecycle acceptance
+
+The two independently proved residual corrections pass all30 selected final
+guards. The final ordinary composition completes1941 mixed requests on one
+process pair and releases every logical/admission owner after each cycle,
+remaining clear after68s final quiet. RSS stays flat in that interval. Separate
+final TCP-only and QUIC-only controls complete32/32 each and also reclaim.
+TERMINAL_RETIREMENT_ORDINARY_CHURN_20260907.json preserves all outcomes, exact
+PIDs, flow detail and independent Product/native accounting. No idle-expiry or
+product restart was used to turn a retained owner into a pass.
+
+The reproduced normal-termination gate is now closed for this tested envelope.
+This does not accept the companion's wider performance tradeoff, attribute the
+uncaptured deployed incident exclusively, or close mixed allocation/recovery,
+native QoS, browser and baseline timing gates. The next transaction returns to
+those already documented issues; no additional speculative lifecycle patch.

@@ -2461,17 +2461,6 @@ where
                 ),
             );
         }
-        if !local_open
-            && !remote_open
-            && send_stream.reinjection_bytes() == 0
-            && response_sender.is_empty()
-            && (!pending_local_fin || close.sent)
-            && (!has_live_output || request_ack_publication.current_generation_is_fully_published())
-            && !path_stream.has_pending_request_requalification_ack()
-            && path_stream.output_membership_generation() == observed_output_membership_generation
-        {
-            break Ok(stats);
-        }
         let previous_response_lane = path_stream.current_lane();
         response_sender.publish_queue_bytes(path_stream);
         let classifier_payload_hint =
@@ -3089,6 +3078,22 @@ where
         // Stop reading so ordinary socket backpressure bounds retained response data.
         let can_read_local = send_path_snapshot.is_some() && can_read_by_flow && read_budget > 0;
         let can_send_pending_fin = pending_local_fin && response_sender.is_empty() && !close.sent;
+
+        // Membership and pending control publication can become reconciled in
+        // this turn without producing another wake. Reconsider completion only
+        // after that work, while retaining every exact-recipient obligation.
+        if !local_open
+            && !remote_open
+            && send_stream.reinjection_bytes() == 0
+            && response_sender.is_empty()
+            && (!pending_local_fin || close.sent)
+            && (!path_stream.has_live_output()
+                || request_ack_publication.current_generation_is_fully_published())
+            && !path_stream.has_pending_request_requalification_ack()
+            && path_stream.output_membership_generation() == observed_output_membership_generation
+        {
+            break Ok(stats);
+        }
 
         // Carrier input and target responses can both remain continuously
         // ready during an upload. Fair polling keeps response progress from

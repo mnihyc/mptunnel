@@ -1,6 +1,6 @@
 # Evidence review and practical acceptance
 
-Updated: 2026-09-07 02:08 UTC. Original reviewed production tree: `7189e69`
+Updated: 2026-09-07 03:23 UTC. Original reviewed production tree: `7189e69`
 (wire11); latest correction checkpoint: `b37bacb`. This is a review/experiment
 plan, not a release verdict. Historical SEEN/UNSEEN labels are mapped below;
 an old OPEN label is not a newly found bug.
@@ -8,13 +8,21 @@ an old OPEN label is not a newly found bug.
 ## Current verdict and fixed priority
 
 **Current continuation:** CURRENT_CLOSURE_PLAN is the authoritative next-step
-ledger. The post-churn gate is now a concrete RED: all1,932 requests complete,
-but1,571 server logical/admission owners remain67s after client completion.
-The held companion-stream integration is under independent terminal/half-close
-audit. Component success did not cover the composed lifetime. No public
-performance/release acceptance follows, and none of the retained native,
-actor or codec candidates is silently promoted. The earlier next-action text
-below is checkpoint history, not permission to bypass this retention blocker.
+ledger. The reproduced post-churn retention gate now passes after three
+separately justified lifetime/order corrections. Initial1932 successful
+requests retained1571 server owners; EOF-only correction still retained3.
+Exact trace and RED tests then separated server terminal reconciliation from
+client input-recipient cancellation of its still-owned writer. Final30 guards
+pass. Ordinary1941 mixed requests on one process pair all complete and reclaim,
+remaining clear with flat RSS after68s quiet; final32-request TCP-only and
+QUIC-only controls also pass. REPAIR_HALF_CLOSE_RETENTION and
+TERMINAL_RETIREMENT_ORDINARY_CHURN_20260907 preserve the full boundary.
+
+This closes the demonstrated normal-terminal retention, not the uncaptured
+deployed incident's sole cause or unlimited sustainability. Next remains the
+already-proved mixed allocation/discovery deficit. No public performance/
+release acceptance follows, and no retained native, actor or codec candidate
+is silently promoted. Earlier next-action text below is checkpoint history.
 
 Latest bounded decision: the relative ACK representation is semantically
 proved but not a network pass (clean 500/10 mixed 175 Mbps, 1.67 s read gap).
@@ -100,6 +108,9 @@ it does not automatically create a patch.
 | Cyclic Product service with executor cooperation | Drain-input-to-empty could postpone a ready source/dispatch indefinitely. Fair service among input, dispatch and read removes that dependency. | Each class can wait for the other finite work quanta. The first candidate omitted executor cooperation and failed; the revised candidate is tested but broader timing/RSS remains open. |
 | Paired QUIC repair ordering stream | A frontier repair had49.326MB of actual unsent native predecessors. A second stream removes that serialization prerequisite without new carrier/copy/CC credit. Actual native ordering and pair-lifecycle tests pass. | Deliberate wire12 mapping and two native streams per attachment; shared connection credit can still block it. Initial download improves but upload does not pass. Not an accepted protocol expansion. |
 | Stateless ACK range encoding | Fixed16-byte range pairs repeat across fragmented full snapshots. Packed per-frame gaps/lengths preserve exact logical snapshots, arbitrary fixed representations and all gap authority; selected only when smaller.58protocol/123transport/29feedback tests and strict Clippy pass. | Explicit wire13, additional O(n) integer work but no dictionary/actor state. First mixed run saves53% reverse bytes per body byte without improving timing. Repeat/comparison gate pending; not an accepted fix for mixed stalls or snapshot-generation CPU. |
+| Ordered-stream relative ACK representation | Repeated full logical snapshots can reuse an exact native-stream dictionary while decoding the identical Frame. ACK_RELATIVE_ENCODING records cancellation/resynchronization and ownership checks; clean500/10 mixed improves46 to175Mbps. | Still1.67s gap and1.34s loaded p95; mirrored adverse timing also fails. Held compression, not an accepted cure for allocation, congestion or application stalls. |
+| Same-ACK RTT ordering | Reordering excess used the old RTT before that ACK published its new RTT, double-counting part of the change. Actual encrypted RED297ms versus251ms; rising/falling cases under CUBIC/BBR3 and470 native tests pass. | Eight ordinary comparisons include gains but still multi-second gaps/echo failures. No gain or threshold change, no full experience acceptance. |
+| Repair EOF and terminal retirement | Clean repair receive EOF incorrectly cancelled ordinary terminal exchange. Exact trace plus subsequent RED tests separately distinguish server completion-before-reconciliation and client recipient-closure cancellation. | Thirty final guards and ordinary1941-request mixed/64-request single-mode controls pass; all owners reclaim without restart or idle expiry. This accepts those bounded lifecycle corrections, not the prerequisite companion performance model or deployed-incident sole attribution. Half-close, per-recipient ACK obligations and real native errors remain. |
 
 The evidence boundary is explicit: classification/lifetime and scan commits
 are intermediate tracked corrections, not proof that every assembled behavior
@@ -368,8 +379,9 @@ applied transition; a changed rate label alone is not recovery evidence.
    competitiveness failures. About10% throughput variation is not an excuse
    for seconds of missing service or worse interactive tails.
 
-Audit workers are unavailable under their usage limit. Root review and tests
-can proceed, but no new independent review is claimed or manufactured.
+Independent audit workers are available again. Their current bounded work is
+terminal reconciliation, recipient retirement and verification of the exact
+same-process churn evidence; earlier usage-limit checkpoints are historical.
 
 ### Historical wording must not restart completed work
 

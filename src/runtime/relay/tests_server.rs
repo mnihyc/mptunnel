@@ -528,6 +528,191 @@ fn server_completion_waits_for_every_live_ack_publication() {
     assert!(publication.current_generation_is_fully_published());
 }
 
+#[derive(Clone, Copy)]
+enum TerminalReconciliationWake {
+    LastDetach,
+    AckCapacity,
+    FinAfterDetach,
+}
+
+async fn assert_server_terminal_reconciliation(wake: TerminalReconciliationWake) {
+    let limits = MuxLimits::default();
+    let session_id = SessionId(715);
+    let stream_id = StreamId(715);
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let binding = ResponseStreamBinding::new_with_limits(
+        session_id,
+        key.underlay,
+        key.path_id,
+        commands.clone(),
+        TrafficClass::Latency,
+        limits,
+    );
+    let (frames_tx, frames_rx) = mpsc::channel(4);
+    let mut path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: limits.max_stream_window_bytes,
+        lane: TrafficClass::Latency,
+        underlay: key.underlay,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frames_rx.into(),
+    };
+    let outbound_id = crate::product::OutboundId::parse("test-direct").expect("outbound ID");
+    let outbound_registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: outbound_id.clone(),
+            config: OutboundConfig::Direct,
+            connect_timeout: Duration::from_secs(1),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("outbound registry");
+    let router = ClientIngressRouter::new(
+        &ProductPolicyConfig {
+            generation: 1,
+            routes: vec![RouteRuleSpec::new(
+                RuleId::parse("default").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(outbound_id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )],
+        },
+        outbound_registry,
+    )
+    .expect("router");
+    let context = ServerReliableRelayContext {
+        router,
+        inbound: InboundId::parse("test-inbound").expect("inbound ID"),
+        performance: MppPerformanceConfig::default(),
+        mux_limits: limits,
+        max_paths_per_session: ResourceLimits::default().max_paths,
+        session_retention_timeout: Duration::from_secs(60),
+        flow_idle_timeout: None,
+        telemetry: RuntimeTelemetry::new(1),
+    };
+    let (mut application, relay_side) = tokio::io::duplex(4096);
+    let mut close = ServerRelayClose {
+        sent: false,
+        lane: TrafficClass::Latency,
+    };
+    let mut relay = Box::pin(relay_reliable_stream_body(
+        relay_side,
+        &mut path_stream,
+        &context,
+        session_id,
+        crate::runtime::stream::SessionSendBuffer::from_limits(limits),
+        &mut close,
+    ));
+
+    application.shutdown().await.expect("target response EOF");
+    // Observe both the original FIN and its terminal replay before changing
+    // membership. No timer or attachment loss substitutes for either EOF.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut fins = 0;
+        while fins < 2 {
+            tokio::select! {
+                result = relay.as_mut() => panic!("request half remains open: {result:?}"),
+                command = recv_reliable_path_command(&mut receivers) => {
+                    let command = command.expect("live carrier output");
+                    let bytes = reliable_path_command_pending_bytes(&command);
+                    if matches!(command, ReliablePathCommand::SendFrame(Frame::StreamFin { .. })) {
+                        fins += 1;
+                    }
+                    receivers.release_pending_command_bytes(bytes);
+                }
+            }
+        }
+    })
+    .await
+    .expect("response FIN publication");
+    assert!(futures::poll!(relay.as_mut()).is_pending());
+
+    if matches!(wake, TerminalReconciliationWake::FinAfterDetach) {
+        binding.detach(key, &commands);
+        assert!(
+            futures::poll!(relay.as_mut()).is_pending(),
+            "last detach must preserve an open request half",
+        );
+    } else {
+        commands
+            .try_enqueue_admitted_frame(Frame::Ping { nonce: 715 }, TrafficClass::Control)
+            .expect("occupy the final ACK's exact carrier queue");
+    }
+    frames_tx
+        .send(Ok(Frame::StreamFin {
+            stream_id,
+            final_offset: 0,
+        }))
+        .await
+        .expect("ordered request FIN");
+
+    if !matches!(wake, TerminalReconciliationWake::FinAfterDetach) {
+        assert!(futures::poll!(relay.as_mut()).is_pending());
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            application.read(&mut byte).await.expect("request EOF"),
+            0,
+            "both Product halves are closed before the final wake",
+        );
+        assert!(
+            futures::poll!(relay.as_mut()).is_pending(),
+            "a live blocked final ACK must retain the Product owner",
+        );
+        match wake {
+            TerminalReconciliationWake::LastDetach => binding.detach(key, &commands),
+            TerminalReconciliationWake::AckCapacity => {
+                let command = try_recv_reliable_path_command(&mut receivers)
+                    .expect("the exact control queue remains full");
+                assert!(matches!(
+                    command,
+                    ReliablePathCommand::SendFrame(Frame::Ping { nonce: 715 })
+                ));
+                receivers
+                    .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+            }
+            TerminalReconciliationWake::FinAfterDetach => unreachable!(),
+        }
+    }
+
+    // The final wake must both reconcile its obligation and reconsider
+    // completion. A second Product frame or retention timer is not required.
+    tokio::time::timeout(Duration::from_millis(100), relay.as_mut())
+        .await
+        .expect("terminal reconciliation must not park an already completed Product")
+        .expect("graceful Product completion");
+    if matches!(wake, TerminalReconciliationWake::AckCapacity) {
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamAck { stream_id: id, .. })) if id == stream_id
+        ));
+    }
+}
+
+#[tokio::test]
+async fn server_terminal_reconciliation_fin_before_last_detach() {
+    assert_server_terminal_reconciliation(TerminalReconciliationWake::LastDetach).await;
+}
+
+#[tokio::test]
+async fn server_terminal_reconciliation_fin_after_last_detach() {
+    assert_server_terminal_reconciliation(TerminalReconciliationWake::FinAfterDetach).await;
+}
+
+#[tokio::test]
+async fn server_terminal_reconciliation_after_final_ack_capacity() {
+    assert_server_terminal_reconciliation(TerminalReconciliationWake::AckCapacity).await;
+}
+
 async fn assert_post_resolution_denial_is_logical_stream_local(
     denial: RouteAction,
     silently_dropped: bool,

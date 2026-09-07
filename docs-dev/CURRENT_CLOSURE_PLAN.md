@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 02:00 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 02:50 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -15,8 +15,23 @@ server RSS grows from about 30 to 352 MiB. Eleven component ownership tests
 pass, so their scope does not cover the assembled terminal transition. See
 SUSTAINABILITY_CHURN_20260907. Trace terminal/half-close propagation before
 changing anything; no arbitrary expiry, lowered concurrency, or attribution
-of the uncaptured deployed incident follows. Two independent source audits
-are active, with a third finishing the existing allocation proposal.
+of the uncaptured deployed incident follows.
+
+**02:50 UTC refinement:** clean repair receive EOF was wrongly treated as a
+whole attachment error, cancelling independently ordered ordinary FIN/ACK.
+The exact-H3 correction and nine other focused controls pass. Fixed32-request
+TCP/QUIC/mixed ablations now all reclaim; longer1930-request ordinary churn
+still leaves3 server owners after37.4s. Do not call this complete. An exact
+per-PID/session diagnostic repeat completes1934 and leaves13:12 received
+request FIN, one coincides with client mailbox closure and missing server FIN.
+Eleven captured states already have target EOF, response FIN sent/replayed,
+empty queues and response ACK=sent, but unreconciled output membership.
+Two independent agents now own separate focused RED tests: server terminal
+predicate before ACK/membership reconciliation; QUIC retired Product recipient
+incorrectly cancelling the outgoing ordered writer. Preserve all final-ACK,
+half-close and real native-error constraints. No timeout or target lookahead.
+REPAIR_HALF_CLOSE_RETENTION and REPAIR_TERMINAL_CHURN_TRACE preserve evidence.
+All temporary diagnostic hooks are removed; allocation code remains untouched.
 
 **Next after this concrete sustainability blocker:** close the allocation/
 discovery model for the already-proved busy-fast/free-slow choice.

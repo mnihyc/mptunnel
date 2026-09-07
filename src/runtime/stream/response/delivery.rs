@@ -51,6 +51,10 @@ pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) bytes: usize,
     pub(super) sent_at: Instant,
     pub(super) kind: CarrierWorkKind,
+    /// OriginalData's absolute retained-recovery deadline. The first owner
+    /// observation initializes it; later observations may only tighten it.
+    /// ACK fragments inherit this assignment clock with the flight metadata.
+    pub(super) owner_fallback_deadline: Option<Instant>,
     pub(super) evidence_eligible: bool,
     /// Exact, generation-fenced authority for Product qualification bytes.
     /// Reinjection copies and untagged OriginalData carry no authority.
@@ -78,6 +82,15 @@ pub(in crate::runtime) struct ResponseDataAckRelease {
     pub(in crate::runtime) path_progress_outputs: SmallVec<[ServerReinjectionOutputIdentity; 4]>,
 }
 
+/// Current retained head and the contiguous part whose assignments are all due.
+/// A future head deadline remains a wake even when no byte is mature yet.
+#[derive(Debug)]
+pub(in crate::runtime) struct ResponseRetainedOwnerFrontier {
+    pub(in crate::runtime) mature_frontier:
+        Option<ReliableLiveOwnerFrontier<ServerReinjectionOutputIdentity>>,
+    pub(in crate::runtime) owner_fallback_deadline: Instant,
+}
+
 impl CarrierPathFlight {
     pub(in crate::runtime::stream) fn fixed_output(
         key: CarrierPathKey,
@@ -95,6 +108,7 @@ impl CarrierPathFlight {
             bytes,
             sent_at,
             kind,
+            owner_fallback_deadline: None,
             evidence_eligible: true,
             qualification_receipt: None,
             reinjection_suppression_deadline: reinjection_suppression_interval
@@ -1224,6 +1238,7 @@ impl ResponseStreamBinding {
                 bytes,
                 sent_at: Instant::now(),
                 kind: CarrierWorkKind::OriginalData,
+                owner_fallback_deadline: None,
                 evidence_eligible,
                 qualification_receipt,
                 reinjection_suppression_deadline: None,
@@ -1627,6 +1642,7 @@ impl ResponseStreamBinding {
                 .map(|(accepted_at, _)| accepted_at)
                 .unwrap_or_else(Instant::now),
             kind,
+            owner_fallback_deadline: None,
             evidence_eligible,
             qualification_receipt,
             reinjection_suppression_deadline,
@@ -1774,6 +1790,121 @@ impl ResponseStreamBinding {
         drop(flights);
         drop(outputs);
         frontier
+    }
+
+    /// Observes assignment clocks independently of an appendable scoring range.
+    /// Every current OriginalData fragment sees the same owner snapshot, even
+    /// if ACK splitting preceded this first observation. Subsequent splits copy
+    /// the stored deadline; fresh assignments receive their own current clock.
+    pub(in crate::runtime) fn observe_live_owner_retained_frontier(
+        &self,
+        range: OffsetRange,
+        lane: TrafficClass,
+        observed_at: Instant,
+    ) -> Option<ResponseRetainedOwnerFrontier> {
+        if range.is_empty() {
+            return None;
+        }
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let owner_intervals = outputs
+            .entries
+            .iter()
+            .map(|entry| {
+                let identity = ServerReinjectionOutputIdentity {
+                    key: entry.key,
+                    incarnation: entry.incarnation,
+                };
+                let snapshot = outputs.snapshot_for_instance(
+                    entry.key,
+                    entry.incarnation,
+                    lane,
+                    self.mux_limits,
+                );
+                (
+                    identity,
+                    reliable_data_retransmission_interval(Some(entry.key.underlay), snapshot),
+                )
+            })
+            .collect::<SmallVec<[_; 4]>>();
+        let mut flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        let mut spans = Vec::new();
+        let mut head_deadline = None::<Instant>;
+        let mut mature_end = range.end;
+        for (&start, path_flights) in flights.iter_mut() {
+            for flight in path_flights {
+                let identity = ServerReinjectionOutputIdentity {
+                    key: flight.key,
+                    incarnation: flight.output_incarnation,
+                };
+                let Some((_, interval)) =
+                    owner_intervals.iter().find(|(owner, _)| *owner == identity)
+                else {
+                    continue;
+                };
+                let overlaps = start < range.end && flight.end > range.start;
+                if flight.kind.is_original_transmission() {
+                    let observed_deadline = flight.sent_at.checked_add(*interval)?;
+                    let deadline = flight
+                        .owner_fallback_deadline
+                        .map_or(observed_deadline, |current| current.min(observed_deadline));
+                    flight.owner_fallback_deadline = Some(deadline);
+                    if overlaps {
+                        if start <= range.start {
+                            head_deadline = Some(
+                                head_deadline.map_or(deadline, |current| current.max(deadline)),
+                            );
+                        }
+                        if deadline > observed_at {
+                            mature_end = mature_end.min(start.max(range.start));
+                        }
+                    }
+                }
+                if overlaps {
+                    // Keep every original/copy identity in the ownership
+                    // sweep. Immaturity truncates service, not avoidance.
+                    spans.push(ReliableFlightSpan {
+                        range: OffsetRange {
+                            start,
+                            end: flight.end,
+                        },
+                        identity,
+                        kind: flight.kind,
+                        sent_at: flight.sent_at,
+                    });
+                }
+            }
+        }
+        drop(flights);
+        drop(outputs);
+        let uniform = reliable_live_owner_uniform_frontier(range, spans.iter().copied())?;
+        if uniform.owners.len() != 1 {
+            return None;
+        }
+        let owner_fallback_deadline = head_deadline?;
+        mature_end = mature_end.min(uniform.range.end);
+        let mature_frontier = if mature_end == uniform.range.end {
+            Some(uniform)
+        } else if mature_end > range.start {
+            reliable_live_owner_uniform_frontier(
+                OffsetRange {
+                    start: range.start,
+                    end: mature_end,
+                },
+                spans,
+            )
+        } else {
+            None
+        };
+        Some(ResponseRetainedOwnerFrontier {
+            mature_frontier,
+            owner_fallback_deadline,
+        })
     }
 
     fn all_flight_outputs_overlapping_frame(&self, frame: &Frame) -> Vec<(CarrierPathKey, u64)> {

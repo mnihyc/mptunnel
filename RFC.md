@@ -3326,6 +3326,17 @@ speculative authoritative-gap recovery retains its separate complete-horizon
 requirement. Existing accepted-copy suppression and exact target/native service
 admission apply before another copy, including a copy to a third carrier.
 
+For this retained fallback, an immature adjacent assignment MUST NOT make an
+already mature lowest prefix wait. Limit the identity-uniform candidate to
+the contiguous mature prefix before ranking, still no larger than `M_s`.
+The assignments covering its first byte own its fallback wake; fresh suffix
+assignments do not renew that wake. Adjacent mature assignments may share the
+existing quantum regardless of cache boundaries. Retain each assignment's
+absolute deadline from its first owner observation, subsequently only moving
+it earlier. ACK fragmentation inherits that deadline; observing fragments of
+one assignment cannot give them different first-observation intervals. This
+does not relax maturity for any included byte or any target/native bound.
+
 Product-queue insertion is provisional: it neither consumes final slot
 publication authority nor grants native admission. Actual writer Apply owns the
 atomic revalidation and commit boundary defined below. Cause clocks remain

@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-08 04:06 +08:00. Category: requested global retrospective and
+Updated: 2026-09-08 05:26 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -159,6 +159,13 @@ does not authorize latent topology inference or a universal Internet model.
   to force aggregation, permanent exploration starvation or renewable waits.
 - No proof of new ordering without half-close/cancel/finalization boundaries;
   no actor-fairness claim without executor cooperation and finite handler work.
+- Reusing a final-only helper in an active caller is not automatically neutral.
+  Compare its byte quantum, whole-frame versus positive-credit admission,
+  bound versus unbound publication, and assignment-clock lifetime first. The
+  response migration passed82 component checks before review exposed a64KiB
+  to14600B shrink and a fresh-append renewable deadline. A passing small-frame
+  fixture did not cover either countercase; keep those boundary discriminators
+  instead of treating helper reuse or a test count as equivalence evidence.
 - No untested candidate stack: retain a known comparator and attributable
   source/build identities. Intermediate correctness fixes may be necessary but
   do not bypass the unchanged final timing/experience gate.

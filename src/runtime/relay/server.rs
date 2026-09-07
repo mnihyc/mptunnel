@@ -14,10 +14,10 @@ use super::io::{
     ReliableAckGapReinjectionProgress, ReliablePathStalenessObservation,
     ReliableResponsePathStaleness, apply_and_write_ready_stream_data_batch,
     begin_reliable_stream_ack, collect_ready_stream_data_batch,
-    exact_contiguous_retransmission_frames, normalized_stream_ack_first_uncovered_extent,
-    pending_stream_fin_ready, preserve_reinjection_frontier_quantum, read_reliable_relay_payload,
-    receive_stream_fin, reconcile_accepted_copy_wake, resize_reliable_relay_buffer,
-    retain_accepted_copy_wake, stream_ack_gap_frontier_reinjection_frames_normalized,
+    exact_contiguous_retransmission_frames, pending_stream_fin_ready,
+    preserve_reinjection_frontier_quantum, read_reliable_relay_payload, receive_stream_fin,
+    reconcile_accepted_copy_wake, resize_reliable_relay_buffer, retain_accepted_copy_wake,
+    stream_ack_gap_frontier_reinjection_frames_normalized,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required, update_reinjection_authoritative_ack_snapshot,
 };
@@ -44,9 +44,8 @@ use crate::model::multipath::{
 #[cfg(test)]
 use crate::model::timing::reliable_data_ack_recovery_deadline;
 use crate::model::timing::{
-    reliable_data_ack_gap_timing, reliable_data_ack_gap_timing_for_assignments,
-    reliable_data_retransmission_interval, reliable_relay_tail_reinjection_delay,
-    sender_service_retry_delay,
+    reliable_data_ack_gap_timing, reliable_data_retransmission_interval,
+    reliable_relay_tail_reinjection_delay, sender_service_retry_delay,
 };
 use crate::model::work::{
     RangeRecoveryState, ReliableWorkClass, flight_interval_bytes,
@@ -369,14 +368,26 @@ fn reliable_relay_tail_reinjection_timer_active(
         )
 }
 
-fn stream_ack_is_authoritative_contiguous_prefix(
-    complete: bool,
-    ranges: &[OffsetRange],
-    frontier: u64,
+fn response_retained_frontier_candidate(
+    path_stream: &ReliablePathStream,
+    send_stream: &ReliableSendStream,
 ) -> bool {
-    complete
-        && frontier > 0
-        && matches!(ranges, [range] if range.start == 0 && range.end == frontier)
+    let frontier = send_stream.data_ack_frontier();
+    if frontier >= send_stream.next_offset() || send_stream.reinjection_bytes() == 0 {
+        return false;
+    }
+    // This is structural eligibility only. Queue fullness must not prevent
+    // the actor from arming capacity before the exact helper observes it.
+    send_stream
+        .retransmission_frames_for_ranges(
+            &[OffsetRange {
+                start: frontier,
+                end: send_stream.next_offset(),
+            }],
+            1,
+        )
+        .first()
+        .is_some_and(|frame| path_stream.has_reinjection_path_for_frame(frame))
 }
 
 // Response reinjection deadlines
@@ -943,25 +954,6 @@ fn mark_response_path_staleness(
     marked_stale
 }
 
-fn reliable_final_tail_reinjection_ready(
-    final_offset_known: bool,
-    send_stream: &ReliableSendStream,
-    last_send_ack_ranges: &[OffsetRange],
-    last_send_ack_frontier: u64,
-    tail_reinjection_deadline: tokio::time::Instant,
-    now: tokio::time::Instant,
-) -> bool {
-    if !final_offset_known
-        || send_stream.reinjection_bytes() == 0
-        || last_send_ack_frontier >= send_stream.next_offset()
-        || now < tail_reinjection_deadline
-    {
-        return false;
-    }
-    !last_send_ack_ranges.is_empty()
-        || (last_send_ack_frontier == 0 && send_stream.next_offset() > 0)
-}
-
 #[cfg(test)]
 fn prefix_reinjection_frames_with_available_output(
     path_stream: &ReliablePathStream,
@@ -1040,13 +1032,23 @@ fn prefix_live_reinjection_frames_with_carrier_credit(
 
 #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
 #[derive(Debug, Default)]
-struct LiveResponseFinalTailEnqueueOutcome {
+struct LiveResponseRetainedFrontierEnqueueOutcome {
     queued: usize,
     pending: bool,
     frontier_limit: usize,
     service_limit: usize,
     blocked_frontier_offset: Option<u64>,
     blocked_for_carrier_capacity: bool,
+    owner_fallback_deadline: Option<Instant>,
+}
+
+/// Preserves the existing operation's sizing, not its recovery authority.
+/// Active sending used the frame-capped bulk quantum; final drain used the
+/// smaller adaptive repair quantum. Both now share the same retained owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseRetainedFrontierPhase {
+    Active,
+    FinalDrain,
 }
 
 fn response_live_owner_recovery_interval_for_frame(
@@ -1073,215 +1075,214 @@ fn response_live_owner_recovery_interval_for_frame(
         .unwrap_or_else(|| reliable_relay_tail_reinjection_delay(fallback_owner_snapshot))
 }
 
-/// Enqueues a final-offset tail while its original carrier is still live.
+/// Enqueues the exact retained frontier while its original carrier is live.
 ///
-/// FIN makes the retained extent exact, but it does not prove carrier failure.
-/// Therefore this path shares the live-owner cause and successor observations
-/// with ACK-gap/contiguous-tail recovery, and it requires a distinct response
-/// output. Exact failed-owner recovery remains in the separate
-/// `failed_original_ranges` path.
+/// Positive mux/cache ownership supplies this obligation during active sending
+/// and final drain; neither source EOF nor a historical negative ACK horizon
+/// supplies its authority. It shares the existing live-owner cause and successor
+/// observations with ACK-gap recovery and requires a distinct response output.
+/// Exact failed-owner recovery remains in the separate `failed_original_ranges`
+/// path.
 #[allow(clippy::too_many_arguments)]
-fn enqueue_live_response_final_tail_reinjection(
+fn enqueue_live_response_retained_frontier_reinjection(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
     send_stream: &ReliableSendStream,
-    last_send_ack_ranges: &[OffsetRange],
     base_reinjection_limit: usize,
+    phase: ResponseRetainedFrontierPhase,
     mux_limits: MuxLimits,
     observed_at: Instant,
-) -> LiveResponseFinalTailEnqueueOutcome {
+) -> LiveResponseRetainedFrontierEnqueueOutcome {
     if base_reinjection_limit == 0
         || mux_limits.max_repair_bytes == 0
         || mux_limits.max_path_flight_bytes == 0
+        || !response_retained_frontier_candidate(path_stream, send_stream)
     {
-        return LiveResponseFinalTailEnqueueOutcome::default();
+        return LiveResponseRetainedFrontierEnqueueOutcome::default();
     }
+    let frontier = send_stream.data_ack_frontier();
+    let frontier_end = send_stream.next_offset();
+    let base_reinjection_limit = match phase {
+        ResponseRetainedFrontierPhase::Active => {
+            let lane = path_stream.current_lane();
+            let owner_snapshot = path_stream.tail_reinjection_snapshot(
+                frontier,
+                lane,
+                relay_lane_startup_chunk_bytes(lane, mux_limits)
+                    .min(path_stream.max_frame_payload_bytes),
+            );
+            adaptive_reliable_relay_chunk_bytes_with_frame_limit(
+                owner_snapshot,
+                TrafficClass::Throughput,
+                mux_limits,
+                path_stream.max_frame_payload_bytes,
+            )
+            .max(adaptive_reliable_relay_reinjection_bytes(
+                owner_snapshot,
+                lane,
+                mux_limits,
+            ))
+        }
+        ResponseRetainedFrontierPhase::FinalDrain => base_reinjection_limit,
+    };
     let selection_limit = reliable_critical_tail_reinjection_limit_bytes(
         base_reinjection_limit,
         send_stream.reinjection_bytes(),
         mux_limits,
     );
-    let Some((frontier, frontier_end)) = normalized_stream_ack_first_uncovered_extent(
-        last_send_ack_ranges,
-        send_stream.next_offset(),
-    ) else {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit: selection_limit,
-            ..LiveResponseFinalTailEnqueueOutcome::default()
-        };
-    };
     let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
-        return LiveResponseFinalTailEnqueueOutcome {
+        return LiveResponseRetainedFrontierEnqueueOutcome {
             frontier_limit: selection_limit,
             blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
+            ..LiveResponseRetainedFrontierEnqueueOutcome::default()
         };
     };
-    let Some(uniform_frontier) = binding.live_owner_uniform_frontier(OffsetRange {
-        start: frontier,
-        end: frontier_end,
-    }) else {
-        return LiveResponseFinalTailEnqueueOutcome {
+    let Some(owner_observation) = binding.observe_live_owner_retained_frontier(
+        OffsetRange {
+            start: frontier,
+            end: frontier_end.min(frontier.saturating_add(selection_limit as u64)),
+        },
+        path_stream.current_lane(),
+        observed_at,
+    ) else {
+        return LiveResponseRetainedFrontierEnqueueOutcome {
             frontier_limit: selection_limit,
             blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
+            ..LiveResponseRetainedFrontierEnqueueOutcome::default()
         };
     };
-    if uniform_frontier.owners.len() != 1 {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit: selection_limit,
-            blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
-        };
-    }
-    let uniform_extent =
-        flight_interval_bytes(uniform_frontier.range.start, uniform_frontier.range.end);
-    let scoring_extent = selection_limit.min(uniform_extent);
-    if scoring_extent == 0 {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit: selection_limit,
-            blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
-        };
-    }
-    let scoring_range = OffsetRange {
-        start: frontier,
-        end: frontier.saturating_add(scoring_extent as u64),
+    let owner_recovery_deadline = owner_observation.owner_fallback_deadline;
+    // Wake ownership comes from the exact current head, not a cached aggregate
+    // whose latest assignment could change when the source appends a suffix.
+    let owner_outcome = LiveResponseRetainedFrontierEnqueueOutcome {
+        owner_fallback_deadline: Some(owner_recovery_deadline),
+        ..LiveResponseRetainedFrontierEnqueueOutcome::default()
     };
-    let Some(scoring_frontier) = binding.live_owner_uniform_frontier(scoring_range) else {
-        return LiveResponseFinalTailEnqueueOutcome {
+    let Some(scoring_frontier) = owner_observation.mature_frontier else {
+        return LiveResponseRetainedFrontierEnqueueOutcome {
             frontier_limit: selection_limit,
             blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
+            ..owner_outcome
         };
     };
-    if scoring_frontier.range != scoring_range
-        || scoring_frontier.owners != uniform_frontier.owners
-        || scoring_frontier.avoid != uniform_frontier.avoid
-    {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit: selection_limit,
-            blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
-        };
-    }
+    let scoring_range = scoring_frontier.range;
+    let scoring_extent = flight_interval_bytes(scoring_range.start, scoring_range.end);
     let Some(scoring_frames) = exact_contiguous_retransmission_frames(send_stream, scoring_range)
     else {
-        return LiveResponseFinalTailEnqueueOutcome {
+        return LiveResponseRetainedFrontierEnqueueOutcome {
             frontier_limit: selection_limit,
             blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
+            ..LiveResponseRetainedFrontierEnqueueOutcome::default()
         };
     };
-    let preview = scoring_frames
-        .first()
-        .expect("non-empty exact cache prefix")
-        .clone();
-    let Some(owner_recovery_timing) = reliable_data_ack_gap_timing_for_assignments(
-        &scoring_frontier.owner_assignments,
-        |identity| {
-            (
-                identity.key.underlay,
-                path_stream.response_output_snapshot(identity, path_stream.current_lane()),
-            )
-        },
-    ) else {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit: selection_limit,
-            blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
+    let (source_frames, cause, frontier_limit, service_limit, target_recovery_interval) =
+        match phase {
+            ResponseRetainedFrontierPhase::Active => {
+                // Preserve active sending's existing per-cache-frame selection and
+                // full-credit preflight. Unbound dispatch re-ranks and revalidates
+                // each whole frame; a common target cannot replace that contract.
+                (
+                    scoring_frames,
+                    RelaySendCause::TailReinjection,
+                    scoring_extent,
+                    scoring_extent,
+                    None,
+                )
+            }
+            ResponseRetainedFrontierPhase::FinalDrain => {
+                let preview = scoring_frames
+                    .first()
+                    .expect("non-empty exact cache prefix");
+                let Some((target, target_snapshot)) = response_sender
+                    .reinjection_frontier_preview_target_for_extent(
+                        path_stream,
+                        send_stream,
+                        preview,
+                        RelaySendCause::TailReinjection,
+                        scoring_extent,
+                    )
+                else {
+                    return LiveResponseRetainedFrontierEnqueueOutcome {
+                        frontier_limit: selection_limit,
+                        blocked_frontier_offset: reliable_stream_frame_extent(preview)
+                            .map(|(offset, _, _)| offset),
+                        blocked_for_carrier_capacity: true,
+                        ..owner_outcome
+                    };
+                };
+                let target_recovery_interval = reliable_data_retransmission_interval(
+                    Some(target_snapshot.underlay),
+                    Some(target_snapshot),
+                );
+                if scoring_frontier.avoid.contains(&target) {
+                    return LiveResponseRetainedFrontierEnqueueOutcome {
+                        frontier_limit: selection_limit,
+                        blocked_frontier_offset: Some(frontier),
+                        ..owner_outcome
+                    };
+                }
+                let target_quantum = adaptive_reliable_relay_reinjection_bytes(
+                    Some(target_snapshot),
+                    path_stream.current_lane(),
+                    mux_limits,
+                );
+                let frontier_limit = reliable_live_frontier_reinjection_limit_bytes(
+                    target_quantum,
+                    base_reinjection_limit,
+                    scoring_extent,
+                    send_stream.reinjection_bytes(),
+                    mux_limits,
+                );
+                let target_service_limit = response_sender.reinjection_service_limit_for_target(
+                    path_stream,
+                    send_stream,
+                    target,
+                    target_snapshot,
+                    false,
+                    mux_limits,
+                );
+                let service_limit = reliable_live_gap_reinjection_authority(
+                    target_service_limit,
+                    frontier_limit,
+                    true,
+                );
+                if service_limit == 0 {
+                    return LiveResponseRetainedFrontierEnqueueOutcome {
+                        frontier_limit,
+                        service_limit,
+                        blocked_frontier_offset: Some(frontier),
+                        blocked_for_carrier_capacity: target_service_limit == 0,
+                        ..owner_outcome
+                    };
+                }
+                let applied_extent = service_limit.min(scoring_extent);
+                let apply_range = OffsetRange {
+                    start: frontier,
+                    end: frontier.saturating_add(applied_extent as u64),
+                };
+                let Some(source_frames) =
+                    exact_contiguous_retransmission_frames(send_stream, apply_range)
+                else {
+                    return LiveResponseRetainedFrontierEnqueueOutcome {
+                        frontier_limit,
+                        service_limit,
+                        blocked_frontier_offset: Some(frontier),
+                        ..owner_outcome
+                    };
+                };
+                let source_frames =
+                    preserve_reinjection_frontier_quantum(source_frames, frontier_limit);
+                let cause =
+                    RelaySendCause::response_completion_tail_reinjection(target, target_snapshot);
+                (
+                    source_frames,
+                    cause,
+                    frontier_limit,
+                    service_limit,
+                    Some(target_recovery_interval),
+                )
+            }
         };
-    };
-    let owner_recovery_deadline = response_sender.observe_completion_tail_owner_fallback(
-        scoring_range,
-        &scoring_frontier.owners,
-        owner_recovery_timing,
-    );
-    let owner_recovery_ready = observed_at >= owner_recovery_deadline;
-    if !owner_recovery_ready {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit: selection_limit,
-            blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
-        };
-    }
-    let Some((target, target_snapshot)) = response_sender
-        .reinjection_frontier_preview_target_for_extent(
-            path_stream,
-            send_stream,
-            &preview,
-            RelaySendCause::TailReinjection,
-            scoring_extent,
-        )
-    else {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit: selection_limit,
-            blocked_frontier_offset: reliable_stream_frame_extent(&preview)
-                .map(|(offset, _, _)| offset),
-            blocked_for_carrier_capacity: true,
-            ..LiveResponseFinalTailEnqueueOutcome::default()
-        };
-    };
-    let target_recovery_interval = reliable_data_retransmission_interval(
-        Some(target_snapshot.underlay),
-        Some(target_snapshot),
-    );
-    if uniform_frontier.avoid.contains(&target) {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit: selection_limit,
-            blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
-        };
-    }
-    let frontier_limit = reliable_live_frontier_reinjection_limit_bytes(
-        adaptive_reliable_relay_reinjection_bytes(
-            Some(target_snapshot),
-            path_stream.current_lane(),
-            mux_limits,
-        ),
-        base_reinjection_limit,
-        scoring_extent,
-        send_stream.reinjection_bytes(),
-        mux_limits,
-    );
-    let target_service_limit = response_sender.reinjection_service_limit_for_target(
-        path_stream,
-        send_stream,
-        target,
-        target_snapshot,
-        false,
-        mux_limits,
-    );
-    let service_limit = reliable_live_gap_reinjection_authority(
-        target_service_limit,
-        frontier_limit,
-        owner_recovery_ready,
-    );
-    if service_limit == 0 {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit,
-            service_limit,
-            blocked_frontier_offset: Some(frontier),
-            blocked_for_carrier_capacity: target_service_limit == 0,
-            ..LiveResponseFinalTailEnqueueOutcome::default()
-        };
-    }
-    let applied_extent = service_limit.min(uniform_extent);
-    let apply_range = OffsetRange {
-        start: frontier,
-        end: frontier.saturating_add(applied_extent as u64),
-    };
-    let Some(source_frames) = exact_contiguous_retransmission_frames(send_stream, apply_range)
-    else {
-        return LiveResponseFinalTailEnqueueOutcome {
-            frontier_limit,
-            service_limit,
-            blocked_frontier_offset: Some(frontier),
-            ..LiveResponseFinalTailEnqueueOutcome::default()
-        };
-    };
-    let source_frames = preserve_reinjection_frontier_quantum(source_frames, frontier_limit);
-    let cause = RelaySendCause::response_completion_tail_reinjection(target, target_snapshot);
     let (reinjection_frames, blocked_frontier_offset) =
         prefix_live_reinjection_frames_with_carrier_credit(
             response_sender,
@@ -1300,11 +1301,14 @@ fn enqueue_live_response_final_tail_reinjection(
             pending = true;
             break;
         }
+        let recovery_interval = target_recovery_interval.unwrap_or_else(|| {
+            response_live_owner_recovery_interval_for_frame(path_stream, &frame, None)
+        });
         response_sender.enqueue_reinjection_frame_with_cause_and_priority(frame, cause, true);
         queued = queued.saturating_add(1);
         accepted_recovery_interval = Some(include_live_owner_recovery_interval(
             accepted_recovery_interval,
-            target_recovery_interval,
+            recovery_interval,
         ));
     }
     if let Some(recovery_interval) = accepted_recovery_interval {
@@ -1316,11 +1320,12 @@ fn enqueue_live_response_final_tail_reinjection(
                 .record_live_owner_frontier_floor_attempt(accepted_at, recovery_interval);
         }
     }
-    LiveResponseFinalTailEnqueueOutcome {
+    LiveResponseRetainedFrontierEnqueueOutcome {
         queued,
         pending,
         frontier_limit,
         service_limit,
+        owner_fallback_deadline: Some(owner_recovery_deadline),
         blocked_frontier_offset,
         blocked_for_carrier_capacity: queued == 0 && blocked_frontier_offset.is_some(),
     }
@@ -1776,15 +1781,12 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
     performance: MppPerformanceConfig,
     max_frame_payload_bytes: usize,
     live_ack_gap_owner_recovery_deadline: Option<Instant>,
-    live_tail_owner_recovery_deadline: Option<Instant>,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
     last_send_ack_frontier: u64,
 ) -> TailReinjectionEnqueueOutcome {
     let observed_at = Instant::now();
     let live_ack_gap_owner_recovery_ready =
         live_ack_gap_owner_recovery_deadline.is_some_and(|deadline| observed_at >= deadline);
-    let live_tail_owner_recovery_ready =
-        live_tail_owner_recovery_deadline.is_some_and(|deadline| observed_at >= deadline);
     let base_reinjection_limit = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         tail_reinjection_path_snapshot,
         TrafficClass::Throughput,
@@ -1931,69 +1933,6 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 blocked_frontier_offset = unknown_owner_blocked_offset;
             }
         }
-        if reinjection_frames.is_empty()
-            && live_tail_owner_recovery_ready
-            && stream_ack_is_authoritative_contiguous_prefix(
-                last_send_ack_complete,
-                last_send_ack_ranges,
-                last_send_ack_frontier,
-            )
-            && last_send_ack_frontier < send_stream.next_offset()
-            && has_distinct_response_reinjection_alternative(
-                path_stream,
-                send_stream,
-                last_send_ack_complete,
-                last_send_ack_ranges,
-                last_send_ack_frontier,
-            )
-        {
-            // A live carrier still owns native recovery. One MPP quantum is
-            // enough to race the blocking frontier without creating a second
-            // congestion window above TCP or QUIC.
-            let frontier_extent = normalized_stream_ack_first_uncovered_extent(
-                last_send_ack_ranges,
-                send_stream.next_offset(),
-            )
-            .map_or(0, |(start, end)| flight_interval_bytes(start, end));
-            let frontier_limit = reliable_live_frontier_reinjection_limit_bytes(
-                base_reinjection_limit,
-                base_reinjection_limit,
-                frontier_extent,
-                send_stream.reinjection_bytes(),
-                mux_limits,
-            );
-            let tail_limit = reliable_live_gap_reinjection_authority(
-                frontier_limit,
-                frontier_limit,
-                live_tail_owner_recovery_ready,
-            );
-            let tail_source_frames = send_stream.retransmission_frames_for_ranges(
-                &[OffsetRange {
-                    start: last_send_ack_frontier,
-                    end: send_stream.next_offset(),
-                }],
-                tail_limit,
-            );
-            let (tail_reinjection_frames, tail_reinjection_blocked_offset) =
-                prefix_live_reinjection_frames_with_carrier_credit(
-                    response_sender,
-                    path_stream,
-                    send_stream,
-                    tail_source_frames,
-                    RelaySendCause::TailReinjection,
-                );
-            if !tail_reinjection_frames.is_empty() {
-                reinjection_limit = tail_limit;
-                reinjection_frames = tail_reinjection_frames;
-                blocked_frontier_offset = tail_reinjection_blocked_offset;
-                reinjection_kind = "tail_reinjection";
-                // A live carrier still owns recovery for its original flight.
-                // Product tail reinjection may race it only on a distinct output.
-                reinjection_cause = RelaySendCause::TailReinjection;
-            } else if blocked_frontier_offset.is_none() {
-                blocked_frontier_offset = tail_reinjection_blocked_offset;
-            }
-        }
     }
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = base_reinjection_limit;
@@ -2039,17 +1978,14 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
             // not skip an overlapped byte and publish a later suffix.
             break;
         }
-        let recovery_interval = matches!(
-            reinjection_cause,
-            RelaySendCause::AckGapReinjection | RelaySendCause::TailReinjection
-        )
-        .then(|| {
-            response_live_owner_recovery_interval_for_frame(
-                path_stream,
-                &frame,
-                tail_reinjection_path_snapshot,
-            )
-        });
+        let recovery_interval = matches!(reinjection_cause, RelaySendCause::AckGapReinjection)
+            .then(|| {
+                response_live_owner_recovery_interval_for_frame(
+                    path_stream,
+                    &frame,
+                    tail_reinjection_path_snapshot,
+                )
+            });
         if critical_tail_reinjection {
             response_sender.enqueue_critical_reinjection_frame_with_cause(frame, reinjection_cause);
         } else {
@@ -2067,19 +2003,9 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
             ));
         }
     }
-    if reinjection_count > 0
-        && matches!(
-            reinjection_cause,
-            RelaySendCause::AckGapReinjection | RelaySendCause::TailReinjection
-        )
-    {
+    if reinjection_count > 0 && matches!(reinjection_cause, RelaySendCause::AckGapReinjection) {
         let accepted_at = Instant::now();
-        let accepted_owner_deadline = match reinjection_cause {
-            RelaySendCause::AckGapReinjection => live_ack_gap_owner_recovery_deadline,
-            RelaySendCause::TailReinjection => live_tail_owner_recovery_deadline,
-            _ => None,
-        };
-        if accepted_owner_deadline.is_some_and(|deadline| accepted_at >= deadline)
+        if live_ack_gap_owner_recovery_deadline.is_some_and(|deadline| accepted_at >= deadline)
             && response_sender.live_owner_frontier_floor_ready(accepted_at)
         {
             response_sender.record_live_owner_frontier_floor_attempt(
@@ -2130,7 +2056,6 @@ fn enqueue_reliable_tail_reinjection(
         mux_limits,
         performance,
         max_frame_payload_bytes,
-        Some(Instant::now()),
         Some(Instant::now()),
         last_send_ack_frontier,
     )
@@ -2675,23 +2600,12 @@ where
             authoritative_data_ack_gap,
             has_distinct_ack_gap_reinjection_alternative,
         );
-        let live_tail_capacity_wait_arm_active = stream_ack_is_authoritative_contiguous_prefix(
-            last_send_ack.complete(),
-            last_send_ack.ranges(),
-            last_send_ack_frontier,
-        ) && last_send_ack_frontier
-            < send_stream.next_offset()
-            && has_distinct_response_reinjection_alternative(
-                path_stream,
-                &send_stream,
-                last_send_ack.complete(),
-                last_send_ack.ranges(),
-                last_send_ack_frontier,
-            );
+        let retained_frontier_candidate =
+            response_retained_frontier_candidate(path_stream, &send_stream);
         let mut response_state_capacity_notifies = if response_recovery_due
             || response_recovery_capacity_blocked
             || ack_gap_capacity_wait_arm_active
-            || live_tail_capacity_wait_arm_active
+            || retained_frontier_candidate
         {
             path_stream.response_recovery_capacity_notifies()
         } else {
@@ -2827,43 +2741,39 @@ where
                 &send_stream,
             );
         let final_offset_known = close.sent || pending_local_fin;
-        // Final-offset live-owner recovery has already selected and bound an
-        // exact alternate. Drive it from the actor's common loop so EOF,
-        // timer, ACK, and output changes all share the same lifecycle; the
-        // generic tail path below remains only for non-final live tails and
-        // exact failed/unknown-owner authority.
-        let final_tail_outcome = if final_offset_known
-            && !failed_original_tail_reinjection_ready
-            && ack_gap_recovery.frame_count == 0
-        {
-            enqueue_live_response_final_tail_reinjection(
-                &mut response_sender,
-                path_stream,
-                &send_stream,
-                last_send_ack.ranges(),
-                ack_gap_recovery.base_limit,
-                mux_limits,
-                Instant::now(),
-            )
+        let retained_frontier_phase = if final_offset_known {
+            ResponseRetainedFrontierPhase::FinalDrain
         } else {
-            LiveResponseFinalTailEnqueueOutcome::default()
+            ResponseRetainedFrontierPhase::Active
         };
-        if final_tail_outcome.queued > 0 {
+        // Active and final sending share one exact retained-owner obligation.
+        // The capacity edge above is armed before this helper checks target
+        // credit. ACK-gap and exact failed/unknown-owner recovery retain their
+        // separate authority; historical ACK completeness does not gate F.
+        let retained_frontier_outcome =
+            if !failed_original_tail_reinjection_ready && ack_gap_recovery.frame_count == 0 {
+                enqueue_live_response_retained_frontier_reinjection(
+                    &mut response_sender,
+                    path_stream,
+                    &send_stream,
+                    ack_gap_recovery.base_limit,
+                    retained_frontier_phase,
+                    mux_limits,
+                    Instant::now(),
+                )
+            } else {
+                LiveResponseRetainedFrontierEnqueueOutcome::default()
+            };
+        if retained_frontier_outcome.queued > 0 {
             response_sender_retry_at = None;
         }
-        response_state_capacity_blocked |= final_tail_outcome.blocked_for_carrier_capacity;
-        let contiguous_live_tail = stream_ack_is_authoritative_contiguous_prefix(
-            last_send_ack.complete(),
-            last_send_ack.ranges(),
-            last_send_ack_frontier,
-        ) && last_send_ack_frontier < send_stream.next_offset();
+        response_state_capacity_blocked |= retained_frontier_outcome.blocked_for_carrier_capacity;
         let tail_reinjection_candidate = has_tail_reinjection_alternative
-            && (contiguous_live_tail
-                || (last_send_ack.has_unacknowledged_extent(last_send_ack_frontier)
-                    && stream_ack_ranges_expose_authoritative_gap(
-                        last_send_ack.complete(),
-                        last_send_ack.ranges(),
-                    )));
+            && last_send_ack.has_unacknowledged_extent(last_send_ack_frontier)
+            && stream_ack_ranges_expose_authoritative_gap(
+                last_send_ack.complete(),
+                last_send_ack.ranges(),
+            );
         let tail_timer_active = reliable_relay_tail_reinjection_timer_active(
             send_stream.reinjection_bytes(),
             tail_reinjection_candidate,
@@ -2895,9 +2805,6 @@ where
         .then(|| ack_gap_reinjection.next_reinjection_deadline())
         .flatten();
         let live_owner_epoch_deadline = response_sender.live_owner_frontier_floor_deadline();
-        let completion_tail_owner_deadline = final_offset_known
-            .then(|| response_sender.completion_tail_owner_fallback_deadline())
-            .flatten();
         let ack_gap_live_owner_wake = live_owner_gap_recovery_wake(
             ack_gap_candidate_deadline,
             ack_gap_reinjection.original_owner_recovery_deadline(),
@@ -2905,12 +2812,9 @@ where
             ack_gap_observed_at,
         );
         let live_tail_wake = server_live_owner_recovery_wake(
-            if final_offset_known {
-                completion_tail_owner_deadline.map(tokio::time::Instant::from_std)
-            } else {
-                (tail_timer_active && !failed_original_tail_reinjection_ready)
-                    .then_some(tail_timer_deadline)
-            },
+            retained_frontier_outcome
+                .owner_fallback_deadline
+                .map(tokio::time::Instant::from_std),
             live_owner_epoch_deadline,
             ack_gap_observed_at,
         );
@@ -2949,7 +2853,6 @@ where
                 (!final_offset_known)
                     .then(|| ack_gap_reinjection.original_owner_recovery_deadline())
                     .flatten(),
-                (!final_offset_known).then_some(tail_timer_deadline.into_std()),
                 last_send_ack_frontier,
             );
             if outcome.queued > 0 {
@@ -3185,7 +3088,6 @@ where
                 (!final_offset_known)
                     .then(|| ack_gap_reinjection.original_owner_recovery_deadline())
                     .flatten(),
-                (!final_offset_known).then_some(tail_timer_deadline.into_std()),
                 last_send_ack_frontier,
             );
             if tail_timer_due {
@@ -3460,49 +3362,48 @@ where
                         response_sender_retry_at = None;
                     }
                     let base_reinjection_limit = reinjection.base_limit;
-                    let fin_tail_observed_at = Instant::now();
-                    // FIN makes the retained tail extent exact, but a live
-                    // original carrier still owns native recovery.  The FIN
-                    // observation therefore shares the same budget and epoch
-                    // as ACK-gap/contiguous-tail recovery.
-                    let fin_tail_ready = (close.sent || pending_local_fin)
-                        && !failed_original_tail_reinjection_ready;
-                    let fin_tail_outcome = if reinjection.frame_count == 0 && fin_tail_ready {
-                        enqueue_live_response_final_tail_reinjection(
+                    let retained_frontier_observed_at = Instant::now();
+                    // Apply positive ACK release before observing the exact
+                    // retained owner, then queue recovery before this branch's
+                    // sender drain regardless of source EOF.
+                    let retained_frontier_outcome = if reinjection.frame_count == 0
+                        && !failed_original_tail_reinjection_ready
+                    {
+                        enqueue_live_response_retained_frontier_reinjection(
                             &mut response_sender,
                             path_stream,
                             &send_stream,
-                            last_send_ack.ranges(),
                             base_reinjection_limit,
+                            retained_frontier_phase,
                             mux_limits,
-                            fin_tail_observed_at,
+                            retained_frontier_observed_at,
                         )
                     } else {
-                        LiveResponseFinalTailEnqueueOutcome::default()
+                        LiveResponseRetainedFrontierEnqueueOutcome::default()
                     };
-                    if fin_tail_outcome.queued > 0 {
+                    if retained_frontier_outcome.queued > 0 {
                         response_sender_retry_at = None;
                     }
                     #[cfg(feature = "lab-diagnostics")]
-                    let reinjection_limit = if fin_tail_outcome.service_limit > 0 {
-                        fin_tail_outcome.service_limit
+                    let reinjection_limit = if retained_frontier_outcome.service_limit > 0 {
+                        retained_frontier_outcome.service_limit
                     } else {
                         reinjection.service_limit
                     };
                     let reinjection_kind = if reinjection.frame_count > 0 {
                         "persistent_ack_gap"
-                    } else if fin_tail_outcome.queued > 0 || fin_tail_outcome.pending {
-                        "fin_tail"
+                    } else if retained_frontier_outcome.queued > 0 || retained_frontier_outcome.pending {
+                        "retained_frontier"
                     } else {
                         "none"
                     };
                     #[cfg(feature = "lab-diagnostics")]
-                    if fin_tail_outcome.blocked_frontier_offset.is_some() {
+                    if retained_frontier_outcome.blocked_frontier_offset.is_some() {
                         lab_diagnostic(
                             "tail_stall_reinjection_blocked_frontier",
                             format_args!(
-                                "stream_id={} blocked_frontier_offset={:?} reinjection_kind=fin_tail",
-                                stream_id.0, fin_tail_outcome.blocked_frontier_offset,
+                                "stream_id={} blocked_frontier_offset={:?} reinjection_kind=retained_frontier",
+                                stream_id.0, retained_frontier_outcome.blocked_frontier_offset,
                             ),
                         );
                     }
@@ -3523,7 +3424,7 @@ where
                             send_stream.next_offset(),
                             response_sender.bytes(),
                             ack.remaining_reinjection_bytes,
-                            reinjection.frame_count.saturating_add(fin_tail_outcome.queued),
+                            reinjection.frame_count.saturating_add(retained_frontier_outcome.queued),
                             reinjection_kind,
                             Some(path_stream.underlay),
                             reinjection.has_multipath_alternative,
@@ -3666,41 +3567,34 @@ where
             multipath_reinjection_alternative_available = now_has_reinjection_alternative;
             response_sender_retry_at = None;
             let output_observed_at = Instant::now();
-            let final_tail_reinjection_ready = !failed_original_tail_reinjection_ready
-                && reliable_final_tail_reinjection_ready(
-                    close.sent || pending_local_fin,
-                    &send_stream,
-                    last_send_ack.ranges(),
-                    last_send_ack_frontier,
-                    tail_timer_deadline,
-                    tokio::time::Instant::from_std(output_observed_at),
-                );
-            let final_tail_outcome = if final_tail_reinjection_ready {
-                enqueue_live_response_final_tail_reinjection(
+            let retained_frontier_candidate = !failed_original_tail_reinjection_ready
+                && response_retained_frontier_candidate(path_stream, &send_stream);
+            let retained_frontier_outcome = if retained_frontier_candidate {
+                enqueue_live_response_retained_frontier_reinjection(
                     &mut response_sender,
                     path_stream,
                     &send_stream,
-                    last_send_ack.ranges(),
                     adaptive_reliable_relay_reinjection_bytes(
                         tail_reinjection_path_snapshot,
                         response_lane,
                         mux_limits,
                     ),
+                    retained_frontier_phase,
                     mux_limits,
                     output_observed_at,
                 )
             } else {
-                LiveResponseFinalTailEnqueueOutcome::default()
+                LiveResponseRetainedFrontierEnqueueOutcome::default()
             };
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "server_output_update",
                 format_args!(
-                    "stream_id={} now_has_reinjection_alternative={} gained_reinjection_alternative={} final_tail_reinjection_ready={} close_sent={} pending_local_fin={} reinjection_bytes={} ack_ranges={} ack_frontier={} sent_offset={} queue_bytes={}",
+                    "stream_id={} now_has_reinjection_alternative={} gained_reinjection_alternative={} retained_frontier_candidate={} close_sent={} pending_local_fin={} reinjection_bytes={} ack_ranges={} ack_frontier={} sent_offset={} queue_bytes={}",
                     stream_id.0,
                     now_has_reinjection_alternative,
                     gained_reinjection_alternative,
-                    final_tail_reinjection_ready,
+                    retained_frontier_candidate,
                     close.sent,
                     pending_local_fin,
                     send_stream.reinjection_bytes(),
@@ -3710,14 +3604,14 @@ where
                     response_sender.bytes(),
                 ),
             );
-            if final_tail_reinjection_ready {
+            if retained_frontier_candidate {
                 #[cfg(feature = "lab-diagnostics")]
-                if final_tail_outcome.blocked_frontier_offset.is_some() {
+                if retained_frontier_outcome.blocked_frontier_offset.is_some() {
                     lab_diagnostic(
                         "tail_stall_reinjection_blocked_frontier",
                         format_args!(
-                            "stream_id={} blocked_frontier_offset={:?} reinjection_kind=fin_tail",
-                            stream_id.0, final_tail_outcome.blocked_frontier_offset,
+                            "stream_id={} blocked_frontier_offset={:?} reinjection_kind=retained_frontier",
+                            stream_id.0, retained_frontier_outcome.blocked_frontier_offset,
                         ),
                     );
                 }
@@ -3725,21 +3619,21 @@ where
                 lab_diagnostic(
                     "tail_stall_reinjection",
                     format_args!(
-                        "stream_id={} lane={:?} ack_frontier={} sent_offset={} reinjection_bytes={} reinjection_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit={} base_reinjection_limit={} reinjection_limit={} optional_reinjection_budget_percent={} reinjection_kind=fin_tail",
+                        "stream_id={} lane={:?} ack_frontier={} sent_offset={} reinjection_bytes={} reinjection_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit={} base_reinjection_limit={} reinjection_limit={} optional_reinjection_budget_percent={} reinjection_kind=retained_frontier",
                         stream_id.0,
                         response_lane,
                         last_send_ack_frontier,
                         send_stream.next_offset(),
                         send_stream.reinjection_bytes(),
-                        final_tail_outcome.queued,
-                        final_tail_outcome.blocked_frontier_offset,
+                        retained_frontier_outcome.queued,
+                        retained_frontier_outcome.blocked_frontier_offset,
                         false,
-                        final_tail_outcome.frontier_limit,
-                        final_tail_outcome.service_limit,
+                        retained_frontier_outcome.frontier_limit,
+                        retained_frontier_outcome.service_limit,
                         performance.optional_reinjection_budget_percent,
                     ),
                 );
-                if final_tail_outcome.queued > 0 {
+                if retained_frontier_outcome.queued > 0 {
                     response_sender_retry_at = None;
                 }
             }

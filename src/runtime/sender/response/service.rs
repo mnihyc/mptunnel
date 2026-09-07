@@ -19,9 +19,7 @@ use crate::lab_diagnostics::{
 };
 use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
-use crate::model::multipath::{
-    LiveOwnerFallbackEpoch, LiveOwnerFrontierFloorEpoch, OptionalReinjectionLedger,
-};
+use crate::model::multipath::{LiveOwnerFrontierFloorEpoch, OptionalReinjectionLedger};
 use crate::model::path::CarrierPathKey;
 use crate::model::timing::{
     ReliableDataAckGapTiming, reliable_data_ack_gap_timing_for_assignments,
@@ -206,7 +204,6 @@ pub(in crate::runtime) struct ServerResponseSenderService {
     pub(in crate::runtime::sender) performance: MppPerformanceConfig,
     pub(in crate::runtime::sender) optional_reinjection: OptionalReinjectionLedger,
     live_owner_frontier_floor: LiveOwnerFrontierFloorEpoch,
-    completion_tail_owner_fallback: LiveOwnerFallbackEpoch<ServerReinjectionOutputIdentity>,
     stale_response_recovery_generation: u64,
 }
 
@@ -331,27 +328,12 @@ impl ServerResponseSenderService {
             performance,
             optional_reinjection: OptionalReinjectionLedger::default(),
             live_owner_frontier_floor: LiveOwnerFrontierFloorEpoch::default(),
-            completion_tail_owner_fallback: LiveOwnerFallbackEpoch::default(),
             stale_response_recovery_generation: 0,
         }
     }
 
     pub(in crate::runtime) fn stale_response_recovery_generation(&self) -> u64 {
         self.stale_response_recovery_generation
-    }
-
-    pub(in crate::runtime) fn observe_completion_tail_owner_fallback(
-        &mut self,
-        range: OffsetRange,
-        owners: &[ServerReinjectionOutputIdentity],
-        timing: ReliableDataAckGapTiming,
-    ) -> Instant {
-        self.completion_tail_owner_fallback
-            .observe(range, owners, timing)
-    }
-
-    pub(in crate::runtime) fn completion_tail_owner_fallback_deadline(&self) -> Option<Instant> {
-        self.completion_tail_owner_fallback.deadline()
     }
 
     pub(in crate::runtime) fn ack_gap_reinjection_path_snapshot(

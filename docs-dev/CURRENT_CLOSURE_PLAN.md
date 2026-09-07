@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 04:22 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 05:26 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -195,7 +195,7 @@ all forward-upload silence. At22--23s a different actual forward plateau has
 64MiB source/target separation despite1,656,000B QUIC native ACK progress.
 Existing snapshots do not identify exact holding ranges or native winners.
 
-## Active transaction: response retained-frontier symmetry preflight
+## Active transaction: response retained-frontier symmetry correction
 
 - **Issue:** the same mixed request has long return delivery stalls after the
   server has read small acknowledgement bodies, including outside deliberate
@@ -223,6 +223,155 @@ Existing snapshots do not identify exact holding ranges or native winners.
   admission stay. Component RED would prove a contract mismatch only, not
   attribute all return stalls. Symmetric mechanism controls and the affected
   ordinary timing/cost comparison still precede practical promotion.
+
+**Producer review / RED authorized, 04:35:** response publication uses cumulative
+`ack_frames()`, not the request-side sparse delta producer. Supported
+`max_ack_ranges=1` realizes two incomplete chunks after receiving originals
+0,1,3 of four64B assignments. Both cells retain exactly[128,192), actualF128;
+an earlier complete snapshot gives H64 versus aligned controlH128. The test
+uses real send admission, receiver ACK production and cache/binding release,
+then actual mature ownership and alternate admission. It isolates the active
+queue predicate, not actor wake scheduling. With default256 ranges this H/F
+geometry needs extensive fragmentation: do NOT attribute the small67B return
+plateau to it. Separately review the same retained obligation before any ACK;
+that is its initial-state boundary, not a new recovery policy. Production is
+unchanged while the RED/control compiles.
+
+**RED/control complete, 04:37:** release focused build1m10s. Aligned-H control
+passes actual alternate dispatch; fragmented-H case passes all reachability,
+cache/owner/maturity/admission assertions then fails intended queue count0vs1.
+Command: `cargo test --release --locked -j 1 --config
+'profile.release.package.mptunnel.opt-level=0' --lib
+active_response_retained_frontier_ -- --nocapture` (1PASS/1RED).
+
+**Bounded correction authorized:** migrate response active/final to the existing
+exact retained-owner helper using actualF. Remove the duplicate generic live
+contiguous-tail branch; retain authoritative-gap and failed/unknown-owner paths.
+Preserve ACK/output enqueue-before-drain order, pre-armed native capacity,
+accepted-copy wakes and exact ranked/Apply authority. Return the currently
+validated owner deadline for wake ownership instead of blindly reusing an old
+epoch when no retained obligation exists. Never reset a mature immutable epoch
+because an alternate temporarily disappears. No new knobs, quantum, controller,
+P/E limits or timer adjustment; RFC15.2 already specifies this shared contract.
+Focused boundary controls and independent source review precede ordinary pair.
+
+**Candidate verification / integration HOLD:** first unified candidate passes
+82 server-component checks in0.11s after1m12s compile, including actual no-ACK,
+fragmented-H, aligned, final and resolved-wake fixtures. This is NOT promotion.
+Root source/formula review found the generic active branch legitimately ranked
+and fully admitted up to65536B; the reused final helper silently clipped it to
+14600B. T06 permits the former. Reviewers retracted their too-broad quantity
+neutrality claim. A private Active/FinalDrain operation phase now preserves
+inherited sizing (EOF selects quantity, not authority); real65536B active versus
+14600B final dispatch control is added but NOT yet run.
+
+Two migration countercases still block ordinary execution: (1) the final helper
+uses positive-service target selection then clips to K, while old active
+preflight requires its whole frame; preserving the cap alone does not preserve
+target eligibility, (2) adjacent same-owner sparse appends grow the ranked
+extent and its latest assignment time, which can renew the fallback epoch for
+unchangedF. Example64B@t0, next64B@t0+R/2 moves D fromt0+R tot0+1.5R.
+This is not an accepted new policy or a reason to tune R/Q. Complete the bounded
+active-retained model (exact mature prefix, immutable oldest obligation and
+existing full-frame admission), then prove these integration controls before
+ordinary comparison. No shared request/helper rewrite is implicitly authorized.
+The need for these checks is a methodology lesson: a proven final-only helper
+is not behaviorally neutral in an active caller. Compare actual quantity,
+selection, assignment lifetime and wake formulas before declaring reuse safe.
+
+**Model decision before further implementation, 05:07:** the clock belongs to
+each exact OriginalData assignment, not the maximum assignment time in an
+appendable candidate. Retain `D_j = a_j + R_j` on the existing response flight;
+on first retained-owner observation initialize it, subsequently only tighten.
+Observe existing fragments coherently under the existing output/flight lock
+order, so fragments created before first observation share their assignment's
+first interval. This explicitly observes current Original flights together,
+not only a selected cache fragment. Later ACK splitting inherits D; evidence
+invalidation cannot erase it; removal of flight ownership removes it. Do not
+freeze a guessed interval at Original commit or reuse an old head's shorter R
+for a newly assigned suffix after native timing has changed.
+
+Keep the complete current owner/copy-avoid/cache-contiguous prefix, limited by
+the inherited operation quantum. At time t, cut it at the first Original span
+with `D_j > t`. The assignment(s) covering actual F supply the head wake;
+fresh later spans cannot alter that wake. Once all adjacent assignments mature,
+they can aggregate to Q: do not freeze a tiny first-observation extent or impose
+cache-chunk boundaries. A due head still has to pass the unchanged distinct
+target, copy/slot, Product service and native Apply gates. This neither infers
+negative ACK loss nor installs a new timer, pacer, copy-ahead cursor or budget.
+
+Response-local scope: add one fixed optional deadline to existing flight
+metadata, use its coherent mature-prefix observation, and remove the response
+aggregate fallback epoch once redundant. Keep shared/request models unchanged
+in this transaction; record their analogous append question separately rather
+than claiming global closure. Cost is bounded by retained entries plus their
+observation scan; ordinary CPU/RSS and timing must verify it, not be assumed.
+
+**Admission preservation decision:** one shared retained obligation may keep
+the pre-existing operation-specific publication forms. Active must reuse its
+per-cache-frame full-credit preflight and unbound TailReinjection dispatch;
+FinalDrain keeps exact bound-target/positive-credit shrinking. A boolean full-
+frame check alone does not preserve Active's multi-frame behavior: two32KiB
+frames versus one64KiB common prefix can select/queue differently. Do not force
+synthetic concatenation or claim these plans are equivalent. There is one
+ownership/maturity cause, not two independent recovery controllers.
+
+**Fresh-append RED confirmed, 05:12:** the built focused suite reports6PASS and
+one intendedRED. The late-alternate case proves head64B mature, suffix64B fresh
+and target credit128B before the queue0vs1 assertion fails. The mature-adjacent
+control dispatches128B; real active65536B/final14600B quantity controls pass.
+Command: `target/release/deps/mptunnel-29ba8ebb1d3edd33
+response_retained_frontier --nocapture` (no rebuild or ordinary run).
+The per-assignment correction above is now authorized, with Active's inherited
+unbound publication form explicitly preserved. Then verify increasing owner R,
+ACK splitting, exact owner identity, no wake after release, copy/capacity
+controls and both inherited publication forms before the ordinary gate.
+
+**Implementation and independent source review, 05:22:** response-local D
+metadata and coherent observation are implemented. The mature-prefix query is
+capped at inheritedQ; clocks are observed over retained entries, but the pure
+ownership sweep runs after releasing locks and only over overlapping spans.
+A fully mature result reuses that sweep. Active preserves unbound per-frame
+full-credit dispatch and the owner-based successor observation; FinalDrain
+preserves bound-target shrinking and its target-based successor observation.
+The response aggregate epoch is removed. Independent review finds no blocking
+model discrepancy, explicitly withholding runtime/cost acceptance.
+The shared actual-dispatch fixture checks bound_reinjection_deadline presence
+only for FinalDrain; two32KiB Active frames thus distinguish the publication
+forms without a new production accessor or synthetic native credit.
+
+**Focused GREEN, 05:26:**88 server tests pass after1m12s build, including both
+original REDs and clock/quantity/dispatch controls. The same executable passes
+155 response stream and90 response sender checks in0.03/0.02s, including native
+Apply, ACK fragments, qualification, copy clocks and terminal boundaries.
+One fixture constructor signature was corrected before this run; no Product
+change was made to satisfy a setup error. Independent source review remains
+clear. Freeze an optimized diagnostics-capable ordinary candidate (all tracing
+disabled during comparison), then run the declared pair. Labels are
+`mixed-combined-up-response-retained-{control,candidate}-0908`; candidate path
+`./.tmp/reflection/bin/response-retained-20260908/mptunnel`. No ordinary result
+or practical promotion is claimed by this GREEN.
+
+**Initial-state boundary confirmed:** with no response ACK, the default
+snapshot has H=None/F0. Even a complete empty ACK leaves the old contiguous
+predicate false because it also requires F>0. The apparent no-ACK exception
+only enters an outer block whose inner recovery branches reject this state.
+Negative-H staleness correctly has no observations here; exact failure needs
+actual owner removal. Thus a mature live original, open response source and
+admitted distinct alternate have no active retained fallback until ACK/EOF.
+Unlike the fragmented-H case, this needs no unusual range count and can affect
+first replies. Native recovery still operates; delayed DataACK may make the
+bounded copy redundant. It remains unproven attribution for the67B plateau.
+
+**Next ordinary gate (after focused GREEN and audit):** one control/candidate
+mixed combined upload pair, both endpoints ordinary diagnostics-off, fixed
+765683b versus only this response correction. Same profile/probe, no initial
+QUIC intervention, sampler, network/config adjustment or extra bulk tracing.
+Keep actual first/max confirmation and write gaps, complete receiver-confirmed
+bytes and full bins, ordered target/reply stage snapshots, directional wire,
+CPU/RSS. An adverse/incomplete pair stops promotion and requires one causal
+question; no third run-to-pass. Useful download/both-direction and full global
+gates still follow, not waived by a small response RED.
 
 Exact network/probe profile remains unchanged: upload70/20ms delay/jitter;
 return30/5ms. Five-second loss epochs upload[3,8,5,6,10,3,5,8]% (mean6),
@@ -275,7 +424,7 @@ Do not reuse the runner's old aggregate300/200 defaults for the required200each.
 - Preserve useful artifacts before scoped cache cleanup. No deletion this
   transaction; no unaccepted runtime overlay or user edit belongs in a commit.
 - Telegram milestones authorized no more often than hourly; last sent
-  2026-09-07 about20:01UTC (initial membership and rejected repair fork).
+  2026-09-07 about21:03UTC (response RED/GREEN and migration hold).
   Respect its soft frequency advisory: nonessential messages can wait.
 - Universal clairvoyant optimality under arbitrary future outages is impossible.
   This does not waive avoidable software delays or any practical acceptance

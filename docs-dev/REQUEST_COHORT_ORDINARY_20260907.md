@@ -944,3 +944,108 @@ would discriminate the branches, with already-receipted frontier evidence
 falsifying a forward-only explanation. This states the missing observation;
 it does not authorize a new run, remove a protection, tune a deadline, or
 bundle the separately observed probe-mailbox delay into the atom correction.
+
+### Exact repair-service capture: two adjacent winning-copy chains
+
+Recorded 2026-09-08 03:15 +08:00. Category: completed bounded diagnostic;
+not ordinary performance acceptance. Runtime is `765683b` with only the
+temporary [observation overlay](ACK_ATOMS_SERVICE_TRACE_20260908.patch).
+The overlay was reversed after freezing the executable and before this one
+unchanged mixed combined upload run. Preserve the logs, service snapshots and
+probe in [the raw capture](ACK_ATOMS_SERVICE_DIAGNOSTIC_20260908.raw.tar.gz),
+from `./.tmp/reflection/results/mixed-combined-up-ack-atoms-service-diag-0908/`.
+
+The probe confirms all 222,429,184 B in 55.808901 s, reports 31.884 Mbps and a
+3.866738-second maximum confirmation gap. Instrumentation perturbs scheduling;
+these numbers do not pass the ordinary gate or establish a causal performance
+comparison with the previous uninstrumented pair.
+
+Both chains below occur before 20 s, at client-relative 16.328--16.632 s and
+16.728--17.185 s. **They are inside the profile's 10-Mbps QoS period at
+15--25 s**, not evidence of physically available 500-Mbps service. Common Unix
+timestamps are used across processes; client/server monotonic origins differ.
+`C` and `S` line references denote `client.log` and `server.log` in the archive.
+All four copies have the same exact owner and target:
+
+- Original owner: TCP index 0, physical instance 2, attachment 0.
+- Repair target: QUIC/UDP index 0, physical instance 4, attachment 2;
+  native request stream 8 at the writer.
+- Selection quantum, target quantum, capped frontier and applied extent are
+  each 14,600 B. Each native write begins and ends within 0--1 ms of successful
+  Apply. The wire decoder presents each copy as 12,000 B plus 2,600 B.
+
+| Copy range, half-open | Selected service L / successful Apply, Unix ms | Peer decode and actual contiguous F advance, Unix ms | Client ACK F reaches copy end, Unix ms |
+| --- | --- | --- | --- |
+| A1 `[10288940,10303540)` | 1,966,080 B; **1788808144532**, C3827--3832 | **1788808144601**, S1189--1194; F 10,288,940 -> 10,303,540 | **1788808144729**, C3842 |
+| A2 `[10303540,10318140)` | 1,966,080 B; **1788808144729**, C3843--3848 | **1788808144793**, S1196--1202; F 10,303,540 -> 10,318,140 | **1788808144836**, C3851 |
+| B1 `[10420012,10434612)` | 1,820,408 B; **1788808144932**, C3861--3866 | **1788808145030**, S1215--1221; F 10,420,012 -> 10,434,612 | **1788808145157**, C3879 |
+| B2 `[10434612,10449212)` | 1,811,008 B; **1788808145157**, C3880--3885 | **1788808145249**, S1225--1231; F 10,434,612 -> 10,449,212 | **1788808145389**, C3894 |
+
+These are actual winning repairs, not merely publications before an ACK.
+The first pair's only intersecting original publication is TCP0's
+`[10288940,10354476)` at Unix 1788808128221 (C159). Its actual receiver
+advance occurs at 1788808144904 (S1206), after both QUIC advances. A redundant
+TCP1 copy of A1 is published at 1788808144714 (C3837--3841), after QUIC
+already delivered A1; it reaches the receiver at 1788808144811 (S1204) and
+does not advance F. Thus neither rival supplied A1 or A2's recorded progress.
+
+For the second pair, the only intersecting original is TCP0's
+`[10420012,10485548)` at 1788808128221 (C161). Its actual receiver advance
+is only at 1788808145402 (S1234), after both QUIC advances. TCP1 duplicates
+of B1/B2 are published at 1788808145107/1788808145376 (C3874--3878 /
+C3889--3893), reach the receiver at 1788808145203/1788808145466
+(S1224/S1240), and leave F unchanged. All intersecting original/copy
+publication records through these intervals were checked, not only equal
+starting offsets.
+
+The actual successful send cause for A1/A2/B1/B2 is
+`PersistentClientAckGapReinjection` (C3830, C3846, C3864, C3883).
+`retained_selected` concurrently observes the same lowest prefix, but this
+capture must not be described as retained-fallback-only attribution. Both
+causes share the live-frontier boundary. The later redundant TCP copies use
+`CompletionTailReinjection` and are separately accounted above.
+
+#### Authority, timing and interpretation boundaries
+
+At each QUIC Apply, queued and previously accepted copy debts are zero and
+the published Product limit is 67,108,864 B. OriginalData debt is respectively
+65,536 / 80,136 / 50,936 / 56,136 B (C3828/C3844/C3862/C3881).
+Selected L is positive and much greater than Q, but is itself capped by
+remaining repair work and resource authority; it is not physical bandwidth.
+Apply's `service_bytes=14600` is additionally capped by the proposed payload,
+not a measurement of all spare service. `snapshot_queue_bytes=14600` is read
+after the current reservation and must not be called preexisting backlog.
+
+Writer completion is local H3 acceptance, and `route_done` is routing
+completion, not necessarily actor execution. The separate
+`repair_receive_frontier` records the actual Product receive-state change.
+Its exact 12,000/2,600-B frame boundaries plus later rival arrival establish
+these winners. The receive wrapper does not expose native stream ID, so
+correlation is role/stream/range under this capture's sole QUIC carrier;
+arbitrary same-range duplicates across multiple QUIC carriers would need
+stronger identity evidence.
+
+For A1/A2, successful Apply to actual peer advance takes 69/64 ms; ACK
+application follows peer advance by 128/43 ms. For B1/B2 these intervals are
+98/92 ms and 127/140 ms. A2 and B2 are selected and committed in the same
+logged millisecond that the preceding copy's ACK advances the client F.
+Their already-due owners are not waiting for fresh owner-age permission;
+the next disjoint publication tracks knowledge of F despite positive L.
+No local writer queue delay explains these four promptly accepted copies.
+The capture does not isolate the later ACK delay into return transport,
+publication, mailbox or actor service.
+
+With no competing original frontier advance inside each two-copy interval,
+the conditional ACK-clocked service is `8 * (2 * 14600) / T`: about
+0.768 Mbps for A's 304 ms and 0.511 Mbps for B's 457 ms. These are two
+observed frontier chains during QoS, **not a global tunnel-throughput ceiling**,
+a controller-rate estimate, or proof that a larger speculative prefix is safe.
+They support a live-prefix feedback serialization mechanism to model next,
+while preserving exact ranking/Apply range identity and duplicate ownership.
+
+A useful counterexample is retained: the earliest hedge `[0,14600)` is
+published at 1788808128438 (C204--211), but the original `[0,65536)` advances
+F at 1788808128682 (S3), before QUIC repair decode at 1788808128689
+(S5--10). Not every repair wins; copying more suffix unconditionally is not
+justified. No quantum, deadline, controller or policy change follows solely
+from this diagnostic, and no automatic repeat is authorized by this result.

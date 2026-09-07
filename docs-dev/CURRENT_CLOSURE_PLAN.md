@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 03:02 +08:00. Authoritative source is `./`. **No release pass.**
+Updated: 2026-09-08 03:18 +08:00. Authoritative source is `./`. **No release pass.**
 This is the existing REVIEW_AND_PRACTICAL_ACCEPTANCE batch, not a new inventory.
 Superseded checkpoints are preserved in
 [the history](CLOSURE_PLAN_HISTORY_THROUGH_20260907.md) and their linked evidence.
@@ -53,9 +53,13 @@ ACK_ATOMS_ORDINARY_20260908.raw.tar.gz. No sampler overlay is included.
   runtime policy change. Record selected owner/frontier/Q and target service L,
   exact successful Apply service/debt, QUIC repair-frame writer begin/end and
   receiver decode/route completion, and ACK application frontier. Reuse existing
-  original/copy decisions and ordered receiver events. Only sender/request,
-  QUIC repair channel and request ACK observer need extra fields; no bulk
-  ordinary-frame transport trace, queues, timers, gains or new state.
+  original/copy decisions and ordered receiver events. Sender/request,
+  QUIC repair channel and request ACK observer need extra fields. Independent
+  review notes the old server stall event omits advances below100ms: add one
+  server receive observation only when a frame covers an already-open reordered
+  frontier, with offset/length and F before/after. This is necessary to identify
+  which arrival actually closes that prefix, not a bulk ordinary-frame transport
+  trace. No queues, timers, gains or new long-lived state.
   Compile once, freeze, archive/reverse overlay, then one unchanged current
   candidate mixed combined upload capture, label ack-atoms-service-diag-0908.
   No simultaneous build/load, new harness or automatic trace repetition.
@@ -71,6 +75,68 @@ ACK_ATOMS_ORDINARY_20260908.raw.tar.gz. No sampler overlay is included.
   RED and implementation. Existing byte-correct checkpoint remains isolated,
   not practically promoted. Ordinary first/gap/drain/cost plus global gates
   remain mandatory; this diagnostic cannot supply performance acceptance.
+
+**Capture frozen, 03:09:** build1m02s; four-file observation overlay archived
+as ACK_ATOMS_SERVICE_TRACE_20260908.patch and fully reversed before execution.
+Frozen binary `./.tmp/reflection/bin/ack-atoms-service-diag-20260908/mptunnel`.
+One same-profile mixed combined up capture, event filter
+`repair_service,repair_transport,repair_receive_frontier,sender_service_decision,request_retained_frontier_reinjection,stream_ack_received,server_receive_hole,server_receive_delivery_stall,request_path_stale,request_reinjection_admission,request_native_authority,client_path_frame_error`.
+Independent review confirms no policy/await/queue changes. Selected L is real
+target service; Apply's service is payload-capped. Owner age covers the scored
+range, not its whole uniform suffix. H3 acceptance/route completion are not
+wire/ordered receipt; only the new receiver event observes actual Product F.
+Matching role/stream/range is required; ambiguous duplicates cannot identify a
+winner. Older trace has late copies after TCP already delivered their ranges,
+so a mere copy-before-client-ACK correlation does not prove useful repair.
+
+**Discriminator complete, 03:17:** one capture completes exact222429184B in
+55.808901s; no diagnostic rate acceptance. Two pairs of adjacent14,600B QUIC
+copies actually advance receiver F before their TCP originals or rivals.
+Writer acceptance takes0--1ms, peer advance64--98ms; the next disjoint copy
+waits another127--128ms for ACK application despite selected L1.8--2.0MB.
+The actual committed cause is persistent ACK-gap recovery, with a concurrent
+retained-frontier observation: this is shared live-prefix serialization, not
+a retained-fallback-only defect. These16--17s pairs are inside10Mbps QoS;
+positive admission L is not proof of500Mbps physical spare capacity.
+
+The trace also falsifies an all-early-interval spare-QUIC premise: QUIC native
+work is substantial until about13s, and several hedges arrive after TCP has
+already delivered. At13--20s, source and target each advance3,276,800B while
+the initial TCP owner's debt decreases exactly that amount;55 QUIC copies
+total803,000B, versus87 new QUIC originals totaling3,276,800B. The stream
+retains64MiB of out-of-order separation until the TCP prefix clears near21s.
+Full chain/counterevidence is appended to REQUEST_COHORT_ORDINARY_20260907;
+raw capture is ACK_ATOMS_SERVICE_DIAGNOSTIC_20260908.raw.tar.gz.
+
+### Next transaction: initial irreversible placement before alternative service
+
+- **Issue/evidence:** the first187 OriginalData decisions commit12,189,484B
+  on TCPindex0/physical2/attachment0 within20ms; QUIC first Original is129ms.
+  That exact TCP prefix then holds ordered service/window until near21s.
+  Native reliability supplies eventual service, not comparable ordered timing.
+- **Question/competing causes:** was TCP the only eligible attachment during
+  the initial batch, or did a ready alternative lose because placement confused
+  Product permission with service opportunity? What exact bootstrap, queue,
+  membership and Apply rules permit this irreversible quantity? Large P alone
+  proves memory/ownership permission, not that placing it now is desirable.
+- **Smallest action:** source/history review of existing initial-path selection,
+  attachment-demand/wake and native writer/OriginalData admission. Use existing
+  trace to bound timing; do not assume a missing alternative was already ready.
+  No runtime change, new experiment, generic controller audit or capacity hint.
+- **Falsifier/stop:** an explicit pending-alternative/no-ready-path state would
+  refute a claim that the rank ignored an available QUIC output. If existing
+  evidence cannot distinguish it, record that exact missing fact before any
+  further observation. Do not pretend source permission proves the dynamic
+  membership history or change a credit/quantum to satisfy the recorded run.
+- **Priority/tradeoff:** the two winning-copy sequences establish a real
+  conditional recovery-service limit, but not dominance of the whole20s stall.
+  Raising repair volume now could mask the upstream placement and restore old
+  duplication/queue-delay failures. A repair-placement frontier is only a
+  conditional design option: each adjacent range must be aged/ranked/admitted,
+  already accepted repair-ahead work scored exactly once, and earliest stalled
+  copy service preserved. Neither DataACK authority nor live OriginalData
+  ownership may be replaced by speculative copy coverage. No such correction
+  is accepted or implemented in this transaction.
 
 Its parent `011aee9` (21 focused checks GREEN; ordinary performance unresolved)
 is frozen at
@@ -656,8 +722,9 @@ remain outside this batch unless evidence and user scope justify inclusion.
 
 - The TCP and mixed ordinary comparisons remain unaccepted. Existing-event
   traces are complete and owned products/probes are stopped, origins retained.
-  The current action is the explicitly declared exact live-owner frontier
-  repair service-chain observation above, not matrix expansion or a controller.
+  The repair service-chain capture is complete. Current action is the bounded
+  initial irreversible placement source/history question above, not a larger
+  repair implementation, matrix expansion or new controller.
   Sampler overlay stays shelved/unaccepted; original RED archive is retained.
 - Use the owned Docker topology only, not host shaping or sudo. Preserve exact
   executable/profile, phase clocks, full series and adverse results. Do not

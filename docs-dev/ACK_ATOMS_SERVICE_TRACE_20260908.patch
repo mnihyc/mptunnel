@@ -1,0 +1,274 @@
+diff --git a/src/runtime/path/quic/repair.rs b/src/runtime/path/quic/repair.rs
+index 200cdc2..9d74e3b 100644
+--- a/src/runtime/path/quic/repair.rs
++++ b/src/runtime/path/quic/repair.rs
+@@ -5,6 +5,8 @@ use super::io::{
+     udp_path_write_frame,
+ };
+ use super::repair_binding::RepairBindings;
++#[cfg(feature = "lab-diagnostics")]
++use crate::lab_diagnostics::lab_diagnostic;
+ use crate::protocol::codec::CodecLimits;
+ use crate::protocol::{Frame, StreamId};
+ use crate::runtime::error::RuntimeError;
+@@ -14,6 +16,22 @@ use std::future::Future;
+ pub(super) type RepairStreams = (UdpPathSendStream, UdpPathRecvStream);
+ pub(super) type QuicRepairBindings = RepairBindings<RepairStreams>;
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn repair_data_extent(frame: &Frame) -> Option<(u64, u64, u64)> {
++    match frame {
++        Frame::StreamData {
++            stream_id,
++            offset,
++            payload,
++        } => Some((
++            stream_id.0,
++            *offset,
++            offset.saturating_add(payload.len() as u64),
++        )),
++        _ => None,
++    }
++}
++
+ pub(super) async fn run_repair_channel<F, R>(
+     mut send: UdpPathSendStream,
+     recv: UdpPathRecvStream,
+@@ -35,7 +53,35 @@ where
+                 // The parent owns and cancels this future when that completes.
+                 return std::future::pending::<Result<(), RuntimeError>>().await;
+             };
++            #[cfg(feature = "lab-diagnostics")]
++            let repair_extent = repair_data_extent(work.frame());
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some((owner, offset, end)) = repair_extent {
++                lab_diagnostic(
++                    "repair_transport",
++                    format_args!(
++                        "phase=write_begin stream_id={} offset={} end={} native_request_stream_id={}",
++                        owner,
++                        offset,
++                        end,
++                        send.request_stream_id(),
++                    ),
++                );
++            }
+             udp_path_write_frame(&mut send, work.frame(), limits).await?;
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some((owner, offset, end)) = repair_extent {
++                lab_diagnostic(
++                    "repair_transport",
++                    format_args!(
++                        "phase=write_end stream_id={} offset={} end={} native_request_stream_id={}",
++                        owner,
++                        offset,
++                        end,
++                        send.request_stream_id(),
++                    ),
++                );
++            }
+             // `work` releases its exact queue/writer byte charge here, or on
+             // cancellation/error. Native receipt does not settle Product debt.
+         }
+@@ -76,6 +122,28 @@ where
+                 ));
+             }
+         }
++        #[cfg(feature = "lab-diagnostics")]
++        let repair_extent = repair_data_extent(&frame);
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some((owner, offset, end)) = repair_extent {
++            lab_diagnostic(
++                "repair_transport",
++                format_args!(
++                    "phase=decoded stream_id={} offset={} end={}",
++                    owner, offset, end,
++                ),
++            );
++        }
+         route(frame).await?;
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some((owner, offset, end)) = repair_extent {
++            lab_diagnostic(
++                "repair_transport",
++                format_args!(
++                    "phase=route_done stream_id={} offset={} end={}",
++                    owner, offset, end,
++                ),
++            );
++        }
+     }
+ }
+diff --git a/src/runtime/relay/client.rs b/src/runtime/relay/client.rs
+index 9c37ad6..003ce47 100644
+--- a/src/runtime/relay/client.rs
++++ b/src/runtime/relay/client.rs
+@@ -851,7 +851,7 @@ pub(super) fn apply_client_stream_ack(
+     lab_diagnostic(
+         "stream_ack_received",
+         format_args!(
+-            "stream_id={} complete={} ranges={} largest_end={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={}",
++            "stream_id={} complete={} ranges={} largest_end={} data_ack_frontier_before={} data_ack_frontier_after={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={}",
+             stream_id.0,
+             complete,
+             normalized_ranges.len(),
+@@ -860,6 +860,8 @@ pub(super) fn apply_client_stream_ack(
+                 .map(|range| range.end)
+                 .max()
+                 .unwrap_or(0),
++            previous_ack_frontier,
++            send_stream.data_ack_frontier(),
+             ack.released_bytes,
+             previous_reinjection_bytes,
+             ack.remaining_reinjection_bytes,
+diff --git a/src/runtime/relay/server.rs b/src/runtime/relay/server.rs
+index 9131dbc..a4a28bb 100644
+--- a/src/runtime/relay/server.rs
++++ b/src/runtime/relay/server.rs
+@@ -3308,8 +3308,31 @@ where
+                             )?;
+                             #[cfg(feature = "lab-diagnostics")]
+                             let mux_started = Instant::now();
++                            #[cfg(feature = "lab-diagnostics")]
++                            let repair_frontier_observation = (
++                                recv_stream.next_offset(),
++                                recv_stream.reorder_bytes(),
++                            );
+                             let outcome = recv_stream.receive_data(offset, payload)?;
+                             #[cfg(feature = "lab-diagnostics")]
++                            if repair_frontier_observation.1 > 0
++                                && offset <= repair_frontier_observation.0
++                            {
++                                lab_diagnostic(
++                                    "repair_receive_frontier",
++                                    format_args!(
++                                        "stream_id={} offset={} end={} frontier_before={} frontier_after={} reorder_before={} reorder_after={}",
++                                        stream_id.0,
++                                        offset,
++                                        offset.saturating_add(payload_len as u64),
++                                        repair_frontier_observation.0,
++                                        recv_stream.next_offset(),
++                                        repair_frontier_observation.1,
++                                        recv_stream.reorder_bytes(),
++                                    ),
++                                );
++                            }
++                            #[cfg(feature = "lab-diagnostics")]
+                             lab_perf_record(
+                                 "mux.receive_data",
+                                 mux_started.elapsed(),
+diff --git a/src/runtime/sender/request.rs b/src/runtime/sender/request.rs
+index c770d50..54c69b5 100644
+--- a/src/runtime/sender/request.rs
++++ b/src/runtime/sender/request.rs
+@@ -1262,6 +1262,32 @@ impl RequestSenderService {
+                                     );
+                                     return Err(RequestFrameAdmissionError::ServiceBlocked);
+                                 }
++                                #[cfg(feature = "lab-diagnostics")]
++                                if let Frame::StreamData { offset, payload, .. } = &frame {
++                                    lab_diagnostic(
++                                        "repair_service",
++                                        format_args!(
++                                            "phase=apply_authorized stream_id={} target_underlay={:?} target_index={} target_path_instance_id={} target_attachment_id={} offset={} end={} cause={:?} payload_bytes={} service_bytes={} queued_copy_bytes={} accepted_copy_bytes={} snapshot_product_limit_bytes={} snapshot_original_bytes={} snapshot_queue_bytes={} snapshot_native_flight_bytes={} snapshot_native_limit_bytes={}",
++                                            self.multipath.stream_id().0,
++                                            instance.key.underlay,
++                                            instance.key.index,
++                                            instance.path_instance_id.as_u64(),
++                                            instance.attachment_id,
++                                            offset,
++                                            offset.saturating_add(payload.len() as u64),
++                                            cause,
++                                            payload_bytes,
++                                            exact_service,
++                                            queued_reinjection,
++                                            accepted_reinjection,
++                                            snapshot.data_level_limit_bytes,
++                                            snapshot.data_level_bytes_in_flight,
++                                            snapshot.queue_bytes,
++                                            snapshot.bytes_in_flight,
++                                            snapshot.carrier_inflight_limit_bytes,
++                                        ),
++                                    );
++                                }
+                             }
+                             if bulk_original_apply {
+                                 let authority = self
+@@ -1350,6 +1376,28 @@ impl RequestSenderService {
+             };
+             match publish_result {
+                 Ok((payload_bytes, accepted_copy_deadline)) => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    if cause.is_reinjection()
++                        && let Frame::StreamData {
++                            offset, payload, ..
++                        } = &frame
++                    {
++                        lab_diagnostic(
++                            "repair_service",
++                            format_args!(
++                                "phase=apply_committed stream_id={} target_underlay={:?} target_index={} target_path_instance_id={} target_attachment_id={} offset={} end={} cause={:?} payload_bytes={}",
++                                self.multipath.stream_id().0,
++                                instance.key.underlay,
++                                instance.key.index,
++                                instance.path_instance_id.as_u64(),
++                                instance.attachment_id,
++                                offset,
++                                offset.saturating_add(payload.len() as u64),
++                                cause,
++                                payload_bytes,
++                            ),
++                        );
++                    }
+                     return Ok((instance, payload_bytes, accepted_copy_deadline));
+                 }
+                 Err(
+@@ -1834,6 +1882,48 @@ impl RequestSenderService {
+             return RequestCompletionTailEnqueueOutcome::default();
+         };
+         let frames = preserve_reinjection_frontier_quantum(frames, frontier_limit);
++        #[cfg(feature = "lab-diagnostics")]
++        {
++            let owner = uniform_frontier.owners[0];
++            let target_instance = target.identity.instance;
++            lab_diagnostic(
++                "repair_service",
++                format_args!(
++                    "phase=retained_selected stream_id={} owner_underlay={:?} owner_index={} owner_path_instance_id={} owner_attachment_id={} target_underlay={:?} target_index={} target_path_instance_id={} target_attachment_id={} offset={} end={} scoring_end={} uniform_end={} horizon={} selection_quantum_bytes={} target_quantum_bytes={} target_service_limit_bytes={} frontier_limit_bytes={} service_limit_bytes={} applied_extent_bytes={} owner_latest_assignment_age_us={:?} owner_deadline_overdue_us={}",
++                    self.multipath.stream_id().0,
++                    owner.key.underlay,
++                    owner.key.index,
++                    owner.path_instance_id.as_u64(),
++                    owner.attachment_id,
++                    target_instance.key.underlay,
++                    target_instance.key.index,
++                    target_instance.path_instance_id.as_u64(),
++                    target_instance.attachment_id,
++                    apply_range.start,
++                    apply_range.end,
++                    scoring_range.end,
++                    uniform_frontier.range.end,
++                    horizon,
++                    selection_reinjection_quantum,
++                    target_reinjection_quantum,
++                    target.service_limit_bytes,
++                    frontier_limit,
++                    service_limit,
++                    applied_extent,
++                    scoring_frontier
++                        .owner_assignments
++                        .first()
++                        .map(|(_, assigned_at)| {
++                            observed_at
++                                .saturating_duration_since(*assigned_at)
++                                .as_micros()
++                        }),
++                    observed_at
++                        .saturating_duration_since(owner_recovery_deadline)
++                        .as_micros(),
++                ),
++            );
++        }
+         let cause = RelaySendCause::CompletionTailReinjection(target.identity);
+         let mut queued = false;
+         let mut accepted_recovery_interval = None::<Duration>;

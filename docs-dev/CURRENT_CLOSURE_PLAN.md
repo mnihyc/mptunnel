@@ -33,7 +33,9 @@ It confirms509,804,544bytes,86.217Mbps/3.806s max gap. PTO counts advance at
 Thus this realization has ordinary exponential PTO recovery. A1.147s learned
 excess remains afterwards, but does not alone explain the earlier14s pause.
 See NATIVE_ACK_TIMER_OBSERVATION_20260907.json and
-UPLOAD_RECOVERY_GATE_ATTRIBUTION. The earlier freeze remains unattributed.
+UPLOAD_RECOVERY_GATE_ATTRIBUTION. The earlier freeze remains unattributed:
+the published counter counts live-packet ACK callbacks, not all late ACKs of
+already-lost originals. Do not equate its plateau with no native ACK reception.
 
 The post-requalification Product gate is also identified:12.26MB old OriginalData
 debt exceeds the reset512KiB acquisition allowance. This follows the current

@@ -38,14 +38,24 @@ credit. It is a real service restriction, but changing it is NOT yet justified:
 extra new bytes can merely queue behind the same old ordered prefix. Any
 candidate must demonstrate earlier ordered delivery, not just more enqueue.
 
-## Dominant native no-progress interval
+## Native live-packet ACK counter pause; attribution remains open
 
 In that same model trace, native acknowledged bytes remain exactly415,820,809
 from roughly31.1 s through44.1 s, while the deliberate UDP outage ends at33 s.
-Native flight is about4.16 MB. RTT/variation are stable at50.112/8.378 ms,
-despite the no-progress interval. ACK progress resumes by45.1 s. This precedes
-the later Product acquisition restriction and accounts for the longer stall;
-changing `E` cannot itself generate missing native acknowledgements.
+Published native flight is about4.16 MB. RTT/variation are stable at
+50.112/8.378 ms. This counter advances again by45.1 s, before the later Product
+acquisition restriction. It does NOT by itself establish absence of every
+native ACK or prove the cause of the whole application stall.
+
+Source audit at01:24UTC narrows its authority: InstrumentedController adds
+these bytes in `on_ack` / `on_ack_with_packet_state`. A late ACK of an already
+declared-lost retained original instead calls `on_lost_packets_retired`, which
+does not increment that telemetry counter. A published snapshot also needs
+its own sampling clock checked. Thus the earlier wording that this counter
+freeze "accounts for the longer stall" was stronger than the evidence. Native
+packet/timer progress and exact Product frontiers must be paired before that
+causal conclusion. This is an interpretation correction, not authorization to
+inject fake ACK callbacks, modify the counter or change Product admission.
 
 The final apply trace records only one post33s bulk-authority failure and nine
 exact-eligibility changes; it does not support a hot optimistic-apply retry

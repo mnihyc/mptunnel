@@ -691,3 +691,256 @@ after the pending probe has expired. Probe5 later succeeds within120ms.
 Thus local probe FIFO starvation is disproved for these probes; the actor
 delay is real in this instrumented execution but does not justify loosening
 probe epochs. Its ordinary magnitude and needed correction remain separate.
+
+## ACK-atom ordinary pair: practical gate failed, 2026-09-08
+
+Raw evidence: [ACK_ATOMS_ORDINARY_20260908.raw.tar.gz](ACK_ATOMS_ORDINARY_20260908.raw.tar.gz).
+The complete result directories are
+`./.tmp/reflection/results/mixed-combined-up-ack-atoms-{control,candidate}-0908/`.
+Control is `011aee9`, frozen `retained-frontier-20260908/mptunnel`; candidate
+is `765683b`, frozen `ack-atoms-20260908/mptunnel`. Both endpoints change
+together. The candidate has 66 focused GREEN checks, including exact partial-
+copy attribution, epoch fences and one actual fixed-output rate observation.
+That is a correctness milestone, not acceptance of this ordinary result.
+Sampler and diagnostic overlays remain absent. No build overlaps the pair.
+
+The existing `mixed combined up` routed/mirrored profile and probe are
+unchanged: three TCP carriers plus QUIC, 40-second planned load, 500 Mbps
+outside upload QoS, upload delay/jitter 70/20 ms, return 30/5 ms, existing
+five-second random-loss epochs, upload QoS 10 Mbps at 15--25 seconds and UDP
+blackhole at 30--33 seconds. Diagnostics/native tracing are off. Actual
+collector transitions are QoS start/end 15.001666/25.002703 s for control,
+15.004325/25.005375 s for candidate; blackhole start/end are
+30.003243/33.152991 and 30.005922/33.095883 s. These are different unseeded
+netem realizations, not packet-identical replay or synchronized probe clocks.
+
+| Probe observation | Control | Candidate |
+| --- | ---: | ---: |
+| Complete / exact accounting / ACK accounting valid | true / true / true | true / true / true |
+| Complete / failed streams; probe errors | 1 / 0; none | 1 / 0; none |
+| Confirmed = locally accepted bytes | 482,017,280 B | 262,209,536 B |
+| Probe elapsed | 60.324411 s | 80.523832 s |
+| Whole-transfer confirmed goodput | 63.923 Mbps | 26.050 Mbps |
+| First sink confirmation | 0.454780 s | 0.517644 s |
+| Maximum confirmation-progress gap | 6.000557 s | 6.035895 s |
+| First local write | 0.124358 s | 0.124178 s |
+| Maximum local-write gap | 7.268060 s | 8.080886 s |
+| Completion beyond planned 40-second load | 20.324411 s | 40.523832 s |
+
+Both probes report `status=ok`, `upload_accounting_source=target_sink_ack`,
+and equality of `bytes`, `target_confirmed_bytes` and `local_accepted_bytes`.
+Candidate completes 219,807,744 fewer bytes and takes 20.199421 seconds longer.
+This pair supplies no practical-benefit pass. It does not establish that the
+atom correction caused the entire difference under independent losses.
+The post-load row is elapsed minus the planned load duration, not an exact
+last-write-to-final-confirmation measurement; actual final local-write time
+is not emitted. Runner elapsed and management collection have other origins.
+
+### Full confirmation series and phase context
+
+The following are all `interval_goodput_raw_mbps` entries, in their original
+one-second probe bins. No first/last-bin trimming is applied. They are rounded
+confirmation-progress rates, not native link rates or exact per-byte arrival
+timestamps. A buffered release can exceed 500 Mbps in a confirmation bin:
+control has 543.642 Mbps in bin 5 and candidate 540.904 Mbps in bin 16.
+
+```text
+Control
+0–9:   1.145, 7.767, 52.955, 5.767, 4.719, 543.642, 125.497, 95.849, 143.655, 132.409
+10–19: 64.347, 135.599, 46.329, 253.851, 214.831, 0.234, 0.0, 0.0, 0.0, 0.0
+20–29: 0.0, 0.174, 161.961, 0.0, 0.0, 19.879, 39.75, 286.498, 286.025, 8.293
+30–39: 64.82, 0.0, 0.0, 0.0, 73.784, 46.47, 0.0, 229.734, 36.272, 88.944
+40–49: 4.54, 0.311, 3.146, 11.534, 5.767, 7.34, 4.719, 5.767, 4.194, 4.719
+50–59: 4.194, 3.146, 3.146, 3.146, 3.146, 3.67, 19.687, 12.915, 41.769, 516.317
+60:    21.769
+
+Candidate
+0–9:   0.096, 14.584, 12.583, 8.913, 7.34, 6.816, 3.67, 3.67, 3.146, 4.719
+10–19: 2.855, 4.057, 3.574, 8.389, 4.407, 4.098, 540.904, 0.0, 0.0, 0.0
+20–29: 0.0, 0.0, 1.189, 0.0, 0.0, 59.673, 4.386, 205.189, 118.489, 92.415
+30–39: 71.739, 0.0, 0.0, 36.648, 164.53, 1.905, 1.573, 3.101, 0.0, 0.0
+40–49: 90.274, 0.0, 24.974, 0.0, 79.884, 127.875, 202.586, 0.911, 16.04, 2.385
+50–59: 1.809, 12.271, 1.337, 2.954, 2.172, 2.525, 1.573, 2.717, 2.525, 2.427
+60–69: 5.65, 3.457, 2.621, 1.573, 5.243, 3.146, 3.146, 4.29, 4.194, 3.146
+70–79: 2.525, 24.213, 2.097, 3.05, 2.193, 3.67, 1.573, 4.194, 4.623, 2.31
+80:    38.866
+```
+
+Approximate confirmed MB, summed from these rounded bins rather than invented
+exact byte events:
+
+| Probe-bin interval | Control | Candidate |
+| --- | ---: | ---: |
+| [0,15), before nominal QoS | 228.545250 | 11.102375 |
+| [15,25), nominal QoS | 20.296125 | 68.273875 |
+| [25,30) | 80.055625 | 60.019000 |
+| [30,33), nominal UDP blackout | 8.102500 | 8.967375 |
+| [33,40) | 59.400500 | 25.969625 |
+| [40,end), different completion windows | 85.617750 | 87.877375 |
+
+The candidate's major initial deficit precedes QoS. Its larger QoS-bin total
+is dominated by delayed confirmation in bin 16, not evidence of better
+10-Mbps service. Bins use probe time; actual shaping uses collector time, so
+this grouping is phase context, not exact boundary attribution.
+
+### Early ordered-work bottleneck and exact carrier identities
+
+Management `client.traffic.reliable.io.to_peer_bytes` counts local/source
+socket reads; server `from_peer_bytes` counts successful ordered target-socket
+writes. Neither is the upload probe's returned sink confirmation. Product
+`data_level_bytes_in_flight` is outstanding OriginalData ACK debt, not exact
+undelivered target bytes, and includes feedback lag. These counters must not
+be relabelled native transmission, receiver reassembly or copy counts.
+
+Candidate session `5179385588750941694` keeps stable physical instances:
+TCP wire path 1 / instance 2 / ordinal 1 is local port 44142; TCP wire path 2 /
+instance 4 / ordinal 2 is port 44144; TCP wire path 0 / instance 1 / ordinal 3
+is port 44138; QUIC wire path 0 / instance 3. Port joins are independently
+checked at 17.004532 s, where the three live `ss bytes_acked` values exactly
+match management: 12,207,915, 1,241,118 and 875,354 respectively. No observed
+replacement changes those identities. Wire path IDs are not configured indices.
+
+Candidate early samples, with time rounded to six decimals from `elapsed`:
+
+| Sample s | Source read B | Target written B | TCP path 1/instance 2 debt B | QUIC path 0/instance 3 debt B |
+| --- | ---: | ---: | ---: | ---: |
+| 4.003123 | 71,630,795 | 4,587,467 | 7,667,712 | 313,080 |
+| 6.003367 | 73,400,267 | 6,291,403 | 5,898,240 | 172,608 |
+| 10.003789 | 75,249,875 | 8,141,011 | 4,063,232 | 145,672 |
+| 14.004213 | 77,594,571 | 10,485,707 | 1,703,936 | 509,688 |
+| 15.004325 | 78,381,003 | 11,337,675 | 917,504 | 182,008 |
+| 16.004423 | 78,839,755 | 11,861,963 | 458,752 | 131,072 |
+| 17.004532 | 146,336,299 | 79,227,435 | 0 | 67,108,864 |
+
+The other two TCP instances have zero OriginalData debt in every 4--17 s
+sample. Between 4.003123 and 15.004325 s, source and target each advance
+6,750,208 B while this TCP owner's debt falls by exactly 6,750,208 B. Across
+4--14 s the source-target gap is 66,977,792--67,108,864 B, nearly the 64-MiB
+Product window. This supports an already-assigned slow ordering domain
+restricting useful service and hence source consumption, not lack of source
+demand. It is not an exact missing-range or winning-copy identification.
+
+QUIC is not continuously idle in this occurrence: its sampled OriginalData
+debt varies between 38,936 and 509,688 B across 4--14 s, native cumulative ACK
+bytes advance 60,169,198 -> 68,995,285 between 4.003123 and 15.004325 s,
+and Product samples refresh, including `data_sample_bytes=50936` at 10.003789 s.
+Native ACK progress alone includes control/copy work; varying original debt
+and Product evidence separately establish that some original work continues.
+Management's `state=active` / `usage=available` is not request-local
+qualification, so brief stale/requalification intervals are not excluded.
+The previous trace's continuous unused-QUIC explanation cannot simply be
+carried into this different realization.
+
+Live TCP port 44142 also progresses: at the 4/15 s endpoints, `bytes_acked`
+4,848,448 -> 11,449,668, `bytes_sent` 5,728,041 -> 13,525,501, and
+`bytes_retrans` 659,498 -> 1,776,194. Send-Q declines 2,477,744 -> 757,989 B;
+`notsent` 2,257,648 -> 458,349 B. This is a native backlog with service,
+not an entirely frozen native ACK clock. Router upload bytes advance
+86,161,330 -> 103,061,381 B during the same sampled interval; initial/final
+backlogs are 165,097/299,319 B, with the latter sample just after QoS begins.
+The exact endpoint management Unix times are client/server
+1788806813597/1788806813602 and 1788806824598/1788806824601.
+
+Control has a similar early shape but exits it sooner: at 4.000467 s its
+target is 8,585,216 B, QUIC debt is zero and TCP wire path 1 / instance 4
+retains 3,670,016 B. By 6.000664 s that TCP debt is zero, target is
+78,727,200 B and QUIC debt is 64 MiB. Candidate's corresponding large
+ordered release occurs around 16--17 s. This is a practical timing contrast,
+not proof of the same exact prefix or a controlled native loss realization.
+
+### Late drain: forward work and feedback are distinct
+
+Candidate local-source consumption first reaches its final 262,209,536 B at
+47.123459 s, after the nominal load ends; at that sample target writes are
+240,132,971 B. Control first reaches its final source total at 59.203944 s.
+Already locally accepted bytes can remain upstream of the source-read
+counter, so these times are not the probe's final local writes.
+
+| Candidate sample s | Source read B | Target written B | Total OriginalData ACK debt B |
+| --- | ---: | ---: | ---: |
+| 40.122802 | 244,938,443 | 216,728,427 | 53,409,184 |
+| 42.122965 | 247,822,027 | 239,989,899 | 43,489,248 |
+| 46.123365 | 255,686,347 | 239,989,899 | 12,669,792 |
+| 47.123459 | 262,209,536 | 240,132,971 | 17,560,992 |
+| 50.123741 | 262,209,536 | 242,492,211 | 11,110,709 |
+| 51.123845 | 262,209,536 | 242,793,291 | 10,771,904 |
+| 60.124807 | 262,209,536 | 246,489,571 | 8,344,808 |
+| 70.125781 | 262,209,536 | 251,164,363 | 3,786,488 |
+| 80.126849 | 262,209,536 | 257,353,947 | 50,936 |
+
+At 42.122965--46.123365 s the target-write counter is flat for the sampled
+4.000401-second interval. Product ACK debt nevertheless releases 30,819,456 B;
+QUIC-owned debt falls 27,816,800 -> 4,402,912 B while QUIC native ACK advances
+only 3,882 B (227,324,506 -> 227,328,388). The Product debt is larger than
+source-minus-target at the first endpoint, so it cannot all represent data
+not yet written to the target. This exposes feedback-debt/ordered-service
+separation, not a direct measurement of which actor or return queue delayed
+an exact ACK. It is also not enough to locate the probe's maximum gap.
+
+From 51.123845 through the final 80.126849 s sample, every outstanding
+OriginalData byte belongs to TCP wire path 2 / instance 4. The other TCP
+instances and QUIC have zero original debt throughout those samples.
+All three native TCP sockets still carry/service work; their 50/80 s values:
+
+| Candidate socket (wire path / instance) | Send-Q B, 50 -> 80 s | `bytes_acked`, 50 -> 80 s |
+| --- | ---: | ---: |
+| 44142 (1 / 2) | 3,208,972 -> 27,934 | 22,522,983 -> 28,011,091 |
+| 44144 (2 / 4) | 2,439,754 -> 5,540 | 6,659,100 -> 17,749,812 |
+| 44138 (0 / 1) | 2,767,204 -> 0 | 12,922,366 -> 19,908,222 |
+
+QUIC native ACK also advances 237,391,639 -> 240,667,604 B over 50--80 s.
+Router upload advances 350,786,825 -> 380,765,453 B, while its class remains
+500 Mbps and backlog falls 101,095 -> 5,478 B. Neither native queue bytes
+nor this wire delta can be assigned to a particular original/copy range.
+At the last management sample (client/server Unix
+1788806889598/1788806889601), target is still 4,855,589 B short of the eventual
+confirmed total, with 50,936 B of Product ACK debt. No zero-debt/final-target
+management sample was captured; the later exact probe completion establishes
+settlement without locating the last native, ordered-output or confirmation
+boundary. Do not assume that most of this gap is a target-write hold merely
+because the retained ACK debt is small: a small missing prefix can hold a
+larger already-received suffix.
+
+### Wire and sampled process cost
+
+Control has 61 samples at 0.000053831--60.204034831 s; candidate has 81 at
+0.000053740--80.126849414 s. Both have no management collection errors and
+one continuous process identity per endpoint. Router class counters are
+monotone. The first two JSON lines in `router` are eth0 return and eth1 upload
+class `1:10`; nested qdisc bytes are not added to those totals.
+
+| Sampled cost | Control | Candidate |
+| --- | ---: | ---: |
+| Upload class bytes first -> last | 989,606 -> 659,070,546 | 555,059 -> 380,765,453 |
+| Upload class-byte delta | 658,080,940 B | 380,210,394 B |
+| Return class bytes first -> last | 42,995 -> 25,169,691 | 34,908 -> 13,237,395 |
+| Return class-byte delta | 25,126,696 B | 13,202,487 B |
+| Upload / return class-drop delta | 9,705 / 1,878 | 4,979 / 1,180 |
+| Client RSS first / peak / final | 57,848 / 432,400 / 303,812 KiB | 54,224 / 279,328 / 250,868 KiB |
+| Server RSS first / peak / final | 30,568 / 142,248 / 132,548 KiB | 30,580 / 131,460 / 128,984 KiB |
+| Final lifetime-average CPU, client / server | 45.1% / 15.0% | 28.5% / 6.7% |
+
+These are unequal work volumes and unequal observation windows. Less wire,
+CPU or RSS is not an efficiency win; more elapsed time with less work is
+not hidden by those smaller totals. Class bytes include framing, control,
+native retransmissions and Product copies, not repair-only overhead. RSS is
+one-second sampled, CPU is `ps` process-lifetime average rather than interval
+utilization, and there is no post-quiet reclamation capture or loaded-latency
+probe. Client logs are empty; the candidate server's sole warning is a remote
+`H3_NO_ERROR` close at 18:48:10.788 UTC, after the final management sample,
+not evidence of an early hard carrier failure.
+
+**Disposition and next causal discriminator:** practical promotion stops;
+the 66-check component result remains valid, but neither the earlier failed
+TCP gate nor mixed timing/experience gates are waived. No ordinary rerun.
+The highest-impact remaining question is the exact slow TCP-owned frontier
+during candidate 4--15 s: is a covering QUIC copy excluded by current
+ownership/qualification/admission, or published but not delivered in time?
+The existing ordinary data rules out total source starvation, continuous
+QUIC non-use and a total native ACK freeze; it lacks exact original/copy
+intervals, request-local qualification transitions and receiver frontier
+receipt times. A single frontier-scoped join of those existing event families
+would discriminate the branches, with already-receipted frontier evidence
+falsifying a forward-only explanation. This states the missing observation;
+it does not authorize a new run, remove a protection, tune a deadline, or
+bundle the separately observed probe-mailbox delay into the atom correction.

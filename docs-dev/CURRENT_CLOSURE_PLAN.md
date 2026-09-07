@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 02:24 +08:00. Authoritative source is `./`. **No release pass.**
+Updated: 2026-09-08 03:02 +08:00. Authoritative source is `./`. **No release pass.**
 This is the existing REVIEW_AND_PRACTICAL_ACCEPTANCE batch, not a new inventory.
 Superseded checkpoints are preserved in
 [the history](CLOSURE_PLAN_HISTORY_THROUGH_20260907.md) and their linked evidence.
@@ -20,8 +20,60 @@ post-load drain. Complete series and limitations are in
 LATE_STARTUP_SCOPE_ORDINARY_20260907. These snapshots are not a causal A/B of
 the rare attachment refusal branch and are not fluent-experience acceptance.
 
-Current isolated model checkpoint is `011aee9` (21 focused checks GREEN;
-ordinary performance pending), frozen at
+Current isolated model checkpoint is `765683b`, exact unique ACK evidence
+beside partial copies (66 focused checks GREEN; ordinary gate failed).
+Frozen executable `./.tmp/reflection/bin/ack-atoms-20260908/mptunnel`; application
+build1m31s. The declared ordinary mixed upload pair is complete: control63.923
+versus candidate26.050Mbps, both exact completion, maximum confirmation gap
+6.000557 versus6.035895s. Candidate completes less work in more time. Promotion
+is stopped; an unseeded pair is not alone a causal regression proof. Full raw
+series, cost and stage evidence are in REQUEST_COHORT_ORDINARY_20260907 and
+ACK_ATOMS_ORDINARY_20260908.raw.tar.gz. No sampler overlay is included.
+
+### Next transaction: exact live-owner frontier repair service chain
+
+- **Observed failure:** in the ordinary candidate4.003--15.004s, source and
+  ordered target each advance6,750,208B while TCPpath1/instance2 OriginalData
+  debt falls by exactly that amount. Their separation remains64MiB. QUIC
+  native ACKs, small OriginalData placements and unique Product receipts
+  continue. This is not continuous QUIC withdrawal or total native silence.
+- **Question/competing causes:** does retained recovery admit one14600B prefix
+  then wait for its ACK before admitting a disjoint next prefix, leaving fast
+  target service unused; or do admitted copies actually wait in native/peer
+  service? Original TCP or later actor service may instead close each hole.
+  A low displayed Product rate does not directly shrink the Native-first
+  repair allowance; exact Apply snapshot/debt must establish target authority.
+- **Origin/model:** T06 fixed a proven112.6-times score/Apply suffix expansion.
+  Preserve that range identity and duplicate ownership. Its live-owner hedge
+  quantum does not by itself prove sustained recovery service. If every next
+  disjoint quantum Q waits for feedback T while originals supply no frontier,
+  conditional service is8Q/T (14600B/100ms is1.168Mbps), even with megabytes of
+  native headroom. The ordinary snapshot does not yet prove this premise.
+- **Smallest next action:** one temporary opt-in diagnostic overlay, not a
+  runtime policy change. Record selected owner/frontier/Q and target service L,
+  exact successful Apply service/debt, QUIC repair-frame writer begin/end and
+  receiver decode/route completion, and ACK application frontier. Reuse existing
+  original/copy decisions and ordered receiver events. Only sender/request,
+  QUIC repair channel and request ACK observer need extra fields; no bulk
+  ordinary-frame transport trace, queues, timers, gains or new state.
+  Compile once, freeze, archive/reverse overlay, then one unchanged current
+  candidate mixed combined upload capture, label ack-atoms-service-diag-0908.
+  No simultaneous build/load, new harness or automatic trace repetition.
+- **Falsifiers/stop:** correlate at least two successive exact frontier copies.
+  Prompt peer copy receipt and positive service authority, followed by the
+  next disjoint copy only after previous ACK/frontier advancement, supports
+  stop-and-wait binding. Late peer receipt falsifies an admission-only cause;
+  progress supplied by another original or lacking target authority prevents
+  claiming that ceiling. Keep role/instance/clock semantics and diagnostic
+  perturbation explicit. If insufficient, retain the boundary, not a selected
+  rerun. No quantum increase, timer change or unscored suffix restoration.
+- **Gate/disposition:** exact attribution precedes any revised recovery model,
+  RED and implementation. Existing byte-correct checkpoint remains isolated,
+  not practically promoted. Ordinary first/gap/drain/cost plus global gates
+  remain mandatory; this diagnostic cannot supply performance acceptance.
+
+Its parent `011aee9` (21 focused checks GREEN; ordinary performance unresolved)
+is frozen at
 `./.tmp/reflection/bin/retained-frontier-20260908/mptunnel`. Application build
 finished1m34s. The ordinary TCP pair and subsequent range trace are complete;
 practical acceptance remains withheld. The next declared discriminator is below.
@@ -604,8 +656,8 @@ remain outside this batch unless evidence and user scope justify inclusion.
 
 - The TCP and mixed ordinary comparisons remain unaccepted. Existing-event
   traces are complete and owned products/probes are stopped, origins retained.
-  The current action is the explicitly declared request requalification timing
-  observation overlay/capture above, not matrix expansion or a new controller.
+  The current action is the explicitly declared exact live-owner frontier
+  repair service-chain observation above, not matrix expansion or a controller.
   Sampler overlay stays shelved/unaccepted; original RED archive is retained.
 - Use the owned Docker topology only, not host shaping or sudo. Preserve exact
   executable/profile, phase clocks, full series and adverse results. Do not
@@ -614,5 +666,5 @@ remain outside this batch unless evidence and user scope justify inclusion.
   LIVE_OWNER_FRONTIER_WORK_BOUND.md untouched. No rejected runtime overlay is
   active. Preserve useful temporary evidence before scoped cleanup.
 - Telegram milestones/blockers are authorized at intervals of at least one
-  hour; last milestone sent 2026-09-07 17:44 UTC. No release gate currently permits a
+  hour; last milestone sent 2026-09-07 18:49 UTC. No release gate currently permits a
   push/release. Resume this exact priority after compaction.

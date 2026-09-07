@@ -114,3 +114,40 @@ The RFC clarifies the distinction between arbitration and record boundaries.
 Strict Clippy initially rejected a redundant boolean expression; simplifying
 that expression changes no predicate. Queue controls and strict checks rerun
 before the ordinary optimized comparison. No source commit or acceptance yet.
+
+## First ordinary comparison — 23:47 UTC
+
+Strict Clippy and all 26 queue controls pass. The optimized build takes 1m03s;
+no traffic overlaps it. The unchanged 500/10 case with ready-feedback batching
+gives 313.253 Mbps, 0.524 s maximum read gap and 564 ms echo p95; 49 attempts
+succeed without a failure. The return cut still carries 29.833 MB. The earlier
+relative-only ordinary case gives 174.755 Mbps / 1.666 s / 1,335 ms, but its
+diagnostic runs vary substantially. One matched ordinary control/candidate
+repeat is next. This is not a competitive gate or proof that all feedback cost
+is fixed; raw and QUIC-only remain about 444 and 432 Mbps with 0.10 s gaps.
+The current candidate changes neither logical feedback cadence nor fanout.
+
+## Decision — 23:53 UTC: remove the packetization candidate
+
+The matched ordinary repeat gives relative-only 291.867 Mbps / 0.879 s gap /
+876 ms echo p95 versus batched 301.671 Mbps / 1.001 s / 874 ms. Both make 42
+successful echo attempts. The earlier large apparent gain does not repeat;
+the repeat is only 3.4% in mean with essentially unchanged p95 and a longer
+worst gap. The return queue also grows to 3.78 MB in the batching repeat.
+Full series are FEEDBACK_PACKETIZATION_COMPARISON_20260906.json.
+
+This is real protected-record overhead but not an accepted practical timing
+fix. Remove the ready-feedback queue head, both writer integrations, associated
+tests, helper export and proposed RFC paragraph. Checks confirm no batching
+symbols remain and the prior held queue/mailbox/repair diffs are unchanged.
+The composed experiment diff and frozen executable remain under .tmp/reflection;
+the composed diff includes older held work and is NOT a standalone patch.
+Do not enlarge a batch or add a timer to make this experiment pass.
+
+The separate lossless ACK encoding candidate remains uncommitted. Its direct
+return-cut improvement is substantial but its other affected clean/adverse
+controls still decide component acceptance. This failed packetization trial
+does not establish that publication cadence or fanout should change, and it
+does not disprove the independently captured slow-original ordering problem.
+After these bounded encoding controls, resume that existing allocation owner;
+no further feedback-policy redesign follows from record counts alone.

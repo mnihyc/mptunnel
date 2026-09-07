@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-06 23:37 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 00:07 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -14,15 +14,24 @@ encoding trace proves relative encoding is used; remaining tiny frames include
 about 175,000 ACKs and 100,000 credit updates. See ACK_RELATIVE_ENCODING and
 FEEDBACK_PACKETIZATION_EVIDENCE for complete records, not just means.
 
-**Next exact transaction:** determine whether the inherited one-frame TCP
-write/flush rule unnecessarily packetizes already-ready feedback separately.
-FEEDBACK_PACKETIZATION_MODEL states the priority, ordering, cancellation and
-bounded-debt proof first. The actual protected server-writer regression is
-running against the unchanged writer before any packetization implementation.
-If proved, batch only ready contiguous ACK/credit heads without waiting,
-dropping snapshots, crossing barriers, changing fanout or adding thresholds.
-Repeat the same ordinary 500/10 case before broader controls. Reject an
-ineffective candidate; do not tune the test or call efficiency a timing pass.
+**Latest disposition:** ready-feedback batching is removed. Its real protected
+record saving and 74 TCP / 26 queue controls did not translate into a repeatable
+timing gain: the matched repeat gives 292 -> 302 Mbps, echo p95 876 -> 874 ms,
+and worst gap 0.879 -> 1.001 s. No larger batch or delayed publication follows.
+Only this candidate's queue head/helper/writer/test/RFC changes were removed;
+the older held stack and separate ACK encoding remain untouched. Full series
+are FEEDBACK_PACKETIZATION_COMPARISON_20260906.json.
+
+**Next exact transaction:** ordinary encoding controls are complete and do NOT
+pass timing non-regression. The mirrored upload repeat gives control81.518Mbps,
+5.629s gap versus candidate44.909Mbps,13.646s gap and26.684s post-load drain.
+Both settle exactly. Compression remains held, not accepted or committed;
+random timing differences do not prove a codec bug. The next diagnostic uses
+existing events to map one upload gap to exact OriginalData and repair copies.
+Then resume the already-demonstrated ordered-allocation/recovery contract. No
+further feedback policy or controller redesign follows merely from counting
+records. Release and global timing remain red. Full new controls are in
+ACK_RELATIVE_CONTROLS_20260906 and ACK_RELATIVE_UPLOAD_CHECK_20260907.
 
 **Global order stays fixed:** mixed feedback/allocation and bidirectional
 startup/recovery; native QUIC/TCP QoS recovery; restart/churn/post-load resource

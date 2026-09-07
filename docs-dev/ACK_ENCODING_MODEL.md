@@ -248,3 +248,58 @@ see FEEDBACK_PACKETIZATION_MODEL. The temporary aggregate trace hook is archived
 under .tmp/reflection and removed from active source. No logical publication,
 fanout, negative authority or controller policy has changed. Source remains
 uncommitted, with all ordinary and diagnostic records preserved separately.
+
+## Affected ordinary controls — 23:59 UTC
+
+The ready-feedback batching trial is removed after its failed timing repeat;
+see FEEDBACK_PACKETIZATION_MODEL. Only the frozen relative encoding candidate
+is used below, without logging or concurrent compilation.
+
+Clean 500/500 Mbps, 100 ms: mixed 399.386 Mbps / echo p95 534 ms / gap 0.303 s;
+QUIC 431.324 / 154 ms / 0.101 s; TCP 392.586 / 1,151 ms / 0.305 s. Mixed and
+QUIC have all 50 successful echoes. TCP has 37 successful attempts because
+serial latency consumes the test time. These do not establish a TCP latency
+improvement; clean controls previously varied substantially.
+
+Combined asymmetric loss/QoS/blackhole mixed download: 71.342 Mbps, 6.673 s
+read gap, 56 successful echo attempts, no failed echo. The gap is at
+18.294--24.967 s, during the 15--25 s QoS, BEFORE the 30--33 s UDP outage.
+At 19--24 s the return queue is only hundreds of bytes, while QUIC's native
+ACKed bytes advance from 218.65 MB to 224.09 MB and Product application bytes
+stay near 217.95 MB. The forward queue holds roughly 2.5--2.9 MB. Thus return
+feedback saturation is not the explanation for this particular residual
+stall. Exact current missing-range carrier attribution is not contained in
+these aggregate counters; prior direct ordered-prefix traces remain the
+relevant independent proof. Do not claim every gap is a TCP hole.
+
+Mirrored mixed upload confirms all 460,849,152 bytes without a reset, at
+65.176 Mbps and 2.487 s worst confirmation gap. It takes 56.567 s including
+16.567 s after the 40 s load. Mean is below the prior 77.747 Mbps control,
+but the maximum confirmation gap is shorter than its 7.949 s. A matched
+control/candidate upload repeat is required before the component decision;
+do not cherry-pick either metric or accept a new regression. Full records are
+ACK_RELATIVE_CONTROLS_20260906.json. Global acceptance remains red.
+
+The dictionary bounds one vector per native ordered direction, not aggregate
+memory for all configured concurrency. It also does not compress the queued
+logical Frame vectors before native encoding. No claim that it fixes the
+uncaptured RAM incident, control-queue retention or whole-process RSS follows.
+
+## Upload check and component disposition — 2026-09-07 00:07 UTC
+
+The ordinary mirrored control/candidate repeat confirms every byte in both
+cases, but timing does not pass. Control: 475,004,928 bytes, 81.518 Mbps,
+5.629 s worst confirmation gap, 46.616 s total. Relative candidate:
+374,341,632 bytes, 44.909 Mbps, 13.646 s gap, 66.684 s total. The load lasts
+40 s, so candidate drain is 26.684 s. Complete records, including all one-second
+observations, are ACK_RELATIVE_UPLOAD_CHECK_20260907.json.
+
+This is not deterministic attribution to the codec: random loss/reordering and
+attachment completion order differ, while decoding preserves every Frame.
+It IS decisive against accepting the composition as timing-nonregressing.
+The codec remains held, uncommitted and excluded from release acceptance.
+Its clean asymmetric-link efficiency is a genuine but insufficient benefit.
+No further encoding or feedback-policy experiment follows before ordered
+allocation/recovery attribution. The rejected ready-feedback batching remains
+removed. An existing-event-only upload trace is the next bounded discriminator;
+its timing numbers will not replace these ordinary observations.

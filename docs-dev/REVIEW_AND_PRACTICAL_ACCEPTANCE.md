@@ -1,6 +1,6 @@
 # Evidence review and practical acceptance
 
-Updated: 2026-09-06 23:44 UTC. Original reviewed production tree: `7189e69`
+Updated: 2026-09-06 23:54 UTC. Original reviewed production tree: `7189e69`
 (wire11); latest correction checkpoint: `b37bacb`. This is a review/experiment
 plan, not a release verdict. Historical SEEN/UNSEEN labels are mapped below;
 an old OPEN label is not a newly found bug.
@@ -15,7 +15,10 @@ TCP rule separately writes/flushes each command. An actual server-session RED
 and protected TLS/Noise byte comparison justify a ready-feedback packetization
 candidate, not a new congestion policy. It preserves every Frame, existing
 fanout, immediate publication, priority barriers and exact write debt. All 74
-TCP controls pass; ordinary timing comparison remains next. See
+TCP controls pass, but the matched ordinary repeat does not establish a useful
+timing gain (292 -> 302 Mbps, p95 876 -> 874 ms, gap 0.879 -> 1.001 s).
+The batching candidate and its RFC paragraph are therefore removed; only the
+separate encoding candidate continues its bounded ordinary controls. See
 FEEDBACK_PACKETIZATION_MODEL and the full-series evidence archives. No held
 candidate is silently accepted and no public README/release claim follows.
 

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 01:20 +08:00. Authoritative source is `./`. **No release pass.**
+Updated: 2026-09-08 01:46 +08:00. Authoritative source is `./`. **No release pass.**
 This is the existing REVIEW_AND_PRACTICAL_ACCEPTANCE batch, not a new inventory.
 Superseded checkpoints are preserved in
 [the history](CLOSURE_PLAN_HISTORY_THROUGH_20260907.md) and their linked evidence.
@@ -11,7 +11,7 @@ transaction and after compaction; the latest explicit transaction is below.
 
 ## Current result and exact next transaction
 
-Current runtime: `11d6f3a`, frozen ordinary executable
+Retained comparison runtime: `11d6f3a`, frozen ordinary executable
 `./.tmp/reflection/bin/late-startup-scope-20260907/mptunnel`.
 Its latest combined mixed download is 85.556 Mbps with a 4.423-second QoS gap
 and one actual echo timeout. Whole-profile mirrored upload confirms every byte
@@ -19,6 +19,85 @@ at 64.602 Mbps, but has a 5.054-second confirmation gap and 19.293-second
 post-load drain. Complete series and limitations are in
 LATE_STARTUP_SCOPE_ORDINARY_20260907. These snapshots are not a causal A/B of
 the rare attachment refusal branch and are not fluent-experience acceptance.
+
+Current isolated model checkpoint is `011aee9` (21 focused checks GREEN;
+ordinary performance pending), frozen at
+`./.tmp/reflection/bin/retained-frontier-20260908/mptunnel`. Application build
+finished1m34s. The ordinary TCP pair and subsequent range trace are complete;
+practical acceptance remains withheld. The next declared discriminator is below.
+
+**Ordinary gate failed/incomplete, 01:26 +08:00:** both cells hit the existing
+observation guard. Control confirmed105,447,159/accepted139,591,680B in85.634515s;
+candidate122,326,512/155,058,176B in85.815888s. Maximum confirmation gaps
+0.743567->4.033013s and local-write gaps2.940043->4.094871s. Neither completes;
+partial byte increase is not accepted performance improvement or a causal
+regression verdict from one random realization. No mixed/QUIC expansion.
+Raw pair archived REQUEST_RETAINED_FRONTIER_ORDINARY_20260908.raw.tar.gz.
+
+**Next exact question, declared01:28 before diagnosis capture:** ordinary
+candidate target writes remain79,691,776B at49.251308--52.251615s while all three
+native TCP sockets receive/ACK bytes, upload wire advances3,471,276B and Product
+flight decreases1,674,736B. Current link is500Mbps, >24s after QoS ends; queued
+router bytes are about0.1MB, not a currently saturated10Mbpsclass. This is a
+sampled ordered-target plateau, not an exact identification of the probe's
+4.033013s gap. Which exact retained prefix/owner blocks progress, and does the
+now-enabled recovery queue and actually publish its covering copy?
+
+Competing causes: retained-frontier selector still has a legitimate or false
+entry/admission block; queued repair waits behind native service; original or
+copy arrives but Product/target service waits afterward. Existing management
+cannot distinguish these range-scoped stages. Falsifiers: an unassigned prefix
+refutes native waiting; already-receipted prefix with flat ordered service
+refutes a transmission-only explanation; timely covering copy publication
+refutes the former complete-H eligibility defect as the remaining sole cause.
+Smallest next action: one unchanged candidate/profile trace using existing
+events, adding only `request_retained_frontier_reinjection` to the prior
+prefix event filter. No build, runtime edit, retry/gain change or new harness.
+Use label retained-frontier-prefix-diag-0908. Diagnostic rates are not ordinary
+acceptance. Preserve trace/control and stop at observed attribution limits;
+no tuning from packet/metric guesses or averaging away the plateau.
+
+**Discriminator resolved, 01:44:** the trace reaches H=73,531,392<F=73,596,928
+and publishes its14,600B repair26ms after the receiver frontier stops. Another
+copy follows201ms later; ordered mux release waits2.100765s. Original native TCP
+is SACK-stalled while both alternatives have megabytes of queued work. Accepted
+writer-command publication is not native socket/wire receipt. Precise stage,
+identity and clock limits are recorded in REQUEST_COHORT_ORDINARY_20260907;
+full trace archived REQUEST_RETAINED_FRONTIER_DIAGNOSTIC_20260908.raw.tar.gz.
+This closes the old eligibility question, not the ordered-service problem.
+
+### Current transaction: practical value with independent QUIC repair ordering
+
+- **Issue/question:** does the isolated retained-frontier correction improve
+  completed default-mode upload service when QUIC's already-existing separate
+  repair stream can avoid TCP's ordered predecessors? TCP-only repair became
+  eligible promptly but its native outputs were all occupied.
+- **Competing causes:** fixed eligibility has practical value with independent
+  repair ordering; or allocation/target/native service still dominates and
+  the added copy work does not improve ordered completion. This is not a
+  presumption that QUIC must always be the better path.
+- **Existing evidence:**21 focused checks, real H<F repair in26ms, native TCP
+  ordering stall/queued alternate evidence; prior accepted paired QUIC repair
+  domain. Historical raw mirrored upload completes4.279Mbps with1.611s gap;
+  that is context, not a waiver of MPP's incomplete transfers.
+- **Smallest action:** one ordinary mixed/upload baseline11d6f3a versus
+  isolated011aee9 pair, both endpoints changed together. Same existing routed
+  mirrored combined profile, all flags as recorded for TCP except run.py
+  `mixed combined up`, diagnostics off. No source/config/controller/limit
+  change, no new harness, sampler still shelved. Labels
+  mixed-combined-up-retained-frontier-{control,candidate}-0908.
+- **Falsifier/gate:** no better completion/timing means no practical-benefit
+  claim; absence of a relevant blocking episode means no repair-bypass causal
+  attribution even if overall timings improve. Compare first/max confirmations,
+  completed bytes/drain, wire and RSS/CPU. Keep all failures and missing bins.
+  Adverse/censored results stop promotion; no third run seeking a better mean.
+  A positive mixed cell does not close TCP, loaded latency, browser or release.
+- **Explicit bounded ordering deviation:** supersedes the earlier instruction
+  to avoid automatic mixed expansion only for this one declared discriminator.
+  Independent review prefers it over another TCP handoff trace or speculative
+  allocator implementation because it directly tests practical value using an
+  already-implemented service domain. Full matrix remains stopped; no previous
+  adverse observation or method requirement is waived.
 
 **Held preceding transaction: request/upload rate refresh.** The existing sampler
 requires each cohort's earliest assignment to follow the previous ACK and
@@ -306,10 +385,10 @@ remain outside this batch unless evidence and user scope justify inclusion.
 
 - The prefix diagnostic is complete/censored and owned products/probes are
   stopped, origin services retained. Isolated recovery correction passes21
-  focused controls; application build is running before the declared ordinary
-  pair. The former RED is GREEN; exact original RED archive remains. Sampler
-  overlay is shelved/unaccepted, not a hidden candidate prerequisite. Next is
-  the ordinary composition gate, not broader controller/producer changes.
+  focused controls; ordinary TCP remains incomplete/adverse and the diagnostic
+  proves prompt copy publication followed by slow ordered service. Next is
+  the single explicitly declared mixed/upload discriminator. No build remains.
+  Sampler overlay stays shelved/unaccepted; original RED archive is retained.
 - Use the owned Docker topology only, not host shaping or sudo. Preserve exact
   executable/profile, phase clocks, full series and adverse results. Do not
   expand test infrastructure or repeat already conclusive diagnostics.
@@ -317,5 +396,5 @@ remain outside this batch unless evidence and user scope justify inclusion.
   LIVE_OWNER_FRONTIER_WORK_BOUND.md untouched. No rejected runtime overlay is
   active. Preserve useful temporary evidence before scoped cleanup.
 - Telegram milestones/blockers are authorized at intervals of at least one
-  hour; last milestone sent 2026-09-07 16:44 UTC. No release gate currently permits a
+  hour; last milestone sent 2026-09-07 17:44 UTC. No release gate currently permits a
   push/release. Resume this exact priority after compaction.

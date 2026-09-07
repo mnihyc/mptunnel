@@ -274,3 +274,207 @@ Current closure plan records original intent, tradeoff, ordinary pair and
 unchanged global acceptance. The existing request wake may wait for the later
 successor floor absent other events; this correction does not rewrite that
 policy. No claim that eligibility alone removes the original measured stall.
+
+## Isolated recovery ordinary pair: gate failed/incomplete, 2026-09-08
+
+Recorded 2026-09-08 01:30 +08:00. Category: ordinary composition acceptance
+withheld; exact model correction retained separately. The 21 focused GREEN
+checks and isolated checkpoint `011aee9` above do not constitute a practical
+performance pass. This pair compares frozen baseline `11d6f3a` at
+`./.tmp/reflection/bin/late-startup-scope-20260907/mptunnel` with
+`./.tmp/reflection/bin/retained-frontier-20260908/mptunnel`. Both endpoints
+change together; the unaccepted sampler overlay remains shelved.
+
+The unchanged ordinary `run.py tcp combined up` profile described above uses
+`REFLECTION_ROUTED=1`, `REFLECTION_MANAGEMENT=1`,
+`REFLECTION_MIRROR_IMPAIRMENT=1`, `REFLECTION_FIFO=0`,
+`REFLECTION_RETURN_RATE=500mbit`, and
+`REFLECTION_NO_JITTER/NO_LOSS/NO_QOS/NO_BLACKHOLE=0` (each name prefixed
+`REFLECTION_`). `REFLECTION_DIAG=0` and `REFLECTION_NATIVE_TRACE=0`;
+per-side binary overrides are unset. There is no overlapping build or added
+interactive workload. The complete raw probes and 86 service samples per run
+are [preserved here](REQUEST_RETAINED_FRONTIER_ORDINARY_20260908.raw.tar.gz),
+under `results/tcp-combined-up-retained-frontier-{control,candidate}-0908/`.
+
+| Observation | Control | Isolated recovery candidate |
+| --- | ---: | ---: |
+| Target-confirmed bytes | 105,447,159 | 122,326,512 |
+| Locally accepted bytes | 139,591,680 | 155,058,176 |
+| Probe duration | 85.634515 s | 85.815888 s |
+| First target confirmation | 0.560093 s | 0.483701 s |
+| Greatest confirmation gap | 0.743567 s | 4.033013 s |
+| First local write | 0.151015 s | 0.115312 s |
+| Greatest local write gap | 2.940043 s | 4.094871 s |
+| Transfer completed / completed streams | no / 0 of 1 | no / 0 of 1 |
+| Exact accounting / lower-bound accounting | no / yes | no / yes |
+
+Both reach the existing runner's approximately 85-second observation guard,
+before the upload probe's 90-second internal completion deadline. Teardown
+produces `upload sink closed before terminal acknowledgement` in both runs;
+neither proves permanent noncompletion or a spontaneous Product reset. Both
+confirmation-bin arrays are empty after invalid terminal ACK accounting. A
+partial-byte/time quotient is not completed-transfer goodput, and the larger
+candidate partial total is not an accepted gain. Maximum confirmation and
+local-write gaps both worsen in this pair. Independent random loss realizations
+prevent a conclusive causal regression verdict, but do not waive the failed
+ordinary gate. No mixed/QUIC/down acceptance expansion follows this result.
+
+### Wire, native queues and sampled resource cost
+
+Class counters are monotone in both captures. The measurement windows are
+service samples `0.000060351--85.138338230 s` for control and
+`0.000058550--85.255061149 s` for candidate. Router HTB class `1:10` on `eth1`
+is upload toward the server; `eth0` is return toward the client. Raw upload
+byte counters are `372245 -> 135434131` and `332305 -> 154506066`; raw return
+counters are `16053 -> 4595747` and `13740 -> 4854982`, respectively.
+
+| Sampled observation | Control | Candidate |
+| --- | ---: | ---: |
+| Upload class-byte delta | 135,061,886 B | 154,173,761 B |
+| Return class-byte delta | 4,579,694 B | 4,841,242 B |
+| Upload / return class-drop delta | 3,470 / 808 | 3,785 / 766 |
+| Peak actual client TCP Send-Q | 8,608,572 B | 13,720,332 B |
+| Final actual client TCP Send-Q / notsent | 8,265,656 / 8,051,472 B | 4,143,212 / 3,992,558 B |
+| Client RSS first / peak / final | 35,444 / 96,268 / 93,320 KiB | 37,752 / 107,860 / 107,860 KiB |
+| Server RSS first / peak / final | 17,364 / 36,100 / 34,972 KiB | 18,112 / 41,212 / 34,820 KiB |
+| Final lifetime-average CPU, client / server | 3.0% / 1.5% | 4.0% / 1.4% |
+
+These are directional class-byte proxies, not physical-link accounting or
+repair-only amplification. Do not add parent HTB and child netem totals, which
+count overlapping work. Normal Product traffic, framing/control, native TCP
+retransmission and Product copies all contribute. Management exports no
+cumulative recovery-copy counter. Its logical forwarded totals explicitly
+exclude retransmission/reinjection; `data_level_bytes_in_flight` tracks unique
+Product ownership, not copy volume. The producer in
+`commit_enqueued_request_product_send` records `Data`/`OriginalData`, while
+reinjection's `None` mutation does not reopen Product flight.
+
+The higher wire totals and RSS coexist with different accepted/received byte
+volumes and unfinished work. They cannot isolate recovery cost, and RSS does
+not establish a leak. `ps %CPU` is a process-lifetime average, not interval
+CPU. One-second sampling can miss peaks and includes no post-quiet reclamation
+observation. Service `elapsed` is recorded before sequential endpoint/router
+collection; management and socket counters are not simultaneous, and native
+management samples can be older than the current status timestamp.
+
+At the final management sample, source-read/target-socket-write counts are
+`139591680 / 105250551 B` and `155058176 / 118590960 B`: stage differences
+34,341,129 and 36,467,216 B. The later final sink confirmations in the first
+table use a different boundary and observation time. Neither whole stage
+difference can be assigned to the much smaller actual native Send-Q. Unique
+Product flight and native queue inventories overlap and must not be summed.
+Source reads first reach their final totals at `61.135889486 s` and
+`68.253288234 s`; these are sampled local-consumption boundaries, not exact
+source-EOF timestamps or measured EOF-to-terminal drain durations.
+
+### Discriminating late ordered-write plateau
+
+Candidate target-socket writes remain exactly **79,691,776 B** from samples
+**49.251307966 through 52.251615069 s**. Source reads remain 146,800,640 B.
+Server status timestamps advance `1788801860046 -> 1788801863046` Unix ms;
+the whole management snapshot is not frozen. Target writes reach 79,888,384 B
+by `53.251712207 s`. This establishes a 3.000307-second sampled ordered-write
+plateau, not its exact start/end or an identification of the probe's separately
+reported 4.033013-second confirmation gap.
+
+During that window, all three server native TCP sockets make receive progress:
+peer ports `34432`, `34446`, `34428` add 1,227,880, 891,720 and 975,888 B,
+respectively. Their client cumulative native ACKs also advance. Unique Product
+flight decreases `33496032 -> 31821296 B`, a net 1,674,736 B, while management
+path `1`, instance `1`, retains 13,078,000 B. Candidate session
+`15188167014112505753` and path/instance pairs `0/2`, `1/1`, `2/3` remain stable
+in the capture. These facts do not identify which exact logical range or copy
+is waiting; aggregate native receipt is not ordered Product receipt.
+
+Router upload class bytes advance `108507366 -> 111978642 B` (3,471,276 B),
+with backlog `96872 -> 87824 B`. The current class is 500 Mbps, with 8% loss
+and unchanged 70/20 ms delay/jitter. The 10 Mbps phase ended more than 24 s
+earlier, so an active 10 Mbps cap cannot directly explain this plateau.
+Earlier queued work, ongoing loss/reordering, native ordered service and
+recovery placement/cost remain competing causes. The control advances target
+writes at every adjacent sample, including 655,360 B over its corresponding
+49--52-second window; different random realizations still matter.
+
+Candidate also has a `32.167679--34.249700 s` sampled target-write plateau at
+51,970,048 B, followed by a 15,663,104 B target-write jump. Neither episode may
+be substituted for the missing exact confirmation chronology. The ordinary
+upload has no concurrent echo task or loaded-latency distribution.
+
+The next discriminating observation is one exact stalled logical frontier's
+original and covering-repair publication/first-receipt timeline, with stable
+carrier-instance identity. It must distinguish no eligible/effective copy,
+a published copy waiting behind native service, and an already-receipted
+prefix held by Product or target service. Timely covering-copy publication
+would refute the old complete-H gate as the sole remaining cause; a prefix
+already receipted during flat output would refute transmission-only waiting.
+Existing-event diagnostic capture is separately predeclared in
+CURRENT_CLOSURE_PLAN; it is causal evidence, not another ordinary throughput
+rerun. No claim that a newly eligible copy must arrive faster, no timer/gain
+change, and no promotion follows from these incomplete ordinary totals.
+
+## Post-correction exact range trace — 2026-09-08 01:44 +08:00
+
+One unchanged candidate/profile trace is preserved in
+[the raw archive](REQUEST_RETAINED_FRONTIER_DIAGNOSTIC_20260908.raw.tar.gz).
+It confirms108,265,101/accepts135,856,128B before85.657787s censoring; maximum
+probe confirmation gap2.247582s. Diagnostics are enabled only through existing
+events; no new instrumentation or runtime change. These are causal observations,
+not a replacement ordinary performance result.
+
+| Event | File:line | Wall Unix ms | Exact work |
+| --- | --- | ---: | --- |
+| Original writer-command commitment | client.log:4668 |1788802168343|[73596928,73662464), TCP index0 / instance2 |
+| Ordered mux frontier reaches hole | server.log:7961 |1788802191771|F=73596928 |
+| Retained-frontier repair queued | client.log:7965 |1788802191797|F=73596928, N=106889216 |
+| First repair writer-command commitment | client.log:7966 |1788802191797|[73596928,73611528), index1 / instance1 |
+| Second repair writer-command commitment | client.log:7972 |1788802191998|same14,600B prefix, index2 / instance3 |
+| Next ordered mux delivery | server.log:8161 |1788802193871|65,536B, F=73662464, gap2.100765s |
+
+At the first repair H=73,531,392 (client.log:7957), below F=73,596,928. The
+formerly rejected H<F case therefore now queues and commits a covering repair
+about26ms after the frontier stops. It precedes the next ordered release by
+2.074s. Do not subtract the per-process monotonic fields: their origins differ
+by43ms. Cross-process wall timestamps give26ms, not69ms.
+
+`sender_service_decision` proves accepted writer-command commitment, not a TCP
+socket write or wire departure. The server stall hook runs immediately after
+`recv_stream.receive_data`, before onward target delivery, and updates its
+reference on EVERY positive result (including unlogged short intervals).
+Thus no intervening14,600B ordered mux advance occurred during the2.100765s
+gap. Which physical transmission closed the hole is not recorded.
+
+Stable client identities in this session:
+
+| Diagnostic index | Instance | Management wire path_id | Socket local port |
+| ---: | ---: | ---: | ---: |
+|0 original|2|1|52778|
+|1 first repair|1|2|52796|
+|2 second repair|3|0|52776|
+
+Index/instance identity is explicit in native events; socket association uses
+distinct cumulative-ACK histories, not an explicit fd join. Management wire
+path_id is NOT the diagnostic configured index.
+
+The original has a native ordered-receive stall over samples51.079996--54.080289s:
+server received stays25,597,846B, client ACK advances only oneMSS, SACK grows
+72->900, and server out-of-order memory grows29,888->1,459,696B despite Recv-Q0.
+By55.080381s, received jumps1,310,184B and target writes resume. Original-index
+telemetry at2193891,20ms after mux release, publishes1,395,304 newly ACKed bytes.
+This is consistent with original native recovery but does not identify the
+winning Product copy.
+
+Both alternatives have substantial work already in service. Last native queue
+publications before copies report2,868,601B (index1 at2191328) and2,828,631B
+(index2 at2190643). Bracketing samples52.080096--55.080381s show their server
+receive counters advance1,189,624/1,291,592B. Upload router class advances
+3,922,758B, backlog90,840->109,008B, rate500Mbps. These sequential observations
+do not place either repair at an exact socket byte position; neither a stale
+queue estimate nor zero Recv-Q proves no preceding native work.
+
+**Disposition:** the negative-horizon eligibility correction is exercised in
+the live pipeline and repair is promptly published. Remaining delay lies after
+that publication and before ordered mux processing. Current events do not
+divide writer/socket/network service from server routing/actor service. This
+joins the already-documented ordered-repair/irreversible-work family, not a
+new timer defect. Do not increase recovery gain or reduce buffers from this
+aggregate evidence. Full performance acceptance remains withheld.

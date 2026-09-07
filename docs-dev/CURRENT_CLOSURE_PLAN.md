@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 04:20 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 04:47 UTC. Historical baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -33,12 +33,22 @@ whole-experience acceptance. No new runtime changes follow from this review.
 The last measured pre-pruning composition has 5.684/2.351/6.216-second
 gaps (QUIC download / mixed download / mirrored mixed upload), with one real
 echo timeout in each download. TERMINAL_RETIREMENT_TIMING_CONTROLS_20260907
-preserves all results. There is no current held-composition versus released
-binary causal A/B; do not claim either overall improvement or regression.
+preserves all results. The first same-profile comparison now exists in
+PRUNED_RELEASE_COMPARISON_20260907: recorded released `d1a99ad` versus frozen
+pruned runtime `b9a1600` gives QUIC0.477->95.238Mbps and mixed3.968->93.139Mbps.
+Released mirrored upload is incomplete at85s; pruned confirms676,265,984bytes
+in44.774s. These are bundled-composition/profile-realization improvements,
+not per-commit causality or general non-regression. All six probes,293 samples
+and phase arithmetic were independently checked. QUIC's echo timeout coincides
+with the deliberate three-second UDP outage; mixed's occurs duringQoS.
 
-**Immediate next decision:** use the verified pruned composition and existing runner
-for the same-condition release comparison, and attribute the exact ordered
-prefix event before another implementation. QUIC-only QoS already shows
+**Immediate next decision:** the six ordinary release/pruned cells and two
+raw/Hysteria controls are complete. Raw/Hysteria deliver4.138/8.371Mbps here;
+their full timing/queue evidence is PRUNED_BASELINE_CONTEXT_20260907. The
+remaining pruned mixed pre-QoS swing is the next exact ordered-prefix event.
+One unchanged-binary selective dispatch/rank/mux diagnostic reproduced it;
+correlate original ownership and actual release before another implementation.
+No new overlay, build, controller or policy was used. QUIC-only QoS already shows
 continued native ACK and physical link service during stalled application
 delivery; this cannot be assumed to require a cross-carrier allocator fix.
 QUIC_QOS_ORDERED_DELIVERY_ATTRIBUTION_20260907 and

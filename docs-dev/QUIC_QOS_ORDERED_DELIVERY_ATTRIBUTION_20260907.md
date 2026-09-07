@@ -12,7 +12,7 @@ JSON, not from a truncated whole-file display.
 
 ## Measured result and limits
 
-The ordinary candidate delivered 108.314 Mbps over the finite workload, but
+The ordinary pre-pruning candidate delivered 108.314 Mbps over the finite workload, but
 had a 5.683657-second bulk read gap, from probe time 18.709254 to 24.392911.
 This ends with a new 64-KiB read, so it is not right-censored. The test requests
 a partial 8-GiB response over a 40-second workload; this is not a full-transfer
@@ -99,3 +99,40 @@ rewrite is not yet justified for this gap: first identify the exact ordered
 owner and recovery event. The separate
 [rate-scope audit](RESPONSE_PLACEMENT_RATE_SCOPE_AUDIT_20260907.md) explains why
 existing numeric fields cannot simply be substituted across carrier families.
+
+## Independent discriminator review, 04:36 UTC
+
+The read-only review finds no additional demonstrated priority or window
+defect in this witness. Quinn selects native stream priority before selecting
+retransmitted versus new bytes within that stream. Equal-priority fairness
+does not reserve service across priority classes, but this capture does not
+show lower-priority starvation. The paired repair stream shares native credit
+and congestion control; with only one physical carrier it is not another
+eligible Product repair owner. Native recovery still owns that original.
+
+If the next matched ordinary controls retain unexplained delay, the minimum
+useful observation is an exact native-to-Product range witness, not another
+aggregate rate:
+
+- Bind the logical stream, path instance and ordinary/repair lane to its native
+  request stream once. A local connection stable ID is not a cross-peer ID.
+- Reuse the archived read-only accepted/first-unsent/contiguous-ACK getters,
+  without per-packet printing. Map a complete serialized H3 write to its actual
+  native before/after offsets; do not assume a header size or equate DSN and
+  native offsets. ACK-prefix coverage proves receipt of that whole batch.
+- Observe the ordered native consumed prefix and first buffered range.
+  `Chunks::next` and `Assembler::read` distinguish missing prefix from empty
+  input; a highest received end alone does not. Buffered contiguous input
+  awaiting a reader must not be classified as network loss.
+- Record the matching DSN at common `accept_reliable_frame`, which covers
+  both decoder paths. Correlate with existing mux-hole events and successful
+  local-write counters. Missing mux events alone prove nothing about receipt.
+
+The resulting boundaries separate native prefix recovery, native/H3 reading,
+MPP decoding, mailbox/reassembly and local output. Instrument only a selected
+attachment with quiet sampling. This is a diagnostic design, not an applied
+overlay or a new model change. Raw/Hysteria controls under the unchanged rate
+cut also remain necessary: time imposed by real queued work or a complete UDP
+outage cannot be declared an MPP implementation defect merely because it is
+unpleasant. Neither that physical explanation nor the earlier post-native
+44-second ACK-processing witness can be transferred without matching evidence.

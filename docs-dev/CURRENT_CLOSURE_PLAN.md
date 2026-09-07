@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 05:44 UTC. Historical baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 06:15 UTC. Historical baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -54,16 +54,29 @@ pruned baseline, and HYSTERESIS_TIME_UNACCEPTED_20260907.patch reconstructs the
 candidate. No ordinary executable is rebuilt merely for this restoration;
 use frozen pruned-20260907, not the current target/release candidate artifact.
 
-Next capture the already-seen native QoS/recovery transaction: timer arm/fire,
-actual probes, ACK classifications and exact connection/controller identity.
-Current observations show both peers' inflated RTT and flat current-controller
-ACK-byte counters despite continuing samples and a drained500Mbps router.
-Two2400B flight increases during the UDP outage are consistent with lost PTO
-probes, not a proof of that chain. A minimal temporary diagnostic on restored
-pruned source may close this gap; no recovery/controller/timer change yet.
-Late startup also retires one TCP carrier, but the log lacks stream/phase
-identity and occurs after the slowdown starts. Do not infer sole causality or
-patch admission thresholds. All global gates remain below.
+That native capture is complete. NATIVE_PTO_LATE_STARTUP_DIAGNOSTIC_20260907
+preserves both full logs, probe and41 compact samples. It reproduces a9.860s
+QoS application gap with continued server native ACKs and PTO0. Native send
+count stops while prior flight drains above the reduced congestion window.
+After the separate UDP blackout, the armed exponential-backoff timer fires
+1.191ms late; the next probes are followed by two live-containing ACK frames
+and PTO0 at each endpoint. This is not a stuck timer or retained-only ACK
+episode. The capture does not reproduce the candidate's earlier persistent
+post-QoS plateau. No timer/backoff/controller change is justified.
+
+No late-startup rejection occurs in that capture, so it is not necessary for
+the QoS gap. An independent read-only lifecycle proof is checking whether an
+already-written STARTUP can legally arrive after FINAL, and whether rejecting
+that attachment incorrectly retires its whole shared carrier. Treat this as
+the existing lifecycle branch, not the explanation for every slow transfer.
+
+Next exact observation: one unchanged-profile capture combines existing
+Product dispatch/hole/recovery events with the frozen native observer binary.
+It must identify the blocked original range, owner and release transaction
+during QoS; ACK activity alone cannot locate an ordered-delivery gap. No new
+hook or rebuild is required. Both temporary native/registry hooks have already
+been removed from source; their exact archive is
+NATIVE_PTO_AND_ATTACHMENT_DIAGNOSTIC_20260907.patch. All global gates remain.
 
 **Exact selection defect, not yet an accepted isolated fix:** the second, temporary prefilter capture proves
 one raw-queue hysteresis defect independently of unavailable/unknown paths.

@@ -1,0 +1,392 @@
+diff --git a/crates/quinn-proto/src/connection/mod.rs b/crates/quinn-proto/src/connection/mod.rs
+index 01696a5..1d66e4e 100644
+--- a/crates/quinn-proto/src/connection/mod.rs
++++ b/crates/quinn-proto/src/connection/mod.rs
+@@ -96,6 +96,42 @@ mod timer;
+ use crate::congestion::Controller;
+ use timer::{Timer, TimerTable};
+ 
++// Temporary opt-in observation only. No diagnostic timer or recovery authority.
++#[derive(Debug)]
++struct NativeRecoveryTrace {
++    started_at: Instant,
++    last_snapshot_at: Option<Instant>,
++    last_ack: Option<(Instant, SpaceId, u64)>,
++    last_controller_ack_at: Option<Instant>,
++    ack_classes: [u64; 3], // live, retained-only, no-known (not necessarily duplicate)
++    live_packets: u64,
++    retained_packets: u64,
++    controller_live_bytes: u64,
++    timeout_counts: [u64; 9],
++    loss_timeouts: u64,
++}
++
++impl NativeRecoveryTrace {
++    fn new(now: Instant) -> Option<Self> {
++        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        (*ENABLED.get_or_init(|| {
++            std::env::var_os("MPTUNNEL_NATIVE_RECOVERY_TRACE").is_some()
++        }))
++        .then_some(Self {
++            started_at: now,
++            last_snapshot_at: None,
++            last_ack: None,
++            last_controller_ack_at: None,
++            ack_classes: [0; 3],
++            live_packets: 0,
++            retained_packets: 0,
++            controller_live_bytes: 0,
++            timeout_counts: [0; 9],
++            loss_timeouts: 0,
++        })
++    }
++}
++
+ fn sample_keep_alive_interval(config: &TransportConfig, rng: &mut StdRng) -> Option<Duration> {
+     let maximum = config.keep_alive_interval?;
+     let minimum = config.keep_alive_interval_min.unwrap_or(maximum);
+@@ -249,6 +285,7 @@ pub struct Connection {
+     //
+     /// The number of times a PTO has been sent without receiving an ack.
+     pto_count: u32,
++    native_recovery_trace: Option<NativeRecoveryTrace>,
+ 
+     //
+     // Congestion Control
+@@ -297,6 +334,93 @@ pub struct ActivePathSnapshot {
+ }
+ 
+ impl Connection {
++    fn emit_native_recovery_trace(&self, now: Instant, event: &str, fields: fmt::Arguments<'_>) {
++        let Some(observation) = &self.native_recovery_trace else {
++            return;
++        };
++        let elapsed = |time: Instant| {
++            time.saturating_duration_since(observation.started_at).as_micros()
++        };
++        let loss = self
++            .loss_time_and_space()
++            .map(|(time, space)| (elapsed(time), space));
++        let pto = if !self.state.is_closed()
++            && (self.path.in_flight.ack_eliciting != 0 || !self.peer_completed_address_validation())
++        {
++            self.pto_time_and_space(now)
++                .map(|(time, space)| (elapsed(time), space))
++        } else {
++            None
++        };
++        let spaces = [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data];
++        let last_sent = spaces.map(|space| {
++            self.spaces[space]
++                .time_of_last_ack_eliciting_packet
++                .map(elapsed)
++        });
++        let probes = spaces.map(|space| self.spaces[space].loss_probes);
++        eprintln!(
++            "mptunnel_native_recovery ts_unix_us={} event={} cid={} side={:?} elapsed_us={} path_generation={} controller_epoch={} validating={} closed={} pto_count={} pto_base_us={} max_ack_delay_us={} loss_time={:?} pto_time={:?} armed_loss_us={:?} last_sent_us={:?} pending_probes={:?} srtt_us={} rttvar_us={} cwnd={} flight={} ack_eliciting={} udp_rx={} udp_tx={} authenticated={} ack_rx={} last_ack={:?} last_controller_ack_us={:?} ack_classes={:?} live_packets={} retained_packets={} controller_live_bytes={} timeout_counts={:?} loss_timeouts={} {}",
++            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros(),
++            event, self.initial_dst_cid, self.side(), elapsed(now), self.path.generation(),
++            self.path.controller_epoch(), self.path.challenge.is_some(), self.state.is_closed(),
++            self.pto_count, self.path.rtt.pto_base().as_micros(),
++            self.ack_frequency.max_ack_delay_for_pto().as_micros(), loss, pto,
++            self.timers.get(Timer::LossDetection).map(elapsed), last_sent, probes,
++            self.path.rtt.get().as_micros(), self.path.rtt.variance().as_micros(),
++            self.path.congestion.window(), self.path.in_flight.bytes, self.path.in_flight.ack_eliciting,
++            self.stats.udp_rx.datagrams, self.stats.udp_tx.datagrams, self.total_authed_packets,
++            self.stats.frame_rx.acks,
++            observation.last_ack.map(|(time, space, largest)| (elapsed(time), space, largest)),
++            observation.last_controller_ack_at.map(elapsed), observation.ack_classes,
++            observation.live_packets, observation.retained_packets, observation.controller_live_bytes,
++            observation.timeout_counts, observation.loss_timeouts, fields,
++        );
++    }
++
++    fn snapshot_native_recovery(&mut self, now: Instant) {
++        let Some(observation) = &mut self.native_recovery_trace else {
++            return;
++        };
++        if observation.last_snapshot_at.is_some_and(|last| {
++            now.saturating_duration_since(last) < Duration::from_secs(1)
++        }) {
++            return;
++        }
++        observation.last_snapshot_at = Some(now);
++        self.emit_native_recovery_trace(now, "snapshot", format_args!(""));
++    }
++
++    // Same packet finalization, with an observation only after encoding/tracking succeeds.
++    // This is protocol emission into Transmit, not proof of a successful OS UDP send.
++    fn finish_packet_with_recovery_trace(
++        &mut self,
++        builder: PacketBuilder,
++        now: Instant,
++        transmit_ecn: Option<EcnCodepoint>,
++        sent: Option<SentFrames>,
++        buf: &mut Vec<u8>,
++        probe_datagram: bool,
++    ) {
++        let probe = (probe_datagram && self.native_recovery_trace.is_some()).then_some((
++            builder.space,
++            builder.exact_number,
++            builder.partial_encode.start,
++            builder.ack_eliciting,
++        ));
++        builder.finish_and_track(now, transmit_ecn, self, sent, buf);
++        if let Some((space, pn, start, ack_eliciting)) = probe {
++            self.emit_native_recovery_trace(
++                now,
++                "probe_emitted",
++                format_args!(
++                    "space={space:?} pn={pn} encoded_bytes={} packet_ack_eliciting={ack_eliciting}",
++                    buf.len() - start,
++                ),
++            );
++        }
++    }
++
+     pub(crate) fn new(
+         endpoint_config: Arc<EndpointConfig>,
+         config: Arc<TransportConfig>,
+@@ -394,6 +518,7 @@ impl Connection {
+             )),
+ 
+             pto_count: 0,
++            native_recovery_trace: NativeRecoveryTrace::new(now),
+ 
+             app_limited: false,
+             receiving_ecn: false,
+@@ -520,6 +645,7 @@ impl Connection {
+         buf: &mut Vec<u8>,
+     ) -> Option<Transmit> {
+         assert!(max_datagrams != 0);
++        self.snapshot_native_recovery(now);
+         let max_datagrams = match self.config.enable_segmentation_offload {
+             false => 1,
+             true => max_datagrams,
+@@ -595,6 +721,7 @@ impl Connection {
+         let mut send_blocked = false;
+         // Only a full congestion window supplies BBR's C.is_cwnd_limited signal.
+         let mut cwnd_blocked = false;
++        let mut native_trace_probe_datagram = false;
+ 
+         // Iterate over all spaces and find data to send
+         let mut space_idx = 0;
+@@ -753,7 +880,14 @@ impl Connection {
+                         builder.pad_to(segment_size as u16);
+                     }
+ 
+-                    builder.finish_and_track(now, transmit_ecn, self, sent_frames.take(), buf);
++                    self.finish_packet_with_recovery_trace(
++                        builder,
++                        now,
++                        transmit_ecn,
++                        sent_frames.take(),
++                        buf,
++                        native_trace_probe_datagram,
++                    );
+ 
+                     if num_datagrams == 1 {
+                         // Set the segment size for this GSO batch to the size of the first UDP
+@@ -784,6 +918,7 @@ impl Connection {
+                 }
+ 
+                 // Allocate space for another datagram
++                native_trace_probe_datagram = self.spaces[space_id].loss_probes != 0;
+                 let next_datagram_size_limit = match self.spaces[space_id].loss_probes {
+                     0 => segment_size,
+                     _ => {
+@@ -821,7 +956,14 @@ impl Connection {
+                 // datagram.
+                 // Finish current packet without adding extra padding
+                 if let Some(builder) = builder_storage.take() {
+-                    builder.finish_and_track(now, transmit_ecn, self, sent_frames.take(), buf);
++                    self.finish_packet_with_recovery_trace(
++                        builder,
++                        now,
++                        transmit_ecn,
++                        sent_frames.take(),
++                        buf,
++                        native_trace_probe_datagram,
++                    );
+                 }
+             }
+ 
+@@ -940,15 +1082,16 @@ impl Connection {
+                     buf.write(token);
+                     self.stats.frame_tx.path_response += 1;
+                     builder.pad_to(MIN_INITIAL_SIZE);
+-                    builder.finish_and_track(
++                    self.finish_packet_with_recovery_trace(
++                        builder,
+                         now,
+                         None,
+-                        self,
+                         Some(SentFrames {
+                             non_retransmits: true,
+                             ..SentFrames::default()
+                         }),
+                         buf,
++                        native_trace_probe_datagram,
+                     );
+                     self.stats.udp_tx.on_sent(1, buf.len());
+                     return Some(Transmit {
+@@ -1008,7 +1151,14 @@ impl Connection {
+             }
+ 
+             let last_packet_number = builder.exact_number;
+-            builder.finish_and_track(now, transmit_ecn, self, sent_frames, buf);
++            self.finish_packet_with_recovery_trace(
++                builder,
++                now,
++                transmit_ecn,
++                sent_frames,
++                buf,
++                native_trace_probe_datagram,
++            );
+             self.path
+                 .congestion
+                 .on_sent(now, buf.len() as u64, last_packet_number);
+@@ -1250,6 +1400,17 @@ impl Connection {
+             if !self.timers.is_expired(timer, now) {
+                 continue;
+             }
++            if let Some(observation) = &mut self.native_recovery_trace {
++                observation.timeout_counts[timer as usize] += 1;
++                // Frequent pacing, delayed-ACK and ordinary loss-time wakeups are counted only.
++                if !matches!(timer, Timer::Pacing | Timer::MaxAckDelay)
++                    && (timer != Timer::LossDetection || self.loss_time_and_space().is_none())
++                {
++                    self.emit_native_recovery_trace(
++                        now, "timeout", format_args!("timer={timer:?}"),
++                    );
++                }
++            }
+             self.timers.stop(timer);
+             trace!(timer = ?timer, "timeout");
+             match timer {
+@@ -1590,12 +1751,34 @@ impl Connection {
+         }
+         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
+         let mut newly_acked = ArrayRangeSet::new();
++        let mut native_trace_live_packets = 0;
+         for range in ack.iter() {
+             self.packet_number_filter.check_ack(space, range.clone())?;
+             for (&pn, _) in self.spaces[space].sent_packets.range(range) {
+                 newly_acked.insert_one(pn);
++                if self.native_recovery_trace.is_some() {
++                    native_trace_live_packets += 1;
++                }
+             }
+         }
++        if let Some(observation) = &mut self.native_recovery_trace {
++            let retained_packets = retained_ack
++                .retired_packets
++                .iter()
++                .filter(|(_, terminal)| terminal.outcome == LostPacketOutcome::Acknowledged)
++                .count() as u64;
++            let class = if native_trace_live_packets != 0 {
++                0
++            } else if retained_packets != 0 {
++                1
++            } else {
++                2
++            };
++            observation.ack_classes[class] += 1;
++            observation.live_packets += native_trace_live_packets;
++            observation.retained_packets += retained_packets;
++            observation.last_ack = Some((now, space, ack.largest));
++        }
+ 
+         if newly_acked.is_empty() {
+             self.publish_reordering_evidence(now, None, retained_ack.oldest_reordered_send);
+@@ -1612,6 +1795,7 @@ impl Connection {
+                 }
+             }
+             self.finish_spurious_loss_detection(&retained_ack);
++            self.snapshot_native_recovery(now);
+             return Ok(());
+         }
+ 
+@@ -1743,6 +1927,7 @@ impl Connection {
+         // cross-space proof.
+         self.finish_spurious_loss_detection(&retained_ack);
+         self.set_loss_detection_timer(now);
++        self.snapshot_native_recovery(now);
+         Ok(())
+     }
+ 
+@@ -1897,6 +2082,12 @@ impl Connection {
+         let current_controller_owned = controller_owns_packet(&info, self.path.controller_epoch())
+             && self.path.challenge.is_none();
+         if current_controller_owned {
++            if info.size != 0 {
++                if let Some(observation) = &mut self.native_recovery_trace {
++                    observation.controller_live_bytes += u64::from(info.size);
++                    observation.last_controller_ack_at = Some(now);
++                }
++            }
+             // Only pass ACKs to the congestion controller if we are not validating the current
+             // path, so as to ignore any ACKs from older paths still coming in.
+             self.path.congestion.on_ack_with_packet_state(
+@@ -1944,6 +2135,9 @@ impl Connection {
+ 
+     fn on_loss_detection_timeout(&mut self, now: Instant) {
+         if let Some((_, pn_space)) = self.loss_time_and_space() {
++            if let Some(observation) = &mut self.native_recovery_trace {
++                observation.loss_timeouts += 1;
++            }
+             // Time threshold loss Detection
+             self.detect_lost_packets(now, pn_space, false);
+             self.set_loss_detection_timer(now);
+@@ -1977,6 +2171,9 @@ impl Connection {
+         self.spaces[space].loss_probes = self.spaces[space].loss_probes.saturating_add(count);
+         self.pto_count = self.pto_count.saturating_add(1);
+         self.set_loss_detection_timer(now);
++        self.emit_native_recovery_trace(
++            now, "pto_queued", format_args!("space={space:?} count={count}"),
++        );
+     }
+ 
+     fn detect_lost_packets(&mut self, now: Instant, pn_space: SpaceId, due_to_ack: bool) {
+diff --git a/src/runtime/stream/registry.rs b/src/runtime/stream/registry.rs
+index 9cbaf73..efc3da5 100644
+--- a/src/runtime/stream/registry.rs
++++ b/src/runtime/stream/registry.rs
+@@ -1515,7 +1515,36 @@ impl ServerReliableStreamRegistry {
+                 Err(RuntimeError::RemoteClosed(_) | RuntimeError::ReliablePathSessionClosed) => {
+                     return Ok(ServerReliableStreamOpen::Rejected);
+                 }
+-                Err(error) => return Err(error),
++                Err(error) => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    if matches!(
++                        &error,
++                        RuntimeError::Protocol(
++                            "startup attachment arrived after return-plan finalization"
++                        )
++                    ) && crate::lab_diagnostics::lab_diagnostic_event_enabled(
++                        "server_late_startup_rejected",
++                    ) {
++                        lab_diagnostic(
++                            "server_late_startup_rejected",
++                            format_args!(
++                                "session_id={} stream_id={} path_underlay={:?} path_id={} path_instance_id={} incoming_phase={:?} candidate_ordinal={} trigger_bytes={} candidate_total={} candidate_tier={:?} retained_phase=Finalized model_generation_after_rejection={}",
++                                session_id.0,
++                                stream_id.0,
++                                underlay,
++                                path_id.0,
++                                path_instance_id.as_u64(),
++                                return_plan.phase,
++                                return_plan.candidate_ordinal,
++                                return_plan.trigger_bytes,
++                                return_plan.candidate_total,
++                                return_plan.candidate_tier,
++                                entry.binding.response_model_generation(),
++                            ),
++                        );
++                    }
++                    return Err(error);
++                }
+             };
+             let response_lane = entry.binding.lane();
+             if matches!(

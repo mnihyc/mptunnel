@@ -1,7 +1,12 @@
 # T03 advisory action score
 
-Status: the pure single-action score is an implemented component checkpoint,
-but the v0.4.7 T03 runtime-migration candidate is **rejected**. T02 has
+Status, 2026-09-07: archived single-action model, not an active implementation.
+The test-only scoring/ranking prototype and its ten algorithm-specific tests
+were removed because it had no runtime consumer or demonstrated production
+benefit. The live coherent directional timing types and their model/runtime
+tests remain. The source checkpoint is recoverable from git history; this
+document preserves the counterexamples, not a task to reimplement it.
+The v0.4.7 T03 runtime-migration candidate is **rejected**. T02 has
 established typed directional rate and normalized MPP work. A post-checkpoint
 owner audit proved that the frozen `A=0` order is not a sufficient sustained
 allocator and can leave an untested carrier with material independent capacity

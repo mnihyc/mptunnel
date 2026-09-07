@@ -76,6 +76,32 @@ the counterexample. This is not attribution of the server-download stall.
   and choose one narrow discriminator; do not launch all variants or tune a
   threshold. An independent read-only auditor checks this attribution.
 
+**Evidence stage complete, 2026-09-08 00:31 +08:00:** the raw pair is archived in
+REQUEST_COHORT_ORDINARY_20260907. Independent read-only audit confirms real
+native queues, stale native publication despite live socket ACK progress, and
+a one-second sampled target-write plateau with one native carrier stalled
+while siblings advance. Exact logical-range ownership remains missing.
+
+**Next discriminator, recorded before running:** use one unchanged TCP-upload
+mirrored-profile capture with existing candidate executable and existing event
+filter only. Question: does the first persistent server receive hole cover
+already-published request work, which stable path index owns it, and was a
+repair published before the hole clears? Correlate `sender_service_decision`,
+`server_receive_hole`, `server_receive_delivery_stall`, `stream_ack_received`,
+`tcp_sender_metrics` and `client_sender_enqueue`, retaining path error/stale
+events and live socket snapshots. Event strings are present in the frozen
+candidate; no build or new instrumentation is required. No source/profile or
+probe changes. The same observation guard remains censoring, not a test pass.
+
+The falsifier is an unassigned prefix (source/dispatch hold), or a prefix
+already receipted while ordered service remains stopped (a later-stage hold).
+Stable path-instance mapping must be checked; a replaced index cannot identify
+the old owner. These events do not identify which original/copy closes the
+hole or fully divide native, server routing and actor delay. Stop at that
+evidence boundary if necessary; do not add another trace family automatically.
+Synchronous event logging makes this a causal capture, not ordinary throughput
+or sampler promotion evidence.
+
 ## Existing dispositions that must not be lost
 
 - **Retained for demonstrated mechanisms:** native packet-number/reordering

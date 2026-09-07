@@ -1,0 +1,538 @@
+diff --git a/RFC.md b/RFC.md
+index dde4212..743192c 100644
+--- a/RFC.md
++++ b/RFC.md
+@@ -2207,6 +2207,19 @@ an output. Data ACK coverage of duplicated bytes MUST NOT be attributed to
+ either copy. A locator, interface, address, route, carrier family, or configured
+ path count establishes neither capacity nor bottleneck identity.
+ 
++Request Product rate evidence uses uniquely attributable OriginalData from one
++exact output and sender direction. Acquisition or expiry establishes a fixed
++assignment-time floor; later ACKs do not advance that floor. After the first
++valid covered cohort, each chronological cohort uses the slower of its paired
++ACK-endpoint and latest-assignment-endpoint intervals. Its earliest assignment
++MUST be at or after the previous valid cohort's latest assignment, not its ACK.
++Old or interleaved cohorts produce no numeric evidence, do not move the valid
++anchors, and contribute no bytes to a later sample. Their exact Data ACK
++release and volume qualification remain independent. This observation measures
++achieved Product receipt service, not native capacity or ordered application
++goodput. It changes no coverage, maturation, frozen-expiry, or Product resource
++requirement; an expired numeric epoch cannot be blended into its successor.
++
+ ### 10.3 No second congestion controller
+ 
+ RTT, loss, ECN, jitter, queue, flight, pacing, and delivery observations MAY
+diff --git a/src/model/request_evidence.rs b/src/model/request_evidence.rs
+index f2bcccb..cc15e25 100644
+--- a/src/model/request_evidence.rs
++++ b/src/model/request_evidence.rs
+@@ -17,7 +17,8 @@ pub(crate) struct RequestPathRateEvidence {
+     pending_bytes: u64,
+     pending_first_sent_at: Instant,
+     pending_latest_sent_at: Instant,
+-    previous_window_acked_at: Option<Instant>,
++    causal_send_floor: Option<Instant>,
++    previous_valid_cohort: Option<(Instant, Instant)>,
+     successor_boundary_epoch: Option<(Instant, Instant)>,
+ }
+ 
+@@ -99,7 +100,8 @@ impl RequestPathRateEvidence {
+             pending_bytes: 0,
+             pending_first_sent_at: first_sent_at,
+             pending_latest_sent_at: first_sent_at,
+-            previous_window_acked_at: None,
++            causal_send_floor: None,
++            previous_valid_cohort: None,
+             successor_boundary_epoch: None,
+         }
+     }
+@@ -111,7 +113,6 @@ impl RequestPathRateEvidence {
+         latest_sent_at: Instant,
+         acked_at: Instant,
+         coverage_floor_bytes: u64,
+-        require_post_boundary_send: bool,
+     ) -> RequestPathRateEvidenceUpdate {
+         self.exact_attributed_bytes = self.exact_attributed_bytes.saturating_add(bytes);
+         if self.pending_bytes == 0 {
+@@ -128,28 +129,35 @@ impl RequestPathRateEvidence {
+         }
+ 
+         let sample_bytes = self.pending_bytes;
+-        let first_window = self.previous_window_acked_at.is_none();
+-        let sample_started_at = self
+-            .previous_window_acked_at
+-            .unwrap_or(self.pending_first_sent_at);
+-        // A later staged window is causal only when every sampled byte was sent
+-        // at or after the ACK that starts the interval. Charging the full
+-        // ACK-to-ACK gap is conservative when the sender was briefly idle.
+-        let ack_clocked = first_window
+-            || !require_post_boundary_send
+-            || self.pending_first_sent_at >= sample_started_at;
++        let first_window = self.causal_send_floor.is_none() && self.previous_valid_cohort.is_none();
++        let after_entry_floor = self
++            .causal_send_floor
++            .is_none_or(|floor| self.pending_first_sent_at >= floor);
++        let chronological = self
++            .previous_valid_cohort
++            .is_none_or(|(_, latest_sent_at)| self.pending_first_sent_at >= latest_sent_at);
++        let (ack_started_at, send_started_at) = self.previous_valid_cohort.unwrap_or((
++            self.causal_send_floor.unwrap_or(self.pending_first_sent_at),
++            self.pending_first_sent_at,
++        ));
++        // Entry provenance is fixed; sustained service uses corresponding
++        // completed-cohort endpoints. Ordinary pipelining need not wait for
++        // the previous ACK before assigning the next cohort.
+         self.pending_bytes = 0;
+-        self.previous_window_acked_at = Some(acked_at);
+-        let ack_elapsed = acked_at.saturating_duration_since(sample_started_at);
++        let ack_elapsed = acked_at.saturating_duration_since(ack_started_at);
+         let send_elapsed = self
+             .pending_latest_sent_at
+-            .saturating_duration_since(self.pending_first_sent_at);
+-        // Product ACKs can arrive in compressed batches. Use the slower of the
+-        // send and ACK clocks so ACK timing alone cannot claim a rate above the
+-        // observed sender rate.
+-        let sample = ack_clocked
++            .saturating_duration_since(send_started_at);
++        // The send clock includes inter-cohort spacing, not only the latest
++        // batch's internal span. Old/interleaved cohorts cannot add bytes to
++        // this interval or move either valid anchor; their actual Product ACK
++        // release and qualification are independent of numeric sampling.
++        let sample = (after_entry_floor && chronological)
+             .then(|| PathRateSample::new(sample_bytes, ack_elapsed.max(send_elapsed)))
+             .flatten();
++        if sample.is_some() {
++            self.previous_valid_cohort = Some((acked_at, self.pending_latest_sent_at));
++        }
+         RequestPathRateEvidenceUpdate::Proven {
+             sample,
+             first_window,
+@@ -163,7 +171,8 @@ impl RequestPathRateEvidence {
+ 
+     pub(crate) fn seed_ack_boundary(&mut self, acked_at: Instant) {
+         self.pending_bytes = 0;
+-        self.previous_window_acked_at = Some(acked_at);
++        self.causal_send_floor = Some(acked_at);
++        self.previous_valid_cohort = None;
+     }
+ 
+     /// Starts acquisition after one expired published Product epoch exactly
+diff --git a/src/model/tests_request_evidence.rs b/src/model/tests_request_evidence.rs
+index 2f0620f..f54536a 100644
+--- a/src/model/tests_request_evidence.rs
++++ b/src/model/tests_request_evidence.rs
+@@ -75,7 +75,6 @@ fn exact_path_provenance_counts_attributed_bytes_before_rate_coverage() {
+             started,
+             started + Duration::from_millis(10),
+             rate_coverage_bytes,
+-            true,
+         ),
+         RequestPathRateEvidenceUpdate::Pending
+     ));
+@@ -88,7 +87,6 @@ fn exact_path_provenance_counts_attributed_bytes_before_rate_coverage() {
+             started,
+             started + Duration::from_millis(20),
+             rate_coverage_bytes,
+-            true,
+         ),
+         RequestPathRateEvidenceUpdate::Pending
+     ));
+@@ -96,13 +94,13 @@ fn exact_path_provenance_counts_attributed_bytes_before_rate_coverage() {
+ }
+ 
+ #[test]
+-fn request_rate_samples_use_causal_ack_windows_and_the_slower_clock() {
++fn request_rate_samples_use_paired_cohort_clocks_without_reusing_interleaved_bytes() {
+     let started = Instant::now();
+     let bytes = PATH_OPEN_SCORE_BYTES as u64;
+     let first_acked_at = started + Duration::from_millis(100);
+     let mut evidence = RequestPathRateEvidence::new(started);
+ 
+-    let first = match evidence.observe(bytes, started, started, first_acked_at, bytes, true) {
++    let first = match evidence.observe(bytes, started, started, first_acked_at, bytes) {
+         RequestPathRateEvidenceUpdate::Proven {
+             sample: Some(sample),
+             first_window: true,
+@@ -117,16 +115,15 @@ fn request_rate_samples_use_causal_ack_windows_and_the_slower_clock() {
+         started + Duration::from_millis(140),
+         started + Duration::from_millis(141),
+         bytes,
+-        true,
+     ) {
+         RequestPathRateEvidenceUpdate::Proven {
+             sample: Some(sample),
+             first_window: false,
+         } => sample,
+-        _ => panic!("a causal post-ACK window must produce a path-rate sample"),
++        _ => panic!("a chronological cohort must produce a path-rate sample"),
+     };
+-    assert_eq!(second.elapsed(), Duration::from_millis(41));
+-    assert_eq!(second.rate_bps(), bytes as f64 * 8.0 / 0.041);
++    assert_eq!(second.elapsed(), Duration::from_millis(140));
++    assert_eq!(second.rate_bps(), bytes as f64 * 8.0 / 0.140);
+ 
+     assert!(matches!(
+         evidence.observe(
+@@ -135,8 +132,92 @@ fn request_rate_samples_use_causal_ack_windows_and_the_slower_clock() {
+             started + Duration::from_millis(150),
+             started + Duration::from_millis(200),
+             bytes,
+-            true,
+         ),
+         RequestPathRateEvidenceUpdate::Proven { sample: None, .. }
+     ));
++    let next = match evidence.observe(
++        bytes,
++        started + Duration::from_millis(140),
++        started + Duration::from_millis(160),
++        started + Duration::from_millis(201),
++        bytes,
++    ) {
++        RequestPathRateEvidenceUpdate::Proven {
++            sample: Some(sample),
++            first_window: false,
++        } => sample,
++        _ => panic!("an interleaved cohort must not move either valid anchor"),
++    };
++    assert_eq!(
++        next.bytes(),
++        bytes,
++        "discarded bytes must not be counted again"
++    );
++    assert_eq!(next.elapsed(), Duration::from_millis(60));
++}
++
++#[test]
++fn request_rate_refreshes_during_continuous_pipelining() {
++    let started = Instant::now();
++    let bytes = PATH_OPEN_SCORE_BYTES as u64;
++    let mut evidence = RequestPathRateEvidence::new(started);
++
++    for index in 0..4 {
++        let sent_at = started + Duration::from_millis(index * 50);
++        let acked_at = sent_at + Duration::from_millis(100);
++        let update = evidence.observe(bytes, sent_at, sent_at, acked_at, bytes);
++        let RequestPathRateEvidenceUpdate::Proven {
++            sample: Some(sample),
++            first_window,
++        } = update
++        else {
++            panic!("chronological pipelined cohort {index} must refresh exact receipt service");
++        };
++        assert_eq!(first_window, index == 0);
++        assert_eq!(sample.bytes(), bytes);
++        assert_eq!(
++            sample.elapsed(),
++            Duration::from_millis(if index == 0 { 100 } else { 50 }),
++        );
++    }
++}
++
++#[test]
++fn request_rate_rejected_cohort_does_not_move_fixed_entry_floor() {
++    let started = Instant::now();
++    let floor = started + Duration::from_millis(100);
++    let bytes = PATH_OPEN_SCORE_BYTES as u64;
++    let mut evidence = RequestPathRateEvidence::new(started);
++    evidence.seed_ack_boundary(floor);
++
++    assert!(matches!(
++        evidence.observe(
++            bytes,
++            started,
++            floor,
++            floor + Duration::from_millis(100),
++            bytes,
++        ),
++        RequestPathRateEvidenceUpdate::Proven { sample: None, .. }
++    ));
++    let update = evidence.observe(
++        bytes,
++        floor + Duration::from_millis(1),
++        floor + Duration::from_millis(50),
++        floor + Duration::from_millis(150),
++        bytes,
++    );
++    let RequestPathRateEvidenceUpdate::Proven {
++        sample: Some(sample),
++        first_window: false,
++    } = update
++    else {
++        panic!("a wholly post-floor cohort must not chase the rejected cohort's ACK");
++    };
++    assert_eq!(
++        sample.bytes(),
++        bytes,
++        "rejected bytes must not carry forward"
++    );
++    assert_eq!(sample.elapsed(), Duration::from_millis(150));
+ }
+diff --git a/src/runtime/sender/request/multipath.rs b/src/runtime/sender/request/multipath.rs
+index a704d29..0620e7b 100644
+--- a/src/runtime/sender/request/multipath.rs
++++ b/src/runtime/sender/request/multipath.rs
+@@ -2900,8 +2900,8 @@ impl RequestMultipathController {
+             {
+                 // Pending timing from the expired authority interval cannot be
+                 // blended into its successor. A wholly post-expiry sample may
+-                // qualify immediately; a straddling sample only seeds the next
+-                // causal ACK window.
++                // qualify immediately; a straddling sample cannot move the
++                // fixed successor assignment floor or publish numeric evidence.
+                 self.request
+                     .path_states
+                     .get_mut(instance)
+@@ -2928,7 +2928,6 @@ impl RequestMultipathController {
+                     latest_sent_at,
+                     acked_at,
+                     coverage_floor_bytes,
+-                    true,
+                 )
+             };
+             if let RequestPathRateEvidenceUpdate::Proven {
+diff --git a/src/runtime/sender/request/tests_multipath.rs b/src/runtime/sender/request/tests_multipath.rs
+index 0a22603..3ccc321 100644
+--- a/src/runtime/sender/request/tests_multipath.rs
++++ b/src/runtime/sender/request/tests_multipath.rs
+@@ -3360,6 +3360,241 @@ async fn expired_request_product_epoch_resets_successor_boundary_only_once() {
+     assert!(successor.fresh_rate_at(second_ack_at).is_some());
+ }
+ 
++async fn commit_request_rate_cohort(
++    sender: &mut crate::runtime::sender::request::RequestSenderService,
++    context: &ClientPathContext,
++    remotes: &mut ReliableRelayRemoteSet,
++    receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers,
++    range: OffsetRange,
++) {
++    let stream_id = remotes.stream_id();
++    let quantum = crate::model::capacity::reliable_relay_buffer_len(context.mux_limits);
++    let mut offset = range.start;
++    while offset < range.end {
++        let bytes = quantum.min((range.end - offset) as usize);
++        sender
++            .send_frame(
++                context,
++                remotes,
++                data_frame(stream_id, offset, bytes),
++                RelaySendCause::StreamData,
++                Some(TrafficClass::Throughput),
++            )
++            .await
++            .expect("ordinary planning, exact admission, reservation and Product commit succeed");
++        loop {
++            match try_recv_reliable_path_command(receivers) {
++                Some(ReliablePathCommand::SendFrame(Frame::PathProofData {
++                    path_id,
++                    proof_id,
++                    payload,
++                })) => {
++                    assert_eq!(path_id, PathId(0));
++                    assert_eq!(Some(proof_id), remotes.paths[0].path_proof_id);
++                    assert!(!payload.is_empty());
++                    continue;
++                }
++                Some(ReliablePathCommand::SendFrame(Frame::StreamData {
++                    stream_id: published_stream,
++                    offset: published_offset,
++                    payload,
++                })) => {
++                    assert_eq!(published_stream, stream_id);
++                    assert_eq!(published_offset, offset);
++                    assert_eq!(payload.len(), bytes);
++                    break;
++                }
++                Some(ReliablePathCommand::SendFrame(frame)) => {
++                    panic!("expected committed Product or attachment proof, got {frame:?}")
++                }
++                Some(_) => panic!("unexpected non-frame command"),
++                None => panic!("committed Product frame was not published"),
++            }
++        }
++        // Carrier dequeue releases only writer occupancy, not Product debt.
++        offset += bytes as u64;
++    }
++}
++
++async fn request_rate_refresh_after_real_bootstrap(pipelined: bool) {
++    let stream_id = StreamId(394);
++    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10394?initial-srtt-s=0.1"]);
++    let (commands, mut receivers) = reliable_path_command_channels(8);
++    let mut remotes =
++        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 8);
++    let owner = remotes.paths[0].instance();
++    consume_client_path_proof_for_test(&mut receivers);
++    context.install_relay_path_instance_for_test(owner);
++    context.mark_tcp_path_open_success(0, Duration::from_millis(100), TrafficClass::Throughput);
++    let mut sender = crate::runtime::sender::request::RequestSenderService::new(stream_id);
++    let floor =
++        request_path_rate_coverage_floor_bytes(UnderlayProtocol::Tcp, None, context.mux_limits);
++    let cohort = |index: u64| OffsetRange {
++        start: index * floor,
++        end: (index + 1) * floor,
++    };
++
++    // Establish qualification and the first numeric sample using actual
++    // accepted OriginalData and exact ACK release, never injected proof flags.
++    commit_request_rate_cohort(
++        &mut sender,
++        &context,
++        &mut remotes,
++        &mut receivers,
++        cohort(0),
++    )
++    .await;
++    assert_eq!(
++        sender
++            .multipath
++            .request
++            .flights
++            .original_data_in_flight_bytes(owner),
++        floor
++    );
++    tokio::time::sleep(Duration::from_millis(100)).await;
++    let bootstrap_ack = Instant::now();
++    sender
++        .multipath
++        .apply_product_ack(&context, &remotes, &[cohort(0)], bootstrap_ack);
++    let state = sender
++        .multipath
++        .request
++        .path_states
++        .get(owner)
++        .expect("actual bootstrap state");
++    assert!(state.product_assignment_qualified());
++    assert!(state.ack_clock_proven());
++    assert!(state.capacity_admitted());
++    let bootstrap_epoch = state.product_rate_epoch().expect("first real sample");
++    assert_eq!(bootstrap_epoch.delivery_samples, 1);
++    assert_eq!(bootstrap_epoch.observed_at, bootstrap_ack);
++    assert!(sender.multipath.request.ack_clock_operation.is_none());
++
++    // The continuous case has two coverage cohorts in flight after bootstrap:
++    // assign A, assign B, ACK A, assign C, ACK B, ACK C. The staged control
++    // instead assigns each new cohort only after the preceding ACK.
++    commit_request_rate_cohort(
++        &mut sender,
++        &context,
++        &mut remotes,
++        &mut receivers,
++        cohort(1),
++    )
++    .await;
++    tokio::time::sleep(Duration::from_millis(50)).await;
++    if pipelined {
++        commit_request_rate_cohort(
++            &mut sender,
++            &context,
++            &mut remotes,
++            &mut receivers,
++            cohort(2),
++        )
++        .await;
++        assert_eq!(
++            sender
++                .multipath
++                .request
++                .flights
++                .original_data_in_flight_bytes(owner),
++            2 * floor
++        );
++    }
++    let mut epochs = Vec::new();
++    let mut ack_times = Vec::new();
++    for index in 1..=3 {
++        tokio::time::sleep(Duration::from_millis(50)).await;
++        let acked_at = Instant::now();
++        let released =
++            sender
++                .multipath
++                .apply_product_ack(&context, &remotes, &[cohort(index)], acked_at);
++        assert_eq!(released.data_ack_progress_paths.as_slice(), &[owner]);
++        let state = sender
++            .multipath
++            .request
++            .path_states
++            .get(owner)
++            .expect("same live owner");
++        assert!(state.product_assignment_qualified());
++        assert!(state.ack_clock_proven());
++        assert!(sender.multipath.request.ack_clock_operation.is_none());
++        epochs.push(
++            state
++                .product_rate_epoch()
++                .expect("retained or refreshed exact epoch"),
++        );
++        ack_times.push(acked_at);
++        if (pipelined && index == 1) || (!pipelined && index < 3) {
++            let next = if pipelined { 3 } else { index + 1 };
++            commit_request_rate_cohort(
++                &mut sender,
++                &context,
++                &mut remotes,
++                &mut receivers,
++                cohort(next),
++            )
++            .await;
++        }
++    }
++    assert_eq!(
++        sender
++            .multipath
++            .request
++            .flights
++            .original_data_in_flight_bytes(owner),
++        0
++    );
++    let replay =
++        sender
++            .multipath
++            .apply_product_ack(&context, &remotes, &[cohort(3)], Instant::now());
++    assert!(replay.data_ack_progress_paths.is_empty());
++    assert_eq!(
++        sender
++            .multipath
++            .request
++            .path_states
++            .get(owner)
++            .unwrap()
++            .product_rate_epoch(),
++        epochs.last().copied()
++    );
++    eprintln!(
++        "pipelined={pipelined} floor={floor} bootstrap_samples={} subsequent_samples={:?} refreshed={:?} final_product_debt=0 acquisition_owner=none",
++        bootstrap_epoch.delivery_samples,
++        epochs
++            .iter()
++            .map(|epoch| epoch.delivery_samples)
++            .collect::<Vec<_>>(),
++        epochs
++            .iter()
++            .zip(&ack_times)
++            .map(|(epoch, at)| epoch.observed_at == *at)
++            .collect::<Vec<_>>(),
++    );
++    for (index, (epoch, acked_at)) in epochs.iter().zip(&ack_times).enumerate() {
++        assert_eq!(
++            epoch.observed_at,
++            *acked_at,
++            "unique admitted cohort {} must refresh request evidence even when its assignment overlaps the previous ACK",
++            index + 1
++        );
++        assert_eq!(epoch.delivery_samples, index as u32 + 2);
++    }
++}
++
++#[tokio::test]
++async fn request_owner_rate_refreshes_after_admitted_pipelining() {
++    request_rate_refresh_after_real_bootstrap(true).await;
++}
++
++#[tokio::test]
++async fn request_owner_rate_refreshes_after_admitted_staged_control() {
++    request_rate_refresh_after_real_bootstrap(false).await;
++}
++
+ #[tokio::test]
+ async fn duplicated_product_ack_does_not_invent_exact_path_progress() {
+     let (context, remotes, tcp, udp) = mixed_remote_set().await;

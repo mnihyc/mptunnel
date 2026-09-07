@@ -79,6 +79,27 @@ cohorts cannot move that floor. New numeric publication retains the existing
 frozen absolute expiry. Repeated polls, cumulative volume and old SACKs cannot
 renew it. Replacement/direction change cannot reuse either anchor.
 
+### Finite obstruction, not a wall-clock recovery guarantee
+
+This argument does not assume FIFO Product receipts. At a fixed valid
+assignment anchor b_i, or entry floor e, only finitely many eligible unique
+OriginalData bytes were assigned before that boundary and remain unACKed.
+Each covered cohort rejected for crossing that fixed boundary consumes at
+least one of those old bytes. Later assignments use a monotonic clock and
+cannot replenish that set; duplicate, copied/ambiguous and revoked-owner
+receipts cannot create eligible unique bytes. Discarding a numeric cohort
+keeps the fixed boundary and valid paired anchors rather than moving either.
+
+Consequently, within one unchanged scope/epoch, with continuing eligible
+unique progress sufficient to complete further cohorts, overlap alone cannot
+reject every future refresh indefinitely. The old moving-ACK fence lacked
+this property: each rejection created a newer obstruction. This is a finite
+progress argument, not a FIFO, native-capacity or elapsed-time guarantee.
+An old byte mixed into each large new cohort can cause many rejected cohorts;
+arbitrarily delayed receipts, sparse/sub-coverage work and scope changes can
+still leave long gaps. No useful wall-clock bound follows from these
+observations, and this correction does not establish full throughput recovery.
+
 ## Meaning and conditional forecast
 
 G is achieved **Product receipt service for K**, including allocation and return
@@ -124,10 +145,12 @@ Keep their real Product debt outstanding until live `apply_product_ack` on
 their exact ranges. Subsequent samples must refresh the epoch despite
 assignments preceding the previous ACK. Also assert ordinary work is still
 admissible and no acquisition Owner reappears. This avoids assuming that a
-cold unqualified path may publish three coverage cohorts. The first compiled
-owner fixture stops before the sampling assertion because its command consumer
-does not recognize a legitimate path-proof command; this is a test fixture
-failure, not Product RED. The two model counterexamples are independently RED
-and four existing model controls pass. Live confirmation remains pending.
+cold unqualified path may publish three coverage cohorts. The initial fixture
+failed to recognize a legitimate path-proof command; that was a fixture
+failure, not Product RED. After checking that command explicitly, the actual
+owner fixture reproduced the defect: pipelined sample counts `[2,2,2]` with
+refresh `[true,false,false]`, versus staged `[2,3,4]` and three refreshes.
+Both released all exact Product debt and left no acquisition Owner. This
+confirms the numeric defect, not an ordinary throughput benefit or release pass.
 Separate compression/interleaving and expiry controls prevent a blanket
 `true` to `false` bypass from passing as the clean correction.

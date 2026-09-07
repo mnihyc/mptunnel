@@ -1,0 +1,118 @@
+# Request cohort correction: incomplete ordinary upload pair
+
+Recorded 2026-09-08 00:31 +08:00; observations 2026-09-07 07:47--07:50 UTC.
+Category: practical acceptance withheld; bounded causal evidence, not release
+or a measured causal performance gain. Applies the mandatory
+[performance method](PERFORMANCE_METHOD_AND_LESSONS.md).
+
+## Comparison and disposition
+
+Baseline runtime `11d6f3a` versus its uncommitted request cohort clock correction,
+whose exact scope and 23 focused GREEN checks are in
+[the correction](REQUEST_COHORT_CLOCK_CORRECTION_20260907.md). Frozen ordinary
+executables: `./.tmp/reflection/bin/late-startup-scope-20260907/mptunnel` and
+`./.tmp/reflection/bin/request-cohort-20260907/mptunnel`. Native/event diagnostic
+flags were off. The second run is a separate random realization, not the same
+packet-loss sequence replayed or a causally conclusive one-pair regression.
+The exact unaccepted source/test/RFC diff is preserved in
+[the candidate patch](REQUEST_COHORT_UNACCEPTED_20260907.patch); retaining this
+evidence is not promoting it into accepted runtime.
+
+| Observation | Baseline | Candidate |
+| --- | ---: | ---: |
+| Target-confirmed bytes | 109,313,995 | 133,561,732 |
+| Locally accepted bytes | 168,296,448 | 191,758,336 |
+| Probe duration | 85.895780 s | 85.563214 s |
+| First target confirmation | 0.441956 s | 0.491257 s |
+| Greatest confirmation gap | 1.004911 s | 2.021790 s |
+| Greatest local write gap | 7.147240 s | 2.042942 s |
+| Transfer completed | no | no |
+
+Both reach the existing runner's 85-second observation guard. Teardown closes
+the tunnel before the sink's terminal acknowledgement, producing the recorded
+`upload sink closed before terminal acknowledgement` error. This is not an
+independent spontaneous Product reset or a proof of permanent noncompletion.
+The roughly 59 MB remaining in each run is nevertheless a real observed
+settlement backlog. A quotient of partial confirmed bytes over censored time
+is not a completed-transfer rate or an accepted 22.7% improvement.
+
+Stop promotion here: no subsequent QUIC/mixed candidate cells and no controller,
+timer, resource limit or topology change. Correct numerical refresh is not
+enough to accept composed timing.
+
+## Unchanged experiment
+
+TCP-only: three default native carriers to one server endpoint, not three
+independent links. Same owned Docker routed profile and runner `./.tmp/reflection/run.py`;
+whole-profile mirroring puts the main impairment on upload. Each direction has
+a 500 Mbps configured link; main delay/jitter 70/20 ms, return 30/5 ms. Main
+five-second loss epochs are `[3,8,5,6,10,3,5,8]` percent (mean 6%); return epochs
+`[1,2,0.5,3,2,0.5,1,2]`. Main QoS is 10 Mbps at 15--25 s; UDP-only blackhole
+30--33 s does not disable these TCP carriers. Source load is 40 s, not a claim
+that intermediate queues finish at 40 s. FIFO override is off. No initial-rate
+override, loss/jitter removal, host shaping, native trace or overlapping build.
+
+Raw probes and all 86 management/socket/router samples per run are preserved
+in [the archive](REQUEST_COHORT_ORDINARY_20260907.raw.tar.gz), with paths under
+`results/tcp-combined-up-request-cohort-{control,candidate}-0907/`.
+The upload probe discards its interval map whenever terminal accounting fails
+(`lab/bulk_upload_probe.py`, `ack_accounting_valid` and `interval_metric_fields`).
+Both preserved confirmation-bin arrays are therefore empty. Management counters
+cannot reconstruct those missing confirmation times or locate the reported
+2.021790-second maximum exactly. No fabricated curves are supplied.
+
+## What the counters actually prove
+
+Source inspection establishes these distinct boundaries:
+
+- Client management `io.to_peer_bytes`: successful reads from the local source
+  socket, via `ObservedProductIo::poll_read` and `relay/control.rs`. Not native
+  transmission or exact carrier allocation.
+- Server management `io.from_peer_bytes`: successful ordered writes to the
+  target socket, via `ObservedProductIo::poll_write` and `relay/server.rs`.
+  Not raw Product receipt/reassembly or target application consumption.
+- Client `ss` ACK/Send-Q/notsent: native TCP carrier byte domain, including
+  framing/control/copies. Not additive with Product flight/debt.
+- Sink confirmation: cumulative target consumption observed back at the
+  client. Return-path and scheduling delays remain included.
+
+At the last service sample, control source/target counters are
+168,296,448/108,986,315 B; candidate 191,758,336/133,496,196 B. Final actual
+client Send-Q totals are 7,703,048 and 21,817,582 B respectively. Thus not all
+unconfirmed work can be called native send-queue backlog. The source/target
+difference repeatedly equals 64 MiB; that alone is not grounds to lower the
+resource allowance or treat resource permission as required placement.
+
+Candidate session `6493328813790544979` maps path/instance `0/3` to client
+`:44630`, `1/2` to `:44628`, and `2/1` to `:44644`, all toward server `:7443`.
+
+Two useful bounded observations survive independent read-only audit:
+
+1. **Stale telemetry is not a stopped socket.** Path `0/3` management retains
+   ACK 76,432,366, sample time 27,551,408 us and queue 32,807,912 B throughout
+   samples 28.005252--50.007632 s. Actual `ss` ACKs rise 76,834,670--87,372,274 B
+   and notsent falls 32,423,060--21,999,824 B. A large native queue is real;
+   the apparent ACK freeze is not. At the final sample this socket still has
+   Send-Q 20,085,116 B and Product debt 20,447,232 B, overlapping inventories.
+2. **One carrier's ordered delivery pauses while siblings progress.** At
+   samples 39.006448--40.006565 s, target writes remain 108,002,692 B. Server
+   `:44628` received remains 23,260,439 B; its client's SACK count rises
+   340--692 while cumulative ACK moves one MSS. Other server sockets receive
+   another 341,728 and 251,904 B. By 41.006694 s the former socket and target
+   writes both advance. This is consistent with a blocked native prefix, but
+   does not establish which carrier owns the missing logical Product range.
+
+## Next exact question and falsifier
+
+Map one actually stalled upload's first missing logical range to its original
+carrier, any repair, receiver frontier and target-write boundary. Distinguish
+slow native ordered service from late/ineffective MPP placement or recovery,
+and from an already-received prefix held by a Product actor or target writer.
+
+If the putative owner supplies that exact prefix only when the frontier
+advances, the native dependency is supported; if it was already available at
+the receiver during the plateau, that explanation is falsified. A high rate
+estimate, aggregate sibling ACK progress or finite total backlog cannot decide
+this. First check whether existing diagnostic events provide the mapping;
+collect only missing discriminating observations, not a new harness or another
+broad matrix. This artifact does not assign the slower gap to the sampler.

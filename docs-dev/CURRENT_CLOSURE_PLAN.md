@@ -1,23 +1,42 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 03:52 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 04:20 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Current checkpoint and next decision
 
-**Requested reflection / implementation pause:**
+**Pruning decision:** CHANGE_DISPOSITION_20260907 is the explicit KEEP/REMOVE
+record. Commit11a68f9 removes the rejected test-only scorer/ranker and ten
+prototype tests; all29 surviving timing controls pass. Stateful relative ACK
+encoding and its transport/RFC state are removed from the active worktree;
+ACK_RELATIVE_REMOVED_20260907.patch reconstructs the exact former feature.
+Stateless packing, paired repair, native reordering, qualification, interlock,
+cooperative actor and terminal corrections are retained for their demonstrated
+mechanism-level benefits and explicit costs, not called universal speed wins.
+Their adverse ordinary results are recorded alongside the benefits. All67
+selected codec/transport/repair/terminal controls pass after removal; exact
+results are in PRUNING_CHECKS_20260907. No new tuning or issue
+inventory is introduced. Intermediate source checkpoints d268aa4/b7abd78/
+59fbd22/b9a1600 track the retained native, qualification, actor and carrier-I/O
+mechanisms. Ordinary application build succeeds; the pruned executable is
+frozen at `./.tmp/reflection/bin/pruned-20260907/mptunnel`. Full-tree formatting
+passes after269c843's three mechanical test-formatting corrections. The
+older terminal-retirement binary still contains relative encoding and is only
+a before reference, not the current candidate executable.
+
+**Requested reflection / no new optimization:**
 PERFORMANCE_REFLECTION_20260907 explicitly separates useful corrections from
 unproved speed claims and records that the held repair-stream implementation
 introduced its own EOF-retention defect. Component correctness did not earn
 whole-experience acceptance. No new runtime changes follow from this review.
-The latest three-cell ordinary composition still has 5.684/2.351/6.216-second
+The last measured pre-pruning composition has 5.684/2.351/6.216-second
 gaps (QUIC download / mixed download / mirrored mixed upload), with one real
 echo timeout in each download. TERMINAL_RETIREMENT_TIMING_CONTROLS_20260907
 preserves all results. There is no current held-composition versus released
 binary causal A/B; do not claim either overall improvement or regression.
 
-**Immediate next decision:** freeze that composition, use the existing runner
+**Immediate next decision:** use the verified pruned composition and existing runner
 for the same-condition release comparison, and attribute the exact ordered
 prefix event before another implementation. QUIC-only QoS already shows
 continued native ACK and physical link service during stalled application

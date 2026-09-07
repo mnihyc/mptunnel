@@ -1,0 +1,1163 @@
+diff --git a/src/protocol/codec.rs b/src/protocol/codec.rs
+--- a/src/protocol/codec.rs
++++ b/src/protocol/codec.rs
+@@ -8,6 +8,10 @@
+ use bytes::Bytes;
+ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+ 
++#[path = "ack_encoding.rs"]
++mod ack_encoding;
++pub(crate) use ack_encoding::{FrameDecoder, FrameEncoder};
++
+ const MAGIC: &[u8; 4] = b"MPTF";
+ const VERSION: u8 = 13;
+ const MAX_CREDENTIAL_ID_BYTES: usize = 64;
+@@ -144,6 +148,13 @@
+ }
+ 
+ pub fn decode_frame_bytes(bytes: Bytes, limits: CodecLimits) -> Result<Frame, CodecError> {
++    let (kind, mut reader) = frame_reader(&bytes, limits)?;
++    let frame = decode_payload(kind, limits, &mut reader)?;
++    reader.finish()?;
++    Ok(frame)
++}
++
++fn frame_reader(bytes: &Bytes, limits: CodecLimits) -> Result<(FrameKind, Reader<'_>), CodecError> {
+     if bytes.len() < FRAME_HEADER_LEN {
+         return Err(CodecError::UnexpectedEof);
+     }
+@@ -164,10 +175,10 @@
+     }
+ 
+     let kind = FrameKind::from_u8(bytes[5])?;
+-    let mut reader = Reader::with_source(&bytes, FRAME_HEADER_LEN, bytes.len());
+-    let frame = decode_payload(kind, limits, &mut reader)?;
+-    reader.finish()?;
+-    Ok(frame)
++    Ok((
++        kind,
++        Reader::with_source(bytes, FRAME_HEADER_LEN, bytes.len()),
++    ))
+ }
+ 
+ pub fn decode_frames_bytes(bytes: Bytes, limits: CodecLimits) -> Result<Vec<Frame>, CodecError> {
+@@ -728,7 +739,7 @@
+                 payload,
+             })
+         }
+-        FrameKind::StreamAck => decode_ack_payload(reader, limits),
++        FrameKind::StreamAck => decode_ack_payload(reader, limits, false).map(|(frame, _)| frame),
+         FrameKind::StreamRequalifyData => {
+             let stream_id = StreamId(reader.get_u64()?);
+             let probe_id = reader.get_u64()?;
+@@ -913,11 +924,17 @@
+     Ok(())
+ }
+ 
+-fn decode_ack_payload(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<Frame, CodecError> {
++fn decode_ack_payload(
++    reader: &mut Reader<'_>,
++    limits: CodecLimits,
++    allow_relative: bool,
++) -> Result<(Frame, bool), CodecError> {
+     let stream_id = StreamId(reader.get_u64()?);
+     let flags = reader.get_u8()?;
++    let allowed = if allow_relative { 7 } else { 3 };
+     let complete = flags & 1 != 0;
+-    if flags & !3 != 0 {
++    let relative = flags & 4 != 0;
++    if flags & !allowed != 0 || (relative && !complete) {
+         return Err(CodecError::InvalidEnum);
+     }
+     let packed = flags & 2 != 0;
+@@ -948,11 +965,14 @@
+         ranges.push(range);
+         previous_end = end;
+     }
+-    Ok(Frame::StreamAck {
+-        stream_id,
+-        complete,
+-        ranges,
+-    })
++    Ok((
++        Frame::StreamAck {
++            stream_id,
++            complete,
++            ranges,
++        },
++        relative,
++    ))
+ }
+ 
+ fn decode_target(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<TargetAddr, CodecError> {
+@@ -1727,6 +1747,7 @@
+     InvalidPathMetrics,
+     InvalidEnum,
+     InvalidRange,
++    MissingAckBasis,
+     InvalidPort,
+     LengthOverflow,
+ }
+@@ -1762,6 +1783,9 @@
+             Self::InvalidPathMetrics => write!(f, "invalid path metrics"),
+             Self::InvalidEnum => write!(f, "invalid enum value"),
+             Self::InvalidRange => write!(f, "invalid offset range"),
++            Self::MissingAckBasis => {
++                write!(f, "relative STREAM_ACK has no matching complete basis")
++            }
+             Self::InvalidPort => write!(f, "port must be in 1..=65535"),
+             Self::LengthOverflow => write!(f, "frame length overflow"),
+         }
+diff --git a/src/protocol/ack_encoding.rs b/src/protocol/ack_encoding.rs
+new file mode 100644
+--- /dev/null
++++ b/src/protocol/ack_encoding.rs
+@@ -0,0 +1,151 @@
++//! Lossless ACK dictionary scoped to one reliable ordered native direction.
++//! Product always receives the original full Frame, never a relative vector.
++
++use super::*;
++use crate::protocol::frame::{normalize_offset_ranges, offset_ranges_not_covered};
++use std::sync::Arc;
++
++#[derive(Debug)]
++struct AckBasis {
++    stream_id: StreamId,
++    ranges: Vec<OffsetRange>,
++}
++
++fn canonical(ranges: &[OffsetRange]) -> bool {
++    ranges.iter().all(|range| !range.is_empty())
++        && ranges.windows(2).all(|pair| pair[0].end < pair[1].start)
++}
++
++fn basis(frame: &Frame) -> Option<Arc<AckBasis>> {
++    match frame {
++        Frame::StreamAck {
++            stream_id,
++            complete: true,
++            ranges,
++        } if canonical(ranges) => Some(Arc::new(AckBasis {
++            stream_id: *stream_id,
++            ranges: ranges.clone(),
++        })),
++        _ => None,
++    }
++}
++
++fn ack_range_wire_bytes(ranges: &[OffsetRange]) -> usize {
++    let fixed = ranges.len() * 16;
++    packed_ack_ranges_len(ranges).map_or(fixed, |packed| packed.min(fixed))
++}
++
++#[derive(Debug, Clone, Default)]
++pub(crate) struct FrameEncoder {
++    // One vector, not a logical-stream map. Switching complete ACK identity
++    // trades a full frame for bounded lifetime memory.
++    basis: Option<Arc<AckBasis>>,
++}
++
++impl FrameEncoder {
++    /// The caller encodes into a prospective clone, clears its live encoder
++    /// before awaited native writes, and installs the clone only on success.
++    pub(crate) fn encode_frame_into(
++        &mut self,
++        frame: &Frame,
++        limits: CodecLimits,
++        out: &mut Vec<u8>,
++    ) -> Result<(), CodecError> {
++        if let Frame::StreamAck { ranges, .. } = frame {
++            if ranges.len() > limits.max_ack_ranges {
++                return Err(CodecError::TooManyAckRanges {
++                    actual: ranges.len(),
++                    limit: limits.max_ack_ranges,
++                });
++            }
++            if ranges.len() > usize::from(u16::MAX) {
++                return Err(CodecError::LengthOverflow);
++            }
++        }
++        let next_basis = basis(frame);
++        if let (Some(previous), Some(next)) = (&self.basis, &next_basis)
++            && previous.stream_id == next.stream_id
++            && next.ranges.len() <= limits.max_ack_ranges
++            && next.ranges.len() <= usize::from(u16::MAX)
++            && offset_ranges_not_covered(&previous.ranges, &next.ranges).is_empty()
++        {
++            let additions = offset_ranges_not_covered(&next.ranges, &previous.ranges);
++            if additions.len() <= limits.max_ack_ranges
++                && additions.len() <= usize::from(u16::MAX)
++                && ack_range_wire_bytes(&additions) < ack_range_wire_bytes(&next.ranges)
++            {
++                let start = out.len();
++                encode_frame_into(
++                    &Frame::StreamAck {
++                        stream_id: next.stream_id,
++                        complete: true,
++                        ranges: additions,
++                    },
++                    limits,
++                    out,
++                )?;
++                out[start + FRAME_HEADER_LEN + 8] |= 4;
++                self.basis = next_basis;
++                return Ok(());
++            }
++        }
++        encode_frame_into(frame, limits, out)?;
++        if matches!(frame, Frame::StreamAck { complete: true, .. }) {
++            self.basis = next_basis;
++        }
++        Ok(())
++    }
++}
++
++#[derive(Debug, Default)]
++pub(crate) struct FrameDecoder {
++    basis: Option<Arc<AckBasis>>,
++}
++
++impl FrameDecoder {
++    pub(crate) fn decode_frame_bytes(
++        &mut self,
++        bytes: Bytes,
++        limits: CodecLimits,
++    ) -> Result<Frame, CodecError> {
++        let (kind, mut reader) = frame_reader(&bytes, limits)?;
++        if kind != FrameKind::StreamAck {
++            let frame = decode_payload(kind, limits, &mut reader)?;
++            reader.finish()?;
++            return Ok(frame);
++        }
++        let (mut frame, relative) = decode_ack_payload(&mut reader, limits, true)?;
++        reader.finish()?;
++        if relative {
++            let Frame::StreamAck {
++                stream_id, ranges, ..
++            } = &mut frame
++            else {
++                unreachable!()
++            };
++            let previous = self
++                .basis
++                .as_ref()
++                .filter(|previous| previous.stream_id == *stream_id)
++                .ok_or(CodecError::MissingAckBasis)?;
++            if !canonical(ranges) || offset_ranges_not_covered(ranges, &previous.ranges) != *ranges
++            {
++                return Err(CodecError::InvalidRange);
++            }
++            let mut combined = previous.ranges.clone();
++            combined.append(ranges);
++            let combined = normalize_offset_ranges(combined);
++            if combined.len() > limits.max_ack_ranges || combined.len() > usize::from(u16::MAX) {
++                return Err(CodecError::TooManyAckRanges {
++                    actual: combined.len(),
++                    limit: limits.max_ack_ranges.min(usize::from(u16::MAX)),
++                });
++            }
++            *ranges = combined;
++        }
++        if matches!(frame, Frame::StreamAck { complete: true, .. }) {
++            self.basis = basis(&frame);
++        }
++        Ok(frame)
++    }
++}
+diff --git a/src/protocol/tests_ack_encoding.rs b/src/protocol/tests_ack_encoding.rs
+--- a/src/protocol/tests_ack_encoding.rs
++++ b/src/protocol/tests_ack_encoding.rs
+@@ -1,5 +1,153 @@
+ use super::*;
+ 
++fn complete_ack(id: u64, ranges: &[(u64, u64)]) -> Frame {
++    Frame::StreamAck {
++        stream_id: StreamId(id),
++        complete: true,
++        ranges: ranges
++            .iter()
++            .map(|&(start, end)| OffsetRange::new(start, end).unwrap())
++            .collect(),
++    }
++}
++
++#[test]
++fn ordered_ack_dictionary_preserves_full_snapshots_and_interleaved_context() {
++    let mut encoder = FrameEncoder::default();
++    let mut decoder = FrameDecoder::default();
++    let frames = [
++        complete_ack(1, &[(0, 2), (4, 6), (8, 10)]),
++        complete_ack(1, &[(0, 6), (8, 10)]),
++        Frame::Ping { nonce: 1 },
++        complete_ack(1, &[(0, 6), (8, 10)]),
++        Frame::StreamAck {
++            stream_id: StreamId(2),
++            complete: false,
++            ranges: vec![OffsetRange::new(20, 21).unwrap()],
++        },
++        complete_ack(1, &[(0, 10)]),
++        complete_ack(2, &[(0, 4)]),
++        complete_ack(1, &[(0, 12)]),
++        complete_ack(1, &[(0, 2)]),
++        complete_ack(1, &[(4, 6), (0, 2)]),
++        complete_ack(1, &[(0, 8)]),
++    ];
++    let mut relative_count = 0;
++    for frame in frames {
++        let mut wire = Vec::new();
++        encoder
++            .encode_frame_into(&frame, CodecLimits::default(), &mut wire)
++            .unwrap();
++        assert!(wire.len() <= encode_frame(&frame, CodecLimits::default()).unwrap().len());
++        if matches!(frame, Frame::StreamAck { .. }) && wire[FRAME_HEADER_LEN + 8] & 4 != 0 {
++            relative_count += 1;
++            assert_eq!(
++                decode_frame_bytes(Bytes::from(wire.clone()), CodecLimits::default()),
++                Err(CodecError::InvalidEnum)
++            );
++            assert_eq!(
++                decode_frames_bytes(Bytes::from(wire.clone()), CodecLimits::default()),
++                Err(CodecError::InvalidEnum)
++            );
++        }
++        assert_eq!(
++            decoder
++                .decode_frame_bytes(Bytes::from(wire), CodecLimits::default())
++                .unwrap(),
++            frame
++        );
++    }
++    assert!(relative_count >= 2);
++}
++
++#[test]
++fn discarded_encoder_transaction_resynchronizes_without_knowing_peer_progress() {
++    let initial = complete_ack(1, &[(0, 2), (4, 6), (8, 10)]);
++    let pending = complete_ack(1, &[(0, 6), (8, 10)]);
++    let successor = complete_ack(1, &[(0, 10)]);
++    for peer_consumed_pending in [false, true] {
++        let mut encoder = FrameEncoder::default();
++        let mut decoder = FrameDecoder::default();
++        let mut wire = Vec::new();
++        encoder
++            .encode_frame_into(&initial, CodecLimits::default(), &mut wire)
++            .unwrap();
++        decoder
++            .decode_frame_bytes(Bytes::from(wire), CodecLimits::default())
++            .unwrap();
++        let mut prospective = encoder.clone();
++        let mut pending_wire = Vec::new();
++        prospective
++            .encode_frame_into(&pending, CodecLimits::default(), &mut pending_wire)
++            .unwrap();
++        encoder = FrameEncoder::default(); // before awaited write; no successful commit
++        if peer_consumed_pending {
++            assert_eq!(
++                decoder
++                    .decode_frame_bytes(Bytes::from(pending_wire), CodecLimits::default())
++                    .unwrap(),
++                pending
++            );
++        }
++        let mut successor_wire = Vec::new();
++        encoder
++            .encode_frame_into(&successor, CodecLimits::default(), &mut successor_wire)
++            .unwrap();
++        assert_eq!(successor_wire[FRAME_HEADER_LEN + 8] & 4, 0);
++        assert_eq!(
++            decoder
++                .decode_frame_bytes(Bytes::from(successor_wire), CodecLimits::default())
++                .unwrap(),
++            successor
++        );
++    }
++}
++
++#[test]
++fn relative_ack_rejects_missing_basis_overlap_and_expanded_count_without_mutation() {
++    let initial = complete_ack(1, &[(0, 1), (4, 5)]);
++    let next = complete_ack(1, &[(0, 1), (2, 3), (4, 5)]);
++    let mut encoder = FrameEncoder::default();
++    let mut decoder = FrameDecoder::default();
++    let mut first = Vec::new();
++    encoder
++        .encode_frame_into(&initial, CodecLimits::default(), &mut first)
++        .unwrap();
++    decoder
++        .decode_frame_bytes(Bytes::from(first), CodecLimits::default())
++        .unwrap();
++    let mut second = Vec::new();
++    encoder
++        .encode_frame_into(&next, CodecLimits::default(), &mut second)
++        .unwrap();
++    assert_ne!(second[FRAME_HEADER_LEN + 8] & 4, 0);
++    assert_eq!(
++        FrameDecoder::default()
++            .decode_frame_bytes(Bytes::from(second.clone()), CodecLimits::default()),
++        Err(CodecError::MissingAckBasis)
++    );
++    assert!(matches!(
++        decoder.decode_frame_bytes(
++            Bytes::from(second.clone()),
++            CodecLimits {
++                max_ack_ranges: 2,
++                ..CodecLimits::default()
++            }
++        ),
++        Err(CodecError::TooManyAckRanges { actual: 3, .. })
++    ));
++    assert!(matches!(
++        decoder.decode_frame_bytes(packed_wire(7, 1, &[0, 1]), CodecLimits::default()),
++        Err(CodecError::InvalidRange)
++    ));
++    assert_eq!(
++        decoder
++            .decode_frame_bytes(Bytes::from(second), CodecLimits::default())
++            .unwrap(),
++        next
++    );
++}
++
+ #[test]
+ fn fragmented_ack_wire_cost_preserves_complete_snapshot() {
+     let frame = Frame::StreamAck {
+diff --git a/src/transport/encrypted.rs b/src/transport/encrypted.rs
+--- a/src/transport/encrypted.rs
++++ b/src/transport/encrypted.rs
+@@ -8,8 +8,8 @@
+ #[cfg(feature = "lab-diagnostics")]
+ use crate::lab_diagnostics::lab_perf_record;
+ use crate::protocol::codec::{
+-    CodecError, CodecLimits, FRAME_HEADER_LEN, decode_frame_bytes, decode_payload_len_from_header,
+-    encode_frame_into,
++    CodecError, CodecLimits, FRAME_HEADER_LEN, FrameDecoder, FrameEncoder,
++    decode_payload_len_from_header,
+ };
+ use crate::protocol::{Frame, UnderlayProtocol};
+ use bytes::BytesMut;
+@@ -572,11 +572,14 @@
+     limits: CodecLimits,
+     wire_bytes: WireByteCounter,
+     encode_buffer: Vec<u8>,
++    encoder: FrameEncoder,
++    decoder: FrameDecoder,
+ }
+ 
+ struct TlsFramedReader<S> {
+     stream: ReadHalf<TlsStream<CountingIo<S>>>,
+     limits: CodecLimits,
++    decoder: FrameDecoder,
+ }
+ 
+ struct TlsFramedWriter<S> {
+@@ -586,6 +589,7 @@
+     wire_baseline: u64,
+     write_poisoned: bool,
+     encode_buffer: Vec<u8>,
++    encoder: FrameEncoder,
+ }
+ 
+ impl<S> TlsFramedStream<S>
+@@ -610,6 +614,8 @@
+             limits,
+             wire_bytes,
+             encode_buffer: Vec::new(),
++            encoder: FrameEncoder::default(),
++            decoder: FrameDecoder::default(),
+         })
+     }
+ 
+@@ -631,6 +637,8 @@
+             limits,
+             wire_bytes,
+             encode_buffer: Vec::new(),
++            encoder: FrameEncoder::default(),
++            decoder: FrameDecoder::default(),
+         })
+     }
+ 
+@@ -659,10 +667,13 @@
+     ) -> Result<(), EncryptedFramedTransportError> {
+         self.encode_buffer.clear();
+         self.encode_buffer.extend_from_slice(prelude);
++        let mut prospective = self.encoder.clone();
+         for frame in frames {
+-            encode_frame_into(frame, self.limits, &mut self.encode_buffer)?;
++            prospective.encode_frame_into(frame, self.limits, &mut self.encode_buffer)?;
+         }
++        self.encoder = FrameEncoder::default();
+         self.stream.write_all(&self.encode_buffer).await?;
++        self.encoder = prospective;
+         Ok(())
+     }
+ 
+@@ -675,7 +686,7 @@
+     }
+ 
+     async fn read_frame(&mut self) -> Result<Frame, EncryptedFramedTransportError> {
+-        read_tls_frame_from(&mut self.stream, self.limits).await
++        read_tls_frame_from(&mut self.stream, self.limits, &mut self.decoder).await
+     }
+ 
+     async fn write_frames(
+@@ -687,6 +698,7 @@
+             self.limits,
+             frames,
+             &mut self.encode_buffer,
++            &mut self.encoder,
+             None,
+         )
+         .await
+@@ -703,6 +715,7 @@
+             TlsFramedReader {
+                 stream: reader,
+                 limits: self.limits,
++                decoder: self.decoder,
+             },
+             TlsFramedWriter {
+                 stream: writer,
+@@ -711,6 +724,7 @@
+                 wire_baseline: baseline,
+                 write_poisoned: false,
+                 encode_buffer: Vec::new(),
++                encoder: self.encoder,
+             },
+         )
+     }
+@@ -721,7 +735,7 @@
+     S: AsyncRead + AsyncWrite + Unpin,
+ {
+     async fn read_frame(&mut self) -> Result<Frame, EncryptedFramedTransportError> {
+-        read_tls_frame_from(&mut self.stream, self.limits).await
++        read_tls_frame_from(&mut self.stream, self.limits, &mut self.decoder).await
+     }
+ }
+ 
+@@ -745,6 +759,7 @@
+             self.limits,
+             frames,
+             &mut self.encode_buffer,
++            &mut self.encoder,
+             Some(&mut self.write_poisoned),
+         )
+         .await
+@@ -773,6 +788,7 @@
+ async fn read_tls_frame_from<R>(
+     stream: &mut R,
+     limits: CodecLimits,
++    decoder: &mut FrameDecoder,
+ ) -> Result<Frame, EncryptedFramedTransportError>
+ where
+     R: AsyncRead + Unpin,
+@@ -789,7 +805,7 @@
+     encoded.extend_from_slice(&header);
+     encoded.resize(frame_len, 0);
+     stream.read_exact(&mut encoded[FRAME_HEADER_LEN..]).await?;
+-    let frame = decode_frame_bytes(encoded.freeze(), limits)?;
++    let frame = decoder.decode_frame_bytes(encoded.freeze(), limits)?;
+     #[cfg(feature = "lab-diagnostics")]
+     lab_perf_record(
+         "transport.tcp.tls_read_frame_total",
+@@ -804,6 +820,7 @@
+     limits: CodecLimits,
+     frames: &[Frame],
+     encode_buffer: &mut Vec<u8>,
++    encoder: &mut FrameEncoder,
+     mut write_poisoned: Option<&mut bool>,
+ ) -> Result<(), EncryptedFramedTransportError>
+ where
+@@ -815,13 +832,16 @@
+     #[cfg(feature = "lab-diagnostics")]
+     let total_started = std::time::Instant::now();
+     encode_buffer.clear();
++    let mut prospective = encoder.clone();
+     for frame in frames {
+-        encode_frame_into(frame, limits, encode_buffer)?;
++        prospective.encode_frame_into(frame, limits, encode_buffer)?;
+     }
++    *encoder = FrameEncoder::default();
+     if let Some(poisoned) = write_poisoned.as_deref_mut() {
+         *poisoned = true;
+     }
+     stream.write_all(encode_buffer).await?;
++    *encoder = prospective;
+     if let Some(poisoned) = write_poisoned {
+         *poisoned = false;
+     }
+@@ -858,6 +878,7 @@
+     plaintext: Vec<u8>,
+     plaintext_offset: usize,
+     poisoned: bool,
++    decoder: FrameDecoder,
+ }
+ 
+ impl NoiseReadState {
+@@ -869,6 +890,7 @@
+             plaintext: Vec::new(),
+             plaintext_offset: 0,
+             poisoned: false,
++            decoder: FrameDecoder::default(),
+         }
+     }
+ }
+@@ -878,6 +900,7 @@
+     length_key: [u8; 32],
+     wire: Vec<u8>,
+     poisoned: bool,
++    encoder: FrameEncoder,
+ }
+ 
+ impl NoiseWriteState {
+@@ -887,6 +910,7 @@
+             length_key,
+             wire: Vec::new(),
+             poisoned: false,
++            encoder: FrameEncoder::default(),
+         }
+     }
+ }
+@@ -1019,16 +1043,20 @@
+     ) -> Result<(), EncryptedFramedTransportError> {
+         self.encode_buffer.clear();
+         self.encode_buffer.extend_from_slice(prelude);
++        let mut prospective = self.write.encoder.clone();
+         for frame in frames {
+-            encode_frame_into(frame, self.limits, &mut self.encode_buffer)?;
++            prospective.encode_frame_into(frame, self.limits, &mut self.encode_buffer)?;
+         }
++        self.write.encoder = FrameEncoder::default();
+         write_noise_plaintext(
+             &mut self.stream,
+             &self.transport,
+             &mut self.write,
+             &self.encode_buffer,
+         )
+-        .await
++        .await?;
++        self.write.encoder = prospective;
++        Ok(())
+     }
+ 
+     /// Reads the one fixed encrypted admission prelude without exposing a
+@@ -1910,7 +1938,7 @@
+     encoded.extend_from_slice(&header);
+     encoded.resize(frame_len, 0);
+     read_noise_exact(stream, transport, read, &mut encoded[FRAME_HEADER_LEN..]).await?;
+-    let frame = decode_frame_bytes(encoded.freeze(), limits)?;
++    let frame = read.decoder.decode_frame_bytes(encoded.freeze(), limits)?;
+     #[cfg(feature = "lab-diagnostics")]
+     lab_perf_record(
+         "transport.tcp.noise_read_frame_total",
+@@ -1937,10 +1965,13 @@
+     #[cfg(feature = "lab-diagnostics")]
+     let total_started = std::time::Instant::now();
+     encode_buffer.clear();
++    let mut prospective = write.encoder.clone();
+     for frame in frames {
+-        encode_frame_into(frame, limits, encode_buffer)?;
++        prospective.encode_frame_into(frame, limits, encode_buffer)?;
+     }
++    write.encoder = FrameEncoder::default();
+     write_noise_plaintext(stream, transport, write, encode_buffer).await?;
++    write.encoder = prospective;
+     #[cfg(feature = "lab-diagnostics")]
+     lab_perf_record(
+         "transport.tcp.noise_write_frames_total",
+diff --git a/src/transport/quic/stream.rs b/src/transport/quic/stream.rs
+--- a/src/transport/quic/stream.rs
++++ b/src/transport/quic/stream.rs
+@@ -6,7 +6,7 @@
+ #[cfg(feature = "lab-diagnostics")]
+ use crate::lab_diagnostics::lab_perf_record;
+ use crate::protocol::codec::{
+-    CodecLimits, decode_frame_bytes, encode_frame_into, encoded_frame_capacity_hint,
++    CodecLimits, FrameDecoder, FrameEncoder, decode_frame_bytes, encoded_frame_capacity_hint,
+ };
+ use crate::protocol::{DatagramFlowId, Frame, IpTunnelId};
+ use bytes::{Bytes, BytesMut};
+@@ -19,6 +19,7 @@
+ 
+ #[derive(Debug)]
+ pub struct SendStream {
++    pub(super) encoder: FrameEncoder,
+     pub(super) stream: H3SendStream,
+     pub(super) connection: quinn::Connection,
+     pub(super) request_stream_id: quinn::StreamId,
+@@ -120,6 +121,7 @@
+ 
+ #[derive(Debug)]
+ pub struct RecvStream {
++    decoder: FrameDecoder,
+     pub(super) stream: H3RecvStream,
+     pub(super) native: NativeDatagramReceiver,
+     pub(super) known_datagram_flows: Arc<Mutex<DatagramFlowRegistry>>,
+@@ -620,8 +622,9 @@
+         total.saturating_add(quic_encoded_frame_capacity_hint(frame))
+     });
+     packet.reserve(capacity_hint);
++    let mut prospective = send.encoder.clone();
+     for frame in frames {
+-        encode_quic_length_prefixed_frame(frame, limits, &mut packet)?;
++        encode_quic_length_prefixed_frame(frame, limits, &mut packet, &mut prospective)?;
+     }
+     let packet_len = packet.len() as u64;
+     #[cfg(feature = "lab-diagnostics")]
+@@ -637,7 +640,9 @@
+         send.telemetry.record_write_activity();
+     }
+     let _transaction = QuicWriteTransaction::new(send.write_backlog.clone(), packet_len);
++    send.encoder = FrameEncoder::default();
+     send.stream.send_data(Bytes::from(packet)).await?;
++    send.encoder = prospective;
+     #[cfg(feature = "lab-diagnostics")]
+     lab_perf_record(
+         "transport.quic.write_frames_wait",
+@@ -662,6 +667,7 @@
+     frame: &Frame,
+     limits: CodecLimits,
+     packet: &mut Vec<u8>,
++    encoder: &mut FrameEncoder,
+ ) -> Result<(), QuicCarrierError> {
+     let Frame::StreamData {
+         stream_id,
+@@ -669,11 +675,11 @@
+         payload,
+     } = frame
+     else {
+-        return encode_length_prefixed_frame(frame, limits, packet);
++        return encode_length_prefixed_frame(frame, limits, packet, encoder);
+     };
+ 
+     if payload.len() <= QUIC_STREAM_RECORD_PAYLOAD_BYTES {
+-        return encode_length_prefixed_frame(frame, limits, packet);
++        return encode_length_prefixed_frame(frame, limits, packet, encoder);
+     }
+ 
+     let mut cursor = 0usize;
+@@ -686,7 +692,7 @@
+             offset: offset.saturating_add(cursor as u64),
+             payload: payload.slice(cursor..next),
+         };
+-        encode_length_prefixed_frame(&split, limits, packet)?;
++        encode_length_prefixed_frame(&split, limits, packet, encoder)?;
+         cursor = next;
+     }
+     Ok(())
+@@ -696,11 +702,12 @@
+     frame: &Frame,
+     limits: CodecLimits,
+     packet: &mut Vec<u8>,
++    encoder: &mut FrameEncoder,
+ ) -> Result<(), QuicCarrierError> {
+     let len_offset = packet.len();
+     packet.extend_from_slice(&[0u8; FRAME_LEN_BYTES]);
+     let frame_start = packet.len();
+-    encode_frame_into(frame, limits, packet)?;
++    encoder.encode_frame_into(frame, limits, packet)?;
+     let frame_len = packet.len().saturating_sub(frame_start);
+     let frame_len = u32::try_from(frame_len).map_err(|_| QuicCarrierError::FrameTooLarge)?;
+     packet[len_offset..len_offset + FRAME_LEN_BYTES].copy_from_slice(&frame_len.to_be_bytes());
+@@ -727,6 +734,7 @@
+             known_ip_tunnel,
+             read_buffer: BytesMut::new(),
+             pending_h3_data: Bytes::new(),
++            decoder: FrameDecoder::default(),
+             deferred_native: VecDeque::new(),
+             deferred_native_bytes: 0,
+             max_deferred_native_bytes: max_deferred_native_bytes.max(1),
+@@ -762,7 +770,7 @@
+         }
+         let _ = self.read_buffer.split_to(FRAME_LEN_BYTES);
+         let encoded = self.read_buffer.split_to(len).freeze();
+-        let frame = decode_frame_bytes(encoded, limits)?;
++        let frame = self.decoder.decode_frame_bytes(encoded, limits)?;
+         self.accept_reliable_frame(frame)
+     }
+ 
+@@ -770,7 +778,9 @@
+         &mut self,
+         limits: CodecLimits,
+     ) -> Result<Option<Frame>, QuicCarrierError> {
+-        let Some(frame) = decode_ready_h3_frame(&mut self.pending_h3_data, limits)? else {
++        let Some(frame) =
++            decode_ready_h3_frame(&mut self.pending_h3_data, limits, &mut self.decoder)?
++        else {
+             return Ok(None);
+         };
+         self.accept_reliable_frame(frame)
+@@ -953,6 +963,7 @@
+ fn decode_ready_h3_frame(
+     pending: &mut Bytes,
+     limits: CodecLimits,
++    decoder: &mut FrameDecoder,
+ ) -> Result<Option<Frame>, QuicCarrierError> {
+     if pending.len() < FRAME_LEN_BYTES {
+         return Ok(None);
+@@ -967,7 +978,7 @@
+     }
+ 
+     let record = pending.split_to(record_len);
+-    let frame = decode_frame_bytes(record.slice(FRAME_LEN_BYTES..), limits)?;
++    let frame = decoder.decode_frame_bytes(record.slice(FRAME_LEN_BYTES..), limits)?;
+     let Frame::StreamData {
+         stream_id,
+         offset,
+diff --git a/src/transport/quic/endpoint.rs b/src/transport/quic/endpoint.rs
+--- a/src/transport/quic/endpoint.rs
++++ b/src/transport/quic/endpoint.rs
+@@ -334,6 +334,7 @@
+         Ok((
+             SendStream {
+                 stream: stream.send,
++                encoder: Default::default(),
+                 connection: self.connection.clone(),
+                 request_stream_id,
+                 native: native_send,
+@@ -367,6 +368,7 @@
+         Ok((
+             SendStream {
+                 stream: stream.send,
++                encoder: Default::default(),
+                 connection: self.connection.clone(),
+                 request_stream_id,
+                 native: native_send,
+diff --git a/src/transport/tests_encrypted.rs b/src/transport/tests_encrypted.rs
+--- a/src/transport/tests_encrypted.rs
++++ b/src/transport/tests_encrypted.rs
+@@ -7,6 +7,94 @@
+ use std::task::{Context, Poll};
+ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, duplex};
+ 
++#[tokio::test]
++async fn repeated_complete_ack_wire_cost_remains_delta_sized() {
++    use crate::protocol::OffsetRange;
++
++    let frames: Vec<_> = (1u64..=200)
++        .map(|prefix_blocks| {
++            let ranges =
++                std::iter::once(OffsetRange::new(0, (prefix_blocks - 1) * 2000 + 1000).unwrap())
++                    .chain(
++                        (prefix_blocks..200)
++                            .map(|i| OffsetRange::new(i * 2000, i * 2000 + 1000).unwrap()),
++                    )
++                    .collect();
++            Frame::StreamAck {
++                stream_id: StreamId(7),
++                complete: true,
++                ranges,
++            }
++        })
++        .collect();
++    let mut measured = Vec::new();
++    for (name, (client, server)) in [
++        ("TLS", connected_pair(16 * 1024).await),
++        ("Noise", transport_secret_pair(16 * 1024).await),
++    ] {
++        let (_, mut writer) = client.split().unwrap();
++        let (mut reader, _) = server.split().unwrap();
++        let send = async {
++            writer.write_frames(&frames).await.unwrap();
++            writer.flush().await.unwrap();
++            writer.wire_bytes_written()
++        };
++        let receive = async {
++            for frame in &frames {
++                assert_eq!(reader.read_frame().await.unwrap(), *frame);
++            }
++        };
++        let (bytes, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
++            tokio::join!(send, receive)
++        })
++        .await
++        .expect("bounded complete ACK transfer");
++        measured.push((name, bytes));
++    }
++    eprintln!("complete ACK sequence protected wire bytes: {measured:?}");
++    assert!(
++        measured.iter().all(|(_, bytes)| *bytes < 16 * 1024),
++        "repeated snapshot wire cost: {measured:?}"
++    );
++}
++
++#[tokio::test]
++async fn protected_stream_split_preserves_directional_ack_basis() {
++    use crate::protocol::OffsetRange;
++    let base_ranges: Vec<_> = (0..100)
++        .map(|i| OffsetRange::new(i * 2000, i * 2000 + 1000).unwrap())
++        .collect();
++    let base = Frame::StreamAck {
++        stream_id: StreamId(7),
++        complete: true,
++        ranges: base_ranges,
++    };
++    let mut next_ranges = vec![OffsetRange::new(0, 3000).unwrap()];
++    next_ranges.extend((2..100).map(|i| OffsetRange::new(i * 2000, i * 2000 + 1000).unwrap()));
++    let next = Frame::StreamAck {
++        stream_id: StreamId(7),
++        complete: true,
++        ranges: next_ranges,
++    };
++    for (mut client, mut server) in [
++        connected_pair(4096).await,
++        transport_secret_pair(4096).await,
++    ] {
++        let (sent, received) = tokio::join!(client.write_frame(&base), server.read_frame());
++        sent.unwrap();
++        assert_eq!(received.unwrap(), base);
++        let (_, mut writer) = client.split().unwrap();
++        let (mut reader, _) = server.split().unwrap();
++        let (sent, received) = tokio::join!(writer.write_frame(&next), reader.read_frame());
++        sent.unwrap();
++        assert_eq!(received.unwrap(), next);
++        assert!(
++            writer.wire_bytes_written() < 256,
++            "splitting discarded the compression basis"
++        );
++    }
++}
++
+ async fn connected_pair(
+     capacity: usize,
+ ) -> (
+diff --git a/src/transport/quic/tests_stream.rs b/src/transport/quic/tests_stream.rs
+--- a/src/transport/quic/tests_stream.rs
++++ b/src/transport/quic/tests_stream.rs
+@@ -21,6 +21,7 @@
+         },
+         limits,
+         &mut packet,
++        &mut FrameEncoder::default(),
+     )
+     .expect("encode split stream data");
+ 
+@@ -63,8 +64,10 @@
+ 
+ fn encoded_h3_records(frames: &[Frame], limits: CodecLimits) -> Bytes {
+     let mut packet = Vec::new();
++    let mut encoder = FrameEncoder::default();
+     for frame in frames {
+-        encode_length_prefixed_frame(frame, limits, &mut packet).expect("encode H3 record");
++        encode_length_prefixed_frame(frame, limits, &mut packet, &mut encoder)
++            .expect("encode H3 record");
+     }
+     Bytes::from(packet)
+ }
+@@ -86,7 +89,7 @@
+     let payload_start = FRAME_LEN_BYTES + encoded_frame_len - payload.len();
+     let encoded_payload_ptr = pending.slice(payload_start..).as_ptr();
+ 
+-    let decoded = decode_ready_h3_frame(&mut pending, limits)
++    let decoded = decode_ready_h3_frame(&mut pending, limits, &mut FrameDecoder::default())
+         .expect("decode ready record")
+         .expect("complete record");
+     let Frame::StreamData {
+@@ -129,7 +132,8 @@
+     );
+ 
+     assert_eq!(
+-        decode_ready_h3_frame(&mut pending, limits).expect("decode ready batch"),
++        decode_ready_h3_frame(&mut pending, limits, &mut FrameDecoder::default())
++            .expect("decode ready batch"),
+         Some(Frame::StreamData {
+             stream_id: StreamId(9),
+             offset: 100,
+@@ -166,12 +170,14 @@
+             payload: Bytes::from_static(b"abc"),
+         };
+         let mut pending = encoded_h3_records(&[first.clone(), boundary.clone()], limits);
++        let mut decoder = FrameDecoder::default();
+         assert_eq!(
+-            decode_ready_h3_frame(&mut pending, limits).expect("decode first record"),
++            decode_ready_h3_frame(&mut pending, limits, &mut decoder).expect("decode first record"),
+             Some(first)
+         );
+         assert_eq!(
+-            decode_ready_h3_frame(&mut pending, limits).expect("decode preserved boundary"),
++            decode_ready_h3_frame(&mut pending, limits, &mut decoder)
++                .expect("decode preserved boundary"),
+             Some(boundary)
+         );
+         assert!(pending.is_empty());
+@@ -198,13 +204,14 @@
+             payload: Bytes::from_static(b"de"),
+         };
+         let mut pending = encoded_h3_records(&[first.clone(), second.clone()], bounded_limits);
++        let mut decoder = FrameDecoder::default();
+         assert_eq!(
+-            decode_ready_h3_frame(&mut pending, bounded_limits)
++            decode_ready_h3_frame(&mut pending, bounded_limits, &mut decoder)
+                 .expect("decode frame below aggregate limit"),
+             Some(first)
+         );
+         assert_eq!(
+-            decode_ready_h3_frame(&mut pending, bounded_limits)
++            decode_ready_h3_frame(&mut pending, bounded_limits, &mut decoder)
+                 .expect("decode record preserved by aggregate limit"),
+             Some(second)
+         );
+@@ -213,6 +220,44 @@
+ }
+ 
+ #[test]
++fn ready_h3_ack_basis_advances_only_when_record_is_consumed() {
++    use crate::protocol::OffsetRange;
++    let first_ack = Frame::StreamAck {
++        stream_id: StreamId(1),
++        complete: true,
++        ranges: vec![
++            OffsetRange::new(0, 2).unwrap(),
++            OffsetRange::new(4, 6).unwrap(),
++            OffsetRange::new(8, 10).unwrap(),
++        ],
++    };
++    let next_ack = Frame::StreamAck {
++        stream_id: StreamId(1),
++        complete: true,
++        ranges: vec![
++            OffsetRange::new(0, 6).unwrap(),
++            OffsetRange::new(8, 10).unwrap(),
++        ],
++    };
++    let data = Frame::StreamData {
++        stream_id: StreamId(2),
++        offset: 0,
++        payload: Bytes::from_static(b"abc"),
++    };
++    let frames = [first_ack, data, next_ack];
++    let limits = CodecLimits::default();
++    let mut pending = encoded_h3_records(&frames, limits);
++    let mut decoder = FrameDecoder::default();
++    for frame in frames {
++        assert_eq!(
++            decode_ready_h3_frame(&mut pending, limits, &mut decoder).unwrap(),
++            Some(frame)
++        );
++    }
++    assert!(pending.is_empty());
++}
++
++#[test]
+ fn native_flow_registry_bounds_live_state_without_exhausting_on_churn() {
+     let target = TargetAddr::Ip("127.0.0.1:53".parse().expect("target"));
+     let mut registry = DatagramFlowRegistry::new(2);
+@@ -961,6 +1006,28 @@
+ 
+ #[tokio::test]
+ async fn quic_carrier_batches_multiple_product_frames_per_write() {
++    use crate::protocol::OffsetRange;
++    let ack = |ranges: &[(u64, u64)]| Frame::StreamAck {
++        stream_id: StreamId(7),
++        complete: true,
++        ranges: ranges
++            .iter()
++            .map(|&(a, b)| OffsetRange::new(a, b).unwrap())
++            .collect(),
++    };
++    let frames = vec![
++        Frame::Ping { nonce: 1 },
++        Frame::Pong { nonce: 2 },
++        ack(&[(0, 2), (4, 6), (8, 10)]),
++        Frame::StreamData {
++            stream_id: StreamId(8),
++            offset: 0,
++            payload: Bytes::from_static(b"abc"),
++        },
++        ack(&[(0, 6), (8, 10)]),
++        ack(&[(0, 6), (8, 10), (12, 14)]),
++    ];
++    let expected = frames.clone();
+     let limits = CodecLimits::default();
+     let mux_limits = MuxLimits::default();
+     let server = Endpoint::bind_server(
+@@ -975,14 +1042,14 @@
+     let server_task = tokio::spawn(async move {
+         let connection = server.accept().await.expect("accepted connection");
+         let (_send, mut recv) = connection.accept_bi().await.expect("accepted stream");
+-        assert_eq!(
+-            read_frame(&mut recv, limits).await.expect("read first"),
+-            Frame::Ping { nonce: 1 }
+-        );
+-        assert_eq!(
+-            read_frame(&mut recv, limits).await.expect("read second"),
+-            Frame::Pong { nonce: 2 }
+-        );
++        for frame in expected {
++            assert_eq!(
++                read_frame(&mut recv, limits)
++                    .await
++                    .expect("read exact batch frame"),
++                frame
++            );
++        }
+     });
+ 
+     let client = Endpoint::bind_client(
+@@ -995,13 +1062,12 @@
+     .expect("client endpoint");
+     let connection = client.connect(server_addr).await.expect("client connect");
+     let (mut send, _recv) = connection.open_bi().await.expect("client stream");
+-    write_frames(
+-        &mut send,
+-        &[Frame::Ping { nonce: 1 }, Frame::Pong { nonce: 2 }],
+-        limits,
+-    )
+-    .await
+-    .expect("client write batch");
++    write_frames(&mut send, &frames[..frames.len() - 1], limits)
++        .await
++        .expect("client write batch");
++    write_frame(&mut send, frames.last().unwrap(), limits)
++        .await
++        .expect("next batch keeps basis");
+     finish_stream(&mut send)
+         .await
+         .expect("client finish stream");
+diff --git a/RFC.md b/RFC.md
+--- a/RFC.md
++++ b/RFC.md
+@@ -2542,8 +2542,8 @@
+ Each fixed `ranges[range_count]` entry is `start:u64, end:u64` and represents
+ `[start, end)`. `start` MUST be less than `end`.
+ 
+-For `STREAM_ACK`, flags bit0 is `complete`; bit1 selects packed ranges.
+-All other bits MUST be zero.
++For `STREAM_ACK`, flags bit0 is `complete`; bit1 selects packed ranges; bit2
++selects an ordered-transport relative snapshot. All other bits MUST be zero.
+ Fixed independent ranges retain arbitrary order and overlap for
+ subsequent Product validation and normalization. In packed form each entry is
+ `gap:varuint64, length:varuint64`: `start = previous_end + gap`,
+@@ -2559,5 +2559,34 @@
+ is less than16 times the range count. Otherwise use fixed form. The two forms
+ have the same header size and range-count limit. Packing itself uses no state
+ from another frame.
++
++An encrypted TCP direction or an HTTP/3 request-stream direction MAY retain
++one complete canonical ACK basis, containing its logical stream ID and range
++vector. Canonical vectors are ordered with strictly separated, non-empty
++ranges. An independent canonical complete ACK replaces the basis; an
++independent noncanonical complete ACK clears it. Other frames, including
++partial ACKs, do not change it. No per-logical-stream dictionary map or
++lifetime ACK history is required. New native streams start without a basis;
++splitting a native stream MUST transfer, not reset, its directional basis.
++
++A relative ACK MUST be complete and name the same logical stream as the
++retained basis. Its encoded ranges are canonical positive additions disjoint
++from that basis. The decoder forms their normalized union, checks the expanded
++range count against the same configured limit and u16 bound, and emits the
++identical full `STREAM_ACK` before any Product processing or ingress coalescing.
++The reconstructed canonical vector becomes the next basis. Missing/mismatched
++bases and invalid additions MUST be rejected without basis mutation. Stateless
++decoders and native datagrams MUST NOT accept relative ACKs. Relative encoding
++does not alter Section8.3 negative-gap authority or feedback publication.
++
++Senders MUST use relative encoding only when it reconstructs exactly the
++original complete vector and is smaller than its independent representation.
++They prepare dictionary changes privately, clear the live encoder basis before
++an awaited native write, and install the prepared basis only after success.
++An uncertain write therefore forces the next ACK to be independent if that
++native stream remains usable. This does not relax native framing, cancellation
++or failure semantics. Decoders advance the basis only for a consumed complete
++record, never speculative read-ahead. Interleaved logical streams can cause
++independent full frames; they MUST NOT cause a growing dictionary.
+ 
+ A target begins with a type:

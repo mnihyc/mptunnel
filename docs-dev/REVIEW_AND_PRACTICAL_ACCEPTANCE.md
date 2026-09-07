@@ -7,6 +7,16 @@ an old OPEN label is not a newly found bug.
 
 ## Current verdict and fixed priority
 
+**Current pruning verdict:** CHANGE_DISPOSITION_20260907 supersedes the older
+"held" wording for inclusion decisions. The test-only static scorer/ranker is
+removed (11a68f9), as is optional stateful relative ACK encoding. Its exact
+former source is archived, not left active. Keep the evidence-backed native,
+qualification, wake/service, repair, stateless-packing and terminal mechanisms
+for the listed concrete benefits and costs. This is not a performance pass;
+negative ordinary results remain explicit. After pruning,29 timing controls
+and67 codec/transport/lifetime controls pass. The next ordinary comparison
+must use the new composition, not reuse rates from the earlier frozen binary.
+
 **Requested retrospective:** PERFORMANCE_REFLECTION_20260907 records the
 explicit benefit/cost verdict for the recent work. The held repair candidate
 introduced its own terminal-retention defect; its correction is not proof of

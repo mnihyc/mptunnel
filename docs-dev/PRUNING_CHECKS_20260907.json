@@ -1,0 +1,49 @@
+{
+  "date_utc": "2026-09-07",
+  "scope": "Current pruned composition; targeted existing tests, not performance acceptance",
+  "prototype_removal": {
+    "commit": "11a68f9",
+    "command": "CARGO_TARGET_DIR=./target cargo test --release --locked --features lab-diagnostics --lib timing -j3",
+    "result": "29 passed; 0 failed; 3m15s compilation; 0.00s tests",
+    "runtime_effect": "Removed only test-only scoring/ranking prototype; live timing types retained"
+  },
+  "after_relative_removal_build": {
+    "command": "CARGO_TARGET_DIR=./target cargo test --release --locked --features lab-diagnostics --lib --no-run -j3",
+    "result": "success; 3m09s; no compiler warnings"
+  },
+  "retained_codec_transport_and_terminal": {
+    "cmd": "target/release/deps/mptunnel-3a813700b0d8f97b --test-threads=3 protocol::codec::tests runtime::path::quic::client::tests::repair_ runtime::path::quic::repair_binding::tests repair_split_keeps_existing_capacity_and_cancellation_charges product_recipient server_terminal_reconciliation split_writer_single_head_transaction_is_profile_neutral tls13_carrier_round_trips_duplex_frames_and_batches abrupt_protected_truncation_is_not_reported_as_a_protocol_frame noise_record_boundaries_are_invisible_to_large_mpp_frames noise_rekeys_both_directions_during_full_duplex_traffic protected_wire_counter_excludes_handshake_and_advances_on_frame_write ready_h3_stream_data_ quic_carrier_round_trips_product_frames quic_carrier_batches_multiple_product_frames_per_write cancelled_h3_request_write_retires_only_that_request_stream stopped_quic_stream_write_keeps_the_shared_connection_available quic_stream_limit_is_independent_from_receive_window_ratio",
+    "result": {
+      "chunk_id": "c51e17",
+      "wall_time_seconds": 0.00000405,
+      "exit_code": 0,
+      "original_token_count": 1658,
+      "output": "\nrunning 67 tests\ntest protocol::codec::tests::codec_rejects_oversize_payloads_and_ack_ranges ... ok\ntest protocol::codec::tests::control_frames_round_trip_auth_and_path_metrics ... ok\ntest protocol::codec::tests::credential_ids_are_bounded_canonical_wire_names ... ok\ntest protocol::codec::tests::datagram_flow_uses_compact_flow_id_after_open ... ok\ntest protocol::codec::tests::decoder_rejects_old_frames_after_v13_wire_cut ... ok\ntest protocol::codec::tests::decoder_rejects_trailing_bytes ... ok\ntest protocol::codec::tests::decoder_rejects_unknown_path_usage ... ok\ntest protocol::codec::tests::encoder_rejects_zero_port_ip_targets ... ok\ntest protocol::codec::tests::ip_tunnel_frames_round_trip_without_transport_semantics ... ok\ntest protocol::codec::tests::ip_tunnel_ready_rejects_duplicate_families_and_invalid_mtu ... ok\ntest protocol::codec::tests::open_stream_creation_and_enrollment_have_distinct_wire_authority ... ok\ntest protocol::codec::tests::open_stream_v13_canonically_carries_return_plan ... ok\ntest protocol::codec::tests::owned_decode_slices_payloads_without_copying ... ok\ntest protocol::codec::tests::owned_single_frame_decode_slices_payload_without_copying ... ok\ntest protocol::codec::tests::path_capacity_protocol_round_trips_without_product_stream_identity ... ok\ntest protocol::codec::tests::path_join_has_stable_canonical_layout ... ok\ntest protocol::codec::tests::path_metrics_v11_presence_bits_distinguish_absence_from_observed_zero ... ok\ntest protocol::codec::tests::path_metrics_v11_rate_authority_budget_is_bounded_canonically ... ok\ntest protocol::codec::tests::path_usage_round_trips_with_sequence_bounds ... ok\ntest protocol::codec::tests::peer_native_delivery_counter_distinguishes_absence_zero_and_both_directions ... ok\ntest protocol::codec::tests::peer_status_count_is_bounded_before_allocation ... ok\ntest protocol::codec::tests::peer_status_decoder_rejects_invalid_enums ... ok\ntest protocol::codec::tests::peer_status_decoder_rejects_paths_on_non_ok_response ... ok\ntest protocol::codec::tests::peer_status_encoder_rejects_paths_on_non_ok_response ... ok\ntest protocol::codec::tests::peer_status_frames_round_trip_with_bounded_fixed_entries ... ok\ntest protocol::codec::tests::peer_status_response_limit_follows_the_configured_frame_size ... ok\ntest protocol::codec::tests::provisional_path_join_without_configured_slot_fails_closed ... ok\ntest protocol::codec::tests::repair_open_roundtrip_has_only_exact_parent_and_product_identity ... ok\ntest protocol::codec::tests::stream_data_decoder_rejects_offset_extent_overflow ... ok\ntest protocol::codec::tests::stream_data_encoder_rejects_offset_extent_overflow ... ok\ntest protocol::codec::tests::stream_frames_round_trip ... ok\ntest protocol::codec::tests::stream_return_plan_enums_reject_noncanonical_wire_values ... ok\ntest protocol::codec::tests::stream_return_plan_final_obeys_path_limit_and_exact_length ... ok\ntest protocol::codec::tests::stream_return_plan_final_v13_has_canonical_kind_and_count ... ok\ntest protocol::codec::tests_ack_encoding::ack_encoding_roundtrip_keeps_full_u64_extent_order_and_overlap ... ok\ntest protocol::codec::tests_ack_encoding::ack_packed_decoder_enforces_integer_range_and_count_bounds ... ok\ntest protocol::codec::tests_ack_encoding::ack_packed_frame_limit_is_actual_wire_size_and_range_count_still_applies ... ok\ntest protocol::codec::tests_ack_encoding::fragmented_ack_wire_cost_preserves_complete_snapshot ... ok\ntest runtime::path::queue::tests::repair_split_keeps_existing_capacity_and_cancellation_charges ... ok\ntest protocol::codec::tests::peer_status_encoder_rejects_count_overflow ... ok\ntest runtime::path::quic::client::tests::repair_companion_is_bidirectional_survives_half_close_and_fails_only_attachment ... ok\ntest runtime::path::quic::client::tests::repair_graceful_response_eof_preserves_request_half_and_ordinary_terminal ... ok\ntest runtime::path::quic::client_writer::tests::quic_write_interlock_closed_product_recipient_is_retired_input ... ok\ntest runtime::path::quic::client_writer::tests::quic_write_interlock_pending_product_recipient_retires_without_error ... ok\ntest runtime::path::quic::repair_binding::tests::repair_binding_cancellation_cannot_reach_a_replacement ... ok\ntest runtime::path::quic::repair_binding::tests::repair_binding_cancelled_claim_returns_child_without_leaking_entry ... ok\ntest runtime::path::quic::repair_binding::tests::repair_binding_claim_is_exact_once_and_connection_local ... ok\ntest runtime::path::quic::client::tests::repair_pair_cancellation_returns_partially_allocated_native_credit ... ok\ntest runtime::relay::server::tests::server_terminal_reconciliation_after_final_ack_capacity ... ok\ntest runtime::relay::server::tests::server_terminal_reconciliation_fin_after_last_detach ... ok\ntest runtime::relay::server::tests::server_terminal_reconciliation_fin_before_last_detach ... ok\ntest transport::encrypted::tests::abrupt_protected_truncation_is_not_reported_as_a_protocol_frame ... ok\ntest transport::encrypted::tests::noise_record_boundaries_are_invisible_to_large_mpp_frames ... ok\ntest transport::encrypted::tests::noise_rekeys_both_directions_during_full_duplex_traffic ... ok\ntest transport::encrypted::tests::protected_wire_counter_excludes_handshake_and_advances_on_frame_write ... ok\ntest transport::encrypted::tests::split_writer_single_head_transaction_is_profile_neutral ... ok\ntest transport::encrypted::tests::tls13_carrier_round_trips_duplex_frames_and_batches ... ok\ntest transport::quic::endpoint::tests::quic_stream_limit_is_independent_from_receive_window_ratio ... ok\ntest protocol::codec::tests_ack_encoding::ack_encoding_wide_fragmentation_keeps_every_snapshot_and_size_bound ... ok\ntest runtime::path::quic::server_stream::tests::client_quic_closed_product_recipient_preserves_ordered_terminal_writer ... ok\ntest transport::quic::stream::tests::cancelled_h3_request_write_retires_only_that_request_stream ... ok\ntest transport::quic::stream::tests::ready_h3_stream_data_coalesces_adjacent_records_from_one_chunk ... ok\ntest transport::quic::stream::tests::ready_h3_stream_data_decode_is_zero_copy_for_one_record ... ok\ntest transport::quic::stream::tests::ready_h3_stream_data_stops_at_semantic_and_codec_boundaries ... ok\ntest transport::quic::stream::tests::quic_carrier_batches_multiple_product_frames_per_write ... ok\ntest transport::quic::stream::tests::quic_carrier_round_trips_product_frames ... ok\ntest transport::quic::stream::tests::stopped_quic_stream_write_keeps_the_shared_connection_available ... ok\n\ntest result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 2276 filtered out; finished in 0.12s\n\n"
+    }
+  },
+  "archive": {
+    "path": "docs-dev/ACK_RELATIVE_REMOVED_20260907.patch",
+    "check": "git apply --check succeeds; independent in-memory replay reconstructs all nine prior files exactly",
+    "action": "Recoverable archive, not included runtime code"
+  },
+  "formatting": {
+    "changed_rust_files": "formatted; git diff --check passes",
+    "full_tree": "cargo fmt --all -- --check passes after three formatting-only pre-existing test changes (269c843); no behavioral change"
+  },
+  "performance": "No new performance run in this pruning pass. Earlier ordinary timing figures apply to earlier frozen compositions.",
+  "ordinary_build": {
+    "command": "CARGO_TARGET_DIR=./target cargo build --release --locked --features lab-diagnostics --bin mptunnel -j3",
+    "result": "success; 1m31s; no warnings",
+    "frozen_binary": "./.tmp/reflection/bin/pruned-20260907/mptunnel",
+    "version": "mptunnel 0.4.8",
+    "source": "b9a1600 runtime, followed by formatting-only269c843; lab diagnostics feature compiled but ordinary execution leaves opt-in diagnostics off"
+  },
+  "intermediate_commits": {
+    "prototype_removal": "11a68f9",
+    "native_reordering": "d268aa4",
+    "qualification_projection": "b7abd78",
+    "cyclic_product_service": "59fbd22",
+    "carrier_io_and_stateless_wire": "b9a1600",
+    "test_formatting": "269c843"
+  }
+}

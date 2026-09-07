@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 01:46 +08:00. Authoritative source is `./`. **No release pass.**
+Updated: 2026-09-08 02:00 +08:00. Authoritative source is `./`. **No release pass.**
 This is the existing REVIEW_AND_PRACTICAL_ACCEPTANCE batch, not a new inventory.
 Superseded checkpoints are preserved in
 [the history](CLOSURE_PLAN_HISTORY_THROUGH_20260907.md) and their linked evidence.
@@ -98,6 +98,48 @@ This closes the old eligibility question, not the ordered-service problem.
   allocator implementation because it directly tests practical value using an
   already-implemented service domain. Full matrix remains stopped; no previous
   adverse observation or method requirement is waived.
+
+**Ordinary result, 01:56:** both mixed uploads complete with exact byte equality,
+but candidate49.967Mbps versus control70.598Mbps and maximum confirmation gap
+3.400809s versus3.242749s do not demonstrate practical benefit. Candidate first
+confirmation improves.530640->.421549s and local-write gap5.937819->2.488303s;
+neither compensates for the early sustained deficit. It accepts295,043,072B
+versus453,967,872B, so its shorter elapsed/drain interval is not an equal-work
+win. Raw candidate bins0--24 stay0--7.864Mbps before a527.242Mbps buffered
+confirmation burst. Preserve all series; do not interpret that burst as wire
+rate above500Mbps. One random pair is not a causal regression verdict, but it
+fails promotion. No third ordinary trial or full-matrix expansion.
+
+### Current transaction: why the idle QUIC alternative does not unblock upload
+
+- **Observed failure:** candidate at4--19s has exactly64MiB between source read
+  and ordered target write. QUIC has already ACKed about56.56MB of native work,
+  zero original Product flight, and only tiny native control-byte increments.
+  One TCP instance retains9.63MB->2.29MB. Source advances one-for-one with slow
+  target delivery; this predates QoS. It is consistent with a slow TCP prefix
+  holding the receiver window while a fast suffix is already ACKed, not a
+  continuously saturated QUIC pipeline or source/actor CPU starvation.
+- **Exact question:** which exact prefix, owner and target eligibility prevent
+  the newly enabled retained fallback from using QUIC during that situation?
+- **Competing causes:** original/copy ownership excludes that alternate;
+  request-local stale/qualification state or unavailable measured target model;
+  target service/admission; or a covering copy is accepted but not received.
+  Dashboard carrier health, stale Product sample1 and advancing native counter
+  timestamps do not uniquely distinguish these. Owner-versus-alternate ETA
+  comparison is test-only in this fallback and cannot be its production veto.
+- **Smallest action:** one same-candidate mixed combined upload capture with
+  existing events only: original/copy commitment, request stale/proof/apply
+  transitions, source budget, native publications, ACK and ordered receiver
+  frontier. Label retained-frontier-mixed-prefix-diag-0908. Same ordinary
+  profile/flags, diagnostics enabled solely for attribution; no source/build,
+  gain, queue limit, timer or harness change.
+- **Falsifier/stop:** prompt covering QUIC commitment excludes missing-target
+  eligibility as the sole cause. An actual request-stale or ownership exclusion
+  must be traced to its producer, not removed from dashboard intuition. If the
+  distinguishing early episode does not recur or a rejecting branch is not
+  observable, preserve that limit and use source/component proof before more
+  logging. No diagnostic throughput acceptance and no automatic second trace.
+
 
 **Held preceding transaction: request/upload rate refresh.** The existing sampler
 requires each cohort's earliest assignment to follow the previous ACK and

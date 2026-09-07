@@ -478,3 +478,129 @@ divide writer/socket/network service from server routing/actor service. This
 joins the already-documented ordered-repair/irreversible-work family, not a
 new timer defect. Do not increase recovery gain or reduce buffers from this
 aggregate evidence. Full performance acceptance remains withheld.
+
+## Bounded mixed-upload pair: no practical-benefit pass, 2026-09-08
+
+Recorded 2026-09-08 01:55 +08:00. CURRENT_CLOSURE_PLAN explicitly predeclared
+this single exception to the stopped matrix: compare baseline `11d6f3a` with
+isolated `011aee9` using `run.py mixed combined up`, to test practical value
+with the already-existing independent QUIC repair stream. Both endpoints
+change together; the mirrored routed profile, 40-second source load, loss,
+jitter, QoS and observation guards are unchanged. Diagnostics are off and
+the sampler remains shelved. The 30--33-second UDP blackhole now affects the
+QUIC carrier; this is not an equivalent TCP-only outage. No third repeat.
+
+Full probes, logs and `service.jsonl` snapshots are preserved in
+[the raw mixed pair archive](REQUEST_RETAINED_FRONTIER_MIXED_20260908.raw.tar.gz),
+under `results/mixed-combined-up-retained-frontier-{control,candidate}-0908/`.
+
+| Observation | Control | Candidate |
+| --- | ---: | ---: |
+| Confirmed = locally accepted bytes | 453,967,872 | 295,043,072 |
+| Completed streams / failed streams | 1 / 0 | 1 / 0 |
+| Exact accounting / valid ACK accounting | yes / yes | yes / yes |
+| Probe duration | 51.442681 s | 47.237684 s |
+| Completed-transfer goodput | 70.598 Mbps | 49.967 Mbps |
+| Elapsed beyond planned 40-second source load | 11.442681 s | 7.237684 s |
+| First target confirmation | 0.530640 s | 0.421549 s |
+| Greatest confirmation gap | 3.242749 s | 3.400809 s |
+| First local write | 0.141209 s | 0.105455 s |
+| Greatest local write gap | 5.937819 s | 2.488303 s |
+
+Both transfers complete without probe errors, so these whole-transfer rates
+are valid, unlike the censored TCP quotients. Candidate runner elapsed
+48.141624 s is not its probe measurement duration. Candidate accepts
+158,924,800 fewer bytes; its shorter finish/post-load window is not an
+equal-work drain improvement. First confirmation and local-write gaps improve,
+but completed goodput falls and maximum confirmation gap worsens. This pair
+therefore supplies no practical-benefit pass and does not waive the failed TCP
+gate, loaded latency, browser experience or release acceptance. Different
+random loss realizations prevent assigning this whole difference causally to
+the correction or to a particular QUIC repair.
+
+### Complete confirmation history and stage limits
+
+The following are the untrimmed raw one-second confirmation bins in Mbps,
+starting at probe time zero. Bin i covers [i,i+1); the last bin can be partial
+but uses a one-second denominator. Values are rounded by the existing probe.
+They measure confirmations observed at the client, not contemporaneous wire
+service; the candidate's 527.242 Mbps bin is not a measured link-capacity claim.
+
+```text
+control, bins 0--51:
+0.620,20.115,178.782,130.119,141.033,197.849,36.529,8.080,308.806,144.275,
+220.105,138.999,243.303,170.253,144.083,72.809,6.291,24.878,0,0.620,
+0,0,26.214,0,0,36.368,7.340,76.133,64.059,245.898,
+1.617,0,7.820,0,0,1.145,2.118,0,0,195.153,
+102.620,172.823,66.254,0,0.288,0.524,190.839,117.057,34.507,39.801,
+36.176,19.438
+candidate, bins 0--47:
+1.573,6.290,4.719,7.864,4.719,5.767,4.719,3.670,3.670,2.621,
+4.194,2.621,3.670,3.670,3.146,4.194,3.670,3.146,4.719,1.145,
+0,0,0,0.096,0,527.242,35.799,112.486,227.253,136.219,
+87.748,106.578,0,0,19.015,150.995,17.086,90.061,93.656,7.960,
+63.675,4.311,2.601,433.251,52.195,0,0,112.332
+```
+
+Approximate confirmed MB by phase, summed from those rounded raw bins:
+
+| Probe-time phase | Control | Candidate |
+| --- | ---: | ---: |
+| 0--15 s, before QoS | 260.369 | 7.864 |
+| 15--25 s, 10 Mbps phase | 16.352 | 2.121 |
+| 25--30 s, restored rate | 53.725 | 129.875 |
+| 30--33 s, UDP outage | 1.180 | 24.291 |
+| 33--40 s, post-outage load | 24.802 | 47.347 |
+| 40 s through completion | 97.541 | 83.546 |
+
+The dominant early deficit predates QoS. Candidate sample 5.000582 s already
+has upload class bytes 83,370,239, source reads 70,319,969 and target-socket
+writes only 3,211,105; at 15.001646 s target writes are 7,929,697 B. This
+establishes substantial work without corresponding ordered target service,
+not the original/copy ownership or precise waiting stage. Phase coincidence
+with QoS/outage does not prove a particular repair caused or cleared a hole.
+
+Candidate target writes stay 166,515,745 B across samples
+31.137191--34.140121 s, spanning the UDP outage/recovery. Later, every source
+byte has been read by sample 44.141154 s; every target byte has been written
+and unique Product debt is zero by 45.141255 s. Nevertheless confirmation
+bins 45 and 46 are zero and bin 47 acknowledges about 14.042 MB before probe
+completion at 47.237684 s. Target-socket acceptance, sink consumption and
+returned confirmation are distinct boundaries; this late confirmation tail
+cannot be assigned to a still-missing forward Product prefix. Control source
+reads reach their final total at sample 42.087222 s. None of these sampled
+boundaries is an exact source-EOF or sink-consumption timestamp, and the full
+individual confirmation timestamps needed to locate each maximum are absent.
+
+### Wire and resource comparison
+
+Control has 52 service samples, 0.000051520--51.088144554 s; candidate has 48,
+0.000046800--47.141465661 s. Monotone router upload class counters are
+`327294 -> 608108903` and `534567 -> 413647900`; return counters are
+`26185 -> 23175746` and `30230 -> 15863488`, respectively.
+
+| Sampled observation | Control | Candidate |
+| --- | ---: | ---: |
+| Upload class-byte delta | 607,781,609 B | 413,113,333 B |
+| Return class-byte delta | 23,149,561 B | 15,833,258 B |
+| Upload / return class-drop delta | 8,218 / 1,586 | 5,612 / 1,205 |
+| Client RSS first / peak / final | 49,964 / 320,244 / 289,832 KiB | 55,988 / 300,892 / 264,424 KiB |
+| Server RSS first / peak / final | 30,024 / 111,868 / 111,868 KiB | 30,496 / 133,436 / 133,436 KiB |
+| Final lifetime-average CPU, client / server | 43.6% / 15.8% | 33.4% / 12.1% |
+
+Wire totals cover different durations and different completed byte volumes;
+they include ordinary data, control, native retransmission and Product copies.
+No repair-only counter or exact native-copy cost is exposed, and nested
+qdiscs must not be summed. Lower aggregate wire/CPU or client RSS cannot be
+called efficiency improvements from this unequal-work pair; higher server RSS
+does not establish a leak. One-second snapshots are sequential, may miss peaks
+and have no post-quiet reclamation observation. CPU is process-lifetime average,
+not interval utilization; no concurrent loaded-latency probe ran.
+
+**Disposition:** completion is established in this mixed cell, but overall
+timing does not support practical promotion of the isolated correction. The
+21 focused GREEN checks and prior prompt H<F repair remain valid mechanism
+evidence. Early ordered-work attribution is unresolved; this ordinary pair
+does not identify a QUIC repair-bypass episode. Keep the adverse phase history,
+stop the matrix, and do not seek a favorable third mean or tune a gain from
+aggregate counters.

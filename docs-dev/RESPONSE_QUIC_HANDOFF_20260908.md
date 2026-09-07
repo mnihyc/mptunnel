@@ -199,3 +199,244 @@ is small in the overlapping aggregate windows. This case contains3.161s before
 publication and a separate1.921s write-to-decode interval; neither is explained
 by the early local busy intervals. No whole-tunnel closure or universal speed
 benefit follows from reducing the measured retained-owner computation.
+
+## Ordinary follow-up: ranked-prefix query scope, September 8
+
+Raw: [FRONTIER_SCOPE_ORDINARY_20260908.raw.tar.gz](FRONTIER_SCOPE_ORDINARY_20260908.raw.tar.gz),
+containing `mixed-combined-up-frontier-scope-{control,candidate}-0908` under
+`./.tmp/reflection/results/`. This is one new ordinary comparison, not a repeat
+of the response-recovery pair seeking a better number. Both endpoints use
+their cell's binary with diagnostics off: frozen response-retained 953a54f
+control versus only the equivalent one-query deletion, 445011f, frozen at
+`./.tmp/reflection/bin/frontier-scope-20260908/mptunnel`. No observer, sampler,
+initial-owner intervention, queue policy, profile change or build overlap.
+
+The 321 affected checks and prefix-restriction oracle establish equivalent
+bounded work: the two retained-helper fixtures now each visit 1372 model items
+instead of 2744/7514. They do not establish end-to-end timing improvement.
+The ordinary pair completes exactly, but maximum confirmation and local-write
+gaps worsen. **Promotion stops; no third ordinary run or wider acceptance.**
+
+| Probe result | Control | Candidate |
+| --- | ---: | ---: |
+| Complete / exact ACK accounting | true / true | true / true |
+| Confirmed = locally accepted = final bytes | 214,695,936 | 420,610,048 |
+| Complete / failed streams | 1 / 0 | 1 / 0 |
+| Whole elapsed time (s) | 47.194034 | 47.163930 |
+| Whole confirmed goodput (Mbps) | 36.394 | 71.344 |
+| First confirmation (s) | 0.485959 | 0.465351 |
+| Maximum confirmation gap (s) | 4.260012 | 4.627694 |
+| First local write (s) | 0.149918 | 0.104370 |
+| Maximum local-write gap (s) | 1.897546 | 6.914621 |
+| Time beyond planned 40 s load boundary (s) | 7.194034 | 7.163930 |
+
+Both probes exit 0 with valid exact `target_sink_ack` accounting and no errors.
+The candidate completes substantially more bytes in nearly equal elapsed time,
+but that does not waive either adverse gap. Unseeded packet-loss realizations
+and unequal work prevent a causal speedup/regression estimate from this pair.
+Time beyond 40 s is not exact drain from the last successful source write;
+that timestamp and exact maximum-gap endpoints are not retained in the summary.
+There is no concurrent interactive/echo-latency or quiet reclamation series.
+
+### Every raw confirmation bin
+
+Indexi is [i,i+1)s on each probe's own clock. These are all48 positive-ACK
+observation bins, including recorded zeros, without the producer's three-bin
+trimming at each end. Cumulative ACK deltas are assigned when the client probe
+observes them, not when the server writes the target or packets cross the
+router. Values above 500 Mbps can therefore represent buffered confirmation
+release and are not a physical-link speed claim.
+
+| One-second bin | Control Mbps | Candidate Mbps |
+| --- | ---: | ---: |
+| 0 | 3.144 | 1.689 |
+| 1 | 4.486 | 4.719 |
+| 2 | 10.193 | 53.885 |
+| 3 | 7.436 | 516.379 |
+| 4 | 6.816 | 30.453 |
+| 5 | 5.671 | 22.020 |
+| 6 | 5.243 | 3.379 |
+| 7 | 4.719 | 6.795 |
+| 8 | 3.146 | 3.457 |
+| 9 | 3.242 | 2.717 |
+| 10 | 3.050 | 5.243 |
+| 11 | 2.097 | 3.574 |
+| 12 | 2.193 | 3.242 |
+| 13 | 3.050 | 1.573 |
+| 14 | 3.146 | 553.412 |
+| 15 | 2.193 | 6.912 |
+| 16 | 3.574 | 25.786 |
+| 17 | 2.621 | 1.049 |
+| 18 | 3.766 | 0.000 |
+| 19 | 3.574 | 0.000 |
+| 20 | 3.670 | 0.716 |
+| 21 | 4.194 | 0.000 |
+| 22 | 10.486 | 30.313 |
+| 23 | 527.389 | 6.816 |
+| 24 | 0.665 | 8.197 |
+| 25 | 4.332 | 75.261 |
+| 26 | 23.315 | 179.210 |
+| 27 | 0.000 | 106.667 |
+| 28 | 0.000 | 184.645 |
+| 29 | 79.928 | 190.272 |
+| 30 | 41.707 | 179.447 |
+| 31 | 0.000 | 0.000 |
+| 32 | 0.000 | 16.990 |
+| 33 | 0.000 | 0.000 |
+| 34 | 118.297 | 0.000 |
+| 35 | 0.000 | 0.000 |
+| 36 | 0.000 | 0.000 |
+| 37 | 0.000 | 51.884 |
+| 38 | 104.429 | 290.027 |
+| 39 | 35.268 | 42.327 |
+| 40 | 0.000 | 59.341 |
+| 41 | 42.423 | 48.567 |
+| 42 | 21.400 | 78.879 |
+| 43 | 176.161 | 79.123 |
+| 44 | 0.000 | 171.774 |
+| 45 | 0.000 | 266.907 |
+| 46 | 287.834 | 8.056 |
+| 47 | 152.710 | 43.177 |
+
+### Forward versus return stage
+
+S/T/Rs/Rc retain the provenance defined in
+[the previous ordinary report](RESPONSE_RETAINED_ORDINARY_20260908.md):
+client local-source reads / server ordered target-socket writes / server
+target-reply reads / client local reply writes. They are independent observed
+I/O counters, not exact native transmission or probe confirmation bins.
+Sample lines below are original `service.jsonl` lines; runner elapsed precedes
+sequential collection, and each endpoint's cached Unix timestamp is separate.
+
+| Cell | Line | Elapsed (s) | S bytes | T bytes | Rs bytes | Rc bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| control | 4 | 3.000323 | 69,467,895 | 2,359,031 | 125 | 125 |
+| control | 23 | 22.002310 | 78,511,863 | 11,402,999 | 1011 | 1011 |
+| control | 24 | 23.002412 | 145,710,263 | 78,601,399 | 1037 | 1037 |
+| control | 31 | 30.003123 | 162,463,479 | 137,595,799 | 1184 | 1115 |
+| control | 36 | 35.112150 | 180,390,807 | 160,390,327 | 1212 | 1142 |
+| control | 39 | 38.112455 | 190,447,351 | 183,184,855 | 1282 | 1142 |
+| control | 47 | 46.113369 | 214,695,936 | 213,998,775 | 1562 | 1212 |
+| control | 48 | 47.113480 | 214,695,936 | 214,695,936 | 1603 | 1352 |
+| candidate | 4 | 3.000368 | 76,939,211 | 9,830,347 | 101 | 101 |
+| candidate | 5 | 4.000466 | 139,198,411 | 74,710,987 | 152 | 152 |
+| candidate | 15 | 14.001601 | 149,994,315 | 83,082,059 | 620 | 620 |
+| candidate | 16 | 15.001721 | 218,783,115 | 152,419,147 | 688 | 688 |
+| candidate | 19 | 18.002021 | 222,894,347 | 155,785,483 | 758 | 758 |
+| candidate | 21 | 20.002226 | 222,894,347 | 155,785,483 | 758 | 758 |
+| candidate | 31 | 30.003336 | 339,298,283 | 272,189,419 | 1052 | 1052 |
+| candidate | 32 | 31.127860 | 345,196,523 | 278,087,659 | 1066 | 1066 |
+| candidate | 34 | 33.128065 | 345,211,123 | 278,102,259 | 1080 | 1080 |
+| candidate | 38 | 37.128495 | 345,211,123 | 278,102,259 | 1080 | 1080 |
+| candidate | 39 | 38.128593 | 355,902,891 | 288,794,027 | 1108 | 1108 |
+| candidate | 41 | 40.128815 | 396,869,355 | 335,193,515 | 1206 | 1178 |
+| candidate | 45 | 44.129229 | 420,610,048 | 409,225,195 | 1416 | 1276 |
+| candidate | 47 | 46.129480 | 420,610,048 | 414,688,683 | 1500 | 1500 |
+| candidate | 48 | 47.129549 | 420,610,048 | 415,308,043 | 1556 | 1556 |
+
+Early service differs materially: the candidate's first large target burst
+is sampled at 3–4 s; the control's at 22–23 s. In those early slow intervals
+Rs and Rc mostly track each other while S consumes far ahead of T. This is
+not evidence that every gap is held return work, or proof that the scope
+optimization alone caused the earlier forward release.
+
+The candidate's adverse long episode is a forward-service plateau:
+
+- Lines 34–38, 33.128065–37.128495 s, keep S=345,211,123 and
+  T=278,102,259 exactly flat, separated by 64 MiB. Rs=Rc=1080 throughout.
+  Client Unix times are 1788821426835–1788821430836; server
+  1788821426836–1788821430836. No new target-reply input is held in the
+  measured server-Rs/client-Rc interval here.
+- Over the longer 31.127860–37.128495 s interval, S and T each advance only
+  14,600 B, at the 33.128065 s sample. The raw series' sole four-bin zero run,
+  bins 33–36, places its maximum confirmation silence in this episode.
+  The 6.914621 s local-write maximum is consistent with the extended source
+  stall, but its exact endpoints cannot be recovered from source-read samples.
+- The UDP block is first sampled at 30.003336 s and cleared at 33.128065 s;
+  the plateau persists for another approximately 4 s. Target progress is
+  visible again at 38.128593 s. Temporal association does not by itself
+  attribute the delay to a native controller or a particular repair.
+
+The control has a different late geometry. Its lines 36–39,
+35.112150–38.112455 s (both endpoint Unix 1788821368441–1788821371441),
+keep Rc=1142 while Rs grows 1212→1282 and T grows 160,390,327→183,184,855 B.
+Thus its bins 35–37 confirmation silence contains held return work despite
+22,794,528 B of forward target progress. Its earlier outage-associated T
+plateau is 30.003123–33.111929 s at 137,595,799 B. These mechanisms must not
+be combined into one average or declared identical across cells.
+
+After 40 s the candidate also has some return lag, but not the same long flat
+Rc episode: at 44.129229 s, T=409,225,195 and Rs/Rc=1416/1276; by 46.129480 s,
+Rs=Rc=1500 while T is 414,688,683. Its last snapshot leaves 5,302,005 target
+bytes unsettled; final probe equality records their later completion.
+The control instead has all payload target-written in its last snapshot but
+Rc/Rs=1352/1603. Neither last sample is the complete terminal state.
+
+### Native context for the candidate's worst pause
+
+During lines 34–38, the stable client-reported path counters are:
+
+| Path / native instance | Native epoch | Native ACKed bytes, start→end | Product OriginalData debt | Reported queue bytes, start→end |
+| --- | --- | ---: | ---: | ---: |
+| TCP1 / 4 | 11500194338610892311 | 32,746,051→34,211,379 | 0 | 3,957,419→2,582,171 |
+| TCP2 / 2 | 2776913170470870378 | 13,479,878→13,479,878 | 0 | 0→0 |
+| TCP0 / 3 | 7311020705210105742 | 14,731,484→17,810,200 | 0 | 5,637,753→2,684,959 |
+| QUIC0 / 1 | 378159093625881351 | 271,021,151→272,224,751 | 67,108,864 | unavailable |
+
+QUIC's ACK counter actually stays 271,021,151 from 31.127860 through 36.128384 s,
+then advances 1,203,600 B by 37.128495 s while T is still flat. TCP native ACK
+progress continues, so this is not a total carrier-set service freeze.
+The retained OriginalData debt is on QUIC, while TCP queues still contain
+megabytes despite zero TCP OriginalData debt. Those queues can contain already
+settled work, repairs or control/framing; the ordinary files cannot identify
+their exact composition or which range blocks ordered target delivery.
+Product debt, native ACKed bytes, native queue and S−T are different byte domains.
+
+All path identities/native epochs are stable from line 2 onward. The control's
+first snapshot has an unresolved second TCP-instance placeholder; the next
+snapshot resolves TCP2/native4. Both then retain three TCP paths plus QUIC.
+No setup trace establishes exact first-owner readiness or ordering. There are
+no management errors; client logs are empty and each server has only its
+post-sampling H3_NO_ERROR teardown warning.
+
+### Sampled costs and limits
+
+Router class 1:10 deltas use eth1 upload and eth0 return, without summing nested
+qdiscs. Counters are monotone. The 48-sample intervals are control
+0.000052–47.113480 s and candidate 0.000053–47.129549 s; neither spans all
+startup/terminal wire work. Values are a whole-class wire-work proxy, not
+repair-only overhead.
+
+| Sampled cost | Control | Candidate |
+| --- | ---: | ---: |
+| Upload class bytes, first→last | 634,471→280,999,438 | 658,669→572,916,055 |
+| Upload byte delta | 280,364,967 | 572,257,386 |
+| Upload packet / drop delta | 234,035 / 2,707 | 463,134 / 7,915 |
+| Return class bytes, first→last | 31,898→9,042,929 | 34,240→22,047,799 |
+| Return byte delta | 9,011,031 | 22,013,559 |
+| Return packet / drop delta | 52,333 / 547 | 124,930 / 1,660 |
+| Client PID | 252799 | 253929 |
+| Client RSS first / peak / last (KiB) | 51,472 / 1,159,376 / 349,140 | 54,892 / 464,976 / 406,508 |
+| Client peak-RSS elapsed (s) | 46.113369 | 45.129364 |
+| Client maximum observed / last ps %CPU | 60.3 / 58.6 | 70.7 / 41.9 |
+| Server PID | 258927 | 260050 |
+| Server RSS first / peak / last (KiB) | 30,740 / 134,740 / 134,740 | 30,632 / 131,468 / 131,468 |
+| Server peak-RSS elapsed (s) | 47.113480 | 47.129549 |
+| Server maximum observed / last ps %CPU | 29.6 / 9.2 | 33.8 / 16.6 |
+
+RSS is sampled resident KiB, not a continuous peak or quiet post-load baseline.
+`ps pcpu` is a process-lifetime average, not interval CPU, CPU seconds or
+proof of which helper consumed time. The smaller candidate client RSS peak
+and lower last CPU observation are useful context, not normalized efficiency
+claims: it completes nearly twice the payload, spends different time in each
+state, and has worse gaps. Wire counters mix framing, control, native retries
+and Product copies; exact repair count/cost is not observed.
+
+The single useful next causal question is the forward plateau after UDP
+reopening: which exact byte range prevents T advancing beyond 278,102,259,
+and is it waiting for native admission/receipt, Product ordering or target
+socket service? The snapshots rule out reusing the prior server-Rs/client-Rc
+held-return explanation here, but do not identify that forward range or its
+recovery service. Do not infer a controller/queue fix, or rerun ordinary cells seeking
+a favourable average. The demonstrated computation reduction remains separate
+from unsatisfied practical timing and global acceptance.

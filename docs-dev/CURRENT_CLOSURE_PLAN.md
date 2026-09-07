@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 06:27 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 06:47 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -13,9 +13,15 @@ does not discard failed experiments, authorizations, or global gates.
 
 ## Current runtime and ordinary results
 
-Current runtime checkpoint: `953a54f`, response retained assignment recovery,
-with333 affected component checks and mixed/adverse ordinary timing. Its fixed
-comparator is `765683b`; ordinary executable
+Current runtime checkpoint: `445011f`, equivalent ranked-prefix query removal,
+with321 affected checks. Optimized build2m01s is frozen at
+`./.tmp/reflection/bin/frontier-scope-20260908/mptunnel`; the declared ordinary
+pair completed against frozen953a54f: more bytes, adverse maximum gaps; no
+performance promotion. Diagnostics were off. This change does not
+close the other measured source/native and local processing delays.
+Previous response retained assignment recovery953a54f has333 affected component
+checks and mixed/adverse ordinary timing. That transaction's fixed comparator
+is `765683b`; ordinary executable
 `./.tmp/reflection/bin/ack-atoms-20260908/mptunnel`.
 No diagnostic or request-sampler overlay is active. The user's seven-line
 LIVE_OWNER_FRONTIER_WORK_BOUND.md addition remains untouched.
@@ -197,7 +203,7 @@ all forward-upload silence. At22--23s a different actual forward plateau has
 64MiB source/target separation despite1,656,000B QUIC native ACK progress.
 Existing snapshots do not identify exact holding ranges or native winners.
 
-## Active transaction: response retained-frontier symmetry correction
+## Previous transaction: response retained-frontier symmetry correction
 
 - **Issue:** the same mixed request has long return delivery stalls after the
   server has read small acknowledgement bodies, including outside deliberate
@@ -721,6 +727,42 @@ return[1,2,.5,3,2,.5,1,2]%; upload10Mbps at15--25s, UDP outage30--33s.
 censoring is not complete throughput. Netem random realizations are not identical.
 Single500Mbps is a configured link limit, not a per-confirmation-window bound.
 Do not reuse the runner's old aggregate300/200 defaults for the required200each.
+
+## Active next transaction: post-outage forward prefix service
+
+**Ordinary pair complete, 06:51:** control214,695,936B/47.194034s/36.394Mbps
+versus candidate420,610,048B/47.163930s/71.344Mbps, both exact complete/noerrors.
+First confirmation.485959->.465351s; maxconfirmationgap4.260012->4.627694s;
+maxlocalwritegap1.897546->6.914621s. Fullbins/stages/cost are retained in
+FRONTIER_SCOPE_ORDINARY_20260908.raw.tar.gz and RESPONSE_QUIC_HANDOFF_20260908.md.
+Nearly twice the bytes does not waive adverse timing. Random realizations and
+different accepted work prevent a simple causal-regression claim. The exact
+work reduction is component-proven; composition remains not performance-accepted.
+No third ordinary trial seeking a better number or full-matrix promotion.
+
+**Exact remaining boundary:** candidate33.128065--37.128495s has source
+S345,211,123B and ordered targetT278,102,259B both flat, exactly64MiB apart;
+server reply reads and client reply delivery both1080B. Across31.127860--37.128495
+the target advances only14600B. The worst confirmation pause is now forward
+ordered-service starvation, not a produced response held in client queues.
+Snapshots show all Original Product debt on QUIC, while TCP has native work
+and zero Original debt. Current native counter epochs must remain separate from
+stale rate estimates; positive TCP native ACK bytes alone do not prove the
+lowest missing Product range arrived. Existing return lag remains a separate
+measured stage later in the same completed stream.
+
+**Question / smallest preflight:** after the intentional UDP outage ends, is
+the exact earliest missing request range still waiting for original QUIC native
+recovery, a not-yet-admitted alternate, an accepted TCP copy behind native work,
+or server input/ordered processing? Inspect current native counters, request
+publication/copy events and their source/history. Reuse existing observations
+where sufficient; declare the minimum identity/range-bound discriminator before
+another capture. No runtime policy change yet, no forced probe/PTO interval,
+quantum, priority, controller or queue adjustment from a stale Active label.
+Falsifier: prompt exact delivery at the server moves attribution beyond native
+service; timely alternate acceptance excludes the old eligibility-only gate.
+All gaps remain open until their actual holding owner is evidenced. This is
+the existing post-QoS/blackhole/failover scope, not a new broad audit.
 
 ## Existing dispositions and attribution limits
 

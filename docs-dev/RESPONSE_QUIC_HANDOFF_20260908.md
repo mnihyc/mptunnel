@@ -240,7 +240,7 @@ There is no concurrent interactive/echo-latency or quiet reclamation series.
 
 ### Every raw confirmation bin
 
-Indexi is [i,i+1)s on each probe's own clock. These are all48 positive-ACK
+Index i is [i,i+1)s on each probe's own clock. These are all 48 positive-ACK
 observation bins, including recorded zeros, without the producer's three-bin
 trimming at each end. Cumulative ACK deltas are assigned when the client probe
 observes them, not when the server writes the target or packets cross the
@@ -437,6 +437,6 @@ reopening: which exact byte range prevents T advancing beyond 278,102,259,
 and is it waiting for native admission/receipt, Product ordering or target
 socket service? The snapshots rule out reusing the prior server-Rs/client-Rc
 held-return explanation here, but do not identify that forward range or its
-recovery service. Do not infer a controller/queue fix, or rerun ordinary cells seeking
-a favourable average. The demonstrated computation reduction remains separate
+recovery service. Do not infer a controller/queue fix, or rerun ordinary cells
+seeking a favourable average. The demonstrated computation reduction remains separate
 from unsatisfied practical timing and global acceptance.

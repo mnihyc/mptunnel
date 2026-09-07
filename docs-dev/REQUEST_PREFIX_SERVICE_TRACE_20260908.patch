@@ -1,0 +1,1401 @@
+diff --git a/crates/quinn-proto/src/connection/mod.rs b/crates/quinn-proto/src/connection/mod.rs
+index 01696a5..bf15946 100644
+--- a/crates/quinn-proto/src/connection/mod.rs
++++ b/crates/quinn-proto/src/connection/mod.rs
+@@ -10,11 +10,14 @@ use std::{
+ use bytes::{Bytes, BytesMut};
+ use frame::StreamMetaVec;
+ 
+-use rand::{rngs::StdRng, RngExt, SeedableRng};
++use rand::{RngExt, SeedableRng, rngs::StdRng};
+ use thiserror::Error;
+ use tracing::{debug, error, trace, trace_span, warn};
+ 
+ use crate::{
++    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
++    MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
++    TransportErrorCode, VarInt,
+     cid_generator::ConnectionIdGenerator,
+     cid_queue::CidQueue,
+     coding::BufMutExt,
+@@ -33,9 +36,6 @@ use crate::{
+     },
+     token::{ResetToken, Token, TokenPayload},
+     transport_parameters::TransportParameters,
+-    Dir, Duration, EndpointConfig, Frame, Instant, Side, StreamId, TokenStore, Transmit,
+-    TransportError, TransportErrorCode, VarInt, INITIAL_MTU, MAX_CID_SIZE, MAX_STREAM_COUNT,
+-    MIN_INITIAL_SIZE, TIMER_GRANULARITY,
+ };
+ 
+ mod ack_frequency;
+@@ -96,6 +96,40 @@ mod timer;
+ use crate::congestion::Controller;
+ use timer::{Timer, TimerTable};
+ 
++// Temporary opt-in observation only. No diagnostic timer or recovery authority.
++#[derive(Debug)]
++struct NativeRecoveryTrace {
++    started_at: Instant,
++    last_snapshot_at: Option<Instant>,
++    last_ack: Option<(Instant, SpaceId, u64)>,
++    last_controller_ack_at: Option<Instant>,
++    ack_classes: [u64; 3], // live, retained-only, no-known (not necessarily duplicate)
++    live_packets: u64,
++    retained_packets: u64,
++    controller_live_bytes: u64,
++    timeout_counts: [u64; 9],
++    loss_timeouts: u64,
++}
++
++impl NativeRecoveryTrace {
++    fn new(now: Instant) -> Option<Self> {
++        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        (*ENABLED.get_or_init(|| std::env::var_os("MPTUNNEL_NATIVE_RECOVERY_TRACE").is_some()))
++            .then_some(Self {
++                started_at: now,
++                last_snapshot_at: None,
++                last_ack: None,
++                last_controller_ack_at: None,
++                ack_classes: [0; 3],
++                live_packets: 0,
++                retained_packets: 0,
++                controller_live_bytes: 0,
++                timeout_counts: [0; 9],
++                loss_timeouts: 0,
++            })
++    }
++}
++
+ fn sample_keep_alive_interval(config: &TransportConfig, rng: &mut StdRng) -> Option<Duration> {
+     let maximum = config.keep_alive_interval?;
+     let minimum = config.keep_alive_interval_min.unwrap_or(maximum);
+@@ -249,6 +283,7 @@ pub struct Connection {
+     //
+     /// The number of times a PTO has been sent without receiving an ack.
+     pto_count: u32,
++    native_recovery_trace: Option<NativeRecoveryTrace>,
+ 
+     //
+     // Congestion Control
+@@ -297,6 +332,121 @@ pub struct ActivePathSnapshot {
+ }
+ 
+ impl Connection {
++    fn emit_native_recovery_trace(&self, now: Instant, event: &str, fields: fmt::Arguments<'_>) {
++        let Some(observation) = &self.native_recovery_trace else {
++            return;
++        };
++        let elapsed = |time: Instant| {
++            time.saturating_duration_since(observation.started_at)
++                .as_micros()
++        };
++        let loss = self
++            .loss_time_and_space()
++            .map(|(time, space)| (elapsed(time), space));
++        let pto = if !self.state.is_closed()
++            && (self.path.in_flight.ack_eliciting != 0 || !self.peer_completed_address_validation())
++        {
++            self.pto_time_and_space(now)
++                .map(|(time, space)| (elapsed(time), space))
++        } else {
++            None
++        };
++        let spaces = [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data];
++        let last_sent = spaces.map(|space| {
++            self.spaces[space]
++                .time_of_last_ack_eliciting_packet
++                .map(elapsed)
++        });
++        let probes = spaces.map(|space| self.spaces[space].loss_probes);
++        eprintln!(
++            "mptunnel_native_recovery ts_unix_us={} event={} cid={} side={:?} elapsed_us={} path_generation={} controller_epoch={} validating={} closed={} pto_count={} pto_base_us={} max_ack_delay_us={} loss_time={:?} pto_time={:?} armed_loss_us={:?} last_sent_us={:?} pending_probes={:?} srtt_us={} rttvar_us={} cwnd={} flight={} ack_eliciting={} udp_rx={} udp_tx={} authenticated={} ack_rx={} last_ack={:?} last_controller_ack_us={:?} ack_classes={:?} live_packets={} retained_packets={} controller_live_bytes={} timeout_counts={:?} loss_timeouts={} {}",
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap_or_default()
++                .as_micros(),
++            event,
++            self.initial_dst_cid,
++            self.side(),
++            elapsed(now),
++            self.path.generation(),
++            self.path.controller_epoch(),
++            self.path.challenge.is_some(),
++            self.state.is_closed(),
++            self.pto_count,
++            self.path.rtt.pto_base().as_micros(),
++            self.ack_frequency.max_ack_delay_for_pto().as_micros(),
++            loss,
++            pto,
++            self.timers.get(Timer::LossDetection).map(elapsed),
++            last_sent,
++            probes,
++            self.path.rtt.get().as_micros(),
++            self.path.rtt.variance().as_micros(),
++            self.path.congestion.window(),
++            self.path.in_flight.bytes,
++            self.path.in_flight.ack_eliciting,
++            self.stats.udp_rx.datagrams,
++            self.stats.udp_tx.datagrams,
++            self.total_authed_packets,
++            self.stats.frame_rx.acks,
++            observation
++                .last_ack
++                .map(|(time, space, largest)| (elapsed(time), space, largest)),
++            observation.last_controller_ack_at.map(elapsed),
++            observation.ack_classes,
++            observation.live_packets,
++            observation.retained_packets,
++            observation.controller_live_bytes,
++            observation.timeout_counts,
++            observation.loss_timeouts,
++            format_args!("remote={} {}", self.path.remote, fields),
++        );
++    }
++
++    fn snapshot_native_recovery(&mut self, now: Instant) {
++        let Some(observation) = &mut self.native_recovery_trace else {
++            return;
++        };
++        if observation
++            .last_snapshot_at
++            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
++        {
++            return;
++        }
++        observation.last_snapshot_at = Some(now);
++        self.emit_native_recovery_trace(now, "snapshot", format_args!(""));
++    }
++
++    // Same packet finalization, with an observation only after encoding/tracking succeeds.
++    // This is protocol emission into Transmit, not proof of a successful OS UDP send.
++    fn finish_packet_with_recovery_trace(
++        &mut self,
++        builder: PacketBuilder,
++        now: Instant,
++        transmit_ecn: Option<EcnCodepoint>,
++        sent: Option<SentFrames>,
++        buf: &mut Vec<u8>,
++        probe_datagram: bool,
++    ) {
++        let probe = (probe_datagram && self.native_recovery_trace.is_some()).then_some((
++            builder.space,
++            builder.exact_number,
++            builder.partial_encode.start,
++            builder.ack_eliciting,
++        ));
++        builder.finish_and_track(now, transmit_ecn, self, sent, buf);
++        if let Some((space, pn, start, ack_eliciting)) = probe {
++            self.emit_native_recovery_trace(
++                now,
++                "probe_emitted",
++                format_args!(
++                    "space={space:?} pn={pn} encoded_bytes={} packet_ack_eliciting={ack_eliciting}",
++                    buf.len() - start,
++                ),
++            );
++        }
++    }
++
+     pub(crate) fn new(
+         endpoint_config: Arc<EndpointConfig>,
+         config: Arc<TransportConfig>,
+@@ -394,6 +544,7 @@ impl Connection {
+             )),
+ 
+             pto_count: 0,
++            native_recovery_trace: NativeRecoveryTrace::new(now),
+ 
+             app_limited: false,
+             receiving_ecn: false,
+@@ -520,6 +671,7 @@ impl Connection {
+         buf: &mut Vec<u8>,
+     ) -> Option<Transmit> {
+         assert!(max_datagrams != 0);
++        self.snapshot_native_recovery(now);
+         let max_datagrams = match self.config.enable_segmentation_offload {
+             false => 1,
+             true => max_datagrams,
+@@ -595,6 +747,7 @@ impl Connection {
+         let mut send_blocked = false;
+         // Only a full congestion window supplies BBR's C.is_cwnd_limited signal.
+         let mut cwnd_blocked = false;
++        let mut native_trace_probe_datagram = false;
+ 
+         // Iterate over all spaces and find data to send
+         let mut space_idx = 0;
+@@ -753,7 +906,14 @@ impl Connection {
+                         builder.pad_to(segment_size as u16);
+                     }
+ 
+-                    builder.finish_and_track(now, transmit_ecn, self, sent_frames.take(), buf);
++                    self.finish_packet_with_recovery_trace(
++                        builder,
++                        now,
++                        transmit_ecn,
++                        sent_frames.take(),
++                        buf,
++                        native_trace_probe_datagram,
++                    );
+ 
+                     if num_datagrams == 1 {
+                         // Set the segment size for this GSO batch to the size of the first UDP
+@@ -784,6 +944,7 @@ impl Connection {
+                 }
+ 
+                 // Allocate space for another datagram
++                native_trace_probe_datagram = self.spaces[space_id].loss_probes != 0;
+                 let next_datagram_size_limit = match self.spaces[space_id].loss_probes {
+                     0 => segment_size,
+                     _ => {
+@@ -821,7 +982,14 @@ impl Connection {
+                 // datagram.
+                 // Finish current packet without adding extra padding
+                 if let Some(builder) = builder_storage.take() {
+-                    builder.finish_and_track(now, transmit_ecn, self, sent_frames.take(), buf);
++                    self.finish_packet_with_recovery_trace(
++                        builder,
++                        now,
++                        transmit_ecn,
++                        sent_frames.take(),
++                        buf,
++                        native_trace_probe_datagram,
++                    );
+                 }
+             }
+ 
+@@ -940,15 +1108,16 @@ impl Connection {
+                     buf.write(token);
+                     self.stats.frame_tx.path_response += 1;
+                     builder.pad_to(MIN_INITIAL_SIZE);
+-                    builder.finish_and_track(
++                    self.finish_packet_with_recovery_trace(
++                        builder,
+                         now,
+                         None,
+-                        self,
+                         Some(SentFrames {
+                             non_retransmits: true,
+                             ..SentFrames::default()
+                         }),
+                         buf,
++                        native_trace_probe_datagram,
+                     );
+                     self.stats.udp_tx.on_sent(1, buf.len());
+                     return Some(Transmit {
+@@ -1008,7 +1177,14 @@ impl Connection {
+             }
+ 
+             let last_packet_number = builder.exact_number;
+-            builder.finish_and_track(now, transmit_ecn, self, sent_frames, buf);
++            self.finish_packet_with_recovery_trace(
++                builder,
++                now,
++                transmit_ecn,
++                sent_frames,
++                buf,
++                native_trace_probe_datagram,
++            );
+             self.path
+                 .congestion
+                 .on_sent(now, buf.len() as u64, last_packet_number);
+@@ -1250,6 +1426,19 @@ impl Connection {
+             if !self.timers.is_expired(timer, now) {
+                 continue;
+             }
++            if let Some(observation) = &mut self.native_recovery_trace {
++                observation.timeout_counts[timer as usize] += 1;
++                // Frequent pacing, delayed-ACK and ordinary loss-time wakeups are counted only.
++                if !matches!(timer, Timer::Pacing | Timer::MaxAckDelay)
++                    && (timer != Timer::LossDetection || self.loss_time_and_space().is_none())
++                {
++                    self.emit_native_recovery_trace(
++                        now,
++                        "timeout",
++                        format_args!("timer={timer:?}"),
++                    );
++                }
++            }
+             self.timers.stop(timer);
+             trace!(timer = ?timer, "timeout");
+             match timer {
+@@ -1590,12 +1779,34 @@ impl Connection {
+         }
+         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
+         let mut newly_acked = ArrayRangeSet::new();
++        let mut native_trace_live_packets = 0;
+         for range in ack.iter() {
+             self.packet_number_filter.check_ack(space, range.clone())?;
+             for (&pn, _) in self.spaces[space].sent_packets.range(range) {
+                 newly_acked.insert_one(pn);
++                if self.native_recovery_trace.is_some() {
++                    native_trace_live_packets += 1;
++                }
+             }
+         }
++        if let Some(observation) = &mut self.native_recovery_trace {
++            let retained_packets = retained_ack
++                .retired_packets
++                .iter()
++                .filter(|(_, terminal)| terminal.outcome == LostPacketOutcome::Acknowledged)
++                .count() as u64;
++            let class = if native_trace_live_packets != 0 {
++                0
++            } else if retained_packets != 0 {
++                1
++            } else {
++                2
++            };
++            observation.ack_classes[class] += 1;
++            observation.live_packets += native_trace_live_packets;
++            observation.retained_packets += retained_packets;
++            observation.last_ack = Some((now, space, ack.largest));
++        }
+ 
+         if newly_acked.is_empty() {
+             self.publish_reordering_evidence(now, None, retained_ack.oldest_reordered_send);
+@@ -1612,6 +1823,7 @@ impl Connection {
+                 }
+             }
+             self.finish_spurious_loss_detection(&retained_ack);
++            self.snapshot_native_recovery(now);
+             return Ok(());
+         }
+ 
+@@ -1705,7 +1917,11 @@ impl Connection {
+         // Learn differential delay against this ACK transaction's current RTT.
+         // Publishing before the RTT update retains a common queue increase as
+         // future reordering allowance (and undercounts it when RTT falls).
+-        self.publish_reordering_evidence(now, largest_current_controller_acked.map(|(_, sent)| sent), retained_ack.oldest_reordered_send);
++        self.publish_reordering_evidence(
++            now,
++            largest_current_controller_acked.map(|(_, sent)| sent),
++            retained_ack.oldest_reordered_send,
++        );
+ 
+         // Must be called before crypto/pto_count are clobbered
+         self.detect_lost_packets(now, space, true);
+@@ -1743,6 +1959,7 @@ impl Connection {
+         // cross-space proof.
+         self.finish_spurious_loss_detection(&retained_ack);
+         self.set_loss_detection_timer(now);
++        self.snapshot_native_recovery(now);
+         Ok(())
+     }
+ 
+@@ -1764,12 +1981,19 @@ impl Connection {
+         )
+     }
+ 
+-    fn publish_reordering_evidence(&mut self, now: Instant, newest_live_send: Option<Instant>, oldest_reordered_send: Option<Instant>) {
++    fn publish_reordering_evidence(
++        &mut self,
++        now: Instant,
++        newest_live_send: Option<Instant>,
++        oldest_reordered_send: Option<Instant>,
++    ) {
+         if let Some(sent) = newest_live_send.max(oldest_reordered_send) {
+             self.path.reordering.on_ack(sent);
+         }
+         if let Some(sent) = oldest_reordered_send {
+-            self.path.reordering.on_late_original(now, sent, self.path.rtt.conservative());
++            self.path
++                .reordering
++                .on_late_original(now, sent, self.path.rtt.conservative());
+         }
+         // Rebinding/rollback is one learned network-path lineage. An unrelated
+         // network path has another epoch and must not inherit this evidence.
+@@ -1800,8 +2024,7 @@ impl Connection {
+     /// Expire retained loss evidence after two PTOs, matching current-main Quinn.
+     fn drain_lost_packets(&mut self, now: Instant) {
+         let two_pto = 2 * self.path.rtt.pto_base();
+-        let expired =
+-            expire_retained_losses_in_spaces(&mut self.spaces, now, two_pto);
++        let expired = expire_retained_losses_in_spaces(&mut self.spaces, now, two_pto);
+         settle_lost_packet_owners(
+             &mut self.path,
+             self.prev_path.as_mut().map(|(_, path)| path),
+@@ -1867,9 +2090,9 @@ impl Connection {
+                     // after an attributable controller response so even a CE-created snapshot is
+                     // ineligible, while invalid ECN feedback above does not taint anything.
+                     let controller_epoch = self.path.controller_epoch();
+-                    for transaction in abandon_retained_transactions_for_epoch(
+-                        &mut self.spaces, controller_epoch,
+-                    ) {
++                    for transaction in
++                        abandon_retained_transactions_for_epoch(&mut self.spaces, controller_epoch)
++                    {
+                         settle_retained_loss_owners(
+                             &mut self.path,
+                             self.prev_path.as_mut().map(|(_, path)| path),
+@@ -1897,6 +2120,12 @@ impl Connection {
+         let current_controller_owned = controller_owns_packet(&info, self.path.controller_epoch())
+             && self.path.challenge.is_none();
+         if current_controller_owned {
++            if info.size != 0 {
++                if let Some(observation) = &mut self.native_recovery_trace {
++                    observation.controller_live_bytes += u64::from(info.size);
++                    observation.last_controller_ack_at = Some(now);
++                }
++            }
+             // Only pass ACKs to the congestion controller if we are not validating the current
+             // path, so as to ignore any ACKs from older paths still coming in.
+             self.path.congestion.on_ack_with_packet_state(
+@@ -1944,6 +2173,9 @@ impl Connection {
+ 
+     fn on_loss_detection_timeout(&mut self, now: Instant) {
+         if let Some((_, pn_space)) = self.loss_time_and_space() {
++            if let Some(observation) = &mut self.native_recovery_trace {
++                observation.loss_timeouts += 1;
++            }
+             // Time threshold loss Detection
+             self.detect_lost_packets(now, pn_space, false);
+             self.set_loss_detection_timer(now);
+@@ -1977,6 +2209,11 @@ impl Connection {
+         self.spaces[space].loss_probes = self.spaces[space].loss_probes.saturating_add(count);
+         self.pto_count = self.pto_count.saturating_add(1);
+         self.set_loss_detection_timer(now);
++        self.emit_native_recovery_trace(
++            now,
++            "pto_queued",
++            format_args!("space={space:?} count={count}"),
++        );
+     }
+ 
+     fn detect_lost_packets(&mut self, now: Instant, pn_space: SpaceId, due_to_ack: bool) {
+@@ -2077,8 +2314,7 @@ impl Connection {
+             self.stats.path.lost_bytes += size_of_lost_packets;
+             trace!(
+                 "packets lost: {:?}, bytes lost: {}",
+-                lost_packets,
+-                size_of_lost_packets
++                lost_packets, size_of_lost_packets
+             );
+ 
+             for &packet in &lost_packets {
+@@ -2133,7 +2369,9 @@ impl Connection {
+                 controller_largest_lost
+             {
+                 self.stats.path.congestion_events += 1;
+-                self.path.reordering.on_loss(now, controller_largest_lost_sent);
++                self.path
++                    .reordering
++                    .on_loss(now, controller_largest_lost_sent);
+                 self.publish_reordering_evidence(now, None, None);
+                 self.path.congestion.on_congestion_event(
+                     now,
+@@ -4496,7 +4734,8 @@ fn settle_retained_loss_owners(
+         }
+         match outcome {
+             RetainedLossTerminal::Abandoned => {
+-                path.congestion.on_recovery_transaction_abandoned(transaction);
++                path.congestion
++                    .on_recovery_transaction_abandoned(transaction);
+             }
+             RetainedLossTerminal::Spurious => {
+                 undone |= path.congestion.on_spurious_congestion_event(transaction);
+@@ -4583,11 +4822,15 @@ fn acknowledge_retained_losses(
+                 ));
+                 if info.controller_epoch == current_controller_epoch {
+                     matched.oldest_reordered_send = Some(
+-                        matched.oldest_reordered_send.map_or(info.time_sent, |sent| sent.min(info.time_sent)),
++                        matched
++                            .oldest_reordered_send
++                            .map_or(info.time_sent, |sent| sent.min(info.time_sent)),
+                     );
+                 }
+                 if let Some(transaction) = info.recovery_transaction {
+-                    matched.matched_transactions.insert((info.controller_epoch, transaction));
++                    matched
++                        .matched_transactions
++                        .insert((info.controller_epoch, transaction));
+                 }
+                 if info.ecn_marked {
+                     matched.ecn_marked_packets = matched.ecn_marked_packets.saturating_add(1);
+@@ -4612,8 +4855,7 @@ fn detect_spurious_loss_in_spaces(
+ ) -> SpuriousLossDetection {
+     // Expiry must precede matching in the same ACK transaction. Any expired member makes the
+     // transaction unproven, while younger records remain available for transport ECN accounting.
+-    let mut expired =
+-        expire_retained_losses_in_spaces(spaces, now, retention);
++    let mut expired = expire_retained_losses_in_spaces(spaces, now, retention);
+     let acknowledged = acknowledge_retained_losses(
+         &mut spaces[space].lost_packets,
+         ack,
+@@ -4901,10 +5143,12 @@ mod tests {
+                     parked.controller_epoch(),
+                     transaction
+                 ));
+-                assert!(!active
+-                    .congestion
+-                    .clone_box()
+-                    .on_spurious_congestion_event(transaction));
++                assert!(
++                    !active
++                        .congestion
++                        .clone_box()
++                        .on_spurious_congestion_event(transaction)
++                );
+                 active
+                     .replace_with_activated(parked)
+                     .expect("restore parked controller");
+@@ -5415,7 +5659,10 @@ mod tests {
+                 ),
+             ]
+         );
+-        assert_eq!(outcome.oldest_reordered_send, Some(sent + Duration::from_millis(80)));
++        assert_eq!(
++            outcome.oldest_reordered_send,
++            Some(sent + Duration::from_millis(80))
++        );
+         assert!(!completes_transaction(&spaces, &outcome, 3));
+         assert!(spaces[SpaceId::Data].lost_packets.is_empty());
+     }
+@@ -5434,12 +5681,21 @@ mod tests {
+         let now = sent + Duration::from_millis(180);
+         let ack = contiguous_packet_ack(20, 21);
+         let matched = detect_spurious_loss_in_spaces(
+-            &mut spaces, now, Duration::from_secs(1), &ack, SpaceId::Data, 3,
++            &mut spaces,
++            now,
++            Duration::from_secs(1),
++            &ack,
++            SpaceId::Data,
++            3,
+         );
+         assert_eq!(matched.oldest_reordered_send, Some(sent));
+         let duplicate = detect_spurious_loss_in_spaces(
+-            &mut spaces, now + Duration::from_millis(10), Duration::from_secs(1),
+-            &ack, SpaceId::Data, 3,
++            &mut spaces,
++            now + Duration::from_millis(10),
++            Duration::from_secs(1),
++            &ack,
++            SpaceId::Data,
++            3,
+         );
+         assert_eq!(duplicate.oldest_reordered_send, None);
+     }
+diff --git a/src/lab_diagnostics.rs b/src/lab_diagnostics.rs
+index 4551942..3a5367e 100644
+--- a/src/lab_diagnostics.rs
++++ b/src/lab_diagnostics.rs
+@@ -26,6 +26,115 @@ pub(crate) fn lab_diagnostic_event_enabled(event: &str) -> bool {
+     lab_diagnostic_event_filter().is_none_or(|filter| filter.contains(event))
+ }
+ 
++// Temporary request-ingress observation. Queue awaits are wall time, including
++// scheduling; they are not measurements of time exclusively spent Pending.
++pub(crate) struct LabRequestReader {
++    session_id: u64,
++    path_id: u16,
++    path_instance_id: u64,
++    domain: &'static str,
++    interval_start_unix_ms: u128,
++    preceding_nondata_frames: u64,
++    preceding_send_await: Duration,
++    preceding_send_await_max: Duration,
++}
++
++impl LabRequestReader {
++    pub(crate) fn new(
++        session_id: u64,
++        path_id: u16,
++        path_instance_id: u64,
++        domain: &'static str,
++    ) -> Option<Self> {
++        lab_diagnostic_event_enabled("request_reader").then(|| Self {
++            session_id,
++            path_id,
++            path_instance_id,
++            domain,
++            interval_start_unix_ms: SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .unwrap_or_default()
++                .as_millis(),
++            preceding_nondata_frames: 0,
++            preceding_send_await: Duration::ZERO,
++            preceding_send_await_max: Duration::ZERO,
++        })
++    }
++
++    pub(crate) fn decoded(
++        &self,
++        frame: &crate::protocol::Frame,
++        queue_free: Option<usize>,
++    ) -> Option<(u64, u64, u64)> {
++        let crate::protocol::Frame::StreamData {
++            stream_id,
++            offset,
++            payload,
++        } = frame
++        else {
++            return None;
++        };
++        let end = offset.saturating_add(payload.len() as u64);
++        lab_diagnostic(
++            "request_reader",
++            format_args!(
++                "phase=decoded domain={} session_id={} path_id={} path_instance_id={} stream_id={} offset={} end={} queue_free={:?} interval_start_unix_ms={} preceding_nondata_frames={} preceding_send_await_us={} preceding_send_await_max_us={}",
++                self.domain,
++                self.session_id,
++                self.path_id,
++                self.path_instance_id,
++                stream_id.0,
++                offset,
++                end,
++                queue_free,
++                self.interval_start_unix_ms,
++                self.preceding_nondata_frames,
++                self.preceding_send_await.as_micros(),
++                self.preceding_send_await_max.as_micros(),
++            ),
++        );
++        Some((stream_id.0, *offset, end))
++    }
++
++    pub(crate) fn sent(
++        &mut self,
++        data: Option<(u64, u64, u64)>,
++        elapsed: Duration,
++        queue_free: Option<usize>,
++        sent: bool,
++    ) {
++        if let Some((stream_id, offset, end)) = data {
++            lab_diagnostic(
++                "request_reader",
++                format_args!(
++                    "phase=handoff_complete domain={} session_id={} path_id={} path_instance_id={} stream_id={} offset={} end={} send_await_us={} queue_free={:?} sent={}",
++                    self.domain,
++                    self.session_id,
++                    self.path_id,
++                    self.path_instance_id,
++                    stream_id,
++                    offset,
++                    end,
++                    elapsed.as_micros(),
++                    queue_free,
++                    sent,
++                ),
++            );
++            self.interval_start_unix_ms = SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .unwrap_or_default()
++                .as_millis();
++            self.preceding_nondata_frames = 0;
++            self.preceding_send_await = Duration::ZERO;
++            self.preceding_send_await_max = Duration::ZERO;
++        } else {
++            self.preceding_nondata_frames += 1;
++            self.preceding_send_await += elapsed;
++            self.preceding_send_await_max = self.preceding_send_await_max.max(elapsed);
++        }
++    }
++}
++
+ #[cfg(not(test))]
+ fn lab_diagnostics_requested() -> bool {
+     static ENABLED: OnceLock<bool> = OnceLock::new();
+diff --git a/src/runtime/path/quic/client.rs b/src/runtime/path/quic/client.rs
+index eac0c46..054b292 100644
+--- a/src/runtime/path/quic/client.rs
++++ b/src/runtime/path/quic/client.rs
+@@ -1700,6 +1700,8 @@ async fn open_client_udp_stream_on_connection(
+                     let _ = frames_tx.send(Ok(frame)).await;
+                     Ok(())
+                 },
++                #[cfg(feature = "lab-diagnostics")]
++                None,
+             )
+             .await
+         };
+@@ -1818,7 +1820,13 @@ async fn open_client_udp_datagram_stream(
+ ) -> Result<ClientUdpDatagramStream, RuntimeError> {
+     let (mut send, recv) = carrier.connection.open_bi().await?;
+     send.set_traffic_class(TrafficClass::RealtimeDatagram)?;
+-    let frames = spawn_quic_path_reader(recv, runtime.codec_limits, runtime.stream_frame_queue);
++    let frames = spawn_quic_path_reader(
++        recv,
++        runtime.codec_limits,
++        runtime.stream_frame_queue,
++        #[cfg(feature = "lab-diagnostics")]
++        None,
++    );
+     Ok(ClientUdpDatagramStream {
+         send,
+         frames,
+diff --git a/src/runtime/path/quic/client_stream.rs b/src/runtime/path/quic/client_stream.rs
+index e963ee7..8cc9705 100644
+--- a/src/runtime/path/quic/client_stream.rs
++++ b/src/runtime/path/quic/client_stream.rs
+@@ -33,7 +33,13 @@ pub(super) async fn run_client_udp_stream(
+     mut commands: ReliablePathCommandReceivers,
+     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
+ ) {
+-    let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
++    let mut carrier_frames = spawn_quic_path_reader(
++        recv,
++        codec_limits,
++        reader_queue_size,
++        #[cfg(feature = "lab-diagnostics")]
++        None,
++    );
+     let mut pending_frames = Vec::<Frame>::new();
+     let mut path_proofs = PathProofTracker::from_limits(mux_limits);
+     let mut deferred_input: Option<Result<Frame, RuntimeError>> = None;
+diff --git a/src/runtime/path/quic/datagram.rs b/src/runtime/path/quic/datagram.rs
+index ff7f4d9..bc02b28 100644
+--- a/src/runtime/path/quic/datagram.rs
++++ b/src/runtime/path/quic/datagram.rs
+@@ -58,6 +58,8 @@ pub(super) async fn handle_server_udp_datagram_stream(
+         recv,
+         context.codec_limits,
+         udp_path_command_queue(context.mux_limits, context.codec_limits),
++        #[cfg(feature = "lab-diagnostics")]
++        None,
+     );
+     let mut flows = Vec::<AcceptedServerDatagramFlow>::new();
+     let mut tombstones = ServerDatagramTombstoneCache::new(context.max_udp_flows_per_session);
+diff --git a/src/runtime/path/quic/io.rs b/src/runtime/path/quic/io.rs
+index b2733b3..12d4fa2 100644
+--- a/src/runtime/path/quic/io.rs
++++ b/src/runtime/path/quic/io.rs
+@@ -391,7 +391,24 @@ pub(in crate::runtime) async fn udp_path_write_frame(
+     codec_limits: CodecLimits,
+ ) -> Result<(), RuntimeError> {
+     ensure_quic_data_plane_frames(std::slice::from_ref(frame))?;
+-    quic_transport::write_frame(&mut send.stream, frame, codec_limits).await?;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_quic_write(
++        send,
++        std::slice::from_ref(frame),
++        "frame",
++        "write_begin",
++        "pending",
++    );
++    let result = quic_transport::write_frame(&mut send.stream, frame, codec_limits).await;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_quic_write(
++        send,
++        std::slice::from_ref(frame),
++        "frame",
++        "write_complete",
++        if result.is_ok() { "ok" } else { "error" },
++    );
++    result?;
+     Ok(())
+ }
+ 
+@@ -429,10 +446,60 @@ async fn udp_path_write_frames(
+     codec_limits: CodecLimits,
+ ) -> Result<(), RuntimeError> {
+     ensure_quic_data_plane_frames(frames)?;
+-    quic_transport::write_frames(&mut send.stream, frames, codec_limits).await?;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_quic_write(send, frames, "batch", "write_begin", "pending");
++    let result = quic_transport::write_frames(&mut send.stream, frames, codec_limits).await;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_quic_write(
++        send,
++        frames,
++        "batch",
++        "write_complete",
++        if result.is_ok() { "ok" } else { "error" },
++    );
++    result?;
+     Ok(())
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn observe_request_quic_write(
++    send: &UdpPathSendStream,
++    frames: &[Frame],
++    mode: &str,
++    phase: &str,
++    result: &str,
++) {
++    if !crate::lab_diagnostics::lab_diagnostic_event_enabled("request_writer")
++        || std::env::var("MPTUNNEL_LAB_ROLE").as_deref() != Ok("client")
++    {
++        return;
++    }
++    for frame in frames {
++        if let Frame::StreamData {
++            stream_id,
++            offset,
++            payload,
++        } = frame
++        {
++            // The common native writer owns this H3 request-stream ID, not a
++            // runtime path incarnation. Completion is local H3 acceptance.
++            crate::lab_diagnostics::lab_diagnostic(
++                "request_writer",
++                format_args!(
++                    "phase={} underlay=Udp mode={} native_request_stream_id={} stream_id={} offset={} end={} result={}",
++                    phase,
++                    mode,
++                    send.request_stream_id(),
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(payload.len() as u64),
++                    result,
++                ),
++            );
++        }
++    }
++}
++
+ fn ensure_quic_data_plane_frames(frames: &[Frame]) -> Result<(), RuntimeError> {
+     if frames.iter().any(Frame::is_path_capacity) {
+         return Err(RuntimeError::Protocol(
+@@ -705,6 +772,9 @@ pub(super) fn spawn_quic_path_reader(
+     mut recv: UdpPathRecvStream,
+     codec_limits: CodecLimits,
+     queue_size: usize,
++    #[cfg(feature = "lab-diagnostics")] mut diagnostic: Option<
++        crate::lab_diagnostics::LabRequestReader,
++    >,
+ ) -> mpsc::Receiver<Result<Frame, RuntimeError>> {
+     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
+     tokio::spawn(async move {
+@@ -727,7 +797,25 @@ pub(super) fn spawn_quic_path_reader(
+                 Err(err) => Err(err),
+             };
+             let done = frame.is_err();
+-            if frames_tx.send(frame).await.is_err() || done {
++            #[cfg(feature = "lab-diagnostics")]
++            let diagnostic_data = frame.as_ref().ok().and_then(|frame| {
++                diagnostic
++                    .as_ref()
++                    .and_then(|observation| observation.decoded(frame, Some(frames_tx.capacity())))
++            });
++            #[cfg(feature = "lab-diagnostics")]
++            let send_started = std::time::Instant::now();
++            let send_result = frames_tx.send(frame).await;
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some(observation) = diagnostic.as_mut() {
++                observation.sent(
++                    diagnostic_data,
++                    send_started.elapsed(),
++                    Some(frames_tx.capacity()),
++                    send_result.is_ok(),
++                );
++            }
++            if send_result.is_err() || done {
+                 return;
+             }
+         }
+diff --git a/src/runtime/path/quic/repair.rs b/src/runtime/path/quic/repair.rs
+index 200cdc2..df5281a 100644
+--- a/src/runtime/path/quic/repair.rs
++++ b/src/runtime/path/quic/repair.rs
+@@ -21,6 +21,9 @@ pub(super) async fn run_repair_channel<F, R>(
+     stream_id: StreamId,
+     limits: CodecLimits,
+     route: F,
++    #[cfg(feature = "lab-diagnostics")] diagnostic: Option<
++        crate::lab_diagnostics::LabRequestReader,
++    >,
+ ) -> Result<(), RuntimeError>
+ where
+     F: FnMut(Frame) -> R,
+@@ -40,7 +43,14 @@ where
+             // cancellation/error. Native receipt does not settle Product debt.
+         }
+     };
+-    let read = read_repair_channel(recv, stream_id, limits, route);
++    let read = read_repair_channel(
++        recv,
++        stream_id,
++        limits,
++        route,
++        #[cfg(feature = "lab-diagnostics")]
++        diagnostic,
++    );
+     tokio::try_join!(write, read).map(|_: ((), ())| ())
+ }
+ 
+@@ -49,6 +59,9 @@ pub(super) async fn read_repair_channel<F, R>(
+     stream_id: StreamId,
+     limits: CodecLimits,
+     mut route: F,
++    #[cfg(feature = "lab-diagnostics")] mut diagnostic: Option<
++        crate::lab_diagnostics::LabRequestReader,
++    >,
+ ) -> Result<(), RuntimeError>
+ where
+     F: FnMut(Frame) -> R,
+@@ -76,6 +89,22 @@ where
+                 ));
+             }
+         }
+-        route(frame).await?;
++        #[cfg(feature = "lab-diagnostics")]
++        let diagnostic_data = diagnostic
++            .as_ref()
++            .and_then(|observation| observation.decoded(&frame, None));
++        #[cfg(feature = "lab-diagnostics")]
++        let route_started = std::time::Instant::now();
++        let route_result = route(frame).await;
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some(observation) = diagnostic.as_mut() {
++            observation.sent(
++                diagnostic_data,
++                route_started.elapsed(),
++                None,
++                route_result.is_ok(),
++            );
++        }
++        route_result?;
+     }
+ }
+diff --git a/src/runtime/path/quic/server_stream.rs b/src/runtime/path/quic/server_stream.rs
+index 41b37f7..fb64b28 100644
+--- a/src/runtime/path/quic/server_stream.rs
++++ b/src/runtime/path/quic/server_stream.rs
+@@ -346,6 +346,13 @@ pub(super) async fn handle_server_udp_reliable_stream(
+                     .reliable_streams
+                     .route_frame(&repair_registration, stream_id, frame)
+             },
++            #[cfg(feature = "lab-diagnostics")]
++            crate::lab_diagnostics::LabRequestReader::new(
++                session_id.0,
++                path_id.0,
++                repair_registration.path_instance_id().as_u64(),
++                "quic_repair",
++            ),
+         )
+         .await
+     };
+@@ -401,8 +408,18 @@ async fn run_server_udp_reliable_stream_loop(
+     } = stream_context;
+     let carrier_frame_queue =
+         udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits);
+-    let mut carrier_frames =
+-        spawn_quic_path_reader(recv, context.codec_limits, carrier_frame_queue);
++    let mut carrier_frames = spawn_quic_path_reader(
++        recv,
++        context.codec_limits,
++        carrier_frame_queue,
++        #[cfg(feature = "lab-diagnostics")]
++        crate::lab_diagnostics::LabRequestReader::new(
++            session_id.0,
++            path_id.0,
++            path_registration.path_instance_id().as_u64(),
++            "quic_ordinary",
++        ),
++    );
+     let mut pending_frames = Vec::<Frame>::new();
+     let mut deferred_input = None;
+     let mut terminal_drain_deadline = None;
+diff --git a/src/runtime/path/quic/tests_client.rs b/src/runtime/path/quic/tests_client.rs
+index 703875e..2c1cc95 100644
+--- a/src/runtime/path/quic/tests_client.rs
++++ b/src/runtime/path/quic/tests_client.rs
+@@ -822,9 +822,14 @@ async fn repair_graceful_response_eof_preserves_request_half_and_ordinary_termin
+         // Consume EOF exactly once through the production read-half owner.
+         // Completion of this half must not consume the independent send half
+         // or cancel the parent's ordinary terminal receive/drain transaction.
+-        super::super::repair::read_repair_channel(repair_recv, stream_id, limits, |_| async {
+-            panic!("finished response half cannot deliver another repair frame")
+-        })
++        super::super::repair::read_repair_channel(
++            repair_recv,
++            stream_id,
++            limits,
++            |_| async { panic!("finished response half cannot deliver another repair frame") },
++            #[cfg(feature = "lab-diagnostics")]
++            None,
++        )
+         .await
+         .expect("graceful EOF completes only the repair receive half");
+         let tail = Frame::StreamData {
+diff --git a/src/runtime/path/tcp/client/writer.rs b/src/runtime/path/tcp/client/writer.rs
+index b67c3ee..ce3c514 100644
+--- a/src/runtime/path/tcp/client/writer.rs
++++ b/src/runtime/path/tcp/client/writer.rs
+@@ -460,6 +460,8 @@ async fn commit_client_tcp_frame_transaction_interlocked(
+     deferred_frame: &mut Option<Frame>,
+ ) -> Result<(), RuntimeError> {
+     let mut routed_frames = 0usize;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_tcp_write(connection, frames, runtime, "write_begin");
+     if deferred_frame.is_some() {
+         connection.carrier.writer.write_frames(frames).await?;
+         connection.carrier.writer.flush().await?;
+@@ -516,6 +518,8 @@ async fn commit_client_tcp_frame_transaction_interlocked(
+         }
+     }
+     // The successful write+flush is the transaction boundary.
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_tcp_write(connection, frames, runtime, "flush_complete");
+     publish_client_tcp_frame_transaction(connection, frames, runtime);
+     #[cfg(not(feature = "lab-diagnostics"))]
+     let _ = routed_frames;
+@@ -534,6 +538,43 @@ async fn commit_client_tcp_frame_transaction_interlocked(
+     Ok(())
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn observe_request_tcp_write(
++    connection: &ClientTcpPathConnection,
++    frames: &[Frame],
++    runtime: &ClientTcpPathSessionRuntime,
++    phase: &str,
++) {
++    if !crate::lab_diagnostics::lab_diagnostic_event_enabled("request_writer") {
++        return;
++    }
++    for frame in frames {
++        if let Frame::StreamData {
++            stream_id,
++            offset,
++            payload,
++        } = frame
++        {
++            // This is the existing protected writer transaction, not peer
++            // receipt. An error/cancellation before flush has no completion.
++            lab_diagnostic(
++                "request_writer",
++                format_args!(
++                    "phase={} underlay=Tcp mode=transaction session_id={} path_index={} path_id={:?} path_instance_id={} stream_id={} offset={} end={}",
++                    phase,
++                    runtime.session_id.0,
++                    runtime.path_index,
++                    runtime.path_id.map(|path_id| path_id.0),
++                    connection.path_instance_id.as_u64(),
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(payload.len() as u64),
++                ),
++            );
++        }
++    }
++}
++
+ /// Writes one ordered frame batch while preserving an inbound barrier for the
+ /// caller that owns the next lifecycle transition. The batch is one commit:
+ /// neither proof evidence nor frame ownership moves before the final flush.
+diff --git a/src/runtime/path/tcp/io.rs b/src/runtime/path/tcp/io.rs
+index b892f1b..34650ea 100644
+--- a/src/runtime/path/tcp/io.rs
++++ b/src/runtime/path/tcp/io.rs
+@@ -74,6 +74,9 @@ pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_terminal_result<
+     queue_size: usize,
+     mut observe: Observe,
+     mut observe_terminal: ObserveTerminal,
++    #[cfg(feature = "lab-diagnostics")] mut diagnostic: Option<
++        crate::lab_diagnostics::LabRequestReader,
++    >,
+ ) -> (
+     mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+     oneshot::Receiver<EncryptedFramedTransportError>,
+@@ -94,11 +97,24 @@ where
+                 Ok(frame) => {
+                     observe(&frame);
+                     #[cfg(feature = "lab-diagnostics")]
++                    let diagnostic_data = diagnostic.as_ref().and_then(|observation| {
++                        observation.decoded(&frame, Some(frames_tx.capacity()))
++                    });
++                    #[cfg(feature = "lab-diagnostics")]
+                     let bytes = reliable_path_frame_pacing_bytes(&frame);
+                     #[cfg(feature = "lab-diagnostics")]
+                     let started = Instant::now();
+                     let send_result = frames_tx.send(Ok(frame)).await;
+                     #[cfg(feature = "lab-diagnostics")]
++                    if let Some(observation) = diagnostic.as_mut() {
++                        observation.sent(
++                            diagnostic_data,
++                            started.elapsed(),
++                            Some(frames_tx.capacity()),
++                            send_result.is_ok(),
++                        );
++                    }
++                    #[cfg(feature = "lab-diagnostics")]
+                     lab_perf_record("runtime.tcp_reader.queue_send", started.elapsed(), bytes);
+                     if send_result.is_err() {
+                         break;
+@@ -172,6 +188,8 @@ mod tests {
+                     let _ = observed_terminal_tx.send(());
+                 }
+             },
++            #[cfg(feature = "lab-diagnostics")]
++            None,
+         );
+ 
+         client
+diff --git a/src/runtime/path/tcp/server.rs b/src/runtime/path/tcp/server.rs
+index 2c59753..4b7ef16 100644
+--- a/src/runtime/path/tcp/server.rs
++++ b/src/runtime/path/tcp/server.rs
+@@ -236,6 +236,13 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
+             );
+         },
+         move |_| terminal_commands.terminate_failed_path(),
++        #[cfg(feature = "lab-diagnostics")]
++        crate::lab_diagnostics::LabRequestReader::new(
++            session_id.0,
++            path_id.0,
++            path_registration.path_instance_id().as_u64(),
++            "tcp",
++        ),
+     );
+     let evidence =
+         ServerTcpEvidenceState::new(tcp_metrics, Some(local_metrics), context.mux_limits);
+diff --git a/src/runtime/relay/server.rs b/src/runtime/relay/server.rs
+index e70c981..e100dbe 100644
+--- a/src/runtime/relay/server.rs
++++ b/src/runtime/relay/server.rs
+@@ -3210,8 +3210,22 @@ where
+                             )?;
+                             #[cfg(feature = "lab-diagnostics")]
+                             let mux_started = Instant::now();
++                            #[cfg(feature = "lab-diagnostics")]
++                            let request_frontier_before = (recv_stream.next_offset(), recv_stream.reorder_bytes());
+                             let outcome = recv_stream.receive_data(offset, payload)?;
+                             #[cfg(feature = "lab-diagnostics")]
++                            lab_diagnostic(
++                                "request_mux",
++                                format_args!(
++                                    "session_id={} stream_id={} offset={} end={} frontier_before={} frontier_after={} reorder_before={} reorder_after={} delivered_bytes={}",
++                                    session_id.0, stream_id.0, offset,
++                                    offset.saturating_add(payload_len as u64),
++                                    request_frontier_before.0, recv_stream.next_offset(),
++                                    request_frontier_before.1, recv_stream.reorder_bytes(),
++                                    outcome.delivered.iter().map(|chunk| chunk.len()).sum::<usize>(),
++                                ),
++                            );
++                            #[cfg(feature = "lab-diagnostics")]
+                             lab_perf_record(
+                                 "mux.receive_data",
+                                 mux_started.elapsed(),
+diff --git a/src/runtime/sender/request.rs b/src/runtime/sender/request.rs
+index 70067c1..9dbcc5a 100644
+--- a/src/runtime/sender/request.rs
++++ b/src/runtime/sender/request.rs
+@@ -1350,6 +1350,43 @@ impl RequestSenderService {
+             };
+             match publish_result {
+                 Ok((payload_bytes, accepted_copy_deadline)) => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    if crate::lab_diagnostics::lab_diagnostic_event_enabled("request_publication")
++                        && let Frame::StreamData {
++                            offset, payload, ..
++                        } = &frame
++                    {
++                        // This observes the completed Product/command transaction,
++                        // not writer service or wire receipt. D is the immutable
++                        // deadline returned by that transaction, never a new RTT
++                        // calculation. Signed remaining time also exposes expiry.
++                        let observed_at = Instant::now();
++                        let accepted_copy_deadline_in_us = accepted_copy_deadline
++                            .map(|deadline| {
++                                if deadline >= observed_at {
++                                    deadline.duration_since(observed_at).as_micros().to_string()
++                                } else {
++                                    format!("-{}", observed_at.duration_since(deadline).as_micros())
++                                }
++                            })
++                            .unwrap_or_else(|| "none".to_string());
++                        lab_diagnostic(
++                            "request_publication",
++                            format_args!(
++                                "phase=apply_committed stream_id={} target_underlay={:?} target_index={} target_path_instance_id={} target_attachment_id={} offset={} end={} cause={} payload_bytes={} accepted_copy_deadline_in_us={}",
++                                self.multipath.stream_id().0,
++                                instance.key.underlay,
++                                instance.key.index,
++                                instance.path_instance_id.as_u64(),
++                                instance.attachment_id,
++                                offset,
++                                offset.saturating_add(payload.len() as u64),
++                                cause.as_str(),
++                                payload_bytes,
++                                accepted_copy_deadline_in_us,
++                            ),
++                        );
++                    }
+                     return Ok((instance, payload_bytes, accepted_copy_deadline));
+                 }
+                 Err(
+diff --git a/src/runtime/stream/registry.rs b/src/runtime/stream/registry.rs
+index ece6610..3686942 100644
+--- a/src/runtime/stream/registry.rs
++++ b/src/runtime/stream/registry.rs
+@@ -2186,7 +2186,17 @@ impl ServerReliableStreamRegistry {
+     async fn route_frame_to_target(
+         frame: Frame,
+         target: ServerStreamFrameRouteTarget,
++        #[cfg(feature = "lab-diagnostics")] identity: ServerCarrierPathIdentity,
+     ) -> Result<(), RuntimeError> {
++        #[cfg(feature = "lab-diagnostics")]
++        let diagnostic_data = Self::request_registry_data(&frame);
++        #[cfg(feature = "lab-diagnostics")]
++        Self::observe_request_registry(
++            identity,
++            diagnostic_data,
++            "begin",
++            target.events.capacity(),
++        );
+         #[cfg(feature = "lab-diagnostics")]
+         let bytes = reliable_path_frame_pacing_bytes(&frame);
+         #[cfg(feature = "lab-diagnostics")]
+@@ -2194,11 +2204,22 @@ impl ServerReliableStreamRegistry {
+         // The relay supervisor retires registry membership after the per-stream
+         // receiver closes. A frame in that interval is stream-local teardown,
+         // not failure of the multiplexed carrier that delivered it.
+-        let _ = target
++        let _send_result = target
+             .events
+             .send(ServerReliableStreamEvent::Frame(frame))
+             .await;
+         #[cfg(feature = "lab-diagnostics")]
++        Self::observe_request_registry(
++            identity,
++            diagnostic_data,
++            if _send_result.is_ok() {
++                "admitted"
++            } else {
++                "closed"
++            },
++            target.events.capacity(),
++        );
++        #[cfg(feature = "lab-diagnostics")]
+         lab_perf_record(
+             "runtime.server_stream.route_frame",
+             started.elapsed(),
+@@ -2210,13 +2231,39 @@ impl ServerReliableStreamRegistry {
+     fn try_route_frame_to_target(
+         frame: Frame,
+         target: ServerStreamFrameRouteTarget,
++        #[cfg(feature = "lab-diagnostics")] identity: ServerCarrierPathIdentity,
+     ) -> Result<ServerStreamFrameRoute, RuntimeError> {
++        #[cfg(feature = "lab-diagnostics")]
++        let diagnostic_data = Self::request_registry_data(&frame);
++        #[cfg(feature = "lab-diagnostics")]
++        Self::observe_request_registry(
++            identity,
++            diagnostic_data,
++            "try_begin",
++            target.events.capacity(),
++        );
+         match target
+             .events
+             .try_send(ServerReliableStreamEvent::Frame(frame))
+         {
+-            Ok(()) => Ok(ServerStreamFrameRoute::Routed),
++            Ok(()) => {
++                #[cfg(feature = "lab-diagnostics")]
++                Self::observe_request_registry(
++                    identity,
++                    diagnostic_data,
++                    "try_admitted",
++                    target.events.capacity(),
++                );
++                Ok(ServerStreamFrameRoute::Routed)
++            }
+             Err(mpsc::error::TrySendError::Full(ServerReliableStreamEvent::Frame(frame))) => {
++                #[cfg(feature = "lab-diagnostics")]
++                Self::observe_request_registry(
++                    identity,
++                    diagnostic_data,
++                    "pending",
++                    target.events.capacity(),
++                );
+                 Ok(ServerStreamFrameRoute::Mailbox(PendingMailboxFrame::new(
+                     frame,
+                     target.events,
+@@ -2225,7 +2272,16 @@ impl ServerReliableStreamRegistry {
+             }
+             // See `route_frame`: retirement owns this short closed-receiver
+             // interval, and one finished stream must not close its carrier.
+-            Err(mpsc::error::TrySendError::Closed(_)) => Ok(ServerStreamFrameRoute::Routed),
++            Err(mpsc::error::TrySendError::Closed(_)) => {
++                #[cfg(feature = "lab-diagnostics")]
++                Self::observe_request_registry(
++                    identity,
++                    diagnostic_data,
++                    "closed",
++                    target.events.capacity(),
++                );
++                Ok(ServerStreamFrameRoute::Routed)
++            }
+             Err(mpsc::error::TrySendError::Full(ServerReliableStreamEvent::PathDetached {
+                 ..
+             })) => {
+@@ -2234,6 +2290,48 @@ impl ServerReliableStreamRegistry {
+         }
+     }
+ 
++    #[cfg(feature = "lab-diagnostics")]
++    fn request_registry_data(frame: &Frame) -> Option<(u64, u64, u64)> {
++        match frame {
++            Frame::StreamData {
++                stream_id,
++                offset,
++                payload,
++            } => Some((
++                stream_id.0,
++                *offset,
++                offset.saturating_add(payload.len() as u64),
++            )),
++            _ => None,
++        }
++    }
++
++    #[cfg(feature = "lab-diagnostics")]
++    fn observe_request_registry(
++        identity: ServerCarrierPathIdentity,
++        data: Option<(u64, u64, u64)>,
++        phase: &str,
++        queue_free: usize,
++    ) {
++        if let Some((stream_id, offset, end)) = data {
++            lab_diagnostic(
++                "request_registry",
++                format_args!(
++                    "phase={} session_id={} underlay={:?} path_id={} path_instance_id={} stream_id={} offset={} end={} queue_free={}",
++                    phase,
++                    identity.session_id.0,
++                    identity.underlay,
++                    identity.path_id.0,
++                    identity.path_instance_id.as_u64(),
++                    stream_id,
++                    offset,
++                    end,
++                    queue_free,
++                ),
++            );
++        }
++    }
++
+     fn record_request_feedback_ingress_from_path_target(
+         identity: ServerCarrierPathIdentity,
+         frame: &Frame,
+@@ -2346,7 +2444,13 @@ impl ServerReliableStreamRegistry {
+             _ => {}
+         }
+         Self::record_request_feedback_ingress_from_path_target(identity, &frame, &target);
+-        Self::route_frame_to_target(frame, target).await
++        Self::route_frame_to_target(
++            frame,
++            target,
++            #[cfg(feature = "lab-diagnostics")]
++            identity,
++        )
++        .await
+     }
+ 
+     fn try_route_frame_from_path(
+@@ -2424,7 +2528,12 @@ impl ServerReliableStreamRegistry {
+             _ => {}
+         }
+         Self::record_request_feedback_ingress_from_path_target(identity, &frame, &target);
+-        Self::try_route_frame_to_target(frame, target)
++        Self::try_route_frame_to_target(
++            frame,
++            target,
++            #[cfg(feature = "lab-diagnostics")]
++            identity,
++        )
+     }
+ 
+     pub(in crate::runtime) fn close(&self, session_id: SessionId, stream_id: StreamId) {

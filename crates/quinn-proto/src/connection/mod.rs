@@ -53,6 +53,7 @@ pub use datagrams::{Datagrams, SendDatagramError};
 
 mod mtud;
 mod pacing;
+mod reordering;
 
 mod packet_builder;
 use packet_builder::PacketBuilder;
@@ -1597,6 +1598,7 @@ impl Connection {
         }
 
         if newly_acked.is_empty() {
+            self.publish_reordering_evidence(now, None, retained_ack.oldest_reordered_send);
             // A late ACK can acknowledge retained loss evidence after the live sent-packet entry
             // was removed. It still advances the packet-space ECN baseline when it is the newest
             // ACK and the retained packet was actually sent ECT(0), but it has no live packet
@@ -1700,6 +1702,11 @@ impl Connection {
             }
         }
 
+        // Learn differential delay against this ACK transaction's current RTT.
+        // Publishing before the RTT update retains a common queue increase as
+        // future reordering allowance (and undercounts it when RTT falls).
+        self.publish_reordering_evidence(now, largest_current_controller_acked.map(|(_, sent)| sent), retained_ack.oldest_reordered_send);
+
         // Must be called before crypto/pto_count are clobbered
         self.detect_lost_packets(now, space, true);
 
@@ -1755,6 +1762,22 @@ impl Connection {
             space,
             controller_epoch,
         )
+    }
+
+    fn publish_reordering_evidence(&mut self, now: Instant, newest_live_send: Option<Instant>, oldest_reordered_send: Option<Instant>) {
+        if let Some(sent) = newest_live_send.max(oldest_reordered_send) {
+            self.path.reordering.on_ack(sent);
+        }
+        if let Some(sent) = oldest_reordered_send {
+            self.path.reordering.on_late_original(now, sent, self.path.rtt.conservative());
+        }
+        // Rebinding/rollback is one learned network-path lineage. An unrelated
+        // network path has another epoch and must not inherit this evidence.
+        if let Some((_, previous)) = self.prev_path.as_mut() {
+            if previous.controller_epoch() == self.path.controller_epoch() {
+                previous.reordering = self.path.reordering;
+            }
+        }
     }
 
     fn finish_spurious_loss_detection(&mut self, detection: &SpuriousLossDetection) {
@@ -1961,10 +1984,14 @@ impl Connection {
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
         let rtt = self.path.rtt.conservative();
-        let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+        let loss_delay = self.path.reordering.loss_delay(
+            cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY),
+            rtt,
+        );
 
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
+        let packet_threshold_enabled = self.path.reordering.packet_threshold_enabled();
         let mut size_of_lost_packets = 0u64;
         let controller_epoch = self.path.controller_epoch();
         let mut controller_lost_bytes = 0u64;
@@ -1993,7 +2020,9 @@ impl Connection {
             // However, we avoid this subtraction as it can panic and there's no
             // saturating equivalent of this substraction operation with a Duration.
             let packet_too_old = now.saturating_duration_since(info.time_sent) >= loss_delay;
-            if packet_too_old || largest_acked_packet >= packet + packet_threshold {
+            if packet_too_old
+                || (packet_threshold_enabled && largest_acked_packet >= packet + packet_threshold)
+            {
                 if Some(packet) == in_flight_mtu_probe {
                     // Lost MTU probes are not included in `lost_packets`, because they should not
                     // trigger a congestion control response
@@ -2104,6 +2133,8 @@ impl Connection {
                 controller_largest_lost
             {
                 self.stats.path.congestion_events += 1;
+                self.path.reordering.on_loss(now, controller_largest_lost_sent);
+                self.publish_reordering_evidence(now, None, None);
                 self.path.congestion.on_congestion_event(
                     now,
                     controller_largest_lost_sent,
@@ -3951,6 +3982,12 @@ impl Connection {
         self.path.in_flight.bytes
     }
 
+    #[cfg(test)]
+    pub(crate) fn reordering_loss_delay(&self) -> (Duration, Duration) {
+        let rtt = self.path.rtt.conservative();
+        (rtt, self.path.reordering.loss_delay(Duration::ZERO, rtt))
+    }
+
     /// Number of bytes worth of non-ack-only packets that may be sent
     #[cfg(test)]
     pub(crate) fn congestion_window(&self) -> u64 {
@@ -4498,6 +4535,7 @@ struct RetainedLossExpiry {
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 struct RetainedAckMatch {
     retired_packets: Vec<(u64, LostPacketTerminal)>,
+    oldest_reordered_send: Option<Instant>,
     matched_transactions: BTreeSet<RetainedRecoveryTransaction>,
     ecn_marked_packets: u64,
     ecn_marked_noncurrent_epoch: bool,
@@ -4506,6 +4544,7 @@ struct RetainedAckMatch {
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 struct SpuriousLossDetection {
     retired_packets: Vec<(u64, LostPacketTerminal)>,
+    oldest_reordered_send: Option<Instant>,
     matched_transactions: Vec<RetainedRecoveryTransaction>,
     abandoned_transactions: Vec<RetainedRecoveryTransaction>,
     ecn_marked_packets: u64,
@@ -4542,6 +4581,11 @@ fn acknowledge_retained_losses(
                         outcome: LostPacketOutcome::Acknowledged,
                     },
                 ));
+                if info.controller_epoch == current_controller_epoch {
+                    matched.oldest_reordered_send = Some(
+                        matched.oldest_reordered_send.map_or(info.time_sent, |sent| sent.min(info.time_sent)),
+                    );
+                }
                 if let Some(transaction) = info.recovery_transaction {
                     matched.matched_transactions.insert((info.controller_epoch, transaction));
                 }
@@ -4581,6 +4625,7 @@ fn detect_spurious_loss_in_spaces(
 
     SpuriousLossDetection {
         retired_packets: expired.retired_packets,
+        oldest_reordered_send: acknowledged.oldest_reordered_send,
         matched_transactions: acknowledged.matched_transactions.into_iter().collect(),
         abandoned_transactions: expired.abandoned_transactions,
         ecn_marked_packets: acknowledged.ecn_marked_packets,
@@ -5308,6 +5353,7 @@ mod tests {
             3,
         );
         assert!(!completes_transaction(&spaces, &outcome, 3));
+        assert_eq!(outcome.oldest_reordered_send, None);
         assert_eq!(
             outcome.abandoned_transactions,
             vec![(3, RecoveryTransactionId(1))]
@@ -5369,8 +5415,33 @@ mod tests {
                 ),
             ]
         );
+        assert_eq!(outcome.oldest_reordered_send, Some(sent + Duration::from_millis(80)));
         assert!(!completes_transaction(&spaces, &outcome, 3));
         assert!(spaces[SpaceId::Data].lost_packets.is_empty());
+    }
+
+    #[test]
+    fn reordering_cohort_uses_oldest_new_original_and_duplicate_ack_cannot_retrain() {
+        let sent = Instant::now();
+        let mut spaces = packet_spaces(sent);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 20, sent, 3);
+        retain_loss(
+            &mut spaces[SpaceId::Data].lost_packets,
+            21,
+            sent + Duration::from_millis(30),
+            3,
+        );
+        let now = sent + Duration::from_millis(180);
+        let ack = contiguous_packet_ack(20, 21);
+        let matched = detect_spurious_loss_in_spaces(
+            &mut spaces, now, Duration::from_secs(1), &ack, SpaceId::Data, 3,
+        );
+        assert_eq!(matched.oldest_reordered_send, Some(sent));
+        let duplicate = detect_spurious_loss_in_spaces(
+            &mut spaces, now + Duration::from_millis(10), Duration::from_secs(1),
+            &ack, SpaceId::Data, 3,
+        );
+        assert_eq!(duplicate.oldest_reordered_send, None);
     }
 
     #[test]
@@ -5487,6 +5558,7 @@ mod tests {
             SpaceId::Data,
             3,
         );
+        assert_eq!(old_outcome.oldest_reordered_send, None);
         assert!(
             !completes_transaction(&spaces, &old_outcome, 3),
             "an old controller epoch cannot trigger the fresh model's undo"
@@ -5505,6 +5577,7 @@ mod tests {
             3,
         );
         assert!(completes_transaction(&spaces, &current_outcome, 3));
+        assert_eq!(current_outcome.oldest_reordered_send, Some(now));
     }
 
     #[test]

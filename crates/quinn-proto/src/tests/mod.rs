@@ -45,6 +45,130 @@ use util::*;
 
 mod token;
 
+
+#[test]
+fn late_original_trains_reordering_without_disabling_real_loss() {
+    for bbr in [false, true] {
+        let mut config = client_config_with_deterministic_pns();
+        let transport = Arc::get_mut(&mut config.transport).unwrap();
+        transport.mtu_discovery_config(None);
+        if bbr {
+            let mut congestion = crate::congestion::Bbr3Config::default();
+            congestion.loss_compensation_floor(0.10);
+            transport.congestion_controller_factory(Arc::new(congestion));
+        }
+        let mut pair = Pair::default_with_deterministic_pns();
+        pair.latency = Duration::from_millis(50);
+        let (client, server) = pair.connect_with(config);
+        pair.drive();
+        for round in 0..3 {
+            let before = pair.client_conn_mut(client).stats().path.lost_packets;
+            let received = pair.server_conn_mut(server).stats().frame_rx.ping;
+            pair.client_conn_mut(client).ping();
+            pair.drive_client();
+            assert_eq!(pair.server.inbound.len(), 1);
+            let mut held = pair.server.inbound.pop_front().unwrap();
+            for _ in 0..4 {
+                pair.time += Duration::from_millis(1);
+                pair.client_conn_mut(client).ping();
+                pair.drive_client();
+            }
+            assert_eq!(pair.server.inbound.len(), 4, "five originals must actually be emitted, bbr={bbr}, round={round}");
+            pair.time += pair.latency;
+            pair.drive_server();
+            pair.time += Duration::from_millis(10);
+            held.0 = pair.time;
+            pair.server.inbound.push_front(held);
+            pair.drive_server();
+            pair.time += Duration::from_millis(40);
+            pair.drive_client();
+            assert_eq!(pair.client_conn_mut(client).stats().path.lost_packets - before, u64::from(round == 0), "bbr={bbr}, round={round}: only the untrained detector falsely loses this original");
+            pair.time += Duration::from_millis(10);
+            pair.drive();
+            assert_eq!(pair.server_conn_mut(server).stats().frame_rx.ping - received, 5, "bbr={bbr}, round={round}");
+        }
+
+        let before = pair.client_conn_mut(client).stats().path.lost_packets;
+        pair.client_conn_mut(client).ping();
+        pair.drive_client();
+        assert_eq!(pair.server.inbound.len(), 1);
+        pair.server.inbound.pop_front().unwrap(); // A real missing original.
+        for _ in 0..4 {
+            pair.time += Duration::from_millis(1);
+            pair.client_conn_mut(client).ping();
+            pair.drive_client();
+        }
+        pair.drive();
+        assert!(pair.client_conn_mut(client).stats().path.lost_packets > before, "learned reordering still detects actual loss, bbr={bbr}");
+    }
+}
+
+#[test]
+fn late_original_uses_rtt_from_the_same_ack_transaction() {
+    for (bbr, arrival_ms) in [(false, 130), (false, 200), (true, 130), (true, 200)] {
+        let mut config = client_config_with_deterministic_pns();
+        let transport = Arc::get_mut(&mut config.transport).unwrap();
+        transport.mtu_discovery_config(None);
+        if bbr {
+            transport.congestion_controller_factory(Arc::new(
+                crate::congestion::Bbr3Config::default(),
+            ));
+        }
+        let mut pair = Pair::default_with_deterministic_pns();
+        pair.latency = Duration::from_millis(50);
+        let (client, _) = pair.connect_with(config);
+        pair.drive();
+        let original_sent = pair.time;
+        let lost_before = pair.client_conn_mut(client).stats().path.lost_packets;
+        pair.client_conn_mut(client).ping();
+        pair.drive_client();
+        assert_eq!(pair.server.inbound.len(), 1);
+        let mut held = pair.server.inbound.pop_front().unwrap();
+        for _ in 0..4 {
+            pair.time += Duration::from_millis(1);
+            pair.client_conn_mut(client).ping();
+            pair.drive_client();
+        }
+        pair.time += pair.latency;
+        pair.drive_server();
+        pair.time += pair.latency;
+        pair.drive_client();
+        assert_eq!(pair.client_conn_mut(client).stats().path.lost_packets, lost_before + 1);
+        let old_rtt = pair.client_conn_mut(client).reordering_loss_delay().0;
+
+        // This newer live packet and the retained original arrive together.
+        // Their ACK supplies both a changing RTT and late-original evidence.
+        let newer_sent = pair.time;
+        pair.client_conn_mut(client).ping();
+        pair.client_conn_mut(client).immediate_ack();
+        pair.drive_client();
+        pair.time = original_sent + Duration::from_millis(arrival_ms);
+        // Apply the same changed forward delay to the live packet too; leaving
+        // its old arrival time would deliver only the retained original in
+        // the short-delay case and supply no RTT update to this ACK.
+        for packet in &mut pair.server.inbound {
+            packet.0 = pair.time;
+        }
+        held.0 = pair.time;
+        pair.server.inbound.push_front(held);
+        pair.drive_server();
+        pair.time += pair.latency;
+        pair.drive_client();
+        let (current_rtt, learned_delay) = pair.client_conn_mut(client).reordering_loss_delay();
+        if arrival_ms == 200 {
+            assert_eq!(current_rtt, pair.time - newer_sent);
+            assert!(current_rtt > old_rtt);
+        } else {
+            assert!(current_rtt < old_rtt, "old={old_rtt:?}, current={current_rtt:?}");
+        }
+        assert_eq!(
+            learned_delay,
+            pair.time - original_sent + TIMER_GRANULARITY,
+            "one ACK must use its current RTT, without double-counting or omitting common delay; bbr={bbr}, arrival_ms={arrival_ms}"
+        );
+    }
+}
+
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
@@ -3820,10 +3944,11 @@ fn datagram_gso() {
     let final_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
     let final_bytes = pair.client_conn_mut(client_ch).stats().udp_tx.bytes;
     assert_eq!(final_ios - initial_ios, 1);
-    // Expected overhead: flags + CID + PN + tag + frame type + frame length = 1 + 8 + 1 + 16 + 1 + 2 = 29
+    // Expected overhead: flags + CID + PN + tag + frame type + frame length
+    // = 1 + 8 + 2 + 16 + 1 + 2 = 30. GSO still emits one batch.
     assert_eq!(
         final_bytes - initial_bytes,
-        ((29 + DATAGRAM_LEN) * DATAGRAMS) as u64
+        ((30 + DATAGRAM_LEN) * DATAGRAMS) as u64
     );
 }
 
@@ -4438,4 +4563,64 @@ fn send_quantum_bounds_the_gso_batch() {
         datagrams <= QUANTUM_DATAGRAMS,
         "batched {datagrams} datagrams, over the {QUANTUM_DATAGRAMS} the send quantum allows"
     );
+}
+
+// No sender ACK is processed during the held flight: receive admission is the
+// owner under test, not congestion recovery or retransmission behavior.
+fn check_timely_original_beyond_receive_history(warm_packets: usize) {
+    for overtakes in [64, 130] {
+        let mut config = client_config_with_deterministic_pns();
+        let transport = Arc::get_mut(&mut config.transport).unwrap();
+        transport.mtu_discovery_config(None);
+        let mut cubic = crate::congestion::CubicConfig::default();
+        cubic.initial_window(1024 * 1024);
+        transport.congestion_controller_factory(Arc::new(cubic));
+        let mut pair = Pair::default_with_deterministic_pns();
+        pair.latency = Duration::from_millis(50);
+        let (client, server) = pair.connect_with(config);
+        pair.drive();
+        // With 150 outstanding packets even the original encoder uses two
+        // bytes, isolating the receive bitmap from short-number ambiguity.
+        for _ in 0..warm_packets {
+            pair.time += Duration::from_micros(20);
+            pair.client_conn_mut(client).ping();
+            pair.drive_client();
+        }
+        assert_eq!(pair.server.inbound.len(), warm_packets);
+        pair.time += pair.latency;
+        pair.drive_server();
+        let before = pair.server_conn_mut(server).stats().frame_rx.ping;
+        pair.client_conn_mut(client).ping();
+        pair.drive_client();
+        assert_eq!(pair.server.inbound.len(), 1);
+        let mut held = pair.server.inbound.pop_front().unwrap();
+        for _ in 0..overtakes {
+            pair.time += Duration::from_micros(20);
+            pair.client_conn_mut(client).ping();
+            pair.drive_client();
+        }
+        assert_eq!(pair.server.inbound.len(), overtakes);
+        pair.time += pair.latency;
+        pair.drive_server();
+        pair.time += Duration::from_millis(10);
+        held.0 = pair.time;
+        pair.server.inbound.push_front(held.clone());
+        pair.drive_server();
+        let received = pair.server_conn_mut(server).stats().frame_rx.ping - before;
+        assert_eq!(received, (overtakes + 1) as u64, "warm={warm_packets}");
+        // The original must be accepted once, not twice.
+        pair.server.inbound.push_front(held);
+        pair.drive_server();
+        assert_eq!(pair.server_conn_mut(server).stats().frame_rx.ping - before, received);
+    }
+}
+
+#[test]
+fn timely_original_beyond_receive_history_wide_number() {
+    check_timely_original_beyond_receive_history(150);
+}
+
+#[test]
+fn timely_original_beyond_receive_history_short_number() {
+    check_timely_original_beyond_receive_history(0);
 }

@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::{BTreeMap, VecDeque},
     mem,
     ops::{Bound, Index, IndexMut, Range},
@@ -544,36 +543,24 @@ impl ThinRetransmits {
     }
 }
 
-/// RFC4303-style sliding window packet number deduplicator.
+/// Exact, bounded receive history matching our minimum packet-number encoding.
 ///
-/// A contiguous bitfield, where each bit corresponds to a packet number and the rightmost bit is
-/// always set. A set bit represents a packet that has been successfully authenticated. Bits left of
-/// the window are assumed to be set.
-///
-/// ```text
-/// ...xxxxxxxxx 1 0
-///     ^        ^ ^
-/// window highest next
-/// ```
+/// The monotone floor is `next - WINDOW_SIZE`. Packets below it are always
+/// rejected; retained packet numbers are accepted exactly once. Ring positions
+/// are cleared only when they enter the window, never when an old packet arrives.
 pub(super) struct Dedup {
-    window: Window,
+    window: Box<[u64; WINDOW_WORDS]>,
     /// Lowest packet number higher than all yet authenticated.
     next: u64,
 }
 
-/// Inner bitfield type.
-///
-/// Because QUIC never reuses packet numbers, this only needs to be large enough to deal with
-/// packets that are reordered but still delivered in a timely manner.
-type Window = u128;
-
-/// Number of packets tracked by `Dedup`.
-const WINDOW_SIZE: u64 = 1 + mem::size_of::<Window>() as u64 * 8;
+const WINDOW_SIZE: u64 = crate::packet::PACKET_NUMBER_REORDER_WINDOW;
+const WINDOW_WORDS: usize = (WINDOW_SIZE as usize).div_ceil(64);
+const STORAGE_BITS: u64 = WINDOW_WORDS as u64 * 64;
 
 impl Dedup {
-    /// Construct an empty window positioned at the start.
     pub(super) fn new() -> Self {
-        Self { window: 0, next: 0 }
+        Self { window: Box::new([0; WINDOW_WORDS]), next: 0 }
     }
 
     /// Highest packet number authenticated.
@@ -581,94 +568,61 @@ impl Dedup {
         self.next - 1
     }
 
-    /// Record a newly authenticated packet number.
-    ///
-    /// Returns whether the packet might be a duplicate.
+    /// Record an authenticated packet. True means duplicate or retired.
     pub(super) fn insert(&mut self, packet: u64) -> bool {
-        if let Some(diff) = packet.checked_sub(self.next) {
-            // Right of window
-            self.window = ((self.window << 1) | 1)
-                .checked_shl(cmp::min(diff, u64::from(u32::MAX)) as u32)
-                .unwrap_or(0);
-            self.next = packet + 1;
-            false
-        } else if self.highest() - packet < WINDOW_SIZE {
-            // Within window
-            if let Some(bit) = (self.highest() - packet).checked_sub(1) {
-                // < highest
-                let mask = 1 << bit;
-                let duplicate = self.window & mask != 0;
-                self.window |= mask;
-                duplicate
-            } else {
-                // == highest
-                true
-            }
-        } else {
-            // Left of window
-            true
+        if packet < self.next.saturating_sub(WINDOW_SIZE) {
+            return true;
         }
+        if packet >= self.next {
+            let end = packet + 1;
+            if end - self.next >= STORAGE_BITS {
+                self.window.fill(0);
+            } else {
+                let mut cursor = self.next;
+                while cursor < end {
+                    let word_end = ((cursor / 64 + 1) * 64).min(end);
+                    self.window[Self::word(cursor)] &= !Self::mask(cursor, word_end);
+                    cursor = word_end;
+                }
+            }
+            self.next = end;
+        }
+        let mask = 1 << (packet % 64);
+        let word = &mut self.window[Self::word(packet)];
+        let duplicate = *word & mask != 0;
+        *word |= mask;
+        duplicate
     }
 
-    /// Returns the packet number of the smallest packet missing between the provided interval
-    ///
-    /// If there are no missing packets, returns `None`
+    fn word(packet: u64) -> usize {
+        ((packet / 64) % WINDOW_WORDS as u64) as usize
+    }
+
+    /// Bits for a nonempty interval within one word.
+    fn mask(start: u64, end: u64) -> u64 {
+        let width = end - start;
+        (u64::MAX >> (64 - width)) << (start % 64)
+    }
+
+    /// Find the first retained, missing packet strictly between two received
+    /// endpoints. Retired history is not evidence of a current missing packet.
     fn smallest_missing_in_interval(&self, lower_bound: u64, upper_bound: u64) -> Option<u64> {
         debug_assert!(lower_bound <= upper_bound);
         debug_assert!(upper_bound <= self.highest());
-        const BITFIELD_SIZE: u64 = (mem::size_of::<Window>() * 8) as u64;
-
-        // Since we already know the packets at the boundaries have been received, we only need to
-        // check those in between them (this removes the necessity of extra logic to deal with the
-        // highest packet, which is stored outside the bitfield)
-        let lower_bound = lower_bound + 1;
-        let upper_bound = upper_bound.saturating_sub(1);
-
-        // Note: the offsets are counted from the right
-        // The highest packet is not included in the bitfield, so we subtract 1 to account for that
-        let start_offset = (self.highest() - upper_bound).max(1) - 1;
-        if start_offset >= BITFIELD_SIZE {
-            // The start offset is outside of the window. All packets outside of the window are
-            // considered to be received.
-            return None;
+        let mut cursor = (lower_bound + 1).max(self.next.saturating_sub(WINDOW_SIZE));
+        while cursor < upper_bound {
+            let end = ((cursor / 64 + 1) * 64).min(upper_bound);
+            let gaps = !self.window[Self::word(cursor)] & Self::mask(cursor, end);
+            if gaps != 0 {
+                return Some(cursor / 64 * 64 + u64::from(gaps.trailing_zeros()));
+            }
+            cursor = end;
         }
-
-        let end_offset_exclusive = self.highest().saturating_sub(lower_bound);
-
-        // The range is clamped at the edge of the window, because any earlier packets are
-        // considered to be received
-        let range_len = end_offset_exclusive
-            .saturating_sub(start_offset)
-            .min(BITFIELD_SIZE);
-        if range_len == 0 {
-            return None;
-        }
-
-        // Ensure the shift is within bounds (we already know start_offset < BITFIELD_SIZE,
-        // because of the early return)
-        let mask = if range_len == BITFIELD_SIZE {
-            u128::MAX
-        } else {
-            ((1u128 << range_len) - 1) << start_offset
-        };
-        let gaps = !self.window & mask;
-
-        let smallest_missing_offset = 128 - gaps.leading_zeros() as u64;
-        let smallest_missing_packet = self.highest() - smallest_missing_offset;
-
-        if smallest_missing_packet <= upper_bound {
-            Some(smallest_missing_packet)
-        } else {
-            None
-        }
+        None
     }
 
-    /// Returns true if there are any missing packets between the provided interval
-    ///
-    /// The provided packet numbers must have been received before calling this function
     fn missing_in_interval(&self, lower_bound: u64, upper_bound: u64) -> bool {
-        self.smallest_missing_in_interval(lower_bound, upper_bound)
-            .is_some()
+        self.smallest_missing_in_interval(lower_bound, upper_bound).is_some()
     }
 }
 
@@ -1013,76 +967,52 @@ mod test {
     #[test]
     fn sanity() {
         let mut dedup = Dedup::new();
-        assert!(!dedup.insert(0));
-        assert_eq!(dedup.next, 1);
-        assert_eq!(dedup.window, 0b1);
-        assert!(dedup.insert(0));
-        assert_eq!(dedup.next, 1);
-        assert_eq!(dedup.window, 0b1);
-        assert!(!dedup.insert(1));
-        assert_eq!(dedup.next, 2);
-        assert_eq!(dedup.window, 0b11);
-        assert!(!dedup.insert(2));
-        assert_eq!(dedup.next, 3);
-        assert_eq!(dedup.window, 0b111);
-        assert!(!dedup.insert(4));
-        assert_eq!(dedup.next, 5);
-        assert_eq!(dedup.window, 0b11110);
-        assert!(!dedup.insert(7));
+        for packet in [0, 1, 2, 4, 7, 3, 6, 5] {
+            assert!(!dedup.insert(packet));
+            assert!(dedup.insert(packet));
+        }
         assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_0100);
-        assert!(dedup.insert(4));
-        assert!(!dedup.insert(3));
-        assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_1100);
-        assert!(!dedup.insert(6));
-        assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_1101);
-        assert!(!dedup.insert(5));
-        assert_eq!(dedup.next, 8);
-        assert_eq!(dedup.window, 0b1111_1111);
+        assert!(!dedup.missing_in_interval(0, 7));
     }
 
     #[test]
     fn happypath() {
         let mut dedup = Dedup::new();
-        for i in 0..(2 * WINDOW_SIZE) {
+        for i in 0..(2 * STORAGE_BITS) {
             assert!(!dedup.insert(i));
-            for j in 0..=i {
+            // Recent, boundary and already-retired duplicates. Linear work,
+            // rather than a quadratic test of a much larger history.
+            for j in [0, i / 2, i.saturating_sub(WINDOW_SIZE - 1), i] {
                 assert!(dedup.insert(j));
             }
         }
+        assert_eq!(mem::size_of_val(dedup.window.as_ref()), 4096);
     }
 
     #[test]
     fn jump() {
         let mut dedup = Dedup::new();
-        dedup.insert(2 * WINDOW_SIZE);
-        assert!(dedup.insert(WINDOW_SIZE));
-        assert_eq!(dedup.next, 2 * WINDOW_SIZE + 1);
-        assert_eq!(dedup.window, 0);
-        assert!(!dedup.insert(WINDOW_SIZE + 1));
-        assert_eq!(dedup.next, 2 * WINDOW_SIZE + 1);
-        assert_eq!(dedup.window, 1 << (WINDOW_SIZE - 2));
+        for highest in [2 * WINDOW_SIZE, 1 << 40, (1 << 62) - 1] {
+            assert!(!dedup.insert(highest));
+            assert!(dedup.insert(highest - WINDOW_SIZE));
+            assert!(!dedup.insert(highest - WINDOW_SIZE + 1));
+            assert!(dedup.insert(highest - WINDOW_SIZE + 1));
+            assert_eq!(dedup.next, highest + 1);
+        }
     }
 
     #[test]
     fn dedup_has_missing() {
         let mut dedup = Dedup::new();
-
         dedup.insert(0);
         assert!(!dedup.missing_in_interval(0, 0));
-
         dedup.insert(1);
         assert!(!dedup.missing_in_interval(0, 1));
-
         dedup.insert(3);
         assert!(dedup.missing_in_interval(1, 3));
-
         dedup.insert(4);
         assert!(!dedup.missing_in_interval(3, 4));
         assert!(dedup.missing_in_interval(0, 4));
-
         dedup.insert(2);
         assert!(!dedup.missing_in_interval(0, 4));
     }
@@ -1090,46 +1020,63 @@ mod test {
     #[test]
     fn dedup_outside_of_window_has_missing() {
         let mut dedup = Dedup::new();
-
-        for i in 0..140 {
-            dedup.insert(i);
-        }
-
-        // 0 and 4 are outside of the window
+        dedup.insert(0);
+        dedup.insert(4);
+        dedup.insert(WINDOW_SIZE + 10);
+        // Retired holes never become newly unseen packets.
         assert!(!dedup.missing_in_interval(0, 4));
-        dedup.insert(160);
-        assert!(!dedup.missing_in_interval(0, 4));
-        assert!(!dedup.missing_in_interval(0, 140));
-        assert!(dedup.missing_in_interval(0, 160));
+        assert_eq!(dedup.smallest_missing_in_interval(0, WINDOW_SIZE + 10), Some(11));
+        assert!(dedup.insert(10));
+        assert!(!dedup.insert(11));
+        assert_eq!(dedup.smallest_missing_in_interval(0, WINDOW_SIZE + 10), Some(12));
     }
 
     #[test]
     fn dedup_smallest_missing() {
         let mut dedup = Dedup::new();
-
         dedup.insert(0);
         assert_eq!(dedup.smallest_missing_in_interval(0, 0), None);
-
         dedup.insert(1);
         assert_eq!(dedup.smallest_missing_in_interval(0, 1), None);
-
         dedup.insert(5);
         dedup.insert(7);
         assert_eq!(dedup.smallest_missing_in_interval(0, 7), Some(2));
         assert_eq!(dedup.smallest_missing_in_interval(5, 7), Some(6));
-
         dedup.insert(2);
         assert_eq!(dedup.smallest_missing_in_interval(1, 7), Some(3));
-
         dedup.insert(170);
         dedup.insert(172);
         dedup.insert(300);
-        assert_eq!(dedup.smallest_missing_in_interval(170, 172), None);
+        assert_eq!(dedup.smallest_missing_in_interval(170, 172), Some(171));
+        dedup.insert(2 * WINDOW_SIZE);
+        let floor = WINDOW_SIZE + 1;
+        assert_eq!(dedup.smallest_missing_in_interval(0, 2 * WINDOW_SIZE), Some(floor));
+        assert_eq!(dedup.smallest_missing_in_interval(0, floor + 1), Some(floor));
+        assert_eq!(dedup.smallest_missing_in_interval(0, floor), None);
+    }
 
-        dedup.insert(500);
-        assert_eq!(dedup.smallest_missing_in_interval(0, 500), Some(372));
-        assert_eq!(dedup.smallest_missing_in_interval(0, 373), Some(372));
-        assert_eq!(dedup.smallest_missing_in_interval(0, 372), None);
+    #[test]
+    fn dedup_ring_wrap_matches_exact_reference() {
+        use std::collections::BTreeSet;
+        let mut received = BTreeSet::new();
+        let mut dedup = Dedup::new();
+        // Include word and storage wrap, skipped packets and reverse delivery.
+        for block in 0..600 {
+            let base = block * 131;
+            for offset in (0..131).rev().filter(|n| n % 5 != 0) {
+                let packet = base + offset;
+                let floor = dedup.next.saturating_sub(WINDOW_SIZE);
+                let duplicate = packet < floor || !received.insert(packet);
+                assert_eq!(dedup.insert(packet), duplicate);
+                assert!(dedup.insert(packet));
+            }
+            let highest = dedup.highest();
+            let start = highest.saturating_sub(190);
+            let first_missing = (start + 1..highest)
+                .filter(|n| *n >= dedup.next.saturating_sub(WINDOW_SIZE))
+                .find(|n| !received.contains(n));
+            assert_eq!(dedup.smallest_missing_in_interval(start, highest), first_missing);
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ use tracing::trace;
 use super::{
     mtud::MtuDiscovery,
     pacing::Pacer,
+    reordering::Reordering,
     spaces::{PacketSpace, SentPacket},
 };
 use crate::{congestion, packet::SpaceId, Duration, Instant, TransportConfig, TIMER_GRANULARITY};
@@ -16,6 +17,7 @@ use qlog::events::quic::MetricsUpdated;
 pub(super) struct PathData {
     pub(super) remote: SocketAddr,
     pub(super) rtt: RttEstimator,
+    pub(super) reordering: Reordering,
     /// Whether we're enabling ECN on outgoing packets
     pub(super) sending_ecn: bool,
     /// Congestion controller state
@@ -125,6 +127,7 @@ impl PathData {
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
+            reordering: Reordering::default(),
             sending_ecn: true,
             pacing: Pacer::new(
                 config.initial_rtt,
@@ -174,6 +177,7 @@ impl PathData {
         Self {
             remote,
             rtt: prev.rtt,
+            reordering: prev.reordering,
             pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
             sending_ecn: true,
             congestion,
@@ -346,6 +350,7 @@ impl PathData {
         controller_epoch: u64,
     ) {
         self.rtt = RttEstimator::new(config.initial_rtt);
+        self.reordering = Reordering::default();
         self.congestion = congestion;
         self.controller_epoch = controller_epoch;
         self.first_packet_after_rtt_sample = None;
@@ -828,7 +833,8 @@ mod tests {
         let mut config = TransportConfig::default();
         config.congestion_controller_factory(factory.clone());
         let now = Instant::now();
-        let initial = path(&config, 0, now);
+        let mut initial = path(&config, 0, now);
+        initial.reordering.on_late_original(now + Duration::from_millis(100), now, Duration::from_millis(90));
         assert_eq!(initial.controller_epoch(), 0);
 
         let rebound = PathData::from_previous(
@@ -840,6 +846,7 @@ mod tests {
         assert_eq!(controller(&rebound).lineage, controller(&initial).lineage);
         assert_eq!(controller(&rebound).epoch, controller(&initial).epoch);
         assert_eq!(rebound.controller_epoch(), initial.controller_epoch());
+        assert!(!rebound.reordering.packet_threshold_enabled());
 
         let mut migrated = PathData::for_new_network_path(
             "[::1]:443".parse().expect("new network address"),
@@ -853,9 +860,12 @@ mod tests {
         assert_eq!(controller(&migrated).lineage, controller(&initial).lineage);
         assert_eq!(controller(&migrated).epoch, controller(&initial).epoch + 1);
         assert_eq!(migrated.controller_epoch(), 2);
+        assert!(migrated.reordering.packet_threshold_enabled());
         assert_eq!(factory.builds.load(Ordering::Relaxed), 1);
 
+        migrated.reordering.on_late_original(now + Duration::from_millis(100), now, Duration::from_millis(90));
         migrated.reset(now, &config, 3).expect("controller reset");
+        assert!(migrated.reordering.packet_threshold_enabled());
         assert_eq!(controller(&migrated).lineage, controller(&initial).lineage);
         assert_eq!(controller(&migrated).epoch, controller(&initial).epoch + 2);
         assert_eq!(migrated.controller_epoch(), 3);

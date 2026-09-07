@@ -686,12 +686,16 @@ pub(crate) enum PacketNumber {
     U32(u32),
 }
 
+/// A two-byte packet number reconstructs correctly while `expected - number`
+/// is strictly below 2^15. Match receive history to that backward interval.
+pub(crate) const PACKET_NUMBER_REORDER_WINDOW: u64 = (1 << 15) - 1;
+
 impl PacketNumber {
     pub(crate) fn new(n: u64, largest_acked: u64) -> Self {
         let range = (n - largest_acked) * 2;
-        if range < 1 << 8 {
-            Self::U8(n as u8)
-        } else if range < 1 << 16 {
+        // Keep enough information for the receive-history reordering interval,
+        // including packets sent just after an ACK (a small forward span).
+        if range < 1 << 16 {
             Self::U16(n as u16)
         } else if range < 1 << 24 {
             Self::U24(n as u32)
@@ -923,7 +927,7 @@ mod tests {
 
     #[test]
     fn pn_encode() {
-        check_pn(PacketNumber::new(0x10, 0), &hex!("10"));
+        check_pn(PacketNumber::new(0x10, 0), &hex!("0010"));
         check_pn(PacketNumber::new(0x100, 0), &hex!("0100"));
         check_pn(PacketNumber::new(0x10000, 0), &hex!("010000"));
     }
@@ -935,6 +939,21 @@ mod tests {
                 assert_eq!(actual, PacketNumber::new(actual, expected).expand(expected));
             }
         }
+    }
+
+    #[test]
+    fn pn_reordering_interval_and_legacy_decode() {
+        for number in [1, 65_530, 1 << 30] {
+            let encoded = PacketNumber::new(number, number - 1);
+            assert_eq!(encoded.len(), 2);
+            for overtakes in [0, 64, 128, 130, PACKET_NUMBER_REORDER_WINDOW - 1] {
+                assert_eq!(encoded.expand(number + overtakes + 1), number);
+            }
+            assert_ne!(encoded.expand(number + PACKET_NUMBER_REORDER_WINDOW + 1), number);
+        }
+        // Old peers still decode normally inside their smaller interval.
+        assert_eq!(PacketNumber::U8(10).expand(100), 10);
+        assert_ne!(PacketNumber::U8(10).expand(140), 10);
     }
 
     #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]

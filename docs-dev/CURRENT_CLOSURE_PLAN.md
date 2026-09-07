@@ -1,10 +1,30 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 00:07 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 00:47 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Current checkpoint and next decision
+
+**Active next transaction, superseding older next-action text:** native QUIC
+post-outage no-progress attribution. Four further diagnostic uploads all
+confirm their bytes but retain3.38--5.45s gaps. The model run's native ACKed
+counter freezes at415,820,809bytes for roughly31.1--44.1s, despite the injected
+UDP outage ending at33s and RTT remaining50ms. Trace actual time-loss versus
+PTO scheduling before changing any admission/model parameter. RFC9002 explicitly
+requires time-loss priority, so choosing a smaller PTO timer is not an implicit
+two-line fix. See UPLOAD_RECOVERY_GATE_ATTRIBUTION and its full four-run archive.
+
+The post-requalification Product gate is also identified:12.26MB old OriginalData
+debt exceeds the reset512KiB acquisition allowance. This follows the current
+RFC; changing it without earlier ordered delivery would only send more suffix.
+The repair queue is empty during another stalled interval, disproving a FIFO
+change as that interval's fix. A QUIC proof receipt succeeds in121ms; larger
+requalification validity is unsupported. Sparse apply events do not establish
+an optimistic-apply busy loop. Product trace overlays are archived and removed;
+the native timer overlay is observation-only and will be removed after freezing
+its binary. No source acceptance, controller/window/timeout/traffic-hint change,
+new release or public performance claim follows. Global order remains below.
 
 **Active verdict:** no release pass. The relative ACK candidate preserves
 every logical snapshot and materially improves the reproduced clean 500/10

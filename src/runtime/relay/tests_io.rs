@@ -641,31 +641,6 @@ fn ack_gap_reinjection_requires_authoritative_ack_gap_shape() {
 }
 
 #[test]
-fn final_ack_extent_uses_the_exact_lowest_hole_across_frame_boundaries() {
-    assert_eq!(
-        normalized_stream_ack_first_uncovered_extent(
-            &[
-                OffsetRange { start: 0, end: 20 },
-                OffsetRange {
-                    start: 80,
-                    end: 100
-                },
-            ],
-            160,
-        ),
-        Some((20, 80)),
-    );
-    assert_eq!(
-        normalized_stream_ack_first_uncovered_extent(&[OffsetRange { start: 0, end: 100 }], 160,),
-        Some((100, 160)),
-    );
-    assert_eq!(
-        normalized_stream_ack_first_uncovered_extent(&[], 160),
-        Some((0, 160)),
-    );
-}
-
-#[test]
 fn exact_cached_prefix_crosses_storage_chunks_without_changing_the_scored_extent() {
     let stream_id = StreamId(776);
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());

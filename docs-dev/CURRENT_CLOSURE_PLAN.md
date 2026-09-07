@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 05:26 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 05:48 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -13,7 +13,9 @@ does not discard failed experiments, authorizations, or global gates.
 
 ## Current runtime and ordinary results
 
-Current isolated runtime: `765683b`; ordinary executable
+Current runtime checkpoint: `953a54f`, response retained assignment recovery,
+with333 affected component checks and mixed/adverse ordinary timing. Its fixed
+comparator is `765683b`; ordinary executable
 `./.tmp/reflection/bin/ack-atoms-20260908/mptunnel`.
 No diagnostic or request-sampler overlay is active. The user's seven-line
 LIVE_OWNER_FRONTIER_WORK_BOUND.md addition remains untouched.
@@ -351,6 +353,112 @@ disabled during comparison), then run the declared pair. Labels are
 `mixed-combined-up-response-retained-{control,candidate}-0908`; candidate path
 `./.tmp/reflection/bin/response-retained-20260908/mptunnel`. No ordinary result
 or practical promotion is claimed by this GREEN.
+
+**Freeze/checkpoint, 05:29:**953a54f records the independently reviewed mechanism
+and333 checks, explicitly not release acceptance. Optimized ordinary build
+completed2m03s; candidate is frozen at the declared path. Control run is started
+with both endpoints on765683b, exact existing profile and runtime tracing off.
+Owned certificate remains valid through2026-10-07; no product/probe was running
+before launch. Host load1.69 on the available host did not justify waiting.
+One compiler warning exposed the now-unused ACK-horizon extent helper; its
+only remaining consumer was its own unit test. Remove those orphaned pieces
+separately after binary freeze, without changing the pair executables or
+calling that cleanup a performance change. No compile overlaps the ordinary
+pair; the cleanup's focused compile follows it.
+
+**Ordinary pair complete; promotion stopped, 05:32:** both transfers complete
+exactly. Control234,815,488B/52.755080s/35.608Mbps; candidate259,457,024B/
+47.594305s/43.611Mbps. First confirmation0.463283->0.406435s and maximum local
+write gap4.655458->3.440146s improve, but maximum confirmation gap worsens
+4.799931->6.080193s. Higher bulk average does not pass the timing gate. This is
+an adverse aspect of an unseeded pair, not conclusive attribution to the change.
+No third acceptance run or download/full-matrix promotion follows it.
+Full raw bins, stages and costs are being preserved in
+RESPONSE_RETAINED_ORDINARY_20260908.md with its raw archive.
+
+**Remaining stage narrowed:** candidate40.101511--46.102124s has client reply
+delivery frozen at840B while server reply reads1218->1526B and ordered target
+writes240,683,927->254,488,023B. Thus the long confirmation gap contains actual
+held return work, not just forward upload silence. At47.102227s every payload
+byte is target-written while only924 of1553 response bytes are locally written.
+Snapshot timing cannot identify the missing response range, ownership or copy
+service. The model correction remains component-proven, not a demonstrated
+closure of this return-stage stall. The orphan-helper cleanup independently
+passes48 I/O component checks after1m06s build, no new warnings.
+
+## Completed discriminator: exact response frontier service capture
+
+- **Question:** during a repeated return-stage stall, which exact lowest
+  response byte is held between server source read and client local write?
+  Does retained repair fail to publish, publish but wait for native service,
+  or arrive ahead of a different missing prefix/behind local delivery?
+- **Existing evidence:** the ordinary40--46s boundary above, the real H/F and
+  fresh-append controls, and333 affected component checks. These do not identify
+  a native cause or prove every delayed response has the repaired geometry.
+- **Smallest action:** one diagnostic capture on frozen953a54f using existing
+  events only: server_sender_dispatch, server_repair_carrier_accept,
+  server_data_ack_recovery, server_response_recovery_wake, server_output_update,
+  stream_ack_received, receive_hole, receive_hole_release and
+  tail_stall_reinjection_blocked_frontier. No new code/build, sampler,
+  congestion/quantum setting or network change. Label
+  `mixed-combined-up-response-retained-service-diag-0908`.
+- **Discriminator:** join exact response offsets, original/copy target,
+  admission timestamp, receiver frontier release and positive ACK application.
+  A timely admitted copy rules out the old eligibility gate for that range;
+  a received frontier ahead of local writes moves the question downstream.
+  Missing events are not proof of native loss or suppression. Preserve current
+  native/management epochs and the profile's actual phase times.
+- **Stop:** one capture, then source/history/model review of the identified
+  stage. No repetition seeking a favourable rate, no bulk throughput promotion
+  from an instrumented executable, no new global controller hypothesis. If the
+  stall does not recur or events are insufficient, record that limit before
+  deciding the next smallest action. Products are stopped before any build.
+
+**Capture complete, 05:43:**314,376,192B exact completion in56.086584s,
+44.842Mbps, first confirmation.518576s and maxgap6.315621s. Instrumented rate
+is not ordinary acceptance. RESPONSE_RETAINED_SERVICE_20260908.raw.tar.gz
+preserves this one capture (4537 client/7505 server log lines).
+
+- Stream0/session15425282828787695206: response[870,884) original UDP0 at
+  Unix1788816968546ms (server.log4147), TCP1 copy170ms later (4230), TCP0
+  copy at6968918 (4249). That second copy's frozen deadline is5,482,425us;
+  third TCP2 copy at6974401 (4546), ACK F884 at6974919 (4551). Early copies
+  already publish: this is not the former H/F/no-ACK eligibility rejection.
+- Exact[912,926) TCP0 copy commits at1788816974919 (server4556), appears in
+  client mux at6977828 (client3003):2.909s later. Command commit does NOT mean
+  native socket/wire acceptance. This witness establishes the remaining stage.
+- Outside outage,[1262,1276) original UDP0 at1788816984760 (server5794);
+  TCP2/0/1 copies at6985031/5244/5445 (5991/6066/6122), about200ms copy
+  deadlines. First ACK F1276 only at6987421 (6282). All three admitted copies
+  still precede the hold: the earlier5.48s deadline is not a sufficient cause
+  and does not justify shortening it.
+- Client records only four hole/release events at6977826--7829, F912->954
+  with at most14B reordering. No observed sustained post-mux hole explains the
+  F870 or F1262 plateaus. During the former's6s client-Rc plateau, this same
+  relay applies456 request ACKs with max57ms adjacent gap; the latter's2s
+  interval applies138 with max47ms gap. Its pending-local-write branch does
+  not service incoming ACKs. A seconds-long already-applied response stuck
+  in that local write/flush therefore does not explain these intervals.
+- Native client TCP Recv-Q has57,005/158,084B at row31 and drains slowly,
+  but these socket bytes are not identified response frames. The cause is
+  not yet attributable to wire delay, writer/read service, mailbox backpressure
+  or relay input arbitration. FIFO or a biased select alone proves no defect.
+
+## Current next action: locate post-command/pre-mux service delay
+
+- **Question:** where does an exact dispatched response range spend the
+  observed seconds before client mux application: native writer/transport/
+  decode, carrier actor, attachment mailbox, or relay fan-in/service?
+- **Smallest action:** independent read-only review of those exact source and
+  history seams, then determine whether existing events can distinguish them.
+  No runtime fix, timer change or new broad audit. If exact handoffs lack
+  observations, declare a temporary offset/identity-keyed lab-only observer
+  and one diagnostic run before building; freeze and reverse the overlay.
+- **Falsifier / stop:** timely decoded and queued bytes localize later delay;
+  timely mux application rules out input service; late native completion
+  rules out a not-yet-reached downstream queue. Missing records remain unknown.
+  Do not revive rejected ready-feedback batching or tune deadlines merely
+  because control volume or a queue is large. Preserve ordinary comparators.
 
 **Initial-state boundary confirmed:** with no response ACK, the default
 snapshot has H=None/F0. Even a complete empty ACK leaves the old contiguous

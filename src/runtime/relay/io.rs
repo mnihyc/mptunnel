@@ -634,34 +634,6 @@ pub(in crate::runtime) fn normalized_stream_ack_first_gap(
     None
 }
 
-/// Returns the exact lowest Product interval omitted below a known horizon.
-/// Unlike an interior ACK gap, a final retained suffix is authoritative once
-/// the stream's final offset is known.
-pub(super) fn normalized_stream_ack_first_uncovered_extent(
-    normalized_ranges: &[OffsetRange],
-    horizon: u64,
-) -> Option<(u64, u64)> {
-    debug_assert!(
-        normalized_ranges
-            .windows(2)
-            .all(|ranges| ranges[0].end < ranges[1].start)
-    );
-    let mut cursor = 0_u64;
-    for range in normalized_ranges {
-        if range.end <= cursor {
-            continue;
-        }
-        if range.start > cursor {
-            return (cursor < horizon).then_some((cursor, range.start.min(horizon)));
-        }
-        cursor = range.end.min(horizon);
-        if cursor >= horizon {
-            return None;
-        }
-    }
-    (cursor < horizon).then_some((cursor, horizon))
-}
-
 pub(in crate::runtime) fn resize_reliable_relay_buffer(
     buffer: &mut bytes::BytesMut,
     target_len: usize,

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 00:27 +08:00. Authoritative source is `./`. **No release pass.**
+Updated: 2026-09-08 00:55 +08:00. Authoritative source is `./`. **No release pass.**
 This is the existing REVIEW_AND_PRACTICAL_ACCEPTANCE batch, not a new inventory.
 Superseded checkpoints are preserved in
 [the history](CLOSURE_PLAN_HISTORY_THROUGH_20260907.md) and their linked evidence.
@@ -145,6 +145,26 @@ or proof that a copy would necessarily improve the measured timing.
   harmful. Focused RED/GREEN and ordinary timing/overhead gates remain required.
   No sampler or recovery candidate is accepted from this trace alone.
 
+**RED stage complete, 00:55 +08:00:** actual cached/ordinarily committed three
+4 KiB chunks, receiver-produced ACK validation and real Product release give
+H=4096, F=8192, retained=4096. Exact owner age and an explicitly fixture-measured
+eligible alternate are checked before the assertion. The partial-ACK case
+fails only because recovery is not queued; aligned-H control queues the exact
+tail and target. Build 3m09s, pair 0.20s; initial test-only integer comparison
+compile failure was corrected, not counted as Product RED. Independent audit
+passes with the documented boundary: component/legal-wire contract, while
+the live trace supplies actual sparse-producer reachability.
+
+**Exact next action:** revise the retained-owner fallback contract/entry point
+using positive mux frontier and exact original ownership, not completeness of
+an older negative snapshot. Inspect active-tail and completion-tail call sites
+together so source closure is not an accidental prerequisite. Preserve the
+separate authoritative-gap path and all native/copy/qualification protections.
+Keep sampler and recovery changes separately attributable before any ordinary
+acceptance comparison; the archived sampler diff is not automatically accepted
+as a prerequisite. No new trace, congestion tuning or sparse-producer rewrite
+is needed to establish this already-proven eligibility defect.
+
 ## Existing dispositions that must not be lost
 
 - **Retained for demonstrated mechanisms:** native packet-number/reordering
@@ -198,9 +218,11 @@ remain outside this batch unless evidence and user scope justify inclusion.
 
 - No build/lab is running; the single prefix diagnostic is complete/censored
   and owned products/probes are stopped, origin services retained. Fresh
-  independent trace/source audits completed. A bounded test-only retained-tail
-  RED/control is being prepared; no recovery runtime change is authorized by
-  an unreviewed fixture. Existing sampler runtime remains unaccepted.
+  independent trace/source and fixture audits completed. The bounded test-only
+  retained-tail pair is RED/control-GREEN; its deliberately failing test remains
+  in the working tree and isolated archive. No recovery runtime change yet.
+  Existing sampler runtime remains unaccepted. Next step is the bounded model
+  correction above, not another diagnosis capture or broad test matrix.
 - Use the owned Docker topology only, not host shaping or sudo. Preserve exact
   executable/profile, phase clocks, full series and adverse results. Do not
   expand test infrastructure or repeat already conclusive diagnostics.

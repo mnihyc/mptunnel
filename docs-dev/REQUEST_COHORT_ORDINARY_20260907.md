@@ -190,3 +190,43 @@ are all incomplete. A focused real-owner RED/control is the next stage before
 changing fallback authority. Preserve native ownership, exact copy suppression,
 ranking and service bounds; delayed ACKs/shared contention are the adverse
 case because a speculative copy may arrive unnecessarily and cost latency.
+
+### Focused retained-tail RED/control
+
+2026-09-08 00:55 +08:00. No recovery implementation change.
+
+```sh
+CARGO_BUILD_JOBS=3 CARGO_TARGET_DIR=./target cargo test --release --locked --features lab-diagnostics --lib retained_completion_tail_ -- --nocapture
+```
+
+Optimized compilation: 3m09s; two tests: 0.20s, one expected RED and one GREEN,
+no ignored cases. The initial compile found two usize/u64 comparisons in new
+assertions; correcting those test-only types is not a Product failure.
+
+Both cases commit three 4 KiB cache chunks through ordinary Product admission
+and actual carrier command publication. A receiver accepts the first two and
+produces legal ACK frames; validation and Product/cache release derive F=8192,
+N=12288 and exactly 4096 B retained on the original owner. They wait until the
+actual original assignment plus unchanged recovery interval. The alternate's
+rate is explicitly fixture-seeded; the real fallback selector must verify
+that exact target and sufficient service before the tested entry point.
+
+| Case | H / F | Result |
+| --- | --- | --- |
+| `retained_completion_tail_survives_partial_ack_frontier_beyond_horizon` | 4096 / 8192 | RED: no recovery queued, no capacity/model-publication block |
+| `retained_completion_tail_with_aligned_complete_ack_horizon_control` | 8192 / 8192 | GREEN: exact retained range and target queued |
+
+The two setups differ only in whether the second receiver ACK is partial or
+complete. Neither injects H/F, cache release or original flight ownership.
+This proves the sender-contract eligibility defect, not actual copy delivery
+or a timing improvement. Independent audit confirms the distinction: the
+fixture directly uses a legal delta for contiguous receiver progress, whereas
+the real TCP sparse producer uses deltas while reordering persists. The live
+capture above supplies that producer reachability; the fixture alone does not.
+
+The isolated test-only diff is
+[preserved here](REQUEST_RETAINED_HORIZON_RED_20260908.patch). It remains an
+intentionally failing test in the working tree, not an accepted runtime patch
+or a CI/release pass. Next, correct the retained-owner fallback contract without
+widening negative ACK authority, then preserve this RED/control and compare
+ordinary timing with the sampler candidate kept independently attributable.

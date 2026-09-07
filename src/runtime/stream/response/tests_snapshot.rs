@@ -11,7 +11,8 @@ use super::super::evidence::{
 };
 use super::super::next_server_carrier_path_instance_id;
 use super::super::test_support::{
-    qualify_product_assignment, stream_data_frame, stream_data_frame_at,
+    native_response_binding_fixture, qualify_product_assignment, stream_data_frame,
+    stream_data_frame_at, with_output_entry_for_key_mut,
 };
 use super::{
     confidence_sample_denominator, server_bulk_output_snapshot, server_bulk_output_snapshot_at,
@@ -1039,6 +1040,52 @@ fn expired_product_rate_retains_durable_product_progress() {
         expired.has_durable_product_progress,
         "numeric freshness expiry cannot erase exact historical Product progress",
     );
+}
+
+#[test]
+fn native_response_snapshot_preserves_product_qualification_without_borrowing_its_rate() {
+    let fixture = native_response_binding_fixture(8, Some(200_000_000));
+    let snapshot = || {
+        fixture
+            .binding
+            .sender_path_targets(TrafficClass::Throughput, 65_536)
+            .into_iter()
+            .find(|target| target.observation.key == fixture.key)
+            .expect("live native output")
+            .observation
+    };
+    let unqualified = snapshot();
+    assert!(!unqualified.product_assignment_qualified);
+    assert!(!unqualified.snapshot.has_durable_product_progress);
+    with_output_entry_for_key_mut(&fixture.binding, fixture.key, |entry| {
+        qualify_product_assignment(entry, MuxLimits::default());
+        install_product_rate(entry, 900_000_000.0);
+    });
+    let qualified = snapshot();
+    assert!(qualified.product_assignment_qualified);
+    assert!(
+        qualified.snapshot.has_durable_product_progress,
+        "native rate projection must not demote a Product-qualified additional output to startup",
+    );
+    assert_eq!(qualified.snapshot.delivery_rate_bps, 200_000_000.0);
+    assert_eq!(qualified.snapshot.product_progress_rate_bps, None);
+    assert_eq!(
+        qualified.snapshot.scheduling_service_rate(),
+        unqualified.snapshot.scheduling_service_rate(),
+    );
+    with_output_entry_for_key_mut(&fixture.binding, fixture.key, |entry| {
+        entry.product_rate_epoch = None;
+    });
+    assert!(
+        snapshot().snapshot.has_durable_product_progress,
+        "numeric Product evidence expiry is not qualification revocation",
+    );
+    with_output_entry_for_key_mut(&fixture.binding, fixture.key, |entry| {
+        entry.product_qualification.revoke();
+    });
+    let revoked = snapshot();
+    assert!(!revoked.product_assignment_qualified);
+    assert!(!revoked.snapshot.has_durable_product_progress);
 }
 
 #[test]

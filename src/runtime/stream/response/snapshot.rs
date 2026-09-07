@@ -621,6 +621,9 @@ pub(super) fn server_native_bulk_output_snapshot_at(
     snapshot.queue_bytes = entry.commands.pending_bytes();
     snapshot.data_level_queue_bytes = data_level_queue_bytes;
     snapshot.data_level_bytes_in_flight = entry.original_data_in_flight_bytes;
+    // Native rate authority excludes Product rate samples, not the independent
+    // exact-output qualification that permits mature additional-path admission.
+    snapshot.has_durable_product_progress = entry.product_qualification.qualified();
     if let Some(shape) = shape {
         let finite_rate_bps = shape.finite_rate_bps();
         snapshot.carrier_delivery_rate_bps = (shape.basis()

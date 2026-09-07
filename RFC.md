@@ -3307,6 +3307,17 @@ native admission. The first overlap, rejection, or identity change ends that
 failure prefix without skipping ahead. All accepted bytes remain in
 directional Product recovery-work accounting.
 
+Retained-frontier fallback applies during active sending as well as final
+drain. Its frontier is the sender's current positive Data-ACK/cache frontier,
+refined to exact cached OriginalData ownership and the ranked prefix above.
+Source EOF, empty source staging and completeness of a historical ACK snapshot
+are not prerequisites. Suffix receipt or source activity MUST NOT postpone the
+original owner's immutable fallback deadline. This local retained obligation
+does not extend the negative ACK horizon or declare omitted/native data lost;
+speculative authoritative-gap recovery retains its separate complete-horizon
+requirement. Existing accepted-copy suppression and exact target/native service
+admission apply before another copy, including a copy to a third carrier.
+
 Product-queue insertion is provisional: it neither consumes final slot
 publication authority nor grants native admission. Actual writer Apply owns the
 atomic revalidation and commit boundary defined below. Cause clocks remain

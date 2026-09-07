@@ -83,6 +83,15 @@ async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+pub(in crate::runtime) fn request_retained_frontier_candidate(
+    send_stream: &ReliableSendStream,
+    remotes: &ReliableRelayRemoteSet,
+) -> bool {
+    send_stream.data_ack_frontier() < send_stream.next_offset()
+        && send_stream.reinjection_bytes() > 0
+        && remotes.path_keys().len() > 1
+}
+
 fn request_live_owner_tail_wake(
     retained_live_tail: bool,
     owner_fallback_deadline: Option<Instant>,
@@ -510,17 +519,7 @@ async fn apply_client_additional_path_open_postaction(
     if !matches!(attached_mode, Some(ReliableRelayAttachMode::Recovery)) {
         return Ok(());
     }
-    if sender.enqueue_tail_reinjection(
-        sender_queue,
-        context,
-        remotes,
-        send_stream,
-        state.progress.last_send_ack.ranges(),
-        state.progress.last_send_ack.complete(),
-        Some(send_stream.next_offset()),
-        state.progress.last_send_ack_frontier,
-        request_lane,
-    ) {
+    if sender.enqueue_tail_reinjection(sender_queue, context, remotes, send_stream, request_lane) {
         state.progress.sender_retry_at = None;
     }
     let response_path_snapshot =
@@ -1323,22 +1322,19 @@ where
         } else {
             path_snapshot
         };
-        let retained_request_live_tail = state.progress.last_send_ack.complete()
-            && state.progress.last_send_ack_frontier < send_stream.next_offset()
-            && send_stream.reinjection_bytes() > 0
-            && remotes.path_keys().len() > 1;
+        let retained_request_live_tail =
+            request_retained_frontier_candidate(&send_stream, &remotes);
         let persistent_product_stall = state
             .progress
             .last_product_stall_attempt_at
             .is_some_and(|attempted_at| attempted_at >= stall_progress_anchor);
-        // After source staging drains, `next_offset` is the assigned final
-        // offset; racing sooner would put duplicate work ahead of unique data.
-        let completion_tail_candidate = !state.endpoint.local_open
-            && sender_queue.data_bytes() == 0
-            && retained_request_live_tail;
+        // The sender proves exact committed OriginalData ownership and its
+        // immutable age below. New source or suffix ACK activity cannot erase
+        // that retained-prefix obligation; neither EOF nor negative ACK
+        // completeness is evidence for this independently timed fallback.
         // Arm before exact-target selection: Notify edges are not retained if
         // the native writer releases capacity between Decide and select.
-        let completion_tail_capacity_wait = completion_tail_candidate
+        let retained_frontier_capacity_wait = retained_request_live_tail
             .then(|| {
                 arm_carrier_capacity_notifies(
                     remotes
@@ -1349,34 +1345,31 @@ where
                 )
             })
             .flatten();
-        let has_completion_tail_capacity_wait = completion_tail_capacity_wait.is_some();
-        let completion_tail_outcome = if completion_tail_candidate {
-            sender.enqueue_completion_tail_reinjection(
+        let has_retained_frontier_capacity_wait = retained_frontier_capacity_wait.is_some();
+        let retained_frontier_outcome = if retained_request_live_tail {
+            sender.enqueue_retained_frontier_reinjection(
                 &mut sender_queue,
                 context,
                 &remotes,
                 &send_stream,
-                state.progress.last_send_ack.ranges(),
-                state.progress.last_send_ack.complete(),
-                state.progress.last_send_ack_frontier,
                 request_lane,
             )
         } else {
             Default::default()
         };
-        let completion_tail_path_model_publication = completion_tail_outcome
+        let retained_frontier_path_model_publication = retained_frontier_outcome
             .waiting_for_path_model_publication
             .then(|| {
                 context
                     .arm_path_model_publication(path_model_generation_before_recovery_observation)
             });
-        let has_completion_tail_path_model_publication =
-            completion_tail_path_model_publication.is_some();
-        if completion_tail_outcome.queued {
+        let has_retained_frontier_path_model_publication =
+            retained_frontier_path_model_publication.is_some();
+        if retained_frontier_outcome.queued {
             state.progress.sender_retry_at = None;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
-                "request_completion_tail_reinjection",
+                "request_retained_frontier_reinjection",
                 format_args!(
                     "stream_id={} ack_frontier={} sent_offset={} reinjection_bytes={} attached_paths={}",
                     stream_id.0,
@@ -1393,10 +1386,6 @@ where
                 context,
                 &remotes,
                 &send_stream,
-                state.progress.last_send_ack.ranges(),
-                state.progress.last_send_ack.complete(),
-                Some(send_stream.next_offset()),
-                state.progress.last_send_ack_frontier,
                 request_lane,
             )
         {
@@ -1513,22 +1502,11 @@ where
         #[cfg(not(feature = "lab-diagnostics"))]
         let _ = data_ack_reinjection;
         if accepted_copy_due {
-            let persistent_product_stall = state
-                .progress
-                .last_product_stall_attempt_at
-                .is_some_and(|attempted_at| attempted_at >= stall_progress_anchor);
-            let reinjection_horizon = persistent_product_stall
-                .then(|| send_stream.next_offset())
-                .or_else(|| state.progress.last_send_ack.horizon());
             if sender.enqueue_tail_reinjection(
                 &mut sender_queue,
                 context,
                 &remotes,
                 &send_stream,
-                state.progress.last_send_ack.ranges(),
-                state.progress.last_send_ack.complete(),
-                reinjection_horizon,
-                state.progress.last_send_ack_frontier,
                 request_lane,
             ) {
                 state.progress.sender_retry_at = None;
@@ -1772,24 +1750,24 @@ where
                 continue;
             }
             _ = async move {
-                if let Some(wait) = completion_tail_capacity_wait {
+                if let Some(wait) = retained_frontier_capacity_wait {
                     wait.await;
                 }
-            }, if completion_tail_outcome.blocked_for_carrier_capacity && has_completion_tail_capacity_wait => {
-                // A due finite tail remains owned by the actor while its exact
+            }, if retained_frontier_outcome.blocked_for_carrier_capacity && has_retained_frontier_capacity_wait => {
+                // A due retained frontier stays owned while its exact
                 // alternate is full. Re-evaluate the same frontier when native
                 // capacity is released; no polling clock is introduced.
                 continue;
             }
             _ = async move {
-                if let Some(publication) = completion_tail_path_model_publication {
+                if let Some(publication) = retained_frontier_path_model_publication {
                     publication.await;
                 }
-            }, if completion_tail_outcome.waiting_for_path_model_publication
-                && has_completion_tail_path_model_publication => {
-                // EOF completion work has horizon zero, so the ordinary
-                // pre-horizon staleness scan cannot own this edge. Re-enter
-                // the exact tail decision when owner/alternate Product
+            }, if retained_frontier_outcome.waiting_for_path_model_publication
+                && has_retained_frontier_path_model_publication => {
+                // Retained work can lie beyond the negative ACK horizon, so
+                // the pre-horizon staleness scan cannot own this edge. Re-enter
+                // the exact frontier decision when owner/alternate Product
                 // evidence or path availability is published.
                 continue;
             }
@@ -1934,18 +1912,11 @@ where
                     .progress
                     .last_product_stall_attempt_at
                     .is_some_and(|attempted_at| attempted_at >= stall_progress_anchor);
-                let reinjection_horizon = persistent_product_stall
-                    .then(|| send_stream.next_offset())
-                    .or_else(|| state.progress.last_send_ack.horizon());
                 let queued_existing_tail_reinjection = sender.enqueue_tail_reinjection(
                     &mut sender_queue,
                     context,
                     &remotes,
                     &send_stream,
-                    state.progress.last_send_ack.ranges(),
-                    state.progress.last_send_ack.complete(),
-                    reinjection_horizon,
-                    state.progress.last_send_ack_frontier,
                     request_lane,
                 );
                 let recovery_open_spawned = persistent_product_stall

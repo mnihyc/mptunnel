@@ -5296,3 +5296,533 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
 
     controller.release_all(&context);
 }
+
+async fn commit_request_rate_cohort(
+    sender: &mut crate::runtime::sender::request::RequestSenderService,
+    context: &ClientPathContext,
+    remotes: &mut ReliableRelayRemoteSet,
+    receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers,
+    range: OffsetRange,
+) {
+    let stream_id = remotes.stream_id();
+    let quantum = crate::model::capacity::reliable_relay_buffer_len(context.mux_limits);
+    let mut offset = range.start;
+    while offset < range.end {
+        let bytes = quantum.min((range.end - offset) as usize);
+        sender
+            .send_frame(
+                context,
+                remotes,
+                data_frame(stream_id, offset, bytes),
+                RelaySendCause::StreamData,
+                Some(TrafficClass::Throughput),
+            )
+            .await
+            .expect("ordinary planning, exact admission, reservation and Product commit succeed");
+        loop {
+            match try_recv_reliable_path_command(receivers) {
+                Some(ReliablePathCommand::SendFrame(Frame::PathProofData {
+                    path_id,
+                    proof_id,
+                    payload,
+                })) => {
+                    assert_eq!(path_id, PathId(0));
+                    assert_eq!(Some(proof_id), remotes.paths[0].path_proof_id);
+                    assert!(!payload.is_empty());
+                    continue;
+                }
+                Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+                    stream_id: published_stream,
+                    offset: published_offset,
+                    payload,
+                })) => {
+                    assert_eq!(published_stream, stream_id);
+                    assert_eq!(published_offset, offset);
+                    assert_eq!(payload.len(), bytes);
+                    break;
+                }
+                Some(ReliablePathCommand::SendFrame(frame)) => {
+                    panic!("expected committed Product or attachment proof, got {frame:?}")
+                }
+                Some(_) => panic!("unexpected non-frame command"),
+                None => panic!("committed Product frame was not published"),
+            }
+        }
+        offset += bytes as u64;
+    }
+}
+
+async fn retained_completion_tail_after_positive_ack(aligned_horizon: bool) {
+    use crate::mux::stream::ReliableRecvStream;
+    use crate::runtime::relay::io::{
+        AuthoritativeStreamAckSnapshot, begin_reliable_stream_ack,
+        update_reinjection_authoritative_ack_snapshot,
+    };
+    use crate::runtime::sender::request::RequestSenderService;
+
+    let stream_id = StreamId(395);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10395?initial-srtt-s=0.02",
+        "tcp://127.0.0.1:10396?initial-srtt-s=0.02",
+    ]);
+    let limits = context.mux_limits;
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(owner);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Throughput);
+
+    // Three small equal cache chunks isolate H < F < N without changing any
+    // resource bound; their total also fits the existing startup allowance.
+    let unit = 4096;
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut originals = Vec::new();
+    for _ in 0..3 {
+        let frame = send_stream
+            .send_data(Bytes::from(vec![0x5a; unit]))
+            .expect("source bytes enter the real retransmission cache");
+        let (start, end, _) =
+            reliable_stream_frame_extent(&frame).expect("cached OriginalData extent");
+        commit_request_rate_cohort(
+            &mut sender,
+            &context,
+            &mut remotes,
+            &mut owner_receivers,
+            OffsetRange { start, end },
+        )
+        .await;
+        originals.push(frame);
+    }
+    assert_eq!(
+        sender
+            .multipath
+            .request
+            .flights
+            .original_data_in_flight_bytes(owner),
+        (3 * unit) as u64,
+        "ordinary publication, not an injected flight, owns every cached byte",
+    );
+
+    let mut receiver = ReliableRecvStream::new(stream_id, limits);
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    for (index, original) in originals.iter().take(2).enumerate() {
+        let Frame::StreamData {
+            offset, payload, ..
+        } = original
+        else {
+            panic!("expected OriginalData");
+        };
+        let received = receiver
+            .receive_data(*offset, payload.clone())
+            .expect("receiver accepts the exact committed prefix");
+        assert_eq!(
+            received.delivered.iter().map(Bytes::len).sum::<usize>(),
+            unit
+        );
+        let frames = if index == 0 || aligned_horizon {
+            receiver.ack_frames()
+        } else {
+            let (start, end, _) =
+                reliable_stream_frame_extent(original).expect("new positive receipt extent");
+            receiver.ack_delta_frames(&[OffsetRange { start, end }])
+        };
+        assert_eq!(frames.len(), 1);
+        let Frame::StreamAck {
+            complete, ranges, ..
+        } = frames.into_iter().next().expect("one ACK publication")
+        else {
+            panic!("expected receiver-produced ACK");
+        };
+        assert_eq!(complete, index == 0 || aligned_horizon);
+        let ack = begin_reliable_stream_ack(&send_stream, complete, ranges)
+            .expect("receiver ACK validates against actual assigned extent");
+        let applied = sender
+            .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
+            .expect("positive ACK releases exact cache and original ownership");
+        assert_eq!(applied.mux.released_bytes, unit);
+        update_reinjection_authoritative_ack_snapshot(&mut snapshot, &ack);
+    }
+    let frontier = send_stream.data_ack_frontier();
+    let horizon = (if aligned_horizon { 2 * unit } else { unit }) as u64;
+    assert_eq!(frontier, (2 * unit) as u64);
+    assert_eq!(snapshot.horizon(), Some(horizon));
+    assert_eq!(
+        snapshot.ranges(),
+        &[OffsetRange {
+            start: 0,
+            end: horizon
+        }]
+    );
+    assert_eq!(send_stream.reinjection_bytes(), unit);
+    assert_eq!(
+        sender
+            .multipath
+            .request
+            .flights
+            .original_data_in_flight_bytes(owner),
+        unit as u64,
+    );
+    let retained = &originals[2];
+    let (retained_start, retained_end, _) =
+        reliable_stream_frame_extent(retained).expect("retained tail");
+    assert_eq!(retained_start, frontier);
+    assert_eq!(retained_end, send_stream.next_offset());
+    let assigned_at = sender
+        .multipath
+        .request
+        .flights
+        .unique_original_sent_at_for_frame(retained)
+        .expect("the unresolved tail retains its actual original commit clock");
+    let owner_deadline = assigned_at
+        + reliable_data_retransmission_interval(
+            Some(owner.key.underlay),
+            context.reliable_path_snapshot_for_instance(owner),
+        );
+    tokio::time::sleep_until(tokio::time::Instant::from_std(owner_deadline)).await;
+    assert!(Instant::now() >= owner_deadline);
+
+    // Attach after all original commits, so the owner is deterministic. Use
+    // the existing measured-alternate fixture and prove its exact fallback
+    // service before reaching the H/F regression assertion.
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, target_commands)),
+        crate::runtime::stream::ReliableRelayAttachOutcome::Attached,
+    );
+    consume_client_path_proof_for_test(&mut target_receivers);
+    let target = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        })
+        .expect("distinct current fallback target");
+    context.install_relay_path_instance_for_test(target);
+    context.mark_tcp_path_open_success(1, Duration::from_millis(20), TrafficClass::Throughput);
+    context.mark_relay_path_rate_sample_for_test(
+        target.key,
+        PathRateSample::new(64 * 1024, Duration::from_millis(20))
+            .expect("existing measured target rate fixture"),
+    );
+    assert!(context.relay_path_instance_has_bulk_model_evidence(target));
+    let mut queue = ReliableRelaySenderQueue::default();
+    let eligible = sender
+        .multipath
+        .tail_reinjection_fallback_service_target_observation_for_extent(
+            &context,
+            &remotes,
+            retained,
+            TrafficClass::Throughput,
+            &queue,
+            send_stream.reinjection_bytes(),
+            limits,
+            unit,
+        )
+        .target
+        .expect("owner-independent alternate qualification and service are already valid");
+    assert_eq!(eligible.identity.instance, target);
+    assert!(eligible.service_limit_bytes >= unit);
+
+    let outcome = sender.enqueue_retained_frontier_reinjection(
+        &mut queue,
+        &context,
+        &remotes,
+        &send_stream,
+        TrafficClass::Throughput,
+    );
+    assert!(
+        outcome.queued,
+        "retained ownership after positive ACK progress must survive H/F divergence: aligned={aligned_horizon} H={horizon} F={frontier} N={} outcome={outcome:?}",
+        send_stream.next_offset(),
+    );
+    let (_, queued) = queue.pop_front().expect("exact retained-tail repair");
+    assert!(matches!(
+        queued.kind,
+        ReliableRelayQueuedWorkKind::Reinjection {
+            frame: Frame::StreamData { offset, payload, .. },
+            cause: RelaySendCause::CompletionTailReinjection(identity),
+        } if offset == frontier && payload.len() == unit && identity.instance == target
+    ));
+    assert!(queue.is_empty());
+    assert_eq!(
+        snapshot.horizon(),
+        Some(horizon),
+        "recovery must not invent negative ACK authority"
+    );
+}
+
+#[tokio::test]
+async fn retained_completion_tail_survives_partial_ack_frontier_beyond_horizon() {
+    retained_completion_tail_after_positive_ack(false).await;
+}
+
+#[tokio::test]
+async fn retained_completion_tail_with_aligned_complete_ack_horizon_control() {
+    retained_completion_tail_after_positive_ack(true).await;
+}
+
+#[tokio::test]
+async fn active_request_retained_hole_recovers_after_partial_ack_beyond_horizon() {
+    use crate::mux::stream::ReliableRecvStream;
+    use crate::runtime::relay::io::{
+        AuthoritativeStreamAckSnapshot, begin_reliable_stream_ack,
+        update_reinjection_authoritative_ack_snapshot,
+    };
+    use crate::runtime::relay::request_retained_frontier_candidate;
+    use crate::runtime::sender::request::RequestSenderService;
+
+    let stream_id = StreamId(396);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10397?initial-srtt-s=0.02",
+        "tcp://127.0.0.1:10398?initial-srtt-s=0.02",
+    ]);
+    let limits = context.mux_limits;
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(owner);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Throughput);
+
+    // Four equal chunks fit unchanged bootstrap credit and distinguish the
+    // retained middle hole from an already positively acknowledged suffix.
+    let unit = 2048;
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut originals = Vec::new();
+    for _ in 0..4 {
+        let frame = send_stream
+            .send_data(Bytes::from(vec![0x5a; unit]))
+            .expect("source commits real cached data without a FIN");
+        let (start, end, _) = reliable_stream_frame_extent(&frame).expect("original extent");
+        commit_request_rate_cohort(
+            &mut sender,
+            &context,
+            &mut remotes,
+            &mut owner_receivers,
+            OffsetRange { start, end },
+        )
+        .await;
+        originals.push(frame);
+    }
+    let mut receiver = ReliableRecvStream::new(stream_id, limits);
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    for index in [0, 1, 3] {
+        let Frame::StreamData {
+            offset, payload, ..
+        } = &originals[index]
+        else {
+            panic!("committed OriginalData");
+        };
+        receiver
+            .receive_data(*offset, payload.clone())
+            .expect("receiver accepts prefix or out-of-order suffix");
+        let frames = if index == 0 {
+            receiver.ack_frames()
+        } else {
+            receiver.ack_delta_frames(&[OffsetRange {
+                start: *offset,
+                end: *offset + payload.len() as u64,
+            }])
+        };
+        assert_eq!(frames.len(), 1);
+        let Frame::StreamAck {
+            complete, ranges, ..
+        } = frames.into_iter().next().expect("receiver-produced ACK")
+        else {
+            panic!("StreamAck");
+        };
+        assert_eq!(complete, index == 0);
+        let ack = begin_reliable_stream_ack(&send_stream, complete, ranges)
+            .expect("ACK validates against committed source extent");
+        let applied = sender
+            .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
+            .expect("positive receipt releases exact Product ownership");
+        assert_eq!(applied.mux.released_bytes, unit);
+        update_reinjection_authoritative_ack_snapshot(&mut snapshot, &ack);
+    }
+    let frontier = (2 * unit) as u64;
+    assert_eq!(snapshot.horizon(), Some(unit as u64));
+    assert_eq!(send_stream.data_ack_frontier(), frontier);
+    assert_eq!(send_stream.next_offset(), (4 * unit) as u64);
+    assert_eq!(send_stream.reinjection_bytes(), unit);
+    assert_eq!(receiver.reorder_bytes(), unit);
+    assert_eq!(
+        sender
+            .multipath
+            .request
+            .flights
+            .original_data_in_flight_bytes(owner),
+        unit as u64,
+    );
+    let retained = &originals[2];
+    let assigned_at = sender
+        .multipath
+        .request
+        .flights
+        .unique_original_sent_at_for_frame(retained)
+        .expect("the retained middle hole has its actual original owner clock");
+    let owner_deadline = assigned_at
+        + reliable_data_retransmission_interval(
+            Some(owner.key.underlay),
+            context.reliable_path_snapshot_for_instance(owner),
+        );
+
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, target_commands)),
+        crate::runtime::stream::ReliableRelayAttachOutcome::Attached,
+    );
+    consume_client_path_proof_for_test(&mut target_receivers);
+    let target = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        })
+        .expect("distinct current target");
+    context.install_relay_path_instance_for_test(target);
+    context.mark_tcp_path_open_success(1, Duration::from_millis(20), TrafficClass::Throughput);
+    context.mark_relay_path_rate_sample_for_test(
+        target.key,
+        PathRateSample::new(64 * 1024, Duration::from_millis(20))
+            .expect("existing measured-alternate fixture"),
+    );
+    assert!(context.relay_path_instance_has_bulk_model_evidence(target));
+    // This is the same eligibility predicate used by the production actor;
+    // source EOF/staging drain is not supplied as recovery authority. The
+    // source still accepts further work, and this test has emitted no FIN.
+    assert!(
+        send_stream
+            .prepare_data(Bytes::from_static(b"more source data"))
+            .is_ok()
+    );
+    assert!(request_retained_frontier_candidate(&send_stream, &remotes));
+    let mut queue = ReliableRelaySenderQueue::default();
+    let eligible = sender
+        .multipath
+        .tail_reinjection_fallback_service_target_observation_for_extent(
+            &context,
+            &remotes,
+            retained,
+            TrafficClass::Throughput,
+            &queue,
+            send_stream.reinjection_bytes(),
+            limits,
+            unit,
+        )
+        .target
+        .expect("target qualification and exact service are not the rejection cause");
+    assert_eq!(eligible.identity.instance, target);
+    assert!(eligible.service_limit_bytes >= unit);
+    assert!(
+        Instant::now() < owner_deadline,
+        "fixture must reach the fresh-owner control"
+    );
+    let fresh = sender.enqueue_retained_frontier_reinjection(
+        &mut queue,
+        &context,
+        &remotes,
+        &send_stream,
+        TrafficClass::Throughput,
+    );
+    assert!(
+        !fresh.queued,
+        "positive ACK progress cannot age a fresh original"
+    );
+    assert!(queue.is_empty());
+
+    tokio::time::sleep_until(tokio::time::Instant::from_std(owner_deadline)).await;
+    assert!(Instant::now() >= owner_deadline);
+    let due = sender.enqueue_retained_frontier_reinjection(
+        &mut queue,
+        &context,
+        &remotes,
+        &send_stream,
+        TrafficClass::Throughput,
+    );
+    assert!(
+        due.queued,
+        "active H<F middle-hole recovery must not require source closure: {due:?}"
+    );
+    assert_eq!(queue.reinjection_bytes(), unit);
+    let (_, queued) = queue.front().expect("one exact frontier repair");
+    assert!(matches!(
+        &queued.kind,
+        ReliableRelayQueuedWorkKind::Reinjection {
+            frame: Frame::StreamData { offset, payload, .. },
+            cause: RelaySendCause::CompletionTailReinjection(identity),
+        } if *offset == frontier && payload.len() == unit && identity.instance == target
+    ));
+    let duplicate = sender.enqueue_retained_frontier_reinjection(
+        &mut queue,
+        &context,
+        &remotes,
+        &send_stream,
+        TrafficClass::Throughput,
+    );
+    assert!(!duplicate.queued);
+    assert_eq!(
+        queue.reinjection_bytes(),
+        unit,
+        "no queued copy or ACKed suffix duplication"
+    );
+    assert_eq!(snapshot.horizon(), Some(unit as u64));
+
+    let Frame::StreamData {
+        offset, payload, ..
+    } = retained
+    else {
+        panic!("retained OriginalData");
+    };
+    receiver
+        .receive_data(*offset, payload.clone())
+        .expect("original or copy closes the hole");
+    let frames = receiver.ack_delta_frames(&[OffsetRange {
+        start: *offset,
+        end: *offset + payload.len() as u64,
+    }]);
+    assert_eq!(frames.len(), 1);
+    let Frame::StreamAck {
+        complete, ranges, ..
+    } = frames.into_iter().next().expect("hole ACK")
+    else {
+        panic!("StreamAck");
+    };
+    assert!(!complete);
+    let ack =
+        begin_reliable_stream_ack(&send_stream, complete, ranges).expect("hole ACK validates");
+    let applied = sender
+        .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
+        .expect("hole receipt releases final retained ownership");
+    assert_eq!(applied.mux.released_bytes, unit);
+    assert_eq!(
+        queue.release_normalized_acked_reinjections(ack.ranges()),
+        unit
+    );
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &ack);
+    assert_eq!(send_stream.data_ack_frontier(), send_stream.next_offset());
+    assert_eq!(send_stream.reinjection_bytes(), 0);
+    assert_eq!(
+        snapshot.horizon(),
+        Some(unit as u64),
+        "partial receipts never widen H"
+    );
+    assert!(!request_retained_frontier_candidate(&send_stream, &remotes));
+    let resolved = sender.enqueue_retained_frontier_reinjection(
+        &mut queue,
+        &context,
+        &remotes,
+        &send_stream,
+        TrafficClass::Throughput,
+    );
+    assert!(!resolved.queued);
+    assert!(queue.is_empty());
+    assert!(
+        send_stream
+            .prepare_data(Bytes::from_static(b"source remains open"))
+            .is_ok()
+    );
+}

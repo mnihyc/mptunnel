@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 00:55 +08:00. Authoritative source is `./`. **No release pass.**
+Updated: 2026-09-08 01:20 +08:00. Authoritative source is `./`. **No release pass.**
 This is the existing REVIEW_AND_PRACTICAL_ACCEPTANCE batch, not a new inventory.
 Superseded checkpoints are preserved in
 [the history](CLOSURE_PLAN_HISTORY_THROUGH_20260907.md) and their linked evidence.
@@ -20,7 +20,7 @@ post-load drain. Complete series and limitations are in
 LATE_STARTUP_SCOPE_ORDINARY_20260907. These snapshots are not a causal A/B of
 the rare attachment refusal branch and are not fluent-experience acceptance.
 
-**Active transaction: request/upload rate refresh.** The existing sampler
+**Held preceding transaction: request/upload rate refresh.** The existing sampler
 requires each cohort's earliest assignment to follow the previous ACK and
 advances that boundary even on rejection. Ordinary pipelining can therefore
 prevent every refresh after the first. The staged predicate predates its
@@ -165,6 +165,94 @@ acceptance comparison; the archived sampler diff is not automatically accepted
 as a prerequisite. No new trace, congestion tuning or sparse-producer rewrite
 is needed to establish this already-proven eligibility defect.
 
+**Implementation transaction, 2026-09-08:** first shelve the independently
+archived, unaccepted request sampler source/RFC/test overlay back to the
+retained baseline. Keep its frozen binaries, evidence and exact patch; retain
+only the shared ordinary-commit test helper needed by the new horizon RED.
+This prevents an unaccepted sampler from becoming an implicit prerequisite or
+confounder. The sampler remains an existing unresolved acceptance item, not a
+rejected mathematical correction. No user-authored changes are included.
+
+Then correct positive retained-frontier observation and active/completion
+entry together, keeping current exact owner, immutable deadline, ranked target,
+copy suppression and final service admission. An active-source regression
+must exercise the production observation/entry; the prior completion-only RED
+cannot close the in-load stall by itself. Before ordinary comparison verify
+negative-horizon, fresh-owner, already-ACKed and copy/admission controls.
+
+**Implementation decision, 2026-09-08 01:09 +08:00:** sampler production/RFC
+overlay is now shelved (archived patch and frozen executable retained). The
+isolated recovery entry derives F/N from the mux, removes negative-snapshot
+arguments from retained-tail APIs, and evaluates the measured exact-owner
+fallback with source still open. The existing native-owner deadline, target
+ranking/service quantum and Product/native admission are unchanged. RFC15.2
+now explicitly distinguishes this active retained obligation from negative
+ACK authority. Original EOF gating in `5633a34` aimed to keep duplicate work
+behind unique work; `53d9ab5` retained complete-snapshot gating while restoring
+bounded fallback. Their invalid premise is that EOF or generic stream silence
+is needed to establish age of an already committed exact missing prefix.
+
+Review identified one directly adjacent preservation obligation: a recent
+accepted copy on B must suppress another same-range copy on vacant C until
+its immutable deadline. Excluding B as a target alone is not this invariant.
+Add its focused three-output control before deciding whether a runtime guard
+is necessary. This is not permission to tune recovery clocks or expand audit.
+The active-source control exercises the production eligibility predicate and
+sender method, not the entire actor select loop; the existing live trace is
+the reachability evidence and ordinary upload remains the composition gate.
+
+**Focused result, 2026-09-08 01:15 +08:00:** isolated positive-frontier entry
+passes the former H<F RED, aligned-H control and new active-source/middle-hole
+test. Three-output control is RED at the intended assertion: after actual
+original A and accepted copy B, measured vacant C is immediately queued before
+B's immutable repeat deadline. The test reached that real publication state;
+an earlier test-only Debug-format compile error was fixed, not runtime RED.
+Applied the existing same-range suppression accessor to every exact scoring
+frame after owner-age observation and before target modeling. It consults full
+attachment membership, preserving a draining/stale B's copy ownership. No
+new timer/state/admission check; the actor already retains B's commit deadline
+as its wake. Rebuild/re-run plus the unchanged ordinary pair are next.
+
+Preserved composition caveat: request tail wake uses the existing maximum of
+owner and successor-floor deadlines. With no source/ACK/capacity/model event,
+that can delay reevaluation past owner maturity. This diff does not alter that
+policy or claim a full actor wall-clock bound; ordinary timing must determine
+whether it is material before any separate change is justified.
+
+**Ordinary gate declared before execution:** after focused GREEN/review, run
+one control/candidate TCP `combined up` pair, both endpoints changed together.
+Control is frozen11d6f3a; candidate is this isolated recovery change, with no
+sampler overlay. Existing routed profile and probe stay untouched. Explicit
+environment: ROUTED=1, MANAGEMENT=1, MIRROR_IMPAIRMENT=1, FIFO=0,
+RETURN_RATE=500mbit, NO_JITTER/NO_LOSS/NO_QOS/NO_BLACKHOLE=0,
+DIAG/NATIVE_TRACE=0 (all prefixed REFLECTION_); unset per-side binary overrides.
+Labels `retained-frontier-{control,candidate}-0908`; run.py `tcp combined up`.
+Three TCP carriers, 500Mbps, upload70/20ms delay/jitter and return30/5ms;
+five-second loss epochs [3,8,5,6,10,3,5,8]% / [1,2,.5,3,2,.5,1,2]%,
+upload QoS10Mbps at15--25s. Existing UDP-only outage is inert for TCP. Loss
+realizations differ; no packet-identical or causal confidence claim from onepair.
+
+Compare full completion/byte equality, first/max confirmation gaps, local
+write gaps, ordered stage settlement, router directional class-byte deltas and
+RSS/lifetime-average CPU. Wire excess is not repair-only; management has no
+cumulative repair counter. Upload probe has no concurrent loaded-latency task.
+Keep runner85s censoring and probe90s completion deadline; missing censored
+confirmation bins stay absent. Positive result supports only this affected
+cell, followed by mixed/down/latency gates. Adverse/censored result stops
+promotion: use existing stage evidence for one causal question before any
+new diagnostic or source change. No rerun-to-pass or extra load/profile tuning.
+
+**Component correction GREEN, 01:20 +08:00:** all21 distinct focused checks
+pass in1.74s, including H<F/completion control, active-source ACKed-suffix
+recovery, fresh original/no duplicates/allACKed cleanup, pre-D suppression and
+post-D C eligibility, exact target capacity/rank/quantum, accepted-copy debt
+and immutable clock, percentage invariance, actor wake and no false negative
+authority/path withdrawal. The guard build took3m05s. Independent review
+supports this evidence separation and preservation correction. This is an
+intermediary model/correctness milestone, not practical performance acceptance.
+Application build is running; ordinary matched pair follows without build/load
+overlap. Sampler remains shelved and user model-document edits remain untouched.
+
 ## Existing dispositions that must not be lost
 
 - **Retained for demonstrated mechanisms:** native packet-number/reordering
@@ -216,13 +304,12 @@ remain outside this batch unless evidence and user scope justify inclusion.
 
 ## Execution and continuity
 
-- No build/lab is running; the single prefix diagnostic is complete/censored
-  and owned products/probes are stopped, origin services retained. Fresh
-  independent trace/source and fixture audits completed. The bounded test-only
-  retained-tail pair is RED/control-GREEN; its deliberately failing test remains
-  in the working tree and isolated archive. No recovery runtime change yet.
-  Existing sampler runtime remains unaccepted. Next step is the bounded model
-  correction above, not another diagnosis capture or broad test matrix.
+- The prefix diagnostic is complete/censored and owned products/probes are
+  stopped, origin services retained. Isolated recovery correction passes21
+  focused controls; application build is running before the declared ordinary
+  pair. The former RED is GREEN; exact original RED archive remains. Sampler
+  overlay is shelved/unaccepted, not a hidden candidate prerequisite. Next is
+  the ordinary composition gate, not broader controller/producer changes.
 - Use the owned Docker topology only, not host shaping or sudo. Preserve exact
   executable/profile, phase clocks, full series and adverse results. Do not
   expand test infrastructure or repeat already conclusive diagnostics.

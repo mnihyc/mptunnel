@@ -230,3 +230,47 @@ intentionally failing test in the working tree, not an accepted runtime patch
 or a CI/release pass. Next, correct the retained-owner fallback contract without
 widening negative ACK authority, then preserve this RED/control and compare
 ordinary timing with the sampler candidate kept independently attributable.
+
+## Isolated retained-frontier correction — 2026-09-08 01:20 +08:00
+
+The sampler source/RFC overlay is shelved; its exact patch and executable are
+retained above. The recovery correction has no sampler dependency. Retained
+recovery now reads F/N from the positive mux/cache state, while active source
+and partial feedback cannot disable an aged exact original frontier. Negative
+H and authoritative-gap/path-withdrawal consumers are unchanged.
+
+The two completion fixtures now pass, along with an active-source test using
+four ordinarily committed2KiB chunks and receiver ACKs for chunks0,1,3. H=2KiB,
+F=4KiB; only the retained2KiB middle hole is eligible after its original clock.
+Fresh-owner, queued duplicate, ACKed suffix and final release checks pass. This
+uses the shared production actor predicate and sender method, not the full
+actor select-loop integration. The prior live trace supplies reachability.
+
+Before accepting the broadened branch, review requested a three-output control:
+actual original A, actual accepted B copy, then measured vacant C while B's
+immutable deadline D remains future. Without a shared-range guard, it fails:
+`RequestCompletionTailEnqueueOutcome { queued: true,
+blocked_for_carrier_capacity: false, waiting_for_path_model_publication: false }`.
+Target avoidance excludes B but does not suppress another same-range copy on C.
+The correction uses the existing exact-frame suppression accessor over all
+scoring frames after owner age and before target modeling. It retains full
+attachment membership and the existing D wake. The same fixture now blocks C
+before D, permits it after D, and preserves B's outstanding Product ownership.
+
+All21 distinct focused tests pass in1.74s. Exact invocation after the release
+lib test build (features `lab-diagnostics`, events off):
+
+```sh
+target/release/deps/mptunnel-3a813700b0d8f97b \
+  retained_completion_tail_ active_request_retained_hole_ \
+  retained_frontier_suppresses_ completion_tail_ client_live_tail_ \
+  ambiguous_prefix_ack committed_request_copy_deadline accepted_request_copy \
+  exact_recovery_copy authoritative_ack_snapshot complete_ack_negative_authority \
+  retained_authoritative_ack request_live_tail_uses accepted_copy_wake_ \
+  --nocapture --test-threads=3
+```
+
+Current closure plan records original intent, tradeoff, ordinary pair and
+unchanged global acceptance. The existing request wake may wait for the later
+successor floor absent other events; this correction does not rewrite that
+policy. No claim that eligibility alone removes the original measured stall.

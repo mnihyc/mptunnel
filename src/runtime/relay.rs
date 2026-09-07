@@ -15,6 +15,8 @@ mod server;
 mod service;
 
 #[cfg(test)]
+pub(super) use control::request_retained_frontier_candidate;
+#[cfg(test)]
 pub(super) use flow::*;
 #[cfg(test)]
 pub(super) use io::*;

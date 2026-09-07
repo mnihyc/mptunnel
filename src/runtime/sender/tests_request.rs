@@ -1024,10 +1024,6 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
         &context,
         &remotes,
         &send_stream,
-        &ack_ranges,
-        true,
-        Some(send_stream.next_offset()),
-        64,
         TrafficClass::Latency,
     ));
     assert!(matches!(
@@ -1128,10 +1124,6 @@ async fn client_live_tail_stops_at_an_already_queued_frontier_copy() {
         &context,
         &remotes,
         &send_stream,
-        &ack_ranges,
-        true,
-        Some(send_stream.next_offset()),
-        64,
         TrafficClass::Latency,
     ));
     assert_eq!(
@@ -1245,14 +1237,11 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
     );
     tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
     let observed_generation = context.path_model_generation();
-    let model_wait = model_wait_sender.enqueue_completion_tail_reinjection(
+    let model_wait = model_wait_sender.enqueue_retained_frontier_reinjection(
         &mut queue,
         &context,
         &remotes,
         &send_stream,
-        &[],
-        true,
-        0,
         TrafficClass::Throughput,
     );
     assert!(!model_wait.queued);
@@ -1342,14 +1331,11 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
             .collect::<Vec<_>>(),
     )
     .expect("completion target exposes native capacity edge");
-    let blocked = capacity_sender.enqueue_completion_tail_reinjection(
+    let blocked = capacity_sender.enqueue_retained_frontier_reinjection(
         &mut capacity_queue,
         &context,
         &remotes,
         &send_stream,
-        &[],
-        true,
-        0,
         TrafficClass::Throughput,
     );
     assert!(
@@ -1372,14 +1358,11 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
         .expect("pre-armed request completion-tail capacity wake cannot be lost");
     assert!(
         capacity_sender
-            .enqueue_completion_tail_reinjection(
+            .enqueue_retained_frontier_reinjection(
                 &mut capacity_queue,
                 &context,
                 &remotes,
                 &send_stream,
-                &[],
-                true,
-                0,
                 TrafficClass::Throughput,
             )
             .queued,
@@ -1389,14 +1372,11 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
     let accepted_after = Instant::now();
     assert!(
         sender
-            .enqueue_completion_tail_reinjection(
+            .enqueue_retained_frontier_reinjection(
                 &mut queue,
                 &context,
                 &remotes,
                 &send_stream,
-                &[],
-                true,
-                0,
                 TrafficClass::Throughput,
             )
             .queued
@@ -1462,14 +1442,11 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
 
     assert!(
         !exhausted_sender
-            .enqueue_completion_tail_reinjection(
+            .enqueue_retained_frontier_reinjection(
                 &mut exhausted_queue,
                 &context,
                 &remotes,
                 &send_stream,
-                &[],
-                true,
-                0,
                 TrafficClass::Throughput,
             )
             .queued
@@ -1586,14 +1563,11 @@ async fn request_completion_tail_extent_is_percentage_invariant() {
 
     let outcomes = cases.each_mut().map(|(percent, sender)| {
         let mut queue = ReliableRelaySenderQueue::default();
-        let outcome = sender.enqueue_completion_tail_reinjection(
+        let outcome = sender.enqueue_retained_frontier_reinjection(
             &mut queue,
             &context,
             &remotes,
             &send_stream,
-            &[],
-            true,
-            0,
             TrafficClass::Throughput,
         );
         let queued_bytes = queue.reinjection_bytes();
@@ -1760,14 +1734,11 @@ async fn completion_tail_uses_cache_independent_ranked_frontier_for_target_and_a
     owner_wins_sender.record_original_frame_for_test(owner, &owner_wins_frame);
     tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
     let mut owner_wins_queue = ReliableRelaySenderQueue::default();
-    let owner_wins_outcome = owner_wins_sender.enqueue_completion_tail_reinjection(
+    let owner_wins_outcome = owner_wins_sender.enqueue_retained_frontier_reinjection(
         &mut owner_wins_queue,
         &context,
         &remotes,
         &owner_wins_stream,
-        &[],
-        true,
-        0,
         TrafficClass::Throughput,
     );
     assert!(
@@ -1788,14 +1759,11 @@ async fn completion_tail_uses_cache_independent_ranked_frontier_for_target_and_a
     let mut queue = ReliableRelaySenderQueue::default();
     assert!(
         sender
-            .enqueue_completion_tail_reinjection(
+            .enqueue_retained_frontier_reinjection(
                 &mut queue,
                 &context,
                 &remotes,
                 &send_stream,
-                &[],
-                true,
-                0,
                 TrafficClass::Throughput,
             )
             .queued
@@ -1834,14 +1802,11 @@ async fn completion_tail_uses_cache_independent_ranked_frontier_for_target_and_a
         .expect("fresh suffix beyond M");
     late_suffix_sender.record_original_frame_for_test(owner, &unranked_suffix);
     let mut late_suffix_queue = ReliableRelaySenderQueue::default();
-    let late_suffix_outcome = late_suffix_sender.enqueue_completion_tail_reinjection(
+    let late_suffix_outcome = late_suffix_sender.enqueue_retained_frontier_reinjection(
         &mut late_suffix_queue,
         &context,
         &remotes,
         &late_suffix_stream,
-        &[],
-        true,
-        0,
         TrafficClass::Throughput,
     );
     assert!(late_suffix_outcome.queued);
@@ -1917,14 +1882,11 @@ async fn completion_tail_uses_cache_independent_ranked_frontier_for_target_and_a
     let mut boundary_queue = ReliableRelaySenderQueue::default();
     assert!(
         boundary_sender
-            .enqueue_completion_tail_reinjection(
+            .enqueue_retained_frontier_reinjection(
                 &mut boundary_queue,
                 &context,
                 &remotes,
                 &boundary_stream,
-                &[],
-                true,
-                0,
                 TrafficClass::Throughput,
             )
             .queued
@@ -2924,4 +2886,185 @@ async fn exhausted_optional_budget_still_allows_one_charged_requalification_quan
         sender.optional_reinjection.reinjected_bytes(),
         charged_before + 4096
     );
+}
+
+#[tokio::test]
+async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() {
+    let stream_id = StreamId(713);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10713",
+        "tcp://127.0.0.1:10714",
+        "tcp://127.0.0.1:10715",
+    ]);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    seed_client_bulk_evidence_for_test(&context, owner);
+
+    // Consume real carrier commands; proof refreshes are separate from the
+    // original/copy publication whose immutable ownership is under test.
+    let take_data =
+        |receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers| {
+            loop {
+                let command = try_recv_reliable_path_command(receivers)
+                    .expect("an admitted data command must remain in its exact writer");
+                receivers
+                    .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+                match command {
+                    ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => continue,
+                    ReliablePathCommand::SendFrame(frame @ Frame::StreamData { .. }) => {
+                        break frame;
+                    }
+                    _ => panic!("unexpected command before admitted Product data"),
+                }
+            }
+        };
+    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(Bytes::from(vec![0x71; 4096]));
+    assert!(matches!(
+        sender
+            .dispatch_client_queued_work(
+                &context,
+                TrafficClass::Throughput,
+                &mut remotes,
+                &mut send_stream,
+                &mut queue,
+                4096,
+                ReliableDataAckFrontierState::Live,
+            )
+            .await
+            .expect("ordinary original commitment on sole A"),
+        ClientQueuedDispatch::Data {
+            payload_bytes: 4096
+        }
+    ));
+    let original = take_data(&mut owner_receivers);
+    assert_eq!(
+        reliable_stream_frame_extent(&original),
+        Some((0, 4096, 4096))
+    );
+    assert!(queue.is_empty());
+
+    let (copy_commands, mut copy_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach(opened_test_relay_stream(stream_id, 1, copy_commands)),
+        ReliableRelayAttachOutcome::Attached
+    );
+    consume_client_path_proof_for_test(&mut copy_receivers);
+    let copy = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("B is the sole alternate")
+        .instance();
+    seed_client_bulk_evidence_for_test(&context, copy);
+    let owner_interval = crate::model::timing::reliable_data_retransmission_interval(
+        Some(owner.key.underlay),
+        context.reliable_path_snapshot_for_instance(owner),
+    );
+    tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
+    assert!(
+        sender
+            .enqueue_retained_frontier_reinjection(
+                &mut queue,
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .queued,
+        "A must mature before the first actual recovery commitment on B"
+    );
+    let dispatch = sender
+        .dispatch_client_queued_work(
+            &context,
+            TrafficClass::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut queue,
+            4096,
+            ReliableDataAckFrontierState::Live,
+        )
+        .await
+        .expect("real first-copy reservation and commitment");
+    let ClientQueuedDispatch::Reinjection {
+        payload_bytes: 4096,
+        accepted_copy_deadline,
+    } = dispatch
+    else {
+        panic!("B must own an accepted recovery copy: {dispatch:?}");
+    };
+    assert_eq!(take_data(&mut copy_receivers), original);
+    assert!(queue.is_empty());
+    assert_eq!(
+        sender.reinjection_suppression_deadline_for_frame(&original, &remotes),
+        Some(accepted_copy_deadline),
+        "draining B's writer command cannot release its un-DataACKed copy",
+    );
+
+    let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach(opened_test_relay_stream(stream_id, 2, alternate_commands)),
+        ReliableRelayAttachOutcome::Attached
+    );
+    consume_client_path_proof_for_test(&mut alternate_receivers);
+    let alternate = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 2)
+        .expect("C is a distinct vacant alternate")
+        .instance();
+    seed_client_bulk_evidence_for_test(&context, alternate);
+    assert!(context.relay_path_instance_has_bulk_model_evidence(alternate));
+    assert!(remotes.contains_path_instance(copy));
+    assert!(
+        Instant::now() < accepted_copy_deadline,
+        "the RED assertion must run before B's actual immutable deadline"
+    );
+    let suppressed = sender.enqueue_retained_frontier_reinjection(
+        &mut queue,
+        &context,
+        &remotes,
+        &send_stream,
+        TrafficClass::Throughput,
+    );
+    assert!(
+        !suppressed.queued && queue.is_empty(),
+        "a fresh vacant C does not bypass B's global same-range repeat delay: {suppressed:?}"
+    );
+
+    // Same live B and same exact retained range: expiry permits C, but never
+    // makes B's own publication slot vacant or releases Product ownership.
+    tokio::time::sleep(
+        accepted_copy_deadline.saturating_duration_since(Instant::now())
+            + Duration::from_millis(10),
+    )
+    .await;
+    assert!(
+        sender
+            .enqueue_retained_frontier_reinjection(
+                &mut queue,
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .queued,
+        "the identical measured C becomes eligible after B's repeat delay"
+    );
+    let (_, work) = queue.pop_front().expect("post-deadline C control");
+    assert!(matches!(
+        work.kind,
+        ReliableRelayQueuedWorkKind::Reinjection {
+            frame: Frame::StreamData { offset: 0, payload, .. },
+            cause: RelaySendCause::CompletionTailReinjection(identity),
+        } if payload.len() == 4096 && identity.instance == alternate
+    ));
+    assert_eq!(send_stream.reinjection_bytes(), 4096);
+    assert!(remotes.contains_path_instance(copy));
+    assert!(queue.is_empty());
 }

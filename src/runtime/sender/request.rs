@@ -1478,17 +1478,12 @@ impl RequestSenderService {
         Ok(sent_any)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn enqueue_tail_reinjection(
         &mut self,
         sender_queue: &mut ReliableRelaySenderQueue,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         send_stream: &ReliableSendStream,
-        last_send_ack_ranges: &[OffsetRange],
-        last_send_ack_complete: bool,
-        reinjection_horizon: Option<u64>,
-        last_send_ack_frontier: u64,
         lane: TrafficClass,
     ) -> bool {
         self.enqueue_tail_reinjection_inner(
@@ -1496,46 +1491,27 @@ impl RequestSenderService {
             context,
             remotes,
             send_stream,
-            last_send_ack_ranges,
-            last_send_ack_complete,
-            reinjection_horizon,
-            last_send_ack_frontier,
             lane,
             false,
         )
         .queued
     }
 
-    /// Recovers a finite retained completion tail on the best measured exact
-    /// alternate after the original owner's immutable native fallback. Exact
-    /// range suppression and the shared repair envelope remain the authority
-    /// for when and how much can be copied.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::runtime) fn enqueue_completion_tail_reinjection(
+    /// Recovers the exact retained frontier on a measured alternate after the
+    /// original owner's immutable fallback, during sending or final drain.
+    /// Positive ACK/cache ownership, not a complete negative ACK snapshot,
+    /// identifies this work. Exact copy and service bounds still govern it.
+    pub(in crate::runtime) fn enqueue_retained_frontier_reinjection(
         &mut self,
         sender_queue: &mut ReliableRelaySenderQueue,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         send_stream: &ReliableSendStream,
-        last_send_ack_ranges: &[OffsetRange],
-        last_send_ack_complete: bool,
-        last_send_ack_frontier: u64,
         lane: TrafficClass,
     ) -> RequestCompletionTailEnqueueOutcome {
-        self.enqueue_tail_reinjection_inner(
-            sender_queue,
-            context,
-            remotes,
-            send_stream,
-            last_send_ack_ranges,
-            last_send_ack_complete,
-            Some(send_stream.next_offset()),
-            last_send_ack_frontier,
-            lane,
-            true,
-        )
-        .completion_tail
-        .unwrap_or_default()
+        self.enqueue_tail_reinjection_inner(sender_queue, context, remotes, send_stream, lane, true)
+            .completion_tail
+            .unwrap_or_default()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1545,24 +1521,14 @@ impl RequestSenderService {
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         send_stream: &ReliableSendStream,
-        last_send_ack_ranges: &[OffsetRange],
-        last_send_ack_complete: bool,
-        reinjection_horizon: Option<u64>,
-        last_send_ack_frontier: u64,
         lane: TrafficClass,
         completion_tail_fallback: bool,
     ) -> RequestTailReinjectionOutcome {
-        let Some(reinjection_horizon) = reinjection_horizon else {
-            return RequestTailReinjectionOutcome::default();
-        };
-        if !last_send_ack_complete
-            || (!completion_tail_fallback && last_send_ack_frontier == 0)
+        let last_send_ack_frontier = send_stream.data_ack_frontier();
+        let reinjection_horizon = send_stream.next_offset();
+        if (!completion_tail_fallback && last_send_ack_frontier == 0)
             || last_send_ack_frontier >= reinjection_horizon
             || send_stream.reinjection_bytes() == 0
-            || !(matches!(
-                last_send_ack_ranges,
-                [range] if range.start == 0 && range.end == last_send_ack_frontier
-            ) || (last_send_ack_frontier == 0 && last_send_ack_ranges.is_empty()))
         {
             return RequestTailReinjectionOutcome::default();
         }
@@ -1797,6 +1763,18 @@ impl RequestSenderService {
             owner_recovery_timing,
         );
         if observed_at < owner_recovery_deadline {
+            return RequestCompletionTailEnqueueOutcome::default();
+        }
+
+        // A copy on any still-attached output owns the same-range repeat
+        // delay, even if that output is no longer eligible for new work.
+        // Merely excluding its target would allow an immediate copy on C.
+        // Preserve the existing accepted-copy deadline/wake and stop at the
+        // retained prefix instead of skipping to unsuppressed suffix data.
+        if scoring_frames.iter().any(|frame| {
+            self.reinjection_suppression_deadline_for_frame(frame, remotes)
+                .is_some()
+        }) {
             return RequestCompletionTailEnqueueOutcome::default();
         }
 

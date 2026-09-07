@@ -1040,10 +1040,7 @@ pub(in crate::runtime) enum ServerTargetAdmission {
     Drop,
 }
 
-pub(in crate::runtime) enum ServerStreamFrameRoute {
-    Routed,
-    Backpressured(Frame),
-}
+pub(in crate::runtime) use super::input::CarrierInputRoute as ServerStreamFrameRoute;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) enum ServerNewStreamPolicy {

@@ -32,6 +32,7 @@ use crate::runtime::path::commands::ReliablePathCommand;
 use crate::runtime::path::commands::{
     ReliablePathCommandSender, reliable_stream_frame_queue_for_payload,
 };
+use crate::runtime::path::input::PendingMailboxFrame;
 use crate::runtime::path::proof::PathProofObservation;
 use crate::runtime::path::{
     CarrierDeliveryRateSample, CarrierNativeWindowSample, ServerCarrierPathApplyAuthority,
@@ -2207,7 +2208,11 @@ impl ServerReliableStreamRegistry {
         {
             Ok(()) => Ok(ServerStreamFrameRoute::Routed),
             Err(mpsc::error::TrySendError::Full(ServerReliableStreamEvent::Frame(frame))) => {
-                Ok(ServerStreamFrameRoute::Backpressured(frame))
+                Ok(ServerStreamFrameRoute::Mailbox(PendingMailboxFrame::new(
+                    frame,
+                    target.events,
+                    ServerReliableStreamEvent::Frame,
+                )))
             }
             // See `route_frame`: retirement owns this short closed-receiver
             // interval, and one finished stream must not close its carrier.
@@ -2385,7 +2390,7 @@ impl ServerReliableStreamRegistry {
                 ) {
                     Ok(()) => Ok(ServerStreamFrameRoute::Routed),
                     Err(RuntimeError::SenderServiceBlocked) => {
-                        Ok(ServerStreamFrameRoute::Backpressured(frame))
+                        Ok(ServerStreamFrameRoute::Barrier(frame))
                     }
                     Err(error) => Err(error),
                 };

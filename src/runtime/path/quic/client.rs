@@ -1627,7 +1627,9 @@ async fn open_client_udp_stream_on_connection(
     advertised_recv_max_offset: u64,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
-    let (mut send, mut recv) = carrier.connection.open_bi().await?;
+    let ((mut send, mut recv), (mut repair_send, repair_recv)) =
+        carrier.connection.open_reliable_pair().await?;
+    let parent_request_id = send.request_stream_id();
     send.set_traffic_class(lane)?;
     let open = Frame::OpenStream {
         stream_id,
@@ -1659,7 +1661,7 @@ async fn open_client_udp_stream_on_connection(
         runtime.codec_limits,
     )
     .await?;
-    let (commands, receivers) = reliable_path_command_channels(udp_path_command_queue(
+    let (commands, mut receivers) = reliable_path_command_channels(udp_path_command_queue(
         runtime.mux_limits,
         runtime.codec_limits,
     ));
@@ -1672,19 +1674,58 @@ async fn open_client_udp_stream_on_connection(
     let stream_frame_queue =
         udp_reliable_stream_frame_queue(runtime.codec_limits, runtime.mux_limits);
     let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);
-    tokio::spawn(run_client_udp_stream(
-        send,
-        recv,
-        stream_id,
-        runtime.path_index,
-        carrier.path_instance_id,
-        runtime.codec_limits,
-        runtime.mux_limits,
-        stream_frame_queue,
-        runtime.state.clone(),
-        receivers,
-        frames_tx,
-    ));
+    let repair_commands = receivers.take_repair_receiver(stream_id);
+    let stream_runtime = runtime.clone();
+    tokio::spawn(async move {
+        let repair = async {
+            repair_send.set_repair_priority()?;
+            udp_path_write_frame(
+                &mut repair_send,
+                &Frame::OpenStreamRepair {
+                    stream_id,
+                    parent_request_id,
+                },
+                stream_runtime.codec_limits,
+            )
+            .await?;
+            super::repair::run_repair_channel(
+                repair_send,
+                repair_recv,
+                repair_commands,
+                stream_id,
+                stream_runtime.codec_limits,
+                |frame| async {
+                    // Retired Product input is not a repair transport failure:
+                    // the ordinary writer still owns queued FIN/detach work.
+                    let _ = frames_tx.send(Ok(frame)).await;
+                    Ok(())
+                },
+            )
+            .await
+        };
+        let ordinary = run_client_udp_stream(
+            send,
+            recv,
+            stream_id,
+            stream_runtime.path_index,
+            carrier.path_instance_id,
+            stream_runtime.codec_limits,
+            stream_runtime.mux_limits,
+            stream_frame_queue,
+            stream_runtime.state.clone(),
+            receivers,
+            frames_tx.clone(),
+        );
+        tokio::select! {
+            biased;
+            result = repair => {
+                if let Err(error) = result {
+                    let _ = frames_tx.send(Err(error)).await;
+                }
+            }
+            () = ordinary => {}
+        }
+    });
     let mut startup = path_startup_snapshot_for_instance(
         runtime.path(),
         PathId(runtime.path_index as u16),

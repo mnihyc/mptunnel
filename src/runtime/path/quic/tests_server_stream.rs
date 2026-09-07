@@ -1007,6 +1007,90 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
 }
 
 #[tokio::test]
+async fn client_quic_closed_product_recipient_preserves_ordered_terminal_writer() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let stream_id = StreamId(406);
+        let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+        let mut server_send = fixture.server_send.take().expect("server sender");
+        let mut server_recv = fixture.server_recv.take().expect("server receiver");
+        let (commands_tx, commands_rx) = reliable_path_command_channels(8);
+        let (frames_tx, frames_rx) = mpsc::channel(1);
+        let state = ClientPathState::new(ClientPathHealth::new(
+            Vec::new(),
+            vec![ClientPathHealthRecord::default()],
+        ));
+        let limits = fixture.context.codec_limits;
+        drop(frames_rx);
+        let actor = tokio::spawn(run_client_udp_stream(
+            fixture.client_send.take().expect("client sender"),
+            fixture.client_recv.take().expect("client receiver"),
+            stream_id,
+            0,
+            next_carrier_path_instance_id(),
+            limits,
+            fixture.context.mux_limits,
+            8,
+            state,
+            commands_rx,
+            frames_tx,
+        ));
+        assert_eq!(
+            udp_path_read_frame(&mut server_recv, limits).await.unwrap(),
+            Frame::Ping { nonce: 1 }
+        );
+        udp_path_write_frame(
+            &mut server_send,
+            &Frame::StreamAck {
+                stream_id,
+                complete: true,
+                ranges: Vec::new(),
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+        // Same-native-stream ordering makes Pong proof that the late ACK was
+        // processed after Product retirement without cancelling the writer.
+        udp_path_write_frame(&mut server_send, &Frame::Ping { nonce: 406 }, limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut server_recv, limits)
+                .await
+                .expect("retired Product input must preserve the independent writer"),
+            Frame::Pong { nonce: 406 }
+        );
+        let terminal = [
+            Frame::StreamFin {
+                stream_id,
+                final_offset: 0,
+            },
+            Frame::StreamDetach { stream_id },
+        ];
+        for frame in &terminal {
+            commands_tx
+                .send_stream_ordered_frame(frame.clone(), TrafficClass::Throughput)
+                .await
+                .unwrap();
+        }
+        commands_tx
+            .send_stream_ordered_close(stream_id, TrafficClass::Throughput)
+            .await
+            .unwrap();
+        for frame in terminal {
+            assert_eq!(
+                udp_path_read_frame(&mut server_recv, limits).await.unwrap(),
+                frame
+            );
+        }
+        actor.await.unwrap();
+        assert!(!fixture._client_connection.is_closed());
+    })
+    .await
+    .expect("retired input and ordered terminal writer must complete");
+}
+
+#[tokio::test]
 async fn client_quic_terminal_input_keeps_feedback_writer_until_owner_close() {
     let stream_id = StreamId(405);
     let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
@@ -1285,6 +1369,7 @@ async fn server_quic_duplicate_refusal_preserves_live_attachment() {
             initial_demand: StreamDemandHint::Throughput,
             return_plan: Default::default(),
             native_rate_authority: None,
+            repair_bindings: Default::default(),
         },
     )
     .await
@@ -2319,6 +2404,7 @@ async fn server_quic_attachment_refusal_is_stream_local_during_ordered_detach() 
             initial_demand: StreamDemandHint::Throughput,
             return_plan: Default::default(),
             native_rate_authority: None,
+            repair_bindings: Default::default(),
         },
     )
     .await

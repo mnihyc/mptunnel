@@ -18,6 +18,61 @@ fn stream_data_frame(stream_id: u64, bytes: usize) -> Frame {
     }
 }
 
+#[tokio::test]
+async fn repair_split_keeps_existing_capacity_and_cancellation_charges() {
+    let (commands, mut ordinary) = reliable_path_command_channels(1);
+    let mut repair = ordinary.take_repair_receiver(StreamId(1));
+    commands
+        .try_enqueue_reinjection_frame(stream_data_frame(1, 64), TrafficClass::Throughput)
+        .unwrap();
+    assert!(
+        commands
+            .try_reserve_reinjection_frame(stream_data_frame(1, 64), TrafficClass::Throughput)
+            .is_err()
+    );
+    assert!(try_recv_reliable_path_command(&mut ordinary).is_none());
+    let work = repair.recv().await.unwrap().unwrap();
+    assert_eq!(work.frame(), &stream_data_frame(1, 64));
+    assert_eq!(commands.metrics.pending_bytes(), 64);
+    assert_eq!(commands.metrics.writer_pending_bytes(), 64);
+    let reserved = commands
+        .try_reserve_reinjection_frame(stream_data_frame(1, 32), TrafficClass::Throughput)
+        .unwrap();
+    drop(ordinary);
+    reserved.commit();
+    assert!(repair.recv().await.unwrap().is_none());
+    drop(repair);
+    assert_eq!(
+        commands.metrics.pending_bytes(),
+        64,
+        "in-flight work retains its own charge"
+    );
+    drop(work);
+    assert_eq!(commands.metrics.pending_bytes(), 0);
+    assert_eq!(commands.metrics.writer_pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn repair_split_close_wakes_receiver_and_rejects_wrong_attachment() {
+    let (commands, mut ordinary) = reliable_path_command_channels(2);
+    let mut repair = ordinary.take_repair_receiver(StreamId(1));
+    commands
+        .try_enqueue_reinjection_frame(stream_data_frame(2, 32), TrafficClass::Throughput)
+        .unwrap();
+    assert!(repair.recv().await.is_err());
+    assert_eq!(commands.metrics.pending_bytes(), 0);
+    let blocked = repair.recv();
+    tokio::pin!(blocked);
+    assert!(futures::poll!(&mut blocked).is_pending());
+    commands
+        .send_control(ReliablePathCommand::CloseStream(StreamId(1)))
+        .await
+        .unwrap();
+    let close = recv_reliable_path_command(&mut ordinary).await.unwrap();
+    ordinary.release_pending_command_bytes(reliable_path_command_pending_bytes(&close));
+    assert!(blocked.await.unwrap().is_none());
+}
+
 fn datagram_data_frame(datagram_id: u64, bytes: usize) -> Frame {
     datagram_data_frame_for_flow(1, datagram_id, bytes)
 }

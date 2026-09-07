@@ -280,10 +280,7 @@ impl Connection {
             .expect("QUIC carrier must use the instrumented congestion controller")
             .telemetry
             .clone();
-        let concurrent_carrier_streams = mux_limits
-            .max_quic_concurrent_bidi_streams
-            .max(1)
-            .min(mux_limits.max_streams.max(1));
+        let concurrent_carrier_streams = quic_native_request_limit(mux_limits);
         let native_route_queue = (mux_limits.max_datagram_queue_bytes / 1200).clamp(8, 256);
         let native_datagrams = NativeDatagramHub::new(
             connection.clone(),
@@ -562,6 +559,16 @@ fn quic_transport_config(
     quic_transport_config_for_path(mux_limits, client_keep_alive, &PathMetadata::default())
 }
 
+fn quic_native_request_limit(mux_limits: MuxLimits) -> usize {
+    mux_limits.max_quic_concurrent_bidi_streams.max(1).min(
+        mux_limits
+            .max_streams
+            .max(1)
+            .saturating_mul(2)
+            .saturating_add(1),
+    )
+}
+
 fn quic_transport_config_for_path(
     mux_limits: MuxLimits,
     client_keep_alive: bool,
@@ -576,10 +583,7 @@ fn quic_transport_config_for_path(
     let send_window = (mux_limits.max_path_flight_bytes as u64)
         .max(mux_limits.max_reliable_relay_chunk_bytes as u64)
         .max(1);
-    let concurrent_streams = mux_limits
-        .max_quic_concurrent_bidi_streams
-        .max(1)
-        .min(mux_limits.max_streams.max(1)) as u64;
+    let concurrent_streams = quic_native_request_limit(mux_limits) as u64;
 
     let mut transport = TransportConfig::default();
     transport

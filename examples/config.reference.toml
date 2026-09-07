@@ -197,7 +197,9 @@ max_payload_bytes = 1048512
 max_ack_ranges = 256
 max_paths = 64
 max_streams = 65536
-max_quic_concurrent_bidi_streams = 65536
+# Native requests: two per reliable QUIC attachment plus carrier control.
+# An explicit smaller value remains a native ceiling, not a logical-flow count.
+max_quic_concurrent_bidi_streams = 131073
 # Maximum retained loss-reclassification metadata per native QUIC path, in
 # bytes. This independent 64 MiB ceiling is not allocated in advance and does
 # not follow max_path_flight_bytes or reserve payload capacity. Finalized loss

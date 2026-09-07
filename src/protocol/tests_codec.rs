@@ -2,6 +2,22 @@
 
 use super::*;
 
+#[test]
+fn repair_open_roundtrip_has_only_exact_parent_and_product_identity() {
+    let frame = Frame::OpenStreamRepair {
+        stream_id: StreamId(7),
+        parent_request_id: 12,
+    };
+    let wire = encode_frame(&frame, CodecLimits::default()).unwrap();
+    assert_eq!(wire.len(), FRAME_HEADER_LEN + 16);
+    assert_eq!(wire[4], VERSION);
+    assert_eq!(wire[5], 50);
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(wire), CodecLimits::default()).unwrap(),
+        frame
+    );
+}
+
 fn round_trip(frame: Frame) {
     let encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
     let decoded = decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode");
@@ -129,7 +145,7 @@ fn stream_frames_round_trip() {
 }
 
 #[test]
-fn open_stream_v11_canonically_carries_return_plan() {
+fn open_stream_v13_canonically_carries_return_plan() {
     let frame = Frame::OpenStream {
         stream_id: StreamId(0x0102_0304_0506_0708),
         target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
@@ -147,7 +163,7 @@ fn open_stream_v11_canonically_carries_return_plan() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 11, 7, 0, 0, 0, 28, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            b'M', b'P', b'T', b'F', 13, 7, 0, 0, 0, 28, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
             187, 2, 0, 0, 0, 0, 0, 0, 228, 32, 4, 0, 0, 2,
         ]
     );
@@ -186,7 +202,7 @@ fn open_stream_creation_and_enrollment_have_distinct_wire_authority() {
 }
 
 #[test]
-fn stream_return_plan_final_v11_has_canonical_kind_and_count() {
+fn stream_return_plan_final_v13_has_canonical_kind_and_count() {
     let frame = Frame::StreamReturnPlanFinal {
         stream_id: StreamId(0x0102_0304_0506_0708),
         retained_ordinals: vec![0, 2, 7],
@@ -195,7 +211,7 @@ fn stream_return_plan_final_v11_has_canonical_kind_and_count() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 11, 49, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 3, 0, 2, 7,
+            b'M', b'P', b'T', b'F', 13, 49, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 3, 0, 2, 7,
         ]
     );
     assert_eq!(
@@ -332,8 +348,8 @@ fn decoder_rejects_unknown_path_usage() {
 }
 
 #[test]
-fn decoder_rejects_old_frames_after_v11_wire_cut() {
-    for version in [9, 10] {
+fn decoder_rejects_old_frames_after_v13_wire_cut() {
+    for version in [9, 10, 11, 12] {
         let mut encoded =
             encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
         encoded[4] = version;
@@ -365,7 +381,7 @@ fn path_metrics_v11_presence_bits_distinguish_absence_from_observed_zero() {
         absent_wire.len(),
         FRAME_HEADER_LEN + PATH_METRICS_ENCODED_LEN
     );
-    assert_eq!(absent_wire[4], 11);
+    assert_eq!(absent_wire[4], VERSION);
     assert_eq!(
         &absent_wire[FRAME_HEADER_LEN + 64..FRAME_HEADER_LEN + 66],
         &[0, 0]

@@ -58,6 +58,15 @@ fn frame_subject(frame: &Frame) -> String {
             format!("path_id={} reason={reason:?}", path_id.0)
         }
         Frame::OpenStream { stream_id, .. } => format!("stream_id={}", stream_id.0),
+        Frame::OpenStreamRepair {
+            stream_id,
+            parent_request_id,
+        } => {
+            format!(
+                "stream_id={} parent_request_id={parent_request_id}",
+                stream_id.0
+            )
+        }
         Frame::StreamData {
             stream_id,
             offset,

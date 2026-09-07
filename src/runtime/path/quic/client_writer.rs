@@ -16,6 +16,7 @@ use crate::runtime::path::commands::{
     reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
     try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
+use crate::runtime::path::input::{CarrierInputRoute, PendingMailboxFrame};
 use crate::runtime::path::proof::PathProofTracker;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
@@ -336,7 +337,7 @@ fn try_route_client_udp_stream_frame_during_write(
     frame: Frame,
     stream_id: StreamId,
     stream_frames: &mpsc::Sender<Result<Frame, RuntimeError>>,
-) -> Result<Option<Frame>, RuntimeError> {
+) -> Result<CarrierInputRoute, RuntimeError> {
     let received_stream_id = match &frame {
         Frame::StreamData { stream_id, .. }
         | Frame::StreamAck { stream_id, .. }
@@ -353,18 +354,22 @@ fn try_route_client_udp_stream_frame_during_write(
             stream_id: terminal_stream_id,
             ..
         } if *terminal_stream_id == stream_id => {
-            return Ok(Some(frame));
+            return Ok(CarrierInputRoute::Barrier(frame));
         }
         Frame::StreamFin { stream_id, .. } | Frame::StreamReset { stream_id, .. } => *stream_id,
-        _ => return Ok(Some(frame)),
+        _ => return Ok(CarrierInputRoute::Barrier(frame)),
     };
     if received_stream_id != stream_id {
-        return Ok(Some(frame));
+        return Ok(CarrierInputRoute::Barrier(frame));
     }
     match stream_frames.try_send(Ok(frame)) {
-        Ok(()) => Ok(None),
-        Err(mpsc::error::TrySendError::Full(Ok(frame))) => Ok(Some(frame)),
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(RuntimeError::ReliablePathSessionClosed),
+        Ok(()) => Ok(CarrierInputRoute::Routed),
+        Err(mpsc::error::TrySendError::Full(Ok(frame))) => Ok(CarrierInputRoute::Mailbox(
+            PendingMailboxFrame::new(frame, stream_frames.clone(), Ok),
+        )),
+        // The Product recipient can retire before this native write and its
+        // ordered terminal commands. Preserve their independent ownership.
+        Err(mpsc::error::TrySendError::Closed(_)) => Ok(CarrierInputRoute::Routed),
         Err(mpsc::error::TrySendError::Full(Err(_))) => {
             unreachable!("client QUIC interlock only routes successful frames")
         }

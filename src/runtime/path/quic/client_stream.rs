@@ -281,10 +281,9 @@ async fn handle_client_udp_stream_input(
             stream_id: received_stream_id,
             ..
         }) if received_stream_id == stream_id => {
-            frames
-                .send(Ok(frame))
-                .await
-                .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+            // Product retirement closes its input before ordered FIN/detach
+            // work drains. Late input must not cancel that independent writer.
+            let _ = frames.send(Ok(frame)).await;
         }
         Frame::StreamDetach {
             stream_id: detached_stream_id,

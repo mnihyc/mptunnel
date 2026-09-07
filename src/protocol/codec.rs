@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 11;
+const VERSION: u8 = 13;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 116;
@@ -365,6 +365,14 @@ fn encode_payload(
             put_u8(out, return_plan.candidate_ordinal);
             Ok(FrameKind::OpenStream)
         }
+        Frame::OpenStreamRepair {
+            stream_id,
+            parent_request_id,
+        } => {
+            put_u64(out, stream_id.0);
+            put_u64(out, *parent_request_id);
+            Ok(FrameKind::OpenStreamRepair)
+        }
         Frame::StreamReturnPlanFinal {
             stream_id,
             retained_ordinals,
@@ -405,14 +413,22 @@ fn encode_payload(
                 return Err(CodecError::LengthOverflow);
             }
             put_u64(out, stream_id.0);
-            put_u8(out, u8::from(*complete));
+            let packed = packed_ack_ranges_len(ranges).is_some_and(|len| len < ranges.len() * 16);
+            put_u8(out, u8::from(*complete) | (u8::from(packed) << 1));
             put_u16(out, ranges.len() as u16);
+            let mut previous_end = 0;
             for range in ranges {
                 if range.is_empty() {
                     return Err(CodecError::InvalidRange);
                 }
-                put_u64(out, range.start);
-                put_u64(out, range.end);
+                if packed {
+                    put_ack_varint(out, range.start - previous_end);
+                    put_ack_varint(out, range.end - range.start);
+                    previous_end = range.end;
+                } else {
+                    put_u64(out, range.start);
+                    put_u64(out, range.end);
+                }
             }
             Ok(FrameKind::StreamAck)
         }
@@ -687,6 +703,10 @@ fn decode_payload(
                 candidate_ordinal: reader.get_u8()?,
             },
         }),
+        FrameKind::OpenStreamRepair => Ok(Frame::OpenStreamRepair {
+            stream_id: StreamId(reader.get_u64()?),
+            parent_request_id: reader.get_u64()?,
+        }),
         FrameKind::StreamReturnPlanFinal => {
             let stream_id = StreamId(reader.get_u64()?);
             let retained_count = usize::from(reader.get_u8()?);
@@ -708,35 +728,7 @@ fn decode_payload(
                 payload,
             })
         }
-        FrameKind::StreamAck => {
-            let stream_id = StreamId(reader.get_u64()?);
-            let complete = match reader.get_u8()? {
-                0 => false,
-                1 => true,
-                _ => return Err(CodecError::InvalidEnum),
-            };
-            let range_count = reader.get_u16()? as usize;
-            if range_count > limits.max_ack_ranges {
-                return Err(CodecError::TooManyAckRanges {
-                    actual: range_count,
-                    limit: limits.max_ack_ranges,
-                });
-            }
-            let mut ranges = Vec::with_capacity(range_count);
-            for _ in 0..range_count {
-                let start = reader.get_u64()?;
-                let end = reader.get_u64()?;
-                let Some(range) = OffsetRange::new(start, end) else {
-                    return Err(CodecError::InvalidRange);
-                };
-                ranges.push(range);
-            }
-            Ok(Frame::StreamAck {
-                stream_id,
-                complete,
-                ranges,
-            })
-        }
+        FrameKind::StreamAck => decode_ack_payload(reader, limits),
         FrameKind::StreamRequalifyData => {
             let stream_id = StreamId(reader.get_u64()?);
             let probe_id = reader.get_u64()?;
@@ -919,6 +911,48 @@ fn encode_target(
         }
     }
     Ok(())
+}
+
+fn decode_ack_payload(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<Frame, CodecError> {
+    let stream_id = StreamId(reader.get_u64()?);
+    let flags = reader.get_u8()?;
+    let complete = flags & 1 != 0;
+    if flags & !3 != 0 {
+        return Err(CodecError::InvalidEnum);
+    }
+    let packed = flags & 2 != 0;
+    let range_count = reader.get_u16()? as usize;
+    if range_count > limits.max_ack_ranges {
+        return Err(CodecError::TooManyAckRanges {
+            actual: range_count,
+            limit: limits.max_ack_ranges,
+        });
+    }
+    let mut ranges = Vec::with_capacity(range_count);
+    let mut previous_end: u64 = 0;
+    for _ in 0..range_count {
+        let (start, end) = if packed {
+            let start = previous_end
+                .checked_add(reader.get_ack_varint()?)
+                .ok_or(CodecError::InvalidRange)?;
+            let end = start
+                .checked_add(reader.get_ack_varint()?)
+                .ok_or(CodecError::InvalidRange)?;
+            (start, end)
+        } else {
+            (reader.get_u64()?, reader.get_u64()?)
+        };
+        let Some(range) = OffsetRange::new(start, end) else {
+            return Err(CodecError::InvalidRange);
+        };
+        ranges.push(range);
+        previous_end = end;
+    }
+    Ok(Frame::StreamAck {
+        stream_id,
+        complete,
+        ranges,
+    })
 }
 
 fn decode_target(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<TargetAddr, CodecError> {
@@ -1286,6 +1320,34 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
+// Per-frame compression only: retain the exact range vector and complete bit,
+// without attachment history or changing Product ACK/gap authority.
+fn packed_ack_ranges_len(ranges: &[OffsetRange]) -> Option<usize> {
+    let mut previous_end = 0;
+    let mut len = 0;
+    for range in ranges {
+        if range.is_empty() {
+            return None;
+        }
+        let gap = range.start.checked_sub(previous_end)?;
+        len += ack_varint_len(gap) + ack_varint_len(range.end - range.start);
+        previous_end = range.end;
+    }
+    Some(len)
+}
+
+fn ack_varint_len(value: u64) -> usize {
+    ((64 - value.leading_zeros()).max(1).div_ceil(7)) as usize
+}
+
+fn put_ack_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 128 {
+        out.push(value as u8 | 128);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -1335,6 +1397,24 @@ impl<'a> Reader<'a> {
         Ok(u64::from_be_bytes(
             self.get_exact(8)?.try_into().expect("slice length"),
         ))
+    }
+
+    fn get_ack_varint(&mut self) -> Result<u64, CodecError> {
+        let mut value = 0;
+        for shift in (0..=63).step_by(7) {
+            let byte = self.get_u8()?;
+            if shift == 63 && byte > 1 {
+                return Err(CodecError::InvalidRange);
+            }
+            value |= u64::from(byte & 127) << shift;
+            if byte & 128 == 0 {
+                if shift > 0 && byte == 0 {
+                    return Err(CodecError::InvalidRange);
+                }
+                return Ok(value);
+            }
+        }
+        Err(CodecError::InvalidRange)
     }
 
     fn get_array<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
@@ -1425,6 +1505,7 @@ enum FrameKind {
     StreamRequalifyData = 42,
     StreamRequalifyAck = 43,
     StreamReturnPlanFinal = 49,
+    OpenStreamRepair = 50,
 }
 
 impl FrameKind {
@@ -1466,6 +1547,7 @@ impl FrameKind {
             42 => Ok(Self::StreamRequalifyData),
             43 => Ok(Self::StreamRequalifyAck),
             49 => Ok(Self::StreamReturnPlanFinal),
+            50 => Ok(Self::OpenStreamRepair),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1691,3 +1773,7 @@ impl std::error::Error for CodecError {}
 #[cfg(test)]
 #[path = "tests_codec.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_ack_encoding.rs"]
+mod tests_ack_encoding;

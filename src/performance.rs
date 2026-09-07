@@ -17,7 +17,8 @@ pub const DEFAULT_MAX_REINJECTION_CACHE_CHUNKS: usize = 65_536;
 pub const DEFAULT_MAX_REORDER_BUFFER_CHUNKS: usize = 65_536;
 pub const DEFAULT_MAX_RETAINED_RECEIVE_RANGES: usize = 65_536;
 pub const DEFAULT_MAX_STREAMS: usize = 65_536;
-pub const DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS: usize = DEFAULT_MAX_STREAMS;
+/// Two native requests per reliable attachment and one carrier-control request.
+pub const DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS: usize = DEFAULT_MAX_STREAMS * 2 + 1;
 /// Per-native-QUIC-path loss-reclassification metadata ceiling. This is not
 /// preallocated and is independent of the payload flight envelope.
 pub const DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES: usize = 64 * 1024 * 1024;

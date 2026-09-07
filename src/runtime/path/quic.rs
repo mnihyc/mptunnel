@@ -11,6 +11,8 @@ mod estimator;
 pub(in crate::runtime) mod io;
 pub(in crate::runtime) mod ip_tunnel;
 pub(in crate::runtime) mod metrics;
+mod repair;
+mod repair_binding;
 pub(in crate::runtime) mod server;
 mod server_stream;
 mod server_writer;

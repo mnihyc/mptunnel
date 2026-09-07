@@ -17,15 +17,15 @@ fn quic_write_interlock_defers_matching_terminal_frames_to_stream_owner() {
             reason: crate::protocol::ResetReason::RemoteClosed,
         },
     ] {
-        assert_eq!(
+        assert!(matches!(
             try_route_client_udp_stream_frame_during_write(
                 terminal.clone(),
                 stream_id,
                 &frames_tx,
             )
             .expect("route terminal frame"),
-            Some(terminal),
-        );
+            CarrierInputRoute::Barrier(frame) if frame == terminal
+        ));
     }
     assert!(frames_rx.try_recv().is_err());
 }
@@ -40,11 +40,11 @@ fn quic_write_interlock_still_routes_nonterminal_stream_feedback() {
         ranges: Vec::new(),
     };
 
-    assert_eq!(
+    assert!(matches!(
         try_route_client_udp_stream_frame_during_write(feedback.clone(), stream_id, &frames_tx)
             .expect("route stream feedback"),
-        None,
-    );
+        CarrierInputRoute::Routed
+    ));
     assert!(matches!(
         frames_rx.try_recv(),
         Ok(Ok(Frame::StreamAck {
@@ -53,6 +53,180 @@ fn quic_write_interlock_still_routes_nonterminal_stream_feedback() {
             ranges,
         })) if received_stream_id == stream_id && ranges.is_empty()
     ));
+}
+
+#[test]
+fn quic_write_interlock_closed_product_recipient_is_retired_input() {
+    let stream_id = StreamId(46);
+    let (frames_tx, frames_rx) = mpsc::channel(1);
+    drop(frames_rx);
+    assert!(matches!(
+        try_route_client_udp_stream_frame_during_write(
+            Frame::StreamAck {
+                stream_id,
+                complete: true,
+                ranges: Vec::new(),
+            },
+            stream_id,
+            &frames_tx,
+        ),
+        Ok(CarrierInputRoute::Routed)
+    ));
+}
+
+#[tokio::test]
+async fn quic_write_interlock_pending_product_recipient_retires_without_error() {
+    let stream_id = StreamId(47);
+    let (frames_tx, frames_rx) = mpsc::channel(1);
+    frames_tx.try_send(Ok(Frame::Ping { nonce: 1 })).unwrap();
+    let route = try_route_client_udp_stream_frame_during_write(
+        Frame::StreamAck {
+            stream_id,
+            complete: true,
+            ranges: Vec::new(),
+        },
+        stream_id,
+        &frames_tx,
+    )
+    .unwrap();
+    let CarrierInputRoute::Mailbox(mut pending) = route else {
+        panic!("full recipient must retain the exact frame");
+    };
+    drop(frames_rx);
+    assert!(!pending.deliver().await);
+}
+
+#[tokio::test]
+async fn quic_write_wait_retries_full_product_mailbox_before_write_completion() {
+    let stream_id = StreamId(44);
+    let (input_tx, mut input_rx) = mpsc::channel(1);
+    let (stream_frames_tx, mut stream_frames_rx) = mpsc::channel(1);
+    let occupied = Frame::StreamMaxData {
+        stream_id,
+        max_offset: 1,
+    };
+    let feedback = Frame::StreamAck {
+        stream_id,
+        complete: false,
+        ranges: Vec::new(),
+    };
+    stream_frames_tx
+        .try_send(Ok(occupied.clone()))
+        .expect("fill Product mailbox");
+    let (release_write, write_released) = oneshot::channel::<()>();
+    let (blocked_signal, blocked) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let mut blocked_signal = Some(blocked_signal);
+        let mut deferred_input = None;
+        let (_, routed) = super::super::io::await_udp_write_while_routing_stream_frames(
+            async move {
+                write_released.await.expect("release native write");
+            },
+            &mut input_rx,
+            &mut deferred_input,
+            |frame| {
+                let result = try_route_client_udp_stream_frame_during_write(
+                    frame,
+                    stream_id,
+                    &stream_frames_tx,
+                )?;
+                if matches!(result, CarrierInputRoute::Mailbox(_))
+                    && let Some(signal) = blocked_signal.take()
+                {
+                    let _ = signal.send(());
+                }
+                Ok(result)
+            },
+        )
+        .await;
+        (routed, deferred_input)
+    });
+    input_tx
+        .send(Ok(feedback.clone()))
+        .await
+        .expect("queue feedback");
+    tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+        .await
+        .expect("observe actual mailbox pressure")
+        .expect("blocked signal");
+    assert_eq!(stream_frames_rx.recv().await.unwrap().unwrap(), occupied);
+    let delivered = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        stream_frames_rx.recv(),
+    )
+    .await;
+    assert!(
+        !task.is_finished(),
+        "retry must not cancel or complete the native write"
+    );
+    release_write
+        .send(())
+        .expect("release native write after capacity test");
+    let (routed, deferred) = task.await.expect("join interlock");
+    assert!(
+        matches!(delivered, Ok(Some(Ok(ref frame))) if frame == &feedback),
+        "Product mailbox capacity must retry feedback while native write is still pending; routed={routed}, retained={}",
+        deferred.is_some(),
+    );
+    assert_eq!(routed, 1);
+    assert!(deferred.is_none());
+}
+
+#[tokio::test]
+async fn quic_write_wins_before_mailbox_capacity_preserves_exact_input() {
+    let stream_id = StreamId(45);
+    let (input_tx, mut input_rx) = mpsc::channel(1);
+    let (stream_frames_tx, mut stream_frames_rx) = mpsc::channel(1);
+    stream_frames_tx
+        .try_send(Ok(Frame::Ping { nonce: 45 }))
+        .unwrap();
+    let feedback = Frame::StreamAck {
+        stream_id,
+        complete: false,
+        ranges: Vec::new(),
+    };
+    let (release_write, write_released) = oneshot::channel::<()>();
+    let (blocked_signal, blocked) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let mut blocked_signal = Some(blocked_signal);
+        let mut deferred_input = None;
+        let (_, routed) = super::super::io::await_udp_write_while_routing_stream_frames(
+            async move {
+                write_released.await.unwrap();
+            },
+            &mut input_rx,
+            &mut deferred_input,
+            |frame| {
+                let result = try_route_client_udp_stream_frame_during_write(
+                    frame,
+                    stream_id,
+                    &stream_frames_tx,
+                )?;
+                if matches!(result, CarrierInputRoute::Mailbox(_))
+                    && let Some(signal) = blocked_signal.take()
+                {
+                    let _ = signal.send(());
+                }
+                Ok(result)
+            },
+        )
+        .await;
+        (routed, deferred_input)
+    });
+    input_tx.send(Ok(feedback.clone())).await.unwrap();
+    blocked.await.unwrap();
+    release_write.send(()).unwrap();
+    let (routed, deferred) = task.await.unwrap();
+    assert_eq!(routed, 0);
+    assert!(matches!(deferred, Some(Ok(frame)) if frame == feedback));
+    assert!(matches!(
+        stream_frames_rx.recv().await,
+        Some(Ok(Frame::Ping { nonce: 45 }))
+    ));
+    assert!(
+        stream_frames_rx.try_recv().is_err(),
+        "write-wins must not duplicate retained feedback"
+    );
 }
 
 #[tokio::test]
@@ -78,7 +252,7 @@ async fn quic_write_interlock_preserves_terminal_before_clean_eof() {
                     stream_id,
                     &stream_frames_tx,
                 )?;
-                if matches!(routed, Some(Frame::StreamFin { .. }))
+                if matches!(routed, CarrierInputRoute::Barrier(Frame::StreamFin { .. }))
                     && let Some(terminal_seen) = terminal_seen.take()
                 {
                     let _ = terminal_seen.send(());

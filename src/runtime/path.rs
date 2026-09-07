@@ -13,6 +13,7 @@ mod carrier_inventory;
 mod client_session;
 pub(super) mod commands;
 mod health;
+pub(in crate::runtime) mod input;
 pub(super) mod model;
 mod ports;
 pub(super) mod proof;

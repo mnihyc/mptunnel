@@ -1103,7 +1103,7 @@ fn quic_stream_limit_is_independent_from_receive_window_ratio() {
     )
     .expect("session-limited QUIC transport");
     assert!(
-        format!("{session_limited:?}").contains("max_concurrent_bidi_streams: 32"),
-        "QUIC/H3 admission must not exceed the session stream envelope"
+        format!("{session_limited:?}").contains("max_concurrent_bidi_streams: 65"),
+        "native capacity accounts for two requests per logical attachment plus control"
     );
 }

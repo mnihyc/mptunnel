@@ -23,6 +23,7 @@ use crate::runtime::path::commands::{
     reliable_path_receivers_closed, try_coalesce_reliable_path_writer_run,
     try_recv_reliable_path_command,
 };
+use crate::runtime::path::input::PendingMailboxFrame;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
     ServerCarrierPathRegistration, ServerDatagramOpenRequest, ServerStreamFrameRoute,
@@ -524,8 +525,11 @@ impl ServerTcpPathSession {
                     frame,
                 )? {
                     ServerStreamFrameRoute::Routed => {}
-                    ServerStreamFrameRoute::Backpressured(frame) => {
+                    ServerStreamFrameRoute::Barrier(frame) => {
                         self.deferred_input = Some(frame);
+                    }
+                    ServerStreamFrameRoute::Mailbox(_) => {
+                        unreachable!("requalification uses reply credit, not the Product mailbox");
                     }
                 }
                 Ok(ServerTcpFrameDisposition::Continue)
@@ -967,14 +971,25 @@ impl ServerTcpPathSession {
     ) -> Result<ServerTcpSessionDisposition, RuntimeError> {
         debug_assert!(self.deferred_input.is_none());
         let mut routed_frames = 0usize;
+        let mut mailbox: Option<PendingMailboxFrame> = None;
         let write_result = {
             let write = self.writer.commit_transaction(&mut self.evidence);
             tokio::pin!(write);
             loop {
                 tokio::select! {
                     biased;
-                    result = &mut write => break result?,
-                    incoming = self.path_frames.recv(), if self.deferred_input.is_none() => {
+                    result = &mut write => {
+                        if let Some(pending) = mailbox.take() {
+                            self.deferred_input = Some(pending.into_frame());
+                        }
+                        break result?;
+                    }
+                    _ = async { mailbox.as_mut().expect("pending mailbox").deliver().await },
+                        if mailbox.is_some() => {
+                        mailbox = None;
+                        routed_frames = routed_frames.saturating_add(1);
+                    }
+                    incoming = self.path_frames.recv(), if self.deferred_input.is_none() && mailbox.is_none() => {
                         let frame = match incoming {
                             Some(Ok(frame)) => frame,
                             Some(Err(err)) if encrypted_framed_peer_closed(&err) => {
@@ -1005,9 +1020,10 @@ impl ServerTcpPathSession {
                                 ServerStreamFrameRoute::Routed => {
                                     routed_frames = routed_frames.saturating_add(1);
                                 }
-                                ServerStreamFrameRoute::Backpressured(frame) => {
+                                ServerStreamFrameRoute::Barrier(frame) => {
                                     self.deferred_input = Some(frame);
                                 }
+                                ServerStreamFrameRoute::Mailbox(pending) => mailbox = Some(pending),
                             },
                             None => self.deferred_input = Some(frame),
                         }

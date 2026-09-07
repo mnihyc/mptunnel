@@ -318,6 +318,12 @@ pub enum Frame {
         demand: StreamDemandHint,
         return_plan: StreamReturnPlan,
     },
+    /// QUIC-only companion of an already accepted native request. This does
+    /// not create a Product stream or enroll another return-plan output.
+    OpenStreamRepair {
+        stream_id: StreamId,
+        parent_request_id: u64,
+    },
     StreamReturnPlanFinal {
         stream_id: StreamId,
         retained_ordinals: Vec<u8>,
@@ -448,6 +454,7 @@ impl Frame {
             Self::PathCapacityFinish { .. } => "PATH_CAPACITY_FINISH",
             Self::PathCapacityReceipt { .. } => "PATH_CAPACITY_RECEIPT",
             Self::OpenStream { .. } => "OPEN_STREAM",
+            Self::OpenStreamRepair { .. } => "OPEN_STREAM_REPAIR",
             Self::StreamReturnPlanFinal { .. } => "STREAM_RETURN_PLAN_FINAL",
             Self::StreamData { .. } => "STREAM_DATA",
             Self::StreamAck { .. } => "STREAM_ACK",

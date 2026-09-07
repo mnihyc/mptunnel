@@ -49,7 +49,8 @@ pub(in crate::runtime) struct ReliablePathCommandReceivers {
     pending_retirement_close: Option<StreamId>,
     control: mpsc::Receiver<QueuedReliablePathCommand>,
     priority: mpsc::Receiver<QueuedReliablePathCommand>,
-    reinjection: mpsc::Receiver<QueuedReliablePathCommand>,
+    reinjection: Option<mpsc::Receiver<QueuedReliablePathCommand>>,
+    repair_owner: Option<(StreamId, tokio::sync::watch::Sender<bool>)>,
     data: mpsc::Receiver<QueuedReliablePathCommand>,
     // A control close may overtake bounded data queues. Retain enough terminal
     // IDs to discard every older queued frame instead of writing stale bytes.
@@ -773,6 +774,23 @@ impl ReliablePathCommandQueueMetrics {
 }
 
 impl ReliablePathCommandReceivers {
+    /// Moves the existing recovery queue to an independently polled native
+    /// ordering domain. Only a single-stream attachment may use this split.
+    /// Capacity, reservations and byte accounting are not duplicated.
+    pub(in crate::runtime) fn take_repair_receiver(
+        &mut self,
+        stream_id: StreamId,
+    ) -> ReliablePathRepairReceiver {
+        let receiver = self.reinjection.take().expect("repair queue split once");
+        let (closed, lifetime) = tokio::sync::watch::channel(false);
+        self.repair_owner = Some((stream_id, closed));
+        ReliablePathRepairReceiver {
+            receiver,
+            stream_id,
+            lifetime,
+        }
+    }
+
     pub(in crate::runtime) fn path_drain_signal(&self) -> ReliablePathDrainSignal {
         ReliablePathDrainSignal {
             metrics: self.metrics.clone(),
@@ -798,7 +816,9 @@ impl ReliablePathCommandReceivers {
         self.retirement.close();
         self.control.close();
         self.priority.close();
-        self.reinjection.close();
+        if let Some(receiver) = &mut self.reinjection {
+            receiver.close();
+        }
         self.data.close();
         self.path_drain_phase = Some(ReliablePathCommandDrainPhase::Retirement);
     }
@@ -846,6 +866,11 @@ impl ReliablePathCommandReceivers {
             ReliablePathCommand::ResetAndCloseStream { stream_id, .. }
             | ReliablePathCommand::CloseStream(stream_id) => {
                 self.closed_streams.insert(*stream_id);
+                if let Some((owner, closed)) = &self.repair_owner
+                    && owner == stream_id
+                {
+                    closed.send_replace(true);
+                }
             }
             _ => {}
         }
@@ -868,6 +893,76 @@ impl ReliablePathCommandReceivers {
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) fn pending_bytes(&self) -> u64 {
         self.metrics.pending_bytes()
+    }
+}
+
+/// The parent receiver remains the sole attachment terminal owner. Dropping
+/// this split receiver releases queued envelopes, not a physical carrier.
+pub(in crate::runtime) struct ReliablePathRepairReceiver {
+    receiver: mpsc::Receiver<QueuedReliablePathCommand>,
+    stream_id: StreamId,
+    lifetime: tokio::sync::watch::Receiver<bool>,
+}
+
+pub(in crate::runtime) struct ReliablePathRepairWork {
+    frame: Frame,
+    bytes: usize,
+    metrics: Arc<ReliablePathCommandQueueMetrics>,
+}
+
+impl ReliablePathRepairWork {
+    pub(in crate::runtime) fn frame(&self) -> &Frame {
+        &self.frame
+    }
+}
+
+impl Drop for ReliablePathRepairWork {
+    fn drop(&mut self) {
+        self.metrics.release_writer_pending_bytes(self.bytes as u64);
+        self.metrics.release_accounted_bytes(self.bytes as u64);
+    }
+}
+
+impl ReliablePathRepairReceiver {
+    pub(in crate::runtime) async fn recv(
+        &mut self,
+    ) -> Result<Option<ReliablePathRepairWork>, RuntimeError> {
+        loop {
+            if *self.lifetime.borrow() || self.lifetime.has_changed().is_err() {
+                return Ok(None);
+            }
+            let queued = tokio::select! {
+                biased;
+                changed = self.lifetime.changed() => {
+                    if changed.is_err() || *self.lifetime.borrow() {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                queued = self.receiver.recv() => match queued {
+                    Some(queued) => queued,
+                    None => return Ok(None),
+                },
+            };
+            match queued.command() {
+                ReliablePathCommand::SendFrame(
+                    Frame::StreamData { stream_id, .. }
+                    | Frame::StreamRequalifyData { stream_id, .. },
+                ) if *stream_id == self.stream_id => {}
+                _ => return Err(RuntimeError::Protocol("repair queue attachment mismatch")),
+            }
+            let metrics = queued.metrics.clone();
+            let (command, bytes) = queued.into_parts();
+            let ReliablePathCommand::SendFrame(frame) = command else {
+                unreachable!("validated repair command")
+            };
+            metrics.add_writer_pending_bytes(bytes as u64);
+            return Ok(Some(ReliablePathRepairWork {
+                frame,
+                bytes,
+                metrics,
+            }));
+        }
     }
 }
 
@@ -1736,7 +1831,8 @@ pub(in crate::runtime) fn reliable_path_command_channels(
             pending_retirement_close: None,
             control: control_rx,
             priority: priority_rx,
-            reinjection: reinjection_rx,
+            reinjection: Some(reinjection_rx),
+            repair_owner: None,
             data: data_rx,
             closed_streams: RecentIdCache::new(
                 queue
@@ -1754,6 +1850,22 @@ fn path_command_receiver_may_recv<T>(receiver: &mpsc::Receiver<T>) -> bool {
     !receiver.is_closed() || !receiver.is_empty()
 }
 
+fn repair_receiver_may_recv(receivers: &ReliablePathCommandReceivers) -> bool {
+    receivers
+        .reinjection
+        .as_ref()
+        .is_some_and(path_command_receiver_may_recv)
+}
+
+async fn recv_ordinary_repair_queue(
+    receiver: &mut Option<mpsc::Receiver<QueuedReliablePathCommand>>,
+) -> Option<QueuedReliablePathCommand> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => None,
+    }
+}
+
 fn retirement_receiver_may_recv<T>(receiver: &mpsc::UnboundedReceiver<T>) -> bool {
     !receiver.is_closed() || !receiver.is_empty()
 }
@@ -1765,7 +1877,7 @@ pub(in crate::runtime) fn reliable_path_receivers_closed(
         && !retirement_receiver_may_recv(&receivers.retirement)
         && !path_command_receiver_may_recv(&receivers.control)
         && !path_command_receiver_may_recv(&receivers.priority)
-        && !path_command_receiver_may_recv(&receivers.reinjection)
+        && !repair_receiver_may_recv(receivers)
         && !path_command_receiver_may_recv(&receivers.data)
 }
 
@@ -1784,7 +1896,7 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
         let retirement_may_recv = retirement_receiver_may_recv(&receivers.retirement);
         let control_may_recv = path_command_receiver_may_recv(&receivers.control);
         let priority_may_recv = path_command_receiver_may_recv(&receivers.priority);
-        let reinjection_may_recv = path_command_receiver_may_recv(&receivers.reinjection);
+        let reinjection_may_recv = repair_receiver_may_recv(receivers);
         let data_may_recv = path_command_receiver_may_recv(&receivers.data);
         let received = tokio::select! {
             biased;
@@ -1797,7 +1909,7 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
             command = receivers.priority.recv(), if priority_may_recv => {
                 ReceivedCommand::Queued(command)
             }
-            command = receivers.reinjection.recv(), if reinjection_may_recv => {
+            command = recv_ordinary_repair_queue(&mut receivers.reinjection), if reinjection_may_recv => {
                 ReceivedCommand::Queued(command)
             }
             command = receivers.data.recv(), if data_may_recv => {
@@ -1865,7 +1977,7 @@ pub(in crate::runtime) async fn recv_reliable_path_command_during_drain(
                 }
             },
             ReliablePathCommandDrainPhase::Reinjection => {
-                match receivers.reinjection.recv().await {
+                match recv_ordinary_repair_queue(&mut receivers.reinjection).await {
                     Some(command) => {
                         if let Some(command) = receivers.take_live_queued_command(command) {
                             return Some(command);
@@ -2068,7 +2180,7 @@ fn recv_ready_priority_command(
             .try_recv()
             .ok()
             .or_else(|| receivers.priority.try_recv().ok())
-            .or_else(|| receivers.reinjection.try_recv().ok())?;
+            .or_else(|| receivers.reinjection.as_mut()?.try_recv().ok())?;
         if let Some(command) = receivers.take_live_queued_command(queued) {
             return Some(command);
         }
@@ -2229,6 +2341,7 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::PathCapacityFinish { .. } => "path_capacity_finish",
         Frame::PathCapacityReceipt { .. } => "path_capacity_receipt",
         Frame::OpenStream { .. } => "open_stream",
+        Frame::OpenStreamRepair { .. } => "open_stream_repair",
         Frame::StreamData { .. } => "stream_data",
         Frame::StreamAck { .. } => "stream_ack",
         Frame::StreamRequalifyData { .. } => "stream_requalify_data",

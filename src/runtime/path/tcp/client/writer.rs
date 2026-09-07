@@ -32,6 +32,7 @@ use crate::runtime::path::commands::{
 };
 #[cfg(test)]
 use crate::runtime::path::commands::{TcpCapacityProbeCommand, reliable_path_writer_frame_queue};
+use crate::runtime::path::input::PendingMailboxFrame;
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
 #[cfg(any(test, feature = "lab-diagnostics"))]
@@ -468,11 +469,26 @@ async fn commit_client_tcp_frame_transaction_interlocked(
             connection.carrier.writer.flush().await
         };
         tokio::pin!(commit);
+        let mut mailbox: Option<(PendingMailboxFrame, StreamId, bool)> = None;
         loop {
             tokio::select! {
                 biased;
-                result = &mut commit => break result?,
-                incoming = connection.carrier.frames.recv(), if deferred_frame.is_none() => {
+                result = &mut commit => {
+                    if let Some((pending, _, _)) = mailbox.take() {
+                        *deferred_frame = Some(pending.into_frame());
+                    }
+                    break result?;
+                }
+                delivered = async { mailbox.as_mut().expect("pending mailbox").0.deliver().await },
+                    if mailbox.is_some() => {
+                    let (_, stream_id, retires_attachment) = mailbox.take().expect("pending mailbox");
+                    if !delivered || retires_attachment {
+                        streams.remove(&stream_id);
+                        closed_streams.insert(stream_id);
+                    }
+                    routed_frames = routed_frames.saturating_add(1);
+                }
+                incoming = connection.carrier.frames.recv(), if deferred_frame.is_none() && mailbox.is_none() => {
                     match incoming {
                         Some(Ok(frame)) => match try_route_client_tcp_frame_during_write_for_session(
                             frame,
@@ -487,6 +503,9 @@ async fn commit_client_tcp_frame_transaction_interlocked(
                             }
                             ClientTcpWriteFrameRoute::Barrier(frame) => {
                                 *deferred_frame = Some(frame);
+                            }
+                            ClientTcpWriteFrameRoute::Mailbox { pending, stream_id, retires_attachment } => {
+                                mailbox = Some((pending, stream_id, retires_attachment));
                             }
                         },
                         Some(Err(err)) => return Err(RuntimeError::Encrypted(err)),
@@ -617,13 +636,26 @@ async fn client_write_tcp_capacity_probe_interlocked(
     let mut first_barrier_reason = None;
     let mut deferred_error = None;
     let mut reader_open = true;
+    let mut mailbox: Option<(PendingMailboxFrame, StreamId, bool)> = None;
     let measurement = loop {
         tokio::select! {
             biased;
             result = &mut write => {
+                if let Some((pending, _, _)) = mailbox.take() {
+                    deferred_frames.push(pending.into_frame());
+                }
                 break result;
             }
-            incoming = connection.carrier.frames.recv(), if reader_open => {
+            delivered = async { mailbox.as_mut().expect("pending mailbox").0.deliver().await },
+                if mailbox.is_some() => {
+                let (_, stream_id, retires_attachment) = mailbox.take().expect("pending mailbox");
+                if !delivered || retires_attachment {
+                    streams.remove(&stream_id);
+                    closed_streams.insert(stream_id);
+                }
+                routed_frames = routed_frames.saturating_add(1);
+            }
+            incoming = connection.carrier.frames.recv(), if reader_open && mailbox.is_none() => {
                 let frame = match incoming {
                     Some(Ok(frame)) => frame,
                     Some(Err(error)) => {
@@ -663,6 +695,9 @@ async fn client_write_tcp_capacity_probe_interlocked(
                             }
                             defer_all = true;
                             deferred_frames.push(frame);
+                        }
+                        ClientTcpWriteFrameRoute::Mailbox { pending, stream_id, retires_attachment } => {
+                            mailbox = Some((pending, stream_id, retires_attachment));
                         }
                     }
                 } else if deferred_frames.len() < deferred_limit {
@@ -734,6 +769,11 @@ fn client_tcp_write_barrier_reason(
 enum ClientTcpWriteFrameRoute {
     Routed,
     Barrier(Frame),
+    Mailbox {
+        pending: PendingMailboxFrame,
+        stream_id: StreamId,
+        retires_attachment: bool,
+    },
 }
 
 fn try_route_client_tcp_frame_during_write_for_session(
@@ -833,9 +873,11 @@ fn try_route_client_tcp_frame_during_write(
             }
             Ok(ClientTcpWriteFrameRoute::Routed)
         }
-        Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
-            Ok(ClientTcpWriteFrameRoute::Barrier(frame))
-        }
+        Err(mpsc::error::TrySendError::Full(Ok(frame))) => Ok(ClientTcpWriteFrameRoute::Mailbox {
+            pending: PendingMailboxFrame::new(frame, state.frames.clone(), Ok),
+            stream_id,
+            retires_attachment,
+        }),
         Err(mpsc::error::TrySendError::Closed(_)) => {
             streams.remove(&stream_id);
             closed_streams.insert(stream_id);

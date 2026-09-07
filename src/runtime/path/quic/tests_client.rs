@@ -135,6 +135,13 @@ impl ClientOpenRaceFixture {
     }
 
     async fn new_with_provider(provider: Arc<dyn CarrierNetworkProvider>) -> Self {
+        Self::new_with_limits(provider, ResourceLimits::default()).await
+    }
+
+    async fn new_with_limits(
+        provider: Arc<dyn CarrierNetworkProvider>,
+        limits: ResourceLimits,
+    ) -> Self {
         let shared_secret = SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret");
         let security = ServerSecurityConfig::for_test(shared_secret.clone());
@@ -148,7 +155,7 @@ impl ClientOpenRaceFixture {
             crate::config::DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
             security,
             MppPerformanceConfig::default(),
-            ResourceLimits::default(),
+            limits,
         );
         let reserved =
             std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve server QUIC address");
@@ -179,7 +186,7 @@ impl ClientOpenRaceFixture {
                 security: client_security,
                 tls: crate::transport::encrypted::test_client_tls_config(),
             }],
-            ResourceLimits::default(),
+            limits,
             None,
             0,
             provider,
@@ -702,6 +709,298 @@ async fn accept_test_datagram_request(
 ) -> Result<(), RuntimeError> {
     let (mut send, _recv) = connection.accept_bi().await?;
     udp_path_write_frame(&mut send, &Frame::SessionReady, limits).await
+}
+
+#[tokio::test]
+async fn repair_pair_cancellation_returns_partially_allocated_native_credit() {
+    let fixture = ClientOpenRaceFixture::new_with_limits(
+        Arc::new(SystemCarrierNetworkProvider),
+        ResourceLimits {
+            // The authenticated control request owns one slot. One remains:
+            // an ordinary half can open, but a pair cannot complete.
+            max_quic_concurrent_bidi_streams: 2,
+            ..ResourceLimits::default()
+        },
+    )
+    .await;
+    let accepted = fixture.establish_current().await;
+    let carrier = current_client_carrier(&fixture.session).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut pair = Box::pin(carrier.connection.open_reliable_pair());
+        let (mut partial_send, mut partial_recv) = tokio::select! {
+            result = &mut pair => panic!("pair exceeded native credit: {}", result.is_ok()),
+            partial = accepted.connection.accept_bi() => partial.unwrap(),
+        };
+        let partial_id = partial_send.request_stream_id();
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pair.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        drop(pair);
+        assert!(
+            udp_path_read_frame(&mut partial_recv, fixture.server_context.codec_limits)
+                .await
+                .is_err(),
+            "cancelled half must finish or reset without Product OPEN"
+        );
+        partial_send.cancel_pending_response();
+        drop((partial_send, partial_recv));
+
+        // Native credit is reclaimed, not bypassed. A later unpaired request
+        // can use that one slot without restarting the physical connection.
+        let (opened, received) = tokio::join!(
+            carrier.connection.open_bi(),
+            accepted.connection.accept_bi(),
+        );
+        let (mut send, _recv) = opened.unwrap();
+        let (_peer_send, mut peer_recv) = received.unwrap();
+        assert!(send.request_stream_id() > partial_id);
+        udp_path_write_frame(
+            &mut send,
+            &Frame::SessionReady,
+            fixture.server_context.codec_limits,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut peer_recv, fixture.server_context.codec_limits)
+                .await
+                .unwrap(),
+            Frame::SessionReady
+        );
+        assert!(!carrier.connection.is_closed());
+    })
+    .await
+    .expect("partial pair cancellation must release native ownership");
+}
+
+#[tokio::test]
+async fn repair_graceful_response_eof_preserves_request_half_and_ordinary_terminal() {
+    let fixture = ClientOpenRaceFixture::new().await;
+    let accepted = fixture.establish_current().await;
+    let carrier = current_client_carrier(&fixture.session).await.unwrap();
+    let stream_id = StreamId(1032);
+    let limits = fixture.server_context.codec_limits;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let ((mut ordinary_send, _ordinary_recv), (mut repair_send, repair_recv)) =
+            carrier.connection.open_reliable_pair().await.unwrap();
+        let open = Frame::OpenStreamRepair {
+            stream_id,
+            parent_request_id: ordinary_send.request_stream_id(),
+        };
+        // Publish both actual H3 requests before accepting their independent halves.
+        udp_path_write_frame(&mut ordinary_send, &Frame::Ping { nonce: 1 }, limits)
+            .await
+            .unwrap();
+        let (_peer_ordinary_send, mut peer_ordinary_recv) =
+            accepted.connection.accept_bi().await.unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut peer_ordinary_recv, limits)
+                .await
+                .unwrap(),
+            Frame::Ping { nonce: 1 }
+        );
+        udp_path_write_frame(&mut repair_send, &open, limits)
+            .await
+            .unwrap();
+        let (mut peer_repair_send, mut peer_repair_recv) =
+            accepted.connection.accept_bi().await.unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut peer_repair_recv, limits)
+                .await
+                .unwrap(),
+            open
+        );
+
+        // Explicit finish emits HTTP 200 plus clean EOF. Dropping a pending
+        // server response would instead emit 404 and test a different failure.
+        super::super::io::udp_path_finish_stream(&mut peer_repair_send)
+            .await
+            .unwrap();
+        // Consume EOF exactly once through the production read-half owner.
+        // Completion of this half must not consume the independent send half
+        // or cancel the parent's ordinary terminal receive/drain transaction.
+        super::super::repair::read_repair_channel(repair_recv, stream_id, limits, |_| async {
+            panic!("finished response half cannot deliver another repair frame")
+        })
+        .await
+        .expect("graceful EOF completes only the repair receive half");
+        let tail = Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: bytes::Bytes::from_static(b"last repair"),
+        };
+        udp_path_write_frame(&mut repair_send, &tail, limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut peer_repair_recv, limits)
+                .await
+                .unwrap(),
+            tail
+        );
+        let fin = Frame::StreamFin {
+            stream_id,
+            final_offset: 0,
+        };
+        udp_path_write_frame(&mut ordinary_send, &fin, limits)
+            .await
+            .unwrap();
+        super::super::io::udp_path_finish_stream(&mut ordinary_send)
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut peer_ordinary_recv, limits)
+                .await
+                .unwrap(),
+            fin
+        );
+        assert!(!carrier.connection.is_closed());
+    })
+    .await
+    .expect("graceful repair half-close must preserve reverse data and ordinary terminal delivery");
+}
+
+#[tokio::test]
+async fn repair_companion_is_bidirectional_survives_half_close_and_fails_only_attachment() {
+    let fixture = ClientOpenRaceFixture::new().await;
+    let accepted = fixture.establish_current().await;
+    let stream_id = StreamId(1030);
+    let limits = fixture.server_context.codec_limits;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let opening = spawn_test_open(&fixture.session, stream_id);
+        let (mut ordinary_send, _ordinary_recv) =
+            read_test_stream_open(&accepted.connection, stream_id, limits)
+                .await
+                .unwrap();
+        let parent_request_id = ordinary_send.request_stream_id();
+        udp_path_write_frame(
+            &mut ordinary_send,
+            &Frame::StreamMaxData {
+                stream_id,
+                max_offset: 65_536,
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+        let mut opened = opening.await.unwrap().unwrap();
+        let (mut repair_send, mut repair_recv) = accepted.connection.accept_bi().await.unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut repair_recv, limits).await.unwrap(),
+            Frame::OpenStreamRepair {
+                stream_id,
+                parent_request_id
+            }
+        );
+        let up = Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: bytes::Bytes::from_static(b"up"),
+        };
+        opened
+            .commands
+            .try_enqueue_reinjection_frame(up.clone(), TrafficClass::Throughput)
+            .unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut repair_recv, limits).await.unwrap(),
+            up
+        );
+        let down = Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: bytes::Bytes::from_static(b"down"),
+        };
+        udp_path_write_frame(&mut repair_send, &down, limits)
+            .await
+            .unwrap();
+        assert_eq!(opened.frames.recv().await.unwrap().unwrap(), down);
+
+        // Normal response FIN/EOF must leave the request direction usable,
+        // including repair. Do not replace this with a timer-based assertion.
+        let fin = Frame::StreamFin {
+            stream_id,
+            final_offset: 4,
+        };
+        udp_path_write_frame(&mut ordinary_send, &fin, limits)
+            .await
+            .unwrap();
+        super::super::io::udp_path_finish_stream(&mut ordinary_send)
+            .await
+            .unwrap();
+        assert_eq!(opened.frames.recv().await.unwrap().unwrap(), fin);
+        let tail = Frame::StreamData {
+            stream_id,
+            offset: 2,
+            payload: bytes::Bytes::from_static(b"tail"),
+        };
+        opened
+            .commands
+            .try_enqueue_reinjection_frame(tail.clone(), TrafficClass::Throughput)
+            .unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut repair_recv, limits).await.unwrap(),
+            tail
+        );
+
+        // A malformed companion frame is an operation failure, unlike clean
+        // directional EOF. It must not close the authenticated carrier/siblings.
+        udp_path_write_frame(
+            &mut repair_send,
+            &Frame::StreamData {
+                stream_id: StreamId(stream_id.0 + 1),
+                offset: 0,
+                payload: bytes::Bytes::from_static(b"wrong owner"),
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+        let error = opened.frames.recv().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Protocol("unexpected QUIC repair attachment frame")
+        ));
+        assert_eq!(
+            client_udp_error_disposition(&error),
+            ClientUdpErrorDisposition::Operation
+        );
+        assert!(!accepted.connection.is_closed());
+        let current = current_client_carrier(&fixture.session).await.unwrap();
+        assert_eq!(current.path_instance_id, opened.path_instance_id);
+        assert!(!current.connection.is_closed());
+
+        let sibling_id = StreamId(1031);
+        let sibling_opening = spawn_test_open(&fixture.session, sibling_id);
+        let (mut sibling_send, _sibling_recv) =
+            read_test_stream_open(&accepted.connection, sibling_id, limits)
+                .await
+                .unwrap();
+        udp_path_write_frame(
+            &mut sibling_send,
+            &Frame::StreamMaxData {
+                stream_id: sibling_id,
+                max_offset: 65_536,
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+        let mut sibling = sibling_opening.await.unwrap().unwrap();
+        let sibling_data = Frame::StreamData {
+            stream_id: sibling_id,
+            offset: 0,
+            payload: bytes::Bytes::from_static(b"live"),
+        };
+        udp_path_write_frame(&mut sibling_send, &sibling_data, limits)
+            .await
+            .unwrap();
+        assert_eq!(sibling.frames.recv().await.unwrap().unwrap(), sibling_data);
+    })
+    .await
+    .expect("paired attachment and sibling must make progress");
 }
 
 fn install_open_failure_pause(

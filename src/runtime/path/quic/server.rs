@@ -160,6 +160,7 @@ async fn handle_server_udp_connection(
     );
     tokio::pin!(control);
     let mut control_active = true;
+    let repair_bindings = super::repair::QuicRepairBindings::default();
     let mut streams = tokio::task::JoinSet::new();
     streams.spawn(run_server_quic_path_metrics(
         context.clone(),
@@ -230,6 +231,7 @@ async fn handle_server_udp_connection(
                 let context = context.clone();
                 let path_registration = path_registration.clone();
                 let native_rate_authority = native_rate_authority.clone();
+                let repair_bindings = repair_bindings.clone();
                 streams.spawn(async move {
                     if let Err(err) = handle_server_udp_bidi_stream_with_native_rate_authority(
                         send,
@@ -239,6 +241,7 @@ async fn handle_server_udp_connection(
                         path_id,
                         path_registration,
                         native_rate_authority,
+                        repair_bindings,
                     )
                     .await
                     {
@@ -537,6 +540,10 @@ async fn run_server_udp_control_stream(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep stream halves, attachment identity, native authority and connection-scoped repair bindings explicit at the accept boundary"
+)]
 async fn handle_server_udp_bidi_stream_with_native_rate_authority(
     send: UdpPathSendStream,
     recv: UdpPathRecvStream,
@@ -547,6 +554,7 @@ async fn handle_server_udp_bidi_stream_with_native_rate_authority(
     native_rate_authority: std::sync::Arc<
         crate::runtime::path::authority::NativeCarrierRateAuthorityHandle,
     >,
+    repair_bindings: super::repair::QuicRepairBindings,
 ) -> Result<(), RuntimeError> {
     handle_server_udp_bidi_stream_inner(
         send,
@@ -556,6 +564,7 @@ async fn handle_server_udp_bidi_stream_with_native_rate_authority(
         path_id,
         path_registration,
         Some(native_rate_authority),
+        repair_bindings,
     )
     .await
 }
@@ -577,10 +586,15 @@ pub(super) async fn handle_server_udp_bidi_stream(
         path_id,
         path_registration,
         None,
+        super::repair::QuicRepairBindings::default(),
     )
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep stream halves, attachment identity, native authority and connection-scoped repair bindings explicit at the accept boundary"
+)]
 async fn handle_server_udp_bidi_stream_inner(
     mut send: UdpPathSendStream,
     mut recv: UdpPathRecvStream,
@@ -591,8 +605,27 @@ async fn handle_server_udp_bidi_stream_inner(
     native_rate_authority: Option<
         std::sync::Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>,
     >,
+    repair_bindings: super::repair::QuicRepairBindings,
 ) -> Result<(), RuntimeError> {
     match udp_path_read_frame(&mut recv, context.codec_limits).await? {
+        Frame::OpenStreamRepair {
+            stream_id,
+            parent_request_id,
+        } => {
+            let child_id = send.request_stream_id();
+            if parent_request_id % 4 != 0 || parent_request_id >= child_id {
+                return Err(RuntimeError::Protocol(
+                    "invalid QUIC repair parent identity",
+                ));
+            }
+            match repair_bindings.claim(parent_request_id, stream_id, (send, recv)) {
+                Ok(()) => Ok(()),
+                Err((mut send, _recv)) => {
+                    udp_path_reject_stream(&mut send).await?;
+                    Ok(())
+                }
+            }
+        }
         Frame::OpenStream { stream_id, .. }
             if context.forwarding_mode == crate::config::ForwardingMode::L3 =>
         {
@@ -625,6 +658,7 @@ async fn handle_server_udp_bidi_stream_inner(
                     initial_demand: demand,
                     return_plan,
                     native_rate_authority,
+                    repair_bindings,
                 },
             )
             .await

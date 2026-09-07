@@ -113,15 +113,23 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
         offset: 0,
         payload: Bytes::from_static(b"response"),
     };
-    assert!(matches!(
-        try_route_client_tcp_frame_during_write(
-            response.clone(),
-            &mut streams,
-            &mut closed_streams,
-            &mut datagrams,
-        ),
-        Ok(ClientTcpWriteFrameRoute::Barrier(frame)) if frame == response
-    ));
+    match try_route_client_tcp_frame_during_write(
+        response.clone(),
+        &mut streams,
+        &mut closed_streams,
+        &mut datagrams,
+    ) {
+        Ok(ClientTcpWriteFrameRoute::Mailbox {
+            pending,
+            stream_id: recipient,
+            retires_attachment,
+        }) => {
+            assert_eq!(pending.into_frame(), response);
+            assert_eq!(recipient, stream_id);
+            assert!(!retires_attachment);
+        }
+        _ => panic!("full ordinary mailbox must carry its own capacity wait"),
+    }
     assert!(matches!(
         try_route_client_tcp_frame_during_write(
             Frame::SessionClose {

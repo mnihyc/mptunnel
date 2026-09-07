@@ -464,7 +464,7 @@ fn try_route_server_udp_stream_frame_during_write(
     stream_id: StreamId,
     context: &ServerPathContext,
     path_registration: &ServerCarrierPathRegistration,
-) -> Result<Option<Frame>, RuntimeError> {
+) -> Result<ServerStreamFrameRoute, RuntimeError> {
     let received_stream_id = match &frame {
         Frame::StreamData { stream_id, .. }
         | Frame::StreamAck { stream_id, .. }
@@ -474,16 +474,12 @@ fn try_route_server_udp_stream_frame_during_write(
         | Frame::StreamMaxData { stream_id, .. }
         | Frame::StreamFin { stream_id, .. }
         | Frame::StreamReset { stream_id, .. } => *stream_id,
-        _ => return Ok(Some(frame)),
+        _ => return Ok(ServerStreamFrameRoute::Barrier(frame)),
     };
     if received_stream_id != stream_id {
-        return Ok(Some(frame));
+        return Ok(ServerStreamFrameRoute::Barrier(frame));
     }
-    match context
+    context
         .reliable_streams
-        .try_route_frame(path_registration, stream_id, frame)?
-    {
-        ServerStreamFrameRoute::Routed => Ok(None),
-        ServerStreamFrameRoute::Backpressured(frame) => Ok(Some(frame)),
-    }
+        .try_route_frame(path_registration, stream_id, frame)
 }

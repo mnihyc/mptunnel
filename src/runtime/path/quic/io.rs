@@ -12,6 +12,7 @@ use crate::runtime::path::authority::{
 use crate::runtime::path::commands::{
     reliable_path_command_queue, reliable_stream_frame_queue_for_payload,
 };
+use crate::runtime::path::input::{CarrierInputRoute, PendingMailboxFrame};
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::scheduler::TrafficClass;
@@ -32,6 +33,7 @@ pub(in crate::runtime) struct UdpPathEndpoint {
 pub(in crate::runtime) struct UdpPathConnection {
     pub(super) connection: quic_transport::Connection,
     native_rate_authority: NativeCarrierRateAuthorityBinding,
+    reliable_pair_open: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -74,6 +76,15 @@ fn quic_stream_priority(lane: TrafficClass) -> i32 {
 }
 
 impl UdpPathSendStream {
+    pub(super) fn request_stream_id(&self) -> u64 {
+        self.stream.request_stream_id()
+    }
+
+    pub(super) fn set_repair_priority(&mut self) -> Result<(), RuntimeError> {
+        self.stream.set_priority(QUIC_LATENCY_STREAM_PRIORITY)?;
+        Ok(())
+    }
+
     /// QUIC stream priority orders locally buffered streams only. Quinn still
     /// owns connection flow control, congestion control, pacing, and recovery.
     pub(super) fn set_traffic_class(&mut self, lane: TrafficClass) -> Result<(), RuntimeError> {
@@ -190,6 +201,7 @@ impl UdpPathConnection {
         Self {
             connection,
             native_rate_authority: NativeCarrierRateAuthorityBinding::default(),
+            reliable_pair_open: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -331,6 +343,24 @@ impl UdpPathConnection {
         ))
     }
 
+    /// Serialize only native pair allocation, not peer acceptance or data I/O.
+    /// Otherwise simultaneous opens can each hold one half of exhausted
+    /// stream credit and wait forever for the second half of their pair.
+    pub(super) async fn open_reliable_pair(
+        &self,
+    ) -> Result<
+        (
+            (UdpPathSendStream, UdpPathRecvStream),
+            (UdpPathSendStream, UdpPathRecvStream),
+        ),
+        RuntimeError,
+    > {
+        let _allocation = self.reliable_pair_open.lock().await;
+        let ordinary = self.open_bi().await?;
+        let repair = self.open_bi().await?;
+        Ok((ordinary, repair))
+    }
+
     pub(super) fn close(&self) {
         self.connection.close();
     }
@@ -452,7 +482,7 @@ pub(super) async fn flush_udp_frame_batch_with_path_proofs_interlocked<F>(
     try_route_frame: F,
 ) -> Result<usize, RuntimeError>
 where
-    F: FnMut(Frame) -> Result<Option<Frame>, RuntimeError>,
+    F: FnMut(Frame) -> Result<CarrierInputRoute, RuntimeError>,
 {
     if frames.is_empty() {
         return Ok(0);
@@ -482,19 +512,31 @@ pub(super) async fn await_udp_write_while_routing_stream_frames<W, T, F>(
 ) -> (T, usize)
 where
     W: std::future::Future<Output = T>,
-    F: FnMut(Frame) -> Result<Option<Frame>, RuntimeError>,
+    F: FnMut(Frame) -> Result<CarrierInputRoute, RuntimeError>,
 {
     tokio::pin!(write);
     let mut routed_frames = 0usize;
+    let mut mailbox: Option<PendingMailboxFrame> = None;
     loop {
         tokio::select! {
             biased;
-            result = &mut write => return (result, routed_frames),
-            incoming = carrier_frames.recv(), if deferred_input.is_none() => {
+            result = &mut write => {
+                if let Some(pending) = mailbox.take() {
+                    *deferred_input = Some(Ok(pending.into_frame()));
+                }
+                return (result, routed_frames);
+            }
+            _ = async { mailbox.as_mut().expect("pending mailbox").deliver().await },
+                if mailbox.is_some() => {
+                mailbox = None;
+                routed_frames = routed_frames.saturating_add(1);
+            }
+            incoming = carrier_frames.recv(), if deferred_input.is_none() && mailbox.is_none() => {
                 match incoming {
                     Some(Ok(frame)) => match try_route_frame(frame) {
-                        Ok(None) => routed_frames = routed_frames.saturating_add(1),
-                        Ok(Some(frame)) => *deferred_input = Some(Ok(frame)),
+                        Ok(CarrierInputRoute::Routed) => routed_frames = routed_frames.saturating_add(1),
+                        Ok(CarrierInputRoute::Barrier(frame)) => *deferred_input = Some(Ok(frame)),
+                        Ok(CarrierInputRoute::Mailbox(pending)) => mailbox = Some(pending),
                         Err(err) => *deferred_input = Some(Err(err)),
                     },
                     Some(Err(err)) => *deferred_input = Some(Err(err)),

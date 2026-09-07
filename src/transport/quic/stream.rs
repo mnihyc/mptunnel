@@ -58,6 +58,10 @@ impl IpPacketSender {
 }
 
 impl SendStream {
+    pub(crate) fn request_stream_id(&self) -> u64 {
+        self.request_stream_id.into()
+    }
+
     /// Apply Product/Core's traffic class to Quinn's native stream scheduler.
     ///
     /// H3 retains the concrete send stream, so the carrier addresses the same

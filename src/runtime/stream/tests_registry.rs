@@ -1848,7 +1848,7 @@ async fn repeated_same_key_reconnect_does_not_wait_for_predecessor_cleanup() {
         if matches!(
             port.try_route_frame(&current, stream_id, frame)
                 .expect("route ACK"),
-            ServerStreamFrameRoute::Backpressured(_)
+            ServerStreamFrameRoute::Mailbox(_)
         ) {
             backpressured = true;
             break;
@@ -2118,7 +2118,10 @@ async fn carrier_retirement_publishes_detach_to_each_stream_without_cross_stream
                 .expect("route request data")
             {
                 ServerStreamFrameRoute::Routed => filled += 1,
-                ServerStreamFrameRoute::Backpressured(_) => break,
+                ServerStreamFrameRoute::Mailbox(_) => break,
+                ServerStreamFrameRoute::Barrier(_) => {
+                    panic!("ordinary data is not an actor barrier")
+                }
             }
         }
         assert!(filled > 0, "test must saturate each bounded actor queue");
@@ -3142,10 +3145,11 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
             .expect("try route frame")
         {
             ServerStreamFrameRoute::Routed => {}
-            ServerStreamFrameRoute::Backpressured(frame) => {
-                backpressured = Some(frame);
+            ServerStreamFrameRoute::Mailbox(pending) => {
+                backpressured = Some(pending.into_frame());
                 break;
             }
+            ServerStreamFrameRoute::Barrier(_) => panic!("ordinary ACK is not an actor barrier"),
         }
     }
     let backpressured = backpressured.expect("bounded stream queue must report pressure");
@@ -3344,8 +3348,11 @@ fn request_requalification_ack_can_return_on_a_healthy_same_session_sibling() {
     };
     match port.try_route_frame(&carrying, stream_id, probe) {
         Ok(ServerStreamFrameRoute::Routed) => {}
-        Ok(ServerStreamFrameRoute::Backpressured(_)) => {
+        Ok(ServerStreamFrameRoute::Barrier(_)) => {
             panic!("healthy sibling must carry the ACK, but routing remained backpressured")
+        }
+        Ok(ServerStreamFrameRoute::Mailbox(_)) => {
+            panic!("requalification does not use the Product mailbox")
         }
         Err(error) => panic!("healthy sibling ACK routing failed: {error}"),
     }

@@ -203,13 +203,15 @@ async fn quic_write_wait_routes_stream_feedback_before_an_ordering_barrier() {
                     if let Some(signal) = routed_signal.take() {
                         let _ = signal.send(());
                     }
-                    Ok(None)
+                    Ok(crate::runtime::path::input::CarrierInputRoute::Routed)
                 }
                 frame => {
                     if let Some(signal) = barrier_signal.take() {
                         let _ = signal.send(());
                     }
-                    Ok(Some(frame))
+                    Ok(crate::runtime::path::input::CarrierInputRoute::Barrier(
+                        frame,
+                    ))
                 }
             },
         )

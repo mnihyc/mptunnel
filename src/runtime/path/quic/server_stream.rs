@@ -159,6 +159,7 @@ pub(super) struct ServerUdpReliableStreamContext {
     pub(super) return_plan: StreamReturnPlan,
     pub(super) native_rate_authority:
         Option<std::sync::Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>>,
+    pub(super) repair_bindings: super::repair::QuicRepairBindings,
 }
 
 struct ServerUdpReliableOutputDetachGuard {
@@ -217,9 +218,10 @@ pub(super) async fn handle_server_udp_reliable_stream(
         initial_demand,
         return_plan,
         native_rate_authority,
+        repair_bindings,
     } = stream_context;
     let duplicate_open_target = target.clone();
-    let (commands_tx, commands_rx) = reliable_path_command_channels(udp_path_command_queue(
+    let (commands_tx, mut commands_rx) = reliable_path_command_channels(udp_path_command_queue(
         context.mux_limits,
         context.codec_limits,
     ));
@@ -302,6 +304,9 @@ pub(super) async fn handle_server_udp_reliable_stream(
         path_registration: path_registration.clone(),
         stream_id,
     };
+    let (_repair_parent, repair_streams) =
+        repair_bindings.register(send.request_stream_id(), stream_id)?;
+    let repair_commands = commands_rx.take_repair_receiver(stream_id);
     if accept_existing {
         write_udp_stream_accept(
             &mut send,
@@ -324,7 +329,27 @@ pub(super) async fn handle_server_udp_reliable_stream(
             return Ok(());
         }
     }
-    run_server_udp_reliable_stream_loop(
+    let repair_context = context.clone();
+    let repair_registration = path_registration.clone();
+    let repair = async {
+        let (repair_send, repair_recv) = repair_streams
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+        super::repair::run_repair_channel(
+            repair_send,
+            repair_recv,
+            repair_commands,
+            stream_id,
+            repair_context.codec_limits,
+            |frame| {
+                repair_context
+                    .reliable_streams
+                    .route_frame(&repair_registration, stream_id, frame)
+            },
+        )
+        .await
+    };
+    let ordinary = run_server_udp_reliable_stream_loop(
         send,
         recv,
         ServerUdpReliableStreamLoop {
@@ -338,8 +363,12 @@ pub(super) async fn handle_server_udp_reliable_stream(
             commands_rx,
             path_proofs,
         },
-    )
-    .await
+    );
+    tokio::select! {
+        biased;
+        result = repair => result,
+        result = ordinary => result,
+    }
 }
 
 struct ServerUdpReliableStreamLoop {
@@ -577,8 +606,11 @@ async fn run_server_udp_reliable_stream_loop(
                             frame,
                         )? {
                             crate::runtime::path::ServerStreamFrameRoute::Routed => {}
-                            crate::runtime::path::ServerStreamFrameRoute::Backpressured(frame) => {
+                            crate::runtime::path::ServerStreamFrameRoute::Barrier(frame) => {
                                 deferred_input = Some(Ok(frame));
+                            }
+                            crate::runtime::path::ServerStreamFrameRoute::Mailbox(_) => {
+                                unreachable!("requalification uses reply credit, not the Product mailbox");
                             }
                         }
                     }

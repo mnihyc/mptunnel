@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 11
+# MPTunnel Multipath Proxy Protocol (MPP) Version 13
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 11: its wire format, carrier profiles,
+This document specifies MPP version 13: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,7 +21,7 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 11 is identified by the frame header in Section 12. A peer MUST
+Wire version 13 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
@@ -814,6 +814,44 @@ proof and do not repeat connection admission. The first MPP frame, together
 with the authenticated physical carrier binding, unambiguously selects that
 operation.
 
+For a reliable Product attachment, ordinary/control work and repeated-range
+repair use two request streams on the same authenticated QUIC connection.
+The client allocates the pair before publishing `OPEN_STREAM`; native pair
+allocation MUST avoid partial-pair deadlock between concurrent openers. Pair
+allocation remains subject to existing native stream credit and Product-open
+cancellation. No additional peer round trip is required when stream credit is
+available. After ordinary attachment acceptance, the companion starts with
+`OPEN_STREAM_REPAIR(stream_id, parent_request_id)`. The parent ID names the
+exact earlier client-initiated bidirectional native request on this connection.
+
+Only an accepted live parent can publish a companion binding, before its
+acceptance response becomes visible. A parent accepts at most one companion.
+A child cannot create a target, enroll a return-plan output or revive a retired
+attachment. Unknown, mismatched, duplicate or retired parent references fail
+only that request. Bindings have parent lifetime, not a separately renewable
+timer. They are removed on claim or parent cancellation. The companion remains
+part of the same physical/configured-slot copy authority and native controller.
+
+Only repeated `STREAM_DATA` and non-delivering `STREAM_REQUALIFY_DATA` use the
+companion after its opening frame. Both directions retain ordinary Product
+validation, credit and exact-copy rules. Data ACK, FIN, RESET, return-plan and
+flow-credit owners are unchanged. Existing bounded repair work is transferred
+to this writer without another Product queue capacity or copy slot. Ordinary
+data never enters its native FIFO. Its native stream priority is above bulk;
+it does not reserve or create connection flow/send credit or congestion credit.
+The parent MUST poll companion service independently of a pending ordinary
+write. Parent termination cancels both stream tasks and reconciles charges;
+premature companion failure retires only this attachment, not the connection,
+session or siblings. A graceful companion receive EOF is not such a failure:
+it closes only that receive half, leaving its send half and the ordinary
+stream's independently ordered terminal exchange alive until parent retirement.
+Reset, truncated framing, rejected HTTP response and invalid companion frames
+remain errors; they MUST NOT be reclassified as graceful EOF. A Product or
+ordinary receive half-close likewise does not terminate a still-required send
+direction. Stream-count defaults and logical-to-native
+admission geometry account for two requests per attachment plus carrier
+control; an explicit native stream ceiling remains authoritative.
+
 The server MUST NOT send a successful response before application
 authentication, `PATH_JOIN`, replay admission, and sequence-zero
 `PATH_STATUS` succeed. It then sends a 2xx response before response DATA
@@ -1515,6 +1553,9 @@ detach or failure processing. Lifecycle input is independent of Product work;
 its exact-instance transition may be required to release carrier retirement
 while the remaining Product direction stays open.
 
+Retiring a Product input recipient MUST NOT cancel still-owned ordered terminal
+output on its attachment; actual native transport failure remains independent.
+
 `STREAM_RESET(stream_id, reason)` terminates the MPP stream.
 
 Product FIN, detach, reset, or logical-stream terminal cancels only work
@@ -2180,6 +2221,23 @@ identity and bounds from Section 15.
 
 ### 10.4 Bounded work and fairness
 
+At a serialized Product relay, incoming frames, queued transmission work, and
+local source reads are independent service classes. Continuously ready work
+in each class MUST receive fair opportunities within the existing finite
+handler quanta and resource authorities. A replenished input queue MUST NOT
+require drain-to-empty before source or sender service. A resource-eligible
+but pending source read MUST NOT prevent ready input from being polled.
+Synchronously ready MPP work MUST preserve the executor's cooperative service
+boundary; selecting it cannot bypass a required yield from an input or I/O
+resource. Fair class order alone does not ensure other actors make progress.
+Already applied ACK, credit, lifecycle and terminal state informs every new
+commitment; input retains FIFO and exact-incarnation validation. This does not
+impose a total arrival order across independent carriers or permit bypassing
+native precommit checks. A selected partial native or local write retains its
+existing ownership and recovery obligations. Product actor service is distinct
+from the final carrier writer's dependency and class priority below: control
+priority there is not a blanket veto on the other Product direction here.
+
 All MPP-owned scheduling, retention, reinjection, measurement, queue, and
 diagnostic allocations MUST have byte and item bounds plus one exact
 cancellation or terminal owner. A time bound is REQUIRED only where this RFC
@@ -2390,7 +2448,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        11
+4      version        13
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -2413,7 +2471,7 @@ frames.
 | 4 | `PATH_JOIN` | `session_id:u64, credential_id, path_id:u16, configured_member_slot:u16, underlay:u8, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
 | 7 | `OPEN_STREAM` | `stream_id:u64, target, demand:u8, trigger_bytes:u64, candidate_total:u8, candidate_tier:u8, phase:u8, candidate_ordinal:u8` |
 | 8 | `STREAM_DATA` | `stream_id:u64, offset:u64, length:u32, bytes` |
-| 9 | `STREAM_ACK` | `stream_id:u64, complete:u8, range_count:u16, ranges[range_count]` |
+| 9 | `STREAM_ACK` | `stream_id:u64, flags:u8, range_count:u16, ranges[range_count]` |
 | 10 | `STREAM_MAX_DATA` | `stream_id:u64, max_offset:u64` |
 | 11 | `STREAM_RESET` | `stream_id:u64, reason:u8` |
 | 12 | `OPEN_DGRAM_FLOW` | `flow_id:u64, target` |
@@ -2443,6 +2501,7 @@ frames.
 | 42 | `STREAM_REQUALIFY_DATA` | `stream_id:u64, probe_id:u64, offset:u64, length:u32, bytes` |
 | 43 | `STREAM_REQUALIFY_ACK` | `stream_id:u64, probe_id:u64, offset:u64, payload_bytes:u32` |
 | 49 | `STREAM_RETURN_PLAN_FINAL` | `stream_id:u64, retained_count:u8, retained_ordinals[retained_count]` |
+| 50 | `OPEN_STREAM_REPAIR` | `stream_id:u64, parent_request_id:u64` |
 
 Kinds 5, 6, 15, 19, 25, 26, 28, 29, and 44 through 48 are reserved and
 MUST NOT be sent. A receiver rejects them as unknown kinds.
@@ -2452,6 +2511,11 @@ the Section 6.1 prelude. `PATH_DRAIN`, `PATH_CLOSE`, and kinds 33 through 35
 are TCP-only. Receiving a carrier-incompatible frame is a
 protocol violation. `PATH_DRAIN` is client-to-server only; `PATH_CLOSE` is
 server-to-client only and requires a matching `PATH_DRAIN`.
+
+Kind50 is QUIC-only and client-to-server, valid only as the first frame of the
+companion request defined in Section6.2. It carries neither a destination nor
+Product admission authority. Unsupported versions are rejected; wire13 does
+not silently fall back to the wire11 single-ordering-stream mapping.
 
 Kinds 38 through 41 are valid only when the endpoint has enabled the IP packet
 service. `OPEN_IP_TUNNEL` is client-to-server, `IP_TUNNEL_READY` is
@@ -2475,8 +2539,26 @@ a different duplicate is a protocol violation.
 
 ### 12.3 Common field encodings
 
-Each `ranges[range_count]` entry is `start:u64, end:u64` and represents
+Each fixed `ranges[range_count]` entry is `start:u64, end:u64` and represents
 `[start, end)`. `start` MUST be less than `end`.
+
+For `STREAM_ACK`, flags bit0 is `complete`; bit1 selects packed ranges.
+All other bits MUST be zero.
+Fixed independent ranges retain arbitrary order and overlap for
+subsequent Product validation and normalization. In packed form each entry is
+`gap:varuint64, length:varuint64`: `start = previous_end + gap`,
+`end = start + length`, with initial `previous_end = 0`. Length MUST be nonzero;
+both additions MUST fit u64. This representation preserves the exact decoded
+range list and complete bit; it does not change Section8.3 ACK authority.
+
+`varuint64` is minimal unsigned base128, least-significant seven bits first;
+bit7 indicates another byte. At most ten bytes are permitted, with the tenth
+byte at most1. A multi-byte representation ending in zero, integer overflow,
+or truncation MUST be rejected. Senders SHOULD select packed form only when
+the entire range vector is ordered/nonoverlapping and its packed byte length
+is less than16 times the range count. Otherwise use fixed form. The two forms
+have the same header size and range-count limit. Packing itself uses no state
+from another frame.
 
 A target begins with a type:
 
@@ -3026,6 +3108,13 @@ Reliable Product recovery is authorized by exact retained range, cause clock,
 eligible target, configured-slot publication vacancy, target Product headroom,
 and final queue/native admission. It is not authorized by a cumulative byte
 percentage.
+
+For QUIC, accepted repair is handed to the attachment's companion ordering
+stream from Section6.2. This removes preceding ordinary stream bytes from its
+native serialization dependency, not shared connection credit or actual native
+service constraints. It grants no additional copy or requalification authority.
+TCP retains its configured physical connections and native FIFO semantics;
+the companion is not a reason to create an unconfigured TCP carrier.
 
 The compatibility-named `[flow].optional_reinjection_budget_percent` setting
 has a Product default of 10 percent. It sets a directional accepted-recovery
@@ -3823,7 +3912,7 @@ A conforming implementation preserves all of the following:
     ordinals, atomically withdraws omitted enrolled outputs before removing the
     ceiling, and is absorbing and idempotent only for an equal repetition.
 42. Kinds 44 through 48 are reserved and MUST be rejected as unknown under
-    version 11.
+    version 13.
 43. Stale requalification uses one finite cyclic exact-incarnation cursor and
     at most one pending proof and one stream-owned ACK publication per
     direction. The ACK carrier is authenticated return service only; the exact

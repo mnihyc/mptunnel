@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-08 00:27 +08:00. Category: requested global retrospective and
+Updated: 2026-09-08 04:06 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -34,22 +34,27 @@ or capture instead of creating another document/test for the same question.
 - Late valid STARTUP after FINAL is now refused at attachment scope instead of
   destroying the shared carrier; runtime commit `11d6f3a` has 34 focused checks.
 - Request sampling has a real pipelining RED: samples [2,2,2] despite unique
-  ACK progress. The uncommitted paired-clock candidate gives [2,3,4] with 23
-  focused checks and independent review. Ordinary performance is not accepted.
+  ACK progress. The shelved paired-clock candidate gives [2,3,4] with 23
+  focused checks and independent review. Ordinary performance is not accepted;
+  its frozen executable/patch are not an implicit dependency of later fixes.
+- Exact retained recovery beyond an older negative ACK horizon and unique-byte
+  attribution beside partial copies have live counterexamples and focused
+  checks. Their adverse/incomplete ordinary comparisons remain explicit in
+  CURRENT_CLOSURE_PLAN; neither component GREEN proves practical improvement.
 - Rejected static ranking, relative ACK dictionary, ready-feedback batching,
   initial uncooperative actor, absolute-delay reordering and isolated raw-byte
   hysteresis deletion are not future implementation obligations. Their reasons,
   patches and adverse observations are retained rather than silently revived.
 
-Latest completed mixed current-snapshot down/up observations are 85.556/64.602
+Earlier late-STARTUP mixed down/up observations were 85.556/64.602
 Mbps with 4.423/5.054-second gaps and 19.293-second upload drain. These are the
 500-Mbps asymmetric changing-loss/QoS/outage profile, not clean-link ceilings.
-The newer TCP-upload sampler pair ends at the existing observation guard:
+The subsequent TCP-upload sampler pair ended at the existing observation guard:
 control 109313995/168296448 confirmed/locally-accepted bytes in 85.895780s;
 candidate 133561732/191758336 in 85.563214s. Neither upload completes. Maximum
 confirmation gap worsens 1.004911 -> 2.021790s while local write gap improves
 7.147240 -> 2.042942s. This is mixed/incomplete evidence, not a 22.7% speed gain
-or conclusive causal regression. No QUIC/mixed candidate runs follow it yet.
+or conclusive causal regression. No QUIC/mixed sampler acceptance followed it.
 Both raw result directories are under
 `./.tmp/reflection/results/tcp-combined-up-request-cohort-{control,candidate}-0907/`.
 

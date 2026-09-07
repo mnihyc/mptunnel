@@ -1275,6 +1275,7 @@ impl ReliableRelayRemoteSet {
         self.frames_rx.try_recv().ok()
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn has_buffered_frame(&self) -> bool {
         !self.frames_rx.is_empty()
     }

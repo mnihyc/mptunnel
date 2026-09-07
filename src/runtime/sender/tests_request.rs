@@ -1909,6 +1909,83 @@ async fn completion_tail_uses_cache_independent_ranked_frontier_for_target_and_a
         } if payload.len() == 1024 && identity.instance == boundary_target
     ));
     assert!(boundary_queue.pop_front().is_none());
+
+    // Keep the same legal ranked prefix, but append storage chunks that cannot
+    // enter its selection quantum. These are real cache admissions and exact
+    // OriginalData flight records, not claims of native delivery. The observed
+    // call is synchronous: no unrelated task can contribute to its visit count.
+    let storage_chunk_bytes = 64;
+    let selection_quantum = remotes
+        .path_instances()
+        .into_iter()
+        .map(|instance| {
+            adaptive_reliable_relay_reinjection_bytes(
+                context.reliable_path_snapshot_for_instance(instance),
+                TrafficClass::Throughput,
+                limits,
+            )
+        })
+        .max()
+        .expect("existing live repair alternatives");
+    let prefix_chunks = selection_quantum.div_ceil(storage_chunk_bytes);
+    let suffix_chunks = limits.max_path_flight_bytes / storage_chunk_bytes;
+    assert!(prefix_chunks > 0 && prefix_chunks < suffix_chunks);
+    let mut prefix_visits = None;
+    for chunks in [prefix_chunks, suffix_chunks] {
+        let mut retained_stream = ReliableSendStream::new(stream_id, limits);
+        let mut retained_sender = RequestSenderService::new(stream_id);
+        for _ in 0..chunks {
+            let original = retained_stream
+                .send_data(Bytes::from(vec![0x75; storage_chunk_bytes]))
+                .expect("retained cache admission remains within existing limits");
+            retained_sender.record_original_frame_for_test(owner, &original);
+        }
+        let retained_bytes = chunks * storage_chunk_bytes;
+        assert!(retained_bytes <= limits.max_path_flight_bytes);
+        assert!(retained_bytes <= limits.max_repair_bytes);
+        assert_eq!(retained_stream.data_ack_frontier(), 0);
+        assert_eq!(retained_stream.next_offset(), retained_bytes as u64);
+        assert_eq!(retained_stream.reinjection_bytes(), retained_bytes);
+        let uniform = retained_sender
+            .multipath
+            .live_owner_uniform_frontier(
+                OffsetRange {
+                    start: 0,
+                    end: retained_bytes as u64,
+                },
+                &remotes.path_instances(),
+            )
+            .expect("every retained byte has its exact original owner");
+        assert_eq!(uniform.range.end, retained_bytes as u64);
+        assert_eq!(uniform.owners, vec![owner]);
+        assert_eq!(uniform.avoid, vec![owner]);
+        let mut retained_queue = ReliableRelaySenderQueue::default();
+        let (_, visits) = crate::model::work::observe_frontier_span_visits_for_test(|| {
+            retained_sender.enqueue_retained_frontier_reinjection(
+                &mut retained_queue,
+                &context,
+                &remotes,
+                &retained_stream,
+                TrafficClass::Throughput,
+            )
+        });
+        println!(
+            "retained frontier: {chunks} chunks, {selection_quantum} ranked bytes, {visits} visits"
+        );
+        if let Some(prefix_visits) = prefix_visits {
+            assert_eq!(
+                visits, prefix_visits,
+                "unrankable suffix chunks must not add frontier visits beyond the identical ranked prefix",
+            );
+        } else {
+            assert!(visits > 0, "control must reach actual frontier discovery");
+            assert!(
+                visits <= 12 * prefix_chunks,
+                "bounded prefix discovery in the control",
+            );
+            prefix_visits = Some(visits);
+        }
+    }
 }
 
 #[tokio::test]

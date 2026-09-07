@@ -1695,39 +1695,29 @@ impl RequestSenderService {
             send_stream.reinjection_bytes(),
             context.mux_limits,
         );
+        // Only the ranked prefix can influence this transaction. Restrict the
+        // owner sweep before collecting/sorting flights, not after discovering
+        // an arbitrarily long uniform suffix and querying the prefix again.
         let range = OffsetRange {
             start: frontier,
-            end: horizon.min(send_stream.next_offset()),
+            end: horizon
+                .min(send_stream.next_offset())
+                .min(frontier.saturating_add(selection_limit as u64)),
         };
-        let Some(uniform_frontier) = self
+        let Some(scoring_frontier) = self
             .multipath
             .live_owner_uniform_frontier(range, live_instances)
         else {
             return RequestCompletionTailEnqueueOutcome::default();
         };
-        if uniform_frontier.owners.len() != 1 {
+        if scoring_frontier.owners.len() != 1 {
             return RequestCompletionTailEnqueueOutcome::default();
         }
-        let uniform_extent =
-            flight_interval_bytes(uniform_frontier.range.start, uniform_frontier.range.end);
-        let scoring_extent = selection_limit.min(uniform_extent);
+        // An earlier owner/copy boundary supplies a shorter valid frontier;
+        // requiring the whole requested quantum would change admission.
+        let scoring_range = scoring_frontier.range;
+        let scoring_extent = flight_interval_bytes(scoring_range.start, scoring_range.end);
         if scoring_extent == 0 {
-            return RequestCompletionTailEnqueueOutcome::default();
-        }
-        let scoring_range = OffsetRange {
-            start: frontier,
-            end: frontier.saturating_add(scoring_extent as u64),
-        };
-        let Some(scoring_frontier) = self
-            .multipath
-            .live_owner_uniform_frontier(scoring_range, live_instances)
-        else {
-            return RequestCompletionTailEnqueueOutcome::default();
-        };
-        if scoring_frontier.range != scoring_range
-            || scoring_frontier.owners != uniform_frontier.owners
-            || scoring_frontier.avoid != uniform_frontier.avoid
-        {
             return RequestCompletionTailEnqueueOutcome::default();
         }
         let Some(scoring_frames) =
@@ -1742,7 +1732,7 @@ impl RequestSenderService {
 
         if !live_instances
             .iter()
-            .any(|instance| !uniform_frontier.owners.contains(instance))
+            .any(|instance| !scoring_frontier.owners.contains(instance))
         {
             return RequestCompletionTailEnqueueOutcome::default();
         }
@@ -1798,7 +1788,7 @@ impl RequestSenderService {
                 ..RequestCompletionTailEnqueueOutcome::default()
             };
         };
-        if uniform_frontier.avoid.contains(&target.identity.instance) {
+        if scoring_frontier.avoid.contains(&target.identity.instance) {
             return RequestCompletionTailEnqueueOutcome::default();
         }
         let target_reinjection_quantum = adaptive_reliable_relay_reinjection_bytes(
@@ -1825,7 +1815,7 @@ impl RequestSenderService {
                 ..RequestCompletionTailEnqueueOutcome::default()
             };
         }
-        let applied_extent = service_limit.min(uniform_extent);
+        let applied_extent = service_limit.min(scoring_extent);
         let apply_range = OffsetRange {
             start: frontier,
             end: frontier.saturating_add(applied_extent as u64),

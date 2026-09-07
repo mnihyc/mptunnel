@@ -90,6 +90,14 @@ std::thread_local! {
     static FRONTIER_SPAN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+pub(crate) fn observe_frontier_span_visits_for_test<T>(observe: impl FnOnce() -> T) -> (T, usize) {
+    let before = FRONTIER_SPAN_VISITS.with(|visits| visits.get());
+    let result = observe();
+    let visits = FRONTIER_SPAN_VISITS.with(|visits| visits.get() - before);
+    (result, visits)
+}
+
 /// Sweeps every flight boundary from the exact lowest missing byte and stops
 /// at the first ownership/avoidance-set change or coverage hole.
 ///
@@ -676,6 +684,7 @@ mod live_owner_reinjection_tests {
             }
             let expected = frontier_by_byte(range, &spans);
             let actual = reliable_live_owner_uniform_frontier(range, spans.iter().copied());
+            let full_frontier_range = actual.as_ref().map(|frontier| frontier.range);
             let project = |f: super::ReliableLiveOwnerFrontier<u8>| {
                 (f.range, f.owners, f.avoid, f.owner_assignments)
             };
@@ -684,6 +693,26 @@ mod live_owner_reinjection_tests {
                 expected.map(project),
                 "case {case}: {spans:?}"
             );
+            let extent = range.end - range.start;
+            for quantum in [0, 1, extent / 2, extent] {
+                let query_end = range.start.saturating_add(quantum).min(range.end);
+                let two_query = full_frontier_range.and_then(|full| {
+                    let scoring_range = OffsetRange::new(range.start, full.end.min(query_end))?;
+                    reliable_live_owner_uniform_frontier(scoring_range, spans.iter().copied())
+                });
+                let restricted = reliable_live_owner_uniform_frontier(
+                    OffsetRange {
+                        start: range.start,
+                        end: query_end,
+                    },
+                    spans.iter().copied(),
+                );
+                assert_eq!(
+                    restricted.map(project),
+                    two_query.map(project),
+                    "prefix restriction case {case}, quantum {quantum}: {spans:?}",
+                );
+            }
         }
     }
 

@@ -652,6 +652,47 @@ focused checks, and declare the isolated ordinary comparison. Reject on semantic
 counterexample or adverse ordinary timing; no restoration of T06 amplification,
 ACK-coalescing, preparation-skipping or new caching state is implied.
 
+**Actual helper RED, 06:43:** existing target/ranked-range/shorter-owner-boundary
+checks pass, then legal64B storage chunks give229chunks/2744visits control
+versus1024chunks/7514visits, both with the same14600B scoring limit. Only the
+intended unrankable-suffix work assertion fails. No resource or timing parameter
+was changed. Command `cargo test --release --locked -j1 --config
+'profile.release.package.mptunnel.opt-level=0' --lib
+completion_tail_uses_cache_independent_ranked_frontier_for_target_and_apply
+-- --nocapture`; build1m10s, test.86s. This observes real cache/flight producers
+and synchronous retained helper work, not a claim of native data delivery.
+Two independent reviews confirm prefix-restriction equivalence and Apply bounds.
+The one-query deletion is now authorized; pure clipping/oracle controls and
+affected focused GREEN precede its ordinary comparison.
+
+**Single-query implementation, 06:44:** productionrequest.rs removes the full
+discovery and redundant second query, querying the current ranked limit once.
+It uses the returned shorter owner-uniform prefix, not a full-Q requirement.
+Independent diff review confirms unchanged cache, assignment/copy clocks,
+owner/avoid ordering, target/rank/native authority and publication cause.
+No shared sweep algorithm or RFC policy changes. Component tests still pending.
+
+**Focused GREEN, 06:46:** after1m08s functional build, both229- and1024-chunk
+cases perform1372visits (formerly2744/7514) and the unchanged exact admission/
+boundary controls pass. The existing4096 oracle cases also pass four restriction
+quanta each, including zero. Same executable passes4 frontier-model,31 request
+sender,28 requeststream and258 relay tests (321distinctchecks); no warnings.
+This proves cheaper equivalent work for the fixtures, not full performance.
+Freeze the normally optimized candidate, then execute the already declared
+ordinary pair with no diagnostics/build overlap. No other runtime change.
+
+**Declared ordinary gate after GREEN:** one fixed control/candidate mixed
+combined upload pair. Control is frozenresponse-retained-20260908 (953a54f);
+candidate is only the request one-query deletion atopcurrentruntime. Both
+endpoints use their cell's binary, diagnostics off; no overlays or sampler.
+Labels `mixed-combined-up-frontier-scope-{control,candidate}-0908`. Same network,
+40s load/probe/observations; preserve exact confirmed bytes, full bins, first/
+maximum confirmations and writes, orderedtarget/reply stages and cost. Removing
+work predicts cheaper evaluation, not an automatic speedup or changed policy.
+An adverse/ambiguous pair stops promotion; no third run-to-pass. This pair
+isolates a new exact-equivalent computation change, not a repeat of the earlier
+response-recovery pair hoping for a favourable number. Wider gates stay open.
+
 **Initial-state boundary confirmed:** with no response ACK, the default
 snapshot has H=None/F0. Even a complete empty ACK leaves the old contiguous
 predicate false because it also requires F>0. The apparent no-ACK exception

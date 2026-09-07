@@ -178,3 +178,58 @@ equal-quality paths, capacity race and true singleton. Then run both request
 and response implementations under the already defined QoS/jitter/loss/outage
 and200-Mbps aggregation gates. Compare complete timing series. If the model
 does not survive those cases, reject it rather than adding thresholds.
+
+## Bounded discovery option — 2026-09-07
+
+Status: future model candidate only; no implementation approval. The current
+lifecycle correction remains the priority. Let `B > 0` be a finite symbolic
+bypass-work budget. B is unspecified and unaccepted: it is neither a user
+configuration field nor an implied default. Qualification floor F_i, startup
+envelope E_i, RTT and the portable rate do not independently justify its value.
+
+One allocation owner shared across logical streams retains, per exact physical
+carrier instance and sender direction, a counter in [0,B], one owed opportunity
+and at most one exact trial observation. A shared cyclic cursor arbitrates owed
+carriers. An unmeasured activation begins owed. Successful fresh OriginalData
+commitment elsewhere advances the counter only when this carrier was an
+eligible alternative; scores, wakes, retries and failed Apply do not. Reaching
+B makes an opportunity owed across source-head turnover. Each placement pass
+offers owed, currently admissible carriers a unique quantum before ordinary
+ranking or another Defer. An unavailable carrier remains owed but cannot block
+other work or cause repeated same-state polling.
+
+Successful exact commitment fulfils the opportunity, resets its bypass counter
+and binds the trial to its stream/output/range. Normal unique placement on that
+carrier can fulfil it without extra traffic. Failed reservation/revalidation
+refunds the claim. Ordinary placement remains free to send additional work:
+the trial is not stop-and-wait admission or a throughput cap. Existing E_i,
+F_i, writer, receive-credit and Product checks remain authoritative.
+
+Current-epoch unambiguous OriginalData ACK resolves trial evidence positively;
+only the existing qualification ledger can set q_i. Duplication makes affected
+evidence ambiguous, without delaying required recovery to protect a sample.
+Closure or invalidation resolves it terminally. These outcomes do not create
+NativeOperational C. Further actual bypass work re-arms an opportunity even
+for previously slow/measured carriers; native evidence keeps its independent
+scope and validity rules. Replacement discards predecessor state. Sparse work
+creates no idle probes or catch-up backlog, but one retained obligation can
+influence the next sparse placement; zero sparse-latency cost is not promised.
+
+With finitely many continuously eligible carriers, continuing fresh work,
+fair actor service and settling trials, this provides finite commitment
+opportunities. It proves attempt non-starvation, not discovery of full
+500-Mbps capacity from small trials, independent marginal capacity, zero HOL,
+or wall-clock recovery. Byte-count cadence can be arbitrarily slow with sparse
+bypass work. A fixed-time discovery promise would require a separate explicit
+time/probing policy; none is proposed here. Unique discovery can itself create
+ordered blocking on an actually slow path, while duplicated discovery cannot
+establish the retained unique-Product qualification contract.
+
+The simpler alternative is qualified, fresh-comparable-evidence-only Defer:
+compare compatible current work/service scopes on both alternatives, retain
+the captured nonrenewable wait, and keep immediate admission policy when an
+alternative is unknown or incomparable. Product qualification alone does not
+make service evidence comparable. This avoids adding discovery state, but it
+does not solve the demonstrated portable approximately 351-Kbit/s branch.
+Neither alternative is accepted as a performance correction without the
+producer, wake and counterexample obligations above.

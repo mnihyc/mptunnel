@@ -57,6 +57,17 @@ packet/timer progress and exact Product frontiers must be paired before that
 causal conclusion. This is an interpretation correction, not authorization to
 inject fake ACK callbacks, modify the counter or change Product admission.
 
+Independent sampling audit subsequently rules out a frozen observer in that
+interval. The same native epoch and carrier instance publish sampled_at_us
+31,738,834 at elapsed31.058s and44,733,472 at44.124s; management generation
+also advances13s. Native flight changes4,149,534 ->4,161,534B in small steps
+while the live-ACK counter remains flat. At45.124s the counter advances to
+417,179,209B, RTT becomes71.612192ms and flight24,000B. sampled_at_us is the
+current observation clock, not the last ACK clock. Thus the fresh observation
+does establish no counted active-controller live-packet delivery during the
+interval, but still cannot exclude retained-only/duplicate ACK reception or
+alone attribute the full application stall. No counter semantics are changed.
+
 The final apply trace records only one post33s bulk-authority failure and nine
 exact-eligibility changes; it does not support a hot optimistic-apply retry
 loop as the dominant delay. The owned client/server INPUT chains are ACCEPT

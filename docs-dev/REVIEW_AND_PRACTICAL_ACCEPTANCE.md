@@ -1,11 +1,20 @@
 # Evidence review and practical acceptance
 
-Updated: 2026-09-06 23:54 UTC. Original reviewed production tree: `7189e69`
+Updated: 2026-09-07 02:08 UTC. Original reviewed production tree: `7189e69`
 (wire11); latest correction checkpoint: `b37bacb`. This is a review/experiment
 plan, not a release verdict. Historical SEEN/UNSEEN labels are mapped below;
 an old OPEN label is not a newly found bug.
 
 ## Current verdict and fixed priority
+
+**Current continuation:** CURRENT_CLOSURE_PLAN is the authoritative next-step
+ledger. The post-churn gate is now a concrete RED: all1,932 requests complete,
+but1,571 server logical/admission owners remain67s after client completion.
+The held companion-stream integration is under independent terminal/half-close
+audit. Component success did not cover the composed lifetime. No public
+performance/release acceptance follows, and none of the retained native,
+actor or codec candidates is silently promoted. The earlier next-action text
+below is checkpoint history, not permission to bypass this retention blocker.
 
 Latest bounded decision: the relative ACK representation is semantically
 proved but not a network pass (clean 500/10 mixed 175 Mbps, 1.67 s read gap).

@@ -1,13 +1,25 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 01:21 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 02:00 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Current checkpoint and next decision
 
-**Active next transaction, superseding older next-action text:** close the
-allocation/discovery model for the already-proved busy-fast/free-slow choice.
+**Active next transaction, superseding older next-action text:** identify the
+ordinary completed-request lifecycle failure reproduced in the held stack.
+Two clean 500 Mbps churn cycles complete all 1,932 requests, but retain 779
+then 1,571 server logical/admission owners after the client returns to zero.
+The latter persists 67 seconds with zero server queue/Product/native flight;
+server RSS grows from about 30 to 352 MiB. Eleven component ownership tests
+pass, so their scope does not cover the assembled terminal transition. See
+SUSTAINABILITY_CHURN_20260907. Trace terminal/half-close propagation before
+changing anything; no arbitrary expiry, lowered concurrency, or attribution
+of the uncaptured deployed incident follows. Two independent source audits
+are active, with a third finishing the existing allocation proposal.
+
+**Next after this concrete sustainability blocker:** close the allocation/
+discovery model for the already-proved busy-fast/free-slow choice.
 The held native ACK-transaction ordering correction has eight ordinary
 before/after observations, not a release pass. Mirrored mixed upload58.093 ->
 76.652Mbps retains4.752 ->4.772s gaps; mixed download68.070 ->92.443 retains
@@ -48,6 +60,34 @@ the native timer overlay is removed after freezing
 its binary. No source acceptance, controller/window/timeout/traffic-hint change,
 new release or public performance claim follows. Global order remains below.
 
+## Completion gates, in order
+
+1. Close the reproduced server-owner retention transaction: exact terminal
+   failure, independent review, narrow model correction, then ordinary mode
+   ablations and the same two-cycle post-load observation. Preserve legitimate
+   half-open sessions, restart/reset and cancellation behavior.
+2. Resolve the observed mixed allocation/startup/recovery timing failures.
+   A theoretical discovery proposal is not an accepted implementation. Retain
+   actual source/credit/copy ownership and finite progress under failed paths.
+3. Recheck native QUIC and TCP downshift/recovery and request/upload progress;
+   separate current service, retained capacity estimates and actual delivery.
+4. Run independent 200 Mbps links and a shared 500 Mbps cut, asymmetric
+   directions, varying loss/jitter, QoS and blackhole combinations plus their
+   ablations. Preserve full timing series, read gaps, latency, wire overhead,
+   completion, restart/churn and post-load resource evidence.
+5. Compare TCP-only, QUIC-only and default against raw TCP, Xray and H2 for
+   cold/warm single/concurrent work and actual browser/Cloudflare experience.
+   Report finite tested envelopes and limitations, never universal optimality.
+6. Publish truthful README/PERFORMANCE plots and release only after the
+   practical gates pass. Commit isolated accepted changes/evidence along the
+   way; do not merge rejected experiments or call component tests acceptance.
+
+New observations must map to these existing owners; speculative improvements
+remain proposals. A real earlier-gate regression interrupts the sequence with
+its exact causal transaction, not a new open-ended audit batch.
+
+## Historical checkpoints (superseded next-action text)
+
 **Active verdict:** no release pass. The relative ACK candidate preserves
 every logical snapshot and materially improves the reproduced clean 500/10
 Mbps mixed case (46 -> 175 Mbps), but retains a 1.67 s gap and 1.34 s echo p95.
@@ -81,7 +121,8 @@ ownership; independent 200 Mbps aggregation and shared-cut controls; cold/warm
 single/concurrent browser work and raw/Xray/H2 comparisons; only then truthful
 README curves and release. Existing unit-proved fixes are component evidence,
 not blanket acceptance of the held runtime stack. Uncaptured deployed RAM
-exhaustion is still unattributed. Independent auditors remain usage-limited.
+exhaustion is still unattributed. Independent auditors are available again;
+historical usage-limit entries below are not the current status.
 
 The entries below preserve checkpoint history; their earlier “next” statements
 are superseded by the active verdict above.

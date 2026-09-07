@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 06:15 UTC. Historical baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 06:30 UTC. Historical baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -70,13 +70,33 @@ already-written STARTUP can legally arrive after FINAL, and whether rejecting
 that attachment incorrectly retires its whole shared carrier. Treat this as
 the existing lifecycle branch, not the explanation for every slow transfer.
 
-Next exact observation: one unchanged-profile capture combines existing
-Product dispatch/hole/recovery events with the frozen native observer binary.
-It must identify the blocked original range, owner and release transaction
-during QoS; ACK activity alone cannot locate an ordered-delivery gap. No new
-hook or rebuild is required. Both temporary native/registry hooks have already
-been removed from source; their exact archive is
-NATIVE_PTO_AND_ATTACHMENT_DIAGNOSTIC_20260907.patch. All global gates remain.
+The combined Product/native capture is also complete. Its2.771s gap is not a
+repeat of the previous9.860s realization. Exact Product prefix218414896 is
+TCP-owned; QUIC repair admission follows35ms after the frontier stops, and the
+repair reaches reassembly2.737s later. Recovery wakes fire about1ms late.
+The router holds4.39MB at the10Mbps cut,3.515s service-equivalent work, not an
+exact residence measurement. PRODUCT_NATIVE_QOS_FRONTIER_ATTRIBUTION_20260907
+and its compact JSON/compressed raw archive preserve the chain. This rules
+out missing enqueue/forgotten wake for this gap; no timer/gain/repair-quantum
+change follows. Mixed placement and precise carrier/native/wire residence
+remain separate open questions. No next run is queued.
+
+**Current implementation transaction:** legitimate late STARTUP after FINAL
+now has an explicit legal sender-order control plus TCP/QUIC adapter REDs.
+The sender control passes. QUIC returns the exact late-finalization Protocol
+error; the TCP actor closes its shared carrier instead of refusing the
+attachment. Correct only this refusal scope: typed obsolete enrollment after
+shape/signature checks, existing Rejected-to-STREAM_DETACH handling, unchanged
+FINAL membership and missing-state restart/reset semantics. Tests also cover
+trailing cancellation frames, sibling traffic and later valid Ordinary opens.
+No new thresholds or silent promotion to Ordinary. Independent review follows
+the focused GREEN build before acceptance. This is not the cause of every
+QoS stall, since two captures reproduce timing failures without that error.
+
+Both temporary native/registry observers are removed from source; their exact
+archive is NATIVE_PTO_AND_ATTACHMENT_DIAGNOSTIC_20260907.patch. The diagnostic
+frozen executable remains separately named. All global gates remain below;
+do not infer release acceptance from these component checks.
 
 **Exact selection defect, not yet an accepted isolated fix:** the second, temporary prefilter capture proves
 one raw-queue hysteresis defect independently of unavailable/unknown paths.

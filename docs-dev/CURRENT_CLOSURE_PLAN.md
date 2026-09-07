@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 07:37 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 07:54 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -14,7 +14,8 @@ Shortening this ledger discards neither failures nor gates.
 
 Runtime checkpoint **445011f**: remove redundant full-horizon request frontier
 discovery; query the already ranked prefix once. Focused321 checks pass, but
-ordinary timing is mixed/adverse. HEAD89a1a63 preserves the comparison.
+ordinary timing is mixed/adverse. 89a1a63 preserves the comparison; 192ae8d
+preserves the subsequent exact request/native service discriminator.
 No observer or shelved request-sampler overlay is active. The user's seven-line
 LIVE_OWNER_FRONTIER_WORK_BOUND.md addition remains untouched.
 
@@ -172,18 +173,31 @@ intentionally excludes stale new-payload owners; its separate stale branch
 must still serve retained ownership coherently. Do not requalify a stale
 owner merely to make recovery possible.
 
-**Source counterexample, not yet tested:** due stale ownerA owns lower interval,
+**Source counterexample, now dispatch-RED:** due stale ownerA owns lower interval,
 due staleB owns only a later interval, and freshC has finite actual admissionK.
 B-before-A entry order lets B chargeK in drive_request_path_recovery before A
 is considered; A-before-B instead lets the prefix enter service. Current live
 frontier fallback excludes staleA and cannot override this ordering. Insertion
 can originate from ordinary progress, not only mark_stale timing.
 
-**Smallest next action:** one real cache/flight/admission/dispatch RED with an
-order-reversed control and unchanged geometry/current computedK. Confirm both
-ranges independently eligible, no earlier accepted copy, and actual native
-command delivery; a fixture/setup failure is not Product RED. No changed
-resource limits, artificial native capacity, timer thresholds or lab profile.
+**Actual proof:** real cache production, exact Original flight fixture, current
+target admission and actual command dispatch. With q=524288 and all ranges
+fitting C's unchanged startup envelope, prefix-first control passes;
+suffix-first emits q instead of0; A/B/A emits2q instead ofq on its second
+dispatch. Both fail only at the intended offset assertion. Two existing
+recovery controls pass. This proves dispatch ordering, not finite-credit
+exhaustion, physical wire timing or the entire captured stall. The first
+fixture incorrectly assumed a smaller measured C bound and failed in setup;
+that was NOT Product RED. No runtime correction or tuned limit was used.
+
+**Smallest next action:** independent reachability/model audit, then choose the
+smallest coherent retained-range service correction. Consider removing bulk
+provisional repair materialization instead of introducing a second queue
+planner. Any lazy service must refill within the existing dispatch batch, not
+make structural recovery wait one actor wake or ACK per frame. Preserve
+already accepted copies, available independent targets, exact queue accounting
+and existing full structural authority. No production edit before this model
+is settled; focused controls and ordinary timing remain mandatory.
 
 **Falsifier/stop:** if model gates prevent this ordering counterexample or both
 orders serve the same lowest eligible range, reject it. The capture does not

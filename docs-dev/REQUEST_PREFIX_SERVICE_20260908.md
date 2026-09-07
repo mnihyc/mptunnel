@@ -355,3 +355,59 @@ even if the source counterexample passes. The232219 reinjection rows also
 demonstrate substantial diagnostic volume; do not reuse this filter casually
 or promote its durations as ordinary regressions. No new runtime fix or
 public performance claim is accepted at this checkpoint.
+
+## Actual-producer recovery-order RED and control
+
+2026-09-08 07:52 +08:00. Test-only transaction on unchanged runtime445011f;
+root coordinated compilation and execution. No production correction, native
+capacity change or additional network experiment was made.
+
+The first fixture was invalid: all three new cases stopped at
+`tests_request.rs:900`, asserting that an empty startup target's current repair
+credit was smaller than `max_repair_bytes`. Its actual model grants the full
+configured repair envelope. That compile took1m32s; two existing controls
+passed, but none of the new cases reached dispatch. This was a fixture failure,
+**not Product RED**. We removed the unsupported premise instead of inventing a
+measured rate, reducing a resource limit or forcing native credit to fit it.
+
+The corrected shared fixture uses default three-TCP context, actual
+`ReliableSendStream::send_data` cache production and the existing exact
+OriginalData-flight recorder. A and B retain disjoint ranges; C is the real
+fresh alternate. Both Original owners are independently recovery-eligible,
+the positive frontier is0, and no accepted-copy suppression deadline exists.
+Only the qualification-entry insertion order is reversed between the first
+two cases. The interleaved case retains A/B/A ownership in byte order.
+
+The quantum is derived from unchanged configuration:
+`q = min(reliable_relay_buffer_len(limits), max_repair_bytes / 3) =524288B`.
+The real target snapshot is checked against
+`K_C = min(max_repair_bytes, total_retained_bytes)`:1048576B for A/B and
+1572864B for A/B/A. **All retained ranges fit this startup credit.** Thus this
+test proves ordering of first native command handoffs, not finite-credit
+exhaustion. Before checking offsets, it runs the real
+`drive_request_path_recovery` and `dispatch_client_queued_work`, observes the
+actual targetC command receiver, and checks exact target-scoped queued bytes.
+
+| Test | Geometry / entry order | Actual result |
+| --- | --- | --- |
+|`request_recovery_prefix_first_owner_order_control` |A[0,q), B[q,2q); entriesA,B |PASS: first repair offset0 |
+|`request_recovery_suffix_first_owner_order_preserves_lowest_prefix` |Same bytes/credit; entriesB,A |Intended RED at final offset assertion: expected0, actual524288 |
+|`request_recovery_interleaved_owners_preserve_global_range_order` |A[0,q), B[q,2q), A[2q,3q); entriesA,B |First offset0 passes; second intended RED: expected524288, actual1048576 |
+
+The coordinated `request_recovery` filter ran five tests: these three plus
+`request_recovery_skips_exhausted_fast_target_for_free_second_target` and
+`committed_request_recovery_copy_survives_target_drain_until_retry_deadline`.
+The prefix-first and both existing controls passed; only the two intended
+ordering assertions failed at `tests_request.rs:1008`.
+
+This demonstrates a real historical-owner-order dependency at recovery
+publication. The interleaved counterexample rules out merely sorting owners
+by their first retained offset: that still sends A's later range before B's
+earlier range. Original ownership is established by the existing component
+flight fixture, not by transmitting Original TCP packets over a network;
+repair command receipt is likewise local native handoff, not wire delivery or
+receiver completion. These results do not attribute the entire captured
+11.844s stall, establish a wall-clock gain, or prove credit starvation in this
+fixture. A coherent byte-obligation-first correction must preserve exact target
+admission, accepted-copy ownership/deadlines and independent-target progress;
+focused GREEN and ordinary timing still remain required.

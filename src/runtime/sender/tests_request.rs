@@ -844,6 +844,175 @@ async fn request_path_recovery_without_a_new_target(stale_before_dispatch: bool)
 }
 
 #[tokio::test]
+async fn request_recovery_prefix_first_owner_order_control() {
+    request_recovery_orders_retained_ranges(false, false).await;
+}
+
+#[tokio::test]
+async fn request_recovery_suffix_first_owner_order_preserves_lowest_prefix() {
+    request_recovery_orders_retained_ranges(true, false).await;
+}
+
+#[tokio::test]
+async fn request_recovery_interleaved_owners_preserve_global_range_order() {
+    request_recovery_orders_retained_ranges(false, true).await;
+}
+
+async fn request_recovery_orders_retained_ranges(suffix_first: bool, interleaved: bool) {
+    let stream_id = StreamId(236);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10381",
+        "tcp://127.0.0.1:10382",
+        "tcp://127.0.0.1:10383",
+    ]);
+    let limits = context.mux_limits;
+    let (a_commands, mut a_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, a_commands), 8);
+    let a = remotes.paths[0].instance();
+    let (b_commands, mut b_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, b_commands));
+    let b = remotes.paths[1].instance();
+    let (c_commands, mut c_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, c_commands));
+    let c = remotes.paths[2].instance();
+    for receivers in [&mut a_receivers, &mut b_receivers, &mut c_receivers] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [a, b, c] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut queue = ReliableRelaySenderQueue::default();
+    // Every range fits C's unchanged startup repair envelope. This isolates
+    // publication order, not exhaustion of measured native service credit.
+    let q = reliable_relay_buffer_len(limits).min(limits.max_repair_bytes / 3);
+    assert!(q > 0);
+    let geometry = if interleaved {
+        vec![(a, q), (b, q), (a, q)]
+    } else {
+        vec![(a, q), (b, q)]
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let mut expected_a = Vec::new();
+    let mut expected_b = Vec::new();
+    for (owner, bytes) in geometry {
+        let start = send_stream.next_offset();
+        let frame = send_stream
+            .send_data(Bytes::from(vec![0x73; bytes]))
+            .expect("legal retained OriginalData cache producer");
+        // This is the existing exact OriginalData-flight fixture, not an
+        // assertion that original TCP packets have traversed a real network.
+        sender.record_original_frame_for_test(owner, &frame);
+        let range = OffsetRange {
+            start,
+            end: send_stream.next_offset(),
+        };
+        if owner == a {
+            expected_a.push(range);
+        } else {
+            expected_b.push(range);
+        }
+    }
+    assert_eq!(send_stream.data_ack_frontier(), 0);
+    assert_eq!(
+        send_stream.reinjection_bytes(),
+        send_stream.next_offset() as usize
+    );
+    assert!(
+        sender
+            .earliest_reinjection_suppression_deadline(&remotes)
+            .is_none()
+    );
+    for owner in if suffix_first { [b, a] } else { [a, b] } {
+        assert!(sender.multipath.mark_path_stale(owner));
+    }
+    assert_eq!(
+        sender.multipath.request_recovery_original_paths(&remotes),
+        if suffix_first { vec![b, a] } else { vec![a, b] }
+    );
+    for (owner, expected) in [(a, expected_a), (b, expected_b)] {
+        let recovery = sender.multipath.path_recovery_state(
+            &context,
+            &remotes,
+            owner,
+            TrafficClass::Throughput,
+        );
+        assert_eq!(recovery.uncovered_ranges, expected);
+        assert!(
+            recovery.retry_deadline.is_none(),
+            "no prior accepted-copy suppression"
+        );
+    }
+    let (selection, exhausted) = sender.multipath.reinjection_path_snapshot(
+        &context,
+        &remotes,
+        &[a, b],
+        &queue,
+        send_stream.reinjection_bytes(),
+        limits,
+    );
+    assert!(!exhausted);
+    let (target, _, capacity) = selection.expect("fresh C has current repair authority");
+    assert_eq!(target, c);
+    assert_eq!(
+        capacity,
+        limits.max_repair_bytes.min(send_stream.reinjection_bytes())
+    );
+    assert_eq!(capacity, if interleaved { 3 * q } else { 2 * q });
+    assert!(try_recv_reliable_path_command(&mut c_receivers).is_none());
+    assert!(
+        sender
+            .drive_request_path_recovery(
+                &mut queue,
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .queued
+    );
+    assert!(queue.request_target_queued_reinjection_bytes(c, false) <= capacity);
+    assert_eq!(queue.request_target_queued_reinjection_bytes(a, false), 0);
+    assert_eq!(queue.request_target_queued_reinjection_bytes(b, false), 0);
+    // The interleaved case observes two native handoffs; merely sorting owners
+    // by their first range must not publish A's later range ahead of B's head.
+    for expected_offset in if interleaved {
+        vec![0, q as u64]
+    } else {
+        vec![0]
+    } {
+        let dispatch = sender
+            .dispatch_client_queued_work(
+                &context,
+                TrafficClass::Throughput,
+                &mut remotes,
+                &mut send_stream,
+                &mut queue,
+                reliable_relay_buffer_len(limits),
+                ReliableDataAckFrontierState::Live,
+            )
+            .await
+            .expect("selected repair passes unchanged native admission");
+        assert!(matches!(dispatch, ClientQueuedDispatch::Reinjection { .. }));
+        let command = try_recv_reliable_path_command(&mut c_receivers)
+            .expect("actual native command receiver observes repair commitment");
+        c_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        let ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset, payload, ..
+        }) = command
+        else {
+            panic!("expected committed repair STREAM_DATA");
+        };
+        assert!(!payload.is_empty());
+        assert_eq!(
+            offset, expected_offset,
+            "historical owner-entry order must not spend C's repair authority on a later range before the lowest eligible retained prefix"
+        );
+    }
+}
+
+#[tokio::test]
 async fn disappeared_bound_path_recovery_target_is_cancelled_and_reselected() {
     let stream_id = StreamId(232);
     let context = client_test_context_with_paths(&[

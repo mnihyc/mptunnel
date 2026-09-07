@@ -105,8 +105,9 @@ after local write. Its later decode-to-mux interval is directly measured1,012ms.
 The decoder reports5,757 preceding nondata sends totaling11,707,975us, maximum
 18,685us. But that counter begins at the previous **ordinary QUIC response**
 `[657,670)` mailbox completion1788819178921 (client1944), not the latest TCP
-frontier or a QUIC repair. Its window is21,872ms, including11,975ms before the
-new Original was published. The whole aggregate could fit before publication;
+frontier or a QUIC repair. Its window is21,872ms, including11,974ms before the
+new Original was dispatched (11,975ms before local write completion). The
+whole aggregate could fit before publication;
 it cannot alone prove how much of the9,897ms write-to-decode interval was local
 waiting. Do not call the complete9.433s stall solved or attributed from this sum.
 
@@ -136,3 +137,65 @@ selecting any new observer. The counters do not identify every nondata frame's
 kind and do not authorize ACK coalescing, priority changes, larger queues or a
 congestion adjustment. Preserve the fast controls, exact effect ordering,
 ownership and ordinary timing gates. No new runtime fix follows this report.
+
+## Follow-up: client cost discriminator, September8
+
+The single frozen/reversed cost-observer capture is
+`./.tmp/reflection/results/mixed-combined-up-response-client-cost-diag-0908/`.
+It completes exactly450,166,784B in44.532321s, with5.083127s maximum
+confirmation gap. Its80.870Mbps is diagnostic context, not an ordinary
+comparison or acceptance. Per-second aggregate scopes cover whole actor
+preparation and per-kind handlers, with nested ACK/recovery costs; individual
+ACK printing and individual performance samples are off.
+
+All86 ordinary QUIC decoded ranges have one matching QUIC mux application and
+advance F. The observed identity is session1736103927169766931/stream0,
+server Path0/native instance1/request stream4, client runtime0/native instance1/
+attachment1. This is this capture's mapping, not a cross-endpoint identity rule.
+Maximum winning decode-to-mux time is300ms, smaller than in the preceding
+capture but still part of a concrete local-service stall:
+
+| Winning range | Actual F hold, Unix ms | Preceding ordinary reader completion -> decode | Measured preceding nondata send awaits | Decode -> mux | Local interval lower bound |
+| --- | --- | --- | --- | --- | --- |
+| `[54,65)` |1788820310229 ->311186;957ms |1788820310009 ->310933;924ms |1118 sends;919771us |253ms |699.771+253=952.771ms |
+| `[65,76)` |1788820311186 ->312326;1140ms |1788820310934 ->312026;1092ms |1338 sends;1088887us |300ms |836.887+300=1136.887ms |
+
+The abbreviated endpoints retain the preceding timestamp's high digits. The
+lower bounds subtract all time before the actual F hold from the preceding-
+send aggregate, then add the disjoint postdecode interval. They do not assume
+uniformly distributed cost. Millisecond timestamp quantization still applies.
+For `[65,76)`, client.log144 is previous mailbox completion;187/188 are
+decode/mailbox completion;189/190 actor routing;193/194 shared admission;
+197/198 dequeue/mux. Original server write completion33 at1788820310072
+precedes the entire hold. The corresponding `[54,65)` records are client108,
+143/144,149/150,151/152,153/154. Reader and actor queues are sampled full.
+
+Surrounding aggregate windows show substantial synchronous preparation and
+ACK work, not one expensive response-data handler:
+
+| Approximate window end, Unix ms | Whole preparation | Retained-frontier helper, nested | Input ACK | Dispatch |
+| --- | --- | --- | --- | --- |
+|1788820310773 |557466us |264280us |330054us |61036us |
+|1788820311774 |587782us |220209us |263948us |87925us |
+|1788820312778 |643220us |195720us |125393us |149764us |
+
+Exact rows are client.log126/129/134/124,170/173/178/168 and302/305/310/300.
+These are approximately one-second completion buckets, not per-F CPU samples;
+do not allocate them uniformly across a shorter stall. Whole preparation,
+Input ACK and Dispatch are distinct outer actor regions; retained-frontier
+cost is already inside preparation. Preparation includes possible topology/
+disconnection awaits and Dispatch includes cooperative yield. Across the full
+capture, retained-frontier totals3.140200s inside7.009682s preparation. That
+3.140200s is the entire helper's measured budget, not promised savings from
+removing its full-horizon query. This identifies meaningful work to examine
+for exact-equivalent reduction, without proving it is the only cause.
+
+The largest5.083s F646 hold is a contrary control, not attributed to this cost:
+F646 begins at1788820324854 (client1100), while its new Original is only
+dispatched/written at1788820328015 (server281--283). It decodes at329936
+(client1200) and reaches mux329937 (1225). Seven preceding nondata sends total
+only3us, reader capacity is available, and decode-to-mux takes1ms. Preparation
+is small in the overlapping aggregate windows. This case contains3.161s before
+publication and a separate1.921s write-to-decode interval; neither is explained
+by the early local busy intervals. No whole-tunnel closure or universal speed
+benefit follows from reducing the measured retained-owner computation.

@@ -602,6 +602,56 @@ or fix; otherwise follow the measured missing boundary. No ordinary rerun,
 queue/priority/coalescing adjustment or broad new audit is authorized by this
 profile. Ordinary timing and the unchanged global matrix still gate acceptance.
 
+**Cost observer frozen/reversed, 06:31:** optimized build2m03s, no warnings.
+Independent review confirms only observation scopes, no control-flow/policy
+change. Frozen binary `./.tmp/reflection/bin/response-client-cost-diag-20260908/mptunnel`;
+full overlay RESPONSE_CLIENT_COST_TRACE_20260908.patch is archived and reversed.
+Source runtime matches5cc2c2b before the capture. Preparation includes any
+disconnected waits, Dispatch includes its cooperative yield, and Input_Data
+includes local-I/O waits; timestamps describe wall time, not CPU attribution.
+Events include exact QUIC response handoffs, dispatch/repair and holes, plus
+client_cost_profile. Individual stream_ack_received printing is disabled.
+
+**Cost capture closed, 06:36:** exact450,166,784B/44.532321s/80.870Mbps;
+maxconfirmationgap5.083127s. Instrumented random capture is not an ordinary
+improvement over the preceding capture. Preparation7.009682s includes retained
+frontier3.140200s; whole ACK handling2.070443s and Dispatch1.585453s are separate.
+Actual winning F65 plateau1.140s has~1.136887s in local handoff/service, and
+F54's.957s has~.952771s. Early busy profile windows contain preparation.40--.64s
+and ACK.13--.35s per approximately1s. This is substantial competing local work.
+The largest5.083s gap instead includes3.161s before the winning response's
+dispatch; actor preparation is small there. Do not call one computation the
+root cause of all stalls or optimize flight settlement from aggregate totals.
+
+**Bounded work correction preflight:** retained recovery performs a full
+`[F,N)` owner-uniform discovery, then repeats discovery on the already limited
+scoring extent. The first query's assignment timestamps are unused. Both
+queries originated in53d9ab5 to remove storage-chunk dependence; bfac5b8 then
+enforced ranked-extent Apply. Active eligibility011aee9 increased how often this
+same work runs. The equivalent O(N log N) sweep remains correct, but scanning
+unrankable later suffixes and doing the second query is unnecessary work.
+Its measured3.14s is a useful bounded optimization target, not a claim that
+removing it will recover3.14s of user latency or close the largest outage gap.
+
+Before production code: prove prefix restriction under frozen ledger/live
+membership. If U is the end of the full owner/avoid-uniform prefix and Q is the
+unchanged selection limit, one query over`[F,min(N,F+Q))` returns exactly
+`[F,min(U,F+Q))`, including original ordered identities and assignment maxima
+within that returned prefix. Use that shorter prefix when U<F+Q, not a new
+full-Q admission requirement. Every later Apply already has service<=scored
+extent, so owner/avoid/cache/clock/rank/credit inputs stay equal. No RFC policy,
+quantum, clock, membership, controller or queue change is required.
+
+Smallest RED/control: actual request cache/flight producer and retained helper
+with identical ranked prefix but a large legal later suffix; count existing
+test-only model visits and show the helper unnecessarily visits the suffix.
+Keep a short-prefix control, owner boundary<Q and pure overlap/clipping oracle
+equivalence. Production changes only after this actual intended RED. Then
+remove the full query, independently audit all preserved inputs, run affected
+focused checks, and declare the isolated ordinary comparison. Reject on semantic
+counterexample or adverse ordinary timing; no restoration of T06 amplification,
+ACK-coalescing, preparation-skipping or new caching state is implied.
+
 **Initial-state boundary confirmed:** with no response ACK, the default
 snapshot has H=None/F0. Even a complete empty ACK leaves the old contiguous
 predicate false because it also requires F>0. The apparent no-ACK exception

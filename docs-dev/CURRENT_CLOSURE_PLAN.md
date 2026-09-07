@@ -1,10 +1,32 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 03:23 UTC. Baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 03:52 UTC. Baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
 ## Current checkpoint and next decision
+
+**Requested reflection / implementation pause:**
+PERFORMANCE_REFLECTION_20260907 explicitly separates useful corrections from
+unproved speed claims and records that the held repair-stream implementation
+introduced its own EOF-retention defect. Component correctness did not earn
+whole-experience acceptance. No new runtime changes follow from this review.
+The latest three-cell ordinary composition still has 5.684/2.351/6.216-second
+gaps (QUIC download / mixed download / mirrored mixed upload), with one real
+echo timeout in each download. TERMINAL_RETIREMENT_TIMING_CONTROLS_20260907
+preserves all results. There is no current held-composition versus released
+binary causal A/B; do not claim either overall improvement or regression.
+
+**Immediate next decision:** freeze that composition, use the existing runner
+for the same-condition release comparison, and attribute the exact ordered
+prefix event before another implementation. QUIC-only QoS already shows
+continued native ACK and physical link service during stalled application
+delivery; this cannot be assumed to require a cross-carrier allocator fix.
+QUIC_QOS_ORDERED_DELIVERY_ATTRIBUTION_20260907 and
+MIRRORED_UPLOAD_TIMING_ATTRIBUTION_20260907 bound the observed queue work and
+missing causal evidence. Keep mixed placement as its separate known branch.
+Allocation/discovery remains a proposal, not the next automatic code change.
+The global gates below remain intact; do not expand the issue inventory.
 
 **Current practical result:** the reproduced completed-request retention now
 clears in ordinary same-process churn. All958 then983 requests complete; both
@@ -27,7 +49,7 @@ TERMINAL_RETIREMENT_CHECKS_20260907. The initial EOF-only correction was
 explicitly partial; its residual owners were not waived. No uncaptured
 deployed-incident sole-cause or whole-performance claim follows.
 
-**Active next model transaction:** allocation/discovery for the already-proved
+**Pending model transaction:** allocation/discovery for the already-proved
 busy-fast/free-slow choice. Read-only producer/evidence audits establish that
 no existing physical-carrier owner tracks recurring discovery opportunities;
 current TCP/UDP Product-rate estimators also have different time denominators.

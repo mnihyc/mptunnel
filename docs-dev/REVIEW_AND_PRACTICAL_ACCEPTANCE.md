@@ -1,11 +1,21 @@
 # Evidence review and practical acceptance
 
-Updated: 2026-09-07 03:23 UTC. Original reviewed production tree: `7189e69`
+Updated: 2026-09-07 03:52 UTC. Original reviewed production tree: `7189e69`
 (wire11); latest correction checkpoint: `b37bacb`. This is a review/experiment
 plan, not a release verdict. Historical SEEN/UNSEEN labels are mapped below;
 an old OPEN label is not a newly found bug.
 
 ## Current verdict and fixed priority
+
+**Requested retrospective:** PERFORMANCE_REFLECTION_20260907 records the
+explicit benefit/cost verdict for the recent work. The held repair candidate
+introduced its own terminal-retention defect; its correction is not proof of
+the user's deployed RAM incident or a speed improvement. The latest ordinary
+composition still fails timing, and there is no final-composition versus
+release A/B. Current native service continues during the QUIC-only QoS gap;
+identify its ordered-prefix owner before another allocator/controller change.
+CURRENT_CLOSURE_PLAN records that immediate decision. Earlier next-action text
+below is historical, not authorization to bypass this reflection.
 
 **Current continuation:** CURRENT_CLOSURE_PLAN is the authoritative next-step
 ledger. The reproduced post-churn retention gate now passes after three

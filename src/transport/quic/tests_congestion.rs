@@ -333,7 +333,11 @@ impl quinn::congestion::Controller for RecordingController {
     }
 
     fn on_lost_packets_retired(&mut self, packets: &[quinn::congestion::LostPacketTerminal]) {
-        self.0.lock().unwrap().lost_retired.extend_from_slice(packets);
+        self.0
+            .lock()
+            .unwrap()
+            .lost_retired
+            .extend_from_slice(packets);
     }
 
     fn on_congestion_event(
@@ -1274,7 +1278,10 @@ fn instrumented_controller_forwards_packet_space_and_recovery_callbacks_once() {
     controller.on_lost_packets_retired(&retired);
     let after_discard = controller.snapshot();
     assert_eq!(after_discard.lost_bytes, before_discard.lost_bytes);
-    assert_eq!(after_discard.total_acked_bytes, before_discard.total_acked_bytes);
+    assert_eq!(
+        after_discard.total_acked_bytes,
+        before_discard.total_acked_bytes
+    );
 
     assert_eq!(controller.snapshot().lost_bytes, 1200);
     let callbacks = recorded.lock().unwrap();
@@ -1300,7 +1307,10 @@ fn instrumented_controller_forwards_packet_space_and_recovery_callbacks_once() {
     assert_eq!(callbacks.spurious, 1);
     assert_eq!(callbacks.abandoned, 1);
     assert_eq!(callbacks.validated_ecn, 1);
-    assert_eq!(callbacks.discarded, [(10, quinn::congestion::SpaceId::Data)]);
+    assert_eq!(
+        callbacks.discarded,
+        [(10, quinn::congestion::SpaceId::Data)]
+    );
     assert_eq!(callbacks.lost_retired, retired);
     assert_eq!(callbacks.cwnd_limited, 1);
     assert_eq!(

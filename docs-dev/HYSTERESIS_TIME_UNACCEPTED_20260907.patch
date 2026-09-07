@@ -1,0 +1,259 @@
+diff --git a/RFC.md b/RFC.md
+index 1d7c16c..71d2132 100644
+--- a/RFC.md
++++ b/RFC.md
+@@ -2751,6 +2751,17 @@ whose authoritative owners admit the command. Profile 7 makes no fairness or
+ aggregate-capacity conformance claim for a sustained sequence; a future profile
+ making either claim must supply the allocation owner required by Section 10.2.
+ 
++Incumbent hysteresis compares completion times, not raw queue sizes. After
++eligibility and resource admission, retain the exact live lower-range owner
++when its ETA is at most the best candidate's ETA plus the larger measured
++jitter of the two candidates. The ETA already includes queue service and the
++next scheduling quantum; an additional byte-queue comparison MUST NOT override
++this timing comparison. Queue growth that produces a material completion-time
++disadvantage still permits a switch. Hysteresis grants no eligibility or credit
++to a failed, excluded, unready or resource-blocked owner and introduces no wait
++for that owner. The same dimensional rule applies to request lead and datagram
++incumbent preference, after their own eligibility and deadline checks.
++
+ The output carrying the contiguous frontier is governed by shared MPP credit
+ and its native carrier. Before an additional output in either stream direction
+ has durable, unambiguous Data ACK coverage for original transmissions, it may
+diff --git a/src/runtime/datagram/quic.rs b/src/runtime/datagram/quic.rs
+index e6974c2..000d4b8 100644
+--- a/src/runtime/datagram/quic.rs
++++ b/src/runtime/datagram/quic.rs
+@@ -360,7 +360,6 @@ impl UdpDatagramClientAssociation {
+                 candidate.snapshot,
+                 best.completion_ms,
+                 best.snapshot,
+-                payload_bytes,
+             )
+         {
+             return Some(candidate.path_index);
+diff --git a/src/runtime/sender/request/multipath.rs b/src/runtime/sender/request/multipath.rs
+index a704d29..c0c979c 100644
+--- a/src/runtime/sender/request/multipath.rs
++++ b/src/runtime/sender/request/multipath.rs
+@@ -1363,7 +1363,6 @@ impl RequestMultipathController {
+             original,
+             alternate_score.eta_ms,
+             alternate,
+-            payload_bytes,
+         ))
+         .then_some((target, alternate))
+     }
+diff --git a/src/runtime/sender/request/scheduling.rs b/src/runtime/sender/request/scheduling.rs
+index 6672bb8..6151ac0 100644
+--- a/src/runtime/sender/request/scheduling.rs
++++ b/src/runtime/sender/request/scheduling.rs
+@@ -1889,12 +1889,11 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+             && old_lead_candidate
+                 .as_ref()
+                 .is_some_and(|(_, old_eta_ms, old_snapshot)| {
+-                    relay_path_within_adaptive_lead_hysteresis(
++                    path_within_adaptive_lead_hysteresis(
+                         *old_eta_ms,
+                         *old_snapshot,
+                         shadow.eta_ms,
+                         shadow.snapshot,
+-                        payload_bytes,
+                     )
+                 });
+         let outcome = if !shadow_is_best {
+@@ -1919,12 +1918,11 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+             .filter(|(_, old_eta_ms, old_snapshot)| {
+                 quic_unused_credit_order(best_eta_ms, best_snapshot, *old_eta_ms, *old_snapshot)
+                     != Ordering::Less
+-                    && relay_path_within_adaptive_lead_hysteresis(
++                    && path_within_adaptive_lead_hysteresis(
+                         *old_eta_ms,
+                         *old_snapshot,
+                         best_eta_ms,
+                         best_snapshot,
+-                        payload_bytes,
+                     )
+             })
+             .unwrap_or((best_position, best_eta_ms, best_snapshot));
+@@ -1940,22 +1938,6 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+     BulkRelayPathChoice::Blocked
+ }
+ 
+-fn relay_path_within_adaptive_lead_hysteresis(
+-    old_eta_ms: f64,
+-    old_snapshot: PathSnapshot,
+-    best_eta_ms: f64,
+-    best_snapshot: PathSnapshot,
+-    payload_bytes: usize,
+-) -> bool {
+-    path_within_adaptive_lead_hysteresis(
+-        old_eta_ms,
+-        old_snapshot,
+-        best_eta_ms,
+-        best_snapshot,
+-        payload_bytes,
+-    )
+-}
+-
+ struct RelayBulkLeadRequest<'a> {
+     observation: &'a RequestRelaySchedulingObservation,
+     lane: TrafficClass,
+diff --git a/src/runtime/sender/request/tests_multipath.rs b/src/runtime/sender/request/tests_multipath.rs
+index 0a22603..7c70f4b 100644
+--- a/src/runtime/sender/request/tests_multipath.rs
++++ b/src/runtime/sender/request/tests_multipath.rs
+@@ -2518,7 +2518,6 @@ async fn retained_tail_uses_only_a_measured_earlier_completion() {
+         original,
+         alternate_score.eta_ms,
+         alternate,
+-        payload_bytes,
+     ));
+ 
+     let target = controller
+diff --git a/src/runtime/sender/response/scheduling.rs b/src/runtime/sender/response/scheduling.rs
+index 042d41b..cf4a5f5 100644
+--- a/src/runtime/sender/response/scheduling.rs
++++ b/src/runtime/sender/response/scheduling.rs
+@@ -304,7 +304,7 @@ pub(super) fn select_response_data_path_with_payload(
+         // The startup-flight bound limits acquisition resources; it does not
+         // grant placement priority over a lower-completion qualified output.
+         // Retain the exact lower-range owner only while its completion remains
+-        // inside measured timing and one-quantum queue uncertainty. This
++        // inside measured timing uncertainty, including queue service. This
+         // advisory hysteresis avoids changing ownership on measurement noise,
+         // but a blocked or materially slower owner immediately yields to the
+         // best structurally admitted candidate.
+@@ -324,9 +324,7 @@ pub(super) fn select_response_data_path_with_payload(
+                 })
+             })
+             .filter(|owner| {
+-                scheduler::path_within_adaptive_lead_hysteresis(
+-                    owner.2, owner.1, best.2, best.1, owner.4,
+-                )
++                scheduler::path_within_adaptive_lead_hysteresis(owner.2, owner.1, best.2, best.1)
+             })
+             .unwrap_or(best);
+ 
+diff --git a/src/runtime/sender/response/tests_scheduling.rs b/src/runtime/sender/response/tests_scheduling.rs
+index 4ad208a..7aa1c44 100644
+--- a/src/runtime/sender/response/tests_scheduling.rs
++++ b/src/runtime/sender/response/tests_scheduling.rs
+@@ -2025,29 +2025,79 @@ fn material_completion_gain_preempts_lower_flight_owner_hysteresis() {
+ }
+ 
+ #[test]
+-fn queue_growth_beyond_one_quantum_preempts_lower_flight_owner_hysteresis() {
++fn raw_queue_bytes_cannot_override_observed_completion_hysteresis() {
++    // Captured ready/qualified candidates at original offset 113231608. A
++    // one-frame TCP excursion held the receiving frontier for 669 ms even
++    // though its predicted gain was only 0.699 ms, inside measured jitter.
+     let mut owner = response_target(
+         0,
+         UnderlayProtocol::Udp,
+-        10.0,
+-        64 * 1024,
+-        16 * 1024 * 1024,
++        53.597119,
++        29_491_200,
++        13_571_222,
+         true,
+     );
+-    owner.observation.snapshot.jitter_ms = 100.0;
+-    owner.observation.snapshot.queue_bytes = 2 * 64 * 1024;
+-    let mut challenger = response_target(1, UnderlayProtocol::Tcp, 9.0, 0, 16 * 1024 * 1024, false);
+-    challenger.observation.snapshot.jitter_ms = 100.0;
++    owner.observation.incarnation = 4;
++    owner.observation.snapshot.peer_usage = Some(PathUsage::Available);
++    owner.observation.snapshot.jitter_ms = 13.541381;
++    owner.observation.snapshot.delivery_rate_bps = 514_184_384.0;
++    owner.observation.snapshot.carrier_delivery_rate_bps = Some(514_184_384.0);
++    owner.observation.snapshot.queue_bytes = 262_144;
++    owner.observation.snapshot.bytes_in_flight = 6_478_667;
++    owner.observation.snapshot.active_flows = 1;
++    owner.observation.snapshot.data_level_limit_bytes = 67_108_864;
++    let mut challenger = response_target(2, UnderlayProtocol::Tcp, 121.414, 327_680, 69_504, false);
++    challenger.observation.incarnation = 1;
++    challenger.observation.snapshot.peer_usage = Some(PathUsage::Available);
++    challenger.observation.native_queue_bytes = 176_898;
++    challenger.observation.native_drain_observed = true;
++    challenger.observation.snapshot.jitter_ms = 19.407;
++    challenger.observation.snapshot.delivery_rate_bps = 8_126_681.388577001;
++    challenger.observation.snapshot.rate_scope = PathRateScope::PerFlowGoodput;
++    challenger.observation.snapshot.carrier_delivery_rate_bps = Some(5_281_000.0);
++    challenger.observation.snapshot.product_progress_rate_bps = Some(8_126_681.388577001);
++    challenger.observation.snapshot.loss_rate = 0.126011;
++    challenger.observation.snapshot.queue_bytes = 176_898;
++    challenger.observation.snapshot.bytes_in_flight = 146_248;
++    challenger.observation.snapshot.active_flows = 1;
++    challenger.observation.snapshot.data_level_limit_bytes = 67_108_864;
++    let owner_eta = scheduler::score_path(
++        response_completion_snapshot(&owner),
++        TrafficClass::Throughput,
++        65_536,
++    )
++    .unwrap()
++    .eta_ms;
++    let challenger_eta = scheduler::score_path(
++        response_completion_snapshot(&challenger),
++        TrafficClass::Throughput,
++        65_536,
++    )
++    .unwrap()
++    .eta_ms;
++    assert!((owner_eta - 500.2019965207445).abs() < 0.000001);
++    assert!((challenger_eta - 499.50260676023004).abs() < 0.000001);
++    // Retain the captured oldest owner and total connection debt. The two
++    // worse candidates and later ledger entries are omitted: their external
++    // debt is nonbinding here and does not contribute to either scored ETA.
+     let lower = [CarrierPathFlightDebt {
+         key: owner.observation.key,
+         output_incarnation: owner.observation.incarnation,
+-        bytes: 64 * 1024,
++        bytes: 29_491_200,
+     }];
+-
++    let selected = select_response_data_path_at_frontier(
++        &[owner.clone(), challenger],
++        TrafficClass::Throughput,
++        65_536,
++        MuxLimits::default(),
++        &lower,
++        29_884_416,
++        ReliableDataAckFrontierState::AuthoritativeGap,
++    )
++    .expect("both captured candidates are ready and Product-admitted");
+     assert_eq!(
+-        select(&[owner, challenger.clone()], &lower, 64 * 1024),
+-        Some(challenger.observation.key),
+-        "hysteresis must not hide more than one scheduling quantum of queue growth",
++        selected.observation.key, owner.observation.key,
++        "queue service is already in ETA; raw bytes cannot veto sub-jitter owner retention",
+     );
+ }
+ 
+diff --git a/src/scheduler/policy.rs b/src/scheduler/policy.rs
+index 108ea38..f2e321c 100644
+--- a/src/scheduler/policy.rs
++++ b/src/scheduler/policy.rs
+@@ -142,18 +142,16 @@ impl PathSnapshot {
+ }
+ 
+ /// Retains a current lead when the challenger does not clear measured timing
+-/// and one scheduling quantum of queue uncertainty.
++/// uncertainty. Queue service and the next quantum already contribute to ETA;
++/// raw queue bytes are not comparable service costs across different rates.
+ pub(crate) fn path_within_adaptive_lead_hysteresis(
+     old_eta_ms: f64,
+     old_snapshot: PathSnapshot,
+     best_eta_ms: f64,
+     best_snapshot: PathSnapshot,
+-    payload_bytes: usize,
+ ) -> bool {
+     let jitter_hysteresis_ms = old_snapshot.jitter_ms.max(best_snapshot.jitter_ms);
+-    let queue_hysteresis_bytes = payload_bytes as u64;
+     old_eta_ms <= best_eta_ms + jitter_hysteresis_ms
+-        && old_snapshot.queue_bytes <= best_snapshot.queue_bytes + queue_hysteresis_bytes
+ }
+ 
+ /// Whether one candidate has a completion lead beyond measured timing

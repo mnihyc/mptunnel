@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 04:47 UTC. Historical baseline source: `7189e69`; evidence checkpoints:
+Updated: 2026-09-07 05:44 UTC. Historical baseline source: `7189e69`; evidence checkpoints:
 `282b71f`, `5d52914`, `9f15ffd`, `c44ecee`, `5e604d1`, `efa8181`. This is the active continuation of REVIEW_AND_PRACTICAL_ACCEPTANCE,
 not a new SEEN/UNSEEN inventory. No release is accepted yet.
 
@@ -42,13 +42,61 @@ not per-commit causality or general non-regression. All six probes,293 samples
 and phase arithmetic were independently checked. QUIC's echo timeout coincides
 with the deliberate three-second UDP outage; mixed's occurs duringQoS.
 
-**Immediate next decision:** the six ordinary release/pruned cells and two
+**Immediate disposition / next observation:** the exact raw-queue deletion
+passed136 selected checks but FAILED the four-cell ordinary non-regression
+gate. Mixed down84.025->56.247Mbps; mirrored upload95.349->51.024Mbps and
+4.247->26.214s post-load confirmation drain. All runs completed; none reached
+the85s guard. Candidate pre-QoS down is faster119.33->143.38Mbps, but restored
+25--30s falls196.15->9.27Mbps. Complete curves and193 samples are preserved in
+HYSTERESIS_TIME_ORDINARY_COMPARISON_20260907; HYSTERESIS_QUEUE_VETO_CORRECTION
+states the decision and limits. Source/tests/RFC are restored exactly to the
+pruned baseline, and HYSTERESIS_TIME_UNACCEPTED_20260907.patch reconstructs the
+candidate. No ordinary executable is rebuilt merely for this restoration;
+use frozen pruned-20260907, not the current target/release candidate artifact.
+
+Next capture the already-seen native QoS/recovery transaction: timer arm/fire,
+actual probes, ACK classifications and exact connection/controller identity.
+Current observations show both peers' inflated RTT and flat current-controller
+ACK-byte counters despite continuing samples and a drained500Mbps router.
+Two2400B flight increases during the UDP outage are consistent with lost PTO
+probes, not a proof of that chain. A minimal temporary diagnostic on restored
+pruned source may close this gap; no recovery/controller/timer change yet.
+Late startup also retires one TCP carrier, but the log lacks stream/phase
+identity and occurs after the slowdown starts. Do not infer sole causality or
+patch admission thresholds. All global gates remain below.
+
+**Exact selection defect, not yet an accepted isolated fix:** the second, temporary prefilter capture proves
+one raw-queue hysteresis defect independently of unavailable/unknown paths.
+Both candidates are ready and qualified: live QUIC owner ETA500.202ms versus
+TCP499.503ms, within19.407ms measured jitter. The extra raw-byte comparison
+overrides retention and sends one TCP original between QUIC originals; that
+range later holds the receiver frontier669ms. Exact inputs and distinct
+unavailable/startup witnesses are in SELECTION_INPUTS_FRONTIER_ATTRIBUTION_20260907.
+The independent HYSTERESIS_QUEUE_VETO_REVIEW_20260907 supports removing only
+the redundant raw-byte conjunct: all live callers already score queue service
+in ETA. First reproduce the exact candidate inputs as a RED test; then retain
+duration hysteresis, material-gain preemption and all admission/lifecycle
+checks. Ordinary mixed download and mirrored-upload comparisons above block
+practical acceptance. No new constant, wait, controller, discovery or protocol preference.
+The busy-fast/free-slow and unknown-startup branches remain separate open issues.
+
+Startup classification is now bounded more precisely: at the captured8308472
+decision, the live TCP frontier retains Product authority while additional
+QUIC's next quantum exceeds its unqualified allowance. QUIC gains actual
+Product qualification335ms later and is admitted. This follows current RFC
+roles and disproves stuck qualification in that interval; it does not explain
+the TCP original's3.199s publication-to-release delay. Do not add a qualification
+threshold fix. The remaining question concerns already-assigned prefix service
+and recovery, not a new admission violation inferred from a slow outcome.
+
+**Completed attribution steps:** the six ordinary release/pruned cells and two
 raw/Hysteria controls are complete. Raw/Hysteria deliver4.138/8.371Mbps here;
 their full timing/queue evidence is PRUNED_BASELINE_CONTEXT_20260907. The
 remaining pruned mixed pre-QoS swing is the next exact ordered-prefix event.
 One unchanged-binary selective dispatch/rank/mux diagnostic reproduced it;
-correlate original ownership and actual release before another implementation.
-No new overlay, build, controller or policy was used. QUIC-only QoS already shows
+the subsequent prefilter-only diagnostic disambiguated candidate exclusion from
+raw-queue hysteresis. Its frozen binary and61-line archived hook are diagnostic
+only; the temporary source hook has been removed. QUIC-only QoS already shows
 continued native ACK and physical link service during stalled application
 delivery; this cannot be assumed to require a cross-carrier allocator fix.
 QUIC_QOS_ORDERED_DELIVERY_ATTRIBUTION_20260907 and

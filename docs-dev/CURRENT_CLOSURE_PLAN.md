@@ -1,9 +1,13 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-07 07:31 UTC. Authoritative source is `./`. **No release pass.**
+Updated: 2026-09-08 00:27 +08:00. Authoritative source is `./`. **No release pass.**
 This is the existing REVIEW_AND_PRACTICAL_ACCEPTANCE batch, not a new inventory.
 Superseded checkpoints are preserved in
 [the history](CLOSURE_PLAN_HISTORY_THROUGH_20260907.md) and their linked evidence.
+Execution and known-failure rejection rules are in
+[the method](PERFORMANCE_METHOD_AND_LESSONS.md).
+The user adopted that method as mandatory on 2026-09-08. Read it before each
+transaction and after compaction; the latest explicit transaction is below.
 
 ## Current result and exact next transaction
 
@@ -23,22 +27,54 @@ prevent every refresh after the first. The staged predicate predates its
 unconditional use introduced by `f4206d0`; no live round barrier invalidates
 the counterexample. This is not attribution of the server-download stall.
 
-1. Prove the live producer RED using actual admission, committed originals,
-   bootstrap qualification and exact Product ACK release. Keep a staged
-   control. Two small model counterexamples are RED for pipelining and a
-   moving acquisition floor; four existing model controls pass. The first
-   compiled live fixture stops at its handling of a legitimate proof command,
-   before the intended assertion. Correct that fixture; runtime is unchanged.
-2. After RED, implement only the independently reviewed model in
-   PRODUCT_COMPLETION_OBSERVATION_MODEL_20260907: fixed entry floor, paired
-   completed-cohort ACK/assignment clocks, chronological assignment guard.
-   Reject invalid numeric cohorts without withholding real debt/qualification
-   release or reusing their bytes. Preserve coverage, expiry, duplicate/copy,
-   incarnation, maturity and native ownership rules.
-3. Prove GREEN and affected controls, review exact RFC/source correspondence,
-   then compare ordinary timing and completion before accepting a change.
-   A numeric refresh fix is not automatically a throughput gain. No generic
-   Defer, new discovery allowance, response-sampler migration or timer tuning.
+1. **RED complete:** actual admission/bootstrap/ACK release gives pipelined
+   samples [2,2,2], staged [2,3,4], both zero final Product debt and idempotent
+   ACK replay. The earlier proof-command fixture failure is kept separate in
+   REQUEST_PIPELINING_OWNER_RED_20260907. No proof flags were injected.
+2. **Candidate GREEN:** fixed entry floor and paired chronological cohort
+   clocks give [2,3,4] in both live cases. All 23 distinct focused checks pass;
+   independent source/RFC review passes. Exact qualification, maturity,
+   expiry, copy and native ownership are unchanged. Justification and tradeoff
+   are REQUEST_COHORT_CLOCK_CORRECTION_20260907. Runtime remains uncommitted.
+3. **Ordinary gate incomplete/adverse:** application build completed in 1m39s;
+   frozen candidate is `./.tmp/reflection/bin/request-cohort-20260907/mptunnel`.
+   Both TCP-upload mirrored-profile cells reached the existing 85s observation
+   guard before completion. Control 109.31/168.30 MB confirmed/locally accepted;
+   candidate 133.56/191.76 MB. Confirmation gap 1.005->2.022s, local write gap
+   7.147->2.043s. No complete-rate or causal speed-win claim. No third run.
+   Censored probes omit confirmation bins; full management/router series and
+   raw probes remain in the two request-cohort result directories.
+4. **Next:** exact queued/ordered-work attribution using existing evidence;
+   no automatic QUIC/mixed expansion or sampler promotion. Actual early
+   Product sample refresh improves, but native sockets still hold substantial
+   work while native ACKs progress. That is not yet the exact gap cause. No
+   generic Defer, discovery allowance, response migration or timer tuning.
+
+### Active transaction: incomplete TCP upload drain
+
+- **Observed failure:** baseline and sampler candidate both retain unconfirmed
+  upload work after the existing 85s observation window. Candidate numerical
+  refresh is proven; practical timing is not accepted.
+- **Competing causes:** native queued work/actual slow transport service;
+  MPP assignment into a slow ordering domain; Product feedback/actor blockage;
+  target or confirmation-path backpressure. Observed socket ACK progress alone
+  does not identify the application gap or eliminate those alternatives.
+- **Question:** where is the already-accepted but not target-confirmed prefix
+  waiting, and what observation would distinguish native service from an MPP
+  progress/placement defect? No new estimator/controller hypothesis is assumed.
+- **Existing evidence:** both raw probes plus 86-sample management/router/socket
+  series. Exact per-confirmation bins are absent after censoring; do not invent
+  them. Inspect existing evidence and producer semantics first.
+- **Falsifier:** sustained exact source/target progress on either side of a
+  supposed blocked stage refutes that stage's total-stop explanation; receipt
+  counters without matching byte/instance scope cannot prove it.
+- **Smallest next action:** preserve the interrupted pair artifact, correlate
+  existing stage/instance counters, then state the remaining observation gap.
+  No new lab or runtime correction until that question is explicit.
+- **Stop/promotion:** no complete-rate claim or sampler acceptance from partial
+  totals. If existing capture cannot identify an exact gap, report that limit
+  and choose one narrow discriminator; do not launch all variants or tune a
+  threshold. An independent read-only auditor checks this attribution.
 
 ## Existing dispositions that must not be lost
 
@@ -91,8 +127,10 @@ remain outside this batch unless evidence and user scope justify inclusion.
 
 ## Execution and continuity
 
-- Three independent agents are available. One owns the focused test build;
-  no overlapping builds/labs. Lab processes are stopped except origin services.
+- No build/lab is running; owned products/probes were stopped, origin services
+  retained. Two audit agents reached their usage limit after the ordinary pair;
+  their completed model/source reviews remain valid, but no unfinished final
+  artifact/review is claimed. Complete pending evidence locally if needed.
 - Use the owned Docker topology only, not host shaping or sudo. Preserve exact
   executable/profile, phase clocks, full series and adverse results. Do not
   expand test infrastructure or repeat already conclusive diagnostics.

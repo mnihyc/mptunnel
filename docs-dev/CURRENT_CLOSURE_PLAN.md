@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 03:18 +08:00. Authoritative source is `./`. **No release pass.**
+Updated: 2026-09-08 03:49 +08:00. Authoritative source is `./`. **No release pass.**
 This is the existing REVIEW_AND_PRACTICAL_ACCEPTANCE batch, not a new inventory.
 Superseded checkpoints are preserved in
 [the history](CLOSURE_PLAN_HISTORY_THROUGH_20260907.md) and their linked evidence.
@@ -137,6 +137,69 @@ raw capture is ACK_ATOMS_SERVICE_DIAGNOSTIC_20260908.raw.tar.gz.
   copy service preserved. Neither DataACK authority nor live OriginalData
   ownership may be replaced by speculative copy coverage. No such correction
   is accepted or implemented in this transaction.
+
+**Source boundary, 03:29:** fullP for first/live-frontier is intentional
+(`65edae3`, T04B_STRUCTURAL_PRODUCT_ADMISSION), and actual owner regressions
+forbid restoring low-rate/BDP resource vetoes. Every original Apply reobserves
+membership; TCP command reservation is a bounded queue/lifecycle permit, not
+CWND credit. Completed asynchronous opens are drained before the next view.
+Source does not prove a ready QUIC output was ignored during the first20ms.
+Existing bulk_precheck is after the sole-path early return; its absence cannot
+positively identify that branch. Do not change P to E or assume socket
+writability means immediate native service.
+
+**Smallest final membership discriminator, declared before action:** one
+temporary diagnostic event at already-successful OriginalData publication,
+using the existing immutable local path_count, selected exact instance/range,
+and lane. No extra model read/state/policy/await. Enable existing asynchronous
+open due/spawned/attached/failure and startup-selection events alongside original
+decisions; same frozen current runtime and mixed combined upload profile.
+Build once, freeze and reverse the one-file overlay before the single capture
+`ack-atoms-initial-membership-diag-0908`. This observation distinguishes initial
+sole-member placement from a multi-member selection decision without making
+another throughput comparison. If the episode does not recur, retain that
+limit. N>1 does not itself prove every sibling eligible; inspect actual rank
+inputs before alleging such a defect. No automatic follow-up trace or policy
+change, no third favourable ordinary trial, no full-matrix expansion.
+
+**Membership question closed, 03:35:** all187 initial TCP publications cover
+12,189,643B with exactly one attached path, in25ms. QUIC was already opening;
+it attached at91ms and received OriginalData at93ms. A ready alternative was
+not ignored. Archive INITIAL_PLACEMENT_DIAGNOSTIC_20260908.raw.tar.gz and its
+one-file observer patch preserve the capture, independently checked. Ordinary
+runtime has no observer overlay. Exact completion217,645,056B/57.963146s with
+13.500752s maximum confirmation gap is diagnostic evidence, not acceptance.
+This closes the selection false positive, not irreversible-placement cost.
+FullP remains real resource permission, not an instruction to eagerly fill it.
+
+### Next transaction: decide the live-repair pipeline model before code
+
+- **Observed failure:** the two exact adjacent winning-copy pairs above wait
+  for the preceding DataACK frontier before admitting the next14,600B prefix.
+  This conditional feedback serialization is real. Sole-path startup explains
+  how a large slow prefix can exist without a ready-path selection defect.
+- **Question:** can independently ranked, exact disjoint copy coverage advance
+  a repair-placement frontier without pretending those bytes were received,
+  hiding admitted repair work, or restoring T06's112.6-times suffix amplifier?
+- **Model constraints:** actual DataACK F, negative H, original ownership,
+  native authority, immutable copy deadlines and same-range suppression stay
+  unchanged. Each next range must independently prove age/ownership and have
+  its own scored extent. Pending copy service must be represented once in
+  subsequent decisions, not erased by advancing a speculative cursor.
+- **Competing causes/cost:** an admitted native window is not spare physical
+  capacity. At10Mbps, putting1.8MB ahead can cost1.44s; more copied suffix can
+  harm both ordinary and interactive service on a shared cut. Existing copies
+  sometimes lose to TCP, so age alone does not prove a useful winner.
+- **Smallest action:** inspect actual score/admission/copy producer semantics
+  and have independent reviewers attack one conditional pipeline contract.
+  Reuse current captures and T03/T04b/T06 evidence; no new trace or lab yet.
+  Write a finite disposition and reachable falsifier before any RED/code.
+- **Stop/gate:** if existing evidence cannot supply the required service/debt
+  distinction, reject a naive cursor/loop as a model change, not invent a rate,
+  native-readiness credit or smaller P/E cap. No timer/quantum/controller tweak.
+  Any supported model revision still needs real RED/control, independent audit,
+  focused GREEN and ordinary timing/cost before promotion. This transaction
+  does not authorize an unbounded allocator redesign or release acceptance.
 
 Its parent `011aee9` (21 focused checks GREEN; ordinary performance unresolved)
 is frozen at
@@ -722,9 +785,9 @@ remain outside this batch unless evidence and user scope justify inclusion.
 
 - The TCP and mixed ordinary comparisons remain unaccepted. Existing-event
   traces are complete and owned products/probes are stopped, origins retained.
-  The repair service-chain capture is complete. Current action is the bounded
-  initial irreversible placement source/history question above, not a larger
-  repair implementation, matrix expansion or new controller.
+  Both repair-chain and initial-membership captures are complete. The latter
+  refutes an ignored-ready-QUIC cause. Current action is the explicit repair
+  pipeline model decision above, not another capture or implementation yet.
   Sampler overlay stays shelved/unaccepted; original RED archive is retained.
 - Use the owned Docker topology only, not host shaping or sudo. Preserve exact
   executable/profile, phase clocks, full series and adverse results. Do not

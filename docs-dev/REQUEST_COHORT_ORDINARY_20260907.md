@@ -1049,3 +1049,49 @@ F at 1788808128682 (S3), before QUIC repair decode at 1788808128689
 (S5--10). Not every repair wins; copying more suffix unconditionally is not
 justified. No quantum, deadline, controller or policy change follows solely
 from this diagnostic, and no automatic repeat is authorized by this result.
+
+### Initial placement membership: the alternative was not attached yet
+
+Recorded 2026-09-08 03:35 +08:00. Category: completed bounded discriminator,
+not a runtime correction or performance pass. The one unchanged mixed combined
+upload capture uses `765683b` plus the temporary
+[publication observer](INITIAL_PLACEMENT_TRACE_20260908.patch), frozen before
+the overlay was reversed. Logs and probe are preserved in
+[the raw capture](INITIAL_PLACEMENT_DIAGNOSTIC_20260908.raw.tar.gz), from
+`./.tmp/reflection/results/mixed-combined-up-ack-atoms-initial-membership-diag-0908/`.
+The added event reads the existing immutable attachment count at successful
+OriginalData publication; it does not infer readiness from configured paths.
+
+All line references below are to this capture's `client.log`, stream 0.
+Elapsed time uses Unix 1788809398702 ms as zero, not the probe's origin.
+
+| Event | Unix ms / elapsed | Exact evidence |
+| --- | --- | --- |
+| QUIC additional open spawned | 1788809398702 / 0 ms | C4: UDP index 0, three opens pending; TCP opens are C2--3 |
+| Initial TCP publications | 1788809398702--1788809398727 / 0--25 ms | C6--379: 187 OriginalData publications, every membership event has N=1; TCP index 0, physical instance 3, attachment 0 |
+| QUIC attached | 1788809398793 / 91 ms | C380: UDP index 0 attached, two other opens remain pending |
+| First QUIC OriginalData | 1788809398795 / 93 ms | C383--384: N=2, UDP index 0, physical instance 4, attachment 1; `[12189643,12255179)` |
+
+The initial 187 contiguous TCP ranges cover exactly `[0,12189643)`, totaling
+12,189,643 B. Their first/last membership records are C6/C378, each followed
+by its successful service decision. The last record's monotonic timestamp is
+24 ms; the independently rounded Unix timestamps span 25 ms. TCP indices 2
+and 1 attach later at Unix 1788809398816/1788809398826 (C408/C411).
+
+Thus **N=1 refutes the claim that this initial batch ignored an already
+attached, eligible QUIC alternative**. Opening QUIC was already requested at
+the beginning; it was attached 91 ms later and used 2 ms afterward. Later N>1
+only counts attached members and does not prove every sibling is eligible,
+writable or capable of earlier service. This observation neither justifies
+restoring a low-rate/BDP-derived Product cap or forcing first/frontier P into
+E, nor proves that initial queue placement or native queue residence is fixed.
+The remaining placement question must preserve the existing single-path,
+unknown-path and high-BDP progress obligations rather than reinterpret resource
+permission as immediate service capacity.
+
+The probe confirms all 217,645,056 B in 57.963146 s (30.039 Mbps), with first
+confirmation at 0.451266 s and maximum confirmation gap 13.500752 s; local
+acceptance equals target confirmation and one stream completes. These are
+diagnostic observations, not an ordinary A/B, fluent-experience acceptance or
+a reason to disregard the gap. No additional run or policy change follows
+automatically from this capture.

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 05:48 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 06:27 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -535,6 +535,72 @@ count/total/max since the preceding response, then resets at response mailbox
 completion. These cfg-only timing counters avoid logging every upload ACK;
 they measure await wall time, not CPU or exact socket arrival. Explicit optional
 client Product identity disables this observer for server/datagram callsites.
+
+**QUIC observer frozen/reversed, 06:12:** optimized build2m04s, no warnings.
+`./.tmp/reflection/bin/response-quic-handoff-diag-20260908/mptunnel` has the
+archived9-file RESPONSE_QUIC_HANDOFF_TRACE_20260908.patch only. Runtime overlay
+fully reversed before execution. Server traces both normal/interlocked and
+deferred-direct writes; client traces reader, normal/interlocked forwarding,
+fanin and mux. No TCP overlay, sampler or native-controller tracing enabled.
+One same-profile diagnostic begins; root/runtime matches f64b904 before launch.
+
+**QUIC chain closed, 06:20:** exact260,571,136B/42.258328s/49.329Mbps;
+maxconfirmationgap9.433234s. Diagnostic only, not ordinary comparison. Raw
+RESPONSE_QUIC_HANDOFF_20260908 archive and matching trace patch retained.
+All82 ordinary QUIC writes join through decoded input and mux;78 advanceF.
+Logged dispatch->writebegin<=2ms/writebegin->localcompletion<=1ms. No server
+writer delay of seconds for these observed frames.
+
+**Actual local service defect class proven:** winning[768,782) has a1.856s
+F768 plateau (Unix1788819201805->9203661). Between previous ordinary-response
+reader mailbox completion9200797 and this decode9202424,474 nondata channel
+sends consume1.622826s of1.627s. At least~.615s overlaps the actualF plateau;
+the disjoint decode->mux interval contributes1.237s. Thus~1.852s of1.856s is
+inside local input handoffs, not native-read waits. Winning[796,810) likewise
+accounts for~.862s of.875s. Early[114,126) crosses decode->mux in1ms with
+available queues. These are useful delayed winners, not duplicate maxima.
+
+Do not overclaim: the11.707975s preceding-send counter for[754,768) spans
+21.872s since prior ordinary response[657,670), including11.975s before this
+frame's publication. It cannot all be assigned to the largest9.433s F754 gap.
+Its1.012s postdecode delay is directly observed. Await totals include executor
+scheduling and recipient service; sampled full queues do not identify exact
+CPU cost or prove every elapsed microsecond was Pending on capacity.
+Nondata counts are not solely ACK counts. F670's QUIC repair winner correctly
+bypasses ordinary reader tracing, not a missing observation or decoder defect.
+
+**Next exact question, no fix yet:** identify what limits client input service
+under existing workload: expensive per-turn scheduling/recovery preparation,
+per-ACK ownership/evidence work, excessive/redundant feedback, native-write
+interlock or executor service. Read source/history and existing cost hooks;
+select one small causal cost discriminator before another build/run. No queue
+size/priority/ACK-coalescing or congestion tweak from saturation alone. Preserve
+exact ACK semantics, epoch/lifecycle fences, native authority and cooperative
+class rotation. Completed handoff traces locate the problem but are not proof
+that a particular processing optimization is safe or practically sufficient.
+
+**Cost discriminator declared, 06:27:** reuse the September6 aggregate profiler,
+not a new harness. That earlier profile disproved direct flight/ACK cost as the
+dominant old tail and found the since-corrected quadratic preparation sweep.
+Current source has the equivalent sweep, so do not repeat that attribution.
+One temporary lab-only overlay records whole live relay preparation (including
+any awaits), complete ACK handler including subsumed ACKs, per-kind Input,
+Dispatch and Read handlers, and nested retained-frontier, path-recovery,
+ACK-gap, staleness, source-admission, Product-ACK and flight-release scopes.
+Reuse existing per-second count/total/max aggregation with individual samples
+off. Enable client-only via the existing diagnostic event filter, without
+changing runner/environment plumbing. Reuse the exact QUIC handoff observer
+to align costs with actual winning F gaps; omit per-ACK diagnostic printing.
+
+Question/falsifier: does synchronous ACK or preparation work occupy those
+intervals, does Dispatch/local-I/O waiting dominate, or is time largely outside
+the instrumented actor? Nested totals overlap; await wall time is not CPU.
+One same-profile `mixed-combined-up-response-client-cost-diag-0908` capture on
+a frozen/reversed overlay, no runtime policy or profile change. If one owner
+dominates, inspect its input sizes and existing equivalence model before a RED
+or fix; otherwise follow the measured missing boundary. No ordinary rerun,
+queue/priority/coalescing adjustment or broad new audit is authorized by this
+profile. Ordinary timing and the unchanged global matrix still gate acceptance.
 
 **Initial-state boundary confirmed:** with no response ACK, the default
 snapshot has H=None/F0. Even a complete empty ACK leaves the old contiguous

@@ -69,8 +69,8 @@ this does not establish when the QUIC native reader first obtained the frame.
 
 ## TCP command service versus delayed copies
 
-All149 observed TCP response transactions complete each of these stages in
-at most1ms: Product dispatch to command stage, command stage to native write
+All149 observed TCP response transactions have logged deltas of at most1ms
+(millisecond timestamp resolution) for Product dispatch to command stage, command stage to native write
 begin, and write begin to flush completion. There is no seconds-long server
 command/writer hold for these recorded frames.146 have exact client decode
 matches; three late copies `[1651,1665)`, `[1665,1679)`, `[1679,1693)` flushed at
@@ -112,7 +112,7 @@ at dequeue), but its exact observed residence is170ms, not several seconds.
 All146 TCP decodes reconcile as76 complete mux chains, two forwarded but
 unconsumed tails,51 successfully routed frames without a subsequent attachment
 forwarder event, and17 routed after attachment retirement. The51 remaining
-queued frames are censored at Product completion; they are not necessarily
+route observations are censored at Product completion; they are not necessarily
 decoded after completion. This is not proof of a leak or that all146 were
 delivered. The maximum complete chain is losing TCP runtime0/native2
 `[1161,1175)`: decode client3168 at1788818256299; route3397/3398 at8313/8315;

@@ -1,0 +1,810 @@
+diff --git a/src/runtime/path/quic/client_stream.rs b/src/runtime/path/quic/client_stream.rs
+index e963ee7..b6fe5fd 100644
+--- a/src/runtime/path/quic/client_stream.rs
++++ b/src/runtime/path/quic/client_stream.rs
+@@ -5,6 +5,8 @@ use super::io::{
+     UdpPathRecvStream, UdpPathSendStream, spawn_quic_path_reader, udp_path_finish_stream,
+     udp_path_input_finished, udp_path_write_frame,
+ };
++#[cfg(feature = "lab-diagnostics")]
++use crate::lab_diagnostics::lab_diagnostic;
+ use crate::model::path::CarrierPathInstanceId;
+ use crate::mux::MuxLimits;
+ use crate::protocol::codec::CodecLimits;
+@@ -283,7 +285,54 @@ async fn handle_client_udp_stream_input(
+         }) if received_stream_id == stream_id => {
+             // Product retirement closes its input before ordered FIN/detach
+             // work drains. Late input must not cancel that independent writer.
+-            let _ = frames.send(Ok(frame)).await;
++            #[cfg(feature = "lab-diagnostics")]
++            let requalification_ack = match &frame {
++                Frame::StreamRequalifyAck {
++                    probe_id,
++                    offset,
++                    payload_bytes,
++                    ..
++                } => Some((*probe_id, *offset, *payload_bytes)),
++                _ => None,
++            };
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some((probe_id, offset, payload_bytes)) = requalification_ack {
++                lab_diagnostic(
++                    "requalification_transport",
++                    format_args!(
++                        "phase=client_pre_mailbox underlay=Udp stream_id={} probe_id={} offset={} payload_bytes={} path_index={} path_instance_id={} native_stream_id={} result=ready",
++                        stream_id.0,
++                        probe_id,
++                        offset,
++                        payload_bytes,
++                        path_index,
++                        path_instance_id.as_u64(),
++                        send.request_stream_id(),
++                    ),
++                );
++            }
++            let _mailbox_closed = frames.send(Ok(frame)).await.is_err();
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some((probe_id, offset, payload_bytes)) = requalification_ack {
++                lab_diagnostic(
++                    "requalification_transport",
++                    format_args!(
++                        "phase=client_mailbox_complete underlay=Udp stream_id={} probe_id={} offset={} payload_bytes={} path_index={} path_instance_id={} native_stream_id={} result={}",
++                        stream_id.0,
++                        probe_id,
++                        offset,
++                        payload_bytes,
++                        path_index,
++                        path_instance_id.as_u64(),
++                        send.request_stream_id(),
++                        if _mailbox_closed {
++                            "closed"
++                        } else {
++                            "accepted"
++                        },
++                    ),
++                );
++            }
+         }
+         Frame::StreamDetach {
+             stream_id: detached_stream_id,
+diff --git a/src/runtime/path/quic/repair.rs b/src/runtime/path/quic/repair.rs
+index 200cdc2..24bd48b 100644
+--- a/src/runtime/path/quic/repair.rs
++++ b/src/runtime/path/quic/repair.rs
+@@ -5,6 +5,8 @@ use super::io::{
+     udp_path_write_frame,
+ };
+ use super::repair_binding::RepairBindings;
++#[cfg(feature = "lab-diagnostics")]
++use crate::lab_diagnostics::lab_diagnostic;
+ use crate::protocol::codec::CodecLimits;
+ use crate::protocol::{Frame, StreamId};
+ use crate::runtime::error::RuntimeError;
+@@ -35,7 +37,43 @@ where
+                 // The parent owns and cancels this future when that completes.
+                 return std::future::pending::<Result<(), RuntimeError>>().await;
+             };
+-            udp_path_write_frame(&mut send, work.frame(), limits).await?;
++            #[cfg(feature = "lab-diagnostics")]
++            let probe = requalification_probe_details(work.frame());
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some((owner, probe_id, offset, payload_bytes)) = probe {
++                for phase in ["repair_dequeue", "h3_write_begin"] {
++                    lab_diagnostic(
++                        "requalification_transport",
++                        format_args!(
++                            "phase={} underlay=Udp stream_id={} probe_id={} offset={} payload_bytes={} native_stream_id={} result=ready",
++                            phase,
++                            owner.0,
++                            probe_id,
++                            offset,
++                            payload_bytes,
++                            send.request_stream_id(),
++                        ),
++                    );
++                }
++            }
++            let result = udp_path_write_frame(&mut send, work.frame(), limits).await;
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some((owner, probe_id, offset, payload_bytes)) = probe {
++                lab_diagnostic(
++                    "requalification_transport",
++                    format_args!(
++                        "phase=h3_write_end underlay=Udp stream_id={} probe_id={} offset={} payload_bytes={} native_stream_id={} result={}",
++                        owner.0,
++                        probe_id,
++                        offset,
++                        payload_bytes,
++                        send.request_stream_id(),
++                        if result.is_ok() { "accepted" } else { "error" },
++                    ),
++                );
++            }
++            // H3 completion is local acceptance, not a wire or peer receipt.
++            result?;
+             // `work` releases its exact queue/writer byte charge here, or on
+             // cancellation/error. Native receipt does not settle Product debt.
+         }
+@@ -63,6 +101,18 @@ where
+             Err(error) if udp_path_input_finished(&error) => return Ok(()),
+             Err(error) => return Err(error),
+         };
++        #[cfg(feature = "lab-diagnostics")]
++        let probe = requalification_probe_details(&frame);
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some((owner, probe_id, offset, payload_bytes)) = probe {
++            lab_diagnostic(
++                "requalification_transport",
++                format_args!(
++                    "phase=peer_decoded underlay=Udp stream_id={} probe_id={} offset={} payload_bytes={} result=decoded",
++                    owner.0, probe_id, offset, payload_bytes,
++                ),
++            );
++        }
+         match &frame {
+             Frame::StreamData {
+                 stream_id: owner, ..
+@@ -76,6 +126,34 @@ where
+                 ));
+             }
+         }
+-        route(frame).await?;
++        let result = route(frame).await;
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some((owner, probe_id, offset, payload_bytes)) = probe {
++            lab_diagnostic(
++                "requalification_transport",
++                format_args!(
++                    "phase=peer_route_complete underlay=Udp stream_id={} probe_id={} offset={} payload_bytes={} result={}",
++                    owner.0,
++                    probe_id,
++                    offset,
++                    payload_bytes,
++                    if result.is_ok() { "ok" } else { "error" },
++                ),
++            );
++        }
++        result?;
++    }
++}
++
++#[cfg(feature = "lab-diagnostics")]
++fn requalification_probe_details(frame: &Frame) -> Option<(StreamId, u64, u64, usize)> {
++    match frame {
++        Frame::StreamRequalifyData {
++            stream_id,
++            probe_id,
++            offset,
++            payload,
++        } => Some((*stream_id, *probe_id, *offset, payload.len())),
++        _ => None,
+     }
+ }
+diff --git a/src/runtime/path/tcp/client/stream.rs b/src/runtime/path/tcp/client/stream.rs
+index 8118f43..1affcfb 100644
+--- a/src/runtime/path/tcp/client/stream.rs
++++ b/src/runtime/path/tcp/client/stream.rs
+@@ -267,7 +267,37 @@ async fn route_client_tcp_stream_frame(
+     stream_id: StreamId,
+     frame: Frame,
+ ) -> Result<(), RuntimeError> {
++    #[cfg(feature = "lab-diagnostics")]
++    let requalification_ack = match &frame {
++        Frame::StreamRequalifyAck {
++            probe_id,
++            offset,
++            payload_bytes,
++            ..
++        } => Some((*probe_id, *offset, *payload_bytes)),
++        _ => None,
++    };
++    #[cfg(feature = "lab-diagnostics")]
++    if let Some((probe_id, offset, payload_bytes)) = requalification_ack {
++        lab_diagnostic(
++            "requalification_transport",
++            format_args!(
++                "phase=client_pre_mailbox underlay=Tcp stream_id={} probe_id={} offset={} payload_bytes={} result=ready",
++                stream_id.0, probe_id, offset, payload_bytes,
++            ),
++        );
++    }
+     let Some(state) = streams.get_mut(&stream_id) else {
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some((probe_id, offset, payload_bytes)) = requalification_ack {
++            lab_diagnostic(
++                "requalification_transport",
++                format_args!(
++                    "phase=client_mailbox_complete underlay=Tcp stream_id={} probe_id={} offset={} payload_bytes={} result=missing_stream",
++                    stream_id.0, probe_id, offset, payload_bytes,
++                ),
++            );
++        }
+         #[cfg(feature = "lab-diagnostics")]
+         let was_recently_closed = closed_streams.contains(&stream_id);
+         closed_streams.insert(stream_id);
+@@ -284,7 +314,22 @@ async fn route_client_tcp_stream_frame(
+     let bytes = reliable_path_frame_pacing_bytes(&frame);
+     #[cfg(feature = "lab-diagnostics")]
+     let started = Instant::now();
+-    if state.frames.send(Ok(frame)).await.is_err() {
++    let mailbox_closed = state.frames.send(Ok(frame)).await.is_err();
++    #[cfg(feature = "lab-diagnostics")]
++    if let Some((probe_id, offset, payload_bytes)) = requalification_ack {
++        lab_diagnostic(
++            "requalification_transport",
++            format_args!(
++                "phase=client_mailbox_complete underlay=Tcp stream_id={} probe_id={} offset={} payload_bytes={} result={}",
++                stream_id.0,
++                probe_id,
++                offset,
++                payload_bytes,
++                if mailbox_closed { "closed" } else { "accepted" },
++            ),
++        );
++    }
++    if mailbox_closed {
+         streams.remove(&stream_id);
+         closed_streams.insert(stream_id);
+     }
+diff --git a/src/runtime/relay/client.rs b/src/runtime/relay/client.rs
+index 9c37ad6..aa84dcf 100644
+--- a/src/runtime/relay/client.rs
++++ b/src/runtime/relay/client.rs
+@@ -461,10 +461,64 @@ pub(super) fn update_request_path_staleness(
+             )
+         })
+         .collect::<SmallVec<[_; 4]>>();
++    #[cfg(feature = "lab-diagnostics")]
++    let clocks_before = state.progress.request_path_staleness.diagnostic_deadlines();
+     let stale_paths = state
+         .progress
+         .request_path_staleness
+         .stale_paths(&observations, data_ack_progress_paths);
++    #[cfg(feature = "lab-diagnostics")]
++    {
++        let observed_at = std::time::Instant::now();
++        let clocks_after = state.progress.request_path_staleness.diagnostic_deadlines();
++        for (candidate, deadline) in &clocks_after {
++            let before = clocks_before
++                .iter()
++                .find_map(|(owner, deadline)| (owner == candidate).then_some(*deadline));
++            let phase = if stale_paths.contains(candidate) {
++                "due"
++            } else if before.is_none() {
++                "armed"
++            } else if before != Some(*deadline) {
++                "progress_reset"
++            } else {
++                continue;
++            };
++            lab_diagnostic(
++                "request_stale_clock",
++                format_args!(
++                    "phase={} stream_id={} path_underlay={:?} path_index={} path_instance_id={} attachment_id={} authoritative_horizon={} eligible_progress={} deadline_in_us={} deadline_overdue_us={}",
++                    phase,
++                    stream_id.0,
++                    candidate.key.underlay,
++                    candidate.key.index,
++                    candidate.path_instance_id.as_u64(),
++                    candidate.attachment_id,
++                    authoritative_horizon,
++                    data_ack_progress_paths.contains(candidate),
++                    deadline.saturating_duration_since(observed_at).as_micros(),
++                    observed_at.saturating_duration_since(*deadline).as_micros(),
++                ),
++            );
++        }
++        for (candidate, _) in clocks_before {
++            if !clocks_after.iter().any(|(owner, _)| *owner == candidate) {
++                lab_diagnostic(
++                    "request_stale_clock",
++                    format_args!(
++                        "phase=removed stream_id={} path_underlay={:?} path_index={} path_instance_id={} attachment_id={} authoritative_horizon={} eligible_progress={}",
++                        stream_id.0,
++                        candidate.key.underlay,
++                        candidate.key.index,
++                        candidate.path_instance_id.as_u64(),
++                        candidate.attachment_id,
++                        authoritative_horizon,
++                        data_ack_progress_paths.contains(&candidate),
++                    ),
++                );
++            }
++        }
++    }
+     let mut marked_stale = false;
+     for stale_path in stale_paths {
+         if !sender.mark_request_path_stale(context, remotes, stale_path, lane) {
+diff --git a/src/runtime/relay/io.rs b/src/runtime/relay/io.rs
+index 05a1e10..c35c656 100644
+--- a/src/runtime/relay/io.rs
++++ b/src/runtime/relay/io.rs
+@@ -436,6 +436,14 @@ impl<Candidate: Copy + Eq> ReliablePathStaleness<Candidate> {
+         self.next_deadline
+     }
+ 
++    #[cfg(feature = "lab-diagnostics")]
++    pub(in crate::runtime) fn diagnostic_deadlines(&self) -> SmallVec<[(Candidate, Instant); 4]> {
++        self.clocks
++            .iter()
++            .map(|clock| (clock.candidate, clock.deadline))
++            .collect()
++    }
++
+     fn stale_paths_at(
+         &mut self,
+         observations: &[ReliablePathStalenessObservation<Candidate>],
+diff --git a/src/runtime/sender/request/multipath.rs b/src/runtime/sender/request/multipath.rs
+index a704d29..5f46570 100644
+--- a/src/runtime/sender/request/multipath.rs
++++ b/src/runtime/sender/request/multipath.rs
+@@ -40,6 +40,8 @@ use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
+ use crate::model::product_qualification::{
+     ProductQualificationAdmissionError, ProductQualificationAuthority,
+ };
++#[cfg(feature = "lab-diagnostics")]
++use crate::model::requalification::StreamPathQualification;
+ use crate::model::requalification::{StreamPathRequalification, StreamRequalificationProbe};
+ use crate::model::request_evidence::{
+     RequestOwnerAckProgress, RequestPathRateEvidenceUpdate, RequestProductRateEpoch,
+@@ -1505,6 +1507,44 @@ impl RequestMultipathController {
+         self.request.requalification.next_deadline()
+     }
+ 
++    #[cfg(feature = "lab-diagnostics")]
++    #[allow(clippy::too_many_arguments)]
++    fn diagnostic_requalification(
++        &self,
++        phase: &str,
++        target: Option<RelayPathInstance>,
++        probe: StreamRequalificationProbe,
++        deadline: Option<Instant>,
++        observed_at: Instant,
++        return_instance: Option<RelayPathInstance>,
++        outcome: &str,
++    ) {
++        lab_diagnostic(
++            "request_requalification",
++            format_args!(
++                "phase={} stream_id={} target_underlay={:?} target_index={:?} target_instance={:?} target_attachment={:?} probe_id={} offset={} payload_bytes={} deadline_in_us={:?} deadline_overdue_us={:?} return_underlay={:?} return_index={:?} return_instance={:?} return_attachment={:?} outcome={}",
++                phase,
++                self.stream_id.0,
++                target.map(|target| target.key.underlay),
++                target.map(|target| target.key.index),
++                target.map(|target| target.path_instance_id.as_u64()),
++                target.map(|target| target.attachment_id),
++                probe.id,
++                probe.offset,
++                probe.payload_bytes,
++                deadline
++                    .map(|deadline| deadline.saturating_duration_since(observed_at).as_micros()),
++                deadline
++                    .map(|deadline| observed_at.saturating_duration_since(deadline).as_micros()),
++                return_instance.map(|instance| instance.key.underlay),
++                return_instance.map(|instance| instance.key.index),
++                return_instance.map(|instance| instance.path_instance_id.as_u64()),
++                return_instance.map(|instance| instance.attachment_id),
++                outcome,
++            ),
++        );
++    }
++
+     pub(super) fn try_enqueue_requalification_probe(
+         &mut self,
+         context: &ClientPathContext,
+@@ -1518,6 +1558,17 @@ impl RequestMultipathController {
+         // planned. Reconcile here so a detached pending candidate cannot own
+         // the only wake deadline and starve another live stale attachment.
+         self.reconcile_request_attachment_membership(remotes);
++        #[cfg(feature = "lab-diagnostics")]
++        let expiring_probe = self
++            .request
++            .requalification
++            .stale_candidates()
++            .find_map(|target| match self.request.requalification.state(target) {
++                StreamPathQualification::Requalifying { probe, retry_at } if retry_at <= now => {
++                    Some((target, probe, retry_at))
++                }
++                _ => None,
++            });
+         let candidates = self
+             .request
+             .requalification
+@@ -1526,6 +1577,18 @@ impl RequestMultipathController {
+                     path.instance() == instance && path.stream.product_admission_active()
+                 })
+             });
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some((target, probe, deadline)) = expiring_probe {
++            self.diagnostic_requalification(
++                "expiry",
++                Some(target),
++                probe,
++                Some(deadline),
++                now,
++                None,
++                "selection_expired",
++            );
++        }
+         let mut capacity_blocked = Vec::new();
+         for candidate in candidates {
+             let Some(source_range) = self
+@@ -1581,6 +1644,8 @@ impl RequestMultipathController {
+             ) else {
+                 continue;
+             };
++            #[cfg(feature = "lab-diagnostics")]
++            let probe_deadline = self.request.requalification.next_deadline();
+             let frame = Frame::StreamRequalifyData {
+                 stream_id,
+                 probe_id: probe.id,
+@@ -1589,6 +1654,16 @@ impl RequestMultipathController {
+             };
+             match path.stream.try_enqueue_requalification_frame(frame, lane) {
+                 Ok(()) => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    self.diagnostic_requalification(
++                        "publication",
++                        Some(candidate),
++                        probe,
++                        probe_deadline,
++                        Instant::now(),
++                        None,
++                        "queued",
++                    );
+                     return Ok(RequalificationAttempt::Published {
+                         target: candidate,
+                         payload_bytes: probe.payload_bytes as usize,
+@@ -1599,16 +1674,46 @@ impl RequestMultipathController {
+                     self.request
+                         .requalification
+                         .cancel_unpublished_probe(candidate, probe, now);
++                    #[cfg(feature = "lab-diagnostics")]
++                    self.diagnostic_requalification(
++                        "publication",
++                        Some(candidate),
++                        probe,
++                        probe_deadline,
++                        Instant::now(),
++                        None,
++                        "cancelled_capacity",
++                    );
+                 }
+                 Err(crate::runtime::RuntimeError::ReliablePathSessionClosed) => {
+                     self.request
+                         .requalification
+                         .cancel_unpublished_probe(candidate, probe, now);
++                    #[cfg(feature = "lab-diagnostics")]
++                    self.diagnostic_requalification(
++                        "publication",
++                        Some(candidate),
++                        probe,
++                        probe_deadline,
++                        Instant::now(),
++                        None,
++                        "cancelled_closed",
++                    );
+                 }
+                 Err(error) => {
+                     self.request
+                         .requalification
+                         .cancel_unpublished_probe(candidate, probe, now);
++                    #[cfg(feature = "lab-diagnostics")]
++                    self.diagnostic_requalification(
++                        "publication",
++                        Some(candidate),
++                        probe,
++                        probe_deadline,
++                        Instant::now(),
++                        None,
++                        "cancelled_error",
++                    );
+                     return Err(error);
+                 }
+             }
+@@ -1644,12 +1749,34 @@ impl RequestMultipathController {
+         // non-reused probe, not that return path, identifies the forward
+         // attachment whose qualification transaction is pending.
+         let Some(target) = self.request.requalification.pending_probe_candidate(probe) else {
++            #[cfg(feature = "lab-diagnostics")]
++            self.diagnostic_requalification(
++                "receipt",
++                None,
++                probe,
++                None,
++                now,
++                Some(_authenticated_return_instance),
++                "unmatched",
++            );
+             return false;
+         };
++        #[cfg(feature = "lab-diagnostics")]
++        let probe_deadline = self.request.requalification.next_deadline();
+         let authority_revoked = self.request.path_states.get(target).is_some_and(|state| {
+             state.product_qualification_authority() == ProductQualificationAuthority::Revoked
+         });
+         if !authority_revoked {
++            #[cfg(feature = "lab-diagnostics")]
++            self.diagnostic_requalification(
++                "receipt",
++                Some(target),
++                probe,
++                probe_deadline,
++                now,
++                Some(_authenticated_return_instance),
++                "authority_not_revoked",
++            );
+             return false;
+         }
+         let acknowledged = self
+@@ -1674,9 +1801,33 @@ impl RequestMultipathController {
+                     .get_mut(target)
+                     .reset_for_requalification();
+                 let _ = self.request.requalification.mark_stale(target, now);
++                #[cfg(feature = "lab-diagnostics")]
++                self.diagnostic_requalification(
++                    "receipt",
++                    Some(target),
++                    probe,
++                    probe_deadline,
++                    now,
++                    Some(_authenticated_return_instance),
++                    "reactivation_failed",
++                );
+                 return false;
+             }
+         }
++        #[cfg(feature = "lab-diagnostics")]
++        self.diagnostic_requalification(
++            "receipt",
++            Some(target),
++            probe,
++            probe_deadline,
++            now,
++            Some(_authenticated_return_instance),
++            if acknowledged {
++                "timely_acquiring"
++            } else {
++                "expired"
++            },
++        );
+         acknowledged
+     }
+ 
+@@ -2879,14 +3030,18 @@ impl RequestMultipathController {
+             lab_diagnostic(
+                 "path_model",
+                 format_args!(
+-                    "stream_id={} path_underlay={:?} path_index={} path_instance={} released_bytes={} elapsed_ms={:.3} path_proving={} cause=stream_ack",
++                    "stream_id={} path_underlay={:?} path_index={} path_instance={} path_instance_id={} frame_offset={} frame_end_offset={} released_bytes={} elapsed_ms={:.3} path_proving={} product_evidence_eligible={} cause=stream_ack",
+                     self.stream_id.0,
+                     release.instance.key.underlay,
+                     release.instance.key.index,
+                     release.instance.attachment_id,
++                    release.instance.path_instance_id.as_u64(),
++                    release.range.start,
++                    release.range.end,
+                     release.bytes,
+                     release.elapsed.as_secs_f64() * 1000.0,
+                     release.path_proving,
++                    product_evidence_eligible,
+                 ),
+             );
+         }
+diff --git a/src/runtime/stream/response/requalification.rs b/src/runtime/stream/response/requalification.rs
+index d57aa04..d4cb6d3 100644
+--- a/src/runtime/stream/response/requalification.rs
++++ b/src/runtime/stream/response/requalification.rs
+@@ -2,6 +2,10 @@
+ 
+ use super::snapshot::server_bulk_output_snapshot;
+ use super::{CarrierPathFlight, ResponseStreamBinding};
++#[cfg(feature = "lab-diagnostics")]
++use crate::lab_diagnostics::lab_diagnostic;
++#[cfg(feature = "lab-diagnostics")]
++use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+ use crate::model::product_qualification::ProductQualificationAuthority;
+ use crate::model::requalification::{
+     StreamPathQualification, StreamRequalificationProbe, StreamRequalificationReceipt,
+@@ -31,6 +35,40 @@ pub(super) struct RequestRequalificationAckPublication {
+ }
+ 
+ impl ResponseStreamBinding {
++    #[cfg(feature = "lab-diagnostics")]
++    fn log_request_requalification_server(
++        &self,
++        phase: &str,
++        probe_identity: Option<(StreamId, StreamRequalificationProbe)>,
++        ingress: (CarrierPathKey, CarrierPathInstanceId),
++        return_identity: Option<(CarrierPathKey, CarrierPathInstanceId, u64)>,
++        result: &str,
++    ) {
++        let Some((stream_id, probe)) = probe_identity else {
++            return;
++        };
++        lab_diagnostic(
++            "request_requalification_server",
++            format_args!(
++                "phase={} session_id={} stream_id={} probe_id={} offset={} payload_bytes={} ingress_underlay={:?} ingress_path_id={} ingress_instance_id={} return_underlay={:?} return_path_id={:?} return_instance_id={:?} return_incarnation={:?} result={}",
++                phase,
++                self.session_id.0,
++                stream_id.0,
++                probe.id,
++                probe.offset,
++                probe.payload_bytes,
++                ingress.0.underlay,
++                ingress.0.path_id.0,
++                ingress.1.as_u64(),
++                return_identity.map(|(key, _, _)| key.underlay),
++                return_identity.map(|(key, _, _)| key.path_id.0),
++                return_identity.map(|(_, instance, _)| instance.as_u64()),
++                return_identity.map(|(_, _, incarnation)| incarnation),
++                result,
++            ),
++        );
++    }
++
+     /// ACKs one request-direction probe through any live authenticated output
+     /// in the same logical session, preferring its carrying attachment.
+     /// Probe bytes are not delivered and create no Product flight.
+@@ -48,6 +86,14 @@ impl ResponseStreamBinding {
+             .entries
+             .iter()
+             .any(|entry| entry.key == key && entry.path_instance_id == path_instance_id);
++        #[cfg(feature = "lab-diagnostics")]
++        self.log_request_requalification_server(
++            "probe_received",
++            Some((stream_id, probe)),
++            (key, path_instance_id),
++            None,
++            if attached { "attached" } else { "closed" },
++        );
+         if !attached {
+             return Err(RuntimeError::ReliablePathSessionClosed);
+         }
+@@ -64,9 +110,25 @@ impl ResponseStreamBinding {
+                 .expect("server request requalification ACK lock");
+             if let Some(highest) = publication.highest_accepted_probe {
+                 if probe.id < highest.id {
++                    #[cfg(feature = "lab-diagnostics")]
++                    self.log_request_requalification_server(
++                        "probe_coalesced",
++                        Some((stream_id, probe)),
++                        (key, path_instance_id),
++                        None,
++                        "older_probe",
++                    );
+                     return Ok(());
+                 }
+                 if probe.id == highest.id && probe != highest {
++                    #[cfg(feature = "lab-diagnostics")]
++                    self.log_request_requalification_server(
++                        "probe_rejected",
++                        Some((stream_id, probe)),
++                        (key, path_instance_id),
++                        None,
++                        "tuple_mismatch",
++                    );
+                     return Err(RuntimeError::Protocol(
+                         "request requalification probe id reused with a different tuple",
+                     ));
+@@ -83,6 +145,14 @@ impl ResponseStreamBinding {
+                         // reliable carrier queue. Native delivery/loss stays
+                         // with that carrier; accepting the same Product probe
+                         // again would create unbounded cross-path copies.
++                        #[cfg(feature = "lab-diagnostics")]
++                        self.log_request_requalification_server(
++                            "probe_coalesced",
++                            Some((stream_id, probe)),
++                            (key, path_instance_id),
++                            None,
++                            "already_queued",
++                        );
+                         return Ok(());
+                     }
+                     false
+@@ -109,6 +179,14 @@ impl ResponseStreamBinding {
+                 true
+             }
+         };
++        #[cfg(feature = "lab-diagnostics")]
++        self.log_request_requalification_server(
++            "ack_retained",
++            Some((stream_id, probe)),
++            (key, path_instance_id),
++            None,
++            if installed { "installed" } else { "coalesced" },
++        );
+         if installed {
+             self.notify_update();
+         }
+@@ -163,6 +241,23 @@ impl ResponseStreamBinding {
+         let Some(pending) = publication.pending.as_ref().cloned() else {
+             return Ok(false);
+         };
++        #[cfg(feature = "lab-diagnostics")]
++        let diagnostic_probe = match &pending.frame {
++            Frame::StreamRequalifyAck {
++                stream_id,
++                probe_id,
++                offset,
++                payload_bytes,
++            } => Some((
++                *stream_id,
++                StreamRequalificationProbe {
++                    id: *probe_id,
++                    offset: *offset,
++                    payload_bytes: *payload_bytes,
++                },
++            )),
++            _ => None,
++        };
+         let outputs = self
+             .outputs
+             .lock()
+@@ -178,11 +273,39 @@ impl ResponseStreamBinding {
+         let mut first_fatal_error = None;
+         for candidate in candidates {
+             let commands = &outputs.entries[candidate].commands;
++            #[cfg(feature = "lab-diagnostics")]
++            let diagnostic_return = Some((
++                outputs.entries[candidate].key,
++                outputs.entries[candidate].path_instance_id,
++                outputs.entries[candidate].incarnation,
++            ));
+             if commands.control_frame_admission_is_closed() {
++                #[cfg(feature = "lab-diagnostics")]
++                self.log_request_requalification_server(
++                    "ack_publication",
++                    diagnostic_probe,
++                    (pending.preferred_key, pending.preferred_path_instance_id),
++                    diagnostic_return,
++                    "closed",
++                );
+                 continue;
+             }
+-            match commands.try_enqueue_admitted_frame(pending.frame.clone(), TrafficClass::Control)
+-            {
++            let enqueue_result =
++                commands.try_enqueue_admitted_frame(pending.frame.clone(), TrafficClass::Control);
++            #[cfg(feature = "lab-diagnostics")]
++            self.log_request_requalification_server(
++                "ack_publication",
++                diagnostic_probe,
++                (pending.preferred_key, pending.preferred_path_instance_id),
++                diagnostic_return,
++                match &enqueue_result {
++                    Ok(()) => "queued",
++                    Err(RuntimeError::SenderServiceBlocked) => "blocked",
++                    Err(RuntimeError::ReliablePathSessionClosed) => "closed",
++                    Err(_) => "error",
++                },
++            );
++            match enqueue_result {
+                 Ok(()) => published = true,
+                 Err(RuntimeError::SenderServiceBlocked)
+                 | Err(RuntimeError::ReliablePathSessionClosed) => {}
+@@ -193,6 +316,22 @@ impl ResponseStreamBinding {
+                 }
+             }
+         }
++        #[cfg(feature = "lab-diagnostics")]
++        self.log_request_requalification_server(
++            "ack_pass",
++            diagnostic_probe,
++            (pending.preferred_key, pending.preferred_path_instance_id),
++            None,
++            if published {
++                "queued"
++            } else if first_fatal_error.is_some() {
++                "error"
++            } else if outputs.entries.is_empty() {
++                "no_outputs"
++            } else {
++                "pending"
++            },
++        );
+         drop(outputs);
+         if published {
+             publication.pending = None;
+

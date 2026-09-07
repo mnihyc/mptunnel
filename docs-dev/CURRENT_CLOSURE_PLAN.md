@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 02:00 +08:00. Authoritative source is `./`. **No release pass.**
+Updated: 2026-09-08 02:24 +08:00. Authoritative source is `./`. **No release pass.**
 This is the existing REVIEW_AND_PRACTICAL_ACCEPTANCE batch, not a new inventory.
 Superseded checkpoints are preserved in
 [the history](CLOSURE_PLAN_HISTORY_THROUGH_20260907.md) and their linked evidence.
@@ -139,6 +139,111 @@ fails promotion. No third ordinary trial or full-matrix expansion.
   distinguishing early episode does not recur or a rejecting branch is not
   observable, preserve that limit and use source/component proof before more
   logging. No diagnostic throughput acceptance and no automatic second trace.
+
+**Existing-event boundary reached, 02:06:** early QUIC repairs are actually
+committed: new retained fallback copies[196608,211208) atUnix1788803911806;
+another covering repair[327627,342227) follows at1911ms of that second.
+Ordered release of the latter waits until1788803912039 (128ms after command
+commit); native handoff/winning copy are not recorded. The diagnostic is a
+different random execution, not a replay of the ordinary20s deficit. It then
+marks QUIC request attachment4/3 stale at1788803914227, excluding that target
+from both new originals and retained repairs. Next QUIC original commitment
+is9.555s later. Native progress does not itself disprove this Product state.
+The absent last-eligible-ACK/probe lifecycle fields prevent exact attribution.
+No automatic trace repeat or production correction follows these observations.
+
+### Current transaction: locate the measured nine-second re-entry exclusion
+
+- **Question/competing causes:** did actual unique Product progress fail its
+  stale clock/epoch projection; did the requalification probe expire before
+  leaving local/QUIC repair ordering; or did forward, reverse or actor service
+  delay its exact receipt? These lead to different model corrections.
+- **Evidence/model:** the last capture withdraws QUIC at3.055s and next commits
+  originals at12.610s. Before withdrawal it commits9.49MB stale-TCP handoff
+  to the higher-priority QUIC repair stream. Source inspection confirms
+  StreamRequalifyData shares that FIFO, so prior repair can delay its probe;
+  priority can also delay ordinary QUIC service. These are reachable competing
+  mechanisms, not yet attribution. T06 explicitly excluded declared-stale
+  handoff; do not misclassify its large extent as a newly discovered mismatch
+  merely from broader RFC wording, or revert its proven live-frontier bound.
+- **Smallest action justified after the missing-evidence review:** one isolated,
+  opt-in lab-diagnostics overlay. Record request stale-clock transitions and
+  final exact-ACK eligibility; probe publication/deadline/expiry/receipt at
+  existing owners; only probe H3 write/decode/route and ACK publication plus
+  client pre-mailbox/adjudication boundaries. Both possible return transports
+  are observed. Reuse exact target/probe identities and clocks; no new policy,
+  durable production state, gain, priority, timeout, credit, profile or harness.
+  Compile once, freeze the diagnostic executable, archive and reverse only
+  that overlay before one unchanged mixed combined upload capture. All
+  ordinary comparisons continue using the existing frozen executables.
+- **Falsifiers/stop:** an eligible current-epoch unique ACK before stale expiry
+  exposes a clock/effect inconsistency; probe expiry before writer dequeue
+  exposes local FIFO delay; timely peer probe receipt followed by delayed client
+  receipt points later in the chain. H3 write completion is local acceptance,
+  never wire transmission. If the excluded interval does not recur, keep the
+  inconclusive result; no repeat to obtain a selected mean or automatic broad
+  instrumentation. Diagnose observed ownership/timing before any runtime fix.
+- **Cost/disposition:** diagnostic scheduling is perturbed and its rate cannot
+  pass the ordinary gate. Extra logs are restricted to the missing causal
+  boundaries, not a permanent dashboard feature. This is an explicitly chosen
+  follow-up after source review, not the prohibited automatic second trace.
+
+**Capture frozen before execution, 02:14:** label
+`retained-frontier-requalification-diag-0908`; executable
+`./.tmp/reflection/bin/retained-requalification-diag-20260908/mptunnel`.
+One `mixed combined up` run with the unchanged mirrored profile. Filter:
+`request_stale_clock,request_requalification,requalification_transport,request_requalification_server,path_model,request_path_stale,request_retained_frontier_reinjection,sender_service_decision,server_receive_hole,server_receive_delivery_stall,stream_ack_received,client_path_frame_error`.
+Keep native trace off; management continues existing snapshots. No bulk-frame
+native write log is added. Build and lab do not overlap.
+
+**Capture complete, 02:24:** diagnostic build1m31s; all seven runtime overlay
+files reversed after executable freeze. Raw capture archived
+REQUEST_REQUALIFICATION_DIAGNOSTIC_20260908.raw.tar.gz. It completes exact
+500236288B/42.715124s, maxconfirmationgap4.662451s; these diagnostic timings
+are not acceptance. QUIC probe3 leaves the local FIFO/H3 write in the same
+logged millisecond as publication, reaches peer102ms later and reaches the
+client mailbox before D, but is adjudicated after expiry. The local probe
+FIFO is not this occurrence's cause. Keep actor queue delay separate; do not
+lengthen deadlines or accept old probe epochs from this observation.
+
+### Current transaction: exact unique bytes discarded by a partial copy
+
+- **Observed failure:** last QUIC eligible progress at3374ms freezes249643us
+  of persistence. QUIC original `[64028513,64094049)` has only one overlapping
+  TCP copy `[64028513,64043113)`. Full original ACK at3535ms is classified
+  wholly non-proving, discarding50936 uniquely attributable bytes. A second
+  65536B original `[64487265,64552801)` has only its14600B prefix copied;
+  fullACK at3620ms similarly discards50936 unique bytes. QUIC is withdrawn
+  at3624ms. Trace publications/ACK ranges identify exact owners and copies.
+- **Question/model:** attribution is a byte-set property, not an original
+  frame or ACK partition property. For original O, acknowledged A and union
+  of multiply-owned intervals D, proving bytes are `(O intersect A) minus D`,
+  clipped to original eligible incarnation/epoch. Settlement remains all of
+  `O intersect A`, and every overlapping copy is settled independently.
+  Coalescing or splitting equal ACK coverage must not change the union of
+  proving bytes. Native ACKs, duplicated bytes and revoked epochs prove none.
+- **Origin/intention:** the request whole-intersection overlap predicate
+  predates v6; it correctly avoids inventing a winning carrier for duplicate
+  bytes, but incorrectly transfers that ambiguity to adjacent unique bytes.
+  The separately captured original-receipt branch removed in1a79f69 was not
+  the stale-progress consumer and is not a reason to restore that machinery.
+  RFC8.3/15.2 already require exact unambiguous byte progress; this is a code
+  mismatch, not justification for a new timeout or looser health model.
+- **Falsifier/action:** first add a small actual-ledger combined-ACK RED and
+  split-ACK control using original65536/copy14600 plus a retained omitted
+  owner range. Verify exact debt release, unique50936, replay and revoked
+  epoch fences. Existing trace supplies actual timing reachability. No
+  production correction before RED; independently audit trace intersections.
+- **Correction boundary:** partition released evidence at existing ambiguity
+  endpoints, preserving original/copy settlement, qualification receipt clips,
+  immutable ownership clocks and native authority. Check the same response
+  consumer for symmetric byte semantics; no unrelated allocator/probe fix.
+- **Expected benefit/cost/gate:** avoid withdrawing a delivering attachment
+  merely because a small hedge overlaps one frame. More ephemeral release
+  atoms are bounded by existing flight/ACK/ambiguity endpoints; no retained
+  timers, retry allowance or rate hint. Test disjoint/full/partial duplicates,
+  exact qualification and stale epochs before one ordinary affected pair.
+  Actual conditional GREEN does not waive timing, loaded latency or release.
 
 
 **Held preceding transaction: request/upload rate refresh.** The existing sampler
@@ -425,11 +530,10 @@ remain outside this batch unless evidence and user scope justify inclusion.
 
 ## Execution and continuity
 
-- The prefix diagnostic is complete/censored and owned products/probes are
-  stopped, origin services retained. Isolated recovery correction passes21
-  focused controls; ordinary TCP remains incomplete/adverse and the diagnostic
-  proves prompt copy publication followed by slow ordered service. Next is
-  the single explicitly declared mixed/upload discriminator. No build remains.
+- The TCP and mixed ordinary comparisons remain unaccepted. Existing-event
+  traces are complete and owned products/probes are stopped, origins retained.
+  The current action is the explicitly declared request requalification timing
+  observation overlay/capture above, not matrix expansion or a new controller.
   Sampler overlay stays shelved/unaccepted; original RED archive is retained.
 - Use the owned Docker topology only, not host shaping or sudo. Preserve exact
   executable/profile, phase clocks, full series and adverse results. Do not

@@ -604,3 +604,40 @@ evidence. Early ordered-work attribution is unresolved; this ordinary pair
 does not identify a QUIC repair-bypass episode. Keep the adverse phase history,
 stop the matrix, and do not seek a favorable third mean or tune a gain from
 aggregate counters.
+
+### Mixed prefix trace: the next missing owner boundary (02:14 +08:00)
+
+The unchanged diagnostic cell `mixed-combined-up-retained-frontier-mixed-prefix-diag-0908`
+is archived in REQUEST_RETAINED_FRONTIER_MIXED_DIAGNOSTIC_20260908.raw.tar.gz.
+It completes 387,317,760 B in 44.085606 s, with maximum confirmation/write gaps
+2.213740/4.151510 s. Logging perturbs scheduling; these are not ordinary
+acceptance or a favourable replacement for the preceding pair.
+
+Use the shared Unix clock, not differences between process-monotonic clocks:
+client original TCP0/instance1 `[327627,393057)` is committed at
+1788803911291; the retained correction commits QUIC0/instance4 repair
+`[327627,342227)` at 1788803911911. Server ordered delivery releases the
+whole 65,430 B at 1788803912039, 128 ms after repair-command commitment.
+The winning original/copy and native write boundary remain unobserved.
+This disproves a blanket claim that QUIC is never selected for recovery.
+
+At 1788803913866 another QUIC repair covers `[2686923,2701523)`.
+TCP0 goes request-stale at 3874 ms; the next 113 ms publishes 9,488,120 B
+of its following retained work onto QUIC through stale-path reinjection.
+The server releases the preceding 14,600 B at 3897 ms: that following
+bulk handoff did not block this preceding repair. Its effect on subsequent
+service is a separate, presently unproven explanation.
+
+QUIC request attachment 4/3 becomes stale at 1788803914227 (client
+monotonic 3.055 s). Its next original publication is at 12.610 s,
+9.555 s later. Native ACK progress during this interval is not necessarily
+current-epoch, unique Product progress. The existing trace lacks final
+Product evidence eligibility and the exact requalification probe lifecycle,
+so it cannot distinguish a clock inconsistency from local FIFO, forward,
+reverse or actor delay. This is the next explicitly bounded question.
+
+The temporary overlay is preserved as REQUEST_REQUALIFICATION_TRACE_20260908.patch.
+It records those missing boundaries only; it changes no recovery policy and
+will be reversed after freezing its diagnostic binary, before the single
+declared follow-up. Publication/H3 acceptance still must not be called wire
+departure. No automatic repeat if the exclusion does not recur.

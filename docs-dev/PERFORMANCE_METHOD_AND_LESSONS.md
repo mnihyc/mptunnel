@@ -88,6 +88,9 @@ Finite state/work or eventual service is not a useful wall-clock bound.
    feedback -> next assignment. State byte domain, direction, incarnation,
    lifetime, wake owner, irreversible work and estimator feedback. Distinguish
    resource permission from placement choice and observation from capacity.
+   Preserve evidence type: a positive receipt, a receiver's authoritative
+   omission, and a sender's exact retained ownership are different facts.
+   One narrower evidence view must not silently gate every valid recovery path.
 4. **Predict before implementing.** Give one reachable counterexample, a
    falsifier, expected practical benefit, cost and likely regression case.
    Check sparse work, unknown paths, shared contention, failure/recovery and
@@ -163,12 +166,16 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Next decision, not another architecture expansion
 
-Keep the sampler's proven mechanism separate from its failed ordinary acceptance.
-Use the existing pair to decide the smallest remaining evidence requirement:
-which exact owner holds the undelivered prefix and why it cannot progress after
-service recovery. Observed native ACK progress plus large socket queues is not
-an exact attribution of a two-second application gap. Do not add congestion
-gains or silently promote the sampler on partial confirmed-byte totals.
+CURRENT_CLOSURE_PLAN is the sole current transaction/next-action ledger; do not
+repeat an earlier experiment simply because this retrospective mentions it.
+Keep the sampler's proven mechanism separate from withheld ordinary acceptance.
+The first use of this workflow preserved its incomplete pair, ruled out an
+apparent native ACK freeze using live sockets, then used one existing-event
+capture to expose the request recovery horizon/positive-frontier mismatch.
+The accompanying REQUEST_COHORT_ORDINARY_20260907 artifact records this chain,
+the exact 4.176371s stall, remaining attribution limits and independent audits.
+It does not prove that a newly eligible repair will improve user timing.
+Do not add congestion gains or promote a candidate on partial byte totals.
 
 Then close the existing allocation/recovery contract and affected controls
 before expanding comparisons. Documentation is a decision ledger, not a

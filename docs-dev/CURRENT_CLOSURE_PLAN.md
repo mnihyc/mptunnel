@@ -102,6 +102,49 @@ evidence boundary if necessary; do not add another trace family automatically.
 Synchronous event logging makes this a causal capture, not ordinary throughput
 or sampler promotion evidence.
 
+**Discriminator complete, 2026-09-08 00:42 +08:00:** one existing-binary trace
+reproduces a 4.176371s ordered upload stall at frontier 21,364,471. Its original
+64 KiB range was published 10.817s before release, with no covering repair.
+Suffix assignment and ACK release continue. All complete ACKs have greatest
+end at most 11,009,783; the retained negative horizon is therefore exactly that
+value. Partial ACKs advance the actual mux frontier beyond it. ACK-gap recovery
+cannot see the newer hole, while the retained-tail entry guard requires the
+old snapshot's contiguous prefix to equal the current mux frontier and rejects
+before owner age or alternate admission. Independent source/trace audits agree.
+This is a recovery-evidence composition defect, not a native-loss declaration
+or proof that a copy would necessarily improve the measured timing.
+
+### Active transaction: retained recovery beyond complete-ACK horizon
+
+- **Observed failure/question:** exact retained OriginalData above an older
+  complete-ACK horizon loses both gap and tail recovery eligibility during
+  supported partial-positive feedback. Why should negative evidence constrain
+  a separately valid retained-owner fallback?
+- **Model:** H is the negative horizon, F the actual positively acknowledged
+  mux frontier. Complete `[0,1)` then partial `[1,2)` and `[3,4)` yields H=1,
+  F=2, exact retained `[2,3)` on A. Even with A's original recovery deadline
+  elapsed and an eligible B, stored `[0,H)` fails the tail equality against F.
+  This contradicts RFC8.3's separation of local retained ownership from remote
+  negative authority. Never extend H using local assignment or partial ACKs.
+- **Competing correction:** cumulative feedback can advance H when its full
+  ranges fit one frame, but cannot be the sole recovery dependency: legal
+  fragmented snapshots remain incomplete. Inspect the sparse producer contract
+  separately, without coupling two source changes into this candidate.
+- **Smallest next action:** one live retained-tail RED plus its aligned-horizon
+  control, before implementation. Use actual cache/original-owner commits and
+  partial ACK release; prove exact F/H, owner age and alternate qualification.
+  A fixture failure before the recovery assertion does not count as RED.
+- **Falsifier:** if current recovery reaches the same eligible owner/target for
+  stale H as for aligned H, this proposed rejection mechanism is disproved.
+- **Correction boundary:** derive retained fallback authority from current F,
+  exact cached owner-uniform prefix and immutable owner clock. Preserve copy
+  suppression, target ranking, publication/native admission and resource scope.
+  No timeout/limit/gain change or unconditional duplication.
+- **Adverse case and gate:** delayed positive ACKs can cause a redundant copy
+  although native delivery succeeded; shared contention can make that copy
+  harmful. Focused RED/GREEN and ordinary timing/overhead gates remain required.
+  No sampler or recovery candidate is accepted from this trace alone.
+
 ## Existing dispositions that must not be lost
 
 - **Retained for demonstrated mechanisms:** native packet-number/reordering
@@ -153,10 +196,11 @@ remain outside this batch unless evidence and user scope justify inclusion.
 
 ## Execution and continuity
 
-- No build/lab is running; owned products/probes were stopped, origin services
-  retained. Two audit agents reached their usage limit after the ordinary pair;
-  their completed model/source reviews remain valid, but no unfinished final
-  artifact/review is claimed. Complete pending evidence locally if needed.
+- No build/lab is running; the single prefix diagnostic is complete/censored
+  and owned products/probes are stopped, origin services retained. Fresh
+  independent trace/source audits completed. A bounded test-only retained-tail
+  RED/control is being prepared; no recovery runtime change is authorized by
+  an unreviewed fixture. Existing sampler runtime remains unaccepted.
 - Use the owned Docker topology only, not host shaping or sudo. Preserve exact
   executable/profile, phase clocks, full series and adverse results. Do not
   expand test infrastructure or repeat already conclusive diagnostics.
@@ -164,5 +208,5 @@ remain outside this batch unless evidence and user scope justify inclusion.
   LIVE_OWNER_FRONTIER_WORK_BOUND.md untouched. No rejected runtime overlay is
   active. Preserve useful temporary evidence before scoped cleanup.
 - Telegram milestones/blockers are authorized at intervals of at least one
-  hour; last sent 2026-09-07 07:30 UTC. No release gate currently permits a
+  hour; last milestone sent 2026-09-07 16:44 UTC. No release gate currently permits a
   push/release. Resume this exact priority after compaction.

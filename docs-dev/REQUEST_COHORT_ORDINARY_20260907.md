@@ -116,3 +116,77 @@ estimate, aggregate sibling ACK progress or finite total backlog cannot decide
 this. First check whether existing diagnostic events provide the mapping;
 collect only missing discriminating observations, not a new harness or another
 broad matrix. This artifact does not assign the slower gap to the sampler.
+
+## Follow-up: exact prefix discriminator, 2026-09-08
+
+One unchanged-candidate, unchanged-profile TCP upload capture used existing
+events, with no rebuild or instrumentation/probe edit. Its raw evidence is
+[archived here](REQUEST_PREFIX_DIAGNOSTIC_20260908.raw.tar.gz), under
+`results/tcp-combined-up-request-cohort-prefix-diag-0908/`.
+Enabled events: `sender_service_decision`, `server_receive_hole`,
+`server_receive_delivery_stall`, `stream_ack_received`, `tcp_sender_metrics`,
+`client_sender_enqueue`, `request_path_stale`, `client_path_frame_error`.
+Synchronous diagnostics make this causal evidence, not a throughput comparison.
+Again censored at the existing guard: 97,189,623/116,588,544 confirmed/accepted
+bytes in 85.616251s; confirmation gap 4.171412s. Products/probe are stopped;
+three origin services remain. No subsequent experiment follows this capture.
+
+### Exact observed episode
+
+Logical stream 0; physical mappings remain stable throughout:
+client path index 0/1/2 maps to instance 2/1/3 respectively.
+
+| Boundary | Timestamp, Unix ms | Evidence |
+| --- | ---: | --- |
+| Original `[21364471,21430007)` published on TCP index 1 | 1788798709118 | `client.log:2051`, post-command-publication event |
+| Last reassembly progress, frontier 21364471 | 1788798715759 | `server.log:3091` |
+| Next reassembly progress, frontier 21430007 | 1788798719935 | `server.log:3619`, explicit 4,176,371 us gap |
+| Covering repair | none | Complete client publication trace has none |
+
+The original was published 10.817s before its reassembly release. During the
+4.176371s gap, 318 ACK events release 6,946,816 B of other received work and
+8,650,752 B of new originals are published across the three carriers. Every
+ACK evaluation reports an alternative available, persistent repair not ready,
+and zero queued gap repairs. Matching target writes remain 21,364,471 B in
+service samples 26--29 s. The receiver's reordered bytes grow from 4,587,520 to
+11,665,408 B. This disproves missing source assignment and a completely stopped
+Product actor; it does not divide the original's downstream delay precisely.
+
+The first hole in the same capture was different: original `[131072,196608)`
+on index 0 already had a partial copy on index 1 published 21ms before server
+hole observation. Later stalls must not be generalized to "repair never ran."
+Persistent nonempty reorder state likewise does not mean 85s without delivery.
+
+### Proven recovery-evidence mismatch
+
+All 27 complete ACK events have greatest end at most **H = 11,009,783**;
+the last is at 1788798692173. A larger complete observation cannot be hidden
+by the idempotency early return: `AuthoritativeStreamAckSnapshot::subsumes`
+explicitly rejects an incoming horizon greater than stored H. The synchronous
+ACK update then reaches the recorded evaluator. Partial positives are correctly
+clipped to H only in this negative-authority snapshot; actual cache/flight ACK
+release and positive mux frontier advance independently.
+
+Thus, at stalled positive frontier **F = 21,364,471 > H**:
+
+1. Authoritative ACK-gap recovery cannot select the current missing range.
+2. Retained tail recovery also requires stored ranges exactly `[0,F)`. Its
+   stored prefix is bounded by H, so it returns before original age, eligible
+   alternate or service admission. Source closure does not bypass that guard.
+
+The negative-horizon rule is intentional and must remain: a partial ACK's
+omission is not loss. `3353d7d` introduced retained negative authority and
+`5e1ace6` corrected its horizon to receiver evidence rather than local sent
+extent. The composition error is using this narrower snapshot as a prerequisite
+for separately valid positive retained-owner fallback. RFC8.3 explicitly keeps
+retained ownership above H valid for Product recovery, without declaring loss.
+This is not a stateless packed-codec defect or proof that every copy is useful.
+
+Symbolic case: complete `[0,1)`, then partial `[1,2)` and `[3,4)`, leaves H=1,
+F=2 and exact retained `[2,3)` on A. Even after A's original recovery interval
+and with qualified B available, the equality guard rejects. Correcting only
+sparse publication cannot solve the general case: legal multi-frame snapshots
+are all incomplete. A focused real-owner RED/control is the next stage before
+changing fallback authority. Preserve native ownership, exact copy suppression,
+ranking and service bounds; delayed ACKs/shared contention are the adverse
+case because a speculative copy may arrive unnecessarily and cost latency.

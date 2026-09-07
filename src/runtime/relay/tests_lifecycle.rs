@@ -731,6 +731,63 @@ async fn final_linearization_omits_preexisting_detach_but_is_immutable_afterward
 }
 
 #[tokio::test]
+async fn late_startup_failed_attempt_can_remain_in_flight_after_final_publication() {
+    let stream_id = StreamId(149);
+    let opening_key = relay_key(UnderlayProtocol::Tcp, 0);
+    let delayed_key = relay_key(UnderlayProtocol::Tcp, 1);
+    let (commands, mut receivers) = reliable_path_command_channels(8);
+    let opening = OpenedRemoteStream::pending(
+        test_stream(
+            stream_id,
+            UnderlayProtocol::Tcp,
+            0,
+            commands,
+            TrafficClass::Throughput,
+        ),
+        0,
+    );
+    let instance = opening.path_instance_id();
+    let plan = Arc::new(
+        ReliableRelayReturnPlan::new(
+            58_400,
+            PathUsage::Available,
+            vec![(opening_key, Some(instance)), (delayed_key, None)],
+        )
+        .expect("frozen two-carrier plan"),
+    );
+    let mut remotes = ReliableRelayRemoteSet::new(opening, 8);
+    let mut startup = ClientReliableReturnPlan::from_initial_open(
+        ReliableRelayOpenedStartup {
+            plan: plan.clone(),
+            opening_ordinal: 0,
+            failed_ordinals: Vec::new(),
+        },
+        remotes.paths[0].instance(),
+    )
+    .expect("requester owns startup settlement");
+    assert!(startup.observe_response_frontier(58_400));
+    assert_eq!(startup.begin_candidate_for_open(delayed_key, None), Some(1));
+    // The real opener freezes this wire phase before publication. A completed
+    // native write does not mean the independent carrier's peer has read it.
+    let delayed_open = plan.wire(StreamAttachmentPhase::Startup, 1);
+    assert!(startup.prepare_final(&remotes).is_none());
+    settle_client_return_plan_open_result(&mut startup, &remotes, delayed_key, Some(1), false)
+        .expect("a local open timeout settles only the attempted ordinal");
+    let retained = startup
+        .prepare_final(&remotes)
+        .expect("all attempts settled")
+        .to_vec();
+    assert_eq!(retained, vec![0]);
+    remotes
+        .publish_return_plan_final(&retained)
+        .expect("publish on surviving carrier");
+    expect_return_plan_final(&mut receivers, stream_id, &[0]).await;
+    assert_eq!(delayed_open.phase, StreamAttachmentPhase::Startup);
+    assert_eq!(delayed_open.candidate_ordinal, 1);
+    assert_eq!(startup.prepare_final(&remotes), Some(&[0][..]));
+}
+
+#[tokio::test]
 async fn final_can_publish_empty_after_all_startup_members_leave() {
     let (mut startup, mut remotes, second) = accepted_two_candidate_return_plan(StreamId(45));
     let first = remotes.paths[0].instance();

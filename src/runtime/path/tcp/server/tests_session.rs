@@ -592,6 +592,182 @@ async fn restart_retained_stream_accepts_ordinary_on_a_new_carrier() {
 }
 
 #[tokio::test]
+async fn late_startup_after_final_refuses_only_the_tcp_attachment() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut session, mut client, commands, path_frames, _relay) =
+            server_tcp_test_session(SessionId(614), PathId(1)).await;
+        let context = session.context.clone();
+        let session_id = session.session_id;
+        let stream_id = StreamId(51);
+        let sibling_id = StreamId(52);
+        let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+        let opening = context.reliable_streams.register_test_carrier_path(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+        );
+        let (opening_commands, _opening_receiver) = reliable_path_command_channels(8);
+        let plan = StreamReturnPlan {
+            trigger_bytes: 58_400,
+            candidate_total: 2,
+            candidate_tier: PathUsage::Available,
+            phase: StreamAttachmentPhase::Create,
+            candidate_ordinal: 0,
+        };
+        context
+            .reliable_streams
+            .open_or_attach(crate::runtime::path::ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: target.clone(),
+                initial_demand: StreamDemandHint::Latency,
+                return_plan: plan,
+                attachment: crate::runtime::path::ServerStreamPathAttachment {
+                    path_registration: opening.clone(),
+                    commands: opening_commands,
+                    max_frame_payload_bytes: context.mux_limits.max_payload_bytes,
+                },
+                mux_limits: context.mux_limits,
+            })
+            .await
+            .expect("CREATE accepted on carrier A");
+        session
+            .handle_frame(Frame::OpenStream {
+                stream_id: sibling_id,
+                target: target.clone(),
+                demand: StreamDemandHint::Latency,
+                return_plan: Default::default(),
+            })
+            .await
+            .expect("unrelated logical stream already owns carrier B");
+        let admission = recv_reliable_path_command(&mut session.commands_rx)
+            .await
+            .expect("sibling admission");
+        session
+            .drain_commands(admission)
+            .await
+            .expect("publish sibling admission");
+        assert_eq!(
+            client.read_frame().await.expect("sibling accepted"),
+            Frame::StreamMaxData {
+                stream_id: sibling_id,
+                max_offset: 0,
+            }
+        );
+
+        // B's STARTUP was written before the local attempt timed out. Keep its
+        // delivery pending while the accepted-or-failed requester publishes
+        // FINAL on A. These independent carriers have no cross-carrier fence.
+        let delayed_open = Frame::OpenStream {
+            stream_id,
+            target: target.clone(),
+            demand: StreamDemandHint::Latency,
+            return_plan: StreamReturnPlan {
+                phase: StreamAttachmentPhase::Startup,
+                candidate_ordinal: 1,
+                ..plan
+            },
+        };
+        context
+            .reliable_streams
+            .route_frame(
+                &opening,
+                stream_id,
+                Frame::StreamReturnPlanFinal {
+                    stream_id,
+                    retained_ordinals: vec![0],
+                },
+            )
+            .await
+            .expect("FINAL omits the locally failed B attempt");
+        let actor = tokio::spawn(session.run());
+        path_frames
+            .send(Ok(delayed_open))
+            .await
+            .expect("deliver already-published late STARTUP");
+        assert_eq!(
+            client
+                .read_frame()
+                .await
+                .expect("late enrollment has an attachment-scoped reply"),
+            Frame::StreamDetach { stream_id }
+        );
+        // Cancellation is ordered after OPEN on B; no Product data is allowed
+        // before acceptance. Its trailing zero grant and DETACH are harmless.
+        path_frames
+            .send(Ok(Frame::StreamMaxData {
+                stream_id,
+                max_offset: 0,
+            }))
+            .await
+            .expect("trailing opener credit");
+        path_frames
+            .send(Ok(Frame::StreamDetach { stream_id }))
+            .await
+            .expect("ordered canceled-attempt detach");
+        commands
+            .send_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id: sibling_id,
+                    offset: 0,
+                    payload: Bytes::from_static(b"sibling"),
+                },
+                TrafficClass::Latency,
+            )
+            .await
+            .expect("sibling still sends on the same carrier");
+        assert_eq!(
+            client
+                .read_frame()
+                .await
+                .expect("sibling payload after obsolete enrollment"),
+            Frame::StreamData {
+                stream_id: sibling_id,
+                offset: 0,
+                payload: Bytes::from_static(b"sibling"),
+            }
+        );
+        path_frames
+            .send(Ok(Frame::OpenStream {
+                stream_id,
+                target,
+                demand: StreamDemandHint::Latency,
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..plan
+                },
+            }))
+            .await
+            .expect("later Ordinary attachment uses retained logical state");
+        assert_eq!(
+            client
+                .read_frame()
+                .await
+                .expect("ordinary attachment accepted"),
+            Frame::StreamMaxData {
+                stream_id,
+                max_offset: 0,
+            }
+        );
+        let snapshot = context.reliable_streams.management_snapshot();
+        assert_eq!(
+            snapshot.paths.len(),
+            2,
+            "neither physical carrier was retired"
+        );
+        assert_eq!(
+            snapshot.active_streams, 2,
+            "no Product reset or replacement target"
+        );
+        actor.abort();
+        let _ = actor.await;
+    })
+    .await
+    .expect("late STARTUP scope test completes without a carrier stall");
+}
+
+#[tokio::test]
 async fn server_tcp_l3_mode_rejects_l4_forwarding_opens() {
     let (mut session, mut client, _commands, _path_frames, _relay) =
         server_tcp_test_session_with_mode(

@@ -40,6 +40,12 @@ pub(super) struct ResponseStartupAttachmentCommit {
     binding: Option<(u8, ResponseAcquisitionOutputId)>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ResponseStartupAttachmentDecision {
+    Admit(ResponseStartupAttachmentCommit),
+    RefuseObsoleteEnrollment,
+}
+
 #[derive(Debug)]
 enum ResponseStartupPlanPhase {
     /// A one-member selected tier with `total=1,h=0` is ready immediately.
@@ -112,14 +118,15 @@ impl ResponseStartupPlanState {
     }
 
     /// Validates one attachment while the caller holds the response-output
-    /// lock, returning an infallible state mutation to commit before unlock.
+    /// lock, returning either a refusal or an infallible mutation to commit.
     /// ORDINARY attachments preserve recovery before FINAL but never enroll,
     /// settle, or otherwise mutate the frozen startup plan.
     pub(super) fn prepare_attachment(
         &self,
         plan: StreamReturnPlan,
         exact: ResponseAcquisitionOutputId,
-    ) -> Result<ResponseStartupAttachmentCommit, RuntimeError> {
+    ) -> Result<ResponseStartupAttachmentDecision, RuntimeError> {
+        use ResponseStartupAttachmentDecision::{Admit, RefuseObsoleteEnrollment};
         validate_return_plan_shape(plan)?;
         match &self.phase {
             ResponseStartupPlanPhase::Singleton {
@@ -129,7 +136,7 @@ impl ResponseStartupPlanState {
                 validate_signature(plan, 0, 1, *candidate_tier)?;
                 match plan.phase {
                     StreamAttachmentPhase::Ordinary => {
-                        Ok(ResponseStartupAttachmentCommit { binding: None })
+                        Ok(Admit(ResponseStartupAttachmentCommit { binding: None }))
                     }
                     StreamAttachmentPhase::Startup | StreamAttachmentPhase::Create
                         if plan.candidate_ordinal == 0 =>
@@ -139,7 +146,7 @@ impl ResponseStartupPlanState {
                                 "return-plan ordinal reused by another exact attachment",
                             ));
                         }
-                        Ok(ResponseStartupAttachmentCommit { binding: None })
+                        Ok(Admit(ResponseStartupAttachmentCommit { binding: None }))
                     }
                     StreamAttachmentPhase::Startup | StreamAttachmentPhase::Create => {
                         unreachable!("shape checked ordinal")
@@ -154,7 +161,7 @@ impl ResponseStartupPlanState {
             } => {
                 validate_signature(plan, *trigger_bytes, *candidate_total, *candidate_tier)?;
                 if plan.phase == StreamAttachmentPhase::Ordinary {
-                    return Ok(ResponseStartupAttachmentCommit { binding: None });
+                    return Ok(Admit(ResponseStartupAttachmentCommit { binding: None }));
                 }
                 if let Some(bound) = bindings.get(&plan.candidate_ordinal) {
                     if *bound != exact {
@@ -162,16 +169,16 @@ impl ResponseStartupPlanState {
                             "return-plan ordinal reused by another exact attachment",
                         ));
                     }
-                    return Ok(ResponseStartupAttachmentCommit { binding: None });
+                    return Ok(Admit(ResponseStartupAttachmentCommit { binding: None }));
                 }
                 if bindings.values().any(|bound| *bound == exact) {
                     return Err(RuntimeError::Protocol(
                         "return-plan exact attachment reused by another ordinal",
                     ));
                 }
-                Ok(ResponseStartupAttachmentCommit {
+                Ok(Admit(ResponseStartupAttachmentCommit {
                     binding: Some((plan.candidate_ordinal, exact)),
-                })
+                }))
             }
             ResponseStartupPlanPhase::Finalized {
                 trigger_bytes,
@@ -182,11 +189,12 @@ impl ResponseStartupPlanState {
             } => {
                 validate_signature(plan, *trigger_bytes, *candidate_total, *candidate_tier)?;
                 if plan.phase != StreamAttachmentPhase::Ordinary {
-                    return Err(RuntimeError::Protocol(
-                        "startup attachment arrived after return-plan finalization",
-                    ));
+                    // Local attempt expiry permits FINAL on another carrier
+                    // while an already-written enrollment is still in flight.
+                    // Keep FINAL absorbing without retiring unrelated owners.
+                    return Ok(RefuseObsoleteEnrollment);
                 }
-                Ok(ResponseStartupAttachmentCommit { binding: None })
+                Ok(Admit(ResponseStartupAttachmentCommit { binding: None }))
             }
         }
     }

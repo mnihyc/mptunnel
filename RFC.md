@@ -1274,8 +1274,16 @@ The responder accepts the first finalization only when every retained ordinal
 is in range, strictly increasing, and enrolled by an exact accepted startup
 attachment. In one transaction it withdraws every omitted enrolled output from
 new Product placement before removing the prefix ceiling. An equal repeated
-finalization is idempotent; a different repetition or a new `CREATE`/`STARTUP`
-attachment after finalization is a protocol violation. The requester retains
+finalization is idempotent; a different repetition is a protocol violation.
+An otherwise valid `CREATE`/`STARTUP` attachment arriving after finalization
+MUST be refused at attachment scope with `STREAM_DETACH`, without changing the
+retained set or admitting an output. A locally expired enrollment may already
+be in flight when FINAL arrives through another carrier; its later arrival is
+not proof of carrier or logical-stream failure. Shape, ordinal, and frozen
+signature validation still apply. The receiver MUST NOT implicitly promote
+that obsolete enrollment to `ORDINARY`, reset the logical stream, or retire
+the shared carrier. A subsequent explicit `ORDINARY` attachment remains legal.
+The requester retains
 the finalization publication until the contiguous response frontier exceeds
 `h`, or until an exact terminal declaration proves either `final_offset > h`
 or contiguous receipt through that final offset. These rules preserve already

@@ -1520,6 +1520,12 @@ impl ServerReliableStreamRegistry {
             let response_lane = entry.binding.lane();
             if matches!(
                 attach_outcome,
+                ResponseStreamAttachOutcome::RejectedObsoleteEnrollment
+            ) {
+                return Ok(ServerReliableStreamOpen::Rejected);
+            }
+            if matches!(
+                attach_outcome,
                 ResponseStreamAttachOutcome::RejectedClosedStream
             ) {
                 #[cfg(feature = "lab-diagnostics")]
@@ -1546,6 +1552,9 @@ impl ServerReliableStreamRegistry {
                     ResponseStreamAttachOutcome::Attached => "attached",
                     ResponseStreamAttachOutcome::ReplacedClosedOutput => "replaced_closed_output",
                     ResponseStreamAttachOutcome::RejectedClosedStream => "rejected_closed_stream",
+                    ResponseStreamAttachOutcome::RejectedObsoleteEnrollment => {
+                        "rejected_obsolete_enrollment"
+                    }
                 };
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(

@@ -124,24 +124,30 @@ fn ordinary_pre_final_attach_does_not_enroll_and_exact_final_is_absorbing() {
     )
     .expect("multipath startup plan");
 
-    let ordinary = state
+    let ResponseStartupAttachmentDecision::Admit(ordinary) = state
         .prepare_attachment(
             plan(58_400, 2, StreamAttachmentPhase::Ordinary, 0),
             alternate,
         )
-        .expect("ordinary recovery attachment remains legal before final");
+        .expect("ordinary recovery attachment remains legal before final")
+    else {
+        panic!("ordinary attachment must be admitted");
+    };
     state.commit_attachment(ordinary);
     assert!(
         state.finalize_for_test(&[0, 1]).is_err(),
         "ordinary attachment cannot silently enroll a startup ordinal",
     );
 
-    let startup = state
+    let ResponseStartupAttachmentDecision::Admit(startup) = state
         .prepare_attachment(
             plan(58_400, 2, StreamAttachmentPhase::Startup, 1),
             alternate,
         )
-        .expect("exact startup enrollment");
+        .expect("exact startup enrollment")
+    else {
+        panic!("unresolved startup must be admitted");
+    };
     state.commit_attachment(startup);
     assert_eq!(
         state.finalize_for_test(&[0, 1]).expect("exact final"),
@@ -158,12 +164,15 @@ fn ordinary_pre_final_attach_does_not_enroll_and_exact_final_is_absorbing() {
     );
     assert!(state.finalize_for_test(&[0]).is_err());
     assert!(
-        state
-            .prepare_attachment(
-                plan(58_400, 2, StreamAttachmentPhase::Startup, 1),
-                alternate,
-            )
-            .is_err(),
+        matches!(
+            state
+                .prepare_attachment(
+                    plan(58_400, 2, StreamAttachmentPhase::Startup, 1),
+                    alternate,
+                )
+                .expect("well-formed obsolete enrollment is not a carrier error"),
+            ResponseStartupAttachmentDecision::RefuseObsoleteEnrollment
+        ),
         "startup enrollment cannot rearm after final",
     );
 }
@@ -383,6 +392,136 @@ fn rejected_startup_enrollment_publishes_nothing_and_burns_no_exact_identity() {
         .find(|candidate| candidate.observation.key == alternate_key)
         .expect("valid enrollment publishes output");
     assert_eq!(alternate.observation.incarnation, 2);
+}
+
+#[test]
+fn late_startup_refusal_preserves_final_identity_and_evidence() {
+    let (opening_commands, _opening_receiver) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        crate::protocol::SessionId(179),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        opening_commands.clone(),
+        TrafficClass::Throughput,
+    );
+    let opening_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    binding.install_unresolved_response_startup_for_test(
+        58_400,
+        2,
+        PathUsage::Available,
+        opening_key,
+    );
+    binding
+        .finalize_response_startup_plan(&[0])
+        .expect("freeze membership before delayed enrollment");
+    let opening_instance = binding.sender_path_targets(TrafficClass::Throughput, 1)[0]
+        .observation
+        .path_instance_id;
+    let alternate_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let alternate_instance = super::super::next_server_carrier_path_instance_id();
+    let (alternate_commands, _alternate_receiver) = reliable_path_command_channels(8);
+    let attachment = |key: CarrierPathKey, path_instance_id, commands| ResponseOutputAttachment {
+        key,
+        path_instance_id,
+        configured_slot: ConfiguredMemberSlot(key.path_id.0),
+        local_policy: PathPolicy::default(),
+        startup_rate_prior: RateHint::Unknown,
+        commands,
+        state: ResponseOutputAttachmentState {
+            peer_usage: Some((7, PathUsage::Backup)),
+            ..Default::default()
+        },
+    };
+    let membership = binding.output_membership_generation();
+    let model = binding.response_model_generation();
+    for phase in [
+        StreamAttachmentPhase::Startup,
+        StreamAttachmentPhase::Create,
+    ] {
+        for (key, instance, commands, ordinal) in [
+            (opening_key, opening_instance, opening_commands.clone(), 0),
+            (
+                alternate_key,
+                alternate_instance,
+                alternate_commands.clone(),
+                1,
+            ),
+        ] {
+            assert_eq!(
+                binding
+                    .attach_output_with_return_plan_if_session_active(
+                        attachment(key, instance, commands),
+                        plan(58_400, 2, phase, ordinal),
+                    )
+                    .expect("valid obsolete phase is refused, not corrupted"),
+                ResponseStreamAttachOutcome::RejectedObsoleteEnrollment
+            );
+            assert_eq!(binding.output_membership_generation(), membership);
+            assert_eq!(
+                binding.response_model_generation(),
+                model,
+                "same-channel refusal must not install accompanying evidence"
+            );
+        }
+    }
+    for invalid in [
+        plan(58_401, 2, StreamAttachmentPhase::Startup, 1),
+        plan(58_400, 2, StreamAttachmentPhase::Startup, 2),
+    ] {
+        assert!(
+            binding
+                .attach_output_with_return_plan_if_session_active(
+                    attachment(
+                        alternate_key,
+                        alternate_instance,
+                        alternate_commands.clone()
+                    ),
+                    invalid,
+                )
+                .is_err(),
+            "signature and ordinal errors are not obsolete-enrollment refusals"
+        );
+    }
+    assert!(matches!(
+        binding
+            .finalize_response_startup_plan(&[0])
+            .expect("same FINAL is idempotent"),
+        ResponseStartupFinalOutcome::Duplicate
+    ));
+    assert!(
+        binding.finalize_response_startup_plan(&[0, 1]).is_err(),
+        "FINAL cannot reopen"
+    );
+    assert_eq!(
+        binding
+            .sender_path_targets(TrafficClass::Throughput, 1)
+            .len(),
+        1
+    );
+    assert_eq!(
+        binding
+            .attach_output_with_return_plan_if_session_active(
+                attachment(alternate_key, alternate_instance, alternate_commands),
+                plan(58_400, 2, StreamAttachmentPhase::Ordinary, 0),
+            )
+            .expect("explicit Ordinary remains legal"),
+        ResponseStreamAttachOutcome::Attached
+    );
+    let alternate = binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .into_iter()
+        .find(|candidate| candidate.observation.key == alternate_key)
+        .expect("ordinary output");
+    assert_eq!(
+        alternate.observation.incarnation, 2,
+        "refusal allocates no exact identity"
+    );
 }
 
 struct EnrolledBindingFixture {

@@ -13,8 +13,8 @@ use crate::mux::MuxLimits;
 use crate::outbound::OutboundConfig;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    Frame, OffsetRange, PathId, ResetReason, SessionId, StreamAttachmentPhase, StreamDemandHint,
-    StreamId, StreamReturnPlan, TargetAddr, UnderlayProtocol,
+    Frame, OffsetRange, PathId, PathUsage, ResetReason, SessionId, StreamAttachmentPhase,
+    StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::ReliableSendStream;
 use crate::runtime::error::RuntimeError;
@@ -208,6 +208,15 @@ impl ServerUdpTerminalWriterFixture {
     }
 
     async fn open_with_max_streams(stream_id: StreamId, max_streams: Option<usize>) -> Self {
+        Self::open_with_accept_receiver(stream_id, max_streams)
+            .await
+            .0
+    }
+
+    async fn open_with_accept_receiver(
+        stream_id: StreamId,
+        max_streams: Option<usize>,
+    ) -> (Self, mpsc::UnboundedReceiver<AcceptedServerReliableStream>) {
         let shared_secret = SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret");
         let security = ServerSecurityConfig::for_test(shared_secret.clone());
@@ -372,25 +381,28 @@ impl ServerUdpTerminalWriterFixture {
                 .expect("server QUIC stream timeout")
                 .expect("accept server QUIC stream");
 
-        Self {
-            context,
-            session_id,
-            path_id,
-            stream_id,
-            target,
-            _path_registration: path_registration,
-            commands_tx,
-            commands_rx: Some(commands_rx),
-            accepted,
-            server_send: Some(server_send),
-            client_recv: Some(client_recv),
-            client_send: Some(client_send),
-            server_recv: Some(server_recv),
-            _server_endpoint: server_endpoint,
-            _client_endpoint: client_endpoint,
-            _server_connection: server_connection,
-            _client_connection: client_connection,
-        }
+        (
+            Self {
+                context,
+                session_id,
+                path_id,
+                stream_id,
+                target,
+                _path_registration: path_registration,
+                commands_tx,
+                commands_rx: Some(commands_rx),
+                accepted,
+                server_send: Some(server_send),
+                client_recv: Some(client_recv),
+                client_send: Some(client_send),
+                server_recv: Some(server_recv),
+                _server_endpoint: server_endpoint,
+                _client_endpoint: client_endpoint,
+                _server_connection: server_connection,
+                _client_connection: client_connection,
+            },
+            accepted_rx,
+        )
     }
 
     fn attached_output_count(&self) -> usize {
@@ -1385,6 +1397,211 @@ async fn server_quic_duplicate_refusal_preserves_live_attachment() {
         1,
         "refusing a duplicate must preserve the existing live attachment",
     );
+}
+
+#[tokio::test]
+async fn late_startup_after_final_refuses_only_the_quic_attachment() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let sibling_id = StreamId(1490);
+        let stream_id = StreamId(1491);
+        let (mut fixture, mut accepted_rx) =
+            ServerUdpTerminalWriterFixture::open_with_accept_receiver(sibling_id, None).await;
+        fixture.drain_zero_credit_admission().await;
+        let opening = fixture.context.reliable_streams.register_test_carrier_path(
+            fixture.session_id,
+            UnderlayProtocol::Tcp,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        );
+        let (opening_commands, _opening_receiver) = reliable_path_command_channels(8);
+        let plan = StreamReturnPlan {
+            trigger_bytes: 58_400,
+            candidate_total: 2,
+            candidate_tier: PathUsage::Available,
+            phase: StreamAttachmentPhase::Create,
+            candidate_ordinal: 0,
+        };
+        fixture
+            .context
+            .reliable_streams
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id: fixture.session_id,
+                stream_id,
+                target: fixture.target.clone(),
+                initial_demand: StreamDemandHint::Throughput,
+                return_plan: plan,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: opening.clone(),
+                    commands: opening_commands,
+                    max_frame_payload_bytes: fixture.context.mux_limits.max_payload_bytes,
+                },
+                mux_limits: fixture.context.mux_limits,
+            })
+            .await
+            .expect("CREATE accepted on carrier A");
+        let _opening_owner = accepted_rx.recv().await.expect("one new logical owner");
+        let sibling_actor = tokio::spawn(run_server_udp_reliable_stream_loop(
+            fixture.server_send.take().expect("sibling sender"),
+            fixture.server_recv.take().expect("sibling receiver"),
+            ServerUdpReliableStreamLoop {
+                context: fixture.context.clone(),
+                session_id: fixture.session_id,
+                path_id: fixture.path_id,
+                path_registration: fixture._path_registration.clone(),
+                stream_id: sibling_id,
+                target: fixture.target.clone(),
+                commands_tx: fixture.commands_tx.clone(),
+                commands_rx: fixture.commands_rx.take().expect("sibling commands"),
+                path_proofs: PathProofTracker::default(),
+            },
+        ));
+        let (mut delayed_send, mut delayed_recv) = fixture
+            ._client_connection
+            .open_bi()
+            .await
+            .expect("open candidate B");
+        udp_path_write_frame(
+            &mut delayed_send,
+            &Frame::OpenStream {
+                stream_id,
+                target: fixture.target.clone(),
+                demand: StreamDemandHint::Throughput,
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Startup,
+                    candidate_ordinal: 1,
+                    ..plan
+                },
+            },
+            fixture.context.codec_limits,
+        )
+        .await
+        .expect("STARTUP enters B before local timeout");
+        // Delay B's native request consumption, not its phase construction.
+        // The locally failed ordinal is omitted by FINAL arriving through A.
+        fixture
+            .context
+            .reliable_streams
+            .route_frame(
+                &opening,
+                stream_id,
+                Frame::StreamReturnPlanFinal {
+                    stream_id,
+                    retained_ordinals: vec![0],
+                },
+            )
+            .await
+            .expect("FINAL arrives on surviving carrier A");
+        let (send, recv) = fixture
+            ._server_connection
+            .accept_bi()
+            .await
+            .expect("consume delayed B request");
+        handle_server_udp_bidi_stream(
+            send,
+            recv,
+            fixture.context.clone(),
+            fixture.session_id,
+            fixture.path_id,
+            fixture._path_registration.clone(),
+        )
+        .await
+        .expect("obsolete enrollment is attachment-local");
+        assert_eq!(
+            udp_path_read_frame(&mut delayed_recv, fixture.context.codec_limits)
+                .await
+                .expect("refusal"),
+            Frame::StreamDetach { stream_id }
+        );
+        assert!(matches!(
+            udp_path_read_frame(&mut delayed_recv, fixture.context.codec_limits).await,
+            Err(RuntimeError::QuicCarrier(
+                crate::transport::quic::QuicCarrierError::StreamFinished
+            ))
+        ));
+        assert_eq!(
+            fixture.attached_output_count(),
+            1,
+            "sibling output remains enrolled"
+        );
+        let data = Frame::StreamData {
+            stream_id: sibling_id,
+            offset: 0,
+            payload: Bytes::from_static(b"sibling"),
+        };
+        fixture
+            .commands_tx
+            .send_stream_ordered_frame(data.clone(), TrafficClass::Throughput)
+            .await
+            .expect("sibling still sends");
+        while udp_path_read_frame(
+            fixture.client_recv.as_mut().expect("sibling receiver"),
+            fixture.context.codec_limits,
+        )
+        .await
+        .expect("sibling payload survives obsolete enrollment")
+            != data
+        {}
+
+        let (mut ordinary_send, mut ordinary_recv) = fixture
+            ._client_connection
+            .open_bi()
+            .await
+            .expect("new Ordinary request");
+        udp_path_write_frame(
+            &mut ordinary_send,
+            &Frame::OpenStream {
+                stream_id,
+                target: fixture.target.clone(),
+                demand: StreamDemandHint::Throughput,
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..plan
+                },
+            },
+            fixture.context.codec_limits,
+        )
+        .await
+        .expect("Ordinary is explicit, not promoted late STARTUP");
+        let (send, recv) = fixture
+            ._server_connection
+            .accept_bi()
+            .await
+            .expect("accept Ordinary request");
+        let ordinary_actor = tokio::spawn(handle_server_udp_bidi_stream(
+            send,
+            recv,
+            fixture.context.clone(),
+            fixture.session_id,
+            fixture.path_id,
+            fixture._path_registration.clone(),
+        ));
+        assert_eq!(
+            udp_path_read_frame(&mut ordinary_recv, fixture.context.codec_limits)
+                .await
+                .expect("Ordinary admission"),
+            Frame::StreamMaxData {
+                stream_id,
+                max_offset: 0
+            }
+        );
+        let snapshot = fixture.context.reliable_streams.management_snapshot();
+        assert_eq!(
+            snapshot.active_streams, 2,
+            "no Product reset or replacement target"
+        );
+        assert_eq!(
+            snapshot.paths.len(),
+            2,
+            "physical carriers remain registered"
+        );
+        assert!(!fixture._client_connection.is_closed());
+        ordinary_actor.abort();
+        let _ = ordinary_actor.await;
+        sibling_actor.abort();
+        let _ = sibling_actor.await;
+    })
+    .await
+    .expect("late STARTUP scope test completes without a carrier stall");
 }
 
 #[tokio::test]

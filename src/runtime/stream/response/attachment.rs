@@ -4,6 +4,7 @@
 use super::ResponseStreamBinding;
 use super::ack_clock::ResponseAckClockRateEvidence;
 use super::evidence::{ServerPathMetricsEntry, install_path_metrics_entry};
+use super::startup::ResponseStartupAttachmentDecision;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::carrier_rate_authority::CarrierRateAuthorityStamp;
@@ -41,6 +42,7 @@ pub(in crate::runtime) enum ResponseStreamAttachOutcome {
     ReplacedClosedOutput,
     RejectedDuplicateLiveOutput,
     RejectedClosedStream,
+    RejectedObsoleteEnrollment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,7 +609,14 @@ impl ResponseStreamBinding {
                     let exact = ResponseAcquisitionOutputId::from(&*entry);
                     let startup_commit = match (&startup, return_plan) {
                         (Some(startup), Some(plan)) => {
-                            Some(startup.prepare_attachment(plan, exact)?)
+                            match startup.prepare_attachment(plan, exact)? {
+                                ResponseStartupAttachmentDecision::Admit(commit) => Some(commit),
+                                ResponseStartupAttachmentDecision::RefuseObsoleteEnrollment => {
+                                    return Ok(
+                                        ResponseStreamAttachOutcome::RejectedObsoleteEnrollment,
+                                    );
+                                }
+                            }
                         }
                         _ => None,
                     };
@@ -642,7 +651,12 @@ impl ResponseStreamBinding {
         };
         let startup_commit = match (&startup, return_plan) {
             (Some(startup), Some(plan)) => {
-                Some(startup.prepare_attachment(plan, prospective_output)?)
+                match startup.prepare_attachment(plan, prospective_output)? {
+                    ResponseStartupAttachmentDecision::Admit(commit) => Some(commit),
+                    ResponseStartupAttachmentDecision::RefuseObsoleteEnrollment => {
+                        return Ok(ResponseStreamAttachOutcome::RejectedObsoleteEnrollment);
+                    }
+                }
             }
             _ => None,
         };

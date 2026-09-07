@@ -101,4 +101,3 @@ implement Defer as the current unknown-path correction, add an arbitrary
 budget, restore static best-path selection, or infer protocol preference.
 A narrower supported-evidence wait is separately possible, but does not close
 the demonstrated issue and is not approved by this review.
-

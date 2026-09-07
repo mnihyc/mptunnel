@@ -1,0 +1,5400 @@
+[
+  {
+    "tag": "quic-steady-down-ack-rtt-control-0907",
+    "probe": {
+      "case": "quic-steady-down-ack-rtt-control-0907",
+      "protocol": "bulk-interactive",
+      "status": "ok",
+      "workload_mode": "bulk-interactive",
+      "mode": "socks5",
+      "target": "127.0.0.1:8080",
+      "udp_target": null,
+      "tcp_echo_target": "127.0.0.1:10022",
+      "interactive_interval_ms": 500,
+      "interactive_timeout_ms": 3000,
+      "interactive_payload_bytes": 64,
+      "failover_after_s": -1,
+      "test_duration_s": 25,
+      "bulk_status": "ok",
+      "bulk_http_code": 200,
+      "bulk_content_length": 8589934592,
+      "bulk_bytes": 493822988,
+      "bulk_time_s": 25.14170222892426,
+      "bulk_load_duration_s": 25,
+      "bulk_requests": 1,
+      "bulk_complete_requests": 0,
+      "bulk_partial_requests": 1,
+      "bulk_goodput_mbps": 157.1327139279795,
+      "bulk_first_body_s": 0.4973890660330653,
+      "bulk_bytes_at_failover": null,
+      "bulk_max_read_gap_s": 0.3545023539336398,
+      "bulk_max_gap_start_s": 13.052792854025029,
+      "bulk_max_gap_end_s": 13.407295207958668,
+      "bulk_max_gap_start_bytes": 245919020,
+      "bulk_max_gap_end_bytes": 245984556,
+      "bulk_recovery_gap_s": 0,
+      "bulk_recovery_gap_start_s": null,
+      "bulk_recovery_gap_end_s": null,
+      "bulk_recovery_gap_start_bytes": null,
+      "bulk_recovery_gap_end_bytes": null,
+      "bulk_interval_seconds": 1,
+      "bulk_interval_trim_discard_each_end": 3,
+      "bulk_interval_goodput_raw_mbps": [
+        3.528,
+        171.039,
+        157.382,
+        210.214,
+        157.823,
+        161.834,
+        168.505,
+        146.246,
+        135.606,
+        150.81,
+        170.003,
+        181.174,
+        143.611,
+        157.34,
+        202.64,
+        137.857,
+        175.775,
+        167.782,
+        168.341,
+        144.518,
+        194.01,
+        158.398,
+        167.693,
+        163.275,
+        154.655
+      ],
+      "bulk_interval_goodput_mbps": [
+        210.214,
+        157.823,
+        161.834,
+        168.505,
+        146.246,
+        135.606,
+        150.81,
+        170.003,
+        181.174,
+        143.611,
+        157.34,
+        202.64,
+        137.857,
+        175.775,
+        167.782,
+        168.341,
+        144.518,
+        194.01,
+        158.398
+      ],
+      "bulk_interval_goodput_avg_mbps": 164.868,
+      "bulk_interval_goodput_max_mbps": 210.214,
+      "bulk_interval_goodput_min_mbps": 135.606,
+      "interactive_connected": true,
+      "interactive_attempt_series": [
+        {
+          "index": 0,
+          "start_offset_s": 0.15031958802137524,
+          "end_offset_s": 0.2654308439232409,
+          "latency_ms": 115.11125590186566,
+          "outcome": "success"
+        },
+        {
+          "index": 1,
+          "start_offset_s": 0.5003688239958137,
+          "end_offset_s": 0.6304475349606946,
+          "latency_ms": 130.07871096488088,
+          "outcome": "success"
+        },
+        {
+          "index": 2,
+          "start_offset_s": 1.000453696004115,
+          "end_offset_s": 1.108038584003225,
+          "latency_ms": 107.58488799910992,
+          "outcome": "success"
+        },
+        {
+          "index": 3,
+          "start_offset_s": 1.500539617962204,
+          "end_offset_s": 1.6148956599645317,
+          "latency_ms": 114.35604200232774,
+          "outcome": "success"
+        },
+        {
+          "index": 4,
+          "start_offset_s": 2.00200004898943,
+          "end_offset_s": 2.1671402299543843,
+          "latency_ms": 165.1401809649542,
+          "outcome": "success"
+        },
+        {
+          "index": 5,
+          "start_offset_s": 2.5020851619774476,
+          "end_offset_s": 2.5974052919773385,
+          "latency_ms": 95.32012999989092,
+          "outcome": "success"
+        },
+        {
+          "index": 6,
+          "start_offset_s": 3.0021714839385822,
+          "end_offset_s": 3.118080665008165,
+          "latency_ms": 115.9091810695827,
+          "outcome": "success"
+        },
+        {
+          "index": 7,
+          "start_offset_s": 3.502251195954159,
+          "end_offset_s": 3.6783201759681106,
+          "latency_ms": 176.06898001395166,
+          "outcome": "success"
+        },
+        {
+          "index": 8,
+          "start_offset_s": 4.002337947953492,
+          "end_offset_s": 4.131803823984228,
+          "latency_ms": 129.46587603073567,
+          "outcome": "success"
+        },
+        {
+          "index": 9,
+          "start_offset_s": 4.502428030013107,
+          "end_offset_s": 4.607015940011479,
+          "latency_ms": 104.5879099983722,
+          "outcome": "success"
+        },
+        {
+          "index": 10,
+          "start_offset_s": 5.002522842027247,
+          "end_offset_s": 5.281478950986639,
+          "latency_ms": 278.9561089593917,
+          "outcome": "success"
+        },
+        {
+          "index": 11,
+          "start_offset_s": 5.502608673996292,
+          "end_offset_s": 5.651734825922176,
+          "latency_ms": 149.1261519258842,
+          "outcome": "success"
+        },
+        {
+          "index": 12,
+          "start_offset_s": 6.002699726028368,
+          "end_offset_s": 6.216608464019373,
+          "latency_ms": 213.90873799100518,
+          "outcome": "success"
+        },
+        {
+          "index": 13,
+          "start_offset_s": 6.502801847993396,
+          "end_offset_s": 6.673835386987776,
+          "latency_ms": 171.03353899437934,
+          "outcome": "success"
+        },
+        {
+          "index": 14,
+          "start_offset_s": 7.002900219988078,
+          "end_offset_s": 7.167921590968035,
+          "latency_ms": 165.02137097995728,
+          "outcome": "success"
+        },
+        {
+          "index": 15,
+          "start_offset_s": 7.502987512969412,
+          "end_offset_s": 7.62247992597986,
+          "latency_ms": 119.49241301044822,
+          "outcome": "success"
+        },
+        {
+          "index": 16,
+          "start_offset_s": 8.003076964989305,
+          "end_offset_s": 8.139168492984027,
+          "latency_ms": 136.09152799472213,
+          "outcome": "success"
+        },
+        {
+          "index": 17,
+          "start_offset_s": 8.503141555935144,
+          "end_offset_s": 8.624316000030376,
+          "latency_ms": 121.17444409523159,
+          "outcome": "success"
+        },
+        {
+          "index": 18,
+          "start_offset_s": 9.003248538938351,
+          "end_offset_s": 9.25008871499449,
+          "latency_ms": 246.84017605613917,
+          "outcome": "success"
+        },
+        {
+          "index": 19,
+          "start_offset_s": 9.503337880945764,
+          "end_offset_s": 9.61062899697572,
+          "latency_ms": 107.29111602995545,
+          "outcome": "success"
+        },
+        {
+          "index": 20,
+          "start_offset_s": 10.003422592999414,
+          "end_offset_s": 10.141842957003973,
+          "latency_ms": 138.42036400455981,
+          "outcome": "success"
+        },
+        {
+          "index": 21,
+          "start_offset_s": 10.503547824919224,
+          "end_offset_s": 10.621633840026334,
+          "latency_ms": 118.08601510711014,
+          "outcome": "success"
+        },
+        {
+          "index": 22,
+          "start_offset_s": 11.005406440002844,
+          "end_offset_s": 11.117065432947129,
+          "latency_ms": 111.65899294428527,
+          "outcome": "success"
+        },
+        {
+          "index": 23,
+          "start_offset_s": 11.50548973097466,
+          "end_offset_s": 11.609324265969917,
+          "latency_ms": 103.83453499525785,
+          "outcome": "success"
+        },
+        {
+          "index": 24,
+          "start_offset_s": 12.005584563012235,
+          "end_offset_s": 12.190317536937073,
+          "latency_ms": 184.732973924838,
+          "outcome": "success"
+        },
+        {
+          "index": 25,
+          "start_offset_s": 12.505662004929036,
+          "end_offset_s": 13.050860950956121,
+          "latency_ms": 545.1989460270852,
+          "outcome": "success"
+        },
+        {
+          "index": 26,
+          "start_offset_s": 13.050882051000372,
+          "end_offset_s": 13.167065343935974,
+          "latency_ms": 116.18329293560237,
+          "outcome": "success"
+        },
+        {
+          "index": 27,
+          "start_offset_s": 13.550969632924534,
+          "end_offset_s": 13.674157959991135,
+          "latency_ms": 123.18832706660032,
+          "outcome": "success"
+        },
+        {
+          "index": 28,
+          "start_offset_s": 14.051071875030175,
+          "end_offset_s": 14.140673410962336,
+          "latency_ms": 89.60153593216091,
+          "outcome": "success"
+        },
+        {
+          "index": 29,
+          "start_offset_s": 14.551547128940001,
+          "end_offset_s": 14.783551092026755,
+          "latency_ms": 232.00396308675408,
+          "outcome": "success"
+        },
+        {
+          "index": 30,
+          "start_offset_s": 15.054222028004006,
+          "end_offset_s": 15.136435735970736,
+          "latency_ms": 82.21370796673,
+          "outcome": "success"
+        },
+        {
+          "index": 31,
+          "start_offset_s": 15.554295760928653,
+          "end_offset_s": 15.709126545931213,
+          "latency_ms": 154.83078500255942,
+          "outcome": "success"
+        },
+        {
+          "index": 32,
+          "start_offset_s": 16.054381311987527,
+          "end_offset_s": 16.20694891398307,
+          "latency_ms": 152.56760199554265,
+          "outcome": "success"
+        },
+        {
+          "index": 33,
+          "start_offset_s": 16.554462273954414,
+          "end_offset_s": 16.667143255006522,
+          "latency_ms": 112.68098105210811,
+          "outcome": "success"
+        },
+        {
+          "index": 34,
+          "start_offset_s": 17.05455305601936,
+          "end_offset_s": 17.189088274957612,
+          "latency_ms": 134.53521893825382,
+          "outcome": "success"
+        },
+        {
+          "index": 35,
+          "start_offset_s": 17.554722080007195,
+          "end_offset_s": 17.680899253929965,
+          "latency_ms": 126.17717392276973,
+          "outcome": "success"
+        },
+        {
+          "index": 36,
+          "start_offset_s": 18.05480230995454,
+          "end_offset_s": 18.409995269961655,
+          "latency_ms": 355.1929600071162,
+          "outcome": "success"
+        },
+        {
+          "index": 37,
+          "start_offset_s": 18.55487740295939,
+          "end_offset_s": 18.6687005009735,
+          "latency_ms": 113.82309801410884,
+          "outcome": "success"
+        },
+        {
+          "index": 38,
+          "start_offset_s": 19.05496661493089,
+          "end_offset_s": 19.13145174703095,
+          "latency_ms": 76.48513210006058,
+          "outcome": "success"
+        },
+        {
+          "index": 39,
+          "start_offset_s": 19.555038235965185,
+          "end_offset_s": 19.83960373001173,
+          "latency_ms": 284.5654940465465,
+          "outcome": "success"
+        },
+        {
+          "index": 40,
+          "start_offset_s": 20.055113657959737,
+          "end_offset_s": 20.19578419602476,
+          "latency_ms": 140.67053806502372,
+          "outcome": "success"
+        },
+        {
+          "index": 41,
+          "start_offset_s": 20.555208429927006,
+          "end_offset_s": 20.64039309800137,
+          "latency_ms": 85.18466807436198,
+          "outcome": "success"
+        },
+        {
+          "index": 42,
+          "start_offset_s": 21.055297781946138,
+          "end_offset_s": 21.193417403963394,
+          "latency_ms": 138.11962201725692,
+          "outcome": "success"
+        },
+        {
+          "index": 43,
+          "start_offset_s": 21.55538761394564,
+          "end_offset_s": 21.64081841299776,
+          "latency_ms": 85.43079905211926,
+          "outcome": "success"
+        },
+        {
+          "index": 44,
+          "start_offset_s": 22.05547233694233,
+          "end_offset_s": 22.161291043972597,
+          "latency_ms": 105.81870703026652,
+          "outcome": "success"
+        },
+        {
+          "index": 45,
+          "start_offset_s": 22.55772665294353,
+          "end_offset_s": 22.66769553499762,
+          "latency_ms": 109.9688820540905,
+          "outcome": "success"
+        },
+        {
+          "index": 46,
+          "start_offset_s": 23.057826724951155,
+          "end_offset_s": 23.18854842800647,
+          "latency_ms": 130.72170305531472,
+          "outcome": "success"
+        },
+        {
+          "index": 47,
+          "start_offset_s": 23.55785903602373,
+          "end_offset_s": 23.772503238986246,
+          "latency_ms": 214.64420296251774,
+          "outcome": "success"
+        },
+        {
+          "index": 48,
+          "start_offset_s": 24.057928888010792,
+          "end_offset_s": 24.172348018968478,
+          "latency_ms": 114.41913095768541,
+          "outcome": "success"
+        },
+        {
+          "index": 49,
+          "start_offset_s": 24.558001540019177,
+          "end_offset_s": 24.657789989956655,
+          "latency_ms": 99.78844993747771,
+          "outcome": "success"
+        }
+      ],
+      "interactive_start_s": 0.00027077202685177326,
+      "interactive_time_s": 24.999837665935047,
+      "interactive_count": 50,
+      "interactive_ok": 50,
+      "interactive_fail": 0,
+      "interactive_request_bytes": 3200,
+      "interactive_response_bytes": 3200,
+      "interactive_p50_ms": 123.18832706660032,
+      "interactive_p95_ms": 284.5654940465465,
+      "interactive_max_ms": 545.1989460270852,
+      "interactive_max_success_gap_s": 0.8605434140190482,
+      "interactive_failover_gap_s": 0,
+      "interactive_disconnected_at_s": null,
+      "interactive_error": null,
+      "mixed_app_payload_bytes": 493829388
+    },
+    "series": [
+      {
+        "elapsed": 0.00005449005402624607,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 371,
+            "qlen": 4,
+            "bytes": 10004,
+            "drops": 0
+          },
+          {
+            "dev": "eth1",
+            "backlog": 0,
+            "qlen": 0,
+            "bytes": 12027,
+            "drops": 1
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        31044  3.0"
+          ],
+          "io": {
+            "to_peer_bytes": "0",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "0",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 0,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 124.053065,
+              "var_ms": 37.997453,
+              "flight": "0",
+              "cap": "19564",
+              "queue": null,
+              "rate": "111976",
+              "pace": null,
+              "loss_ppm": 54296,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "7564",
+              "native_sample_us": "648291"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        29128  3.5"
+          ],
+          "io": {
+            "to_peer_bytes": "0",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "0",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 0,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 118.995,
+              "var_ms": 48.769,
+              "flight": "1555",
+              "cap": "16732",
+              "queue": "0",
+              "rate": "133680",
+              "pace": null,
+              "loss_ppm": 128126,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "7739",
+              "native_sample_us": "689477"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 1.0001725250622258,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2184498,
+            "qlen": 455,
+            "bytes": 17658285,
+            "drops": 128
+          },
+          {
+            "dev": "eth1",
+            "backlog": 26274,
+            "qlen": 126,
+            "bytes": 387150,
+            "drops": 16
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        36956  5.1"
+          ],
+          "io": {
+            "to_peer_bytes": "196",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "441393",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 111.527494,
+              "var_ms": 15.298668,
+              "flight": "465",
+              "cap": "22280",
+              "queue": null,
+              "rate": "111976",
+              "pace": null,
+              "loss_ppm": 23012,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "10280",
+              "native_sample_us": "1720923"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        166148 10.5"
+          ],
+          "io": {
+            "to_peer_bytes": "67025969",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "196",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 87.455,
+              "var_ms": 17.721,
+              "flight": "444312",
+              "cap": "444924",
+              "queue": "0",
+              "rate": "9379152",
+              "pace": "266208000",
+              "loss_ppm": 32582,
+              "age_ms": 76,
+              "app_limited": false,
+              "acked": "432924",
+              "native_sample_us": "1775945"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 2.0002848180010915,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1761156,
+            "qlen": 368,
+            "bytes": 48484324,
+            "drops": 298
+          },
+          {
+            "dev": "eth1",
+            "backlog": 21626,
+            "qlen": 110,
+            "bytes": 1299060,
+            "drops": 64
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        50164 17.5"
+          ],
+          "io": {
+            "to_peer_bytes": "324",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "19032924",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 75.243772,
+              "var_ms": 10.679148,
+              "flight": "1062",
+              "cap": "32119",
+              "queue": null,
+              "rate": "259320",
+              "pace": null,
+              "loss_ppm": 1228,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "20119",
+              "native_sample_us": "2745558"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        195940 29.8"
+          ],
+          "io": {
+            "to_peer_bytes": "84203516",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "324",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 38.393,
+              "var_ms": 11.046,
+              "flight": "2997578",
+              "cap": "3893327",
+              "queue": "0",
+              "rate": "225087640",
+              "pace": "222836768",
+              "loss_ppm": 185643,
+              "age_ms": 29,
+              "app_limited": false,
+              "acked": "22167336",
+              "native_sample_us": "2773801"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 3.0004657229874283,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1931304,
+            "qlen": 472,
+            "bytes": 71686072,
+            "drops": 455
+          },
+          {
+            "dev": "eth1",
+            "backlog": 29514,
+            "qlen": 140,
+            "bytes": 2080339,
+            "drops": 103
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        53468 21.4"
+          ],
+          "io": {
+            "to_peer_bytes": "452",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "41494364",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 73.176291,
+              "var_ms": 11.884825999999999,
+              "flight": "1719",
+              "cap": "34179",
+              "queue": null,
+              "rate": "259320",
+              "pace": null,
+              "loss_ppm": 754,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "31739",
+              "native_sample_us": "3727261"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        224064 37.8"
+          ],
+          "io": {
+            "to_peer_bytes": "108555228",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "452",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 39.982,
+              "var_ms": 11.069,
+              "flight": "2697564",
+              "cap": "3892000",
+              "queue": "0",
+              "rate": "223640080",
+              "pace": "221403680",
+              "loss_ppm": 138175,
+              "age_ms": 1,
+              "app_limited": false,
+              "acked": "47166812",
+              "native_sample_us": "3801259"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 4.000581035972573,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1920085,
+            "qlen": 577,
+            "bytes": 102307384,
+            "drops": 677
+          },
+          {
+            "dev": "eth1",
+            "backlog": 42508,
+            "qlen": 201,
+            "bytes": 3149218,
+            "drops": 142
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        56588 24.2"
+          ],
+          "io": {
+            "to_peer_bytes": "580",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "63609660",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 78.307184,
+              "var_ms": 26.816688000000003,
+              "flight": "376",
+              "cap": "43312",
+              "queue": null,
+              "rate": "259320",
+              "pace": null,
+              "loss_ppm": 470,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "41953",
+              "native_sample_us": "4733658"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        263952 42.0"
+          ],
+          "io": {
+            "to_peer_bytes": "128871516",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "580",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 45.755,
+              "var_ms": 8.825,
+              "flight": "3883182",
+              "cap": "5613325",
+              "queue": "0",
+              "rate": "332912208",
+              "pace": "411978856",
+              "loss_ppm": 129115,
+              "age_ms": 7,
+              "app_limited": false,
+              "acked": "70721410",
+              "native_sample_us": "4795401"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 5.000678800046444,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1645650,
+            "qlen": 440,
+            "bytes": 125800894,
+            "drops": 884
+          },
+          {
+            "dev": "eth1",
+            "backlog": 28627,
+            "qlen": 137,
+            "bytes": 4221719,
+            "drops": 187
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        56588 25.7"
+          ],
+          "io": {
+            "to_peer_bytes": "708",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "86585116",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 68.134044,
+              "var_ms": 18.979903,
+              "flight": "258",
+              "cap": "48517",
+              "queue": null,
+              "rate": "259320",
+              "pace": null,
+              "loss_ppm": 343,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "54796",
+              "native_sample_us": "5715292"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        289208 46.0"
+          ],
+          "io": {
+            "to_peer_bytes": "153611772",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "708",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 45.856,
+              "var_ms": 5.844,
+              "flight": "2320800",
+              "cap": "3049313",
+              "queue": "0",
+              "rate": "193810408",
+              "pace": "191872304",
+              "loss_ppm": 164119,
+              "age_ms": 11,
+              "app_limited": false,
+              "acked": "93630356",
+              "native_sample_us": "5791968"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 6.000779203954153,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 3027996,
+            "qlen": 805,
+            "bytes": 150442146,
+            "drops": 1086
+          },
+          {
+            "dev": "eth1",
+            "backlog": 48685,
+            "qlen": 225,
+            "bytes": 5221822,
+            "drops": 233
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        56588 25.8"
+          ],
+          "io": {
+            "to_peer_bytes": "836",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "105333276",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 77.366605,
+              "var_ms": 8.678391000000001,
+              "flight": "946",
+              "cap": "56652",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 295,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "63189",
+              "native_sample_us": "6742260"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        298508 45.6"
+          ],
+          "io": {
+            "to_peer_bytes": "172304604",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "836",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 46.285,
+              "var_ms": 7.785,
+              "flight": "2131200",
+              "cap": "3094660",
+              "queue": "0",
+              "rate": "179969896",
+              "pace": "178170192",
+              "loss_ppm": 159571,
+              "age_ms": 3,
+              "app_limited": false,
+              "acked": "113276750",
+              "native_sample_us": "6798954"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 7.000891386996955,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1600938,
+            "qlen": 392,
+            "bytes": 177150917,
+            "drops": 1287
+          },
+          {
+            "dev": "eth1",
+            "backlog": 30448,
+            "qlen": 146,
+            "bytes": 6382441,
+            "drops": 280
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        57840 27.1"
+          ],
+          "io": {
+            "to_peer_bytes": "964",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "127084892",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 79.935449,
+              "var_ms": 11.774068,
+              "flight": "376",
+              "cap": "67955",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 236,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "74492",
+              "native_sample_us": "7745297"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        299140 47.4"
+          ],
+          "io": {
+            "to_peer_bytes": "193669468",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "964",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 38.235,
+              "var_ms": 3.514,
+              "flight": "2744305",
+              "cap": "2997230",
+              "queue": "0",
+              "rate": "193768856",
+              "pace": "191831168",
+              "loss_ppm": 167384,
+              "age_ms": 24,
+              "app_limited": false,
+              "acked": "134756590",
+              "native_sample_us": "7794264"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 8.001002141041681,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 125442,
+            "qlen": 14,
+            "bytes": 197237765,
+            "drops": 1444
+          },
+          {
+            "dev": "eth1",
+            "backlog": 349,
+            "qlen": 4,
+            "bytes": 7284598,
+            "drops": 331
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        57840 27.2"
+          ],
+          "io": {
+            "to_peer_bytes": "1092",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "144644092",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 67.545584,
+              "var_ms": 9.018492,
+              "flight": "509",
+              "cap": "76007",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 204,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "82544",
+              "native_sample_us": "8722212"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        290748 47.1"
+          ],
+          "io": {
+            "to_peer_bytes": "211228668",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1092",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 47.896,
+              "var_ms": 6.522,
+              "flight": "2340000",
+              "cap": "2823926",
+              "queue": "0",
+              "rate": "186195880",
+              "pace": "184333920",
+              "loss_ppm": 160901,
+              "age_ms": 12,
+              "app_limited": false,
+              "acked": "155175590",
+              "native_sample_us": "8789778"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 9.00111258495599,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1687878,
+            "qlen": 475,
+            "bytes": 219678196,
+            "drops": 1601
+          },
+          {
+            "dev": "eth1",
+            "backlog": 29306,
+            "qlen": 142,
+            "bytes": 8078169,
+            "drops": 370
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        58200 26.6"
+          ],
+          "io": {
+            "to_peer_bytes": "1220",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "161891228",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 91.463099,
+              "var_ms": 24.269407,
+              "flight": "941",
+              "cap": "82787",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 185,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "90176",
+              "native_sample_us": "9748446"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        290748 45.8"
+          ],
+          "io": {
+            "to_peer_bytes": "227415228",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1220",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 40.356,
+              "var_ms": 11.132,
+              "flight": "3568800",
+              "cap": "4081020",
+              "queue": "0",
+              "rate": "288171472",
+              "pace": "285289760",
+              "loss_ppm": 156997,
+              "age_ms": 6,
+              "app_limited": false,
+              "acked": "170560790",
+              "native_sample_us": "9796769"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 10.001220659003593,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1766124,
+            "qlen": 462,
+            "bytes": 244365217,
+            "drops": 1782
+          },
+          {
+            "dev": "eth1",
+            "backlog": 30042,
+            "qlen": 146,
+            "bytes": 9079625,
+            "drops": 417
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        58748 27.0"
+          ],
+          "io": {
+            "to_peer_bytes": "1348",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "180204508",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 75.80697599999999,
+              "var_ms": 16.574287,
+              "flight": "0",
+              "cap": "5808",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 162,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "99337",
+              "native_sample_us": "10733695"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        291840 46.7"
+          ],
+          "io": {
+            "to_peer_bytes": "247105692",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1348",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 39.473,
+              "var_ms": 11.341,
+              "flight": "2172000",
+              "cap": "3633323",
+              "queue": "0",
+              "rate": "193027192",
+              "pace": "191096920",
+              "loss_ppm": 161366,
+              "age_ms": 15,
+              "app_limited": false,
+              "acked": "192215816",
+              "native_sample_us": "10787184"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 11.00132078200113,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1790943,
+            "qlen": 550,
+            "bytes": 274787752,
+            "drops": 2021
+          },
+          {
+            "dev": "eth1",
+            "backlog": 36417,
+            "qlen": 172,
+            "bytes": 10193299,
+            "drops": 465
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        59500 27.5"
+          ],
+          "io": {
+            "to_peer_bytes": "1476",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "204125396",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 71.796363,
+              "var_ms": 12.995230999999999,
+              "flight": "925",
+              "cap": "100405",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 166,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "109574",
+              "native_sample_us": "11740593"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        300532 47.1"
+          ],
+          "io": {
+            "to_peer_bytes": "267720124",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1476",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 41.925,
+              "var_ms": 2.774,
+              "flight": "3304800",
+              "cap": "4801200",
+              "queue": "0",
+              "rate": "288171472",
+              "pace": "356612200",
+              "loss_ppm": 155143,
+              "age_ms": 17,
+              "app_limited": false,
+              "acked": "213338051",
+              "native_sample_us": "11786276"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 12.001418577041477,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1232064,
+            "qlen": 319,
+            "bytes": 298886108,
+            "drops": 2213
+          },
+          {
+            "dev": "eth1",
+            "backlog": 21351,
+            "qlen": 121,
+            "bytes": 11242803,
+            "drops": 514
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        60688 27.8"
+          ],
+          "io": {
+            "to_peer_bytes": "1604",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "224859644",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 67.552609,
+              "var_ms": 17.527014,
+              "flight": "615",
+              "cap": "112426",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 209,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "121691",
+              "native_sample_us": "12699164"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        300564 48.2"
+          ],
+          "io": {
+            "to_peer_bytes": "291564156",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1604",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 36.268,
+              "var_ms": 7.307,
+              "flight": "2218702",
+              "cap": "2993326",
+              "queue": "0",
+              "rate": "176031848",
+              "pace": "174271528",
+              "loss_ppm": 164115,
+              "age_ms": 15,
+              "app_limited": false,
+              "acked": "236159552",
+              "native_sample_us": "12787042"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 13.001531179994345,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1264356,
+            "qlen": 343,
+            "bytes": 316559744,
+            "drops": 2355
+          },
+          {
+            "dev": "eth1",
+            "backlog": 27861,
+            "qlen": 140,
+            "bytes": 11971319,
+            "drops": 556
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        60688 27.6"
+          ],
+          "io": {
+            "to_peer_bytes": "1732",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "243206876",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 79.041084,
+              "var_ms": 9.829030000000001,
+              "flight": "0",
+              "cap": "121815",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 193,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "131080",
+              "native_sample_us": "13723240"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        302084 47.6"
+          ],
+          "io": {
+            "to_peer_bytes": "308942332",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1732",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 48.16,
+              "var_ms": 6.418,
+              "flight": "1724400",
+              "cap": "2089701",
+              "queue": "0",
+              "rate": "155776312",
+              "pace": "154218544",
+              "loss_ppm": 160592,
+              "age_ms": 14,
+              "app_limited": false,
+              "acked": "255712248",
+              "native_sample_us": "13788778"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 14.001644453033805,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1872918,
+            "qlen": 467,
+            "bytes": 347948290,
+            "drops": 2606
+          },
+          {
+            "dev": "eth1",
+            "backlog": 33547,
+            "qlen": 159,
+            "bytes": 13134734,
+            "drops": 623
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61844 27.8"
+          ],
+          "io": {
+            "to_peer_bytes": "1860",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "263051068",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 73.900851,
+              "var_ms": 12.727392,
+              "flight": "493",
+              "cap": "131628",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 193,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "140989",
+              "native_sample_us": "14734156"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        310496 47.7"
+          ],
+          "io": {
+            "to_peer_bytes": "330127612",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1860",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 41.655,
+              "var_ms": 8.138,
+              "flight": "3780996",
+              "cap": "3782160",
+              "queue": "0",
+              "rate": "275329032",
+              "pace": "272575744",
+              "loss_ppm": 156908,
+              "age_ms": 10,
+              "app_limited": false,
+              "acked": "277806562",
+              "native_sample_us": "14792113"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 15.001740677049384,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1646862,
+            "qlen": 410,
+            "bytes": 374924458,
+            "drops": 2826
+          },
+          {
+            "dev": "eth1",
+            "backlog": 23834,
+            "qlen": 113,
+            "bytes": 14292030,
+            "drops": 677
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61844 28.0"
+          ],
+          "io": {
+            "to_peer_bytes": "1988",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "289018108",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 78.61063299999999,
+              "var_ms": 11.275132000000001,
+              "flight": "2034",
+              "cap": "141521",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 177,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "151375",
+              "native_sample_us": "15739172"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        318288 48.5"
+          ],
+          "io": {
+            "to_peer_bytes": "354921948",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1988",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 42.6,
+              "var_ms": 6.414,
+              "flight": "2755152",
+              "cap": "3277327",
+              "queue": "0",
+              "rate": "210949368",
+              "pace": "208839872",
+              "loss_ppm": 160113,
+              "age_ms": 3,
+              "app_limited": false,
+              "acked": "301175112",
+              "native_sample_us": "15798999"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 16.00183924101293,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2066688,
+            "qlen": 452,
+            "bytes": 400955292,
+            "drops": 3020
+          },
+          {
+            "dev": "eth1",
+            "backlog": 34189,
+            "qlen": 162,
+            "bytes": 15226401,
+            "drops": 716
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61844 28.0"
+          ],
+          "io": {
+            "to_peer_bytes": "2116",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "305451036",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 77.20647699999999,
+              "var_ms": 12.988894,
+              "flight": "0",
+              "cap": "150984",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 185,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "160838",
+              "native_sample_us": "16645281"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        318852 48.5"
+          ],
+          "io": {
+            "to_peer_bytes": "372518364",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2116",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 49.03,
+              "var_ms": 5.626,
+              "flight": "2082000",
+              "cap": "2964000",
+              "queue": "0",
+              "rate": "176970872",
+              "pace": "175201168",
+              "loss_ppm": 158716,
+              "age_ms": 15,
+              "app_limited": false,
+              "acked": "321395034",
+              "native_sample_us": "16786859"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 17.001950253965333,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2569698,
+            "qlen": 514,
+            "bytes": 420769946,
+            "drops": 3162
+          },
+          {
+            "dev": "eth1",
+            "backlog": 33908,
+            "qlen": 161,
+            "bytes": 15879973,
+            "drops": 747
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61844 27.7"
+          ],
+          "io": {
+            "to_peer_bytes": "2244",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "328396636",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 70.073533,
+              "var_ms": 12.531967,
+              "flight": "1465",
+              "cap": "156432",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 227,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "168880",
+              "native_sample_us": "17716949"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        319088 48.6"
+          ],
+          "io": {
+            "to_peer_bytes": "395342396",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2244",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 61.475,
+              "var_ms": 33.086,
+              "flight": "260400",
+              "cap": "261037",
+              "queue": "185986",
+              "rate": "234430816",
+              "pace": "232086512",
+              "loss_ppm": 163834,
+              "age_ms": 145,
+              "app_limited": false,
+              "acked": "342000074",
+              "native_sample_us": "17772776"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 18.003142494009808,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1671732,
+            "qlen": 453,
+            "bytes": 448163284,
+            "drops": 3379
+          },
+          {
+            "dev": "eth1",
+            "backlog": 34396,
+            "qlen": 166,
+            "bytes": 16906410,
+            "drops": 801
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61856 27.9"
+          ],
+          "io": {
+            "to_peer_bytes": "2372",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "343671708",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 79.464246,
+              "var_ms": 11.053694,
+              "flight": "817",
+              "cap": "164713",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 217,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "177161",
+              "native_sample_us": "18730161"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        319088 48.3"
+          ],
+          "io": {
+            "to_peer_bytes": "410732444",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2372",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 43.271,
+              "var_ms": 12.589,
+              "flight": "3422400",
+              "cap": "3673004",
+              "queue": "0",
+              "rate": "228429488",
+              "pace": "226145192",
+              "loss_ppm": 161036,
+              "age_ms": 10,
+              "app_limited": false,
+              "acked": "362747865",
+              "native_sample_us": "18791810"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 19.00324528804049,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1389798,
+            "qlen": 331,
+            "bytes": 470617193,
+            "drops": 3552
+          },
+          {
+            "dev": "eth1",
+            "backlog": 23459,
+            "qlen": 118,
+            "bytes": 17893043,
+            "drops": 842
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61856 27.9"
+          ],
+          "io": {
+            "to_peer_bytes": "2500",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "363827388",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 68.903876,
+              "var_ms": 14.850481,
+              "flight": "0",
+              "cap": "175543",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 204,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "187991",
+              "native_sample_us": "19744999"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        320260 48.3"
+          ],
+          "io": {
+            "to_peer_bytes": "430936252",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2500",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 43.488,
+              "var_ms": 5.65,
+              "flight": "1966800",
+              "cap": "2167183",
+              "queue": "0",
+              "rate": "165193440",
+              "pace": "163541504",
+              "loss_ppm": 162623,
+              "age_ms": 1,
+              "app_limited": false,
+              "acked": "383361067",
+              "native_sample_us": "19800828"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 20.003341741976328,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2040343,
+            "qlen": 424,
+            "bytes": 496577357,
+            "drops": 3723
+          },
+          {
+            "dev": "eth1",
+            "backlog": 30792,
+            "qlen": 146,
+            "bytes": 18789348,
+            "drops": 894
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61984 27.9"
+          ],
+          "io": {
+            "to_peer_bytes": "2628",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "387308796",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 77.319198,
+              "var_ms": 15.713854999999999,
+              "flight": "1518",
+              "cap": "183897",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 195,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "196345",
+              "native_sample_us": "20730152"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        320392 48.0"
+          ],
+          "io": {
+            "to_peer_bytes": "453694524",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2628",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 42.906,
+              "var_ms": 6.504,
+              "flight": "1923600",
+              "cap": "2167183",
+              "queue": "0",
+              "rate": "165193440",
+              "pace": "163541504",
+              "loss_ppm": 157772,
+              "age_ms": 2,
+              "app_limited": false,
+              "acked": "402666661",
+              "native_sample_us": "20800778"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 21.00345608603675,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1591002,
+            "qlen": 415,
+            "bytes": 525054279,
+            "drops": 3915
+          },
+          {
+            "dev": "eth1",
+            "backlog": 25660,
+            "qlen": 128,
+            "bytes": 19942889,
+            "drops": 942
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61984 28.3"
+          ],
+          "io": {
+            "to_peer_bytes": "2756",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "409618588",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 76.174491,
+              "var_ms": 9.441865,
+              "flight": "1164",
+              "cap": "191757",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 190,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "208213",
+              "native_sample_us": "21732158"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        326548 48.8"
+          ],
+          "io": {
+            "to_peer_bytes": "476566844",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2756",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 45.674,
+              "var_ms": 5.196,
+              "flight": "2487578",
+              "cap": "3435551",
+              "queue": "0",
+              "rate": "196550160",
+              "pace": "194584656",
+              "loss_ppm": 160181,
+              "age_ms": 30,
+              "app_limited": false,
+              "acked": "426460725",
+              "native_sample_us": "21779004"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 22.003558758995496,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1537596,
+            "qlen": 253,
+            "bytes": 547782879,
+            "drops": 4035
+          },
+          {
+            "dev": "eth1",
+            "backlog": 15795,
+            "qlen": 87,
+            "bytes": 20600047,
+            "drops": 977
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61984 28.4"
+          ],
+          "io": {
+            "to_peer_bytes": "2884",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "430948636",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 84.75632399999999,
+              "var_ms": 12.283165,
+              "flight": "958",
+              "cap": "201871",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 182,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "218327",
+              "native_sample_us": "22723239"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        326548 49.0"
+          ],
+          "io": {
+            "to_peer_bytes": "496221244",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2884",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 51.632,
+              "var_ms": 8.185,
+              "flight": "2332800",
+              "cap": "3508800",
+              "queue": "0",
+              "rate": "187791928",
+              "pace": "185914008",
+              "loss_ppm": 157048,
+              "age_ms": 18,
+              "app_limited": false,
+              "acked": "447684930",
+              "native_sample_us": "22784244"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 23.003660261980258,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2048058,
+            "qlen": 496,
+            "bytes": 576579470,
+            "drops": 4197
+          },
+          {
+            "dev": "eth1",
+            "backlog": 41880,
+            "qlen": 197,
+            "bytes": 21481021,
+            "drops": 1024
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61984 28.6"
+          ],
+          "io": {
+            "to_peer_bytes": "3012",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "452479388",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 78.256788,
+              "var_ms": 16.358674,
+              "flight": "0",
+              "cap": "209222",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 177,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "227348",
+              "native_sample_us": "23618206"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        326548 49.1"
+          ],
+          "io": {
+            "to_peer_bytes": "512100892",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "3012",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 44.669,
+              "var_ms": 12.019,
+              "flight": "3957600",
+              "cap": "4128000",
+              "queue": "0",
+              "rate": "310946432",
+              "pace": "384796208",
+              "loss_ppm": 151495,
+              "age_ms": 16,
+              "app_limited": false,
+              "acked": "469719310",
+              "native_sample_us": "23785978"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 24.00375529495068,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1902744,
+            "qlen": 469,
+            "bytes": 594777064,
+            "drops": 4310
+          },
+          {
+            "dev": "eth1",
+            "backlog": 28835,
+            "qlen": 139,
+            "bytes": 22076550,
+            "drops": 1063
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        61984 28.2"
+          ],
+          "io": {
+            "to_peer_bytes": "3140",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "471688156",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 87.942503,
+              "var_ms": 32.195424,
+              "flight": "924",
+              "cap": "221256",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 169,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "239382",
+              "native_sample_us": "24712188"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        326548 49.0"
+          ],
+          "io": {
+            "to_peer_bytes": "538633692",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "3140",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 69.759,
+              "var_ms": 11.654,
+              "flight": "232800",
+              "cap": "233577",
+              "queue": "207728",
+              "rate": "230903744",
+              "pace": "228594704",
+              "loss_ppm": 154612,
+              "age_ms": 91,
+              "app_limited": false,
+              "acked": "489938929",
+              "native_sample_us": "24779293"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 25.003859368967824,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 0,
+            "qlen": 0,
+            "bytes": 615103950,
+            "drops": 4452
+          },
+          {
+            "dev": "eth1",
+            "backlog": 0,
+            "qlen": 0,
+            "bytes": 23059948,
+            "drops": 1102
+          }
+        ],
+        "client": {
+          "process": [
+            " 192806 mptunnel        62356 28.3"
+          ],
+          "io": {
+            "to_peer_bytes": "3268",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "491442524",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 75.117523,
+              "var_ms": 11.550333,
+              "flight": "2124",
+              "cap": "226179",
+              "queue": null,
+              "rate": "336576",
+              "pace": null,
+              "loss_ppm": 182,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "248132",
+              "native_sample_us": "25736163"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 191403 mptunnel        326548 48.8"
+          ],
+          "io": {
+            "to_peer_bytes": "557073500",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "3268",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 40.423,
+              "var_ms": 9.768,
+              "flight": "2608800",
+              "cap": "2961600",
+              "queue": "0",
+              "rate": "213897976",
+              "pace": "211758992",
+              "loss_ppm": 153920,
+              "age_ms": 25,
+              "app_limited": false,
+              "acked": "509708727",
+              "native_sample_us": "25785211"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "tag": "quic-steady-down-ack-rtt-candidate-0907",
+    "probe": {
+      "case": "quic-steady-down-ack-rtt-candidate-0907",
+      "protocol": "bulk-interactive",
+      "status": "ok",
+      "workload_mode": "bulk-interactive",
+      "mode": "socks5",
+      "target": "127.0.0.1:8080",
+      "udp_target": null,
+      "tcp_echo_target": "127.0.0.1:10022",
+      "interactive_interval_ms": 500,
+      "interactive_timeout_ms": 3000,
+      "interactive_payload_bytes": 64,
+      "failover_after_s": -1,
+      "test_duration_s": 25,
+      "bulk_status": "ok",
+      "bulk_http_code": 200,
+      "bulk_content_length": 8589934592,
+      "bulk_bytes": 551935924,
+      "bulk_time_s": 25.002071217051707,
+      "bulk_load_duration_s": 25,
+      "bulk_requests": 1,
+      "bulk_complete_requests": 0,
+      "bulk_partial_requests": 1,
+      "bulk_goodput_mbps": 176.60486419975422,
+      "bulk_first_body_s": 0.4188100090250373,
+      "bulk_bytes_at_failover": null,
+      "bulk_max_read_gap_s": 0.34585523302666843,
+      "bulk_max_gap_start_s": 3.289405360003002,
+      "bulk_max_gap_end_s": 3.6352605930296704,
+      "bulk_max_gap_start_bytes": 55857652,
+      "bulk_max_gap_end_bytes": 55923188,
+      "bulk_recovery_gap_s": 0,
+      "bulk_recovery_gap_start_s": null,
+      "bulk_recovery_gap_end_s": null,
+      "bulk_recovery_gap_start_bytes": null,
+      "bulk_recovery_gap_end_bytes": null,
+      "bulk_interval_seconds": 1,
+      "bulk_interval_trim_discard_each_end": 3,
+      "bulk_interval_goodput_raw_mbps": [
+        4.812,
+        162.84,
+        206.333,
+        200.137,
+        154.378,
+        145.752,
+        203.041,
+        156.287,
+        198.853,
+        185.784,
+        123.265,
+        180.776,
+        194.221,
+        120.665,
+        197.867,
+        164.067,
+        192.526,
+        165.169,
+        170.289,
+        133.937,
+        238.506,
+        256.184,
+        230.976,
+        200.09,
+        228.204
+      ],
+      "bulk_interval_goodput_mbps": [
+        200.137,
+        154.378,
+        145.752,
+        203.041,
+        156.287,
+        198.853,
+        185.784,
+        123.265,
+        180.776,
+        194.221,
+        120.665,
+        197.867,
+        164.067,
+        192.526,
+        165.169,
+        170.289,
+        133.937,
+        238.506,
+        256.184
+      ],
+      "bulk_interval_goodput_avg_mbps": 177.984,
+      "bulk_interval_goodput_max_mbps": 256.184,
+      "bulk_interval_goodput_min_mbps": 120.665,
+      "interactive_connected": true,
+      "interactive_attempt_series": [
+        {
+          "index": 0,
+          "start_offset_s": 0.11350948503240943,
+          "end_offset_s": 0.21278636110946536,
+          "latency_ms": 99.27687607705593,
+          "outcome": "success"
+        },
+        {
+          "index": 1,
+          "start_offset_s": 0.5004656329983845,
+          "end_offset_s": 0.6481310050003231,
+          "latency_ms": 147.66537200193852,
+          "outcome": "success"
+        },
+        {
+          "index": 2,
+          "start_offset_s": 1.0005343040684238,
+          "end_offset_s": 1.218507447047159,
+          "latency_ms": 217.97314297873527,
+          "outcome": "success"
+        },
+        {
+          "index": 3,
+          "start_offset_s": 1.5006729050073773,
+          "end_offset_s": 1.5866872390033677,
+          "latency_ms": 86.01433399599046,
+          "outcome": "success"
+        },
+        {
+          "index": 4,
+          "start_offset_s": 2.001730064046569,
+          "end_offset_s": 2.2702573370188475,
+          "latency_ms": 268.5272729722783,
+          "outcome": "success"
+        },
+        {
+          "index": 5,
+          "start_offset_s": 2.5018370770849288,
+          "end_offset_s": 2.6406392831122503,
+          "latency_ms": 138.80220602732152,
+          "outcome": "success"
+        },
+        {
+          "index": 6,
+          "start_offset_s": 3.001917877001688,
+          "end_offset_s": 3.110546091105789,
+          "latency_ms": 108.62821410410106,
+          "outcome": "success"
+        },
+        {
+          "index": 7,
+          "start_offset_s": 3.502010121010244,
+          "end_offset_s": 3.7493728160625324,
+          "latency_ms": 247.36269505228847,
+          "outcome": "success"
+        },
+        {
+          "index": 8,
+          "start_offset_s": 4.002095496049151,
+          "end_offset_s": 4.1275771100772545,
+          "latency_ms": 125.48161402810365,
+          "outcome": "success"
+        },
+        {
+          "index": 9,
+          "start_offset_s": 4.502174201072194,
+          "end_offset_s": 4.773329954012297,
+          "latency_ms": 271.1557529401034,
+          "outcome": "success"
+        },
+        {
+          "index": 10,
+          "start_offset_s": 5.002270345110446,
+          "end_offset_s": 5.136900616111234,
+          "latency_ms": 134.63027100078762,
+          "outcome": "success"
+        },
+        {
+          "index": 11,
+          "start_offset_s": 5.502361559076235,
+          "end_offset_s": 5.636688489001244,
+          "latency_ms": 134.3269299250096,
+          "outcome": "success"
+        },
+        {
+          "index": 12,
+          "start_offset_s": 6.002450903062709,
+          "end_offset_s": 6.079813790041953,
+          "latency_ms": 77.36288697924465,
+          "outcome": "success"
+        },
+        {
+          "index": 13,
+          "start_offset_s": 6.50252055702731,
+          "end_offset_s": 6.771280184038915,
+          "latency_ms": 268.7596270116046,
+          "outcome": "success"
+        },
+        {
+          "index": 14,
+          "start_offset_s": 7.002620242070407,
+          "end_offset_s": 7.114911535056308,
+          "latency_ms": 112.29129298590124,
+          "outcome": "success"
+        },
+        {
+          "index": 15,
+          "start_offset_s": 7.502690958091989,
+          "end_offset_s": 7.616781252087094,
+          "latency_ms": 114.09029399510473,
+          "outcome": "success"
+        },
+        {
+          "index": 16,
+          "start_offset_s": 8.002772312029265,
+          "end_offset_s": 8.128092675004154,
+          "latency_ms": 125.32036297488958,
+          "outcome": "success"
+        },
+        {
+          "index": 17,
+          "start_offset_s": 8.50285985704977,
+          "end_offset_s": 8.707060676068068,
+          "latency_ms": 204.2008190182969,
+          "outcome": "success"
+        },
+        {
+          "index": 18,
+          "start_offset_s": 9.003106152056716,
+          "end_offset_s": 9.157246724003926,
+          "latency_ms": 154.14057194720954,
+          "outcome": "success"
+        },
+        {
+          "index": 19,
+          "start_offset_s": 9.503142696106806,
+          "end_offset_s": 9.614395223092288,
+          "latency_ms": 111.25252698548138,
+          "outcome": "success"
+        },
+        {
+          "index": 20,
+          "start_offset_s": 10.003213151008822,
+          "end_offset_s": 10.257906743092462,
+          "latency_ms": 254.6935920836404,
+          "outcome": "success"
+        },
+        {
+          "index": 21,
+          "start_offset_s": 10.503300166106783,
+          "end_offset_s": 10.59598588803783,
+          "latency_ms": 92.68572193104774,
+          "outcome": "success"
+        },
+        {
+          "index": 22,
+          "start_offset_s": 11.003380201058462,
+          "end_offset_s": 11.156506805098616,
+          "latency_ms": 153.12660404015332,
+          "outcome": "success"
+        },
+        {
+          "index": 23,
+          "start_offset_s": 11.50347805407364,
+          "end_offset_s": 11.617854910087772,
+          "latency_ms": 114.3768560141325,
+          "outcome": "success"
+        },
+        {
+          "index": 24,
+          "start_offset_s": 12.003516799071804,
+          "end_offset_s": 12.097151697031222,
+          "latency_ms": 93.6348979594186,
+          "outcome": "success"
+        },
+        {
+          "index": 25,
+          "start_offset_s": 12.503602755023167,
+          "end_offset_s": 12.608129220083356,
+          "latency_ms": 104.52646506018937,
+          "outcome": "success"
+        },
+        {
+          "index": 26,
+          "start_offset_s": 13.003668111050501,
+          "end_offset_s": 13.111283855047077,
+          "latency_ms": 107.61574399657547,
+          "outcome": "success"
+        },
+        {
+          "index": 27,
+          "start_offset_s": 13.503763045067899,
+          "end_offset_s": 13.64588000101503,
+          "latency_ms": 142.11695594713092,
+          "outcome": "success"
+        },
+        {
+          "index": 28,
+          "start_offset_s": 14.00384664000012,
+          "end_offset_s": 14.126864059013315,
+          "latency_ms": 123.01741901319474,
+          "outcome": "success"
+        },
+        {
+          "index": 29,
+          "start_offset_s": 14.503936345106922,
+          "end_offset_s": 14.615001740050502,
+          "latency_ms": 111.06539494358003,
+          "outcome": "success"
+        },
+        {
+          "index": 30,
+          "start_offset_s": 15.004026571055874,
+          "end_offset_s": 15.104901633108966,
+          "latency_ms": 100.87506205309182,
+          "outcome": "success"
+        },
+        {
+          "index": 31,
+          "start_offset_s": 15.504118356038816,
+          "end_offset_s": 15.705698630074039,
+          "latency_ms": 201.58027403522283,
+          "outcome": "success"
+        },
+        {
+          "index": 32,
+          "start_offset_s": 16.004209292004816,
+          "end_offset_s": 16.16346858406905,
+          "latency_ms": 159.25929206423461,
+          "outcome": "success"
+        },
+        {
+          "index": 33,
+          "start_offset_s": 16.50429479801096,
+          "end_offset_s": 16.61671216005925,
+          "latency_ms": 112.41736204829067,
+          "outcome": "success"
+        },
+        {
+          "index": 34,
+          "start_offset_s": 17.00436794210691,
+          "end_offset_s": 17.132608735002577,
+          "latency_ms": 128.24079289566725,
+          "outcome": "success"
+        },
+        {
+          "index": 35,
+          "start_offset_s": 17.504467997001484,
+          "end_offset_s": 17.617905377061106,
+          "latency_ms": 113.43738005962223,
+          "outcome": "success"
+        },
+        {
+          "index": 36,
+          "start_offset_s": 18.004551683086902,
+          "end_offset_s": 18.13509855803568,
+          "latency_ms": 130.54687494877726,
+          "outcome": "success"
+        },
+        {
+          "index": 37,
+          "start_offset_s": 18.504627949092537,
+          "end_offset_s": 18.613512421026826,
+          "latency_ms": 108.88447193428874,
+          "outcome": "success"
+        },
+        {
+          "index": 38,
+          "start_offset_s": 19.00469721504487,
+          "end_offset_s": 19.1063373220386,
+          "latency_ms": 101.64010699372739,
+          "outcome": "success"
+        },
+        {
+          "index": 39,
+          "start_offset_s": 19.50478237203788,
+          "end_offset_s": 19.780032370006666,
+          "latency_ms": 275.24999796878546,
+          "outcome": "success"
+        },
+        {
+          "index": 40,
+          "start_offset_s": 20.004872257006355,
+          "end_offset_s": 20.134378966060467,
+          "latency_ms": 129.50670905411243,
+          "outcome": "success"
+        },
+        {
+          "index": 41,
+          "start_offset_s": 20.504944313084707,
+          "end_offset_s": 20.634235341101885,
+          "latency_ms": 129.29102801717818,
+          "outcome": "success"
+        },
+        {
+          "index": 42,
+          "start_offset_s": 21.00503295904491,
+          "end_offset_s": 21.16947153408546,
+          "latency_ms": 164.43857504054904,
+          "outcome": "success"
+        },
+        {
+          "index": 43,
+          "start_offset_s": 21.505118526052684,
+          "end_offset_s": 21.572220250032842,
+          "latency_ms": 67.10172398015857,
+          "outcome": "success"
+        },
+        {
+          "index": 44,
+          "start_offset_s": 22.005201592110097,
+          "end_offset_s": 22.1093403151026,
+          "latency_ms": 104.13872299250215,
+          "outcome": "success"
+        },
+        {
+          "index": 45,
+          "start_offset_s": 22.50528468808625,
+          "end_offset_s": 22.609941834001802,
+          "latency_ms": 104.65714591555297,
+          "outcome": "success"
+        },
+        {
+          "index": 46,
+          "start_offset_s": 23.005606695078313,
+          "end_offset_s": 23.10508535907138,
+          "latency_ms": 99.47866399306804,
+          "outcome": "success"
+        },
+        {
+          "index": 47,
+          "start_offset_s": 23.50567584100645,
+          "end_offset_s": 23.618729458074085,
+          "latency_ms": 113.05361706763506,
+          "outcome": "success"
+        },
+        {
+          "index": 48,
+          "start_offset_s": 24.005759327090345,
+          "end_offset_s": 24.15548083104659,
+          "latency_ms": 149.7215039562434,
+          "outcome": "success"
+        },
+        {
+          "index": 49,
+          "start_offset_s": 24.505835055024363,
+          "end_offset_s": 24.603261617012322,
+          "latency_ms": 97.42656198795885,
+          "outcome": "success"
+        }
+      ],
+      "interactive_start_s": 0.00033795100171118975,
+      "interactive_time_s": 24.999815034097992,
+      "interactive_count": 50,
+      "interactive_ok": 50,
+      "interactive_fail": 0,
+      "interactive_request_bytes": 3200,
+      "interactive_response_bytes": 3200,
+      "interactive_p50_ms": 123.01741901319474,
+      "interactive_p95_ms": 268.7596270116046,
+      "interactive_max_ms": 275.24999796878546,
+      "interactive_max_success_gap_s": 0.6914663939969614,
+      "interactive_failover_gap_s": 0,
+      "interactive_disconnected_at_s": null,
+      "interactive_error": null,
+      "mixed_app_payload_bytes": 551942324
+    },
+    "series": [
+      {
+        "elapsed": 0.00005614000838249922,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 15929,
+            "qlen": 4,
+            "bytes": 15143,
+            "drops": 2
+          },
+          {
+            "dev": "eth1",
+            "backlog": 79,
+            "qlen": 1,
+            "bytes": 15886,
+            "drops": 2
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        31588  3.1"
+          ],
+          "io": {
+            "to_peer_bytes": "0",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "0",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 0,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 115.45455,
+              "var_ms": 23.943241,
+              "flight": "0",
+              "cap": "19564",
+              "queue": null,
+              "rate": "120696",
+              "pace": null,
+              "loss_ppm": 60860,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "7564",
+              "native_sample_us": "606397"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        29092  2.8"
+          ],
+          "io": {
+            "to_peer_bytes": "0",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "0",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 0,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 112.172,
+              "var_ms": 33.987,
+              "flight": "1468",
+              "cap": "15255",
+              "queue": "0",
+              "rate": "120168",
+              "pace": null,
+              "loss_ppm": 0,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "7733",
+              "native_sample_us": "768301"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 1.000168501981534,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2748546,
+            "qlen": 406,
+            "bytes": 17726454,
+            "drops": 123
+          },
+          {
+            "dev": "eth1",
+            "backlog": 18914,
+            "qlen": 94,
+            "bytes": 380198,
+            "drops": 19
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        38440  4.7"
+          ],
+          "io": {
+            "to_peer_bytes": "196",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "351857",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 112.270874,
+              "var_ms": 17.021865000000002,
+              "flight": "186",
+              "cap": "22406",
+              "queue": null,
+              "rate": "120696",
+              "pace": null,
+              "loss_ppm": 34068,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "10406",
+              "native_sample_us": "1726342"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        166084 9.3"
+          ],
+          "io": {
+            "to_peer_bytes": "67460721",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "196",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 80.684,
+              "var_ms": 18.141,
+              "flight": "484968",
+              "cap": "529437",
+              "queue": "0",
+              "rate": "25421152",
+              "pace": "266208000",
+              "loss_ppm": 75523,
+              "age_ms": 17,
+              "app_limited": false,
+              "acked": "517437",
+              "native_sample_us": "1816573"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 2.000281634973362,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2079108,
+            "qlen": 384,
+            "bytes": 54861663,
+            "drops": 334
+          },
+          {
+            "dev": "eth1",
+            "backlog": 20135,
+            "qlen": 99,
+            "bytes": 1250146,
+            "drops": 56
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        51968 22.0"
+          ],
+          "io": {
+            "to_peer_bytes": "324",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "20051460",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 77.152888,
+              "var_ms": 15.407366,
+              "flight": "1977",
+              "cap": "29435",
+              "queue": null,
+              "rate": "144536",
+              "pace": null,
+              "loss_ppm": 565,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "17435",
+              "native_sample_us": "2729389"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        190028 28.6"
+          ],
+          "io": {
+            "to_peer_bytes": "85182244",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "324",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 41.631,
+              "var_ms": 9.195,
+              "flight": "3522000",
+              "cap": "4015976",
+              "queue": "0",
+              "rate": "300333264",
+              "pace": "297329928",
+              "loss_ppm": 175350,
+              "age_ms": 8,
+              "app_limited": false,
+              "acked": "24842029",
+              "native_sample_us": "2825654"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 3.000388460000977,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2755974,
+            "qlen": 570,
+            "bytes": 80906211,
+            "drops": 505
+          },
+          {
+            "dev": "eth1",
+            "backlog": 32513,
+            "qlen": 154,
+            "bytes": 2012511,
+            "drops": 103
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        53800 26.2"
+          ],
+          "io": {
+            "to_peer_bytes": "452",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "42858116",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 78.169605,
+              "var_ms": 14.860692,
+              "flight": "0",
+              "cap": "34316",
+              "queue": null,
+              "rate": "202024",
+              "pace": null,
+              "loss_ppm": 450,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "31677",
+              "native_sample_us": "3698383"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        217316 39.3"
+          ],
+          "io": {
+            "to_peer_bytes": "109966980",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "452",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 41.384,
+              "var_ms": 9.073,
+              "flight": "2941180",
+              "cap": "3952000",
+              "queue": "0",
+              "rate": "250415088",
+              "pace": "247910936",
+              "loss_ppm": 142902,
+              "age_ms": 13,
+              "app_limited": false,
+              "acked": "51487702",
+              "native_sample_us": "3820958"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 4.000486231059767,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1506546,
+            "qlen": 354,
+            "bytes": 105834753,
+            "drops": 702
+          },
+          {
+            "dev": "eth1",
+            "backlog": 21612,
+            "qlen": 112,
+            "bytes": 2949338,
+            "drops": 137
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        55496 27.7"
+          ],
+          "io": {
+            "to_peer_bytes": "580",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "68572292",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 70.377694,
+              "var_ms": 17.924737999999998,
+              "flight": "128",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 251,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "42964",
+              "native_sample_us": "4740393"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        248552 45.3"
+          ],
+          "io": {
+            "to_peer_bytes": "134167596",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "580",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 39.977,
+              "var_ms": 6.973,
+              "flight": "3291579",
+              "cap": "3291729",
+              "queue": "0",
+              "rate": "208232216",
+              "pace": "206149888",
+              "loss_ppm": 158169,
+              "age_ms": 17,
+              "app_limited": false,
+              "acked": "76747204",
+              "native_sample_us": "4816224"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 5.00058699096553,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1506546,
+            "qlen": 368,
+            "bytes": 127778142,
+            "drops": 876
+          },
+          {
+            "dev": "eth1",
+            "backlog": 26900,
+            "qlen": 129,
+            "bytes": 3886661,
+            "drops": 185
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        56624 27.3"
+          ],
+          "io": {
+            "to_peer_bytes": "708",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "88835108",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 75.762468,
+              "var_ms": 9.702745,
+              "flight": "0",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 239,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "53372",
+              "native_sample_us": "5692389"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        261980 45.4"
+          ],
+          "io": {
+            "to_peer_bytes": "155943972",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "708",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 48.53,
+              "var_ms": 6.55,
+              "flight": "2075982",
+              "cap": "3298467",
+              "queue": "0",
+              "rate": "175238016",
+              "pace": "173485632",
+              "loss_ppm": 152398,
+              "age_ms": 11,
+              "app_limited": false,
+              "acked": "97053984",
+              "native_sample_us": "5822286"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 6.000684679020196,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1794690,
+            "qlen": 430,
+            "bytes": 155608878,
+            "drops": 1050
+          },
+          {
+            "dev": "eth1",
+            "backlog": 42182,
+            "qlen": 199,
+            "bytes": 4855692,
+            "drops": 234
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        57548 27.8"
+          ],
+          "io": {
+            "to_peer_bytes": "836",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "109282468",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 78.605851,
+              "var_ms": 8.860813,
+              "flight": "0",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 236,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "63169",
+              "native_sample_us": "6670794"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        275308 45.4"
+          ],
+          "io": {
+            "to_peer_bytes": "174204644",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "836",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 44.776,
+              "var_ms": 7.911,
+              "flight": "3074400",
+              "cap": "4287267",
+              "queue": "0",
+              "rate": "336577504",
+              "pace": "416514664",
+              "loss_ppm": 138438,
+              "age_ms": 23,
+              "app_limited": false,
+              "acked": "116929507",
+              "native_sample_us": "6810584"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 7.000787958037108,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1605891,
+            "qlen": 390,
+            "bytes": 180068701,
+            "drops": 1235
+          },
+          {
+            "dev": "eth1",
+            "backlog": 24928,
+            "qlen": 123,
+            "bytes": 5892502,
+            "drops": 271
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        57548 28.3"
+          ],
+          "io": {
+            "to_peer_bytes": "964",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "131671908",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 67.711944,
+              "var_ms": 9.385008000000001,
+              "flight": "0",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 185,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "76590",
+              "native_sample_us": "7679403"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        291732 46.9"
+          ],
+          "io": {
+            "to_peer_bytes": "198780772",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "964",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 35.873,
+              "var_ms": 10.446,
+              "flight": "2564400",
+              "cap": "2852412",
+              "queue": "0",
+              "rate": "195974280",
+              "pace": "194014536",
+              "loss_ppm": 147650,
+              "age_ms": 10,
+              "app_limited": false,
+              "acked": "141882282",
+              "native_sample_us": "7823326"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 8.000900006038137,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2537406,
+            "qlen": 371,
+            "bytes": 205143377,
+            "drops": 1418
+          },
+          {
+            "dev": "eth1",
+            "backlog": 29183,
+            "qlen": 139,
+            "bytes": 6820912,
+            "drops": 314
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        58420 28.5"
+          ],
+          "io": {
+            "to_peer_bytes": "1092",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "154198756",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 68.913168,
+              "var_ms": 13.073034000000002,
+              "flight": "192",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 247,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "86220",
+              "native_sample_us": "8734627"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        284400 46.9"
+          ],
+          "io": {
+            "to_peer_bytes": "220783332",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1092",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 37.763,
+              "var_ms": 9.542,
+              "flight": "2313600",
+              "cap": "2852412",
+              "queue": "0",
+              "rate": "187229392",
+              "pace": "185357104",
+              "loss_ppm": 140390,
+              "age_ms": 15,
+              "app_limited": false,
+              "acked": "162829347",
+              "native_sample_us": "8819049"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 9.001007235026918,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2076590,
+            "qlen": 540,
+            "bytes": 242234312,
+            "drops": 1662
+          },
+          {
+            "dev": "eth1",
+            "backlog": 35121,
+            "qlen": 166,
+            "bytes": 7991334,
+            "drops": 366
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        60068 28.9"
+          ],
+          "io": {
+            "to_peer_bytes": "1220",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "176112036",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 78.72867,
+              "var_ms": 9.58489,
+              "flight": "0",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 216,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "95327",
+              "native_sample_us": "9677569"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        297176 47.9"
+          ],
+          "io": {
+            "to_peer_bytes": "241886180",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1220",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 37.548,
+              "var_ms": 6.071,
+              "flight": "5104773",
+              "cap": "6753930",
+              "queue": "0",
+              "rate": "315611712",
+              "pace": "390569496",
+              "loss_ppm": 137165,
+              "age_ms": 12,
+              "app_limited": false,
+              "acked": "190009320",
+              "native_sample_us": "9821790"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 10.00110754405614,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 131652,
+            "qlen": 18,
+            "bytes": 262790297,
+            "drops": 1791
+          },
+          {
+            "dev": "eth1",
+            "backlog": 1813,
+            "qlen": 15,
+            "bytes": 8823178,
+            "drops": 397
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        60068 29.3"
+          ],
+          "io": {
+            "to_peer_bytes": "1348",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "202278732",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 74.095099,
+              "var_ms": 6.402681,
+              "flight": "308",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 188,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "106393",
+              "native_sample_us": "10688381"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        303936 49.1"
+          ],
+          "io": {
+            "to_peer_bytes": "266533380",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1348",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 41.238,
+              "var_ms": 6.003,
+              "flight": "2658000",
+              "cap": "3098660",
+              "queue": "0",
+              "rate": "204559336",
+              "pace": "202513744",
+              "loss_ppm": 149284,
+              "age_ms": 13,
+              "app_limited": false,
+              "acked": "212836768",
+              "native_sample_us": "10820331"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 11.00120437296573,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1820772,
+            "qlen": 432,
+            "bytes": 287078200,
+            "drops": 1967
+          },
+          {
+            "dev": "eth1",
+            "backlog": 23174,
+            "qlen": 115,
+            "bytes": 9619379,
+            "drops": 450
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        60068 28.8"
+          ],
+          "io": {
+            "to_peer_bytes": "1476",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "217687044",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 80.241479,
+              "var_ms": 16.906574,
+              "flight": "736",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 202,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "114901",
+              "native_sample_us": "11730430"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        304596 48.3"
+          ],
+          "io": {
+            "to_peer_bytes": "284002084",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1476",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 38.924,
+              "var_ms": 5.618,
+              "flight": "4316210",
+              "cap": "4316618",
+              "queue": "0",
+              "rate": "316288184",
+              "pace": "313125304",
+              "loss_ppm": 147052,
+              "age_ms": 10,
+              "app_limited": false,
+              "acked": "230676921",
+              "native_sample_us": "11823692"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 12.001310180989094,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1850580,
+            "qlen": 471,
+            "bytes": 313414602,
+            "drops": 2172
+          },
+          {
+            "dev": "eth1",
+            "backlog": 34994,
+            "qlen": 167,
+            "bytes": 10604535,
+            "drops": 503
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        60136 28.9"
+          ],
+          "io": {
+            "to_peer_bytes": "1604",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "240272228",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 66.262609,
+              "var_ms": 21.013902,
+              "flight": "1459",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 258,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "125495",
+              "native_sample_us": "12739486"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        307644 48.6"
+          ],
+          "io": {
+            "to_peer_bytes": "305480484",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1604",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 40.438,
+              "var_ms": 9.126,
+              "flight": "2581180",
+              "cap": "3569279",
+              "queue": "0",
+              "rate": "210121816",
+              "pace": "208020600",
+              "loss_ppm": 152376,
+              "age_ms": 5,
+              "app_limited": false,
+              "acked": "252281464",
+              "native_sample_us": "12829358"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 13.001415241975337,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2220696,
+            "qlen": 533,
+            "bytes": 338704066,
+            "drops": 2383
+          },
+          {
+            "dev": "eth1",
+            "backlog": 29417,
+            "qlen": 147,
+            "bytes": 11698180,
+            "drops": 557
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        60136 29.1"
+          ],
+          "io": {
+            "to_peer_bytes": "1732",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "261601028",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 70.33182000000001,
+              "var_ms": 12.820722,
+              "flight": "630",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 253,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "137465",
+              "native_sample_us": "13718383"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        308796 49.1"
+          ],
+          "io": {
+            "to_peer_bytes": "328709892",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1732",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 42.075,
+              "var_ms": 6.998,
+              "flight": "2793564",
+              "cap": "3533293",
+              "queue": "0",
+              "rate": "204289368",
+              "pace": "202246472",
+              "loss_ppm": 152540,
+              "age_ms": 4,
+              "app_limited": false,
+              "acked": "274213651",
+              "native_sample_us": "13830086"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 14.001509641995654,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1799658,
+            "qlen": 417,
+            "bytes": 366806327,
+            "drops": 2574
+          },
+          {
+            "dev": "eth1",
+            "backlog": 27548,
+            "qlen": 131,
+            "bytes": 12778090,
+            "drops": 612
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        61112 29.3"
+          ],
+          "io": {
+            "to_peer_bytes": "1860",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "279645228",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 76.460456,
+              "var_ms": 13.267494,
+              "flight": "0",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 230,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "146290",
+              "native_sample_us": "14738399"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        313832 49.5"
+          ],
+          "io": {
+            "to_peer_bytes": "346754092",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1860",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 44.894,
+              "var_ms": 7.52,
+              "flight": "2485192",
+              "cap": "3595500",
+              "queue": "0",
+              "rate": "222084624",
+              "pace": "219863776",
+              "loss_ppm": 155068,
+              "age_ms": 2,
+              "app_limited": false,
+              "acked": "296425358",
+              "native_sample_us": "14831225"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 15.00161992199719,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1696572,
+            "qlen": 467,
+            "bytes": 391759216,
+            "drops": 2793
+          },
+          {
+            "dev": "eth1",
+            "backlog": 25125,
+            "qlen": 119,
+            "bytes": 13845498,
+            "drops": 676
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        62044 29.4"
+          ],
+          "io": {
+            "to_peer_bytes": "1988",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "304378756",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 64.179131,
+              "var_ms": 12.084597,
+              "flight": "779",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 213,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "156655",
+              "native_sample_us": "15709406"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        321332 49.9"
+          ],
+          "io": {
+            "to_peer_bytes": "369176324",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "1988",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 42.03,
+              "var_ms": 6.156,
+              "flight": "2595594",
+              "cap": "3595500",
+              "queue": "0",
+              "rate": "202893888",
+              "pace": "200864952",
+              "loss_ppm": 152589,
+              "age_ms": 20,
+              "app_limited": false,
+              "acked": "318157098",
+              "native_sample_us": "15813133"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 16.001721241977066,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 3159648,
+            "qlen": 701,
+            "bytes": 416899546,
+            "drops": 3025
+          },
+          {
+            "dev": "eth1",
+            "backlog": 45291,
+            "qlen": 212,
+            "bytes": 14842763,
+            "drops": 732
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        62276 29.3"
+          ],
+          "io": {
+            "to_peer_bytes": "2116",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "324887300",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 74.94287299999999,
+              "var_ms": 13.036733,
+              "flight": "2783",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 208,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "165871",
+              "native_sample_us": "16725438"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        306088 49.9"
+          ],
+          "io": {
+            "to_peer_bytes": "391933476",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2116",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 43.658,
+              "var_ms": 10.425,
+              "flight": "2511600",
+              "cap": "3595500",
+              "queue": "0",
+              "rate": "196393728",
+              "pace": "194429792",
+              "loss_ppm": 150997,
+              "age_ms": 34,
+              "app_limited": false,
+              "acked": "339147348",
+              "native_sample_us": "16799259"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 17.00182629399933,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1728832,
+            "qlen": 415,
+            "bytes": 442916830,
+            "drops": 3181
+          },
+          {
+            "dev": "eth1",
+            "backlog": 24499,
+            "qlen": 117,
+            "bytes": 15805197,
+            "drops": 779
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        64260 29.5"
+          ],
+          "io": {
+            "to_peer_bytes": "2244",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "346643084",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 66.379342,
+              "var_ms": 15.152256,
+              "flight": "0",
+              "cap": "5808",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 203,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "180291",
+              "native_sample_us": "17740816"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        297716 50.0"
+          ],
+          "io": {
+            "to_peer_bytes": "413686308",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2244",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 44.234,
+              "var_ms": 8.946,
+              "flight": "2235581",
+              "cap": "2781696",
+              "queue": "0",
+              "rate": "193153456",
+              "pace": "191221920",
+              "loss_ppm": 154110,
+              "age_ms": 16,
+              "app_limited": false,
+              "acked": "361597843",
+              "native_sample_us": "17817083"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 18.001931383041665,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1757430,
+            "qlen": 405,
+            "bytes": 468190256,
+            "drops": 3383
+          },
+          {
+            "dev": "eth1",
+            "backlog": 26137,
+            "qlen": 126,
+            "bytes": 16800639,
+            "drops": 823
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        64260 29.6"
+          ],
+          "io": {
+            "to_peer_bytes": "2372",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "369302244",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 77.244354,
+              "var_ms": 10.949580000000001,
+              "flight": "480",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 192,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "189973",
+              "native_sample_us": "18706926"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        297716 50.1"
+          ],
+          "io": {
+            "to_peer_bytes": "431978660",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2372",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 41.608,
+              "var_ms": 9.718,
+              "flight": "2252400",
+              "cap": "3103821",
+              "queue": "0",
+              "rate": "193153456",
+              "pace": "191221920",
+              "loss_ppm": 150005,
+              "age_ms": 14,
+              "app_limited": false,
+              "acked": "383383792",
+              "native_sample_us": "18819181"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 19.00203509395942,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2275344,
+            "qlen": 387,
+            "bytes": 494898179,
+            "drops": 3535
+          },
+          {
+            "dev": "eth1",
+            "backlog": 32266,
+            "qlen": 152,
+            "bytes": 17692540,
+            "drops": 865
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        64260 29.6"
+          ],
+          "io": {
+            "to_peer_bytes": "2500",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "387501892",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 70.964553,
+              "var_ms": 11.113828,
+              "flight": "160",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 181,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "200825",
+              "native_sample_us": "19705460"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        297716 50.0"
+          ],
+          "io": {
+            "to_peer_bytes": "452232676",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2500",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 39.72,
+              "var_ms": 8.406,
+              "flight": "2619600",
+              "cap": "3457821",
+              "queue": "0",
+              "rate": "275871832",
+              "pace": "273113112",
+              "loss_ppm": 146194,
+              "age_ms": 5,
+              "app_limited": false,
+              "acked": "405458992",
+              "native_sample_us": "19829066"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 20.002149636042304,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2225664,
+            "qlen": 360,
+            "bytes": 525935730,
+            "drops": 3693
+          },
+          {
+            "dev": "eth1",
+            "backlog": 18796,
+            "qlen": 105,
+            "bytes": 18621088,
+            "drops": 914
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        64924 29.6"
+          ],
+          "io": {
+            "to_peer_bytes": "2628",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "407628044",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 77.233398,
+              "var_ms": 13.000851,
+              "flight": "0",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 183,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "212086",
+              "native_sample_us": "20687404"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        301872 50.0"
+          ],
+          "io": {
+            "to_peer_bytes": "474736908",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2628",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 44.486,
+              "var_ms": 4.541,
+              "flight": "3074400",
+              "cap": "3105883",
+              "queue": "0",
+              "rate": "298840632",
+              "pace": "295852224",
+              "loss_ppm": 142292,
+              "age_ms": 16,
+              "app_limited": false,
+              "acked": "433648141",
+              "native_sample_us": "20817579"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 21.00224556797184,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2136240,
+            "qlen": 344,
+            "bytes": 557997855,
+            "drops": 3865
+          },
+          {
+            "dev": "eth1",
+            "backlog": 17190,
+            "qlen": 94,
+            "bytes": 19531284,
+            "drops": 961
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        64924 29.7"
+          ],
+          "io": {
+            "to_peer_bytes": "2756",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "437441476",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 78.09007299999999,
+              "var_ms": 19.268497,
+              "flight": "0",
+              "cap": "38221",
+              "queue": null,
+              "rate": "375080",
+              "pace": null,
+              "loss_ppm": 188,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "225784",
+              "native_sample_us": "21618425"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        314808 50.0"
+          ],
+          "io": {
+            "to_peer_bytes": "504550340",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2756",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 42.559,
+              "var_ms": 7.818,
+              "flight": "3105600",
+              "cap": "3105883",
+              "queue": "0",
+              "rate": "298840632",
+              "pace": "295852224",
+              "loss_ppm": 138441,
+              "age_ms": 17,
+              "app_limited": false,
+              "acked": "462515300",
+              "native_sample_us": "21816639"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 22.002342349966057,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2036880,
+            "qlen": 289,
+            "bytes": 589870016,
+            "drops": 4018
+          },
+          {
+            "dev": "eth1",
+            "backlog": 16451,
+            "qlen": 86,
+            "bytes": 20390127,
+            "drops": 1000
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        64964 29.8"
+          ],
+          "io": {
+            "to_peer_bytes": "2884",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "469464644",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 72.35228500000001,
+              "var_ms": 8.392254999999999,
+              "flight": "221",
+              "cap": "38221",
+              "queue": null,
+              "rate": "410304",
+              "pace": null,
+              "loss_ppm": 206,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "241808",
+              "native_sample_us": "22720581"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        324772 49.9"
+          ],
+          "io": {
+            "to_peer_bytes": "536398372",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "2884",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 39.441,
+              "var_ms": 9.042,
+              "flight": "3655200",
+              "cap": "3655880",
+              "queue": "0",
+              "rate": "307137224",
+              "pace": "380082312",
+              "loss_ppm": 134694,
+              "age_ms": 1,
+              "app_limited": false,
+              "acked": "491987213",
+              "native_sample_us": "22833301"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 23.002454702043906,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 2045574,
+            "qlen": 335,
+            "bytes": 617694511,
+            "drops": 4163
+          },
+          {
+            "dev": "eth1",
+            "backlog": 19829,
+            "qlen": 106,
+            "bytes": 21037848,
+            "drops": 1027
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        64964 29.6"
+          ],
+          "io": {
+            "to_peer_bytes": "3012",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "498336740",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 68.897637,
+              "var_ms": 9.487854,
+              "flight": "1962",
+              "cap": "38221",
+              "queue": null,
+              "rate": "410304",
+              "pace": null,
+              "loss_ppm": 223,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "252260",
+              "native_sample_us": "23713548"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        324772 49.7"
+          ],
+          "io": {
+            "to_peer_bytes": "564665372",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "3012",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 43.485,
+              "var_ms": 9.139,
+              "flight": "2651994",
+              "cap": "2677500",
+              "queue": "0",
+              "rate": "323660512",
+              "pace": "320423904",
+              "loss_ppm": 133619,
+              "age_ms": 12,
+              "app_limited": false,
+              "acked": "518988370",
+              "native_sample_us": "23821223"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 24.00254946295172,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 1829466,
+            "qlen": 260,
+            "bytes": 645202327,
+            "drops": 4300
+          },
+          {
+            "dev": "eth1",
+            "backlog": 21417,
+            "qlen": 111,
+            "bytes": 21655590,
+            "drops": 1061
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        64964 29.4"
+          ],
+          "io": {
+            "to_peer_bytes": "3140",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "523348132",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 73.998733,
+              "var_ms": 8.189828,
+              "flight": "2324",
+              "cap": "38221",
+              "queue": null,
+              "rate": "410304",
+              "pace": null,
+              "loss_ppm": 240,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "264650",
+              "native_sample_us": "24717767"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        324772 49.2"
+          ],
+          "io": {
+            "to_peer_bytes": "590387044",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "3140",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 47.89,
+              "var_ms": 6.046,
+              "flight": "2677200",
+              "cap": "2677500",
+              "queue": "0",
+              "rate": "323660512",
+              "pace": "320423904",
+              "loss_ppm": 129378,
+              "age_ms": 17,
+              "app_limited": false,
+              "acked": "545394339",
+              "native_sample_us": "24817081"
+            }
+          ]
+        }
+      },
+      {
+        "elapsed": 25.002665407024324,
+        "epoch": -1,
+        "udp_blackhole": false,
+        "mirrored_impairment": false,
+        "router_qdisc": [
+          {
+            "dev": "eth0",
+            "backlog": 0,
+            "qlen": 0,
+            "bytes": 663908978,
+            "drops": 4387
+          },
+          {
+            "dev": "eth1",
+            "backlog": 0,
+            "qlen": 0,
+            "bytes": 22179726,
+            "drops": 1087
+          }
+        ],
+        "client": {
+          "process": [
+            " 193432 mptunnel        65156 29.2"
+          ],
+          "io": {
+            "to_peer_bytes": "3268",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "550866076",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 75.29689,
+              "var_ms": 13.361608,
+              "flight": "1053",
+              "cap": "38221",
+              "queue": null,
+              "rate": "410304",
+              "pace": null,
+              "loss_ppm": 299,
+              "age_ms": null,
+              "app_limited": null,
+              "acked": "278004",
+              "native_sample_us": "25677424"
+            }
+          ]
+        },
+        "server": {
+          "process": [
+            " 192016 mptunnel        324772 48.9"
+          ],
+          "io": {
+            "to_peer_bytes": "617504188",
+            "to_peer_packets": "0",
+            "from_peer_bytes": "3268",
+            "from_peer_packets": "0"
+          },
+          "active_flows": 2,
+          "paths": [
+            {
+              "underlay": "udp",
+              "id": "0",
+              "instance": "1",
+              "state": "active",
+              "rtt_ms": 44.905,
+              "var_ms": 8.637,
+              "flight": "3150000",
+              "cap": "3151164",
+              "queue": "0",
+              "rate": "323660512",
+              "pace": "400529880",
+              "loss_ppm": 125361,
+              "age_ms": 17,
+              "app_limited": false,
+              "acked": "572484332",
+              "native_sample_us": "25816175"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

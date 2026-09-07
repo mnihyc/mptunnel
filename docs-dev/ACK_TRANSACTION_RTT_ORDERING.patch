@@ -1,0 +1,109 @@
+--- a/crates/quinn-proto/src/connection/mod.rs
++++ b/crates/quinn-proto/src/connection/mod.rs
+@@ -1674,7 +1674,6 @@
+                 space,
+             );
+         }
+-        self.publish_reordering_evidence(now, largest_current_controller_acked.map(|(_, sent)| sent), retained_ack.oldest_reordered_send);
+         if mtu_updated {
+             // MTUD state changes immediately, but congestion-controller callbacks are serialized:
+             // one received ACK is one complete controller transaction, followed by at most one
+@@ -1702,6 +1701,11 @@
+                 }
+             }
+         }
++
++        // Learn differential delay against this ACK transaction's current RTT.
++        // Publishing before the RTT update retains a common queue increase as
++        // future reordering allowance (and undercounts it when RTT falls).
++        self.publish_reordering_evidence(now, largest_current_controller_acked.map(|(_, sent)| sent), retained_ack.oldest_reordered_send);
+ 
+         // Must be called before crypto/pto_count are clobbered
+         self.detect_lost_packets(now, space, true);
+@@ -3976,6 +3980,12 @@
+     #[cfg(test)]
+     pub(crate) fn bytes_in_flight(&self) -> u64 {
+         self.path.in_flight.bytes
++    }
++
++    #[cfg(test)]
++    pub(crate) fn reordering_loss_delay(&self) -> (Duration, Duration) {
++        let rtt = self.path.rtt.conservative();
++        (rtt, self.path.reordering.loss_delay(Duration::ZERO, rtt))
+     }
+ 
+     /// Number of bytes worth of non-ack-only packets that may be sent
+--- a/crates/quinn-proto/src/tests/mod.rs
++++ b/crates/quinn-proto/src/tests/mod.rs
+@@ -100,6 +100,72 @@
+         }
+         pair.drive();
+         assert!(pair.client_conn_mut(client).stats().path.lost_packets > before, "learned reordering still detects actual loss, bbr={bbr}");
++    }
++}
++
++#[test]
++fn late_original_uses_rtt_from_the_same_ack_transaction() {
++    for (bbr, arrival_ms) in [(false, 130), (false, 200), (true, 130), (true, 200)] {
++        let mut config = client_config_with_deterministic_pns();
++        let transport = Arc::get_mut(&mut config.transport).unwrap();
++        transport.mtu_discovery_config(None);
++        if bbr {
++            transport.congestion_controller_factory(Arc::new(
++                crate::congestion::Bbr3Config::default(),
++            ));
++        }
++        let mut pair = Pair::default_with_deterministic_pns();
++        pair.latency = Duration::from_millis(50);
++        let (client, _) = pair.connect_with(config);
++        pair.drive();
++        let original_sent = pair.time;
++        let lost_before = pair.client_conn_mut(client).stats().path.lost_packets;
++        pair.client_conn_mut(client).ping();
++        pair.drive_client();
++        assert_eq!(pair.server.inbound.len(), 1);
++        let mut held = pair.server.inbound.pop_front().unwrap();
++        for _ in 0..4 {
++            pair.time += Duration::from_millis(1);
++            pair.client_conn_mut(client).ping();
++            pair.drive_client();
++        }
++        pair.time += pair.latency;
++        pair.drive_server();
++        pair.time += pair.latency;
++        pair.drive_client();
++        assert_eq!(pair.client_conn_mut(client).stats().path.lost_packets, lost_before + 1);
++        let old_rtt = pair.client_conn_mut(client).reordering_loss_delay().0;
++
++        // This newer live packet and the retained original arrive together.
++        // Their ACK supplies both a changing RTT and late-original evidence.
++        let newer_sent = pair.time;
++        pair.client_conn_mut(client).ping();
++        pair.client_conn_mut(client).immediate_ack();
++        pair.drive_client();
++        pair.time = original_sent + Duration::from_millis(arrival_ms);
++        // Apply the same changed forward delay to the live packet too; leaving
++        // its old arrival time would deliver only the retained original in
++        // the short-delay case and supply no RTT update to this ACK.
++        for packet in &mut pair.server.inbound {
++            packet.0 = pair.time;
++        }
++        held.0 = pair.time;
++        pair.server.inbound.push_front(held);
++        pair.drive_server();
++        pair.time += pair.latency;
++        pair.drive_client();
++        let (current_rtt, learned_delay) = pair.client_conn_mut(client).reordering_loss_delay();
++        if arrival_ms == 200 {
++            assert_eq!(current_rtt, pair.time - newer_sent);
++            assert!(current_rtt > old_rtt);
++        } else {
++            assert!(current_rtt < old_rtt, "old={old_rtt:?}, current={current_rtt:?}");
++        }
++        assert_eq!(
++            learned_delay,
++            pair.time - original_sent + TIMER_GRANULARITY,
++            "one ACK must use its current RTT, without double-counting or omitting common delay; bbr={bbr}, arrival_ms={arrival_ms}"
++        );
+     }
+ }

@@ -1,0 +1,1408 @@
+{
+  "tag": "mixed-combined-up-relative-upload-native-timer-0907",
+  "origin_unix_ms": 1788742325170,
+  "probe": {
+    "bytes": 509804544,
+    "case": "mixed-combined-up-relative-upload-native-timer-0907",
+    "complete": true,
+    "complete_streams": 1,
+    "completion_timeout_s": 50,
+    "exit_code": 0,
+    "failed_streams": 0,
+    "failover_after_s": -1,
+    "failover_trigger_source": "timer",
+    "first_delivery_s": 0.377767,
+    "first_write_s": 0.089974,
+    "goodput_mbps": 86.217,
+    "interval_goodput_avg_mbps": 86.962,
+    "interval_goodput_max_mbps": 537.587,
+    "interval_goodput_mbps": [
+      537.587,
+      206.851,
+      98.296,
+      286.211,
+      127.486,
+      132.549,
+      232.644,
+      106.814,
+      77.551,
+      259.47,
+      98.278,
+      109.96,
+      273.73,
+      0.665,
+      6.675,
+      0,
+      0,
+      33.835,
+      30.172,
+      0,
+      0,
+      2.237,
+      7.244,
+      34.079,
+      58.388,
+      0,
+      81.169,
+      285.648,
+      0,
+      0,
+      0,
+      43.464,
+      0,
+      114.915,
+      0,
+      83.362,
+      17.538,
+      125.357,
+      172.446,
+      0.428,
+      4.719,
+      2.621
+    ],
+    "interval_goodput_min_mbps": 0,
+    "interval_goodput_raw_mbps": [
+      0.737,
+      5.551,
+      7.867,
+      537.587,
+      206.851,
+      98.296,
+      286.211,
+      127.486,
+      132.549,
+      232.644,
+      106.814,
+      77.551,
+      259.47,
+      98.278,
+      109.96,
+      273.73,
+      0.665,
+      6.675,
+      0,
+      0,
+      33.835,
+      30.172,
+      0,
+      0,
+      2.237,
+      7.244,
+      34.079,
+      58.388,
+      0,
+      81.169,
+      285.648,
+      0,
+      0,
+      0,
+      43.464,
+      0,
+      114.915,
+      0,
+      83.362,
+      17.538,
+      125.357,
+      172.446,
+      0.428,
+      4.719,
+      2.621,
+      3.146,
+      11.49,
+      397.255
+    ],
+    "interval_seconds": 1,
+    "interval_trim_discard_each_end": 3,
+    "load_duration_s": 40,
+    "local_accepted_bytes": 509804544,
+    "local_accepted_goodput_mbps": 86.217,
+    "local_recovery_gap_s": 0,
+    "max_delivery_gap_s": 3.806247,
+    "max_write_gap_s": 6.193877,
+    "mode": "duration-upload",
+    "parallel_uploads": 1,
+    "protocol": "tcp-upload",
+    "recovery_gap_s": 0,
+    "status": "ok",
+    "streams": 1,
+    "streams_with_delivery": 1,
+    "target_confirmed_bytes": 509804544,
+    "time_s": 47.304517,
+    "upload_accounting_exact": true,
+    "upload_accounting_lower_bound": false,
+    "upload_accounting_source": "target_sink_ack",
+    "upload_ack_accounting_valid": true,
+    "upload_goodput_mbps": 86.217,
+    "upload_metric_version": 2,
+    "upload_probe_errors": []
+  },
+  "native_event_selection": "First event per observed integer second, plus every PTO-count change; raw log remains in the named local run. Not every packet-loss event.",
+  "native": [
+    {
+      "seconds_from_first_original": -1.092,
+      "event": "mpp_native_timer ts_unix_ms=1788742324078 event=select role=Client pto_count=0 pto_base_us=999000 srtt_us=333000 var_us=166500 loss_in_us=None pto_in_us=Some(999000) in_flight=1200 ack_eliciting=1 sent=1 received=0 reorder=Reordering { seen: false, observed_excess: 0ns, recovery_start: None, recovering: false, remaining_recoveries: 0 }"
+    },
+    {
+      "seconds_from_first_original": -0.537,
+      "event": "mpp_native_timer ts_unix_ms=1788742324633 event=fired role=Client pto_count=0 pto_base_us=275021 srtt_us=114706 var_us=40078 loss_in_us=Some(0) pto_in_us=Some(252765) in_flight=1452 ack_eliciting=1 sent=23 received=23 reorder=Reordering { seen: false, observed_excess: 0ns, recovery_start: None, recovering: false, remaining_recoveries: 0 }"
+    },
+    {
+      "seconds_from_first_original": 0.488,
+      "event": "mpp_native_timer ts_unix_ms=1788742325658 event=fired role=Client pto_count=0 pto_base_us=177759 srtt_us=87813 var_us=22486 loss_in_us=Some(0) pto_in_us=Some(175806) in_flight=153912 ack_eliciting=106 sent=249 received=53 reorder=Reordering { seen: true, observed_excess: 27.693201ms, recovery_start: Some(Instant { tv_sec: 777087, tv_nsec: 123267315 }), recovering: true, remaining_recoveries: 16 }"
+    },
+    {
+      "seconds_from_first_original": 1.009,
+      "event": "mpp_native_timer ts_unix_ms=1788742326179 event=fired role=Client pto_count=0 pto_base_us=115263 srtt_us=51006 var_us=16064 loss_in_us=Some(0) pto_in_us=Some(140176) in_flight=3852528 ack_eliciting=3176 sent=6549 received=460 reorder=Reordering { seen: true, observed_excess: 97.68762ms, recovery_start: Some(Instant { tv_sec: 777087, tv_nsec: 654453060 }), recovering: true, remaining_recoveries: 16 }"
+    },
+    {
+      "seconds_from_first_original": 2.004,
+      "event": "mpp_native_timer ts_unix_ms=1788742327174 event=fired role=Client pto_count=0 pto_base_us=90374 srtt_us=54430 var_us=8986 loss_in_us=Some(0) pto_in_us=Some(115308) in_flight=2668642 ack_eliciting=2224 sent=38759 received=5477 reorder=Reordering { seen: true, observed_excess: 112.279162ms, recovery_start: Some(Instant { tv_sec: 777088, tv_nsec: 618558860 }), recovering: false, remaining_recoveries: 11 }"
+    },
+    {
+      "seconds_from_first_original": 3.002,
+      "event": "mpp_native_timer ts_unix_ms=1788742328172 event=fired role=Client pto_count=0 pto_base_us=66155 srtt_us=47945 var_us=4552 loss_in_us=Some(0) pto_in_us=Some(91102) in_flight=2750345 ack_eliciting=2292 sent=62039 received=9889 reorder=Reordering { seen: true, observed_excess: 122.576456ms, recovery_start: Some(Instant { tv_sec: 777089, tv_nsec: 601404333 }), recovering: false, remaining_recoveries: 11 }"
+    },
+    {
+      "seconds_from_first_original": 4.003,
+      "event": "mpp_native_timer ts_unix_ms=1788742329173 event=fired role=Client pto_count=0 pto_base_us=95849 srtt_us=38015 var_us=14458 loss_in_us=Some(0) pto_in_us=Some(120838) in_flight=5731200 ack_eliciting=4776 sent=77940 received=12287 reorder=Reordering { seen: true, observed_excess: 122.576456ms, recovery_start: Some(Instant { tv_sec: 777090, tv_nsec: 512031062 }), recovering: false, remaining_recoveries: 7 }"
+    },
+    {
+      "seconds_from_first_original": 5.001,
+      "event": "mpp_native_timer ts_unix_ms=1788742330171 event=fired role=Client pto_count=0 pto_base_us=73316 srtt_us=46614 var_us=6675 loss_in_us=Some(0) pto_in_us=Some(92689) in_flight=3348000 ack_eliciting=2790 sent=107673 received=16581 reorder=Reordering { seen: true, observed_excess: 122.576456ms, recovery_start: Some(Instant { tv_sec: 777091, tv_nsec: 600234695 }), recovering: false, remaining_recoveries: 1 }"
+    },
+    {
+      "seconds_from_first_original": 6.004,
+      "event": "mpp_native_timer ts_unix_ms=1788742331174 event=fired role=Client pto_count=0 pto_base_us=72756 srtt_us=42273 var_us=7620 loss_in_us=Some(0) pto_in_us=Some(97666) in_flight=2612354 ack_eliciting=2177 sent=133416 received=20819 reorder=Reordering { seen: true, observed_excess: 114.218902ms, recovery_start: Some(Instant { tv_sec: 777092, tv_nsec: 564627479 }), recovering: false, remaining_recoveries: 14 }"
+    },
+    {
+      "seconds_from_first_original": 7.011,
+      "event": "mpp_native_timer ts_unix_ms=1788742332181 event=fired role=Client pto_count=0 pto_base_us=82450 srtt_us=45766 var_us=9171 loss_in_us=Some(0) pto_in_us=Some(107410) in_flight=2363976 ack_eliciting=1970 sent=153462 received=25209 reorder=Reordering { seen: true, observed_excess: 114.218902ms, recovery_start: Some(Instant { tv_sec: 777093, tv_nsec: 526817645 }), recovering: false, remaining_recoveries: 8 }"
+    },
+    {
+      "seconds_from_first_original": 8.002,
+      "event": "mpp_native_timer ts_unix_ms=1788742333172 event=fired role=Client pto_count=0 pto_base_us=69269 srtt_us=53085 var_us=4046 loss_in_us=Some(0) pto_in_us=Some(94035) in_flight=3316800 ack_eliciting=2764 sent=181640 received=29061 reorder=Reordering { seen: true, observed_excess: 116.709125ms, recovery_start: Some(Instant { tv_sec: 777094, tv_nsec: 524762681 }), recovering: false, remaining_recoveries: 14 }"
+    },
+    {
+      "seconds_from_first_original": 9.006,
+      "event": "mpp_native_timer ts_unix_ms=1788742334176 event=fired role=Client pto_count=0 pto_base_us=87650 srtt_us=43846 var_us=10951 loss_in_us=Some(0) pto_in_us=Some(112582) in_flight=3151188 ack_eliciting=2626 sent=209131 received=32407 reorder=Reordering { seen: true, observed_excess: 119.17999ms, recovery_start: Some(Instant { tv_sec: 777095, tv_nsec: 564058702 }), recovering: false, remaining_recoveries: 12 }"
+    },
+    {
+      "seconds_from_first_original": 10.027,
+      "event": "mpp_native_timer ts_unix_ms=1788742335197 event=fired role=Client pto_count=0 pto_base_us=137746 srtt_us=67090 var_us=17664 loss_in_us=Some(0) pto_in_us=Some(135252) in_flight=121335 ack_eliciting=104 sent=223544 received=34829 reorder=Reordering { seen: true, observed_excess: 119.17999ms, recovery_start: Some(Instant { tv_sec: 777096, tv_nsec: 511388765 }), recovering: false, remaining_recoveries: 7 }"
+    },
+    {
+      "seconds_from_first_original": 11.003,
+      "event": "mpp_native_timer ts_unix_ms=1788742336173 event=fired role=Client pto_count=0 pto_base_us=128156 srtt_us=66822 var_us=15333 loss_in_us=Some(0) pto_in_us=Some(146099) in_flight=252836 ack_eliciting=213 sent=226739 received=35198 reorder=Reordering { seen: true, observed_excess: 119.17999ms, recovery_start: Some(Instant { tv_sec: 777097, tv_nsec: 627675986 }), recovering: true, remaining_recoveries: 5 }"
+    },
+    {
+      "seconds_from_first_original": 12.003,
+      "event": "mpp_native_timer ts_unix_ms=1788742337173 event=fired role=Client pto_count=0 pto_base_us=67552 srtt_us=48909 var_us=4660 loss_in_us=Some(0) pto_in_us=Some(90825) in_flight=2343590 ack_eliciting=1953 sent=251202 received=38236 reorder=Reordering { seen: true, observed_excess: 118.570054ms, recovery_start: Some(Instant { tv_sec: 777098, tv_nsec: 509511839 }), recovering: false, remaining_recoveries: 15 }"
+    },
+    {
+      "seconds_from_first_original": 13.002,
+      "event": "mpp_native_timer ts_unix_ms=1788742338172 event=fired role=Client pto_count=0 pto_base_us=88091 srtt_us=45009 var_us=10770 loss_in_us=Some(0) pto_in_us=Some(112977) in_flight=5383194 ack_eliciting=4486 sent=284059 received=42147 reorder=Reordering { seen: true, observed_excess: 125.123474ms, recovery_start: Some(Instant { tv_sec: 777099, tv_nsec: 525049657 }), recovering: false, remaining_recoveries: 14 }"
+    },
+    {
+      "seconds_from_first_original": 14,
+      "event": "mpp_native_timer ts_unix_ms=1788742339170 event=fired role=Client pto_count=0 pto_base_us=83447 srtt_us=42066 var_us=10345 loss_in_us=Some(0) pto_in_us=Some(108349) in_flight=2131136 ack_eliciting=1776 sent=309425 received=47166 reorder=Reordering { seen: true, observed_excess: 125.123474ms, recovery_start: Some(Instant { tv_sec: 777100, tv_nsec: 558792701 }), recovering: false, remaining_recoveries: 8 }"
+    },
+    {
+      "seconds_from_first_original": 15.031,
+      "event": "mpp_native_timer ts_unix_ms=1788742340201 event=fired role=Client pto_count=0 pto_base_us=132730 srtt_us=54961 var_us=19442 loss_in_us=Some(0) pto_in_us=Some(152315) in_flight=2721547 ack_eliciting=2268 sent=326829 received=51794 reorder=Reordering { seen: true, observed_excess: 125.123474ms, recovery_start: Some(Instant { tv_sec: 777101, tv_nsec: 602133495 }), recovering: true, remaining_recoveries: 3 }"
+    },
+    {
+      "seconds_from_first_original": 16.228,
+      "event": "mpp_native_timer ts_unix_ms=1788742341398 event=fired role=Client pto_count=0 pto_base_us=2432218 srtt_us=565130 var_us=466772 loss_in_us=Some(0) pto_in_us=Some(2453183) in_flight=3123511 ack_eliciting=2603 sent=328410 received=52196 reorder=Reordering { seen: true, observed_excess: 300.539683ms, recovery_start: Some(Instant { tv_sec: 777101, tv_nsec: 602133495 }), recovering: false, remaining_recoveries: 16 }"
+    },
+    {
+      "seconds_from_first_original": 17.294,
+      "event": "mpp_native_timer ts_unix_ms=1788742342464 event=select role=Client pto_count=0 pto_base_us=4526488 srtt_us=1701193 var_us=706323 loss_in_us=Some(243988) pto_in_us=Some(4069169) in_flight=2947164 ack_eliciting=2456 sent=329232 received=52528 reorder=Reordering { seen: true, observed_excess: 373.157497ms, recovery_start: Some(Instant { tv_sec: 777101, tv_nsec: 602133495 }), recovering: false, remaining_recoveries: 16 }"
+    },
+    {
+      "seconds_from_first_original": 18.037,
+      "event": "mpp_native_timer ts_unix_ms=1788742343207 event=fired role=Client pto_count=0 pto_base_us=3022487 srtt_us=2467733 var_us=138688 loss_in_us=Some(0) pto_in_us=Some(1822080) in_flight=2067577 ack_eliciting=1723 sent=329232 received=52669 reorder=Reordering { seen: true, observed_excess: 373.157497ms, recovery_start: Some(Instant { tv_sec: 777104, tv_nsec: 504045302 }), recovering: true, remaining_recoveries: 16 }"
+    },
+    {
+      "seconds_from_first_original": 19.314,
+      "event": "mpp_native_timer ts_unix_ms=1788742344484 event=fired role=Client pto_count=0 pto_base_us=3116378 srtt_us=2808395 var_us=76995 loss_in_us=Some(0) pto_in_us=Some(638721) in_flight=621600 ack_eliciting=518 sent=329232 received=52862 reorder=Reordering { seen: true, observed_excess: 373.157497ms, recovery_start: Some(Instant { tv_sec: 777104, tv_nsec: 504045302 }), recovering: true, remaining_recoveries: 16 }"
+    },
+    {
+      "seconds_from_first_original": 20.517,
+      "event": "mpp_native_timer ts_unix_ms=1788742345687 event=fired role=Client pto_count=0 pto_base_us=2504473 srtt_us=587802 var_us=479167 loss_in_us=Some(0) pto_in_us=Some(2526327) in_flight=4084800 ack_eliciting=3404 sent=333124 received=53007 reorder=Reordering { seen: true, observed_excess: 373.157497ms, recovery_start: Some(Instant { tv_sec: 777104, tv_nsec: 504045302 }), recovering: false, remaining_recoveries: 15 }"
+    },
+    {
+      "seconds_from_first_original": 21,
+      "event": "mpp_native_timer ts_unix_ms=1788742346170 event=fired role=Client pto_count=0 pto_base_us=2048870 srtt_us=590421 var_us=364612 loss_in_us=Some(0) pto_in_us=Some(2073080) in_flight=4659600 ack_eliciting=3883 sent=334386 received=53071 reorder=Reordering { seen: true, observed_excess: 373.157497ms, recovery_start: Some(Instant { tv_sec: 777107, tv_nsec: 192963997 }), recovering: true, remaining_recoveries: 15 }"
+    },
+    {
+      "seconds_from_first_original": 22.761,
+      "event": "mpp_native_timer ts_unix_ms=1788742347931 event=select role=Client pto_count=0 pto_base_us=4733019 srtt_us=1069394 var_us=915906 loss_in_us=Some(860161) pto_in_us=Some(4731218) in_flight=5281200 ack_eliciting=4401 sent=336632 received=53362 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777107, tv_nsec: 192963997 }), recovering: true, remaining_recoveries: 16 }"
+    },
+    {
+      "seconds_from_first_original": 23.767,
+      "event": "mpp_native_timer ts_unix_ms=1788742348937 event=select role=Client pto_count=0 pto_base_us=3935729 srtt_us=3025312 var_us=227604 loss_in_us=Some(630655) pto_in_us=Some(3944006) in_flight=6333600 ack_eliciting=5278 sent=338438 received=53474 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777107, tv_nsec: 192963997 }), recovering: false, remaining_recoveries: 15 }"
+    },
+    {
+      "seconds_from_first_original": 24.7,
+      "event": "mpp_native_timer ts_unix_ms=1788742349870 event=fired role=Client pto_count=0 pto_base_us=3750005 srtt_us=3408697 var_us=85327 loss_in_us=Some(0) pto_in_us=Some(3758143) in_flight=6340800 ack_eliciting=5284 sent=339347 received=53577 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777107, tv_nsec: 192963997 }), recovering: false, remaining_recoveries: 15 }"
+    },
+    {
+      "seconds_from_first_original": 25.027,
+      "event": "mpp_native_timer ts_unix_ms=1788742350197 event=fired role=Client pto_count=0 pto_base_us=3843972 srtt_us=644474 var_us=799874 loss_in_us=Some(0) pto_in_us=Some(3868942) in_flight=5153975 ack_eliciting=4295 sent=344197 received=54086 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777111, tv_nsec: 625123975 }), recovering: false, remaining_recoveries: 14 }"
+    },
+    {
+      "seconds_from_first_original": 26.07,
+      "event": "mpp_native_timer ts_unix_ms=1788742351240 event=fired role=Client pto_count=0 pto_base_us=76909 srtt_us=41895 var_us=8753 loss_in_us=Some(0) pto_in_us=Some(101891) in_flight=14110800 ack_eliciting=11759 sent=378700 received=59725 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777111, tv_nsec: 625123975 }), recovering: false, remaining_recoveries: 14 }"
+    },
+    {
+      "seconds_from_first_original": 27,
+      "event": "mpp_native_timer ts_unix_ms=1788742352170 event=fired role=Client pto_count=0 pto_base_us=166358 srtt_us=71726 var_us=23658 loss_in_us=Some(0) pto_in_us=Some(188182) in_flight=6202800 ack_eliciting=5169 sent=385091 received=60949 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777112, tv_nsec: 813426394 }), recovering: false, remaining_recoveries: 13 }"
+    },
+    {
+      "seconds_from_first_original": 28.155,
+      "event": "mpp_native_timer ts_unix_ms=1788742353325 event=fired role=Client pto_count=0 pto_base_us=82333 srtt_us=45926 var_us=9101 loss_in_us=Some(0) pto_in_us=Some(107316) in_flight=1489200 ack_eliciting=1241 sent=397153 received=63455 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777114, tv_nsec: 27811808 }), recovering: false, remaining_recoveries: 12 }"
+    },
+    {
+      "seconds_from_first_original": 29.004,
+      "event": "mpp_native_timer ts_unix_ms=1788742354174 event=fired role=Client pto_count=0 pto_base_us=117538 srtt_us=45696 var_us=17960 loss_in_us=Some(0) pto_in_us=Some(99228) in_flight=6410883 ack_eliciting=5347 sent=414049 received=66646 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777115, tv_nsec: 233525138 }), recovering: false, remaining_recoveries: 11 }"
+    },
+    {
+      "seconds_from_first_original": 30,
+      "event": "mpp_native_timer ts_unix_ms=1788742355170 event=fired role=Client pto_count=0 pto_base_us=89423 srtt_us=42261 var_us=11790 loss_in_us=Some(0) pto_in_us=Some(99313) in_flight=7072800 ack_eliciting=5894 sent=428836 received=69105 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777116, tv_nsec: 424701535 }), recovering: false, remaining_recoveries: 10 }"
+    },
+    {
+      "seconds_from_first_original": 31.001,
+      "event": "mpp_native_timer ts_unix_ms=1788742356171 event=fired role=Client pto_count=0 pto_base_us=80158 srtt_us=43941 var_us=9054 loss_in_us=Some(0) pto_in_us=Some(105041) in_flight=6200177 ack_eliciting=5167 sent=432599 received=69173 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777117, tv_nsec: 625221521 }), recovering: true, remaining_recoveries: 10 }"
+    },
+    {
+      "seconds_from_first_original": 31.498,
+      "event": "mpp_native_timer ts_unix_ms=1788742356668 event=fired role=Client pto_count=1 pto_base_us=80158 srtt_us=43941 var_us=9054 loss_in_us=None pto_in_us=Some(0) in_flight=6205816 ack_eliciting=5172 sent=433863 received=69173 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777117, tv_nsec: 625221521 }), recovering: true, remaining_recoveries: 10 }"
+    },
+    {
+      "seconds_from_first_original": 31.92,
+      "event": "mpp_native_timer ts_unix_ms=1788742357090 event=fired role=Client pto_count=2 pto_base_us=80158 srtt_us=43941 var_us=9054 loss_in_us=None pto_in_us=Some(0) in_flight=6208216 ack_eliciting=5174 sent=433865 received=69173 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777117, tv_nsec: 625221521 }), recovering: true, remaining_recoveries: 10 }"
+    },
+    {
+      "seconds_from_first_original": 32.763,
+      "event": "mpp_native_timer ts_unix_ms=1788742357933 event=fired role=Client pto_count=3 pto_base_us=80158 srtt_us=43941 var_us=9054 loss_in_us=None pto_in_us=Some(0) in_flight=6210616 ack_eliciting=5176 sent=433867 received=69173 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777117, tv_nsec: 625221521 }), recovering: true, remaining_recoveries: 10 }"
+    },
+    {
+      "seconds_from_first_original": 34.447,
+      "event": "mpp_native_timer ts_unix_ms=1788742359617 event=fired role=Client pto_count=4 pto_base_us=80158 srtt_us=43941 var_us=9054 loss_in_us=None pto_in_us=Some(0) in_flight=6213016 ack_eliciting=5178 sent=433869 received=69184 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777117, tv_nsec: 625221521 }), recovering: true, remaining_recoveries: 10 }"
+    },
+    {
+      "seconds_from_first_original": 34.612,
+      "event": "mpp_native_timer ts_unix_ms=1788742359782 event=fired role=Client pto_count=0 pto_base_us=79933 srtt_us=44922 var_us=8752 loss_in_us=None pto_in_us=Some(0) in_flight=4800 ack_eliciting=4 sent=433875 received=69186 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777121, tv_nsec: 175310748 }), recovering: true, remaining_recoveries: 9 }"
+    },
+    {
+      "seconds_from_first_original": 35.612,
+      "event": "mpp_native_timer ts_unix_ms=1788742360782 event=select role=Client pto_count=0 pto_base_us=75997 srtt_us=51770 var_us=6056 loss_in_us=Some(435983) pto_in_us=Some(100997) in_flight=10442317 ack_eliciting=8702 sent=457825 received=71311 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777121, tv_nsec: 175310748 }), recovering: false, remaining_recoveries: 8 }"
+    },
+    {
+      "seconds_from_first_original": 36.067,
+      "event": "mpp_native_timer ts_unix_ms=1788742361237 event=fired role=Client pto_count=0 pto_base_us=132920 srtt_us=68822 var_us=16024 loss_in_us=Some(0) pto_in_us=Some(153569) in_flight=9169117 ack_eliciting=7641 sent=461856 received=72058 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777122, tv_nsec: 741048324 }), recovering: true, remaining_recoveries: 8 }"
+    },
+    {
+      "seconds_from_first_original": 37.068,
+      "event": "mpp_native_timer ts_unix_ms=1788742362238 event=fired role=Client pto_count=0 pto_base_us=127823 srtt_us=71618 var_us=14051 loss_in_us=Some(0) pto_in_us=Some(1904) in_flight=752400 ack_eliciting=627 sent=467397 received=72979 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777122, tv_nsec: 741048324 }), recovering: false, remaining_recoveries: 7 }"
+    },
+    {
+      "seconds_from_first_original": 38.068,
+      "event": "mpp_native_timer ts_unix_ms=1788742363238 event=fired role=Client pto_count=0 pto_base_us=131896 srtt_us=72206 var_us=14922 loss_in_us=Some(0) pto_in_us=Some(150868) in_flight=532800 ack_eliciting=444 sent=468280 received=73152 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777124, tv_nsec: 12028028 }), recovering: false, remaining_recoveries: 6 }"
+    },
+    {
+      "seconds_from_first_original": 39.015,
+      "event": "mpp_native_timer ts_unix_ms=1788742364185 event=fired role=Client pto_count=0 pto_base_us=196641 srtt_us=77536 var_us=29776 loss_in_us=Some(0) pto_in_us=Some(0) in_flight=451200 ack_eliciting=376 sent=471633 received=73520 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777125, tv_nsec: 287591281 }), recovering: false, remaining_recoveries: 5 }"
+    },
+    {
+      "seconds_from_first_original": 40.441,
+      "event": "mpp_native_timer ts_unix_ms=1788742365611 event=fired role=Client pto_count=0 pto_base_us=139821 srtt_us=76768 var_us=15763 loss_in_us=Some(0) pto_in_us=Some(0) in_flight=48000 ack_eliciting=40 sent=472096 received=73709 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777125, tv_nsec: 287591281 }), recovering: false, remaining_recoveries: 5 }"
+    },
+    {
+      "seconds_from_first_original": 41.701,
+      "event": "mpp_native_timer ts_unix_ms=1788742366871 event=fired role=Client pto_count=0 pto_base_us=89384 srtt_us=46229 var_us=10788 loss_in_us=Some(0) pto_in_us=Some(102664) in_flight=3168902 ack_eliciting=2644 sent=480388 received=74807 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777127, tv_nsec: 116577606 }), recovering: false, remaining_recoveries: 4 }"
+    },
+    {
+      "seconds_from_first_original": 42.063,
+      "event": "mpp_native_timer ts_unix_ms=1788742367233 event=fired role=Client pto_count=0 pto_base_us=103937 srtt_us=49459 var_us=13619 loss_in_us=Some(0) pto_in_us=Some(0) in_flight=1652989 ack_eliciting=1379 sent=483096 received=75677 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777127, tv_nsec: 116577606 }), recovering: false, remaining_recoveries: 4 }"
+    },
+    {
+      "seconds_from_first_original": 43.001,
+      "event": "mpp_native_timer ts_unix_ms=1788742368171 event=fired role=Client pto_count=0 pto_base_us=88169 srtt_us=52690 var_us=8869 loss_in_us=Some(0) pto_in_us=Some(113143) in_flight=2508446 ack_eliciting=2091 sent=490006 received=76505 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777129, tv_nsec: 293830124 }), recovering: false, remaining_recoveries: 3 }"
+    },
+    {
+      "seconds_from_first_original": 44,
+      "event": "mpp_native_timer ts_unix_ms=1788742369170 event=fired role=Client pto_count=0 pto_base_us=70591 srtt_us=47523 var_us=5766 loss_in_us=Some(0) pto_in_us=Some(95519) in_flight=8646783 ack_eliciting=7206 sent=512390 received=80871 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777130, tv_nsec: 526036570 }), recovering: false, remaining_recoveries: 2 }"
+    },
+    {
+      "seconds_from_first_original": 45.004,
+      "event": "mpp_native_timer ts_unix_ms=1788742370174 event=fired role=Client pto_count=0 pto_base_us=120714 srtt_us=64607 var_us=14026 loss_in_us=Some(0) pto_in_us=Some(143147) in_flight=1862538 ack_eliciting=1554 sent=523553 received=82723 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777130, tv_nsec: 526036570 }), recovering: false, remaining_recoveries: 2 }"
+    },
+    {
+      "seconds_from_first_original": 46.022,
+      "event": "mpp_native_timer ts_unix_ms=1788742371192 event=fired role=Client pto_count=0 pto_base_us=133257 srtt_us=79074 var_us=13545 loss_in_us=Some(0) pto_in_us=Some(135530) in_flight=312000 ack_eliciting=260 sent=524227 received=82953 reorder=Reordering { seen: true, observed_excess: 1.146635137s, recovery_start: Some(Instant { tv_sec: 777131, tv_nsec: 741509609 }), recovering: false, remaining_recoveries: 1 }"
+    },
+    {
+      "seconds_from_first_original": 47.091,
+      "event": "mpp_native_timer ts_unix_ms=1788742372261 event=fired role=Client pto_count=0 pto_base_us=178097 srtt_us=89696 var_us=22100 loss_in_us=Some(0) pto_in_us=Some(132852) in_flight=94 ack_eliciting=1 sent=526296 received=83399 reorder=Reordering { seen: true, observed_excess: 79.456281ms, recovery_start: Some(Instant { tv_sec: 777133, tv_nsec: 428900759 }), recovering: false, remaining_recoveries: 14 }"
+    }
+  ],
+  "service": [
+    {
+      "elapsed": 0.000046359957195818424,
+      "epoch": 0,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 31614,
+          "drops": 0,
+          "backlog": 3893,
+          "qlen": 28
+        },
+        {
+          "dev": "eth1",
+          "bytes": 584344,
+          "drops": 13,
+          "backlog": 260002,
+          "qlen": 49
+        }
+      ]
+    },
+    {
+      "elapsed": 1.0001553610200062,
+      "epoch": 0,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 812923,
+          "drops": 42,
+          "backlog": 53959,
+          "qlen": 295
+        },
+        {
+          "dev": "eth1",
+          "bytes": 31471217,
+          "drops": 210,
+          "backlog": 2321367,
+          "qlen": 436
+        }
+      ]
+    },
+    {
+      "elapsed": 2.0002739320043474,
+      "epoch": 0,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 1856439,
+          "drops": 99,
+          "backlog": 26822,
+          "qlen": 146
+        },
+        {
+          "dev": "eth1",
+          "bytes": 60782825,
+          "drops": 420,
+          "backlog": 2067032,
+          "qlen": 483
+        }
+      ]
+    },
+    {
+      "elapsed": 3.0003729730378836,
+      "epoch": 0,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 3062188,
+          "drops": 165,
+          "backlog": 4324,
+          "qlen": 45
+        },
+        {
+          "dev": "eth1",
+          "bytes": 88271081,
+          "drops": 643,
+          "backlog": 278187,
+          "qlen": 97
+        }
+      ]
+    },
+    {
+      "elapsed": 4.000571075011976,
+      "epoch": 0,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 3911274,
+          "drops": 206,
+          "backlog": 27905,
+          "qlen": 153
+        },
+        {
+          "dev": "eth1",
+          "bytes": 116318369,
+          "drops": 843,
+          "backlog": 2755293,
+          "qlen": 440
+        }
+      ]
+    },
+    {
+      "elapsed": 5.000671816058457,
+      "epoch": 1,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 5060619,
+          "drops": 309,
+          "backlog": 48340,
+          "qlen": 285
+        },
+        {
+          "dev": "eth1",
+          "bytes": 158155625,
+          "drops": 1340,
+          "backlog": 2149828,
+          "qlen": 582
+        }
+      ]
+    },
+    {
+      "elapsed": 6.000766996061429,
+      "epoch": 1,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 6050428,
+          "drops": 436,
+          "backlog": 53698,
+          "qlen": 327
+        },
+        {
+          "dev": "eth1",
+          "bytes": 181959507,
+          "drops": 1889,
+          "backlog": 1666522,
+          "qlen": 413
+        }
+      ]
+    },
+    {
+      "elapsed": 7.000895256991498,
+      "epoch": 1,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 7029873,
+          "drops": 532,
+          "backlog": 29208,
+          "qlen": 152
+        },
+        {
+          "dev": "eth1",
+          "bytes": 208478189,
+          "drops": 2438,
+          "backlog": 2212596,
+          "qlen": 368
+        }
+      ]
+    },
+    {
+      "elapsed": 8.001003377023153,
+      "epoch": 1,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 8503651,
+          "drops": 668,
+          "backlog": 19688,
+          "qlen": 116
+        },
+        {
+          "dev": "eth1",
+          "bytes": 243337223,
+          "drops": 2996,
+          "backlog": 2470376,
+          "qlen": 451
+        }
+      ]
+    },
+    {
+      "elapsed": 9.001113557023928,
+      "epoch": 1,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 9677848,
+          "drops": 769,
+          "backlog": 2797,
+          "qlen": 30
+        },
+        {
+          "dev": "eth1",
+          "bytes": 268645183,
+          "drops": 3448,
+          "backlog": 1806180,
+          "qlen": 274
+        }
+      ]
+    },
+    {
+      "elapsed": 10.001219467027113,
+      "epoch": 2,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 10755432,
+          "drops": 858,
+          "backlog": 1200,
+          "qlen": 13
+        },
+        {
+          "dev": "eth1",
+          "bytes": 284659678,
+          "drops": 3752,
+          "backlog": 124624,
+          "qlen": 42
+        }
+      ]
+    },
+    {
+      "elapsed": 11.001315786037594,
+      "epoch": 2,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 11137571,
+          "drops": 878,
+          "backlog": 72042,
+          "qlen": 462
+        },
+        {
+          "dev": "eth1",
+          "bytes": 297556818,
+          "drops": 3899,
+          "backlog": 2441324,
+          "qlen": 350
+        }
+      ]
+    },
+    {
+      "elapsed": 12.001415485981852,
+      "epoch": 2,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 12546520,
+          "drops": 928,
+          "backlog": 23609,
+          "qlen": 128
+        },
+        {
+          "dev": "eth1",
+          "bytes": 330497996,
+          "drops": 4258,
+          "backlog": 2864204,
+          "qlen": 429
+        }
+      ]
+    },
+    {
+      "elapsed": 13.001528574037366,
+      "epoch": 2,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 14529257,
+          "drops": 986,
+          "backlog": 45946,
+          "qlen": 182
+        },
+        {
+          "dev": "eth1",
+          "bytes": 374442475,
+          "drops": 4798,
+          "backlog": 2463642,
+          "qlen": 876
+        }
+      ]
+    },
+    {
+      "elapsed": 14.001662702998146,
+      "epoch": 2,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 15930342,
+          "drops": 1025,
+          "backlog": 33983,
+          "qlen": 178
+        },
+        {
+          "dev": "eth1",
+          "bytes": 400384118,
+          "drops": 5195,
+          "backlog": 1676492,
+          "qlen": 502
+        }
+      ]
+    },
+    {
+      "elapsed": 15.001762391999364,
+      "epoch": 3,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16578667,
+          "drops": 1056,
+          "backlog": 1487,
+          "qlen": 7
+        },
+        {
+          "dev": "eth1",
+          "bytes": 412278088,
+          "drops": 5412,
+          "backlog": 3466983,
+          "qlen": 874
+        }
+      ]
+    },
+    {
+      "elapsed": 16.001861799973994,
+      "epoch": 3,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16637157,
+          "drops": 1067,
+          "backlog": 3036,
+          "qlen": 15
+        },
+        {
+          "dev": "eth1",
+          "bytes": 413256423,
+          "drops": 5422,
+          "backlog": 3587406,
+          "qlen": 741
+        }
+      ]
+    },
+    {
+      "elapsed": 17.001977698062547,
+      "epoch": 3,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16700225,
+          "drops": 1082,
+          "backlog": 711,
+          "qlen": 5
+        },
+        {
+          "dev": "eth1",
+          "bytes": 414522233,
+          "drops": 5430,
+          "backlog": 3013212,
+          "qlen": 556
+        }
+      ]
+    },
+    {
+      "elapsed": 18.002074697986245,
+      "epoch": 3,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16739864,
+          "drops": 1096,
+          "backlog": 1092,
+          "qlen": 8
+        },
+        {
+          "dev": "eth1",
+          "bytes": 415785903,
+          "drops": 5435,
+          "backlog": 1909230,
+          "qlen": 400
+        }
+      ]
+    },
+    {
+      "elapsed": 19.002183536067605,
+      "epoch": 3,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16770830,
+          "drops": 1106,
+          "backlog": 1151,
+          "qlen": 8
+        },
+        {
+          "dev": "eth1",
+          "bytes": 417015633,
+          "drops": 5441,
+          "backlog": 712248,
+          "qlen": 220
+        }
+      ]
+    },
+    {
+      "elapsed": 20.002297624014318,
+      "epoch": 4,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16809227,
+          "drops": 1114,
+          "backlog": 809,
+          "qlen": 5
+        },
+        {
+          "dev": "eth1",
+          "bytes": 418480465,
+          "drops": 5505,
+          "backlog": 3913908,
+          "qlen": 555
+        }
+      ]
+    },
+    {
+      "elapsed": 21.002396072028205,
+      "epoch": 4,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16833267,
+          "drops": 1118,
+          "backlog": 1401,
+          "qlen": 7
+        },
+        {
+          "dev": "eth1",
+          "bytes": 419490977,
+          "drops": 5534,
+          "backlog": 5613324,
+          "qlen": 722
+        }
+      ]
+    },
+    {
+      "elapsed": 22.002498399000615,
+      "epoch": 4,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16870217,
+          "drops": 1121,
+          "backlog": 643,
+          "qlen": 3
+        },
+        {
+          "dev": "eth1",
+          "bytes": 420727955,
+          "drops": 5542,
+          "backlog": 4979244,
+          "qlen": 610
+        }
+      ]
+    },
+    {
+      "elapsed": 23.002597445971332,
+      "epoch": 4,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16897097,
+          "drops": 1126,
+          "backlog": 754,
+          "qlen": 5
+        },
+        {
+          "dev": "eth1",
+          "bytes": 421974649,
+          "drops": 5566,
+          "backlog": 5563656,
+          "qlen": 608
+        }
+      ]
+    },
+    {
+      "elapsed": 24.002703813952394,
+      "epoch": 4,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 16918368,
+          "drops": 1126,
+          "backlog": 512,
+          "qlen": 4
+        },
+        {
+          "dev": "eth1",
+          "bytes": 423231511,
+          "drops": 5586,
+          "backlog": 5809956,
+          "qlen": 635
+        }
+      ]
+    },
+    {
+      "elapsed": 25.0028100409545,
+      "epoch": 5,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 17549727,
+          "drops": 1151,
+          "backlog": 17109,
+          "qlen": 102
+        },
+        {
+          "dev": "eth1",
+          "bytes": 451829664,
+          "drops": 5709,
+          "backlog": 2479468,
+          "qlen": 393
+        }
+      ]
+    },
+    {
+      "elapsed": 26.002916987985373,
+      "epoch": 5,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 18492788,
+          "drops": 1177,
+          "backlog": 1485,
+          "qlen": 16
+        },
+        {
+          "dev": "eth1",
+          "bytes": 484183723,
+          "drops": 5897,
+          "backlog": 137082,
+          "qlen": 32
+        }
+      ]
+    },
+    {
+      "elapsed": 27.003016425063834,
+      "epoch": 5,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 18594425,
+          "drops": 1181,
+          "backlog": 15735,
+          "qlen": 105
+        },
+        {
+          "dev": "eth1",
+          "bytes": 489799274,
+          "drops": 5930,
+          "backlog": 1113006,
+          "qlen": 259
+        }
+      ]
+    },
+    {
+      "elapsed": 28.003108051023446,
+      "epoch": 5,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 19048851,
+          "drops": 1199,
+          "backlog": 8415,
+          "qlen": 68
+        },
+        {
+          "dev": "eth1",
+          "bytes": 504609928,
+          "drops": 6026,
+          "backlog": 886582,
+          "qlen": 194
+        }
+      ]
+    },
+    {
+      "elapsed": 29.003211767063476,
+      "epoch": 5,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 19632743,
+          "drops": 1214,
+          "backlog": 1195,
+          "qlen": 13
+        },
+        {
+          "dev": "eth1",
+          "bytes": 524456331,
+          "drops": 6140,
+          "backlog": 117702,
+          "qlen": 39
+        }
+      ]
+    },
+    {
+      "elapsed": 30.00332250399515,
+      "epoch": 6,
+      "udp_blackhole": true,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 20369104,
+          "drops": 1239,
+          "backlog": 1316,
+          "qlen": 14
+        },
+        {
+          "dev": "eth1",
+          "bytes": 546331375,
+          "drops": 6337,
+          "backlog": 945572,
+          "qlen": 130
+        }
+      ]
+    },
+    {
+      "elapsed": 31.026969381025992,
+      "epoch": 6,
+      "udp_blackhole": true,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 20393618,
+          "drops": 1243,
+          "backlog": 1560,
+          "qlen": 15
+        },
+        {
+          "dev": "eth1",
+          "bytes": 551696447,
+          "drops": 6367,
+          "backlog": 84784,
+          "qlen": 28
+        }
+      ]
+    },
+    {
+      "elapsed": 32.02707691595424,
+      "epoch": 6,
+      "udp_blackhole": true,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 20421616,
+          "drops": 1248,
+          "backlog": 1070,
+          "qlen": 10
+        },
+        {
+          "dev": "eth1",
+          "bytes": 552707151,
+          "drops": 6390,
+          "backlog": 75766,
+          "qlen": 26
+        }
+      ]
+    },
+    {
+      "elapsed": 33.02716734202113,
+      "epoch": 6,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 20473392,
+          "drops": 1256,
+          "backlog": 868,
+          "qlen": 10
+        },
+        {
+          "dev": "eth1",
+          "bytes": 554481819,
+          "drops": 6427,
+          "backlog": 72672,
+          "qlen": 24
+        }
+      ]
+    },
+    {
+      "elapsed": 34.02725932805333,
+      "epoch": 6,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 20494353,
+          "drops": 1257,
+          "backlog": 1295,
+          "qlen": 13
+        },
+        {
+          "dev": "eth1",
+          "bytes": 555118160,
+          "drops": 6439,
+          "backlog": 63888,
+          "qlen": 25
+        }
+      ]
+    },
+    {
+      "elapsed": 35.027358032995835,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 21337882,
+          "drops": 1330,
+          "backlog": 18593,
+          "qlen": 101
+        },
+        {
+          "dev": "eth1",
+          "bytes": 581876567,
+          "drops": 6908,
+          "backlog": 1726774,
+          "qlen": 255
+        }
+      ]
+    },
+    {
+      "elapsed": 36.02745390799828,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 21919318,
+          "drops": 1402,
+          "backlog": 5770,
+          "qlen": 49
+        },
+        {
+          "dev": "eth1",
+          "bytes": 593618998,
+          "drops": 7117,
+          "backlog": 477509,
+          "qlen": 121
+        }
+      ]
+    },
+    {
+      "elapsed": 37.02755378303118,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 22017467,
+          "drops": 1412,
+          "backlog": 1087,
+          "qlen": 12
+        },
+        {
+          "dev": "eth1",
+          "bytes": 597028236,
+          "drops": 7201,
+          "backlog": 149522,
+          "qlen": 50
+        }
+      ]
+    },
+    {
+      "elapsed": 38.02766394696664,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 22220819,
+          "drops": 1453,
+          "backlog": 540,
+          "qlen": 6
+        },
+        {
+          "dev": "eth1",
+          "bytes": 602990515,
+          "drops": 7320,
+          "backlog": 36336,
+          "qlen": 12
+        }
+      ]
+    },
+    {
+      "elapsed": 39.02777414303273,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 22654885,
+          "drops": 1498,
+          "backlog": 10921,
+          "qlen": 82
+        },
+        {
+          "dev": "eth1",
+          "bytes": 604123288,
+          "drops": 7417,
+          "backlog": 124262,
+          "qlen": 36
+        }
+      ]
+    },
+    {
+      "elapsed": 40.02787262597121,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 22716361,
+          "drops": 1509,
+          "backlog": 720,
+          "qlen": 8
+        },
+        {
+          "dev": "eth1",
+          "bytes": 605743578,
+          "drops": 7468,
+          "backlog": 75700,
+          "qlen": 25
+        }
+      ]
+    },
+    {
+      "elapsed": 41.02797376003582,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 23426312,
+          "drops": 1572,
+          "backlog": 516,
+          "qlen": 6
+        },
+        {
+          "dev": "eth1",
+          "bytes": 607090817,
+          "drops": 7625,
+          "backlog": 1145034,
+          "qlen": 109
+        }
+      ]
+    },
+    {
+      "elapsed": 42.02807381504681,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 23824387,
+          "drops": 1619,
+          "backlog": 3942,
+          "qlen": 37
+        },
+        {
+          "dev": "eth1",
+          "bytes": 620952236,
+          "drops": 7885,
+          "backlog": 160546,
+          "qlen": 35
+        }
+      ]
+    },
+    {
+      "elapsed": 43.02818137803115,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 24411953,
+          "drops": 1691,
+          "backlog": 29331,
+          "qlen": 146
+        },
+        {
+          "dev": "eth1",
+          "bytes": 636773995,
+          "drops": 8276,
+          "backlog": 2658159,
+          "qlen": 614
+        }
+      ]
+    },
+    {
+      "elapsed": 44.028278272016905,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 25183499,
+          "drops": 1775,
+          "backlog": 10787,
+          "qlen": 73
+        },
+        {
+          "dev": "eth1",
+          "bytes": 662534243,
+          "drops": 8731,
+          "backlog": 1307366,
+          "qlen": 208
+        }
+      ]
+    },
+    {
+      "elapsed": 45.02838959603105,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 25399848,
+          "drops": 1807,
+          "backlog": 2075,
+          "qlen": 23
+        },
+        {
+          "dev": "eth1",
+          "bytes": 671011915,
+          "drops": 8862,
+          "backlog": 130336,
+          "qlen": 47
+        }
+      ]
+    },
+    {
+      "elapsed": 46.028498689993285,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 25594074,
+          "drops": 1826,
+          "backlog": 2608,
+          "qlen": 28
+        },
+        {
+          "dev": "eth1",
+          "bytes": 673611814,
+          "drops": 8988,
+          "backlog": 268914,
+          "qlen": 58
+        }
+      ]
+    },
+    {
+      "elapsed": 47.0286134830676,
+      "epoch": 7,
+      "udp_blackhole": false,
+      "mirrored_impairment": true,
+      "router_qdisc": [
+        {
+          "dev": "eth0",
+          "bytes": 26063127,
+          "drops": 1877,
+          "backlog": 814,
+          "qlen": 9
+        },
+        {
+          "dev": "eth1",
+          "bytes": 677100408,
+          "drops": 9147,
+          "backlog": 72983,
+          "qlen": 27
+        }
+      ]
+    }
+  ]
+}

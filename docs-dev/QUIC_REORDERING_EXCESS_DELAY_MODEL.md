@@ -130,3 +130,53 @@ and controls as ablations; do not restart the accepted restart/journal fixes,
 pretend an echo connection closed by its probe later recovered, or promote a
 success-only latency percentile. A further change requires ownership-level
 evidence before another model or parameter is altered.
+
+## ACK transaction ordering — 2026-09-07 01:04 UTC
+
+`T_at_observation` includes any eligible RTT update supplied by this same ACK.
+The initial integration published reordering before native RTT processing.
+It was placed beside the end-of-ACK controller callback, but that callback is
+not the completion of the ACK's RTT transaction. This is a held-candidate
+implementation error, not evidence that RFC9002 itself is defective.
+
+For an old baseline100ms, current eligible sample146ms and newly acknowledged
+retained original age250ms, pre-update learning retains151ms. Recomposition
+with current146ms then gives297ms. The specified model instead retains105ms
+and gives251ms. The46ms common increase is counted twice by the old ordering.
+Conversely, using a higher old baseline during a downshift can undercount the
+needed differential allowance and repeat premature loss. No RTT sample is
+invented: an ACK without a valid current-path sample uses the existing baseline.
+
+The proposed correction relocates only the existing publication, after RTT
+update and before native loss detection. Controller callbacks, retained-proof
+expiry, duplicate matching, migration lineage, timer priority and persistence
+are unchanged. The actual encrypted packet fixture fails297ms versus251ms
+before the move, then passes for CUBIC and BBR3; the470-test native suite passes.
+Ordinary timing comparisons remain required. A component/model correction does
+not establish that the old14s native freeze or mixed recovery gaps are fixed.
+
+Eight ordinary observations now compare the frozen prior composition with
+only this RTT-publication change. No compiler overlaps the owned routed labs;
+diagnostic events are disabled. The profiles, configured500Mbps cuts, native
+controller and compensation hint are unchanged. These are individual random
+realizations, not proof of statistical equivalence or final competitiveness.
+
+| Case | Prior / current mean Mbps | Prior / current maximum gap s | Other timing |
+| --- | ---: | ---: | --- |
+| Mirrored combined mixed upload |58.093 /76.652 |4.752 /4.772 |Exact468,779,008 /437,846,016B; complete64.556 /45.697s. |
+| Combined QUIC download |92.635 /99.060 |7.750 /6.036 |Echo30 successful then timeout in both; successful-only p95267 /297ms is not a whole-run verdict. |
+| Combined mixed download |68.070 /92.443 |5.056 /2.943 |Echo30 successful then timeout in both; successful-only p95839 /889ms. |
+| Stationary QUIC delay/loss |157.133 /176.605 |0.355 /0.346 |All50 echoes in both; p95285 /269ms, first body0.497 /0.419s. |
+
+Full application series and router/native observations are
+ACK_TRANSACTION_RTT_CONTROLS_20260907.json and
+ACK_TRANSACTION_RTT_STEADY_20260907.json. The isolated code/test overlay is
+ACK_TRANSACTION_RTT_ORDERING.patch, relative to the held pre-change tree.
+
+Disposition: retain this proven model-consistency correction in the held
+candidate, not as an accepted release or an explanation of every stall. The
+stationary result does not show a return of the earlier jitter collapse, but
+combined timing remains unacceptable. Both mixed runs expose slow initial
+ordered progress before a large buffered release; a release bin above500Mbps
+is not wire capacity. Continue the already-proved allocation/discovery boundary
+instead of adjusting another native timer, gain or acquisition allowance.

@@ -74,3 +74,30 @@ removed from source after freezing their binaries. Native tracing is likewise
 temporary. Independent audit is still usage-limited. Relative ACK encoding
 and the older runtime composition remain held; rejected batching stays removed.
 Global acceptance, browser, aggregation and sustainability gates are unchanged.
+
+## Native timer observation — 2026-09-07 01:04 UTC
+
+The next diagnostic confirms all509,804,544bytes in47.305s,86.217Mbps,
+with a3.806s maximum confirmation gap. It does **not** reproduce the earlier
+14s native ACK freeze. First-per-second native events plus every PTO-count
+transition, the complete application probe and the router queue series are
+preserved in NATIVE_ACK_TIMER_OBSERVATION_20260907.json. The selection is
+explicit; it is not represented as a complete packet trace.
+
+After the last pre-outage ACK, native PTO counts advance at31.498,31.920,
+32.763 and34.447s. The outage ends at33s; a subsequent ACK resets PTO at
+34.612s. That realization has ordinary exponential PTO recovery, not a14s
+driver outage or evidence that BBR prevents probe transmission. A learned
+1.147s excess remains after the QoS queue clears and affects subsequent
+time-loss deadlines. This alone does not attribute the prior14s pause.
+
+The bounded next check is an ACK-transaction consistency defect in the held
+reordering candidate: it learns excess against the old RTT immediately before
+the same ACK updates RTT. An actual encrypted packet/ACK fixture demonstrates
+297ms learned delay instead of the model's251ms, double-counting the46ms
+common RTT increase. The correction moves learning after the existing RTT
+update, before loss detection. It neither changes timer priority nor supplies
+a new RTT sample, congestion parameter or acquisition allowance. Full470
+native tests pass for the rising-RTT case; falling-RTT fixture coverage and
+ordinary timing controls follow before any disposition. This is not a new
+upstream defect: the held MPP reordering integration owns the ordering mistake.

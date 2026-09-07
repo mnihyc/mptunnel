@@ -460,6 +460,82 @@ preserves this one capture (4537 client/7505 server log lines).
   Do not revive rejected ready-feedback batching or tune deadlines merely
   because control volume or a queue is large. Preserve ordinary comparators.
 
+**Observer preflight, 05:51:** existing TCP reader/route/wait counters aggregate
+duration without exact frame identity. Client attachment forwarding bypasses
+ReliablePathStream::recv_frame; instrumenting that handle would miss this path.
+Independent source/history review finds class rotation intentional (59fbd22),
+not proof of wall-clock service; the shared FIFO predates this batch (da63e85).
+
+Authorize one temporary lab-diagnostics-only, StreamData-only observer overlay:
+server TCP command writer stage/start/flush completion; client authenticated
+TCP decode and stream routing; attachment forwarder shared-send before/after;
+shared fan-in dequeue (both async/ready-only); every client mux application,
+including in-order input. Record exact path/instance/attachment where owned,
+stream/offset/end and queue snapshots. Do not mutate protocol, queue/admission,
+timing, priority or selection to observe them. Send-completion logs bound
+admission but are not its linearization instant; cross-worker dequeue may log
+first. Queue length is not a guaranteed frame position.
+
+Freeze the overlay executable, archive/reverse it before one same-profile
+`mixed-combined-up-response-handoff-diag-0908` capture. Ordinary binaries remain
+unchanged. Only these response handoffs plus existing exact response dispatch,
+repair, hole and ACK events are enabled; no upload-payload log flood, new test
+harness or ordinary rerun. If native decode is late and downstream service is
+prompt, mailbox/actor hypothesis is falsified for that range. If input is
+decoded early, locate the exact subsequent handoff before proposing a fix.
+
+**Frozen/reversed, 05:56:** optimized build2m04s, no warnings. Diagnostic
+binary `./.tmp/reflection/bin/response-handoff-diag-20260908/mptunnel` includes
+only the archived7-file RESPONSE_HANDOFF_TRACE_20260908.patch atop95a5292.
+Overlay is fully reversed before execution; runtime worktree matches HEAD.
+Events response_tcp_handoff/response_handoff/response_handoff_mux_apply join
+existing server_sender_dispatch/server_repair_carrier_accept/
+server_data_ack_recovery/stream_ack_received/receive_hole/receive_hole_release.
+Server local write/flush completion is not wire receipt; normal and
+interlocked client routing both observed. No sampler/native trace/build overlap.
+
+**Capture closed, 06:06:**259,325,952B exact complete/49.986587s,
+41.503Mbps, firstconfirmation.448020s/maxgap3.215542s. Not an acceptance
+comparison. RESPONSE_HANDOFF_20260908.md/raw archive and observer patch record
+the chain. All149 TCP response transactions dispatch/stage/write/localflush
+within1ms perstage.218 complete attachment->mux tuples: sharedadmission<=9ms,
+sharedresidence<=170ms, dequeue->mux<=1ms. Do NOT replace these stages or tune
+their capacities to fix a seconds-long gap they did not produce.
+
+Some TCP copies spend up to10.163s before authenticated decode and2.415s
+after decode; these are losing duplicates. All7 TCP frontier-winning frames
+are OriginalData, not repairs, and have decode->mux<=12ms. Actual largestF gap
+1147->1161 is3.216s, won by QUIC at1788818247409; its attachment sharedsend
+begins only89ms earlier.156 requestACK effects continue during that gap,
+maxadjacent32ms. Likewise F1203's2.767s gap spends only106ms after attachment
+sendbegin. The dominant winning-frame delay remains BEFORE that handoff.
+This closes a false inference from losing-copy or maximum queue delay to user
+stall. The observer's decode/server path_index field means wirePathId, while
+route/attachment path_index is runtimeindex; map0->0/1->2/2->1 explicitly.
+
+**Next bounded discriminator authorized:** complete the missing QUIC winning-
+frame ingress chain, not another controller/batching experiment. One temporary
+StreamData-only observer at actual server QUIC write begin/completion, client
+ordinary frame decode, normal/interlocked carrier forwarding, and the existing
+attachment/mux seams. run_client_udp_stream uses the shared QUIC reader;
+its datagram callers must not be mistaken for Product input. Preserve exact
+identity where available and native request-stream id/declared singleton
+mapping where not; no guessed path identity, extra native state or changed
+queue policy. Also record before/after reader mailbox send for the same data
+frame, so an earlier decoded frame blocked on delivery is not called wire loss.
+One frozen/reversed overlay capture, label
+mixed-combined-up-response-quic-handoff-diag-0908, same profile. Falsifier:
+if the winning data decodes early, local pipeline caused later service delay;
+if decode is late, the remaining native/reader boundary must be distinguished
+before blaming congestion. Do not implement ACK coalescing, queue limits or
+actor priority simply because they look relevant. No further ordinary run.
+
+Reader observer records aggregate preceding nondata-frame channel-send await
+count/total/max since the preceding response, then resets at response mailbox
+completion. These cfg-only timing counters avoid logging every upload ACK;
+they measure await wall time, not CPU or exact socket arrival. Explicit optional
+client Product identity disables this observer for server/datagram callsites.
+
 **Initial-state boundary confirmed:** with no response ACK, the default
 snapshot has H=None/F0. Even a complete empty ACK leaves the old contiguous
 predicate false because it also requires F>0. The apparent no-ACK exception
@@ -532,7 +608,7 @@ Do not reuse the runner's old aggregate300/200 defaults for the required200each.
 - Preserve useful artifacts before scoped cache cleanup. No deletion this
   transaction; no unaccepted runtime overlay or user edit belongs in a commit.
 - Telegram milestones authorized no more often than hourly; last sent
-  2026-09-07 about21:03UTC (response RED/GREEN and migration hold).
+  2026-09-07 about22:08UTC (adverse ordinary result and response-stage isolation).
   Respect its soft frequency advisory: nonessential messages can wait.
 - Universal clairvoyant optimality under arbitrary future outages is impossible.
   This does not waive avoidable software delays or any practical acceptance

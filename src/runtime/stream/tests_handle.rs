@@ -988,6 +988,84 @@ fn fixed_ambiguous_data_ack_releases_original_debt_without_minting_evidence() {
 }
 
 #[test]
+fn fixed_partial_copy_combined_ack_counts_one_rate_observation() {
+    const TOTAL_BYTES: u64 = 4 * MIN_RATE_SAMPLE_BYTES;
+    const COPY_BYTES: u64 = MIN_RATE_SAMPLE_BYTES;
+    const UNIQUE_BYTES: u64 = 3 * MIN_RATE_SAMPLE_BYTES;
+
+    // Keep each unique side large enough for the production sample floor;
+    // this tests observation counting, not subfloor sample rejection.
+    for original_frame_bytes in [TOTAL_BYTES as usize, COPY_BYTES as usize] {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let output = ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(12),
+            commands,
+            MuxLimits::default(),
+        );
+        let ReliablePathStreamOutput::Fixed(fixed) = &output else {
+            panic!("expected fixed output");
+        };
+        for offset in (0..TOTAL_BYTES).step_by(original_frame_bytes) {
+            fixed.record_original_flight(&stream_data_frame_at(offset, original_frame_bytes));
+        }
+        fixed.record_reinjected_flight(&stream_data_frame_at(COPY_BYTES, COPY_BYTES as usize));
+        {
+            let model = fixed.model.lock().expect("fixed output model lock");
+            assert_eq!(model.original_data_in_flight_bytes, TOTAL_BYTES);
+            assert_eq!(model.carrier_work_in_flight_bytes, TOTAL_BYTES + COPY_BYTES);
+            assert_eq!(model.product_progress_bytes, 0);
+            assert_eq!(model.delivery_samples, 0);
+            assert!(model.product_rate_epoch.is_none());
+        }
+
+        // One ACK observation covers both unique sides of the copied middle,
+        // regardless of whether those sides share an original frame record.
+        let acked = OffsetRange {
+            start: 0,
+            end: TOTAL_BYTES,
+        };
+        let acked_at = std::time::Instant::now() + Duration::from_millis(20);
+        fixed.release_normalized_acked_ranges_at(&[acked], acked_at);
+        let epoch = {
+            let model = fixed.model.lock().expect("fixed output model lock");
+            assert!(model.flights.is_empty());
+            assert_eq!(model.original_data_in_flight_bytes, 0);
+            assert_eq!(model.carrier_work_in_flight_bytes, 0);
+            assert_eq!(
+                model.product_progress_bytes, UNIQUE_BYTES,
+                "frame_bytes={original_frame_bytes}: only the copied middle is ambiguous"
+            );
+            let epoch = model
+                .product_rate_epoch
+                .expect("one actual ACK rate sample");
+            assert_eq!(epoch.sample_bytes, UNIQUE_BYTES);
+            assert_eq!(
+                epoch.sample_count, 1,
+                "frame_bytes={original_frame_bytes}: release atoms are not independent rate observations"
+            );
+            assert_eq!(model.delivery_samples, 1);
+            assert_eq!(epoch.observed_at, acked_at);
+            epoch
+        };
+
+        fixed.release_normalized_acked_ranges_at(&[acked], acked_at + Duration::from_millis(20));
+        let model = fixed.model.lock().expect("fixed output model lock");
+        assert!(model.flights.is_empty());
+        assert_eq!(model.original_data_in_flight_bytes, 0);
+        assert_eq!(model.carrier_work_in_flight_bytes, 0);
+        assert_eq!(model.product_progress_bytes, UNIQUE_BYTES);
+        assert_eq!(model.delivery_samples, 1);
+        let replay_epoch = model.product_rate_epoch.expect("existing ACK rate sample");
+        assert_eq!(replay_epoch.sample_bytes, epoch.sample_bytes);
+        assert_eq!(replay_epoch.sample_count, epoch.sample_count);
+        assert_eq!(replay_epoch.rate_bps, epoch.rate_bps);
+        assert_eq!(replay_epoch.observed_at, epoch.observed_at);
+        assert_eq!(replay_epoch.expires_at, epoch.expires_at);
+    }
+}
+
+#[test]
 fn fixed_native_window_and_rate_evidence_expire_without_rewriting_product_authority() {
     let mux_limits = MuxLimits::default();
     let (commands, _receivers) = reliable_path_command_channels(8);

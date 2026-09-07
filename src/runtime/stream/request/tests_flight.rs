@@ -98,6 +98,123 @@ fn duplicate_data_ack_releases_original_and_reinjected_flights_without_path_proo
     assert!(ledger.original_transmission_instances().is_empty());
 }
 
+fn partial_copy_ack_proving_bytes(split_ack: bool, invalidate_epoch: bool) -> usize {
+    let owner = path(UnderlayProtocol::Udp, 0, 71);
+    let copy = path(UnderlayProtocol::Tcp, 1, 73);
+    let original = OffsetRange {
+        start: 0,
+        end: 65_536,
+    };
+    let retained = OffsetRange {
+        start: 65_536,
+        end: 131_072,
+    };
+    let mut ledger = RequestFlightLedger::default();
+    for range in [original, retained] {
+        assert_eq!(
+            ledger.record_original_frame_instance_with_evidence(
+                owner,
+                &data_frame(range.start, 65_536),
+                true,
+                None,
+            ),
+            65_536,
+        );
+    }
+    assert_eq!(
+        ledger
+            .record_reinjection_frame_instance_with_suppression_interval(
+                copy,
+                &data_frame(0, 14_600),
+                Duration::from_secs(1),
+            )
+            .0,
+        14_600,
+    );
+    if invalidate_epoch {
+        ledger.invalidate_original_evidence(owner);
+    }
+
+    let released = if split_ack {
+        let mut prefix = ledger.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 14_600,
+        }]);
+        prefix.extend(ledger.release_normalized_acked_ranges(&[OffsetRange {
+            start: 14_600,
+            end: original.end,
+        }]));
+        prefix
+    } else {
+        ledger.release_normalized_acked_ranges(&[original])
+    };
+
+    for (instance, expected_bytes) in [(owner, 65_536), (copy, 14_600)] {
+        assert_eq!(
+            released
+                .iter()
+                .filter(|release| release.instance == instance)
+                .map(|release| release.bytes)
+                .sum::<usize>(),
+            expected_bytes,
+            "ACK settlement releases all original and copy debts, independently of evidence",
+        );
+    }
+    assert_original_data_cache(&ledger, 65_536, &[(owner, 65_536), (copy, 0)]);
+    assert_eq!(ledger.reinjected_data_in_flight_bytes(copy), 0);
+    assert_eq!(
+        ledger.latest_unacked_ranges_for_path_instance(owner),
+        vec![retained],
+    );
+    let expected_candidates = if invalidate_epoch {
+        vec![]
+    } else {
+        vec![owner]
+    };
+    assert_eq!(
+        ledger
+            .unacked_original_paths_before(retained.end)
+            .as_slice(),
+        expected_candidates.as_slice(),
+        "the omitted owner remains a stale-clock candidate only in its eligible epoch",
+    );
+    assert!(
+        ledger
+            .release_normalized_acked_ranges(&[original])
+            .is_empty()
+    );
+    let proving = released.iter().filter(|release| release.path_proving);
+    proving
+        .map(|release| {
+            assert_eq!(release.instance, owner);
+            assert!(release.kind.is_original_transmission());
+            assert!(release.range.start >= 14_600 && release.range.end <= original.end);
+            release.bytes
+        })
+        .sum()
+}
+
+#[test]
+fn combined_ack_preserves_unique_original_evidence_outside_partial_copy() {
+    assert_eq!(
+        partial_copy_ack_proving_bytes(false, false),
+        50_936,
+        "a copied prefix cannot erase adjacent unique progress from the same ACK",
+    );
+}
+
+#[test]
+fn split_ack_preserves_unique_original_evidence_and_epoch_fence() {
+    assert_eq!(partial_copy_ack_proving_bytes(true, false), 50_936);
+    for split_ack in [false, true] {
+        assert_eq!(
+            partial_copy_ack_proving_bytes(split_ack, true),
+            0,
+            "neither ACK partition may revive evidence from a pre-stale epoch",
+        );
+    }
+}
+
 #[test]
 fn total_original_data_flight_cache_tracks_original_only_ack_and_drain() {
     let owner = path(UnderlayProtocol::Tcp, 0, 7);

@@ -7,7 +7,7 @@ use super::state::RequestProductQualificationReceipt;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::work::{
     CarrierWorkKind, RangeRecoveryState, ReliableFlightSpan, ReliableLiveOwnerFrontier,
-    ambiguous_flight_intervals, flight_interval_bytes, flight_intervals_overlap,
+    ambiguous_flight_intervals, flight_evidence_segments, flight_interval_bytes,
     reliable_live_owner_uniform_frontier, split_flight_interval_by_ack,
 };
 use crate::protocol::frame::{
@@ -228,7 +228,11 @@ impl RequestFlightLedger {
         let mut released = Vec::new();
         for (start, flight) in original_flights.iter().copied() {
             let split = split_flight_interval_by_ack(start, flight.end, ranges);
-            for (acked_start, acked_end) in split.acked {
+            for (acked_start, acked_end, is_ambiguous) in split
+                .acked
+                .into_iter()
+                .flat_map(|(start, end)| flight_evidence_segments(start, end, &ambiguous_intervals))
+            {
                 let bytes = flight_interval_bytes(acked_start, acked_end);
                 if bytes == 0 {
                     continue;
@@ -253,7 +257,7 @@ impl RequestFlightLedger {
                 }
                 let path_proving = flight.evidence_eligible
                     && flight.kind.is_original_transmission()
-                    && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end);
+                    && !is_ambiguous;
                 released.push(RequestPathRelease {
                     instance: flight.instance,
                     range: OffsetRange {

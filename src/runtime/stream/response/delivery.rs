@@ -16,9 +16,9 @@ use crate::model::response::CarrierPathFlightDebt;
 use crate::model::timing::reliable_data_retransmission_interval;
 use crate::model::work::{
     CarrierWorkKind, RangeRecoveryState, ReliableFlightSpan, ReliableLiveOwnerFrontier,
-    ReliableReinjectionTargetWork, ambiguous_flight_intervals, flight_interval_bytes,
-    reliable_live_owner_uniform_frontier, reliable_reinjection_service_limit_bytes,
-    split_flight_interval_by_ack,
+    ReliableReinjectionTargetWork, ambiguous_flight_intervals, flight_evidence_segments,
+    flight_interval_bytes, reliable_live_owner_uniform_frontier,
+    reliable_reinjection_service_limit_bytes, split_flight_interval_by_ack,
 };
 use crate::protocol::frame::{
     normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_accounted_bytes,
@@ -1920,20 +1920,23 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
     let mut released = Vec::new();
     for (start, flight) in original_flights.iter().copied() {
         let split = split_flight_interval_by_ack(start, flight.end, ranges);
-        for (acked_start, acked_end) in split.acked {
+        for (acked_start, acked_end, is_ambiguous) in split
+            .acked
+            .into_iter()
+            .flat_map(|(start, end)| flight_evidence_segments(start, end, &ambiguous_intervals))
+        {
             let bytes = flight_interval_bytes(acked_start, acked_end);
             if bytes == 0 {
                 continue;
             }
-            let qualification_ambiguous_ranges = ambiguous_intervals
-                .iter()
-                .filter_map(|(ambiguous_start, ambiguous_end)| {
-                    OffsetRange::new(
-                        acked_start.max(*ambiguous_start),
-                        acked_end.min(*ambiguous_end),
-                    )
-                })
-                .collect::<SmallVec<[_; 2]>>();
+            let qualification_ambiguous_ranges = if is_ambiguous {
+                SmallVec::from_slice(&[OffsetRange {
+                    start: acked_start,
+                    end: acked_end,
+                }])
+            } else {
+                SmallVec::new()
+            };
             released.push((
                 acked_start,
                 CarrierPathReleasedFlight {
@@ -1950,7 +1953,7 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
                     },
                     path_proving: flight.evidence_eligible
                         && flight.kind.is_original_transmission()
-                        && qualification_ambiguous_ranges.is_empty(),
+                        && !is_ambiguous,
                     qualification_ambiguous_ranges,
                 },
             ));

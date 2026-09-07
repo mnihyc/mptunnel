@@ -1460,6 +1460,14 @@ If a byte was outstanding on multiple carriers, the Data ACK proves delivery
 but not which copy delivered it. No implementation may invent per-carrier
 delivery evidence for that range.
 
+Attribution is byte-exact: ambiguity in one part of an acknowledged original
+MUST NOT discard its adjacent uniquely attributable bytes. Partition released
+coverage at accepted-copy boundaries before projecting owner/epoch evidence.
+For the same committed transmissions and acknowledged byte set, storage-frame
+or ACK coalescing alone MUST NOT change the attributable byte union. These
+partitions release the same total original/copy debt and do not create extra
+independent rate observations or confidence samples within an ACK transaction.
+
 Processing newly received unique Product bytes marks the cumulative Data ACK
 state pending and advances one local publication generation. Before the
 serialized receive actor parks or yields its bounded cooperative turn, it MUST

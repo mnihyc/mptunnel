@@ -377,7 +377,7 @@ pub(crate) fn ambiguous_flight_intervals(
         *events.entry(start).or_default() += 1;
         *events.entry(end).or_default() -= 1;
     }
-    let mut intervals = Vec::new();
+    let mut intervals = Vec::<(u64, u64)>::new();
     let mut active = 0_i64;
     let mut previous = None;
     for (position, delta) in events {
@@ -385,7 +385,16 @@ pub(crate) fn ambiguous_flight_intervals(
             && previous < position
             && active > 1
         {
-            intervals.push((previous, position));
+            // Multiplicity can change without changing ambiguity. Retain its
+            // union, not a boundary for every nested copy: those boundaries
+            // would needlessly fragment each downstream release/hole record.
+            if let Some((_, end)) = intervals.last_mut()
+                && *end == previous
+            {
+                *end = position;
+            } else {
+                intervals.push((previous, position));
+            }
         }
         active += delta;
         previous = Some(position);
@@ -393,11 +402,42 @@ pub(crate) fn ambiguous_flight_intervals(
     intervals
 }
 
-pub(crate) fn flight_intervals_overlap(intervals: &[(u64, u64)], start: u64, end: u64) -> bool {
-    let position = intervals.partition_point(|(_, interval_end)| *interval_end <= start);
-    intervals
-        .get(position)
-        .is_some_and(|(interval_start, _)| *interval_start < end)
+/// Partition one released interval by the pre-release ambiguity index. The
+/// returned flag describes only that atom: a copied prefix cannot erase proof
+/// from the adjacent original-only suffix. No flight ownership is changed.
+pub(crate) fn flight_evidence_segments(
+    start: u64,
+    end: u64,
+    ambiguous: &[(u64, u64)],
+) -> impl Iterator<Item = (u64, u64, bool)> + '_ {
+    let mut cursor = start;
+    let mut index = ambiguous.partition_point(|(_, interval_end)| *interval_end <= start);
+    std::iter::from_fn(move || {
+        if cursor >= end {
+            return None;
+        }
+        while let Some(&(ambiguous_start, ambiguous_end)) = ambiguous.get(index) {
+            if ambiguous_end <= cursor {
+                index += 1;
+                continue;
+            }
+            if ambiguous_start >= end {
+                break;
+            }
+            let is_ambiguous = cursor >= ambiguous_start;
+            let segment_end = if is_ambiguous {
+                ambiguous_end.min(end)
+            } else {
+                ambiguous_start
+            };
+            let segment = (cursor, segment_end, is_ambiguous);
+            cursor = segment_end;
+            return Some(segment);
+        }
+        let segment = (cursor, end, false);
+        cursor = end;
+        Some(segment)
+    })
 }
 
 pub(crate) struct FlightIntervalSplit {
@@ -441,6 +481,44 @@ pub(crate) fn split_flight_interval_by_ack(
 
 pub(crate) fn flight_interval_bytes(start: u64, end: u64) -> usize {
     usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod flight_evidence_tests {
+    use super::{ambiguous_flight_intervals, flight_evidence_segments};
+
+    #[test]
+    fn evidence_partition_matches_byte_ambiguity_and_half_open_bounds() {
+        let nested = ambiguous_flight_intervals((1..=64).map(|end| (0, end)));
+        assert_eq!(nested, vec![(0, 63)]);
+        for end in 1..=64 {
+            assert!(flight_evidence_segments(0, end, &nested).count() <= 2);
+        }
+        // All ambiguity patterns on eight bytes, including adjacent intervals;
+        // all clipped/empty queries. Each atom must cover exactly its bytes.
+        for mask in 0..256_u16 {
+            let ambiguous = (0..8_u64)
+                .filter(|byte| mask & (1 << byte) != 0)
+                .map(|byte| (byte, byte + 1))
+                .collect::<Vec<_>>();
+            for start in 0..=8 {
+                for end in start..=8 {
+                    let mut cursor = start;
+                    for (low, high, is_ambiguous) in
+                        flight_evidence_segments(start, end, &ambiguous)
+                    {
+                        assert_eq!(low, cursor);
+                        assert!(low < high && high <= end);
+                        for byte in low..high {
+                            assert_eq!(is_ambiguous, mask & (1 << byte) != 0);
+                        }
+                        cursor = high;
+                    }
+                    assert_eq!(cursor, end);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

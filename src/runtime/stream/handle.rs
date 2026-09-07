@@ -1605,7 +1605,6 @@ impl FixedReliablePathOutput {
         }
         let mut sample_bytes = 0_u64;
         let mut sample_start = now;
-        let mut released_proven_flights = 0_u32;
         for (_, release) in released {
             let (bytes, sent_at, kind, path_proving) = release.fixed_output_sample();
             model.carrier_work_in_flight_bytes = model
@@ -1622,7 +1621,6 @@ impl FixedReliablePathOutput {
             if path_proving {
                 sample_bytes = sample_bytes.saturating_add(bytes as u64);
                 sample_start = sample_start.min(sent_at);
-                released_proven_flights = released_proven_flights.saturating_add(1);
             }
         }
         model.product_progress_bytes = model.product_progress_bytes.saturating_add(sample_bytes);
@@ -1642,10 +1640,10 @@ impl FixedReliablePathOutput {
                 Some(previous) => previous.mul_add(0.875, sample_rtt_ms * 0.125),
                 None => sample_rtt_ms,
             });
-            let next_delivery_samples = fresh_prior_epoch
-                .map_or(released_proven_flights, |epoch| {
-                    epoch.sample_count.saturating_add(released_proven_flights)
-                });
+            // One ACK transaction produces one rate observation, regardless
+            // of how many flight/ambiguity atoms supplied its unique bytes.
+            let next_delivery_samples =
+                fresh_prior_epoch.map_or(1, |epoch| epoch.sample_count.saturating_add(1));
             let next_sample_bytes = fresh_prior_epoch.map_or(sample_bytes, |epoch| {
                 epoch.sample_bytes.saturating_add(sample_bytes)
             });
@@ -1659,10 +1657,8 @@ impl FixedReliablePathOutput {
                     self.startup.jitter_ms,
                 ),
             );
+            model.delivery_samples = model.delivery_samples.saturating_add(1);
         }
-        model.delivery_samples = model
-            .delivery_samples
-            .saturating_add(released_proven_flights);
     }
 
     fn reinjection_suppression_deadline(&self, frame: &Frame) -> Option<Instant> {

@@ -240,10 +240,82 @@ lengthen deadlines or accept old probe epochs from this observation.
   consumer for symmetric byte semantics; no unrelated allocator/probe fix.
 - **Expected benefit/cost/gate:** avoid withdrawing a delivering attachment
   merely because a small hedge overlaps one frame. More ephemeral release
-  atoms are bounded by existing flight/ACK/ambiguity endpoints; no retained
+  and retained ACK-hole atoms are bounded by existing flight/ACK/ambiguity endpoints; no new
   timers, retry allowance or rate hint. Test disjoint/full/partial duplicates,
   exact qualification and stale epochs before one ordinary affected pair.
   Actual conditional GREEN does not waive timing, loaded latency or release.
+
+**RED complete, 02:33:** real request and response combined-ACK fixtures fail
+only at0 versus50936 uniquely attributable bytes, after exact settlement/tag
+controls. Split-ACK and invalidated-epoch controls pass. Test-only compile
+mistakes (temporary slice lifetime, then Vec/SmallVec mismatch) were corrected;
+neither was a Product failure. Successful test build3m06s; pair executes<.01s.
+Production correction now authorized by this RED plus live withdrawal trace.
+
+Independent pre-implementation review identifies one directly affected
+consumer: fixed-output handle counts release records as confidence samples.
+New byte atoms would create two samples from one original/ACK around a copied
+middle. Its rate estimator actually constructs one PathRateSample per ACK;
+count that single successful observation, as main request/response already do.
+Add one focused fixed-output containment case. This is a required preservation
+of sample meaning, not a confidence threshold or a separate performance knob.
+Implement the common allocation-free boundary sweep in both release paths;
+keep response exact qualification metadata/consumers otherwise unchanged.
+
+**Implemented, 02:36:** common no-allocation interval iterator replaces the
+whole-overlap predicate. Both directions now release atoms using one frozen
+ambiguity snapshot. Total settlement and retained original/copy fragments are
+unchanged; response ACK-hole metadata may have additional boundaries, not
+additional bytes. Work is O(log M + intersected boundaries) per ACK interval,
+replacing the response's full ambiguity-index scan. No new long-lived field
+or budget. Existing per-output sample aggregation remains; fixed-output
+counting now follows its one actual PathRateSample per transaction. This also
+reduces its former multiple-confidence increments for a multi-frame ACK
+without copies, so legacy scalar promotion may need more genuine observations;
+Native-first authority and exact-byte qualification are unchanged. The new
+fixed-output control tests both one-frame and four-frame forms explicitly.
+
+The existing response qualification-only fixture's old zero path-byte
+expectation is intentionally6144 now. Other debt, epoch, ambiguity, replay,
+ordering, copy-clock and qualification controls must remain GREEN. Added one
+exhaustive eight-byte boundary oracle (all256ambiguity patterns and clipped/
+empty queries), not a long performance test. Independent actual diff review
+finds no counterexample; coherent test build running session71959.
+
+**Ordinary gate declared before execution:** after focused GREEN, freeze this
+isolated atom correction atop011aee9, with sampler still shelved. One mixed
+combined upload control/candidate pair, both endpoints changed together;
+control is retained-frontier-20260908, candidate is
+`./.tmp/reflection/bin/ack-atoms-20260908/mptunnel`. Use labels
+`ack-atoms-{control,candidate}-0908`, diagnostics/native trace off and every
+routed/mirrored/profile/limit/probe flag unchanged as specified above. Compare
+completed work, full raw confirmation series, first/max confirmation and write
+gaps, drain context, directional wire, RSS/CPU—not just a mean. No build/load
+overlap. An adverse/incomplete pair stops promotion; no favourable third run.
+A positive cell supports only this affected workload, not the remaining
+TCP/down/browser/loaded-latency/recovery/baseline or release gates.
+
+**Focused run, 02:41:**65/66 tests pass, including both former REDs and the
+preserved recovery/epoch/qualification/ordering controls. The new fixed-output
+fixture incorrectly expected a rate epoch from6144B, below the existing
+PathRateSample minimum; its byte attribution/debt assertions already pass.
+Correct only fixture volume, deriving original4*MIN_RATE_SAMPLE_BYTES and
+copy1*floor so the unique3*floor legitimately produces one sample. No threshold
+change. Independent review also identified avoidable fragmentation of nested
+copies: merge touching multiply-owned spans into their actual ambiguity union
+before atomization. A64nested-copy geometry control proves at most two atoms
+per flight instead of one for every multiplicity boundary. This contains
+introduced metadata work; it is not attribution of a pre-existing RAM incident.
+Final coherent focused rebuild follows, with no ordinary acceptance yet.
+
+**Component GREEN, 02:43:** final build3m07s and all66 focused checks pass in
+1.23s. Both combined-ACK REDs now credit exactly50936 unique bytes; split/replay,
+revoked/detached epochs, exact capped tags, real fixed-output rate observation,
+retained horizon recovery, immutable copy suppression, ordering/frontier and
+stale clock controls pass. Independent final source review passes, including
+nested-copy union coalescence. Application build now runs before the declared
+ordinary mixed upload pair. This is an intermediary correctness milestone,
+not a throughput, fluent-experience, baseline or release acceptance.
 
 
 **Held preceding transaction: request/upload rate refresh.** The existing sampler

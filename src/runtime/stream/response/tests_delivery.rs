@@ -198,10 +198,116 @@ fn partial_ambiguous_data_ack_preserves_exact_neighboring_qualification_progress
     assert_eq!(ledger.verified_bytes, 6144);
     assert_eq!(ledger.outstanding_tag_bytes, 0);
     assert_eq!(
-        original.original_data_acked_bytes, 0,
-        "qualification range precision must not change rate-sample aggregation"
+        original.original_data_acked_bytes, 6144,
+        "unique byte attribution is shared by qualification and path progress"
     );
     assert!(ledger.holds());
+}
+
+#[test]
+fn combined_ack_partial_copy_preserves_response_unique_path_progress() {
+    const ORIGINAL_BYTES: usize = 65_536;
+    const COPY_BYTES: usize = 14_600;
+    const UNIQUE_BYTES: u64 = (ORIGINAL_BYTES - COPY_BYTES) as u64;
+
+    // The split-ACK control reaches the same settled byte set first. Combining
+    // its ACK coverage must not make the original-only suffix ambiguous.
+    for split_ack in [true, false] {
+        let (binding, original, _original_receivers) = binding_for_underlay(UnderlayProtocol::Udp);
+        let duplicate = key(UnderlayProtocol::Tcp, 1);
+        let (commands, _duplicate_receivers) = reliable_path_command_channels(8);
+        binding.attach(
+            duplicate.underlay,
+            duplicate.path_id,
+            commands,
+            TrafficClass::Throughput,
+        );
+        let original_identity = server_output_identity(&binding, original);
+        binding.record_original_flight(original, &stream_data_frame_at(0, ORIGINAL_BYTES));
+        binding.record_reinjected_flight(duplicate, &stream_data_frame_at(0, COPY_BYTES));
+
+        {
+            let flights = binding.flights.lock().expect("response flights");
+            let recorded = flights.get(&0).expect("original and prefix copy");
+            assert_eq!(recorded.len(), 2);
+            assert!(recorded.iter().any(|flight| {
+                flight.key == original
+                    && flight.end == ORIGINAL_BYTES as u64
+                    && flight.bytes == ORIGINAL_BYTES
+                    && flight.kind == CarrierWorkKind::OriginalData
+                    && flight.evidence_eligible
+            }));
+            assert!(recorded.iter().any(|flight| {
+                flight.key == duplicate
+                    && flight.end == COPY_BYTES as u64
+                    && flight.bytes == COPY_BYTES
+                    && flight.kind == CarrierWorkKind::ReinjectedData
+            }));
+        }
+        {
+            let outputs = binding.outputs.lock().expect("response outputs");
+            assert_eq!(outputs.original_data_in_flight_bytes, ORIGINAL_BYTES as u64);
+            assert_eq!(
+                outputs
+                    .entries
+                    .iter()
+                    .map(|entry| entry.bytes_in_flight)
+                    .sum::<u64>(),
+                (ORIGINAL_BYTES + COPY_BYTES) as u64
+            );
+            for entry in &outputs.entries {
+                assert_eq!(entry.qualification, StreamPathQualification::Qualified);
+                assert!(entry.product_rate_epoch.is_none());
+            }
+        }
+
+        if split_ack {
+            let prefix = binding.release_normalized_acked_ranges(&[range(0, COPY_BYTES as u64)]);
+            assert!(prefix.path_progress_outputs.is_empty());
+        }
+        let release = binding.release_normalized_acked_ranges(&[range(0, ORIGINAL_BYTES as u64)]);
+        let replay = binding.release_normalized_acked_ranges(&[range(0, ORIGINAL_BYTES as u64)]);
+        assert!(replay.path_progress_outputs.is_empty());
+        assert!(binding.flights.lock().expect("response flights").is_empty());
+
+        let outputs = binding.outputs.lock().expect("response outputs");
+        assert_eq!(outputs.original_data_in_flight_bytes, 0);
+        for entry in &outputs.entries {
+            assert_eq!(entry.bytes_in_flight, 0);
+            assert_eq!(entry.original_data_in_flight_bytes, 0);
+            assert_eq!(entry.qualification, StreamPathQualification::Qualified);
+            let ledger = entry.product_qualification.invariant();
+            assert_eq!(ledger.outstanding_tag_bytes, 0);
+            assert!(ledger.holds());
+            if entry.key == duplicate {
+                assert_eq!(ledger.verified_bytes, 0);
+                assert_eq!(entry.original_data_acked_bytes, 0);
+                assert_eq!(entry.delivery_samples, 0);
+                assert!(entry.product_rate_epoch.is_none());
+            }
+        }
+        let original = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == original)
+            .expect("original output");
+        assert_eq!(
+            original.product_qualification.invariant().verified_bytes,
+            UNIQUE_BYTES
+        );
+        assert_eq!(
+            original.original_data_acked_bytes, UNIQUE_BYTES,
+            "split_ack={split_ack}: settlement and exact qualification succeed; the 50,936 original-only bytes must also prove path progress"
+        );
+        assert_eq!(
+            release.path_progress_outputs.as_slice(),
+            &[original_identity]
+        );
+        assert_eq!(
+            original.delivery_samples, 1,
+            "partitioning a single unique suffix does not manufacture delivery confidence"
+        );
+    }
 }
 
 #[test]

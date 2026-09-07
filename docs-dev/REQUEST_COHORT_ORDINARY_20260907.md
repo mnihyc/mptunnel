@@ -641,3 +641,53 @@ It records those missing boundaries only; it changes no recovery policy and
 will be reversed after freezing its diagnostic binary, before the single
 declared follow-up. Publication/H3 acceptance still must not be called wire
 departure. No automatic repeat if the exclusion does not recur.
+
+### Requalification trace: false silence localized to ACK attribution
+
+Raw evidence: REQUEST_REQUALIFICATION_DIAGNOSTIC_20260908.raw.tar.gz;
+temporary source patch and frozen diagnostic binary are identified above and
+in CURRENT_CLOSURE_PLAN. Build1m31s, source overlay reversed before execution.
+This independent realization completes500236288B/42.715124s with a4.662451s
+maximum confirmation gap. Diagnostic rate93.688Mbps is not an ordinary pass.
+
+The exact partial-copy evidence is independently checked against **all**
+intersecting original/copy publication intervals in the client log:
+
+| Exact QUIC original | Only overlapping TCP copy | Full original ACK | Discarded unique bytes |
+| --- | --- | --- | ---: |
+| `[64028513,64094049)`; line1365 | `[64028513,64043113)`; line5713,3489ms | line5962,3535ms |50936 |
+| `[64487265,64552801)`; line1372 | `[64487265,64501865)`; line6319,3606ms | line6375,3620ms |50936 |
+
+There is no other covering publication in either suffix. Both whole-original
+releases have `path_proving=false` and `product_evidence_eligible=false`.
+The last eligible QUIC progress/reset is lines5550/5551 at3373/3374ms with
+249643us persistence. Its stale clock expires at3623ms and withdrawal occurs
+at3624ms, only4ms after the second original-only suffix was acknowledged.
+These are one client clock domain; the250ms-scale deadline is observed, not
+a proposed parameter. Late old-epoch receipts remain legitimately ineligible
+after withdrawal, which makes preventing the false entry important.
+
+Source cause: request/flight.rs computes the exact multiply-owned intervals,
+then applies `any overlap` to each entire ACKed-original intersection.
+This erases adjacent unique progress. Response delivery has the same coarse
+path-progress bit despite its separately precise qualification ranges.
+The old response partial-overlap test intentionally preserved zero rate bytes
+while repairing qualification; it did not validate byte-level stale progress.
+It must be explicitly revised, not claimed as an unchanged regression test.
+
+The correct invariant for the pre-release ownership snapshot is:
+`proving = eligible_original intersect newly_ACKed minus multiply_owned`.
+Partition these sets into nonoverlapping release atoms. Their settlement sum
+is unchanged; only the unique atoms may contribute to progress and samples.
+The current exact epoch and per-ACK sample aggregation still apply. Frame or
+ACK coalescing alone cannot change that attributable union. No controller,
+expiry, copy limit, stale persistence or native ownership changes follow.
+
+There is also a separate downstream receipt-delay observation, not bundled
+into this fix: QUIC probe3 is published/H3-accepted atUnix1788805128280;
+server decodes and queues all return ACKs at8382. Client UDP mailbox receives
+at8705 and completes at8706, before expiry8814; actor handles it at8864,
+after the pending probe has expired. Probe5 later succeeds within120ms.
+Thus local probe FIFO starvation is disproved for these probes; the actor
+delay is real in this instrumented execution but does not justify loosening
+probe epochs. Its ordinary magnitude and needed correction remain separate.

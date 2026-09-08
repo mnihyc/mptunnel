@@ -203,7 +203,7 @@ pub(super) struct ObservedBulkPathCandidate {
 ///
 /// Membership generation travels with the evidence so the apply phase cannot
 /// accidentally fence a decision against a different attachment topology.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct RequestRelaySchedulingObservation {
     pub(super) stream_id: StreamId,
     pub(super) membership_generation: u64,

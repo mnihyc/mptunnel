@@ -865,6 +865,93 @@ async fn frame_reservation_owns_byte_charge_from_reserve_through_writer_release(
 }
 
 #[test]
+fn physical_writer_boundary_is_shared_and_invalidated_by_queue_lifecycle() {
+    use crate::model::path::CarrierPathInstanceId;
+
+    for drain in [false, true] {
+        let (commands, receivers) = reliable_path_command_channels(4);
+        let sibling = commands.clone();
+        let boundary = commands.writer_boundary();
+        assert!(
+            boundary.snapshot().is_none(),
+            "an empty queue is not a ready writer"
+        );
+        let ready = receivers
+            .writer_ready_boundary(CarrierPathInstanceId::from_raw(1))
+            .unwrap();
+        assert_eq!(sibling.writer_boundary().snapshot(), Some(ready.receipt()));
+        if drain {
+            sibling.begin_path_drain();
+            assert!(
+                receivers
+                    .writer_ready_boundary(CarrierPathInstanceId::from_raw(1))
+                    .is_none()
+            );
+            drop(receivers);
+        } else {
+            drop(receivers);
+        }
+        assert!(!ready.receipt().is_current());
+        assert!(!ready.try_consume());
+        assert!(boundary.snapshot().is_none());
+    }
+}
+
+#[test]
+fn direct_claimed_frames_release_only_their_writer_charge() {
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    commands
+        .try_reserve_admitted_frame(stream_data_frame(50, 32), TrafficClass::Throughput)
+        .unwrap()
+        .commit();
+    let remaining_slots = commands.data.capacity();
+    let first = receivers.register_claimed_writer_frame(&stream_data_frame(51, 64));
+    let second = receivers.register_claimed_writer_frame(&stream_data_frame(51, 96));
+    assert_eq!((first, second), (64, 96));
+    assert_eq!(commands.data.capacity(), remaining_slots);
+    assert_eq!(commands.pending_bytes(), 32 + 64 + 96);
+    assert_eq!(commands.writer_pending_bytes(), 64 + 96);
+
+    receivers.release_pending_command_bytes(first);
+    assert_eq!(commands.pending_bytes(), 32 + 96);
+    assert_eq!(commands.writer_pending_bytes(), 96);
+    receivers.release_pending_command_bytes(second);
+    assert_eq!(commands.pending_bytes(), 32);
+    assert_eq!(commands.writer_pending_bytes(), 0);
+
+    let queued = try_recv_reliable_path_command(&mut receivers).unwrap();
+    assert!(
+        matches!(queued, ReliablePathCommand::SendFrame(ref frame) if frame == &stream_data_frame(50, 32))
+    );
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&queued));
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(commands.writer_pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn cancelled_direct_claim_keeps_charge_until_receiver_drop() {
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let remaining_slots = commands.data.capacity();
+    let mut transaction = Box::pin(async {
+        let bytes = receivers.register_claimed_writer_frame(&stream_data_frame(52, 64));
+        std::future::pending::<()>().await;
+        receivers.release_pending_command_bytes(bytes);
+    });
+    assert!(futures::poll!(&mut transaction).is_pending());
+    assert_eq!(commands.pending_bytes(), 64);
+    assert_eq!(commands.writer_pending_bytes(), 64);
+    drop(transaction);
+    assert_eq!(commands.data.capacity(), remaining_slots);
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert_eq!(commands.pending_bytes(), 64);
+    assert_eq!(commands.writer_pending_bytes(), 64);
+    drop(receivers);
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(commands.writer_pending_bytes(), 0);
+}
+
+#[test]
 fn cloned_senders_pipeline_original_data_in_the_shared_bounded_queue() {
     let (commands, mut receivers) = reliable_path_command_channels(4);
     let first = commands.clone();

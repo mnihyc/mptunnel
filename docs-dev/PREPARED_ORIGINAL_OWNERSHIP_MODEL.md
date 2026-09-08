@@ -1,6 +1,6 @@
-# Prepared Original ownership — pre-implementation model
+# Prepared Original ownership — candidate model and integration proof
 
-2026-09-08 11:10 +08:00. Category: bounded architectural candidate for the
+2026-09-08 13:01 +08:00. Category: bounded architectural candidate for the
 existing early ordered-upload failure. **Not accepted runtime, performance or
 RFC policy.** Read PERFORMANCE_METHOD_AND_LESSONS and CURRENT_CLOSURE_PLAN.
 REQUEST_PREFIX_SERVICE_20260908 contains the exact existing capture; this file
@@ -160,10 +160,14 @@ FirstPath/frontier/AdditionalPath classification must retain actual claimed
 ownership rather than filtering the member set to ready writers. Regular-before-
 backup follows the RFC's finite exact-attempt rule: try every current regular
 candidate in the applicable freshness/policy class first. Backup is eligible
-only after that pass fails, with its exhausted membership, authority and writer-
-readiness generations revalidated. A busy regular is unavailable for this
-imminent claim, not stale, dead or permanently demoted. Its return to readiness
-before backup commit invalidates the failed pass. Never requalify a stale owner
+only after that pass fails. Revalidate membership and authority, and repeat
+selection against current sampled writer opportunities before commit. Fence
+the selected writer's exact ready epoch; do not freeze every unselected writer's
+ready/occupied generation. A busy regular is unavailable for this imminent
+claim, not stale, dead or permanently demoted. A regular observed newly ready
+by final selection participates and displaces a backup when eligible. This
+does not promise an instantaneous globally best choice under arbitrary
+concurrent readiness changes. Never requalify a stale owner
 or classify a filtered survivor as a fresh FirstPath merely to claim bytes.
 
 Pre-code cross-check rejected this draft's earlier blanket ban on backup while
@@ -186,6 +190,11 @@ than spinning. Withdraw readiness before every operation that can occupy the
 writer, including control writes and awaited input forwarding. This rule
 must be checked against existing persistence/hysteresis and tier controls;
 those tests, not task wake order, determine whether migration preserved policy.
+
+The executed integration counterexample below supersedes the earlier blanket
+whole-Ready generation rule: it admitted a zero-progress retry cycle. Readiness
+is scheduling evidence except for the selected epoch consumed by the claim;
+an unselected withdrawal does not revoke source or target authority.
 
 This readiness representation is not a per-frame actor handshake. A singleton
 writer must synchronously claim its next prepared action immediately after its
@@ -413,3 +422,109 @@ admission view or a hidden send-state borrow across I/O. Use the existing
 terminal/half-close/default producer controls, keep the intended boundary RED,
 and add no unrelated metric/queue/rate changes. This refactor is preparation
 for the same observed pre-writer waiting defect, not practical acceptance.
+
+## Integration question — bounded lock acquisition, not another controller
+
+2026-09-08 11:39 +08:00. Both independent source reviews conditionally accept
+the following smaller lock protocol for implementation. It supersedes this
+draft's universal Native-before-Product requirement, not its byte or admission
+invariants. No shared writer or performance acceptance follows from review.
+
+The strict Native-before-Product draft above would require splitting every
+existing synchronous actor recovery/ACK observer and publication into detached
+intents. The actual source now has separate I/O boundaries and fenced source
+commit. A smaller candidate preserves synchronous actor Product-to-Native
+calls but makes the writer's Native-fenced Product acquisition **nonblocking**.
+No writer may wait for Product while retaining any Native guard.
+
+For locks P (the single request Product owner) and N (the existing Native
+activation/coordinator/shape chain), an actor may hold P while waiting for N.
+A writer may acquire N, then try P. If P is busy it immediately leaves N,
+retains no source grant, and parks on a previously armed owner-release wake.
+The wait-for graph then has P→N but no blocking N→P edge, so this pair cannot
+form a lock cycle. Once P is acquired in the fenced writer callback, only
+current Product state and the supplied target Native shape may be consumed;
+entering another Native authority there would invalidate this argument.
+
+Busy is a synchronization outcome, not failed admission, stale path evidence
+or a reason to try a backup tier. Arm and enable the release wait before the
+try-acquisition. The owner guard unlocks before notifying; reader guards also
+release any registered waiters. A losing writer must not manufacture a Product
+generation or self-wake while nothing has changed. Existing source, ACK,
+membership, Native and writer-readiness wake owners remain separate. Successful
+singleton claims still need no actor reply or packet ACK.
+
+This alternative changes the implementation lock protocol, not source/flight
+invariants, claim policy, protected writes, resource limits or congestion
+control. Required falsifiers are a Native-held blocking Product acquisition,
+hidden Native call after a writer acquires P, a missed release wake, spinning
+under contention, an actor guard across real await, or inability to preserve
+exact current source/ACK/attachment revalidation. Until those are reviewed and
+exercised, no successful shared-claim or liveness claim is accepted. The concrete
+owner uses a non-Send standard mutex guard so production Send futures also reject
+a guard retained across await at compile time. Neither this type property nor
+the acyclic lock graph establishes bounded wall-clock service under arbitrary
+contention; preserve actual claimant-progress and residence-time checks.
+
+### Compiler falsifier and native arbitration distinction
+
+2026-09-08 12:18 +08:00. First integration build rejects the proposed
+same-variable guard drop/rebind shortcut, including its small require-Send
+control. Use lexical synchronous scopes and owned I/O inputs. The compiler
+check is useful precisely because a written intention to drop a guard is not
+proof of the future's stored state. This is an integration failure, not a new
+deployed performance defect or a reason to weaken the non-Send guard.
+
+The receiver now owns Send-only deferred waits. Async flushes exclusively
+borrow that receiver with `&mut`; shared accounting reads remain synchronous.
+Requiring deferred futures to be Sync or declaring the receiver Sync unsafely
+would misrepresent its ownership. This correction changes no arbitration.
+
+Prepared source is not a published Original command. The actor's repair-only
+queue view therefore serves critical then ordinary repair without consuming U;
+the physical writer retains its existing control/repair/Original lane order.
+This is not an assertion that the old actor's Data-before-ordinary-repair
+queue order is unchanged. Retained-copy K/J/D, optional-copy accounting and
+ordinary source authority remain unchanged. Verify repair pressure and actual
+writer feeding; a queue-unit GREEN alone cannot prove service non-regression.
+
+## Executed claim-boundary falsifiers — 2026-09-08 13:01 +08:00
+
+The first coherent build passes after lexical guard/I/O scoping. The initial
+integration run passes521/529; failures on legitimate PathProofData, missing
+actual bulk proof, FIN accounting and pending terminal metadata were fixture
+errors before their intended assertion, not Product defects. Strict fixtures
+now consume only their known metadata and use the real challenge/ACK proof
+path without fabricated rates or changed admission.
+
+The corrected two-writer fixture executes two real retry cycles. A captures
+A-ready/B-ready, B selects A and withdraws, then A rejects the changed whole-
+Ready view. Each withdrawal wakes the other claimant. All source/admission
+premises remain true, yet C remains0 instead of65536; the ordinary control
+claims65536. This is a demonstrated liveness defect of the unaccepted candidate,
+not a newly attributed deployed stall. Resampling other writer opportunities
+at both selection stages and consuming only the chosen exact epoch removes
+the false veto. Source, full membership, proof/qualification, negative ACK,
+load, Native fence and W/P/E admission remain mandatory. Selected-path draining
+and newly ready Regular-versus-Backup controls guard the opposite errors.
+
+A separate actual two-claim fixture demonstrates the observer-clock defect:
+all source/flight/stamp controls pass, but observing C later moves the fallback
+anchor27ms past the successful claim. The delay uses the existing fixture PTO;
+it is not a new runtime threshold. Store the successful claim time atomically
+with C and use max(existing actor progress, actual claim time) when observing
+new C. Failed claims and unchanged C do not update it; a newer ACK/control
+anchor survives. No observation timestamp remains in that production helper.
+
+Independent reviews pass and the completed warning-free rebuild passes533
+focused checks in1.28s, including both actual physical multi-quantum/EOF transfers
+and existing small TCP/QUIC controls. TCP's initial PathOpenTimedOut was caused
+by the fixture omitting the carrier reconciliation owner; the wait-only open
+predates this migration. The existing helper now starts concurrently with
+ingress, asserting no initial carrier and doing no prewarming. No Product
+timeout or setup policy changed. The Regular-becomes-ready control injects
+before advisory selection; final readiness refresh is source-reviewed rather
+than separately interleaved. Neither correction changes an existing claimed
+assignment/copy deadline, renews evidence, or proves ordinary performance.
+Request-only intermediate checkpoint is eligible; optimized ordinary timing,
+response parity and the direction-neutral RFC amendment remain pending.

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 11:10 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 13:05 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -333,9 +333,92 @@ Legacy repair selection is unchanged: blindly sharing Original's bulk-gated
 evidence flag would have blocked persistent repairs and was rejected before code.
 These are preparation, not a completed writer claim. Next integrate the real
 shared source/claim and writer-readiness lifecycle under the stated constraints.
-No copied mutable snapshot,
-extra controller, claim policy change or new performance run is authorized by
-these source-equivalence preparation checkpoints alone.
+The coherent migration is now in progress, **not accepted**: existing
+mux prepare/commit moves source consumption into fenced Product commit; source
+errors cannot retire a carrier. All nine inline open paths have owned I/O phase
+cuts; the actor is being converted to scoped shared ownership. Receiver-owned
+direct-frame accounting reuses existing completion/drop release, and actual
+TCP/QUIC idle loops publish stamped writer boundaries then withdraw before I/O.
+Writer consumers are being connected to weak, zero-payload Original notices;
+TCP keeps one protected transaction and QUIC keeps its existing bounded batch,
+without coalescing awaits after a new source claim. These are coupled parts of
+one migration, not independently accepted throughput fixes or new issue scope.
+
+Both independent reviews accept a smaller deadlock-avoidance protocol: actor
+synchronous Product→Native calls remain, while a Native-fenced writer may only
+try Product, never block on it. Busy releases Native and parks on a prearmed
+unlock notification; every Product guard unlocks before notifying. This replaces
+the draft's universal lock-order requirement, not its source/admission rules.
+Poison is not Busy. No writer may call another Native authority after try-lock
+success. Actual opposite-lock/wake controls and the compiler's non-Send guard
+check are being added; no starvation-free wall-clock claim follows from the
+wait-for graph. The model records this justification and its falsifiers.
+At046a746,485 controls were GREEN plus the intended128KiB RED. The first
+coherent migration build failed before tests:
+59 reported errors are repeated consumers of two ownership mismatches, not
+59 deployed defects. Same-variable guard drop/rebind retains a non-Send guard
+in the async state (also reproduced by the small owner compile check).
+Replace it with lexical synchronous scopes returning owned phase values;
+do not make the guard Send. New receiver-owned deferred futures make that
+exclusive receiver non-Sync; four async flush helpers must borrow it mutably,
+as their existing callers already do. No unsafe Sync claim is justified.
+Independent review otherwise finds source/flight atomicity, full-membership
+admission and final supplied-Native-shape projection coherent. Actual producer,
+alternate-ready-writer and cancellation tests are written but unexecuted;
+shared TCP/QUIC physical multi-quantum/EOF controls are being added without
+replacing the small-request tests. No new performance run, optimized build,
+commit or release acceptance has followed046a746. Finish compiler-enforced
+scoping, real producer/writer/lifecycle GREEN and audit before ordinary timing.
+
+**Executed integration checkpoint:** lexical ownership correction compiles
+warning-free in1m10s. The focused run is521/529 GREEN in9.54s; all eight failures
+are newly added controls, not eight established deployed regressions. Initial
+128KiB preparation/no-claim and actual QUIC multi-quantum upload/EOF pass.
+Several new controls fail before their intended assertion: regenerated
+PathProofData is legitimate metadata; alternate A lacked actual proof for
+additional bulk admission; FIN remains charged as control work; and actor
+completion need not mean native terminal commands have drained. Correct these
+setups without changing Product admission. New TCP physical test fails at
+SOCKS open before source service; exact handler error is being exposed.
+
+**Executed claim-boundary RED→GREEN:** the corrected fixture reaches the actual
+two-writer cycle twice: B defers to A and withdraws readiness, invalidating A's
+frozen whole-Ready view; A's withdrawal wakes B. C remains0 versus65536, while
+the ordinary control succeeds. The actual two-claim observer test independently
+fails because delayed observation renews its fallback anchor27ms past the claim.
+These are defects in the unaccepted migration, not newly attributed deployed
+regressions. Whole-Ready freezing is replaced by current opportunity sampling
+at both selections and exact chosen-epoch fencing. The actor observes the
+successful claim timestamp, preserving any newer ACK/control anchor. No new
+clock threshold, guessed rate, resource limit or controller change is involved.
+
+Independent reviews pass. Selected drain, newly observed Regular displacing
+Backup, failed/same-C claim clocks, cancellation/weak-notice, EOF/FIN, source
+conservation and existing admission/repair controls pass. The new TCP wire
+fixture had omitted its carrier establishment owner: open waits for readiness,
+while the production probe service starts reconciliation. This predates the
+migration at6aac504. Starting the existing reconciliation helper concurrently
+with ingress, with an initial no-instance assertion and no prewarming, makes
+the exact multi-quantum/EOF test pass. No product open timeout was changed.
+
+Warning-free functional rebuild1m08s;533 focused tests pass1.28s, including
+existing small TCP/QUIC requests and both actual multi-quantum wire transfers.
+The newly-ready Regular interleaving exercises the pre-advisory cut; final
+refresh is independently source-reviewed, not separately race-injected.
+One premature local invocation used the previous binary before build completion;
+it is discarded as verification, not counted as new RED or GREEN. Recorded
+GREEN is from the completed rebuild. Small raw logs are retained with this
+checkpoint; no ordinary speed or ideality claim follows.
+
+**Next exact transaction:** commit this coherent request-only mechanism
+checkpoint, then build the normal optimized binary. Compare1436ff4 control
+against this candidate, both endpoints, on the pinned ordinary mixed-upload
+profile. Preserve exact bytes/completion, first service, forward/return series,
+gaps, recovery and wire/CPU/RSS cost. Stop promotion on adverse or ambiguous
+evidence; no favourable third trial, profile tuning or response implementation
+stack. The candidate has changed the request placement boundary, not the final
+direction-neutral RFC contract: response parity and RFC amendment remain
+explicit obligations before model acceptance.
 Response parity and all existing global gates remain pending, not waived.
 
 **Falsifier/stop:** if head work was already promptly published, pursue its
@@ -387,9 +470,10 @@ aggregate300/200 defaults as200each. Do not tune this profile to pass.
 
 - Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
   overlap. All products/probes are stopped; origin services retained.
-- No diagnostic overlay, active build or lab. Candidate483GREEN/audit and both
-  ordinary cells are complete; performance promotion stopped on adverse early
-  delivery. Products/probes stopped, ordinary binaries and raw evidence retained.
+- No diagnostic overlay or active lab. Request prepared-claim candidate533GREEN/
+  audit; ordinary candidate comparison is next. Performance promotion remains
+  stopped on earlier adverse delivery. Products/probes stopped; comparators and
+  raw evidence retained.
   Commit exact intermediate dispositions;
   preserve small evidence before scoped cache cleanup. No deletion this turn.
   User seven-line edit must remain outside commits.

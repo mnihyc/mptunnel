@@ -17,7 +17,9 @@ pub(in crate::runtime) use queue::{
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use request::{
-    ClientQueuedDispatch, RelayRecvProgressSend, RequestProductState, RequestSenderService,
+    ClientQueuedDispatch, RelayRecvProgressSend, RequestPreparedClaim, RequestPreparedSource,
+    RequestProductState, RequestSenderService, SharedRequestProduct, WeakSharedRequestProduct,
+    claim_prepared_request_data,
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use response::ServerResponseSenderService;

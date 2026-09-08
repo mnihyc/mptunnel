@@ -860,6 +860,7 @@ impl ServerTcpPathSession {
                     }
                 }
                 ReliablePathCommand::PrepareConnection { .. }
+                | ReliablePathCommand::PreparedOriginal(_)
                 | ReliablePathCommand::OpenStream { .. }
                 | ReliablePathCommand::OpenDatagramAttachment { .. }
                 | ReliablePathCommand::OpenDatagramFlow { .. }

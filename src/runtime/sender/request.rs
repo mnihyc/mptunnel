@@ -87,7 +87,15 @@ impl RequestAfterFrameReservationHook {
 }
 
 mod multipath;
+mod owner;
+mod prepared;
 mod scheduling;
+pub(in crate::runtime) use owner::{
+    RequestProductLockWait, SharedRequestProduct, WeakSharedRequestProduct,
+};
+pub(in crate::runtime) use prepared::{
+    RequestPreparedClaim, RequestPreparedSource, claim_prepared_request_data,
+};
 #[cfg(test)]
 mod tcp_capacity;
 #[cfg(test)]
@@ -172,6 +180,40 @@ struct RequestReinjectionQueueContext<'a> {
     // Only queued publication consumes the queue's current front. A direct
     // structural copy must charge every independently queued live intent.
     exclude_front: bool,
+}
+
+/// Borrowed source ownership for one queued Original publication. No offset or
+/// queue bytes are committed until the selected Native fence accepts Apply.
+struct RequestQueuedSourceCommit<'a> {
+    send_stream: &'a mut ReliableSendStream,
+    sender_queue: &'a mut ReliableRelaySenderQueue,
+}
+
+impl RequestQueuedSourceCommit<'_> {
+    fn validate(&self, frame: &Frame) -> Result<(), RequestFrameAdmissionError> {
+        let Frame::StreamData { payload, .. } = frame else {
+            return Err(RequestFrameAdmissionError::Source(
+                StreamError::InvalidPreparedFrame,
+            ));
+        };
+        let Some((_, queued)) = self.sender_queue.front() else {
+            return Err(RequestFrameAdmissionError::SourceChanged);
+        };
+        let ReliableRelayQueuedWorkKind::Data(current) = &queued.kind else {
+            return Err(RequestFrameAdmissionError::SourceChanged);
+        };
+        // Preparation slices this exact shared Bytes allocation. Comparing
+        // its prefix identity is constant work and cannot accept a different
+        // source item merely because it contains equal bytes. Checking the
+        // global front also preserves critical-repair priority at commit.
+        if payload.is_empty()
+            || payload.len() > current.len()
+            || payload.as_ptr() != current.as_ptr()
+        {
+            return Err(RequestFrameAdmissionError::SourceChanged);
+        }
+        Ok(())
+    }
 }
 
 /// The exact admitted frame's Product commit inputs, borrowed only for the
@@ -262,6 +304,7 @@ pub(in crate::runtime) struct RequestProductState {
     pub(in crate::runtime) send_stream: ReliableSendStream,
     pub(in crate::runtime) last_send_ack: AuthoritativeStreamAckSnapshot,
     pub(in crate::runtime) remotes: ReliableRelayRemoteSet,
+    pub(in crate::runtime) prepared: RequestPreparedSource,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -664,6 +707,7 @@ impl RequestSenderService {
         frame: Frame,
         request_lane: TrafficClass,
         frontier_state: ReliableDataAckFrontierState,
+        source_commit: RequestQueuedSourceCommit<'_>,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         self.send_frame_at_frontier(
             context,
@@ -673,6 +717,7 @@ impl RequestSenderService {
             Some(request_lane),
             frontier_state,
             None,
+            Some(source_commit),
         )
     }
 
@@ -843,38 +888,59 @@ impl RequestSenderService {
         let dispatch_payload_bytes = data_quantum_bytes.min(payload.len()).max(1);
         let dispatch_payload = payload.slice(..dispatch_payload_bytes);
         let frame = send_stream
-            .send_data(dispatch_payload)
+            .prepare_data(dispatch_payload)
             .map_err(RuntimeError::Stream)?;
         // Queue priority stays duplex-aware, but request exploration must not
         // borrow bulk classification from reverse-direction response bytes.
         match self.send_stream_data_for_request_lane(
             context,
             remotes,
-            frame.clone(),
+            frame,
             request_lane,
             frontier_state,
+            RequestQueuedSourceCommit {
+                send_stream,
+                sender_queue,
+            },
         ) {
-            Ok(_) => {
-                let committed = sender_queue
-                    .commit_front_data_prefix(dispatch_payload_bytes)
-                    .expect("sent queued data must still be at queue front");
-                Ok(ClientQueuedDispatch::Data {
-                    payload_bytes: committed.payload_bytes,
-                })
-            }
-            Err(RuntimeError::SenderServiceBlocked) => {
-                let _ = send_stream.rollback_committed_data(&frame);
-                Err(RuntimeError::SenderServiceBlocked)
-            }
+            Ok(_) => Ok(ClientQueuedDispatch::Data {
+                payload_bytes: dispatch_payload_bytes,
+            }),
+            Err(RuntimeError::SenderServiceBlocked) => Err(RuntimeError::SenderServiceBlocked),
             Err(err) if reliable_path_error_is_migratable(&err) => {
-                let _ = send_stream.rollback_committed_data(&frame);
                 Ok(ClientQueuedDispatch::PathAttachmentRequired(err))
             }
-            Err(err) => {
-                let _ = send_stream.rollback_committed_data(&frame);
-                Err(err)
-            }
+            Err(err) => Err(err),
         }
+    }
+
+    /// Prepared Original source belongs to native claimants. The Product
+    /// actor still publishes the same exact repair work, without removing or
+    /// assigning any bytes from the prepared Data lane.
+    pub(in crate::runtime) fn dispatch_client_repair_work(
+        &mut self,
+        context: &ClientPathContext,
+        request_lane: TrafficClass,
+        remotes: &mut ReliableRelayRemoteSet,
+        sender_queue: &mut ReliableRelaySenderQueue,
+    ) -> Result<Option<ClientQueuedDispatch>, RuntimeError> {
+        let Some(queued) = sender_queue.front_reinjection() else {
+            return Ok(None);
+        };
+        let ReliableRelayQueuedWorkKind::Reinjection { frame, cause } = queued.kind.clone() else {
+            return Err(RuntimeError::Protocol(
+                "request repair queue contains non-repair work",
+            ));
+        };
+        self.dispatch_client_reinjection_work(
+            context,
+            request_lane,
+            remotes,
+            sender_queue,
+            frame,
+            cause,
+        )
+        .map(Some)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -898,11 +964,12 @@ impl RequestSenderService {
                 queue: sender_queue,
                 exclude_front: true,
             }),
+            None,
         );
         match dispatch {
             Ok(outcome) => {
-                let (_, committed) = sender_queue
-                    .commit_front()
+                let committed = sender_queue
+                    .commit_front_reinjection()
                     .expect("sent queued reinjection must still be at queue front");
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -940,8 +1007,8 @@ impl RequestSenderService {
                     RelaySendCause::TailReinjection | RelaySendCause::CompletionTailReinjection(_)
                 ) && reliable_path_error_is_migratable(&err) =>
             {
-                let (_, _) = sender_queue
-                    .commit_front()
+                let _ = sender_queue
+                    .commit_front_reinjection()
                     .expect("deferred live-tail reinjection must still be at queue front");
                 Ok(ClientQueuedDispatch::ReinjectionDeferred)
             }
@@ -968,6 +1035,7 @@ impl RequestSenderService {
             request_lane,
             ReliableDataAckFrontierState::Live,
             None,
+            None,
         )
     }
 
@@ -981,6 +1049,7 @@ impl RequestSenderService {
         request_lane: Option<TrafficClass>,
         frontier_state: ReliableDataAckFrontierState,
         reinjection_queue: Option<RequestReinjectionQueueContext<'_>>,
+        source_commit: Option<RequestQueuedSourceCommit<'_>>,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         let sent_frame = frame.clone();
         let avoid_instances =
@@ -995,6 +1064,7 @@ impl RequestSenderService {
             request_lane,
             frontier_state,
             reinjection_queue,
+            source_commit,
         )?;
         let path_key = instance.key;
         self.record_decision(path_key, payload_bytes, &sent_frame, cause);
@@ -1015,6 +1085,7 @@ impl RequestSenderService {
         request_lane: Option<TrafficClass>,
         frontier_state: ReliableDataAckFrontierState,
         reinjection_queue: Option<RequestReinjectionQueueContext<'_>>,
+        mut source_commit: Option<RequestQueuedSourceCommit<'_>>,
     ) -> Result<(RelayPathInstance, usize, Option<Instant>), RuntimeError> {
         let mut last_error = None;
         let mut rejected_bulk_original_targets =
@@ -1339,6 +1410,7 @@ impl RequestSenderService {
                                         reinjection_target_snapshot,
                                         request_load_claim,
                                     },
+                                    source_commit.as_mut(),
                                 )?;
                             command.commit();
                             Ok((payload_bytes, accepted_copy_deadline))
@@ -1377,6 +1449,12 @@ impl RequestSenderService {
                     }
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
+                Err(RequestFrameAdmissionError::SourceChanged) => {
+                    return Err(RuntimeError::SenderServiceBlocked);
+                }
+                Err(RequestFrameAdmissionError::Source(error)) => {
+                    return Err(RuntimeError::Stream(error));
+                }
                 Err(RequestFrameAdmissionError::Runtime(err)) => {
                     last_error = Some(err);
                     self.fail_client_path_instance(context, remotes, instance);
@@ -1395,6 +1473,7 @@ impl RequestSenderService {
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
         commit: RequestFrameProductCommit<'_>,
+        mut source_commit: Option<&mut RequestQueuedSourceCommit<'_>>,
     ) -> Result<(usize, Option<Instant>), RequestFrameAdmissionError> {
         let RequestFrameProductCommit {
             plan,
@@ -1406,10 +1485,46 @@ impl RequestSenderService {
             request_load_claim,
         } = commit;
         let (_, instance) = plan.target();
-        let (payload_bytes, accepted_copy_deadline) = self
-            .multipath
-            .record_emitted_frame(context, instance, frame, cause, reinjection_target_snapshot)
-            .map_err(|_| RequestFrameAdmissionError::ServiceBlocked)?;
+        if let Some(source) = source_commit.as_mut() {
+            if !plan.assigns_original_data() {
+                return Err(RequestFrameAdmissionError::Source(
+                    StreamError::InvalidPreparedFrame,
+                ));
+            }
+            source.validate(frame)?;
+            source
+                .send_stream
+                .commit_prepared_data(frame)
+                .map_err(RequestFrameAdmissionError::Source)?;
+        }
+        let (payload_bytes, accepted_copy_deadline) = match self.multipath.record_emitted_frame(
+            context,
+            instance,
+            frame,
+            cause,
+            reinjection_target_snapshot,
+        ) {
+            Ok(recorded) => recorded,
+            Err(_) => {
+                // Qualification refusal installs neither a tag nor flight.
+                // Undo only this just-committed mux prefix before leaving the
+                // same synchronous fence; queued source remains untouched.
+                if let Some(source) = source_commit.as_mut() {
+                    source
+                        .send_stream
+                        .rollback_committed_data(frame)
+                        .map_err(RequestFrameAdmissionError::Source)?;
+                }
+                return Err(RequestFrameAdmissionError::ServiceBlocked);
+            }
+        };
+        if let Some(source) = source_commit {
+            let committed = source
+                .sender_queue
+                .commit_front_data_prefix(payload_bytes)
+                .expect("validated queued source remains the exact Data front during commit");
+            assert_eq!(committed.payload_bytes, payload_bytes);
+        }
         if let Some(claim) = request_load_claim {
             let remote = &mut remotes.paths[position];
             // The exact path owns the lease after queue
@@ -2082,6 +2197,7 @@ impl RequestSenderService {
                     queue: sender_queue,
                     exclude_front: false,
                 }),
+                None,
             ) {
                 Ok(outcome) => {
                     // Discovery and failed Apply attempts consume no optional
@@ -2212,6 +2328,10 @@ fn reserve_request_frame_with_mode<'a>(
 enum RequestFrameAdmissionError {
     ServiceBlocked,
     OrderedTerminalPending,
+    // Source/claim failures do not implicate the selected carrier. In
+    // particular they must never enter the Runtime path-retirement branch.
+    SourceChanged,
+    Source(StreamError),
     Runtime(RuntimeError),
 }
 
@@ -2229,6 +2349,8 @@ impl RequestFrameAdmissionError {
         match self {
             Self::ServiceBlocked => RuntimeError::SenderServiceBlocked,
             Self::OrderedTerminalPending => RuntimeError::ReliablePathSessionClosed,
+            Self::SourceChanged => RuntimeError::SenderServiceBlocked,
+            Self::Source(error) => RuntimeError::Stream(error),
             Self::Runtime(error) => error,
         }
     }

@@ -93,6 +93,58 @@ fn sender_queue_dispatches_original_data_before_ordinary_reinjection() {
 }
 
 #[test]
+fn prepared_source_is_not_consumed_by_actor_repair_dispatch() {
+    let stream_id = StreamId(779);
+    let source = Bytes::from_static(b"still prepared");
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(source.clone());
+    let ordinary = Frame::StreamData {
+        stream_id,
+        offset: 32,
+        payload: Bytes::from_static(b"ordinary"),
+    };
+    let critical = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: Bytes::from_static(b"head"),
+    };
+    queue.push_reinjection(ordinary.clone());
+    queue.push_critical_reinjection_with_cause(critical.clone(), RelaySendCause::TailReinjection);
+    let fin = Frame::StreamFin {
+        stream_id,
+        final_offset: source.len() as u64,
+    };
+    let fin_bytes = reliable_stream_frame_accounted_bytes(&fin);
+    queue.push_final_control(fin);
+
+    for expected in [critical, ordinary] {
+        assert!(queue.has_reinjection());
+        assert!(matches!(
+            &queue.front_reinjection().unwrap().kind,
+            ReliableRelayQueuedWorkKind::Reinjection { frame, .. } if frame == &expected
+        ));
+        let repair = queue.commit_front_reinjection().unwrap();
+        assert!(matches!(
+            repair.kind,
+            ReliableRelayQueuedWorkKind::Reinjection { frame, .. } if frame == expected
+        ));
+        assert_eq!(queue.data_bytes(), source.len());
+    }
+    assert!(!queue.has_reinjection());
+    assert!(queue.commit_front_reinjection().is_none());
+    assert!(matches!(
+        &queue.front().unwrap().1.kind,
+        ReliableRelayQueuedWorkKind::Data(payload) if payload == &source
+    ));
+    assert_eq!(queue.bytes(), source.len() + fin_bytes);
+    queue.commit_front_data_prefix(source.len()).unwrap();
+    assert!(matches!(
+        &queue.front().unwrap().1.kind,
+        ReliableRelayQueuedWorkKind::Control(Frame::StreamFin { .. })
+    ));
+}
+
+#[test]
 fn sender_queue_dispatches_critical_reinjection_before_original_data() {
     let stream_id = StreamId(78);
     let mut queue = ReliableRelaySenderQueue::default();

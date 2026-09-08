@@ -863,15 +863,17 @@ async fn stale_path_failure_does_not_blacklist_same_key_successor() {
 
     let mut sender = RequestSenderService::new(stream_id);
     let mut suppressions = ClientRelayPathOpenSuppressions::default();
-    resolve_client_relay_path_error(
-        &mut sender,
-        &context,
-        &mut remotes,
-        &mut suppressions,
-        stale,
-        &RuntimeError::ReliablePathSessionClosed,
-    )
-    .await;
+    let error = RuntimeError::ReliablePathSessionClosed;
+    let native_settlement = begin_client_relay_path_error(&context, &mut remotes, stale, &error);
+    if let Some(settlement) = native_settlement.await {
+        finish_client_relay_path_error(
+            &mut sender,
+            &context,
+            &mut remotes,
+            &mut suppressions,
+            settlement,
+        );
+    }
 
     assert_eq!(remotes.paths.len(), 1);
     assert_eq!(remotes.paths[0].instance(), successor);
@@ -900,15 +902,17 @@ async fn matching_path_failure_still_removes_and_suppresses_the_failed_instance(
     let mut sender = RequestSenderService::new(stream_id);
     let mut suppressions = ClientRelayPathOpenSuppressions::default();
 
-    resolve_client_relay_path_error(
-        &mut sender,
-        &context,
-        &mut remotes,
-        &mut suppressions,
-        failed,
-        &RuntimeError::ReliablePathSessionClosed,
-    )
-    .await;
+    let error = RuntimeError::ReliablePathSessionClosed;
+    let native_settlement = begin_client_relay_path_error(&context, &mut remotes, failed, &error);
+    if let Some(settlement) = native_settlement.await {
+        finish_client_relay_path_error(
+            &mut sender,
+            &context,
+            &mut remotes,
+            &mut suppressions,
+            settlement,
+        );
+    }
 
     assert!(remotes.is_empty());
     assert!(suppressions.blocks(&context, failed.key, tokio::time::Instant::now()));
@@ -952,15 +956,16 @@ async fn quic_request_stream_abandonment_detaches_only_its_logical_attachment() 
     let error = frame.expect_err("request stream must report its abandonment");
     assert!(reliable_path_error_is_migratable(&error));
 
-    resolve_client_relay_path_error(
-        &mut sender,
-        &context,
-        &mut remotes,
-        &mut suppressions,
-        instance,
-        &error,
-    )
-    .await;
+    let native_settlement = begin_client_relay_path_error(&context, &mut remotes, instance, &error);
+    if let Some(settlement) = native_settlement.await {
+        finish_client_relay_path_error(
+            &mut sender,
+            &context,
+            &mut remotes,
+            &mut suppressions,
+            settlement,
+        );
+    }
 
     assert!(remotes.is_empty(), "only the abandoned attachment retires");
     assert!(
@@ -1525,7 +1530,13 @@ async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted(
         Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 1 }))
     ));
     let (mut application, mut relay_side) = duplex(64);
-    retry_stream_ack_and_commit_ready_fin(&mut relay_side, &mut state, &recv_stream, &mut remotes)
+    let local_shutdown = retry_stream_ack_and_commit_ready_fin(
+        &mut relay_side,
+        &mut state,
+        &recv_stream,
+        &mut remotes,
+    );
+    local_shutdown
         .await
         .expect("retry final ACK and commit retained FIN");
 
@@ -1736,6 +1747,266 @@ async fn final_feedback_backpressure_keeps_fin_pending_until_ack_is_queued() {
     );
 
     relay.abort();
+}
+
+#[tokio::test]
+async fn prepared_request_actor_keeps_eof_source_claimable_until_final_offset() {
+    use crate::model::capacity::adaptive_reliable_relay_chunk_bytes;
+    use crate::model::path::RelayPathInstance;
+    use crate::runtime::path::commands::{
+        reliable_path_command_pending_bytes, reliable_path_command_queue,
+    };
+    use crate::runtime::sender::RequestPreparedClaim;
+
+    struct EofObservedSource {
+        remaining: Bytes,
+        eof_observed: Arc<Notify>,
+    }
+
+    impl AsyncRead for EofObservedSource {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if self.remaining.is_empty() {
+                self.eof_observed.notify_one();
+            } else {
+                let count = buf.remaining().min(self.remaining.len());
+                buf.put_slice(&self.remaining.split_to(count));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for EofObservedSource {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve fixture endpoint");
+    let endpoint = listener.local_addr().expect("fixture endpoint");
+    let context = ClientPathContext::new(
+        vec![format!("tcp://{endpoint}").parse().expect("TCP path")],
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let limits = context.mux_limits;
+    let quantum = adaptive_reliable_relay_chunk_bytes(None, TrafficClass::Latency, limits);
+    let source = Bytes::from(
+        (0..2 * quantum + 13)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let stream_id = StreamId(720);
+    let (commands, mut receivers) =
+        reliable_path_command_channels(reliable_path_command_queue(limits));
+    let (frames_tx, frames_rx) = mpsc::channel(8);
+    let opened = test_opened_remote_stream(stream_id, 0, commands.clone(), frames_rx);
+    context.install_relay_path_instance_for_test(RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        path_instance_id: opened.path_instance_id(),
+        attachment_id: 0,
+    });
+    let eof_observed = Arc::new(Notify::new());
+    let local = EofObservedSource {
+        remaining: source.clone(),
+        eof_observed: eof_observed.clone(),
+    };
+    let relay_context = context.clone();
+    let mut relay = tokio::spawn(async move {
+        relay_migrating_tcp_stream(
+            local,
+            &relay_context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec::new(TargetAddr::Ip(endpoint), TrafficClass::Latency),
+            opened,
+            None,
+        )
+        .await
+    });
+
+    // The actor itself observes EOF before this fixture ever offers a writer
+    // boundary. These bytes therefore remain unclaimed U, not queued Originals.
+    tokio::time::timeout(Duration::from_secs(5), eof_observed.notified())
+        .await
+        .expect("the ordinary source admission stages this finite input through EOF");
+    assert!(commands.writer_boundary().snapshot().is_none());
+    assert!(
+        !relay.is_finished(),
+        "EOF must not discard unclaimed source"
+    );
+    let mut notices = std::collections::VecDeque::new();
+    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
+        let pending = reliable_path_command_pending_bytes(&command);
+        match command {
+            ReliablePathCommand::PreparedOriginal(work) => notices.push_back(work),
+            ReliablePathCommand::SendFrame(Frame::StreamData { .. } | Frame::StreamFin { .. }) => {
+                panic!("neither assigned source nor FIN may precede the first writer claim");
+            }
+            ReliablePathCommand::SendFrame(_) => {}
+            _ => panic!("unexpected native lifecycle command before claiming EOF source"),
+        }
+        receivers.release_pending_command_bytes(pending);
+    }
+    assert!(
+        !notices.is_empty(),
+        "EOF source retains its actual weak writer notice"
+    );
+    assert_eq!(
+        commands.pending_bytes(),
+        0,
+        "prepared notices carry no payload debt"
+    );
+    assert_eq!(commands.writer_pending_bytes(), 0);
+
+    let mut claimed = Vec::new();
+    let final_offset = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let command = match notices.pop_front() {
+                Some(work) => ReliablePathCommand::PreparedOriginal(work),
+                None => recv_reliable_path_command(&mut receivers)
+                    .await
+                    .expect("EOF source keeps its carrier live"),
+            };
+            let pending = reliable_path_command_pending_bytes(&command);
+            match command {
+                ReliablePathCommand::PreparedOriginal(work) => {
+                    let ready = receivers
+                        .writer_ready_boundary(work.instance().path_instance_id)
+                        .expect("actual fixture writer enters its next native transaction");
+                    match work.try_claim(ready) {
+                        RequestPreparedClaim::Claimed(frame) => {
+                            let charged = receivers.register_claimed_writer_frame(&frame);
+                            let Frame::StreamData {
+                                stream_id: actual,
+                                offset,
+                                payload,
+                            } = frame
+                            else {
+                                panic!("an Original claim returns only StreamData");
+                            };
+                            assert_eq!(actual, stream_id);
+                            assert_eq!(offset, claimed.len() as u64);
+                            assert!(!payload.is_empty());
+                            claimed.extend_from_slice(&payload);
+                            assert!(claimed.len() <= source.len());
+                            assert_eq!(claimed.as_slice(), &source[..claimed.len()]);
+                            receivers.release_pending_command_bytes(charged);
+                            work.requeue();
+                        }
+                        RequestPreparedClaim::Empty => {
+                            // An exhausted or superseded weak notice owns no bytes.
+                        }
+                        RequestPreparedClaim::Busy(_) | RequestPreparedClaim::Blocked(_) => {
+                            panic!("the sole ready healthy writer must claim admitted EOF source");
+                        }
+                    }
+                }
+                ReliablePathCommand::SendFrame(Frame::StreamFin {
+                    stream_id: actual,
+                    final_offset,
+                }) => {
+                    assert_eq!(actual, stream_id);
+                    assert_eq!(claimed.as_slice(), source.as_ref());
+                    receivers.release_pending_command_bytes(pending);
+                    break final_offset;
+                }
+                ReliablePathCommand::SendFrame(Frame::StreamData { .. }) => {
+                    panic!(
+                        "unclaimed source must use the actual writer claim, not payload commands"
+                    );
+                }
+                ReliablePathCommand::SendFrame(_) => {}
+                _ => panic!("unexpected lifecycle command before the EOF final offset"),
+            }
+            receivers.release_pending_command_bytes(pending);
+        }
+    })
+    .await
+    .expect("all prepared EOF bytes become contiguous native claims before FIN");
+    assert_eq!(final_offset, source.len() as u64);
+    frames_tx
+        .send(Ok(Frame::StreamAck {
+            stream_id,
+            complete: true,
+            ranges: vec![OffsetRange {
+                start: 0,
+                end: final_offset,
+            }],
+        }))
+        .await
+        .expect("settle all claimed request bytes");
+    frames_tx
+        .send(Ok(Frame::StreamFin {
+            stream_id,
+            final_offset: 0,
+        }))
+        .await
+        .expect("peer finishes its empty response");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut relay => {
+                    result.expect("relay task").expect("orderly EOF relay completion");
+                    break;
+                }
+                command = recv_reliable_path_command(&mut receivers) => {
+                    let command = command.expect("carrier remains until relay cleanup");
+                    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+                }
+            }
+        }
+    })
+    .await
+    .expect("final ACK and peer FIN settle the actual actor");
+    // Actor completion means ordered terminal commands were published, not
+    // that this fixture's independent native receiver consumed them already.
+    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
+        assert!(
+            matches!(
+                &command,
+                ReliablePathCommand::SendFrame(
+                    Frame::StreamAck { .. }
+                        | Frame::StreamMaxData { .. }
+                        | Frame::StreamFin { .. }
+                        | Frame::StreamDetach { .. }
+                ) | ReliablePathCommand::CloseStream(_)
+            ),
+            "only ordered terminal/control work may remain after complete EOF source"
+        );
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    }
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(commands.writer_pending_bytes(), 0);
 }
 
 #[test]

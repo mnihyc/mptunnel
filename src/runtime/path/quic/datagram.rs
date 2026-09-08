@@ -369,6 +369,7 @@ async fn drain_server_udp_datagram_commands(
                 true
             }
             ReliablePathCommand::PrepareConnection { .. }
+            | ReliablePathCommand::PreparedOriginal(_)
             | ReliablePathCommand::OpenStream { .. }
             | ReliablePathCommand::OpenDatagramAttachment { .. }
             | ReliablePathCommand::OpenDatagramFlow { .. }
@@ -437,7 +438,7 @@ async fn flush_server_udp_datagram_frame_batch(
     send: &mut UdpPathSendStream,
     pending_frames: &mut Vec<Frame>,
     codec_limits: crate::protocol::codec::CodecLimits,
-    commands: &ReliablePathCommandReceivers,
+    commands: &mut ReliablePathCommandReceivers,
     pending_frame_command_bytes: &mut usize,
 ) -> Result<(), RuntimeError> {
     let result = flush_udp_frame_batch(send, pending_frames, codec_limits).await;

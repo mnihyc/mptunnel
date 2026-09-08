@@ -96,6 +96,7 @@ pub(super) async fn drain_one_server_udp_command_while_input_deferred(
             Ok(true)
         }
         ReliablePathCommand::PrepareConnection { .. }
+        | ReliablePathCommand::PreparedOriginal(_)
         | ReliablePathCommand::OpenStream { .. }
         | ReliablePathCommand::OpenDatagramAttachment { .. }
         | ReliablePathCommand::OpenDatagramFlow { .. }
@@ -328,6 +329,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 }
             }
             ReliablePathCommand::PrepareConnection { .. }
+            | ReliablePathCommand::PreparedOriginal(_)
             | ReliablePathCommand::OpenStream { .. }
             | ReliablePathCommand::OpenDatagramAttachment { .. }
             | ReliablePathCommand::OpenDatagramFlow { .. }
@@ -415,7 +417,7 @@ async fn flush_server_udp_frame_batch(
     pending_frames: &mut Vec<Frame>,
     codec_limits: crate::protocol::codec::CodecLimits,
     path_proofs: &mut PathProofTracker,
-    commands: &ReliablePathCommandReceivers,
+    commands: &mut ReliablePathCommandReceivers,
     pending_frame_command_bytes: &mut usize,
     _path_id: PathId,
     stream_id: StreamId,

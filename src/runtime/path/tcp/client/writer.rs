@@ -34,6 +34,7 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::commands::{TcpCapacityProbeCommand, reliable_path_writer_frame_queue};
 use crate::runtime::path::input::PendingMailboxFrame;
 use crate::runtime::recent_ids::RecentIdCache;
+use crate::runtime::sender::RequestPreparedClaim;
 use std::collections::HashMap;
 #[cfg(any(test, feature = "lab-diagnostics"))]
 use std::time::Instant;
@@ -102,6 +103,63 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
         #[cfg(feature = "lab-diagnostics")]
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         match command {
+            ReliablePathCommand::PreparedOriginal(work) => {
+                // A notice carries no payload or offset. Only this physical
+                // writer, after higher lanes have arbitrated, may claim it.
+                if work.instance().path_instance_id != connection.path_instance_id
+                    || !streams
+                        .get(&work.stream_id())
+                        .is_some_and(|stream| stream.pending_open.is_none())
+                {
+                    break;
+                }
+                let Some(ready) = commands.writer_ready_boundary(connection.path_instance_id)
+                else {
+                    break;
+                };
+                match work.try_claim(ready) {
+                    RequestPreparedClaim::Claimed(frame) => {
+                        let bytes = commands.register_claimed_writer_frame(&frame);
+                        #[cfg(feature = "lab-diagnostics")]
+                        let encoded_bytes =
+                            crate::protocol::codec::encoded_frame_capacity_hint(&frame).max(1);
+                        writer_pending_bytes = writer_pending_bytes.checked_add(bytes).ok_or(
+                            RuntimeError::Protocol("client TCP writer transaction byte overflow"),
+                        )?;
+                        pending_frames.push(frame);
+                        #[cfg(feature = "lab-diagnostics")]
+                        {
+                            sent_bytes = sent_bytes.saturating_add(encoded_bytes);
+                            sent_items = sent_items.saturating_add(1);
+                        }
+                        // Successor work remains a weak source notice, never
+                        // a fixed-target payload waiting behind this write.
+                        work.requeue();
+                        commit_client_tcp_command_frame_transaction(
+                            connection,
+                            pending_frames,
+                            streams,
+                            closed_streams,
+                            datagrams,
+                            runtime,
+                            commands,
+                            &mut writer_pending_bytes,
+                            &mut deferred_frame,
+                        )
+                        .await?;
+                    }
+                    RequestPreparedClaim::Busy(wait) => {
+                        commands.defer_prepared_work(work, wait);
+                    }
+                    RequestPreparedClaim::Blocked(wait) => {
+                        commands.defer_prepared_work(work, wait);
+                    }
+                    RequestPreparedClaim::Empty => {}
+                }
+                // Preserve one protected TCP transaction, then arbitrate all
+                // lanes and streams again without a Product actor roundtrip.
+                break;
+            }
             ReliablePathCommand::SendFrame(frame)
                 if reliable_path_frame_requires_capacity_command(&frame) =>
             {
@@ -398,7 +456,7 @@ async fn commit_client_tcp_command_frame_transaction(
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
-    commands: &ReliablePathCommandReceivers,
+    commands: &mut ReliablePathCommandReceivers,
     writer_pending_bytes: &mut usize,
     deferred_frame: &mut Option<Frame>,
 ) -> Result<(), RuntimeError> {
@@ -1071,6 +1129,9 @@ async fn handle_connected_client_tcp_command(
                 "client TCP path received an untyped capacity frame",
             ))
         }
+        ReliablePathCommand::PreparedOriginal(_) => Err(RuntimeError::Protocol(
+            "prepared Original requires the TCP writer claim transaction",
+        )),
         ReliablePathCommand::SendFrame(frame) => {
             connection.carrier.writer.write_frame(&frame).await?;
             connection.path_proofs.record_sent_frame(&frame);

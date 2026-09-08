@@ -1785,6 +1785,98 @@ async fn socks5_ingress_relays_tcp_payload_over_encrypted_internal_stream() {
 }
 
 #[tokio::test]
+async fn prepared_tcp_singleton_upload_survives_source_eof() {
+    assert_prepared_singleton_upload_survives_eof(UnderlayProtocol::Tcp).await;
+}
+
+async fn assert_prepared_singleton_upload_survives_eof(underlay: UnderlayProtocol) {
+    // Exercise several ordinary source quanta and a partial tail without
+    // changing Product resources, native admission, or the writer batch size.
+    // The guard below detects hangs; it is not a throughput acceptance bound.
+    tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, async {
+        let quantum = crate::model::capacity::reliable_relay_buffer_len(MuxLimits::default());
+        let payload: Vec<u8> = (0..3 * quantum + 13).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let target_addr = listener.local_addr().expect("target address");
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("target accept");
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.expect("target EOF");
+            assert_eq!(
+                received, expected,
+                "FIN must not truncate or duplicate source"
+            );
+            stream.write_all(b"complete").await.expect("target receipt");
+            stream.shutdown().await.expect("target shutdown");
+        });
+        let (path, server_path) = match underlay {
+            UnderlayProtocol::Tcp => spawn_server_path(OutboundConfig::Direct).await,
+            UnderlayProtocol::Udp => spawn_udp_server_path(OutboundConfig::Direct).await,
+        };
+        let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
+            .expect("singleton context");
+        // TCP opens wait for the application's carrier reconciliation owner;
+        // ingress does not create pool members. Start that existing owner
+        // alongside ingress, without prewarming or changing the open deadline.
+        let tcp_reconciliation = if underlay == UnderlayProtocol::Tcp {
+            assert!(context.tcp_sessions[0].connection_instance_id().is_none());
+            Some(spawn_tcp_pool_reconciliation(&context))
+        } else {
+            None
+        };
+        let (mut client, server) = duplex(4096);
+        let handler_context = context.clone();
+        let handler = tokio::spawn(async move {
+            let result = handle_socks5_client_stream(server, handler_context).await;
+            assert!(
+                result.is_ok(),
+                "{underlay:?} singleton handler failed: {result:?}"
+            );
+            result
+        });
+        open_socks5_tcp_tunnel(&mut client, target_addr).await;
+        client
+            .write_all(&payload)
+            .await
+            .expect("multi-quantum source");
+        client.shutdown().await.expect("source EOF");
+        let mut reply = Vec::new();
+        client
+            .read_to_end(&mut reply)
+            .await
+            .expect("reply after upload EOF");
+        assert_eq!(reply, b"complete");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handler result");
+        target.await.expect("exact target receipt");
+        let telemetry = context.telemetry_snapshot();
+        assert_eq!(telemetry.reliable.io.to_peer_bytes, payload.len() as u64);
+        assert_eq!(telemetry.reliable.io.from_peer_bytes, reply.len() as u64);
+        assert_eq!(telemetry.reliable.flows.active, 0);
+        assert_eq!(telemetry.reliable.flows.completed, 1);
+        assert_eq!(telemetry.reliable.flows.failed, 0);
+        if let Some(reconciliation) = tcp_reconciliation {
+            reconciliation.await.expect("TCP carrier reconciliation");
+        }
+        context.retire_session(CloseReason::Normal);
+        if underlay == UnderlayProtocol::Udp {
+            server_path.abort();
+            let _ = server_path.await;
+        } else {
+            server_path
+                .await
+                .expect("TCP server task")
+                .expect("TCP server result");
+        }
+    })
+    .await
+    .expect("prepared singleton physical-writer lifecycle deadline");
+}
+
+#[tokio::test]
 async fn socks5_ingress_accepts_configured_username_password_auth() {
     let (target_addr, target) = spawn_echo_target().await;
     let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
@@ -1890,6 +1982,11 @@ async fn socks5_ingress_rejects_wrong_username_password_auth() {
     assert_eq!(auth_response, [0x01, 0x01]);
 
     assert!(handler.await.expect("join").is_err());
+}
+
+#[tokio::test]
+async fn prepared_quic_singleton_upload_survives_source_eof() {
+    assert_prepared_singleton_upload_survives_eof(UnderlayProtocol::Udp).await;
 }
 
 #[tokio::test]

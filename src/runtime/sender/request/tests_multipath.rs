@@ -5712,6 +5712,7 @@ async fn direct_request_recovery_apply_charges_unrelated_queued_front() {
                 queue: &queue,
                 exclude_front: false
             }),
+            None,
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -5742,6 +5743,7 @@ async fn direct_request_recovery_apply_charges_unrelated_queued_front() {
                 queue: &queue,
                 exclude_front: false,
             }),
+            None,
         )
         .expect("identical direct Apply succeeds once that reserve is genuinely free");
     assert!(outcome.accepted_copy_deadline.is_some());

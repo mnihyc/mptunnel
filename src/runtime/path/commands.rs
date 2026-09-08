@@ -219,6 +219,7 @@ impl Drop for TcpCapacityProbeCommand {
 }
 
 pub(in crate::runtime) enum ReliablePathCommand {
+    PreparedOriginal(super::prepared::PreparedOriginalWork),
     PrepareConnection {
         open_deadline: tokio::time::Instant,
         endpoint_generation: u64,

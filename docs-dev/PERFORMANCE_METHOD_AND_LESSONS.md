@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-08 09:05 +08:00. Category: requested global retrospective and
+Updated: 2026-09-08 13:04 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -159,6 +159,19 @@ does not authorize latent topology inference or a universal Internet model.
   to force aggregation, permanent exploration starvation or renewable waits.
 - No proof of new ordering without half-close/cancel/finalization boundaries;
   no actor-fairness claim without executor cooperation and finite handler work.
+- More validation is not automatically safer service. The prepared-source
+  candidate froze every writer's ready/occupied generation. An unselected
+  loser withdrawing then invalidated the unchanged winner; two real retries
+  made zero progress while the ordinary control claimed64KiB. Separate sampled
+  scheduling opportunities from exact chosen ownership, refresh the former
+  and fence the latter. Preserve opposite-case controls: selected withdrawal
+  must refuse, and a newly observed eligible Regular must displace Backup.
+  A deadlock-free lock graph alone did not establish claimant progress.
+- Observe progress using its producer timestamp, not the consumer's later
+  scheduling time. The actual claim/observer counterexample renewed a fallback
+  anchor despite unchanged service. Same-event observation must not renew a
+  deadline or overwrite newer ACK/control progress. This is a clock-domain
+  correction, not authority to shorten timeouts.
 - Reusing a final-only helper in an active caller is not automatically neutral.
   Compare its byte quantum, whole-frame versus positive-credit admission,
   bound versus unbound publication, and assignment-clock lifetime first. The

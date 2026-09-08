@@ -14,14 +14,14 @@ use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes, relay_lane_startup_chunk_bytes,
     reliable_relay_buffer_len,
 };
-use crate::model::path::RelayPathKey;
+use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
-use crate::protocol::{Frame, UnderlayProtocol};
+use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::stream::{
-    ReliablePathStream, ReliableRelayAttachOutcome, ReliableRelayRemoteSet,
+    OpenedRemoteStream, ReliablePathStream, ReliableRelayAttachOutcome, ReliableRelayRemoteSet,
 };
 use crate::scheduler::TrafficClass;
 use std::collections::HashSet;
@@ -111,53 +111,108 @@ fn send_request_attach_control_frames(
     Ok(())
 }
 
-struct RelayPathAttachRequest<'a> {
-    spec: &'a ReliableRelayOpenSpec,
+/// Actor-owned ordered retry state. Only an individual owned attempt crosses
+/// native opening I/O; attachment membership is borrowed at begin/finish only.
+pub(super) struct ReliableRelayAttachPlan {
+    spec: ReliableRelayOpenSpec,
+    stream_id: StreamId,
     output_lane: TrafficClass,
     final_offset: Option<u64>,
-    candidates: Vec<RelayPathKey>,
+    candidates: std::vec::IntoIter<RelayPathKey>,
+    last_retryable_error: Option<RuntimeError>,
 }
 
-struct RelayPathAttachResult {
-    attached: usize,
+pub(super) struct ReliableRelayAttachAttempt {
+    spec: ReliableRelayOpenSpec,
+    stream_id: StreamId,
+    output_lane: TrafficClass,
+    key: RelayPathKey,
+    startup_ordinal: Option<u8>,
+    startup_expected_instance: Option<CarrierPathInstanceId>,
 }
 
-async fn attach_relay_path_candidates(
-    context: &ClientPathContext,
-    remotes: &mut ReliableRelayRemoteSet,
-    startup: &mut ClientReliableReturnPlan,
-    request: RelayPathAttachRequest<'_>,
-) -> Result<RelayPathAttachResult, RuntimeError> {
-    let stream_id = remotes.stream_id();
-    let mut last_retryable_error = None;
-    let candidates = request.candidates;
+pub(super) struct ReliableRelayAttachCompletion {
+    key: RelayPathKey,
+    startup_ordinal: Option<u8>,
+    startup_expected_instance: Option<CarrierPathInstanceId>,
+    result: Result<OpenedRemoteStream, RuntimeError>,
+}
 
-    for key in candidates {
-        if remotes.contains_path_key(key) {
-            continue;
-        }
-        let current_instance = context
-            .health()
-            .lock()
-            .expect("client path health lock")
-            .path_record(key)
-            .and_then(|record| record.path_instance_id());
-        let startup_ordinal = startup.begin_candidate_for_open(key, current_instance);
-        let startup_expected_instance =
-            startup_ordinal.and_then(|ordinal| startup.bound_instance(ordinal));
-        let open_spec = startup_ordinal.map_or_else(
-            || request.spec.for_ordinary_attachment(),
-            |ordinal| request.spec.for_startup_ordinal(ordinal),
-        );
-        match open_remote_stream_for_relay_path(
+impl ReliableRelayAttachAttempt {
+    pub(super) async fn open(self, context: &ClientPathContext) -> ReliableRelayAttachCompletion {
+        let result = open_remote_stream_for_relay_path(
             context,
-            stream_id,
-            &open_spec,
-            request.output_lane,
-            key,
+            self.stream_id,
+            &self.spec,
+            self.output_lane,
+            self.key,
         )
-        .await
-        {
+        .await;
+        ReliableRelayAttachCompletion {
+            key: self.key,
+            startup_ordinal: self.startup_ordinal,
+            startup_expected_instance: self.startup_expected_instance,
+            result,
+        }
+    }
+}
+
+impl ReliableRelayAttachPlan {
+    pub(super) fn next_attempt(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        startup: &mut ClientReliableReturnPlan,
+    ) -> Result<Option<ReliableRelayAttachAttempt>, RuntimeError> {
+        for key in self.candidates.by_ref() {
+            if remotes.contains_path_key(key) {
+                continue;
+            }
+            let current_instance = context
+                .health()
+                .lock()
+                .expect("client path health lock")
+                .path_record(key)
+                .and_then(|record| record.path_instance_id());
+            let startup_ordinal = startup.begin_candidate_for_open(key, current_instance);
+            let startup_expected_instance =
+                startup_ordinal.and_then(|ordinal| startup.bound_instance(ordinal));
+            let spec = startup_ordinal.map_or_else(
+                || self.spec.for_ordinary_attachment(),
+                |ordinal| self.spec.for_startup_ordinal(ordinal),
+            );
+            return Ok(Some(ReliableRelayAttachAttempt {
+                spec,
+                stream_id: self.stream_id,
+                output_lane: self.output_lane,
+                key,
+                startup_ordinal,
+                startup_expected_instance,
+            }));
+        }
+        if remotes.is_empty() {
+            Err(self
+                .last_retryable_error
+                .take()
+                .unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn finish_attempt(
+        &mut self,
+        remotes: &mut ReliableRelayRemoteSet,
+        startup: &mut ClientReliableReturnPlan,
+        completion: ReliableRelayAttachCompletion,
+    ) -> Result<bool, RuntimeError> {
+        let ReliableRelayAttachCompletion {
+            key,
+            startup_ordinal,
+            startup_expected_instance,
+            result,
+        } = completion;
+        match result {
             Ok(opened) => {
                 if startup_expected_instance
                     .is_some_and(|expected| opened.path_instance_id() != expected)
@@ -166,10 +221,10 @@ async fn attach_relay_path_candidates(
                     if let Some(ordinal) = startup_ordinal {
                         startup.settle_failed(ordinal)?;
                     }
-                    continue;
+                    return Ok(false);
                 }
                 let attach_control_result =
-                    send_request_attach_control_frames(opened.stream(), request.final_offset);
+                    send_request_attach_control_frames(opened.stream(), self.final_offset);
                 match attach_control_result {
                     Ok(()) => {
                         let attach_outcome = remotes.try_attach_candidate(opened)?;
@@ -183,13 +238,13 @@ async fn attach_relay_path_candidates(
                                     )?;
                                     startup.settle_accepted(ordinal, instance)?;
                                 }
-                                return Ok(RelayPathAttachResult { attached: 1 });
+                                return Ok(true);
                             }
                             ReliableRelayAttachOutcome::RejectedDuplicate => {
                                 if let Some(ordinal) = startup_ordinal {
                                     startup.settle_failed(ordinal)?;
                                 }
-                                continue;
+                                return Ok(false);
                             }
                         }
                     }
@@ -197,7 +252,7 @@ async fn attach_relay_path_candidates(
                         if let Some(ordinal) = startup_ordinal {
                             startup.settle_failed(ordinal)?;
                         }
-                        last_retryable_error = Some(err);
+                        self.last_retryable_error = Some(err);
                     }
                     Err(err) => {
                         if let Some(ordinal) = startup_ordinal {
@@ -213,13 +268,13 @@ async fn attach_relay_path_candidates(
                 }
                 // The server refused this attachment, not the carrier. Keep
                 // global path health intact and consider the next candidate.
-                last_retryable_error = Some(err);
+                self.last_retryable_error = Some(err);
             }
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
                 if let Some(ordinal) = startup_ordinal {
                     startup.settle_failed(ordinal)?;
                 }
-                last_retryable_error = Some(err);
+                self.last_retryable_error = Some(err);
             }
             Err(err) => {
                 if let Some(ordinal) = startup_ordinal {
@@ -228,106 +283,46 @@ async fn attach_relay_path_candidates(
                 return Err(err);
             }
         }
-    }
-    if remotes.is_empty() {
-        Err(last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
-    } else {
-        Ok(RelayPathAttachResult { attached: 0 })
+        Ok(false)
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
+pub(super) fn begin_reliable_relay_attach_with_claims_and_suppressions(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
     lanes: ReliableRelayPathLanes,
-    remotes: &mut ReliableRelayRemoteSet,
-    startup: &mut ClientReliableReturnPlan,
+    remotes: &ReliableRelayRemoteSet,
     input: ReliableRelayAttachInput,
     path_open_suppressions: &ClientRelayPathOpenSuppressions,
     inflight_path_claims: &HashSet<RelayPathKey>,
-) -> Result<usize, RuntimeError> {
+) -> ReliableRelayAttachPlan {
     let payload_bytes = input.payload_bytes;
-    if matches!(input.mode, ReliableRelayAttachMode::BulkStriping) {
-        let result = attach_relay_path_candidates(
+    // The previous bulk branch always returned: exhaustion is an error when
+    // membership is empty and otherwise succeeds with zero attachments.
+    let candidates = if matches!(input.mode, ReliableRelayAttachMode::BulkStriping) {
+        context.ordered_reliable_bulk_striping_path_keys(payload_bytes)
+    } else if input.prefer_reinjection_alternative {
+        reliable_relay_reinjection_path_candidates(context, remotes, lanes.selection, payload_bytes)
+    } else {
+        reliable_relay_additional_path_candidates(context, remotes, lanes.selection, payload_bytes)
+    };
+    let candidates = reliable_relay_exclude_inflight_open_claims(
+        reliable_relay_path_open_candidates_after_suppression(
             context,
-            remotes,
-            startup,
-            RelayPathAttachRequest {
-                spec,
-                output_lane: lanes.output,
-                final_offset: input.final_offset,
-                candidates: reliable_relay_exclude_inflight_open_claims(
-                    reliable_relay_path_open_candidates_after_suppression(
-                        context,
-                        context.ordered_reliable_bulk_striping_path_keys(payload_bytes),
-                        path_open_suppressions,
-                    ),
-                    inflight_path_claims,
-                ),
-            },
-        )
-        .await;
-        match result {
-            Ok(result) if result.attached > 0 || !remotes.is_empty() => {
-                return Ok(result.attached);
-            }
-            Ok(_) => {}
-            Err(err) => return Err(err),
-        }
+            candidates,
+            path_open_suppressions,
+        ),
+        inflight_path_claims,
+    );
+    ReliableRelayAttachPlan {
+        spec: spec.clone(),
+        stream_id: remotes.stream_id(),
+        output_lane: lanes.output,
+        final_offset: input.final_offset,
+        candidates: candidates.into_iter(),
+        last_retryable_error: None,
     }
-    if input.prefer_reinjection_alternative {
-        let result = attach_relay_path_candidates(
-            context,
-            remotes,
-            startup,
-            RelayPathAttachRequest {
-                spec,
-                output_lane: lanes.output,
-                final_offset: input.final_offset,
-                candidates: reliable_relay_exclude_inflight_open_claims(
-                    reliable_relay_path_open_candidates_after_suppression(
-                        context,
-                        reliable_relay_reinjection_path_candidates(
-                            context,
-                            remotes,
-                            lanes.selection,
-                            payload_bytes,
-                        ),
-                        path_open_suppressions,
-                    ),
-                    inflight_path_claims,
-                ),
-            },
-        )
-        .await?;
-        return Ok(result.attached);
-    }
-    let result = attach_relay_path_candidates(
-        context,
-        remotes,
-        startup,
-        RelayPathAttachRequest {
-            spec,
-            output_lane: lanes.output,
-            final_offset: input.final_offset,
-            candidates: reliable_relay_exclude_inflight_open_claims(
-                reliable_relay_path_open_candidates_after_suppression(
-                    context,
-                    reliable_relay_additional_path_candidates(
-                        context,
-                        remotes,
-                        lanes.selection,
-                        payload_bytes,
-                    ),
-                    path_open_suppressions,
-                ),
-                inflight_path_claims,
-            ),
-        },
-    )
-    .await?;
-    Ok(result.attached)
 }
 
 pub(in crate::runtime) fn reliable_relay_additional_path_candidates(

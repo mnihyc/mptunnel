@@ -16,6 +16,7 @@ mod health;
 pub(in crate::runtime) mod input;
 pub(super) mod model;
 mod ports;
+pub(in crate::runtime) mod prepared;
 pub(super) mod proof;
 mod queue;
 pub(in crate::runtime) mod quic;
@@ -25,6 +26,7 @@ mod set;
 mod state;
 pub(in crate::runtime) mod tcp;
 pub(in crate::runtime) mod traffic;
+pub(in crate::runtime) mod writer_boundary;
 
 pub(in crate::runtime) use carrier_inventory::{
     AuthenticatedCarrierAvailability, AuthenticatedCarrierInventory,

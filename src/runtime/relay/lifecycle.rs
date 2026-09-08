@@ -9,8 +9,8 @@ use super::open::{
     ReliableRelayOpenSpec, open_remote_stream_for_relay_path, relay_path_open_error_is_retryable,
 };
 use super::remote::{
-    ReliableRelayAttachInput, ReliableRelayAttachMode, ReliableRelayPathLanes,
-    attach_reliable_relay_paths_with_claims_and_suppressions,
+    ReliableRelayAttachInput, ReliableRelayAttachMode, ReliableRelayAttachPlan,
+    ReliableRelayPathLanes, begin_reliable_relay_attach_with_claims_and_suppressions,
     reliable_relay_additional_path_open_payload_bytes, reliable_relay_attach_payload_bytes,
     reliable_relay_path_open_candidates_after_suppression,
     reliable_relay_reinjection_path_candidates,
@@ -343,38 +343,6 @@ impl ClientReliableReturnPlan {
 
 pub(super) fn reliable_relay_lane_changed(previous: TrafficClass, current: TrafficClass) -> bool {
     previous != current
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn switch_reliable_relay_to_best_path(
-    context: &ClientPathContext,
-    spec: &ReliableRelayOpenSpec,
-    lanes: ReliableRelayPathLanes,
-    remotes: &mut ReliableRelayRemoteSet,
-    startup: &mut ClientReliableReturnPlan,
-    input: ReliableRelayAttachInput,
-    path_open_suppressions: &ClientRelayPathOpenSuppressions,
-    pending_additional_path_opens: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
-) -> Result<bool, RuntimeError> {
-    let inflight_path_claims = pending_additional_path_opens
-        .keys()
-        .copied()
-        .collect::<HashSet<_>>();
-    let attached = attach_reliable_relay_paths_with_claims_and_suppressions(
-        context,
-        spec,
-        lanes,
-        remotes,
-        startup,
-        input,
-        path_open_suppressions,
-        &inflight_path_claims,
-    )
-    .await?;
-    if attached == 0 {
-        return Ok(false);
-    }
-    Ok(true)
 }
 
 pub(super) fn reliable_relay_can_send_pending_fin(
@@ -1226,33 +1194,30 @@ fn reliable_relay_bulk_path_open_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn attach_reliable_relay_paths_with_suppressions(
+pub(super) fn begin_reliable_relay_attach_with_suppressions(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
     lanes: ReliableRelayPathLanes,
-    remotes: &mut ReliableRelayRemoteSet,
-    startup: &mut ClientReliableReturnPlan,
+    remotes: &ReliableRelayRemoteSet,
     input: ReliableRelayAttachInput,
     path_open_suppressions: &ClientRelayPathOpenSuppressions,
     pending_additional_path_opens: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
-) -> Result<usize, RuntimeError> {
+) -> ReliableRelayAttachPlan {
     // A pending open owns logical (stream, path) membership. Synchronous
     // recovery must not race that claim through either carrier.
     let inflight_path_claims = pending_additional_path_opens
         .keys()
         .copied()
         .collect::<HashSet<_>>();
-    attach_reliable_relay_paths_with_claims_and_suppressions(
+    begin_reliable_relay_attach_with_claims_and_suppressions(
         context,
         spec,
         lanes,
         remotes,
-        startup,
         input,
         path_open_suppressions,
         &inflight_path_claims,
     )
-    .await
 }
 
 pub(in crate::runtime) fn reliable_relay_stall_watch_active(

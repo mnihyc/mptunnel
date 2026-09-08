@@ -155,6 +155,7 @@ impl RequestRelayNativeCapture {
 
 /// Owned Native inputs, captured before Product/health observation. These are
 /// advisory values, not a replacement for the selected output's fenced Apply.
+#[derive(Clone)]
 pub(super) struct RequestRelayNativeInputs {
     membership_generation: u64,
     attached_paths: SmallVec<
@@ -167,6 +168,21 @@ pub(super) struct RequestRelayNativeInputs {
 }
 
 impl RequestRelayNativeInputs {
+    /// Retain the detached membership/proof receipt and all other advisory
+    /// inputs while replacing only the selected fence's current Native shape.
+    pub(super) fn with_fenced_target(
+        mut self,
+        target: RelayPathInstance,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) -> Self {
+        for (instance, _, value) in &mut self.attached_paths {
+            if *instance == target {
+                *value = ReliableRequestNativeShape::Current(shape);
+            }
+        }
+        self
+    }
+
     /// Under the selected Native fence, project only its supplied shape.
     /// There is no transport read, handle lookup or optional recapture path.
     pub(super) fn for_fenced_target(
@@ -928,7 +944,7 @@ impl RequestMultipathController {
         if !lane.is_bulk() || !plan.assigns_original_data() {
             return None;
         }
-        let (entry_offset, _, payload_bytes) = reliable_stream_frame_extent(frame)?;
+        let (_, _, payload_bytes) = reliable_stream_frame_extent(frame)?;
         let observation = observe_request_relay_scheduling_from_native_inputs(
             context,
             self.stream_id,
@@ -950,6 +966,33 @@ impl RequestMultipathController {
         if !eligible.contains(&plan.target.instance) {
             return None;
         }
+
+        self.bulk_original_data_authority_from_observation(
+            context,
+            remotes,
+            plan,
+            frame,
+            frontier_state,
+            pending_load_claim,
+            &observation,
+        )
+    }
+
+    /// Exact W/P/E calculation after the caller has established the selected
+    /// output's eligibility. Native command Apply uses its structural tier;
+    /// an imminent writer claim uses the finite ready-writer tier pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bulk_original_data_authority_from_observation(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        plan: &RequestMultipathPlan,
+        frame: &Frame,
+        frontier_state: ReliableDataAckFrontierState,
+        pending_load_claim: bool,
+        observation: &RequestRelaySchedulingObservation,
+    ) -> Option<RequestOriginalDataApplyAuthority> {
+        let (entry_offset, _, payload_bytes) = reliable_stream_frame_extent(frame)?;
 
         let stream_outstanding_bytes = self.request.flights.total_original_data_in_flight_bytes();
         let lower_owner = self
@@ -977,7 +1020,7 @@ impl RequestMultipathController {
             flights: Some(&self.request.flights),
         };
         let snapshot = request_original_data_authority_snapshot(
-            &observation,
+            observation,
             plan.target.instance,
             lower_owner.map(|instance| instance.key),
             TrafficClass::Throughput,
@@ -1003,6 +1046,113 @@ impl RequestMultipathController {
                 .original_data_in_flight_bytes(plan.target.instance),
             output,
         })
+    }
+
+    /// Reuses normal Product projection with no command-queue reservation.
+    /// Writer-boundary readiness is applied separately by the claim planner.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn observe_original_claim_from_inputs(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+        include_bulk_admission: bool,
+        inputs: RequestRelayNativeInputs,
+    ) -> Option<RequestRelaySchedulingObservation> {
+        observe_request_relay_scheduling_from_native_inputs(
+            context,
+            self.stream_id,
+            remotes.membership_generation(),
+            &remotes.paths,
+            None,
+            lane,
+            reliable_stream_frame_accounted_bytes(frame),
+            include_bulk_admission,
+            &self.request.requalification,
+            inputs,
+        )
+    }
+
+    /// Preserve full membership and Original debt when choosing among actual
+    /// imminent writers. The finite tier pass does not reclassify a filtered
+    /// survivor as FirstPath and does not turn a busy regular into a dead path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_original_claim_from_observation(
+        &self,
+        context: &ClientPathContext,
+        observation: &RequestRelaySchedulingObservation,
+        authority_observation: &RequestRelaySchedulingObservation,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+        frontier_state: ReliableDataAckFrontierState,
+        ready: &[RelayPathInstance],
+    ) -> Result<RequestMultipathPlan, RequestMultipathPlanError> {
+        let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
+        for (eligibility, stale) in [
+            (RequestPathEligibility::Regular, false),
+            (RequestPathEligibility::Backup, false),
+            (RequestPathEligibility::Regular, true),
+            (RequestPathEligibility::Backup, true),
+        ] {
+            let mut tier = observation.clone();
+            for path in &mut tier.paths {
+                let eligible = ready.contains(&path.instance)
+                    && request_path_eligibility(path.shared_snapshot, lane) == eligibility
+                    && self
+                        .request
+                        .requalification
+                        .stale_for_original_data(path.instance)
+                        == stale
+                    && remotes.paths.iter().any(|remote| {
+                        remote.instance() == path.instance
+                            && remote.stream.product_admission_active()
+                            && payload_bytes <= remote.stream.max_frame_payload_bytes
+                    });
+                path.can_enqueue_frame &= eligible;
+                path.can_enqueue_stream_lane &= eligible;
+            }
+            // A rejected whole-frame Product allowance removes that exact
+            // candidate for this pass only. No credit or new quantum is minted.
+            for _ in 0..tier.paths.len() {
+                let Ok(plan) = self.plan_original_relay_path_send_from_observation(
+                    &tier,
+                    remotes,
+                    frame,
+                    lane,
+                    &[],
+                    frontier_state,
+                    payload_bytes,
+                ) else {
+                    break;
+                };
+                let target = plan.target.instance;
+                let allowed = if lane.is_bulk() {
+                    self.bulk_original_data_authority_from_observation(
+                        context,
+                        remotes,
+                        &plan,
+                        frame,
+                        frontier_state,
+                        plan.load_expectation().is_some(),
+                        authority_observation,
+                    )
+                    .is_some_and(RequestOriginalDataApplyAuthority::has_headroom)
+                } else {
+                    self.plan_retains_exact_product_headroom(&plan)
+                };
+                if allowed {
+                    return Ok(plan);
+                }
+                let Some(path) = tier.paths.iter_mut().find(|path| path.instance == target) else {
+                    break;
+                };
+                path.can_enqueue_frame = false;
+                path.can_enqueue_stream_lane = false;
+            }
+        }
+        Err(blocked_attachment_set_error(remotes))
     }
 
     #[cfg(feature = "lab-diagnostics")]
@@ -2221,6 +2371,27 @@ impl RequestMultipathController {
             membership_generation,
             unique_data_payload_bytes,
         })
+    }
+
+    /// Actor-equivalent Original preparation before detached Native sampling.
+    /// This must run outside a Native-fenced Product claim: pending proof
+    /// publication is allowed here, not inside the final supplied-shape Apply.
+    pub(super) fn prepare_original_claim(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        frame: &Frame,
+    ) -> Result<(), RequestMultipathPlanError> {
+        self.prepare_relay_path_decision(context, remotes, frame, RelaySendCause::StreamData)?;
+        Ok(())
+    }
+
+    pub(super) fn reconcile_original_claim(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+    ) {
+        self.reconcile_request_path_state(context, remotes);
     }
 
     /// Keeps the ReceiptMode ACK-clock transaction subordinate to ordinary

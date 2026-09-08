@@ -84,6 +84,7 @@ pub(super) async fn run_client_udp_stream(
                 &mut commands,
                 &mut send,
                 stream_id,
+                path_instance_id,
                 codec_limits,
                 mux_limits,
                 &mut pending_frames,
@@ -104,9 +105,11 @@ pub(super) async fn run_client_udp_stream(
             }
             continue;
         }
+        let mut writer_ready = commands.writer_ready_boundary(path_instance_id);
         tokio::select! {
             biased;
             frame = carrier_frames.recv(), if carrier_input_open => {
+                drop(writer_ready.take());
                 let input = frame.unwrap_or(Err(RuntimeError::ReliablePathSessionClosed));
                 if input.as_ref().is_err_and(udp_path_input_finished) {
                     if !product_terminal_received {
@@ -139,6 +142,7 @@ pub(super) async fn run_client_udp_stream(
                         &mut commands,
                         &mut send,
                         stream_id,
+                        path_instance_id,
                             codec_limits,
                             mux_limits,
                             &mut pending_frames,
@@ -160,12 +164,14 @@ pub(super) async fn run_client_udp_stream(
                 }
             }
             command = recv_reliable_path_command(&mut commands), if command_may_recv => {
+                drop(writer_ready.take());
                 if let Some(command) = command {
                     let result = drain_client_udp_stream_commands(
                         command,
                         &mut commands,
                         &mut send,
                         stream_id,
+                        path_instance_id,
                         codec_limits,
                         mux_limits,
                         &mut pending_frames,

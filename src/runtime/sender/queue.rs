@@ -88,6 +88,27 @@ impl ReliableRelaySenderQueue {
         self.data_bytes
     }
 
+    /// Actor repair work is independent of source bytes awaiting a native
+    /// Original claim. Preserve critical-before-ordinary repair priority.
+    pub(in crate::runtime) fn has_reinjection(&self) -> bool {
+        self.front_reinjection().is_some()
+    }
+
+    pub(super) fn front_reinjection(&self) -> Option<&ReliableRelayQueuedWork> {
+        self.critical_reinjection
+            .front()
+            .or_else(|| self.reinjection.front())
+    }
+
+    pub(super) fn commit_front_reinjection(&mut self) -> Option<ReliableRelayQueuedWork> {
+        let work = self
+            .critical_reinjection
+            .pop_front()
+            .or_else(|| self.reinjection.pop_front())?;
+        self.bytes = self.bytes.saturating_sub(work.payload_bytes);
+        Some(work)
+    }
+
     /// Test-only aggregate of queued ReinjectedData, bound or unbound.
     ///
     /// Production recovery admission uses the exact target's queued debt via

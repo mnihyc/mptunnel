@@ -6,6 +6,7 @@ use super::io::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{Frame, StreamId};
@@ -18,6 +19,7 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::input::{CarrierInputRoute, PendingMailboxFrame};
 use crate::runtime::path::proof::PathProofTracker;
+use crate::runtime::sender::RequestPreparedClaim;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -28,6 +30,7 @@ pub(super) async fn drain_client_udp_stream_commands(
     commands: &mut ReliablePathCommandReceivers,
     send: &mut UdpPathSendStream,
     stream_id: StreamId,
+    path_instance_id: CarrierPathInstanceId,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     pending_frames: &mut Vec<Frame>,
@@ -47,21 +50,23 @@ pub(super) async fn drain_client_udp_stream_commands(
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
     let mut pending_frame_command_bytes = 0usize;
+    let mut has_prepared_claim = false;
 
     loop {
         let Some(command) = next_command
             .take()
             .or_else(|| try_recv_reliable_path_command(commands))
         else {
-            if try_coalesce_reliable_path_writer_run(
-                commands,
-                &mut next_command,
-                sent_items,
-                sent_bytes,
-                byte_budget,
-                item_budget,
-            )
-            .await
+            if !has_prepared_claim
+                && try_coalesce_reliable_path_writer_run(
+                    commands,
+                    &mut next_command,
+                    sent_items,
+                    sent_bytes,
+                    byte_budget,
+                    item_budget,
+                )
+                .await
             {
                 continue;
             }
@@ -100,6 +105,45 @@ pub(super) async fn drain_client_udp_stream_commands(
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
+            ReliablePathCommand::PreparedOriginal(work) => {
+                if work.stream_id() != stream_id
+                    || work.instance().path_instance_id != path_instance_id
+                {
+                    // An obsolete weak subscription owns neither payload nor
+                    // carrier failure authority.
+                    false
+                } else if let Some(ready) = commands.writer_ready_boundary(path_instance_id) {
+                    match work.try_claim(ready) {
+                        RequestPreparedClaim::Claimed(frame) => {
+                            let bytes = commands.register_claimed_writer_frame(&frame);
+                            let encoded_bytes =
+                                crate::protocol::codec::encoded_frame_capacity_hint(&frame).max(1);
+                            pending_frame_command_bytes = pending_frame_command_bytes
+                                .checked_add(bytes)
+                                .ok_or(RuntimeError::Protocol(
+                                    "client QUIC writer transaction byte overflow",
+                                ))?;
+                            pending_frames.push(frame);
+                            has_prepared_claim = true;
+                            sent_bytes = sent_bytes.saturating_add(encoded_bytes);
+                            // Feed the same imminent bounded batch without a
+                            // source-actor reply. No coalescing await is allowed
+                            // after the first actual claim and before flush.
+                            work.requeue();
+                        }
+                        RequestPreparedClaim::Busy(wait) => {
+                            commands.defer_prepared_work(work, wait);
+                        }
+                        RequestPreparedClaim::Blocked(wait) => {
+                            commands.defer_prepared_work(work, wait);
+                        }
+                        RequestPreparedClaim::Empty => {}
+                    }
+                    false
+                } else {
+                    false
+                }
+            }
             ReliablePathCommand::SendFrame(frame)
                 if reliable_path_frame_requires_capacity_command(&frame) =>
             {
@@ -292,7 +336,7 @@ async fn flush_client_udp_frame_batch(
     pending_frames: &mut Vec<Frame>,
     codec_limits: CodecLimits,
     path_proofs: &mut PathProofTracker,
-    commands: &ReliablePathCommandReceivers,
+    commands: &mut ReliablePathCommandReceivers,
     pending_frame_command_bytes: &mut usize,
     stream_id: StreamId,
     carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,

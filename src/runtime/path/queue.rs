@@ -2,9 +2,12 @@ use super::authority::NativeCarrierRateAuthorityHandle;
 use super::commands::ReliablePathCommand;
 #[cfg(test)]
 use super::commands::{RequestTcpCapacityProbeRequest, TcpCapacityProbeCommand};
+use super::prepared::{PreparedOriginalWait, PreparedOriginalWork};
+use super::writer_boundary::{ReliableWriterBoundary, ReliableWriterReadyGuard};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
+use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{DatagramFlowId, Frame, ResetReason, StreamId};
@@ -13,11 +16,13 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::tcp::capacity::RequestTcpCapacityProbeLease;
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::scheduler::TrafficClass;
+use futures::{StreamExt, stream::FuturesUnordered};
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
+use std::task::{Context, Poll};
 use std::time::Duration;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
@@ -35,6 +40,7 @@ const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [TrafficClass; 3] = [
 
 #[derive(Clone)]
 pub(in crate::runtime) struct ReliablePathCommandSender {
+    prepared_waits: mpsc::UnboundedSender<PreparedOriginalWait>,
     retirement: mpsc::UnboundedSender<ReliablePathRetirementCommand>,
     control: mpsc::Sender<QueuedReliablePathCommand>,
     priority: mpsc::Sender<QueuedReliablePathCommand>,
@@ -45,6 +51,10 @@ pub(in crate::runtime) struct ReliablePathCommandSender {
 }
 
 pub(in crate::runtime) struct ReliablePathCommandReceivers {
+    // These Send-only waits belong to the exclusive physical writer. Async
+    // writer helpers retain &mut Self, not a shared receiver across await.
+    prepared_waits: mpsc::UnboundedReceiver<PreparedOriginalWait>,
+    deferred_prepared: FuturesUnordered<PreparedOriginalWait>,
     retirement: mpsc::UnboundedReceiver<ReliablePathRetirementCommand>,
     pending_retirement_close: Option<StreamId>,
     control: mpsc::Receiver<QueuedReliablePathCommand>,
@@ -303,6 +313,7 @@ impl Drop for ReliablePathFrameReservation<'_> {
 struct ReliablePathCommandQueueMetrics {
     pending_bytes: AtomicU64,
     writer_pending_bytes: AtomicU64,
+    writer_boundary: Arc<ReliableWriterBoundary>,
     /// Upper/lower 32 bits hold total and latency-sensitive live flows.
     flow_counts: AtomicU64,
     capacity_released: Arc<Notify>,
@@ -813,6 +824,10 @@ impl ReliablePathCommandReceivers {
             return;
         }
         self.metrics.lifecycle.begin_drain();
+        self.metrics.writer_boundary.invalidate();
+        self.prepared_waits.close();
+        self.deferred_prepared.clear();
+        while self.prepared_waits.try_recv().is_ok() {}
         self.retirement.close();
         self.control.close();
         self.priority.close();
@@ -827,22 +842,60 @@ impl ReliablePathCommandReceivers {
     /// completed. A later receiver drop cannot overwrite planned retirement
     /// with generic carrier failure.
     pub(in crate::runtime) fn finish_planned_path_retirement(&self) -> bool {
+        self.metrics.writer_boundary.invalidate();
         self.metrics.lifecycle.finish_planned_retirement()
+    }
+
+    /// Called by the physical writer only when it can accept the next work.
+    /// Queue capacity and authentication do not publish this owner boundary.
+    pub(in crate::runtime) fn writer_ready_boundary(
+        &self,
+        instance: CarrierPathInstanceId,
+    ) -> Option<ReliableWriterReadyGuard> {
+        if !self.metrics.lifecycle.is_active() {
+            return None;
+        }
+        let guard = self.metrics.writer_boundary.publish(instance)?;
+        if !self.metrics.lifecycle.is_active() {
+            drop(guard);
+            return None;
+        }
+        Some(guard)
     }
 
     fn take_queued_command(&self, command: QueuedReliablePathCommand) -> ReliablePathCommand {
         let (command, accounted_bytes) = command.into_parts();
-        self.dequeued_unreleased_bytes
-            .fetch_add(accounted_bytes as u64, Ordering::Relaxed);
-        self.metrics
-            .add_writer_pending_bytes(accounted_bytes as u64);
+        self.register_writer_pending_bytes(accounted_bytes);
         command
+    }
+
+    fn register_writer_pending_bytes(&self, bytes: usize) {
+        self.dequeued_unreleased_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.metrics.add_writer_pending_bytes(bytes as u64);
+    }
+
+    /// Charges an already claimed frame handed directly to this writer, without
+    /// a Data queue envelope. This is accounting, not admission or ownership:
+    /// the caller must register each successful claim exactly once and release
+    /// it through `release_pending_command_bytes` after the writer transaction.
+    /// Receiver drop reconciles a cancelled or failed transaction's remainder.
+    pub(in crate::runtime) fn register_claimed_writer_frame(&self, frame: &Frame) -> usize {
+        let bytes = reliable_path_frame_pacing_bytes(frame);
+        self.metrics.add_pending_bytes(bytes);
+        self.register_writer_pending_bytes(bytes);
+        bytes
     }
 
     fn take_live_queued_command(
         &mut self,
         queued: QueuedReliablePathCommand,
     ) -> Option<ReliablePathCommand> {
+        if matches!(queued.command(), ReliablePathCommand::PreparedOriginal(_))
+            && !self.metrics.lifecycle.is_active()
+        {
+            return None;
+        }
         if queued.retired_server_datagram_work() {
             // The flow-scoped retirement command overtakes bounded work. Drop
             // only older work carrying its exact fence; the envelope returns
@@ -888,6 +941,16 @@ impl ReliablePathCommandReceivers {
             .release_writer_pending_bytes(previous_pending.min(requested_pending));
         self.metrics
             .release_accounted_bytes(previous_pending.min(requested_pending));
+    }
+
+    /// The actual writer yields this weak notice while its already armed
+    /// owner wait is pending. Completion republishes in the original lane.
+    pub(in crate::runtime) fn defer_prepared_work(
+        &mut self,
+        work: PreparedOriginalWork,
+        wait: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.deferred_prepared.push(work.after_wait(Box::pin(wait)));
     }
 
     #[cfg(feature = "lab-diagnostics")]
@@ -969,6 +1032,7 @@ impl ReliablePathRepairReceiver {
 impl Drop for ReliablePathCommandReceivers {
     fn drop(&mut self) {
         self.metrics.lifecycle.finish_failed();
+        self.metrics.writer_boundary.invalidate();
         // Queued envelopes reconcile themselves. This covers a command already
         // removed from mpsc when a writer exits through an async error path.
         let outstanding = self.dequeued_unreleased_bytes.swap(0, Ordering::Relaxed);
@@ -978,6 +1042,55 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
+    /// Preserves the existing Original lane and queue capacity. A full queue
+    /// owns only one weak registration wait, never a reserved source payload.
+    pub(in crate::runtime::path) fn enqueue_prepared_work(&self, work: PreparedOriginalWork) {
+        if !self.metrics.lifecycle.admits_new_command(true) {
+            return;
+        }
+        let queue = if reliable_path_frame_uses_priority_queue(work.lane()) {
+            &self.priority
+        } else {
+            &self.data
+        };
+        match queue.try_reserve() {
+            Ok(permit) => {
+                if self.metrics.lifecycle.admits_new_command(true) {
+                    permit.send(QueuedReliablePathCommand::new(
+                        ReliablePathCommand::PreparedOriginal(work),
+                        0,
+                        self.metrics.clone(),
+                    ));
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let Some(cancelled) = work.cancellation_wait() else {
+                    return;
+                };
+                let queue = queue.clone();
+                let metrics = self.metrics.clone();
+                let wait: PreparedOriginalWait = Box::pin(async move {
+                    tokio::select! {
+                        biased;
+                        () = cancelled => {}
+                        permit = queue.reserve_owned() => {
+                            if let Ok(permit) = permit
+                                && metrics.lifecycle.admits_new_command(true) {
+                                permit.send(QueuedReliablePathCommand::new(ReliablePathCommand::PreparedOriginal(work), 0, metrics));
+                            }
+                        }
+                    }
+                });
+                let _ = self.prepared_waits.send(wait);
+            }
+        }
+    }
+
+    pub(in crate::runtime) fn writer_boundary(&self) -> Arc<ReliableWriterBoundary> {
+        self.metrics.writer_boundary.clone()
+    }
+
     /// Attach the physical QUIC connection's one native rate authority before
     /// this sender is cloned into Product scheduling state.
     pub(in crate::runtime) fn with_native_rate_authority(
@@ -999,6 +1112,7 @@ impl ReliablePathCommandSender {
     /// preventing ordered control needed to settle work already admitted.
     pub(in crate::runtime) fn begin_path_drain(&self) {
         self.metrics.lifecycle.begin_drain();
+        self.metrics.writer_boundary.invalidate();
         self.metrics.capacity_released.notify_waiters();
     }
 
@@ -1013,6 +1127,7 @@ impl ReliablePathCommandSender {
     /// retained to exchange ordered retirement frames.
     pub(in crate::runtime) fn terminate_failed_path(&self) {
         self.metrics.lifecycle.finish_failed();
+        self.metrics.writer_boundary.invalidate();
         self.metrics.capacity_released.notify_waiters();
     }
 
@@ -1788,6 +1903,7 @@ fn reliable_path_retirable_datagram_flow_id(frame: &Frame) -> Option<DatagramFlo
 
 fn reliable_path_command_requires_product_admission(command: &ReliablePathCommand) -> bool {
     match command {
+        ReliablePathCommand::PreparedOriginal(_) => true,
         #[cfg(test)]
         ReliablePathCommand::SendTcpCapacityProbe(_) => true,
         ReliablePathCommand::PrepareConnection { .. }
@@ -1815,9 +1931,11 @@ pub(in crate::runtime) fn reliable_path_command_channels(
     let reinjection_queue = reliable_path_priority_headroom_frames().min(queue).max(1);
     let (reinjection_tx, reinjection_rx) = mpsc::channel(reinjection_queue);
     let (data_tx, data_rx) = mpsc::channel(queue);
+    let (prepared_waits_tx, prepared_waits_rx) = mpsc::unbounded_channel();
     let metrics = Arc::new(ReliablePathCommandQueueMetrics::default());
     (
         ReliablePathCommandSender {
+            prepared_waits: prepared_waits_tx,
             retirement: retirement_tx,
             control: control_tx,
             priority: priority_tx,
@@ -1827,6 +1945,8 @@ pub(in crate::runtime) fn reliable_path_command_channels(
             native_rate_authority: None,
         },
         ReliablePathCommandReceivers {
+            prepared_waits: prepared_waits_rx,
+            deferred_prepared: FuturesUnordered::new(),
             retirement: retirement_rx,
             pending_retirement_close: None,
             control: control_rx,
@@ -1848,6 +1968,37 @@ pub(in crate::runtime) fn reliable_path_command_channels(
 
 fn path_command_receiver_may_recv<T>(receiver: &mpsc::Receiver<T>) -> bool {
     !receiver.is_closed() || !receiver.is_empty()
+}
+
+/// Polling these owned waits only republishes notices into their existing
+/// lanes. It never returns work ahead of retirement/control/repair ordering.
+fn poll_prepared_waits(
+    waits: &mut mpsc::UnboundedReceiver<PreparedOriginalWait>,
+    deferred: &mut FuturesUnordered<PreparedOriginalWait>,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
+    let mut progressed = false;
+    while let Poll::Ready(Some(wait)) = waits.poll_recv(cx) {
+        deferred.push(wait);
+        progressed = true;
+    }
+    while let Poll::Ready(Some(())) = deferred.poll_next_unpin(cx) {
+        progressed = true;
+    }
+    if progressed {
+        Poll::Ready(())
+    } else {
+        Poll::Pending
+    }
+}
+
+fn poll_ready_prepared_waits(receivers: &mut ReliablePathCommandReceivers) {
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let _ = poll_prepared_waits(
+        &mut receivers.prepared_waits,
+        &mut receivers.deferred_prepared,
+        &mut cx,
+    );
 }
 
 fn repair_receiver_may_recv(receivers: &ReliablePathCommandReceivers) -> bool {
@@ -1887,17 +2038,35 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
     enum ReceivedCommand {
         Retirement(Option<ReliablePathRetirementCommand>),
         Queued(Option<QueuedReliablePathCommand>),
+        PreparedWake,
     }
 
     loop {
+        std::future::poll_fn(|cx| {
+            let _ = poll_prepared_waits(
+                &mut receivers.prepared_waits,
+                &mut receivers.deferred_prepared,
+                cx,
+            );
+            Poll::Ready(())
+        })
+        .await;
         if let Some(command) = recv_ready_priority_command(receivers) {
             return Some(command);
+        }
+        if reliable_path_receivers_closed(receivers) {
+            // Weak retry bookkeeping alone never retains an otherwise closed
+            // physical command owner.
+            return None;
         }
         let retirement_may_recv = retirement_receiver_may_recv(&receivers.retirement);
         let control_may_recv = path_command_receiver_may_recv(&receivers.control);
         let priority_may_recv = path_command_receiver_may_recv(&receivers.priority);
         let reinjection_may_recv = repair_receiver_may_recv(receivers);
         let data_may_recv = path_command_receiver_may_recv(&receivers.data);
+        let prepared_may_recv = !receivers.prepared_waits.is_closed()
+            || !receivers.prepared_waits.is_empty()
+            || !receivers.deferred_prepared.is_empty();
         let received = tokio::select! {
             biased;
             command = receivers.retirement.recv(), if retirement_may_recv => {
@@ -1915,6 +2084,9 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
             command = receivers.data.recv(), if data_may_recv => {
                 ReceivedCommand::Queued(command)
             }
+            () = std::future::poll_fn(|cx| poll_prepared_waits(
+                &mut receivers.prepared_waits, &mut receivers.deferred_prepared, cx,
+            )), if prepared_may_recv => ReceivedCommand::PreparedWake,
             else => return None,
         };
         match received {
@@ -1926,7 +2098,9 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
                     return Some(command);
                 }
             }
-            ReceivedCommand::Retirement(None) | ReceivedCommand::Queued(None) => {}
+            ReceivedCommand::Retirement(None)
+            | ReceivedCommand::Queued(None)
+            | ReceivedCommand::PreparedWake => {}
         }
     }
 }
@@ -2006,6 +2180,7 @@ pub(in crate::runtime) async fn recv_reliable_path_command_during_drain(
 pub(in crate::runtime) fn try_recv_reliable_path_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
+    poll_ready_prepared_waits(receivers);
     loop {
         if let Some(command) = recv_ready_priority_command(receivers) {
             return Some(command);
@@ -2020,6 +2195,7 @@ pub(in crate::runtime) fn try_recv_reliable_path_command(
 pub(in crate::runtime) fn try_recv_reliable_path_priority_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
+    poll_ready_prepared_waits(receivers);
     recv_ready_priority_command(receivers)
 }
 
@@ -2218,6 +2394,7 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
     command: &ReliablePathCommand,
 ) -> usize {
     match command {
+        ReliablePathCommand::PreparedOriginal(_) => 0,
         ReliablePathCommand::SendFrame(frame)
         | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
             reliable_path_frame_pacing_bytes(frame)
@@ -2246,6 +2423,7 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
     command: &ReliablePathCommand,
 ) -> usize {
     match command {
+        ReliablePathCommand::PreparedOriginal(_) => 0,
         ReliablePathCommand::SendFrame(frame)
         | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
             crate::protocol::codec::encoded_frame_capacity_hint(frame).max(1)
@@ -2275,6 +2453,7 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
 
 fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> Option<StreamId> {
     match command {
+        ReliablePathCommand::PreparedOriginal(work) => Some(work.stream_id()),
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_stream_id(frame),
         ReliablePathCommand::SendDatagramFrame { .. }
         | ReliablePathCommand::OpenDatagramAttachment { .. }
@@ -2309,6 +2488,7 @@ fn reliable_path_frame_stream_id(frame: &Frame) -> Option<StreamId> {
 #[cfg(feature = "lab-diagnostics")]
 fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
     match command {
+        ReliablePathCommand::PreparedOriginal(_) => "prepared_original",
         ReliablePathCommand::PrepareConnection { .. } => "prepare_connection",
         ReliablePathCommand::OpenStream { .. } => "open_stream",
         ReliablePathCommand::CancelTcpOpen { .. } => "cancel_tcp_open",

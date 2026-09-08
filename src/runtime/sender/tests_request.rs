@@ -102,11 +102,27 @@ fn opened_request_stream_with_retained_input(
     )
 }
 
+fn try_recv_request_command_after_path_proofs_for_test(
+    receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers,
+) -> Option<ReliablePathCommand> {
+    loop {
+        let command = try_recv_reliable_path_command(receivers)?;
+        if let ReliablePathCommand::SendFrame(Frame::PathProofData { payload, .. }) = &command {
+            // Installing the fixture's exact live incarnation can change its
+            // proof generation after attachment. Actual claim preparation
+            // retries that control proof; it is not Original source work.
+            assert!(!payload.is_empty());
+            receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+            continue;
+        }
+        return Some(command);
+    }
+}
+
 #[tokio::test]
 async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start() {
-    // Proposed PREPARED_ORIGINAL_OWNERSHIP_MODEL RED, not a mismatch with the
-    // current early-binding contract. No writer is spawned or data command
-    // consumed: preparation alone must not become a native Original claim.
+    // The actual actor producer publishes weak wake metadata only. No writer
+    // is spawned or data command consumed, preserving the original RED premise.
     let stream_id = StreamId(714);
     let context = client_test_context_with_paths(&["tcp://127.0.0.1:10714"]);
     let limits = context.mux_limits;
@@ -114,7 +130,7 @@ async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start()
     let (commands, mut receivers) = reliable_path_command_channels(command_capacity);
     let (opened, _frames_tx) =
         opened_request_stream_with_retained_input(stream_id, 0, commands.clone());
-    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, command_capacity);
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, command_capacity);
     let proof = try_recv_reliable_path_priority_command(&mut receivers)
         .expect("attachment publishes its separate priority proof");
     assert!(matches!(
@@ -124,8 +140,8 @@ async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start()
     receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
     let owner = remotes.paths[0].instance();
     context.install_relay_path_instance_for_test(owner);
-    let mut sender = RequestSenderService::new(stream_id);
-    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let sender = RequestSenderService::new(stream_id);
+    let send_stream = ReliableSendStream::new(stream_id, limits);
     let mut queue = ReliableRelaySenderQueue::default();
 
     let admission = sender.reliable_stream_source_admission(
@@ -168,32 +184,33 @@ async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start()
             .is_empty()
     );
 
+    let shared = SharedRequestProduct::new(RequestProductState {
+        sender_queue: queue,
+        sender,
+        send_stream,
+        last_send_ack: Default::default(),
+        remotes,
+        prepared: RequestPreparedSource::new(TrafficClass::Throughput, quantum),
+    });
+    let _actor_lifetime = shared.actor_lifetime();
+    let mut state = shared.lock();
     for _ in 0..2 {
-        match sender
-            .dispatch_client_queued_work(
-                &context,
-                TrafficClass::Throughput,
-                &mut remotes,
-                &mut send_stream,
-                &mut queue,
-                quantum,
-                ReliableDataAckFrontierState::Live,
-            )
-            .expect("two legal source quanta fit the unchanged ordinary admission")
-        {
-            ClientQueuedDispatch::Data { payload_bytes } => {
-                assert_eq!(payload_bytes, quantum);
-            }
-            _ => panic!("ordinary preparation must not require another attachment"),
-        }
+        crate::runtime::relay::control::publish_prepared_request_work(
+            &mut state,
+            &shared,
+            &context,
+            TrafficClass::Throughput,
+            quantum,
+            true,
+        );
     }
-    // Conservation, not a required storage placement. If preparation moves
-    // into a shared owner, use its actual prepared-byte view in this sum.
     assert_eq!(
-        queue.data_bytes() + send_stream.reinjection_bytes(),
+        state.sender_queue.data_bytes() + state.send_stream.reinjection_bytes(),
         source_bytes
     );
-    assert_eq!(queue.reinjection_bytes(), 0);
+    assert_eq!(state.sender_queue.data_bytes(), source_bytes);
+    assert_eq!(state.sender_queue.reinjection_bytes(), 0);
+    assert_eq!(commands.pending_bytes(), 0, "notices carry no payload debt");
     assert_eq!(
         commands.writer_pending_bytes(),
         0,
@@ -201,15 +218,572 @@ async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start()
     );
     assert!(commands.can_enqueue_lane_now(TrafficClass::Throughput));
 
-    let assigned = sender
+    let assigned = state
+        .sender
         .multipath
         .latest_unacked_ranges_for_path_instance(owner);
     assert_eq!(
-        (send_stream.next_offset(), assigned.is_empty()),
+        (state.send_stream.next_offset(), assigned.is_empty()),
         (0, true),
         "prepared but unconsumed source must not advance the wire horizon or own \
          exact Original ranges on a future writer; assigned={assigned:?}"
     );
+}
+
+#[tokio::test]
+async fn prepared_request_ready_alternate_claims_one_shared_prefix_without_queue_binding() {
+    let stream_id = StreamId(718);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10718", "tcp://127.0.0.1:10719"]);
+    let limits = context.mux_limits;
+    let capacity = crate::runtime::path::commands::reliable_path_command_queue(limits);
+    let (a_commands, mut a_receivers) = reliable_path_command_channels(capacity);
+    let (b_commands, mut b_receivers) = reliable_path_command_channels(capacity);
+    let (a_opened, _a_input) =
+        opened_request_stream_with_retained_input(stream_id, 0, a_commands.clone());
+    let (b_opened, _b_input) =
+        opened_request_stream_with_retained_input(stream_id, 1, b_commands.clone());
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(a_opened, capacity);
+    assert_eq!(
+        remotes.attach(b_opened),
+        ReliableRelayAttachOutcome::Attached
+    );
+    consume_client_path_proof_for_test(&mut a_receivers);
+    consume_client_path_proof_for_test(&mut b_receivers);
+    let a = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 0)
+        .unwrap()
+        .instance();
+    let b = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .unwrap()
+        .instance();
+    context.install_relay_path_instance_for_test(a);
+    context.install_relay_path_instance_for_test(b);
+    // Additional bulk admission requires real path validation, not merely a
+    // ready writer. Installing the exact native identities invalidates the
+    // earlier challenges, so acknowledge the current producer's challenges.
+    remotes.retry_pending_path_proofs(&context);
+    for (instance, receivers) in [(a, &mut a_receivers), (b, &mut b_receivers)] {
+        let command = try_recv_reliable_path_priority_command(receivers)
+            .expect("current attachment challenge");
+        let ReliablePathCommand::SendFrame(frame @ Frame::PathProofData { .. }) = &command else {
+            panic!("validation consumes the actual path challenge");
+        };
+        let mut tracker = crate::runtime::path::PathProofTracker::from_limits(limits);
+        tracker.record_sent_frame(frame);
+        let Frame::PathProofData {
+            path_id,
+            proof_id,
+            payload,
+        } = frame
+        else {
+            unreachable!();
+        };
+        let path = remotes
+            .paths
+            .iter()
+            .find(|path| path.instance() == instance)
+            .expect("exact attached output");
+        assert_eq!(path.path_proof_id, Some(*proof_id));
+        let receipt = tracker
+            .acknowledge(*path_id, *proof_id, payload.len().try_into().unwrap())
+            .expect("the exact challenge has an actual tracked receipt");
+        context.mark_relay_path_proof_observation(
+            instance.key.underlay,
+            instance.key.index,
+            instance.path_instance_id,
+            receipt,
+        );
+        assert!(context.relay_path_has_fresh_proof(
+            instance.key.underlay,
+            instance.key.index,
+            *proof_id,
+            path.attached_at,
+        ));
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    }
+    let sender = RequestSenderService::new(stream_id);
+    let admission = sender.reliable_stream_source_admission(
+        &context,
+        &remotes,
+        TrafficClass::Throughput,
+        reliable_relay_buffer_len(limits),
+    );
+    let quantum = crate::model::capacity::adaptive_reliable_relay_chunk_bytes(
+        admission.selected_path,
+        TrafficClass::Throughput,
+        limits,
+    );
+    let total = 3 * quantum;
+    assert!(total <= admission.window_bytes);
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(Bytes::from(vec![0x78; total]));
+    let shared = SharedRequestProduct::new(RequestProductState {
+        sender_queue: queue,
+        sender,
+        send_stream: ReliableSendStream::new(stream_id, limits),
+        last_send_ack: Default::default(),
+        remotes,
+        prepared: RequestPreparedSource::new(TrafficClass::Throughput, quantum),
+    });
+    let actor_lifetime = shared.actor_lifetime();
+    {
+        let mut state = shared.lock();
+        crate::runtime::relay::control::publish_prepared_request_work(
+            &mut state,
+            &shared,
+            &context,
+            TrafficClass::Throughput,
+            quantum,
+            true,
+        );
+        assert_eq!(state.send_stream.next_offset(), 0);
+        assert_eq!(state.sender_queue.data_bytes(), total);
+        assert_eq!(state.prepared.last_claimed_at, None);
+    }
+    let take_notice =
+        |receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers| {
+            loop {
+                let command =
+                    try_recv_reliable_path_command(receivers).expect("actual actor notice");
+                match command {
+                    ReliablePathCommand::PreparedOriginal(work) => break work,
+                    ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => {
+                        receivers.release_pending_command_bytes(
+                            reliable_path_command_pending_bytes(&command),
+                        );
+                    }
+                    _ => panic!("prepared source must not become an ordinary payload command"),
+                }
+            }
+        };
+    assert!(a_commands.writer_boundary().snapshot().is_none());
+    let b_work = take_notice(&mut b_receivers);
+    let b_ready = b_receivers
+        .writer_ready_boundary(b.path_instance_id)
+        .expect("actual B writer boundary");
+    let first_claim_started = std::time::Instant::now();
+    let RequestPreparedClaim::Claimed(first) = b_work.try_claim(b_ready) else {
+        panic!("the only ready exact writer must claim the first admitted shared prefix");
+    };
+    let first_claim_finished = std::time::Instant::now();
+    let first_claimed_at = shared
+        .lock()
+        .prepared
+        .last_claimed_at
+        .expect("successful first claim timestamp");
+    assert!(first_claim_started <= first_claimed_at && first_claimed_at <= first_claim_finished);
+    assert_eq!(
+        reliable_stream_frame_extent(&first),
+        Some((0, quantum as u64, quantum))
+    );
+    let charged = b_receivers.register_claimed_writer_frame(&first);
+    assert_eq!(b_commands.writer_pending_bytes(), charged as u64);
+    assert!(charged >= quantum);
+    assert_eq!(a_commands.pending_bytes(), 0);
+    {
+        let state = shared.lock();
+        assert_eq!(state.send_stream.next_offset(), quantum as u64);
+        assert_eq!(state.send_stream.reinjection_bytes(), quantum);
+        assert_eq!(state.sender_queue.data_bytes(), 2 * quantum);
+        assert_eq!(
+            state.sender_queue.data_bytes() + state.send_stream.reinjection_bytes(),
+            total
+        );
+        assert!(
+            state
+                .sender
+                .multipath
+                .latest_unacked_ranges_for_path_instance(a)
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .sender
+                .multipath
+                .latest_unacked_ranges_for_path_instance(b),
+            vec![OffsetRange {
+                start: 0,
+                end: quantum as u64
+            }]
+        );
+    }
+    // B's protected frame remains charged. It is not ready again; A claims
+    // the next distinct prefix, never a copy or a transfer of B's wire owner.
+    let a_work = take_notice(&mut a_receivers);
+    let a_ready = a_receivers
+        .writer_ready_boundary(a.path_instance_id)
+        .expect("actual A writer boundary");
+    {
+        let state = shared.lock();
+        let frame = state
+            .send_stream
+            .prepare_data(Bytes::from(vec![0x78; quantum]))
+            .expect("current second Original extent");
+        let inputs = super::multipath::RequestRelayNativeCapture::new(
+            state.remotes.membership_generation(),
+            &state.remotes.paths,
+        )
+        .resolve();
+        let observation = state
+            .sender
+            .multipath
+            .observe_original_claim_from_inputs(
+                &context,
+                &state.remotes,
+                &frame,
+                TrafficClass::Throughput,
+                true,
+                inputs,
+            )
+            .expect("current exact Native and Product observation");
+        let plan = state
+            .sender
+            .multipath
+            .plan_original_claim_from_observation(
+                &context,
+                &observation,
+                &observation,
+                &state.remotes,
+                &frame,
+                TrafficClass::Throughput,
+                ReliableDataAckFrontierState::Live,
+                &[a],
+            )
+            .expect("actual proof admits A within unchanged additional-path P/E authority");
+        assert_eq!(plan.target().1, a);
+        assert_eq!(state.send_stream.next_offset(), quantum as u64);
+        assert_eq!(state.send_stream.reinjection_bytes(), quantum);
+    }
+    let second_claim_started = std::time::Instant::now();
+    let RequestPreparedClaim::Claimed(second) = a_work.try_claim(a_ready) else {
+        panic!("the next ready output must use unchanged whole-frame Product authority");
+    };
+    let second_claim_finished = std::time::Instant::now();
+    let second_claimed_at = shared
+        .lock()
+        .prepared
+        .last_claimed_at
+        .expect("successful second claim timestamp");
+    assert!(
+        second_claim_started <= second_claimed_at && second_claimed_at <= second_claim_finished
+    );
+    assert!(first_claimed_at <= second_claimed_at);
+    assert_eq!(
+        reliable_stream_frame_extent(&second),
+        Some((quantum as u64, (2 * quantum) as u64, quantum))
+    );
+    let a_charged = a_receivers.register_claimed_writer_frame(&second);
+    {
+        let state = shared.lock();
+        assert_eq!(state.send_stream.next_offset(), (2 * quantum) as u64);
+        assert_eq!(state.send_stream.reinjection_bytes(), 2 * quantum);
+        assert_eq!(state.sender_queue.data_bytes(), quantum);
+        assert_eq!(
+            state.sender_queue.data_bytes() + state.send_stream.reinjection_bytes(),
+            total
+        );
+        assert_eq!(
+            state
+                .sender
+                .multipath
+                .latest_unacked_ranges_for_path_instance(a),
+            vec![OffsetRange {
+                start: quantum as u64,
+                end: (2 * quantum) as u64
+            }]
+        );
+    }
+    b_receivers.release_pending_command_bytes(charged);
+    a_receivers.release_pending_command_bytes(a_charged);
+    assert_eq!(a_commands.pending_bytes(), 0);
+    assert_eq!(b_commands.pending_bytes(), 0);
+
+    // The logical actor owns cancellation even while this test retains the
+    // shared owner and a previously admitted weak token. U must not be claimed.
+    drop(actor_lifetime);
+    let ready = b_receivers
+        .writer_ready_boundary(b.path_instance_id)
+        .unwrap();
+    assert!(matches!(
+        b_work.try_claim(ready),
+        RequestPreparedClaim::Empty
+    ));
+    let state = shared.lock();
+    assert_eq!(state.send_stream.next_offset(), (2 * quantum) as u64);
+    assert_eq!(state.sender_queue.data_bytes(), quantum);
+    assert!(!state.prepared.claims_active);
+    assert_eq!(
+        state.prepared.last_claimed_at,
+        Some(second_claimed_at),
+        "the failed post-abort claim cannot manufacture progress time",
+    );
+
+    // Both actual successful claims precede this one actor observation. The
+    // used helper takes no observation clock that could renew their age.
+    let mut observed_offset = 0;
+    let mut last_stream_at = first_claim_started;
+    let observed_bytes = crate::runtime::relay::control::observe_prepared_request_claims(
+        &state,
+        &mut observed_offset,
+        &mut last_stream_at,
+    );
+    assert_eq!(observed_bytes, 2 * quantum);
+    assert_eq!(observed_offset, (2 * quantum) as u64);
+    let recv_stream = crate::mux::stream::ReliableRecvStream::new(stream_id, limits);
+    let anchor = crate::runtime::relay::lifecycle::reliable_relay_stall_progress_anchor(
+        last_stream_at,
+        first_claim_started,
+        first_claim_started,
+        &recv_stream,
+        false,
+        TrafficClass::Throughput,
+        false,
+        limits,
+    );
+    assert_eq!(
+        anchor, second_claimed_at,
+        "delayed actor observation must not renew the nonresponse fallback anchor past the actual successful claim",
+    );
+    assert_eq!(
+        crate::runtime::relay::control::observe_prepared_request_claims(
+            &state,
+            &mut observed_offset,
+            &mut last_stream_at,
+        ),
+        0,
+        "the same claimed horizon is not new progress",
+    );
+    assert_eq!(last_stream_at, second_claimed_at);
+
+    // A newer ACK/control event already owned by the actor must survive
+    // observation of these older claims. The existing path-derived PTO only
+    // orders the synthetic later event; no sleep or new threshold is involved.
+    let newer_ack_at = second_claimed_at
+        + crate::model::timing::transport_pto_from_snapshot(admission.selected_path);
+    let mut unobserved_offset = 0;
+    let mut newer_progress = newer_ack_at;
+    assert_eq!(
+        crate::runtime::relay::control::observe_prepared_request_claims(
+            &state,
+            &mut unobserved_offset,
+            &mut newer_progress,
+        ),
+        2 * quantum,
+    );
+    assert_eq!(newer_progress, newer_ack_at);
+}
+
+#[tokio::test]
+async fn queued_request_source_validation_preserves_the_attached_carrier() {
+    let stream_id = StreamId(715);
+    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10715"]);
+    let limits = context.mux_limits;
+    let capacity = crate::runtime::path::commands::reliable_path_command_queue(limits);
+    let (commands, mut receivers) = reliable_path_command_channels(capacity);
+    let (opened, _frames_tx) =
+        opened_request_stream_with_retained_input(stream_id, 0, commands.clone());
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, capacity);
+    let proof = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
+    assert!(matches!(
+        proof,
+        ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+    let owner = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(owner);
+    let generation = remotes.membership_generation();
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let mut queue = ReliableRelaySenderQueue::default();
+    let payload = Bytes::from(vec![0x72; 4096]);
+    queue.push_data(payload.clone());
+
+    for source_replaced in [false, true] {
+        let mut frame = send_stream.prepare_data(payload.clone()).unwrap();
+        if source_replaced {
+            queue
+                .commit_front()
+                .expect("replace the uncommitted source item");
+            let replacement = Bytes::copy_from_slice(&payload);
+            assert_ne!(replacement.as_ptr(), payload.as_ptr());
+            queue.push_data(replacement);
+        } else {
+            let Frame::StreamData { offset, .. } = &mut frame else {
+                unreachable!()
+            };
+            *offset += 1;
+        }
+        let result = sender.send_stream_data_for_request_lane(
+            &context,
+            &mut remotes,
+            frame,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            RequestQueuedSourceCommit {
+                send_stream: &mut send_stream,
+                sender_queue: &mut queue,
+            },
+        );
+        if source_replaced {
+            assert!(matches!(result, Err(RuntimeError::SenderServiceBlocked)));
+        } else {
+            assert!(matches!(
+                result,
+                Err(RuntimeError::Stream(StreamError::InvalidPreparedFrame))
+            ));
+        }
+        assert_eq!(
+            (send_stream.next_offset(), send_stream.reinjection_bytes()),
+            (0, 0)
+        );
+        assert_eq!(queue.data_bytes(), payload.len());
+        assert!(
+            sender
+                .multipath
+                .latest_unacked_ranges_for_path_instance(owner)
+                .is_empty()
+        );
+        assert_eq!(remotes.membership_generation(), generation);
+        assert_eq!(remotes.paths.len(), 1);
+        assert_eq!(remotes.paths[0].instance(), owner);
+        assert_eq!(commands.pending_bytes(), 0);
+        assert!(try_recv_request_command_after_path_proofs_for_test(&mut receivers).is_none());
+    }
+
+    let result = sender
+        .dispatch_client_queued_work(
+            &context,
+            TrafficClass::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut queue,
+            payload.len(),
+            ReliableDataAckFrontierState::Live,
+        )
+        .expect("the unchanged live carrier accepts the actual current source");
+    assert!(
+        matches!(result, ClientQueuedDispatch::Data { payload_bytes } if payload_bytes == payload.len())
+    );
+    assert_eq!(queue.data_bytes(), 0);
+    assert_eq!(
+        (send_stream.next_offset(), send_stream.reinjection_bytes()),
+        (payload.len() as u64, payload.len())
+    );
+    assert_eq!(
+        sender
+            .multipath
+            .latest_unacked_ranges_for_path_instance(owner),
+        vec![OffsetRange {
+            start: 0,
+            end: payload.len() as u64
+        }]
+    );
+    let command = try_recv_reliable_path_command(&mut receivers).expect("one committed Original");
+    assert!(
+        matches!(&command, ReliablePathCommand::SendFrame(Frame::StreamData { stream_id: actual, offset: 0, payload: actual_payload }) if *actual == stream_id && actual_payload == &payload)
+    );
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert_eq!(commands.pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn rejected_native_request_admission_preserves_uncommitted_source() {
+    for close_receiver in [false, true] {
+        let stream_id = StreamId(716);
+        let context = client_test_context_with_paths(&["quic://127.0.0.1:10716"]);
+        let limits = context.mux_limits;
+        let capacity = crate::runtime::path::commands::reliable_path_command_queue(limits);
+        let (commands, mut receivers) = reliable_path_command_channels(capacity);
+        let (opened, native) = opened_test_relay_stream_with_native_source(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            commands.clone(),
+            crate::transport::RateHint::BitsPerSecond(25_000_000),
+            7,
+            Some(100_000_000),
+        );
+        let native = native.expect("actual attached QUIC authority");
+        let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, capacity);
+        let owner = remotes.paths[0].instance();
+        let proof = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
+        assert!(matches!(
+            proof,
+            ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
+        ));
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+        seed_client_bulk_evidence_for_test(&context, owner);
+        let mut receivers = Some(receivers);
+        let mut sender = RequestSenderService::new(stream_id);
+        let mut send_stream = ReliableSendStream::new(stream_id, limits);
+        let mut queue = ReliableRelaySenderQueue::default();
+        let payload = Bytes::from(vec![0x73; 4096]);
+        queue.push_data(payload.clone());
+        let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if close_receiver {
+            drop(receivers.take());
+        } else {
+            let observed_reservation = reserved.clone();
+            sender.set_after_frame_reservation_for_test(move || {
+                observed_reservation.store(true, std::sync::atomic::Ordering::SeqCst);
+                native.advance_transport_activation_for_test(2).unwrap();
+                native
+                    .publish_observation_for_test(2, 8, Some(100_000_000))
+                    .unwrap();
+                // No successor scheduling shape exists yet. The old exact
+                // Native receipt must not commit the queued source.
+            });
+        }
+        let frame = send_stream.prepare_data(payload.clone()).unwrap();
+        let result = sender.send_stream_data_for_request_lane(
+            &context,
+            &mut remotes,
+            frame,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            RequestQueuedSourceCommit {
+                send_stream: &mut send_stream,
+                sender_queue: &mut queue,
+            },
+        );
+        assert!(
+            result.is_err(),
+            "neither a closed carrier nor an unpublished successor can claim source"
+        );
+        assert_eq!(
+            (send_stream.next_offset(), send_stream.reinjection_bytes()),
+            (0, 0)
+        );
+        assert_eq!(queue.data_bytes(), payload.len());
+        assert!(
+            matches!(queue.front().map(|(_, work)| &work.kind), Some(ReliableRelayQueuedWorkKind::Data(current)) if current == &payload)
+        );
+        assert!(
+            sender
+                .multipath
+                .latest_unacked_ranges_for_path_instance(owner)
+                .is_empty()
+        );
+        assert_eq!(commands.pending_bytes(), 0);
+        if let Some(receivers) = receivers.as_mut() {
+            assert!(reserved.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(matches!(result, Err(RuntimeError::SenderServiceBlocked)));
+            assert_eq!(
+                remotes.paths.len(),
+                1,
+                "a stale Native receipt is not carrier failure"
+            );
+            assert_eq!(remotes.paths[0].instance(), owner);
+            assert!(try_recv_request_command_after_path_proofs_for_test(receivers).is_none());
+        }
+    }
 }
 
 #[test]
@@ -3673,4 +4247,451 @@ async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() 
     assert_eq!(send_stream.reinjection_bytes(), 4096);
     assert!(remotes.contains_path_instance(copy));
     assert!(queue.is_empty());
+}
+
+#[tokio::test]
+async fn prepared_request_deferred_notice_wakes_before_poll_and_does_not_retain_source() {
+    let stream_id = StreamId(719);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10720", "tcp://127.0.0.1:10721"]);
+    let limits = context.mux_limits;
+    let capacity = crate::runtime::path::commands::reliable_path_command_queue(limits);
+    let (a_commands, mut a_receivers) = reliable_path_command_channels(capacity);
+    let (b_commands, mut b_receivers) = reliable_path_command_channels(capacity);
+    let (a_opened, _a_input) =
+        opened_request_stream_with_retained_input(stream_id, 0, a_commands.clone());
+    let (b_opened, _b_input) =
+        opened_request_stream_with_retained_input(stream_id, 1, b_commands.clone());
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(a_opened, capacity);
+    assert_eq!(
+        remotes.attach(b_opened),
+        ReliableRelayAttachOutcome::Attached
+    );
+    for receivers in [&mut a_receivers, &mut b_receivers] {
+        let proof = try_recv_reliable_path_priority_command(receivers).unwrap();
+        assert!(matches!(
+            proof,
+            ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
+        ));
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+    }
+    let a = remotes.paths[0].instance();
+    let b = remotes.paths[1].instance();
+    context.install_relay_path_instance_for_test(a);
+    context.install_relay_path_instance_for_test(b);
+    let sender = RequestSenderService::new(stream_id);
+    let admission = sender.reliable_stream_source_admission(
+        &context,
+        &remotes,
+        TrafficClass::Throughput,
+        reliable_relay_buffer_len(limits),
+    );
+    let quantum = crate::model::capacity::adaptive_reliable_relay_chunk_bytes(
+        admission.selected_path,
+        TrafficClass::Throughput,
+        limits,
+    );
+    assert!(admission.selected_path.is_some());
+    assert!(quantum <= admission.window_bytes);
+    let source: Arc<[u8]> = Arc::from(vec![0x79; quantum]);
+    let weak_source = Arc::downgrade(&source);
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(Bytes::from_owner(source));
+    let shared = SharedRequestProduct::new(RequestProductState {
+        sender_queue: queue,
+        sender,
+        send_stream: ReliableSendStream::new(stream_id, limits),
+        last_send_ack: Default::default(),
+        remotes,
+        prepared: RequestPreparedSource::new(TrafficClass::Throughput, quantum),
+    });
+    let weak_product = shared.downgrade();
+    let actor_lifetime = shared.actor_lifetime();
+    let registration = {
+        let mut state = shared.lock();
+        crate::runtime::relay::control::publish_prepared_request_work(
+            &mut state,
+            &shared,
+            &context,
+            TrafficClass::Throughput,
+            quantum,
+            true,
+        );
+        state.prepared.registrations[1].clone()
+    };
+    assert_eq!(registration.instance(), b);
+    let weak_registration = Arc::downgrade(&registration);
+    let take_b_notice =
+        |receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers| {
+            let command = try_recv_request_command_after_path_proofs_for_test(receivers)
+                .expect("actual weak notice");
+            let ReliablePathCommand::PreparedOriginal(work) = command else {
+                panic!("prepared source must remain a payload-free notice");
+            };
+            work
+        };
+
+    // Both actual default writers are ready. The unchanged ordinary order
+    // selects A; B must park without claiming or manufacturing a new delay.
+    let _a_ready = a_receivers
+        .writer_ready_boundary(a.path_instance_id)
+        .unwrap();
+    let work = take_b_notice(&mut b_receivers);
+    let ready = b_receivers
+        .writer_ready_boundary(b.path_instance_id)
+        .unwrap();
+    let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
+        panic!("B must defer to the eligible ordinary A writer");
+    };
+    b_receivers.defer_prepared_work(work, wait);
+    // These notifications follow claim entry, before the deferred future's
+    // first poll. Neither Product, Native nor A readiness changes here.
+    registration.notify();
+    registration.notify();
+    let work = take_b_notice(&mut b_receivers);
+    assert!(try_recv_request_command_after_path_proofs_for_test(&mut b_receivers).is_none());
+    assert!(a_commands.writer_boundary().snapshot().is_some());
+    assert!(b_commands.writer_boundary().snapshot().is_none());
+
+    // Without a fresh notification the same real failed claim stays parked;
+    // withdrawing B's own Ready guard must not trigger an immediate retry.
+    let ready = b_receivers
+        .writer_ready_boundary(b.path_instance_id)
+        .unwrap();
+    let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
+        panic!("unchanged ordinary selection must still choose A");
+    };
+    b_receivers.defer_prepared_work(work, wait);
+    assert!(try_recv_request_command_after_path_proofs_for_test(&mut b_receivers).is_none());
+    {
+        let state = shared.lock();
+        assert_eq!(state.send_stream.next_offset(), 0);
+        assert_eq!(state.send_stream.reinjection_bytes(), 0);
+        assert_eq!(state.sender_queue.data_bytes(), quantum);
+    }
+    assert_eq!(a_commands.pending_bytes(), 0);
+    assert_eq!(b_commands.pending_bytes(), 0);
+    drop(registration);
+    drop(actor_lifetime);
+    assert!(weak_registration.upgrade().is_none());
+    {
+        let state = shared.lock();
+        assert!(!state.prepared.claims_active);
+        assert!(state.prepared.registrations.is_empty());
+        assert_eq!(state.sender_queue.data_bytes(), quantum);
+    }
+    drop(shared);
+    // Keep A's queued token and B's deferred token/receivers alive and unpolled:
+    // neither may retain the logical owner or its actual source allocation.
+    assert!(weak_product.upgrade().is_none());
+    assert!(weak_source.upgrade().is_none());
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparedWriterClaimCase {
+    Uncontended,
+    LoserWithdraws,
+    SelectedDrains,
+    BackupFallback,
+    RegularBecomesReady,
+}
+
+fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, usize) {
+    let stream_id = StreamId(721);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10722", "tcp://127.0.0.1:10723"]);
+    let limits = context.mux_limits;
+    let capacity = crate::runtime::path::commands::reliable_path_command_queue(limits);
+    let (a_commands, mut a_receivers) = reliable_path_command_channels(capacity);
+    let (b_commands, mut b_receivers) = reliable_path_command_channels(capacity);
+    let (a_opened, _a_input) =
+        opened_request_stream_with_retained_input(stream_id, 0, a_commands.clone());
+    let (b_opened, _b_input) =
+        opened_request_stream_with_retained_input(stream_id, 1, b_commands.clone());
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(a_opened, capacity);
+    assert_eq!(
+        remotes.attach(b_opened),
+        ReliableRelayAttachOutcome::Attached
+    );
+    for receivers in [&mut a_receivers, &mut b_receivers] {
+        let proof = try_recv_reliable_path_priority_command(receivers).unwrap();
+        assert!(matches!(
+            proof,
+            ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
+        ));
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+    }
+    let a = remotes.paths[0].instance();
+    let b = remotes.paths[1].instance();
+    context.install_relay_path_instance_for_test(a);
+    context.install_relay_path_instance_for_test(b);
+    let a_is_backup = matches!(
+        case,
+        PreparedWriterClaimCase::BackupFallback | PreparedWriterClaimCase::RegularBecomesReady
+    );
+    if a_is_backup {
+        assert!(context.update_relay_path_usage_for_test(a, 1, crate::protocol::PathUsage::Backup));
+    }
+    // The hook may publish B's actual exclusive receiver boundary while A is
+    // suspended. This test-local owner is never a production synchronization.
+    let b_receivers = Arc::new(std::sync::Mutex::new(b_receivers));
+    let sender = RequestSenderService::new(stream_id);
+    let admission = sender.reliable_stream_source_admission(
+        &context,
+        &remotes,
+        TrafficClass::Throughput,
+        reliable_relay_buffer_len(limits),
+    );
+    assert!(admission.selected_path.is_some());
+    let quantum = crate::model::capacity::adaptive_reliable_relay_chunk_bytes(
+        admission.selected_path,
+        TrafficClass::Throughput,
+        limits,
+    );
+    assert!(quantum <= admission.window_bytes);
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(Bytes::from(vec![0x7b; quantum]));
+    let shared = SharedRequestProduct::new(RequestProductState {
+        sender_queue: queue,
+        sender,
+        send_stream: ReliableSendStream::new(stream_id, limits),
+        last_send_ack: Default::default(),
+        remotes,
+        prepared: RequestPreparedSource::new(TrafficClass::Throughput, quantum),
+    });
+    let _actor_lifetime = shared.actor_lifetime();
+    {
+        let mut state = shared.lock();
+        crate::runtime::relay::control::publish_prepared_request_work(
+            &mut state,
+            &shared,
+            &context,
+            TrafficClass::Throughput,
+            quantum,
+            true,
+        );
+    }
+    let take_notice =
+        |receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers| {
+            let command = try_recv_request_command_after_path_proofs_for_test(receivers)
+                .expect("actual initial or deferred-wake notice");
+            let ReliablePathCommand::PreparedOriginal(work) = command else {
+                panic!("source must remain an unbound weak notice");
+            };
+            work
+        };
+    for _round in 0..2 {
+        let a_work = take_notice(&mut a_receivers);
+        let mut b_work = Some(take_notice(&mut b_receivers.lock().unwrap()));
+        let a_ready = a_receivers
+            .writer_ready_boundary(a.path_instance_id)
+            .unwrap();
+        let mut b_ready = (!a_is_backup).then(|| {
+            b_receivers
+                .lock()
+                .unwrap()
+                .writer_ready_boundary(b.path_instance_id)
+                .unwrap()
+        });
+        let parked_b = Arc::new(std::sync::Mutex::new(None));
+        let newly_ready_b = Arc::new(std::sync::Mutex::new(None));
+        if case == PreparedWriterClaimCase::LoserWithdraws {
+            let parked_b = parked_b.clone();
+            let b_work = b_work.take().unwrap();
+            let b_ready = b_ready.take().unwrap();
+            shared.before_prepared_native_resolve_once_for_test(move || {
+                // A is paused after its full Ready capture with Product
+                // unlocked. B makes its real ordinary decision, selects A,
+                // and relinquishes only B's own Ready epoch before A resumes.
+                let RequestPreparedClaim::Blocked(wait) = b_work.try_claim(b_ready) else {
+                    panic!("the unchanged default ordinary choice must be A, not B");
+                };
+                *parked_b.lock().unwrap() = Some((b_work, wait));
+            });
+        } else if case == PreparedWriterClaimCase::SelectedDrains {
+            let commands = a_commands.clone();
+            shared.before_prepared_native_resolve_once_for_test(move || {
+                commands.begin_path_drain();
+            });
+        } else if case == PreparedWriterClaimCase::RegularBecomesReady {
+            let receivers = b_receivers.clone();
+            let newly_ready_b = newly_ready_b.clone();
+            assert!(b_commands.writer_boundary().snapshot().is_none());
+            shared.before_prepared_native_resolve_once_for_test(move || {
+                let ready = receivers
+                    .lock()
+                    .unwrap()
+                    .writer_ready_boundary(b.path_instance_id)
+                    .expect("healthy regular B reaches its actual writer boundary");
+                *newly_ready_b.lock().unwrap() = Some(ready);
+            });
+        }
+        match a_work.try_claim(a_ready) {
+            RequestPreparedClaim::Claimed(frame) => {
+                assert!(
+                    !matches!(
+                        case,
+                        PreparedWriterClaimCase::SelectedDrains
+                            | PreparedWriterClaimCase::RegularBecomesReady
+                    ),
+                    "A cannot commit after its drain or a newly ready regular B"
+                );
+                assert_eq!(
+                    reliable_stream_frame_extent(&frame),
+                    Some((0, quantum as u64, quantum))
+                );
+                let state = shared.lock();
+                assert_eq!(state.sender_queue.data_bytes(), 0);
+                assert_eq!(state.send_stream.reinjection_bytes(), quantum);
+                assert_eq!(
+                    state
+                        .sender
+                        .multipath
+                        .latest_unacked_ranges_for_path_instance(a),
+                    vec![OffsetRange {
+                        start: 0,
+                        end: quantum as u64
+                    }]
+                );
+                assert!(
+                    state
+                        .sender
+                        .multipath
+                        .latest_unacked_ranges_for_path_instance(b)
+                        .is_empty()
+                );
+                return (state.send_stream.next_offset(), quantum);
+            }
+            RequestPreparedClaim::Blocked(wait) => {
+                if case == PreparedWriterClaimCase::RegularBecomesReady {
+                    {
+                        let state = shared.lock();
+                        assert_eq!(state.send_stream.next_offset(), 0);
+                        assert_eq!(state.send_stream.reinjection_bytes(), 0);
+                        assert_eq!(state.sender_queue.data_bytes(), quantum);
+                    }
+                    let ready = newly_ready_b
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("regular B became ready during A's unlocked observation");
+                    let RequestPreparedClaim::Claimed(frame) =
+                        b_work.take().unwrap().try_claim(ready)
+                    else {
+                        panic!("the newly ready regular must claim the unchanged shared head");
+                    };
+                    assert_eq!(
+                        reliable_stream_frame_extent(&frame),
+                        Some((0, quantum as u64, quantum))
+                    );
+                    let state = shared.lock();
+                    assert_eq!(state.sender_queue.data_bytes(), 0);
+                    assert!(
+                        state
+                            .sender
+                            .multipath
+                            .latest_unacked_ranges_for_path_instance(a)
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        state
+                            .sender
+                            .multipath
+                            .latest_unacked_ranges_for_path_instance(b),
+                        vec![OffsetRange {
+                            start: 0,
+                            end: quantum as u64
+                        }]
+                    );
+                    return (state.send_stream.next_offset(), quantum);
+                }
+                if case == PreparedWriterClaimCase::SelectedDrains {
+                    let state = shared.lock();
+                    assert_eq!(state.send_stream.reinjection_bytes(), 0);
+                    assert_eq!(state.sender_queue.data_bytes(), quantum);
+                    assert!(a_commands.writer_boundary().snapshot().is_none());
+                    assert_eq!(a_commands.pending_bytes(), 0);
+                    return (state.send_stream.next_offset(), quantum);
+                }
+                assert!(
+                    case == PreparedWriterClaimCase::LoserWithdraws,
+                    "an uncontended current writer must pass actual admission"
+                );
+                let (b_work, b_wait) = parked_b
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("the competing actual B claim completed before A resumed");
+                a_receivers.defer_prepared_work(a_work, wait);
+                b_receivers
+                    .lock()
+                    .unwrap()
+                    .defer_prepared_work(b_work, b_wait);
+                let state = shared.lock();
+                assert_eq!(state.send_stream.next_offset(), 0);
+                assert_eq!(state.send_stream.reinjection_bytes(), 0);
+                assert_eq!(state.sender_queue.data_bytes(), quantum);
+                assert_eq!(a_commands.pending_bytes(), 0);
+                assert_eq!(b_commands.pending_bytes(), 0);
+                // The next round consumes both actual receiver-deferred wakes.
+                // No source, ACK, Native, policy or capacity event is injected.
+            }
+            RequestPreparedClaim::Empty if case == PreparedWriterClaimCase::SelectedDrains => {
+                let state = shared.lock();
+                assert_eq!(state.send_stream.reinjection_bytes(), 0);
+                assert_eq!(state.sender_queue.data_bytes(), quantum);
+                assert!(
+                    state
+                        .sender
+                        .multipath
+                        .latest_unacked_ranges_for_path_instance(a)
+                        .is_empty()
+                );
+                assert!(a_commands.writer_boundary().snapshot().is_none());
+                assert_eq!(a_commands.pending_bytes(), 0);
+                return (state.send_stream.next_offset(), quantum);
+            }
+            _ => panic!("eligible current writers must either claim or await changed evidence"),
+        }
+    }
+    let state = shared.lock();
+    (state.send_stream.next_offset(), quantum)
+}
+
+#[tokio::test]
+async fn prepared_request_ready_claim_control_progresses() {
+    let (claimed, quantum) =
+        prepared_competing_writer_claim_case(PreparedWriterClaimCase::Uncontended);
+    assert_eq!(claimed, quantum as u64);
+}
+
+#[tokio::test]
+async fn prepared_request_ready_claim_loser_withdrawal_cannot_prevent_progress() {
+    let (claimed, quantum) =
+        prepared_competing_writer_claim_case(PreparedWriterClaimCase::LoserWithdraws);
+    assert_eq!(
+        claimed, quantum as u64,
+        "the losing writer's own withdrawal must not repeatedly invalidate the \
+         ordinary winner and regenerate both retries without any claim"
+    );
+}
+
+#[tokio::test]
+async fn prepared_request_ready_claim_selected_drain_retains_source() {
+    let (claimed, _) =
+        prepared_competing_writer_claim_case(PreparedWriterClaimCase::SelectedDrains);
+    assert_eq!(claimed, 0);
+}
+
+#[tokio::test]
+async fn prepared_request_ready_claim_new_regular_displaces_backup() {
+    let (claimed, quantum) =
+        prepared_competing_writer_claim_case(PreparedWriterClaimCase::BackupFallback);
+    assert_eq!(
+        claimed, quantum as u64,
+        "backup may serve after the regular writer's failed pass"
+    );
+    let (claimed, quantum) =
+        prepared_competing_writer_claim_case(PreparedWriterClaimCase::RegularBecomesReady);
+    assert_eq!(claimed, quantum as u64);
 }

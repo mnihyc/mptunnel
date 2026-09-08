@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 15:23 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 15:49 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -10,7 +10,58 @@ approaches, remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`.
 Detailed evidence is linked below; shortening obsolete next-action prose does
 not discard findings, adverse results or acceptance gates.
 
-## Active transaction: native claimant owner admission
+## Active transaction: QoS forward-prefix stall
+
+**Issue / evidence:** the completed e476308 ordinary run has a5.000s sampled
+T173608233 hold during15–20s. By16s S−T=64MiB, Rs=Rc435 and all client TCP
+Recv-Q values are zero. Native TCP ACK bytes and QUIC accounting still advance.
+This is not the previous already-produced reply backlog. Separate Rc449 and
+Rc841 holds with continued T/Rs progress remain recorded, not waived.
+ADVISORY_OWNER_SERVICE_20260908 contains the full pair, phases and raw bins.
+
+**Exact question / alternatives:** which original attachment owns the blocking
+request prefix, when was it actually claimed/written, and did an admitted
+recovery copy exist before server ordered delivery resumed? Alternatives are
+no source assignment, native queued/lost service, unavailable exact recovery,
+and local receive/ordering service. Aggregate S−T is neither claimed C nor one
+64MiB native queue. Zero client Recv-Q does not prove zero server input delay.
+
+**Smallest discriminator:** one diagnostic capture on unchanged e476308 and
+the same profile, not another ordinary performance trial. Reuse server hole/
+delivery-stall and client ACK/recovery events. Fill only absent exact range,
+instance, claim/write and receiving-frontier boundaries needed to join the
+blocking request; no per-attempt scheduler logging or aggregate cost overlay.
+Archive/reverse every temporary hook before running its frozen binary. Review
+its owner/lifetime and timestamp semantics independently before build.
+
+**Falsifier / stop:** a different or absent long forward hold is non-reproduction,
+not improvement. Exact source/range/instance joins precede blame; write completion
+is local native acceptance, not remote arrival. Accepted ownership does not
+prove protected write completion; duplicate arrival does not identify a winner.
+Follow the earliest supported held boundary and retain unknown sub-stages.
+No controller/resource/threshold correction without a real counterexample.
+
+**Disposition / scope:** e476308 remains an isolated mechanism-correct
+intermediate checkpoint, not a promoted performance fix. Its early receive
+consumption and T improve in this realization; worse max gaps and later
+settlement prohibit uniform benefit claims. No rollback of exact ownership
+from a random average alone. Source audit of existing ACK-release cost found
+an exact potential untouched-suffix work exclusion, but it is NOT the next
+fix: no RED/implementation or new obligation follows while the observed worst
+phase is forward starvation. Keep that contingent reasoning only for a later
+cost-selected question. All global gates below are unchanged.
+
+## Completed transaction: native claimant owner admission
+
+**Ordinary pair complete15:39 — no promotion:** optimized e476308 build3m31s,
+warning-free. Parent9ea25e2 completes355532800B/44.964483s; candidate completes
+409796608B/49.163739s. Maximum confirmation5.052667→6.197568s and maximum
+write1.356326→5.462440s worsen; first confirmation.848948→.713189s and
+first write.580035→.122947s improve.63.256→66.683Mbps is not acceptance.
+Full phase/socket/cost comparison is complete; all raw data and RED/GREEN/
+build logs archived in ADVISORY_OWNER_SERVICE_20260908.raw.tar.gz. No build or
+lab running, no further runtime edit. Different work and random realizations
+prevent attributing all changes to contention. Preserve earlier adverse cases.
 
 **Pre-change decision15:23:** the completed reply/cost joins below select a
 reachable local service boundary, not a universal congestion explanation.
@@ -119,8 +170,10 @@ a different stage, follow it rather than force the recovery-cost hypothesis.
 
 ## Current source and latest practical disposition
 
-Runtime checkpoint **9ea25e2** maintains exact additive accepted-copy debt by
-attachment. RED checkpoint **3396087**, evidence checkpoint **ebad57f**.
+Runtime checkpoint **e476308** adds the two nonblocking advisory acquisitions
+above; RED checkpoint584b748. Its ordinary result is mixed/adverse in timing
+and not promoted. Parent **9ea25e2** maintains exact additive accepted-copy debt
+by attachment; RED checkpoint **3396087**, evidence checkpoint **ebad57f**.
 No shelved sampler, new Native observation policy or congestion tuning is active.
 The user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md edit is untouched and
 must remain outside commits.
@@ -176,6 +229,7 @@ Do not silently package it as source cleanup.
 | Prepared request ownership9720e4b |U→exact Original ownership at native claim; no premature TCP assignment.533checks/audit, then ordinary75s return hold/incomplete settlement |
 | Persistent idle readinessb3dfef1 |Real all-refused two-writer retry recurrence removed;535checks/audit. Ordinary long return/target holds remain |
 | Exact copy-debt index9ea25e2 |Work and conservation proved; ordinary settlement improves,11s gaps remain |
+| Native advisory owner admissione476308 |Actual two-cut contention RED/GREEN; no blocking native Product acquisition. Ordinary completion with worse gaps; no practical promotion |
 | Shelved paired-clock request sampler |Actual[2,2,2]→[2,3,4] sampling correction; ordinary incomplete/adverse, not stacked into runtime |
 
 Preserve prepared-source conservation and exact chosen readiness epochs:
@@ -221,10 +275,10 @@ above500Mbps can be buffered observation, not wire capacity.
 
 - Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
   overlap. Products/probes stopped; origins retained. No build/lab running.
-- Normal frozen candidate:`./.tmp/reflection/bin/copy-debt-20260908/mptunnel`.
-  Normal parent:`./.tmp/reflection/bin/prepared-idle-20260908/mptunnel`.
+- Normal frozen candidate:`./.tmp/reflection/bin/advisory-owner-20260908/mptunnel`.
+  Normal parent:`./.tmp/reflection/bin/copy-debt-20260908/mptunnel`.
   Diagnostic: `./.tmp/reflection/bin/copy-debt-service-20260908/mptunnel`.
-  target/release is the diagnostic binary: do not use it as ordinary.
+  target/release is now the completed ordinarye476308 binary.
 - Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
   No deletion this turn; ample root space. User7lines must stay unstaged.
 - Telegram last meaningful report before2026-09-08 07:26UTC; next nonurgent

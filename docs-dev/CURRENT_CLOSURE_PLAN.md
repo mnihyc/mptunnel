@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 22:34 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 23:08 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,81 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Current return finding23:08:** the capture settles388759552 exact bytes in
+45.495787s, but maximum confirmation gap6.510292s persists. Its largest F591
+gap is6.474s before the server produces the next reply; read-to-local delivery
+is37ms. Do not call that a receive-service stall. Separately, TCP Original
+[325,339) is positively decoded before F becomes325, yet the entire943ms
+frontier hold follows; a later QUIC repair wins before that Original is routed.
+This proves material local service delay, not missing input or one long mutex.
+Winning[885,899) also spends790ms decode-to-local. All83 source enqueues and
+Originals reconcile1122B; enqueue-to-claim<=3ms, claim-to-write<=1ms.
+
+Typed ordinary-reader predecessors contain15998 MAX_DATA frames with12.405800s
+summed send-await, versus6138 ACKs/3.276955s. These are downstream waits, not
+exclusive handler CPU. F269's1.253s hold contains conservatively>=481ms of
+credit handoff waits and a separate532ms postdecode interval. Whole ages and
+overlapping totals are not predicted time savings.
+
+**Next bounded question / forecast:** preserve RFC8.4's immediate full-window
+credit publication (5c1d288); do not restore quarter-window gating. Client
+merged input currently returns each monotonic credit as a separate actor turn,
+repeating admission/path observations. Test the actual input path with a finite
+already-ready same-stream MAX_DATA run, followed by useful Data. A proposed
+latest-credit fold may replace only that consecutive run by its greatest grant;
+snapshot ready work, retain the first non-MAX boundary, never wait/coalesce
+ACKs/cross terminal or identity boundaries. One private deferred slot must be
+accounted in ready/closed state. Isolated credit still returns immediately.
+
+This can remove redundant actor preparation for such runs without withholding
+credit; it cannot remove intervening ACK work, pre-source gaps or all measured
+local residence. Practical gain may be zero if those other costs dominate.
+Real producer RED and opposite grant/ordering/lifecycle controls precede code;
+independent review precedes one implementation. Then affected ordinary UP and
+healthy high-capacity timing decide retention, including costs and both halves;
+an absent material benefit stops promotion, not a new threshold. No new model
+or performance acceptance is claimed. Diagnostic archive has7 exact members.
+
+**Symbolic boundary:** for current grant G and an already-ready consecutive
+same-stream sequence g1..gn, repeated application yields
+max(...max(G,g1),...,gn)=max(G,max(g1..gn)). These frames acknowledge no byte
+and carry no path proof. Keeping the greatest frame's actual instance preserves
+origin; keeping every non-credit boundary preserves its order and semantics.
+This removes n-1 input/preparation turns for that run, not n-1 ACK operations
+or a measured CPU fraction. It intentionally changes scheduling interleavings
+by exposing already-received valid credit sooner, without changing authority.
+The scan count is the entry backlog, not a configurable timer or new cap.
+
+**Ordinary control23:08:** while the disjoint input RED is authored, no build
+is running. Freeze current0449b9f TCP/QUIC/mixed upload on the existing routed
+500Mbps/100ms profile with loss/jitter/QoS/outage disabled. Three40s cells,
+default binary response-claim-20260908, tag credit-ready-healthy-control-0908.
+The relevant high-capacity comparison measures confirmed upload plus its tiny
+return replies, all timing bins and costs. Existing current healthy download
+cells remain their controls. Candidate comparison requires mechanism checks
+first; no healthy result waives the retained adverse harsh/loaded timing.
+
+**Healthy UP controls23:12:** all three settle exactly, no failures. TCP
+426.610Mbps/0.435956s maxconfirmation gap, QUIC440.804/0.319541,
+mixed204.707/0.769314. Mixed therefore has a major clean500Mbps deficit,
+not merely a harsh-loss problem. Client sampled maximum ps CPU is84.6/136/
+143%, RSS170172/512044/625192KiB respectively; not exclusive cycle attribution.
+This changes the practical magnitude to test, not the cause already established:
+credit-fold influence remains unproved, and no promise of2x follows. Preserve
+all42 bins/costs per mode; the mixed profile/source/host are not retuned.
+
+**Return observer22:56:** root and independent whole19-file reviews pass;
+the exact archived patch reverse-checks cleanly. One lab-diagnostics build
+is running, no lab. The overlay changes no scheduling, authority, Native
+controller or await boundary. Typed predecessor totals are wall-await time,
+not exclusive ACK CPU; terminal windows without a next reply are censored.
+Freeze/reverse before one unchanged mixed UP, preserving ordinary binaries.
+
+**Capture22:58:** warning-free1m23s diagnostic build is frozen as
+response-return-service-20260908. All19 source hooks are reversed, source diff
+is empty and the archived patch applies cleanly. One unchanged mixed combined
+upload is running; no build overlaps it. The ordinary model remains0449b9f.
 
 **Next existing stall boundary22:37 — diagnostic, not another fix:** the
 current ordinary UP has Rc966 held across41.189–45.189s while T advances65MB
@@ -754,19 +829,22 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 ## Execution, evidence and continuity
 
 - Root owns builds/labs. Response claim verification and the declared ordinary
-  healthy/harsh comparisons are complete; no observer hooks are active.
+  healthy/harsh/restored comparisons are complete. The response-only return
+  observer is frozen and fully reversed; archive is
+  RESPONSE_RETURN_SERVICE_TRACE_20260908.patch. Its single upload capture is
+  running. No further production change is active.
   Owned Docker only: no sudo, host shaping, outside-repo work or build/lab overlap.
 - Ordinary candidate:`./.tmp/reflection/bin/response-claim-20260908/mptunnel`.
   Ordinary comparator:`./.tmp/reflection/bin/ack-support-20260908/mptunnel`.
-  Current diagnostic:`./.tmp/reflection/bin/native-read-service-20260908/mptunnel`.
+  Current diagnostic:`./.tmp/reflection/bin/response-return-service-20260908/mptunnel`.
   Previous forward diagnostic:`./.tmp/reflection/bin/post-ack-forward-20260908/mptunnel`.
   Previous reply diagnostic:`./.tmp/reflection/bin/reply-residence-20260908/mptunnel`.
   Do not use diagnostic target/release as an ordinary comparator.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram last attribution/comparison report:13:25UTC; next nonurgent not
-  before14:26UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram last attribution/comparison report:14:34UTC; next nonurgent not
+  before15:35UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

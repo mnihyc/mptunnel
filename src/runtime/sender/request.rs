@@ -4,7 +4,10 @@
 //! observe/intent/apply scheduling cycle. TCP keeps its portable fallback;
 //! QUIC path use is gated by validation and native writer backpressure.
 
-use self::multipath::{RequestMultipathController, RequestMultipathPlanError};
+use self::multipath::{
+    RequestMultipathController, RequestMultipathPlanError, RequestRelayNativeCapture,
+    RequestRelayNativeInputs,
+};
 use super::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
 use super::work::{
     CarrierEmitMode, ClientReinjectionOutputIdentity, RelaySendCause, RelaySendOutcome,
@@ -1198,6 +1201,19 @@ impl RequestSenderService {
                             }
                             return Err(RuntimeError::SenderServiceBlocked);
                         }
+                        // TCP's Product calculation can observe attached QUIC
+                        // authorities too. Resolve that advisory input before
+                        // entering the Apply closure; it must never hide a
+                        // Product -> Native read when ownership is shared.
+                        let tcp_original_native_inputs = (bulk_original_apply
+                            && instance.key.underlay == UnderlayProtocol::Tcp)
+                            .then(|| {
+                                RequestRelayNativeCapture::new(
+                                    remotes.membership_generation(),
+                                    &remotes.paths,
+                                )
+                                .resolve()
+                            });
                         // The exact Native stamp now guards the complete first
                         // irreversible publication: Product flight, load
                         // ownership, Product receipt/cursor, and carrier queue.
@@ -1260,9 +1276,19 @@ impl RequestSenderService {
                                 }
                             }
                             if bulk_original_apply {
+                                let native_inputs = match native_shape {
+                                    Some(shape) => RequestRelayNativeInputs::for_fenced_target(
+                                        remotes.membership_generation(),
+                                        &remotes.paths,
+                                        instance,
+                                        shape,
+                                    ),
+                                    None => tcp_original_native_inputs
+                                        .expect("TCP Apply requires resolved Native inputs"),
+                                };
                                 let authority = self
                                     .multipath
-                                    .bulk_original_data_apply_authority_with_native_shape(
+                                    .bulk_original_data_apply_authority_from_native_inputs(
                                         context,
                                         remotes,
                                         &plan,
@@ -1270,7 +1296,7 @@ impl RequestSenderService {
                                         selection_lane,
                                         frontier_state,
                                         request_load_claim.is_some(),
-                                        native_shape,
+                                        native_inputs,
                                     );
                                 if authority.is_none_or(|authority| !authority.has_headroom()) {
                                     #[cfg(feature = "lab-diagnostics")]

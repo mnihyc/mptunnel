@@ -57,7 +57,9 @@ use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, PathMetricDirection, StreamId, UnderlayProtocol};
-use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
+use crate::runtime::path::authority::{
+    NativeCarrierRateAuthorityHandle, NativeCarrierSchedulingShapeSnapshot,
+};
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::{ClientPathContext, ReliableRequestNativeShape};
 use crate::runtime::stream::request::{
@@ -71,29 +73,90 @@ use crate::scheduler::{self, PathSnapshot, TrafficClass, cyclic_cursor_distance}
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn request_native_scheduling_shape(path: &ReliableRelayRemotePath) -> ReliableRequestNativeShape {
-    if path.key().underlay != UnderlayProtocol::Udp {
-        return ReliableRequestNativeShape::NotApplicable;
+fn request_path_proof(path: &ReliableRelayRemotePath) -> Option<RelayPathProofEpoch> {
+    path.path_proof_id.map(|proof_id| RelayPathProofEpoch {
+        proof_id,
+        proof_generation: path.path_proof_generation,
+        attached_at: path.attached_at,
+    })
+}
+
+/// Detached read inputs, not admission authority. Constructing this capture
+/// only clones handles; resolve it after leaving Product ownership.
+pub(super) struct RequestRelayNativeCapture {
+    membership_generation: u64,
+    paths: SmallVec<
+        [(
+            RelayPathInstance,
+            Option<RelayPathProofEpoch>,
+            Option<Arc<NativeCarrierRateAuthorityHandle>>,
+        ); 4],
+    >,
+}
+
+impl RequestRelayNativeCapture {
+    pub(super) fn new(
+        membership_generation: u64,
+        remote_paths: &[ReliableRelayRemotePath],
+    ) -> Self {
+        Self {
+            membership_generation,
+            paths: remote_paths
+                .iter()
+                .map(|path| {
+                    let authority = if path.key().underlay == UnderlayProtocol::Udp {
+                        match &path.stream.output {
+                            ReliablePathStreamOutput::Fixed(output) => {
+                                output.commands().native_rate_authority().cloned()
+                            }
+                            ReliablePathStreamOutput::Switchable(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    (path.instance(), request_path_proof(path), authority)
+                })
+                .collect(),
+        }
     }
-    let ReliablePathStreamOutput::Fixed(output) = &path.stream.output else {
-        return ReliableRequestNativeShape::Unavailable;
-    };
-    let scope =
-        CarrierRateAuthorityScope::new(path.path_instance_id, PathMetricDirection::ClientToServer);
-    let Some(authority) = output.commands().native_rate_authority() else {
-        return ReliableRequestNativeShape::Unavailable;
-    };
-    authority
-        .scheduling_shape_snapshot(scope)
-        .map(ReliableRequestNativeShape::Current)
-        .unwrap_or(ReliableRequestNativeShape::Unavailable)
+
+    pub(super) fn resolve(self) -> RequestRelayNativeInputs {
+        let attached_paths = self
+            .paths
+            .into_iter()
+            .map(|(instance, proof, authority)| {
+                let shape = if instance.key.underlay != UnderlayProtocol::Udp {
+                    ReliableRequestNativeShape::NotApplicable
+                } else {
+                    authority
+                        .and_then(|authority| {
+                            authority
+                                .scheduling_shape_snapshot(CarrierRateAuthorityScope::new(
+                                    instance.path_instance_id,
+                                    PathMetricDirection::ClientToServer,
+                                ))
+                                .ok()
+                        })
+                        .map(ReliableRequestNativeShape::Current)
+                        .unwrap_or(ReliableRequestNativeShape::Unavailable)
+                };
+                (instance, proof, shape)
+            })
+            .collect();
+        RequestRelayNativeInputs {
+            membership_generation: self.membership_generation,
+            attached_paths,
+        }
+    }
 }
 
 /// Owned Native inputs, captured before Product/health observation. These are
 /// advisory values, not a replacement for the selected output's fenced Apply.
 pub(super) struct RequestRelayNativeInputs {
+    membership_generation: u64,
     attached_paths: SmallVec<
         [(
             RelayPathInstance,
@@ -103,39 +166,50 @@ pub(super) struct RequestRelayNativeInputs {
     >,
 }
 
-pub(super) fn capture_request_relay_native_inputs(
-    remote_paths: &[ReliableRelayRemotePath],
-    native_override: Option<(RelayPathInstance, NativeCarrierSchedulingShapeSnapshot)>,
-) -> RequestRelayNativeInputs {
-    // Resolve attachment-owned Native shapes before entering the health-lock
-    // observation. Native publication/apply uses Native -> health ordering;
-    // leaving this iterator lazy would invert that order as health -> Native.
-    let attached_paths = remote_paths
-        .iter()
-        .map(|path| {
-            let instance = path.instance();
-            let shape = match native_override {
-                Some((target, shape)) if target == instance => {
-                    ReliableRequestNativeShape::Current(shape)
-                }
-                // The override is evaluated while the target Native fence is
-                // held. Do not acquire another carrier authority lock here;
-                // other candidates remain advisory health observations.
-                Some(_) => ReliableRequestNativeShape::NotApplicable,
-                None => request_native_scheduling_shape(path),
-            };
-            (
-                instance,
-                path.path_proof_id.map(|proof_id| RelayPathProofEpoch {
-                    proof_id,
-                    proof_generation: path.path_proof_generation,
-                    attached_at: path.attached_at,
-                }),
-                shape,
-            )
-        })
-        .collect();
-    RequestRelayNativeInputs { attached_paths }
+impl RequestRelayNativeInputs {
+    /// Under the selected Native fence, project only its supplied shape.
+    /// There is no transport read, handle lookup or optional recapture path.
+    pub(super) fn for_fenced_target(
+        membership_generation: u64,
+        remote_paths: &[ReliableRelayRemotePath],
+        target: RelayPathInstance,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) -> Self {
+        Self {
+            membership_generation,
+            attached_paths: remote_paths
+                .iter()
+                .map(|path| {
+                    let instance = path.instance();
+                    (
+                        instance,
+                        request_path_proof(path),
+                        if instance == target {
+                            ReliableRequestNativeShape::Current(shape)
+                        } else {
+                            ReliableRequestNativeShape::NotApplicable
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn matches_membership(
+        &self,
+        membership_generation: u64,
+        remote_paths: &[ReliableRelayRemotePath],
+    ) -> bool {
+        self.membership_generation == membership_generation
+            && self.attached_paths.len() == remote_paths.len()
+            && self
+                .attached_paths
+                .iter()
+                .zip(remote_paths)
+                .all(|((instance, proof, _), path)| {
+                    *instance == path.instance() && *proof == request_path_proof(path)
+                })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,7 +251,15 @@ fn observe_request_relay_scheduling_with_native_override(
     requalification: &StreamPathRequalification<RelayPathInstance>,
     native_override: Option<(RelayPathInstance, NativeCarrierSchedulingShapeSnapshot)>,
 ) -> RequestRelaySchedulingObservation {
-    let native_inputs = capture_request_relay_native_inputs(remote_paths, native_override);
+    let native_inputs = match native_override {
+        Some((target, shape)) => RequestRelayNativeInputs::for_fenced_target(
+            membership_generation,
+            remote_paths,
+            target,
+            shape,
+        ),
+        None => RequestRelayNativeCapture::new(membership_generation, remote_paths).resolve(),
+    };
     observe_request_relay_scheduling_from_native_inputs(
         context,
         stream_id,
@@ -190,11 +272,12 @@ fn observe_request_relay_scheduling_with_native_override(
         requalification,
         native_inputs,
     )
+    .expect("serialized request observation retains captured attachment membership")
 }
 
 /// Consumes already captured Native values without entering a Native authority.
-/// The caller must preserve the exact attachment order/membership between
-/// capture and observation; final publication still validates its own fence.
+/// Rejects a changed receipt before pairing current Product state with Native
+/// inputs. This is advisory validation, not the final selected Native fence.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn observe_request_relay_scheduling_from_native_inputs(
     context: &ClientPathContext,
@@ -207,8 +290,10 @@ pub(super) fn observe_request_relay_scheduling_from_native_inputs(
     include_bulk_admission: bool,
     requalification: &StreamPathRequalification<RelayPathInstance>,
     native_inputs: RequestRelayNativeInputs,
-) -> RequestRelaySchedulingObservation {
-    debug_assert_eq!(remote_paths.len(), native_inputs.attached_paths.len());
+) -> Option<RequestRelaySchedulingObservation> {
+    if !native_inputs.matches_membership(membership_generation, remote_paths) {
+        return None;
+    }
     let path_evidence = context.observe_reliable_request_paths(
         native_inputs.attached_paths,
         payload_bytes,
@@ -262,7 +347,7 @@ pub(super) fn observe_request_relay_scheduling_from_native_inputs(
             }
         })
         .collect();
-    RequestRelaySchedulingObservation {
+    Some(RequestRelaySchedulingObservation {
         stream_id,
         membership_generation,
         mux_limits: context.mux_limits,
@@ -278,7 +363,7 @@ pub(super) fn observe_request_relay_scheduling_from_native_inputs(
             .collect(),
         latency_pressure: path_evidence.latency_pressure,
         observed_at: Instant::now(),
-    }
+    })
 }
 
 fn relay_path_can_enqueue_frame_for_cause_now(
@@ -810,7 +895,10 @@ impl RequestMultipathController {
         frontier_state: ReliableDataAckFrontierState,
         pending_load_claim: bool,
     ) -> Option<RequestOriginalDataApplyAuthority> {
-        self.bulk_original_data_apply_authority_with_native_shape(
+        let native_inputs =
+            RequestRelayNativeCapture::new(remotes.membership_generation(), &remotes.paths)
+                .resolve();
+        self.bulk_original_data_apply_authority_from_native_inputs(
             context,
             remotes,
             plan,
@@ -818,12 +906,15 @@ impl RequestMultipathController {
             lane,
             frontier_state,
             pending_load_claim,
-            None,
+            native_inputs,
         )
     }
 
+    /// Product-only authority calculation from explicit Native inputs. The
+    /// caller captures TCP's advisory set before entering Apply, or supplies
+    /// the selected QUIC fence's current shape without any other Native read.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn bulk_original_data_apply_authority_with_native_shape(
+    pub(super) fn bulk_original_data_apply_authority_from_native_inputs(
         &self,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
@@ -832,13 +923,13 @@ impl RequestMultipathController {
         lane: TrafficClass,
         frontier_state: ReliableDataAckFrontierState,
         pending_load_claim: bool,
-        native_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
+        native_inputs: RequestRelayNativeInputs,
     ) -> Option<RequestOriginalDataApplyAuthority> {
         if !lane.is_bulk() || !plan.assigns_original_data() {
             return None;
         }
         let (entry_offset, _, payload_bytes) = reliable_stream_frame_extent(frame)?;
-        let observation = observe_request_relay_scheduling_with_native_override(
+        let observation = observe_request_relay_scheduling_from_native_inputs(
             context,
             self.stream_id,
             remotes.membership_generation(),
@@ -848,8 +939,8 @@ impl RequestMultipathController {
             payload_bytes,
             true,
             &self.request.requalification,
-            native_shape.map(|shape| (plan.target.instance, shape)),
-        );
+            native_inputs,
+        )?;
         let eligible = current_request_original_data_tier(
             &observation,
             remotes,

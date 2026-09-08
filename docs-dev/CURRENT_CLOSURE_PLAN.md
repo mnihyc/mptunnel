@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 10:43 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 10:57 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -311,7 +311,23 @@ bindings then remove five new compiler warnings without changing owner lifetime.
 This is a verified preparation checkpoint, not the ownership fix or a speed
 result. Next move observation/intent/fenced Apply into safe transaction boundaries
 and integrate real writer claims. Never wrap whole normal planners/
-ACK handlers under the new lock or carry a guard across actual I/O awaits.
+ACK handlers under a Product lock. The used detached capture now clones only
+Native handles and exact membership/proof receipts; resolve outside ownership
+and validate before projecting current path/Product state. Existing controls
+plus two explicit unchanged/stale-receipt cases pass485checks in1.26s, with only
+the unchanged128KiB boundary RED remaining; warning-free rebuild1m09s.
+Independent review confirms TCP's normal Native sampling remains outside Apply
+and QUIC's fenced target projection enters no other Native authority. First
+new equivalence test failed in setup by reading a predecorator handle; corrected
+to the actual attachment output, not waived or labelled Product RED. No deployed
+defect or speed claim follows from exposing this future concurrency obligation.
+Preserve the actor's actual negative-ACK frontier authority when moving claims;
+positive mux F alone is not equivalent. No guard may span actual I/O awaits.
+Next move that one existing ACK snapshot into Product, preserving its update
+order and actor-only timing; then make the existing frame intent/fenced commit
+boundary explicit for the real writer claim. No copied mutable snapshot,
+extra controller, claim policy change or new performance run is authorized by
+these source-equivalence preparation checkpoints alone.
 Response parity and all existing global gates remain pending, not waived.
 
 **Falsifier/stop:** if head work was already promptly published, pursue its

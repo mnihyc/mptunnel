@@ -432,6 +432,240 @@ fn bounded_mixed_remote_set(
 }
 
 #[tokio::test]
+async fn detached_request_native_receipt_preserves_unchanged_observation() {
+    let stream_id = StreamId(382);
+    let (context, remotes, _remote_input, tcp, udp, _commands, mut tcp_rx, mut udp_rx) =
+        bounded_mixed_remote_set(stream_id);
+    consume_client_path_proof_for_test(&mut tcp_rx);
+    consume_client_path_proof_for_test(&mut udp_rx);
+    for instance in [tcp, udp] {
+        mark_client_path_proof_fresh_for_test(
+            &context,
+            &remotes,
+            instance,
+            Duration::from_millis(20),
+        );
+    }
+    let udp_path = remotes
+        .paths
+        .iter()
+        .find(|path| path.instance() == udp)
+        .expect("exact QUIC attachment");
+    let ReliablePathStreamOutput::Fixed(output) = &udp_path.stream.output else {
+        panic!("QUIC fixture retains a fixed Native output");
+    };
+    let native = output
+        .commands()
+        .native_rate_authority()
+        .expect("exact QUIC Native owner");
+    native
+        .publish_observation_for_test(1, 1, Some(100_000_000))
+        .expect("existing Native test producer publishes capacity");
+    let native_shape = native
+        .refresh_scheduling_shape_for_test(
+            CarrierRateAuthorityScope::new(
+                udp.path_instance_id,
+                PathMetricDirection::ClientToServer,
+            ),
+            1,
+            1,
+            Some(100_000_000),
+            Duration::from_millis(20),
+            Duration::from_millis(4),
+            512 * 1024,
+            0,
+            1400,
+            Some(100_000_000),
+            false,
+        )
+        .expect("coherent Native source for detached resolution");
+    let frame = data_frame(stream_id, 0, 4096);
+    let requalification = StreamPathRequalification::default();
+    let capture = RequestRelayNativeCapture::new(remotes.membership_generation(), &remotes.paths);
+    let detached = observe_request_relay_scheduling_from_native_inputs(
+        &context,
+        stream_id,
+        remotes.membership_generation(),
+        &remotes.paths,
+        Some(&frame),
+        TrafficClass::Throughput,
+        4096,
+        true,
+        &requalification,
+        capture.resolve(),
+    )
+    .expect("unchanged detached receipt remains valid");
+    let immediate = observe_request_relay_scheduling(
+        &context,
+        stream_id,
+        remotes.membership_generation(),
+        &remotes.paths,
+        Some(&frame),
+        TrafficClass::Throughput,
+        4096,
+        true,
+        &requalification,
+    );
+    assert_eq!(
+        detached.membership_generation,
+        immediate.membership_generation
+    );
+    assert_eq!(detached.paths.len(), immediate.paths.len());
+    assert_eq!(
+        detached
+            .path_by_instance(udp)
+            .unwrap()
+            .native_authority_stamp,
+        Some(native_shape.stamp()),
+    );
+    for (detached, immediate) in detached.paths.iter().zip(&immediate.paths) {
+        // Observation wall time and derived ages are intentionally not equality fields.
+        let identity = |path: &RequestRelayPathObservation| {
+            (
+                path.instance,
+                path.fresh_proof,
+                path.native_authority_stamp,
+                path.native_authority_unavailable,
+                path.can_enqueue_frame,
+                path.can_enqueue_stream_lane,
+                path.carrier_pending_bytes,
+                path.load_owned,
+                path.config_ordinal,
+                path.member_ordinal,
+            )
+        };
+        assert_eq!(identity(detached), identity(immediate));
+        let authority = |path: &RequestRelayPathObservation| {
+            path.shared_snapshot.map(|snapshot| {
+                (
+                    snapshot.delivery_rate_bps,
+                    snapshot.carrier_inflight_limit_bytes,
+                    snapshot.data_level_limit_bytes,
+                    snapshot.data_level_bytes_in_flight,
+                    snapshot.data_level_queue_bytes,
+                )
+            })
+        };
+        assert_eq!(authority(detached), authority(immediate));
+    }
+    assert_eq!(
+        choose_observed_ordinary_data_path(&detached, TrafficClass::Throughput, 4096, 0, &[], None),
+        choose_observed_ordinary_data_path(
+            &immediate,
+            TrafficClass::Throughput,
+            4096,
+            0,
+            &[],
+            None
+        ),
+    );
+}
+
+#[tokio::test]
+async fn detached_request_native_receipt_rejects_changed_attachment_projection() {
+    for change in ["replacement", "order", "proof"] {
+        let stream_id = StreamId(383);
+        let (context, mut remotes, _remote_input, tcp, _udp, _commands, mut tcp_rx, mut udp_rx) =
+            bounded_mixed_remote_set(stream_id);
+        consume_client_path_proof_for_test(&mut tcp_rx);
+        consume_client_path_proof_for_test(&mut udp_rx);
+        let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+        let frame = send_stream
+            .send_data(Bytes::from_static(b"retained"))
+            .expect("real cached Product source");
+        let mut controller = RequestMultipathController::new(stream_id);
+        controller.record_original_frame_for_test(tcp, &frame);
+        let generation = remotes.membership_generation();
+        let capture = RequestRelayNativeCapture::new(generation, &remotes.paths);
+        let before = (
+            send_stream.next_offset(),
+            send_stream.reinjection_bytes(),
+            controller
+                .request
+                .flights
+                .total_original_data_in_flight_bytes(),
+        );
+        let mut replacement_receiver = None;
+        match change {
+            "replacement" => {
+                drop(
+                    remotes
+                        .remove_path_instance(tcp)
+                        .expect("withdraw exact old attachment"),
+                );
+                let (commands, receivers) = reliable_path_command_channels(8);
+                replacement_receiver = Some(receivers);
+                remotes.attach_candidate(opened_test_relay_stream(
+                    stream_id,
+                    tcp.key.index,
+                    commands,
+                ));
+                let successor = remotes
+                    .path_instance_for_key(tcp.key)
+                    .expect("same-key successor");
+                context.install_relay_path_instance_for_test(successor);
+                assert_ne!(successor, tcp);
+                assert_ne!(remotes.membership_generation(), generation);
+            }
+            "order" => {
+                // Isolate the positional projection guard; not a claimed deployed reordering race.
+                remotes.paths.swap(0, 1);
+                assert_eq!(remotes.membership_generation(), generation);
+            }
+            "proof" => {
+                let old_proof = request_path_proof(&remotes.paths[0]);
+                context.set_tcp_endpoint_control(
+                    tcp.key.index,
+                    ClientTcpEndpointControlState::Suspect,
+                );
+                remotes.retry_pending_path_proofs(&context);
+                assert_ne!(request_path_proof(&remotes.paths[0]), old_proof);
+                assert_eq!(remotes.membership_generation(), generation);
+                consume_client_path_proof_for_test(&mut tcp_rx);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            observe_request_relay_scheduling_from_native_inputs(
+                &context,
+                stream_id,
+                remotes.membership_generation(),
+                &remotes.paths,
+                Some(&frame),
+                TrafficClass::Throughput,
+                8,
+                true,
+                &controller.request.requalification,
+                capture.resolve(),
+            )
+            .is_none(),
+            "{change} must reject a detached receipt before pairing it with current attachments",
+        );
+        assert_eq!(
+            (
+                send_stream.next_offset(),
+                send_stream.reinjection_bytes(),
+                controller
+                    .request
+                    .flights
+                    .total_original_data_in_flight_bytes(),
+            ),
+            before,
+            "receipt rejection does not commit or release Product ownership",
+        );
+        assert_eq!(
+            controller
+                .request
+                .flights
+                .original_data_in_flight_bytes(tcp),
+            8,
+            "even attachment replacement leaves exact retained debt with its original owner",
+        );
+        drop(replacement_receiver);
+    }
+}
+
+#[tokio::test]
 async fn request_product_acquisition_does_not_preempt_ordinary_completion_order() {
     let stream_id = StreamId(377);
     let context = client_test_context_with_paths(&[

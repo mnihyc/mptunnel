@@ -1,6 +1,6 @@
 # Prepared Original ownership — pre-implementation model
 
-2026-09-08 10:43 +08:00. Category: bounded architectural candidate for the
+2026-09-08 10:57 +08:00. Category: bounded architectural candidate for the
 existing early ordered-upload failure. **Not accepted runtime, performance or
 RFC policy.** Read PERFORMANCE_METHOD_AND_LESSONS and CURRENT_CLOSURE_PLAN.
 REQUEST_PREFIX_SERVICE_20260908 contains the exact existing capture; this file
@@ -251,6 +251,35 @@ as the current native-override Apply already does. Release every guard before
 encoding/native I/O. Actor ACK/recovery must either operate only on captured
 non-Native inputs under Product ownership or follow the same Native-first
 transaction; no Product-to-Native callback is permitted.
+
+The next used seam captures only ordered exact attachment/proof identities,
+membership generation and cloned UDP Native authority handles. Resolve Native
+outside Product, then reject a changed receipt before projecting current path
+fields. Re-read lane/admission/load/qualification/flights there; do not cache
+them as another authority. The serialized actor wrapper may expect its unchanged
+receipt; a future concurrent caller must reobserve on rejection. TCP fenced
+Apply must also consume explicit resolved inputs: the old optional QUIC override's
+`None` means normal Native capture, not no Native read. This is a migration
+obligation, not evidence of a present actor lock deadlock.
+
+The writer also needs the actual authoritative ACK snapshot currently owned by
+the actor's `last_send_ack`, not a default Live flag inferred from positive F.
+Move that authority into the same Product transaction when claims are shared.
+The narrow ACK transaction already settles mux/flight/qualification and health
+sampling without Native reads; the outer handler's subsequent staleness and
+recovery observations do read Native and must stay split. Existing retry/watch
+timing does not become a second ACK authority.
+
+Detached capture and explicit TCP-normal/QUIC-fenced Apply input are now used
+by the current actor:485 focused controls pass1.26s after a warning-free1m09s
+rebuild, including unchanged observation/choice and rejection after exact
+replacement, explicit order change, or actual proof renewal. The128KiB producer
+RED is unchanged. Independent review confirms read count/order and current
+commit/rollback semantics. Capture adds bounded per-path metadata/Arc work;
+its cost is not a claimed optimization and ordinary migration cost remains a
+gate. A first test read the fixture's undecorated command clone rather than its
+attached Native output and failed setup; correcting that fixture is not a
+Product fix or a waived invariant.
 
 Existing request structural-recovery batches assume one serialized Dispatch.
 After this migration, a writer may append a higher-offset Original while the

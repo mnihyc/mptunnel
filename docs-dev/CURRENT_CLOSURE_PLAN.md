@@ -11,7 +11,58 @@ entry is preserved below. Earlier history, including rejected approaches,
 remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
-## Active discriminator: native ordered-read service during recovery
+## Active transaction: user-requested mixed-mode architectural redesign
+
+**2026-09-08 19:52 +08:00 — scope:** the user explicitly asks why mixed-mode
+still fails and requests a careful comprehensive redesign. This supersedes
+another narrow native observer as the automatic next action. Runtime remains
+d999fea; no new controller, threshold or deployment change is authorized by a
+slow result alone. The completed native discriminator remains evidence below.
+
+**Observed failure / exact question:** default mixed upload still has5.50s
+confirmation gaps in its latest ordinary run; previous mixed download loses
+interactive service despite substantial bulk throughput. Does the existing
+allocation/ownership/recovery/feedback composition make avoidable cross-carrier
+ordered-service dependencies, and which minimal replacement contract removes
+them without disabling useful aggregation or restoring old hard admission?
+
+**Alternatives / information forecast:** compare immediate independent-writer
+claiming, a common ordered-service placement policy above unchanged resource
+authority, and a change of native ordering scope only if evidence requires it.
+Existing exact frontier and reader captures can establish or reject proposed
+dependencies without another lab. The useful output is one coherent model,
+explicit impossibility limits, retained/deleted responsibilities, a benefit
+forecast and decisive old/new counterexamples. It is not an expected speed gain
+from documentation. Do not promise to remove physical queue-drain or unobserved
+packet-loss time; seconds-long policy-induced stalls are the material target.
+
+**Smallest next action / stop:** root reviews RFC/history/code while independent
+audits challenge authority, ordered service and causal evidence. Persist a
+bounded redesign proposal and amend normative RFC text only for a demonstrated
+wrong contract. No implementation before counterexamples, failure/recovery and
+both-direction composition are covered; no new topology-estimator framework.
+Then freeze the comparison basis before a candidate so a full product-level
+baseline cannot again be displaced by a chain of local corrections.
+
+**Redesign review20:04:** root inspected the65edae3 origin, current RFC10/15,
+request prepared claims, response queue-time commitment and receive mailbox
+boundaries. Three independent reviews separate placement, local receive service
+and physical/native limits. [Proposed replacement](MIXED_SERVICE_REDESIGN_20260908.md)
+retains exact ownership, configured pipeline and controllers; it explicitly
+does not claim a specified allocator or authorize speculative performance-Defer.
+Current ordinary comparison is now the first execution step, not another fix.
+
+**Comparison forecast / execution:** frozen d999fea ordinary binary,
+redesign-baseline-0908 tag. Existing runner/profile only, diagnostics disabled;
+downstream phase runs TCP,QUIC,mixed,raw,VMess,H2, then upstream mirrors the
+whole impairment. One initial cell per product/direction, no build overlap.
+This separates current mixed-mode interaction from single-carrier limits and
+provides an honest baseline snapshot; it is not a statistical universal ranking.
+Retain all gaps, echo failures and censored outcomes. Stop only the failed cell,
+verify its owned probe has exited before proceeding, and do not change profile
+or protocol to obtain favorable results. No runtime candidate yet.
+
+## Completed discriminator: native ordered-read service during recovery
 
 **Issue / observed failure / exact question:** the completed d999fea forward
 capture has a 6.095822s confirmation gap. In restored capacity, QUIC Original

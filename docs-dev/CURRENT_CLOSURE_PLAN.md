@@ -13,6 +13,33 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
+**Discriminator outcome01:47:** feature-only observer builds warning-free1m03,
+is frozen as feedback-encode-20260909, and all69source additions are reversed
+before capture. Current ordinary source remains4c7e232. Independent audit PASS:
+encoded attempts exclude native overhead/retransmission and may include later
+failed/cancelled writes; counters are cumulative at last event-driven report,
+not final exact totals. Each kind has its own stamp; compute deltas between
+successive rows of that kind, not groups of numerically equal millisecond stamps.
+
+The repeated mixed feedback restriction reproduces a2.523657s body gap,
+451.224→157.891→417.733Mbps body phases and71/71actualechoes, worst2.871s.
+At last report the client has396286ACKframes/47375035encodedB/6562914ranges
+(all complete, max87ranges), versus281279MAXframes/7313254B and other control
+negligible. ACK alone reaches20.959Mbps across19.530→20.534process seconds,
+during restrictedreturn; before QoS it also repeatedly exceeds10Mbps. Sparse
+cumulative ACK serialization is therefore a real material owner, not merely
+an aggregate-wire guess. This does not yet attribute every queue byte or prove
+baseline-like full-capacity service can be recovered by an arbitrary ACK change.
+
+One Q-only same-observer/profile control now discriminates intrinsic native
+feedback cost from mixed cumulative state amplification; no new build/policy.
+In parallel establish the smallest proof-preserving publication model. A single
+ACK already updates shared Product authority across attachments; all-attachment
+copies supply redundant delivery service, not distinct logical facts. Removing
+fanout without replacing slow/failed-carrier service is invalid. A narrower
+complete prefix also does not prove newly exposed gaps above its own horizon.
+No runtime correction is selected yet. Telegram milestone17:47UTC; next>=18:47.
+
 **Next discriminator01:41:** one temporary feature-only codec observer counts
 successful per-frame encodings by wire kind, exact encoded frame bytes, and ACK
 range/count/complete distributions. Report cumulative counters at one-second

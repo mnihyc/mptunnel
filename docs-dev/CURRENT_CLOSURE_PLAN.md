@@ -1,16 +1,55 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 18:39 +08:00. Authoritative source is `./`.
+Updated:2026-09-08. Active observer18:56 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
-Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
+Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
 transaction and after compaction. This is the active scope/decision ledger,
-not a new issue inventory. Full previous ledger, including all earlier failed
-approaches, remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`.
-Detailed evidence is linked below; shortening obsolete next-action prose does
-not discard findings, adverse results or acceptance gates.
+not a new issue inventory. Full pre-condensation chronology is retained at
+`git show 13876d6:docs-dev/CURRENT_CLOSURE_PLAN.md`; the subsequent observer18:56
+entry is preserved below. Earlier history, including rejected approaches,
+remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
+retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
-## Active discriminator: forward prefix after ACK work reduction
+## Active discriminator: native ordered-read service during recovery
+
+**Issue / observed failure / exact question:** the completed d999fea forward
+capture has a 6.095822s confirmation gap. In restored capacity, QUIC Original
+[379841438,379853438) completes its local write at Unix1788865120575 but
+decodes at5124171 (3.596s); mux follows4ms later. Its current-frontier hold is
+1.270544s, not the whole residence. Was its native reader waiting for absent
+ordered bytes, or were available bytes waiting for local polling/parsing?
+
+**Existing evidence / competing causes:** exact forward claims, local writes,
+decodes and ACKs reconcile. Repair route residence is tiny, but an ordinary
+reader can wait on its input channel. QoS-period repair delays also coexist
+with6.151MB queued on the shared10Mbps cut (4.921s aggregate drain), so do not
+classify that physical effect as an MPP defect. During restored-capacity rows
+41–43, the router backlog is only92–101KB at500Mbps and native QUIC ACKs barely
+advance; Native queued bytes and missing offsets are not in those gauges.
+A separate2.169s frontier gap has2.076s before Original claim and only93ms
+write→decode/mux; preserve this assignment/feedback boundary, not all-Native blame.
+
+**Smallest model / action / falsifier:** diagnostic-only ordered-read episodes
+start at the wrapper's actual Poll::Pending, not a partial read that returns
+bytes. Under the already-held native guard, retain exact connection/stream
+identity and missing native offset r. First successful validated ingestion
+covering r records availability; first nonempty ordered Chunk closes the
+episode. Record producer times; repeated pending at the same r adds no state.
+Cancellation/terminal episodes remain censored. Native offsets include H3
+framing, not Product DSN; join connection/H3 identity and retain ambiguous
+frame/chunk mappings. Early availability with late return selects local
+service; late availability with prompt return selects pre-processed-receipt
+delay, not automatically packet loss/PTO. No sender packet trace yet.
+
+**Acceptance / stop:** reuse the exact Product forward/repair observer plus
+only these sparse native transitions. Root and independent review before one
+build; archive/freeze/reverse before one unchanged capture. No runtime policy,
+queue, rate, timer, sampler or RFC correction is justified yet. No favorable
+rerun or performance promotion from diagnostic Mbps/non-reproduction. Prove
+an actual causal defect before implementing a correction.
+
+## Completed discriminator: forward prefix after ACK work reduction
 
 **Observed failure / question:** ordinary d999fea still has5.497708s maximum
 confirmation gap. QoS T234499808/Rs556 stay fixed for5.999s at server
@@ -39,754 +78,233 @@ transport. Predecode alone still cannot assign Native loss/timer blame.
 No new or resurrected correction before a reachable real counterexample;
 diagnostic rate and non-reproduction are not ordinary improvement.
 
-## Completed transaction: exact ACK-support work exclusion
-
-**Ordinary pair18:40 — not promoted:** parent473104384B/47.992259s versus
-candidate393150464B/46.768581s, both exact/complete. Maxconfirmation
-3.060424→5.497708s and maxwrite4.396938→5.665049s worsen; firstconfirmation
-.368903→.378394s/firstwrite.091815→.115526s.78.863→67.250Mbps is not
-acceptance; earlier finish transfers less work. Independent fullphase/cost
-analysis retained in ACK_SUPPORT_SERVICE_20260908.md/raw.tar.gz (16files,
-95rawbins; integrity/range checks pass). Sourcework/exactsemantics remain proven, but
-there is no ordinary timing promotion or rollback to fullsuffix work from
-one randomaverage. No favorable repeat. New strongest hold is forward above.
-
-**Issue / measured motivation:** current reply capture completes387579904B
-in52.491225s, maxconfirmation3.508291s. Winning reply[863,877) has3.247s
-server-read→delivery, including599ms after authenticated decode and1.961027s
-preceding nondata reader-send await inside a1.965s interval. This selects real
-local input backpressure, not an all-Native explanation. Prior unchanged
-flight-release implementation in COPY_DEBT_SERVICE records4786releases taking
-7.808784s within8.160194s ACK-handler elapsed; contained backpressure windows
-include246899us and285275us flight release. New reader counters do not establish
-ACK-only work or the current function's causal share. Existing actual cost
-evidence motivates one work reduction without another aggregate capture.
-
-**Origin / intended invariant:** fd32e60 introduced whole-flight snapshot/
-ambiguity/rebuild to settle exact copies; f4206d0 moved its ownership and
-765683b corrected byte-exact partial-copy attribution. RFC8.3 requires frozen
-pre-release multiplicity on acknowledged bytes, not rebuilding unrelated
-suffix. Current request ledger takes/flattens all retained flights, computes
-global ambiguity and reinserts every survivor for each non-subsumed ACK.
-
-**Model / predicted correction:** for normalized ACK ranges let H=max(end).
-Every released byte u satisfies u<H. A flight starting at or above H neither
-covers u nor contributes ambiguity there. Extract only starts<H in existing
-key/vector order; retain crossing flights intact for split/proof computation;
-leave other keys alone. Preserve all bytes, instances, qualification receipts,
-assignment timestamps, evidence epochs and additive copy debt. Retained crossing
-pieces rekeyed at H must precede the existing H bucket exactly as before; that
-one bucket merge can move its records. No split_off/whole-map append, new
-index/threshold/policy or ACK coalescing. Full-horizon ACK remains proportional
-to all eligible flights. This is a request hot-path implementation correction,
-not an RFC contract change or completed response prepared-source parity.
-
-**Falsifier / smallest action / acceptance:** actual ledger producers plus
-normalized ACK must first prove identical released/remainder/proof/debt while
-irrelevant suffix fragmentation increases current record work. Include partial
-copy, boundary collision/order, disjoint/replayed ACK and exact-instance controls.
-Independent proof/fixture review before intended RED; runtime changes only after
-RED. Then coherent focused GREEN and ordinary parent/candidate unchanged mixed
-upload, full timing/completion/cost. No promotion if adverse/ambiguous, and no
-claim that this explains every prior local or predecode hold. Scope is the
-already-profiled request operation, not another controller or queue redesign.
-
-**Order18:24:** independent exclusion/metadata/order proof passes with the
-explicit boundary-bucket and k≈N cost caveats. Test-only actual producer RED
-preparation delegated; no runtime edit or build. Fresh ordinary frozen b783cd6
-parent runs first (ack-support-control-0908), then candidate only after
-RED/GREEN/audit. No favorable repeat or diagnostic rate substituted as control.
-
-**Parent18:26:** ordinary b783cd6 completes473104384exactB/47.992259s,
-firstconfirmation.368903/max3.060424s, firstwrite.091815/max4.396938s.
-Runner0/48.391215s;48rawbins retained, including buffered confirmation bins
-above500Mbps (not wire capacity). No lab/build now. Test-only fixture pending.
-
-**Practical work support18:30:** replayed already-retained
-prepared-claim-service-0908 exact commit/ACK events without reconstructing
-missing ACK ranges. Keep only committed starts at/above the maximum end of
-every applied ACK so far: none can have been acknowledged. Among6367applied
-ACKs,6343still have such records; their sum is4470499 needless workset visits,
-mean702.136/max2520. This is a conservative suffix-work lower bound, not CPU
-savings or current-run causal attribution. No new capture or policy.
-
-**RED preparation18:30:** root/independent fixture review passes real ledger
-producer tests: same131072B Original plus14600B copy; exact release/proof,
-successor debt and immutable suffix metadata before3versus66work assertion.
-Separate crossing-H control covers receipt clipping, saved boundary order,
-deadlines, replay and full-horizon settlement. No native/actor admission claim.
-One test build now runs with no lab; production algorithm unchanged.
-
-**RED18:32:** warning-free1m12s build; two tests execute in.00s. Boundary/
-receipt/replay/full-horizon control passes. Intended work assertion alone fails
-66versus3 after release/proof/debt/metadata controls. Root and independent
-reviews pass. Independent raw replay reproduces4470499lower-bound visits.
-Checkpoint test-only RED, then implement only the reviewed extraction and
-boundary ordering. Keep old whole-map extraction when every key is eligible;
-this exact predicate avoids removal overhead for full-horizon ACKs.
-
-**GREEN18:35:** one production function changed: exact eligible-prefix
-extraction plus preserved H-bucket order. Independent whole-function review
-passes; warning-free test rebuild1m08s,546focused checks pass1.28s including
-both new work/metadata tests and existing epoch/copy/EOF/TCP/QUIC controls.
-The real suffix-fragmentation cases now each process2records; observed RED
-was3versus66. No rate/deadline/ACK/evidence policy changed. Checkpoint runtime,
-then one ordinary optimized build and fixed paired candidate. Component
-GREEN is not performance acceptance. Reply-chain evidence committed bd3b810.
-
-**Candidate18:39:** warning-free optimized build3m29s; ordinary d999fea frozen
-as ack-support-20260908. Source clean except user's7lines. Candidate now runs
-the unchanged mixed-upload profile, no diagnostic events/build overlap.
-
-## Completed discriminator: already-read response service residence
-
-**Observed failure / exact question:** terminal capture on unchanged b783cd6
-completes424017920B/56.939769s but contains a7.996908s confirmation gap.
-Client reply F999@Unix1788861542294→F1013@1550291; the winning14bytes were
-already read by server at1543136, leaving7.155s after server read. A later
-exact reply range[1041,1055) spans server read1544756→clientdelivery1560442,
-15.686s. All1208reply bytes reconcile across both observers. Which stage
-retains these bytes: response admission/publication, native write/receipt,
-client input routing/Product mux, or local delivery? No native attribution
-from these end-to-end timestamps, and no whole-interval blocked actor claim.
-
-**Existing evidence / model / competing causes:** earlier reply-stage
-captures already contain reusable exact frame/write/decode/mux observations;
-their different-version intervals are not silently attributed to this run.
-The current terminal-only capture lacks these intervening payload boundaries.
-T391950079 separately remains flat for14.999s in sampled server observations;
-source EOF has32MB unclaimed data. Product work/feedback service, Native
-ordered delay and unavailable exact source admission remain distinct owners.
-No invariant or threshold is changed to force a selected cause.
-
-**Smallest next action / falsifier / stop:** read and reuse the smallest
-existing reply-stage observer on current source before authoring more hooks.
-Observe exact server publication/native-write/client-decode/mux boundaries
-for small reverse replies only, retaining the existing source/read/delivery
-timestamps. Prompt write/decode excludes those stages; delayed publication
-selects its actual authority/service owner. Exact same-range joins precede
-any fix or wider Native packet/timer capture. No large cost framework, new
-harness, favorable repeat or performance promotion from diagnostic throughput.
-**Preflight18:08:** reuse existing sparse reply-chain hooks only: server
-enqueue/dispatch/copy acceptance; TCP/QUIC write and client authenticated
-decode; shared input and mux application; terminal observer's reply read and
-successful delivery endpoints. Retain existing QUIC preceding-nondata
-mailbox-wait aggregate to distinguish local reader blocking from Native delay.
-No new seam, cost scope, request/copy-debt/claim counter or packet trace is
-needed. Selective temporary adaptation is authorized; two independent reviews,
-archive/freeze/reverse before one unchanged capture. No runtime correction,
-build or lab is running at this entry.
-
-**Observer18:15:** root and independent whole18-file reviews pass. Existing
-write/route results, admission, queue charges and awaits are unchanged. TCP
-decode lacks physical identity and requires session/wire-path joins; QUIC H3
-IDs are connection-local. Full interlocked mailboxes remain pending, and
-preceding nondata send-await time is not packet delay or ACK-only CPU time.
-Sparse exact range coverage, not record counts, will determine winning service.
-REPLY_RESIDENCE_TRACE_20260908.patch archives the whole temporary overlay.
-One diagnostic build is running with no lab; freeze/reverse before capture.
-
-**Capture18:17:** warning-free optimized build3m31s frozen separately as
-reply-residence-20260908. All18runtime-file observer changes reversed and
-source diff verified empty before one unchanged-profile mixed-upload capture.
-No build/lab overlap; source remains b783cd6. target/release is diagnostic,
-not the ordinary comparator. Terminal evidence committed cd97c5d.
-
-## Completed discriminator: upload terminal service after full target delivery
-
-**Result17:59 — prior terminal geometry not reproduced:** warning-free
-3m31s build,203 total diagnostic lines,57service samples, exact424017920B
-in56.939769s. Maxconfirmation7.996908s/maxwrite4.374934s are not ordinary
-performance. At source EOF1552966, C391950079+U32067841 equals final424017920;
-all queued bytes are unclaimed Data. FIN cannot declare current C then without
-excluding those bytes. This does not prove the entire8.909s prepublication
-wait necessary: no intervening claim/refusal trace was enabled.
-
-Two same-offset FIN publications/native writes at1561875 retain24.47MB
-Product cache, excluding a cache-zero prerequisite. Server decodes3133,
-handles3134 with F419210455 (not yet final), and final Data makes FIN ready
-at3384. Target shutdown starts/completes that same millisecond; final13B reply
-read3385, client27B delivery3421 and clean completion3422. Duplicate FINs are
-normal replay, not conflicting offsets. The1.258s FINwrite→decode remains
-composite predecode service, not measured packet delay. No terminal/RFC
-correction is justified by this capture. Earlier postfull-target6s tail stays
-unattributed; detailed raw/evidence in TERMINAL_SERVICE_20260908.
-
-**Observed failure / current owner:** ordinary b783cd6 completes326041600B
-in52.965807s, with6.082958s maximum confirmation gap. Candidate service rows
-48–53 already have full target T326041600, while server-read/client-delivered
-reply Rs=Rc1142 are unchanged. Only final row54 observes13new server-read
-reply bytes. Local TCP receive queues are zero through this tail, but client
-native TCP Send-Q drains8.70→2.69MB. Those queues are not exact Product debt.
-This is the existing completion-service timing owner, not a new bug inventory.
-
-**Competing causes / exact question:** determine where the request EOF/FIN
-and terminal response spend that tail: source EOF recognition, pending FIN
-publication/admission, selected native ordered service, server FIN/mux-ready
-handling, target write-half-close, sink natural EOF/final reply production,
-or response delivery. lab/tcp_sink.py checks its .2s ACK cadence only after
-recv(data); it does not produce an idle periodic ACK. Final OK is generated
-only after natural EOF. Thirteen bytes are consistent with the final OK line,
-not a direct content observation. Full T and flat Rs do not establish a
-6s already-produced reply stall, nor a6s missing forward payload.
-
-**Existing evidence / smallest action:** PREPARED_STALE_SERVICE_20260908
-retains the ordinary pair. Inspect current terminal origin/RFC and existing
-diagnostic seams first, then add only missing EOF/FIN/half-close timestamps
-to one temporary diagnostic. Preserve actual admission, ordering, wakes and
-all policy. No native controller change or larger packet-tracing framework.
-Archive/reverse hooks before one unchanged-profile capture; a different or
-absent tail is non-reproduction, not a performance win.
-
-**Falsifier / acceptance / stop:** prompt source FIN publication followed by
-held decode excludes source publication; prompt server FIN-ready/shutdown
-excludes that stage. Observe producer timestamp before attributing response
-transport. Exact same-flow/stage joins precede a real-producer RED/control
-and any coherent fix. The earlier already-written QUIC predecode payload
-stalls remain distinct and unresolved. No policy tuning or favorable rerun.
-Native receipt/hole/timer source preflight is retained only as an alternative
-if later evidence selects it; no Native observer or correction implemented.
-
-**Observer17:51:** root and independent whole-patch audits pass. Temporary
-11-file terminal_service hooks cover both actual source EOF reads, first
-already-owned pending-FIN state, successful selected publication/attach replay,
-actual TCP/QUIC FIN write and authenticated decode, both server FIN-ready/
-target-shutdown branches, server reply reads and successful client delivery.
-No new await/lock/payload clone/authority read or policy change. Write success
-is local acceptance, not peer delivery; reply read is not sink emission time.
-QUIC H3 IDs are connection-local; correlate existing bindings and retain
-ambiguity if reused. Attach replay publication lacks exact path identity.
-Patch archived as TERMINAL_SERVICE_TRACE_20260908.patch. One diagnostic
-build running, no lab; freeze/reverse all hooks before the declared capture.
-
-**Capture17:58:** warning-free3m31s diagnostic build frozen separately as
-terminal-service-20260908. All11runtime-file hooks reversed with source diff
-verified empty before one unchanged-profile capture. Enabled only
-terminal_service, terminal_fin_replay, client_stream_fin_received and
-client_relay_result. No compilation now; target/release is the temporary
-diagnostic, not the ordinary b783cd6 binary. Failure remains begin-only;
-post-publication observations are not an earlier commit timestamp.
-
-## Completed transaction: one owner for prepared stale-path preference
-
-**Ordinary pair17:36 — no performance promotion:** control389218304B/47.562042s
-versus candidate326041600B/52.965807s, exact complete accounting in both.
-First confirmation.641281→.448263s; maximum confirmation4.845539→6.082958s.
-First write.131315→.104305s; maximum write3.553143→2.223001s.65.467→49.246Mbps
-does not pass the timing/throughput gate. Candidate early target delivery is
-better at10s but worse at15s; peak client RSS775264→832336KiB with unequal
-work. Independent full-phase/cost analysis distinguishes its terminal hold
-from middle incomplete-target and early already-produced-reply holds. No
-favorable third run or causal rate ratio from these random unequal workloads.
-Runtime b783cd6 remains a mechanism-correct intermediate checkpoint, not
-accepted performance. No rollback to the proven duplicate gate merely from
-one average, and no assertion it fixed the largest captured stalls.
-
-**Observed failure / exact cause boundary:** latest capture completes484507648B
-in44.176499s but maxconfirmation4.478852s/maxwrite8.647851s remain. Longest
-C329149108 hold4.987s has a9.273s already-selected QUIC write across it;
-TCP writers attempt353+ claims inside the hold. No lost notice or critical
-queue-front cause is supported for that interval. Separate lateC471356880
-has Ready QUIC, positive unclaimed source and plan refusals atUnix1788857702445
-and7703448; stale tier eligibility is true but its input can_enqueue is false,
-while fresh TCP writers are not Ready. These sampled predicates select the
-double policy filter, not a claim that every downstream resource is free.
-
-**Origin / model / competing cause:**5d660f3b allowed stale fallback only when
-no attached active/scorable nonstale output exists. Its useful intent was to
-avoid feeding a stale output while permitting sole survivors.9720e4b later
-introduced finite Ready+fresh/stale tiers but reused that prefiltered snapshot.
-The first mask ignores writer Ready and downstream Product admission; the
-second tier can only AND it and cannot recover an eligible stale survivor.
-This is a false availability premise, not insufficient congestion aggression.
-The capture's largest actual server stalls remain already-written/predecode;
-they are not attributed to this narrower gate or waived by its correction.
-
-**Predicted bounded correction / falsifier:** separate resource observation
-from the legacy nonstale preference. Legacy callers retain their current
-wrapper/policy; prepared claims consume unmasked resource observations and
-apply their existing finite four-tier policy exactly once. Preserve full
-membership/Original debt, W/P/E, qualification, actual Ready, source and Native
-fences. No new rate, timer, hint or synthetic can_enqueue override. Test the
-actual producer with fresh active/scorable but non-Ready output and stale
-Ready output having positive exact authority. Require same lowest-source
-claim, without requalification or minting credit. Opposites: fresh Ready wins,
-selected withdrawal refuses, and exhausted stale P/E still refuses. No
-runtime edit until semantic controls pass and intended assertion is RED.
-
-**Acceptance / stop / order:** independent model/fixture audit, focused GREEN,
-then fresh ordinary e476308 parent first and candidate second on unchanged
-mixed upload. Parent may run during test-only preparation, never compilation.
-Retain full completion/timing/cost; adverse or ambiguous pair stops promotion,
-not a favorable retry. Expected benefit is removing avoidable fallback
-starvation; cost risk is more service on a stale path, bounded by unchanged
-authority. Critical queue priority and native recovery stay unchanged.
-
-**RED preparation17:18:** minimal extension of the existing competing-writer
-fixture uses actual source publication, current Native/member capture and
-mark_request_path_stale. A pre-stale plan identifies A; current post-stale
-authority is recomputed independently of selection, without changing observed
-flags. This positive case is legitimately FirstPath, not an Additional/E
-exhaustion proof. Fresh Ready opposite and stale-ACK no-requalification checks
-are included; existing selected withdrawal stays intact. Independent fixture
-audit passes; functional RED build now runs with no lab overlap. Fresh ordinary
-parent already completed389218304B/47.562042s, maxconfirmation4.845539s and
-maxwrite3.553143s. Runtime remains unchanged until the intended assertion fails.
-
-**RED17:21:** warning-free1m12s build; actual two-test run finishes.01s.
-Fresh-Ready opposite passes. Stale-Ready claim alone fails at the intended
-0versus65536-byte assertion after current authority, source, membership and
-Ready controls pass. No fabricated snapshot flags or setup failure. Implement
-only the agreed observation/policy separation now; independent review and
-focused GREEN precede the ordinary candidate. Existing W/P/E helper controls
-are not misrepresented as an actual stale-Ready E-exhaustion claim test.
-
-**Implementation17:29:** only shared resource capture/projection and named
-legacy/prepared entrypoints changed, plus the existing batch-type internal
-re-export. Root reviewed every advisory/final prepared caller: both consume
-the same resource projection and retain the unchanged current four-tier,
-full-membership W/P/E, selected proof/load/Ready/source/Native checks. Legacy
-short-circuit/read order remains identical. One coherent GREEN rebuild is
-running; independent consumer review pending, no ordinary build/lab overlap.
-
-**GREEN17:32:** warning-free1m09s rebuild;544 focused checks pass1.27s.
-Both new actual stale/fresh controls and unchanged W/P/E exhaustion, selected
-withdrawal, Native refusal, idle/wake, half-close and real TCP/QUIC EOF controls
-pass. Independent consumer audit passes. Coverage disposition: current stale
-producer is FirstPath; E refusal is covered by unchanged exact-authority
-component tests, not a falsely claimed facade exhaustion test. Implementing
-that additional real-claim setup is unnecessary to change this policy mask.
-Checkpoint the isolated correction, then one ordinary optimized candidate
-build and the already-fixed paired comparison. No performance promotion yet.
-
-**Ordinary17:35:** runtime checkpoint b783cd6; warning-free optimized build
-3m29s, frozen as prepared-stale-20260908. Source is clean except user's
-unrelated seven-line document edit. One unchanged-profile candidate running,
-no compilation. Independent baseline review finds existing matched mirrored
-raw/Xray/H2 controls in review-mirrored-0906: raw completes4.279Mbps with
-1.610879s maximum confirmation gap; Xray/H2 are incomplete. Their router
-epochs match, but they are historical unequal-work random realizations and
-cannot attribute current gaps to Native or Product. Nonmirrored raw274.677Mbps
-must not be substituted. No redundant baseline rerun merely to obtain wins.
-
-## Completed discriminator: available request source is not claimed
-
-**Observed failure / priority:** second capture's largest target hold is
-F471135545 for6.295860s. Source S already485359616 atUnix1788855768480, but
-Original C stays471135545 until1788855774162;14224071 consumed-source bytes
-are unclaimed. Server reaches F at5770186, almost4s before that next claim.
-Client ACKs keep advancing F423163193→435960841 during that interval. This
-is not source starvation, already-assigned native delay, or a7s repair backlog.
-QOS_FORWARD_PREFIX_20260908 continuation records exact proof and contrary case.
-
-**Exact question / competing causes:** what prevents a physical Ready writer
-from claiming the lowest prepared range while source exists? Separate owner
-Busy at three cuts, critical queue-front precedence, mux window/cache refusal,
-missing Original incarnation, no Ready/eligible lead or whole-frame Product
-authority, and final source/Native/Ready/proof/load revalidation. Capture the
-actual failing predicate; aggregate management/native flight cannot infer it.
-
-**Origin/model:**9720e4b preserves byte conservation/late native assignment and
-inherits the combined queue's critical-repair-before-Data front at both initial
-read and RequestQueuedSourceCommit validation. A TCP-bound critical intent
-could therefore veto independent QUIC source, but this is only a candidate
-cause. RFC10.4's final-writer priority is not proof that this global barrier is
-necessary. A missing retained Original incarnation is a separate pre-planning
-gate; do not mislabel it as absence of every possible copy transmitter.
-
-**Smallest discriminator / acceptance:** one diagnostic on unchanged e476308
-and unchanged profile, using existing stage events plus bounded per-stage
-claim counts, first/last occurrence timestamps and sampled actual state at
-the existing1s diagnostic cadence. Counts are through each emitted sample,
-not a promised final total; no intermediate state is reconstructed.
-Observe queue front kind/cause/range/bound target, C/F/source bytes, Ready
-identities and already-computed admission/refusal inputs. No per-attempt log
-flood, extra Native sampling, queue scan for display, reservation or policy
-change. Independently review, archive/reverse, then capture once. A long hold
-must join actual refusals; absent holds are non-reproduction. Test a focused
-real producer counterexample before any model correction. Do not jump from
-empty native flight to removal of proven Product ownership.
-
-**Observer preparation16:40:** count notice publication/coalescing, dequeue/
-claim entry and deferred completion too: zero claims alone cannot distinguish
-no notice, parked wait and a genuinely occupied writer. Do not add a select
-or strong Product lifetime to instrument wake outcomes. A process-local
-bounded-capture helper formats state only when emitting and releases its own
-counter mutex before formatting/output; Busy has no new Product read. Reuse
-the first exact forward-range overlay, not the now-answered repair-route trace.
-
-**Retained alternative:** the same second capture has a different QoS5.138s
-hold: repair local acceptance→decode4.899s, route27us. All1407 completed repair
-routes total41.466ms/max3.494ms. That route alternative is closed for this
-capture; native ordered delivery/task service remains unresolved. No threshold
-change follows. Native reorder tolerance/priority source inspection is context,
-not measured missing-packet attribution. No native trace/retuning now.
-
-**Observer audit16:49:** actual claim-return stages and already-computed
- planner inputs are sampled separately from notice/wake outcomes. Planner
- counts are branch visits, not claim totals; shared candidate instrumentation
- excludes repair-mode calls. Queue acceptance is separate from notification
- activation. Biased wake labels identify selected branches, not exclusive
- causes; physical-key counts may merge attachment generations. Root and
- independent source reviews preserve all policy/Native reads and ownership.
- Exact16-file overlay retained in PREPARED_CLAIM_SERVICE_TRACE_20260908.patch;
- one diagnostic build next, no simultaneous lab. No runtime fix proposed.
-
-**Capture16:54:** warning-free optimized diagnostic build3m33s. Frozen as
-prepared-claim-service-20260908; all16 observer files reversed and src diff
-verified empty before capture. One unchanged-profile mixed upload now runs,
-with exact forward events plus request_prepared_claim/request_prepared_plan/
-prepared_notice. No build/lab overlap; target/release is diagnostic-only.
-
-**Result16:55:** runner0,45service samples,484507648 exactB/44.176499s.
-10428Originals cover complete source;6367ACKs release exactly that total.
-All Originals write/decode; four losing TCP copies lack positive completion.
-Top actual server holds4.408347/3.514626s concern already-written QUIC Originals.
-The prior long unclaimed-head geometry is not identically reproduced. Root
-and independent joins exclude lost notice/global critical front as causes of
-the largest pending-source interval. No runtime/performance acceptance.
-
-## Completed discriminator: QoS forward-prefix stall
-
-**Issue / evidence:** the completed e476308 ordinary run has a5.000s sampled
-T173608233 hold during15–20s. By16s S−T=64MiB, Rs=Rc435 and all client TCP
-Recv-Q values are zero. Native TCP ACK bytes and QUIC accounting still advance.
-This is not the previous already-produced reply backlog. Separate Rc449 and
-Rc841 holds with continued T/Rs progress remain recorded, not waived.
-ADVISORY_OWNER_SERVICE_20260908 contains the full pair, phases and raw bins.
-
-**Exact question / alternatives:** which original attachment owns the blocking
-request prefix, when was it actually claimed/written, and did an admitted
-recovery copy exist before server ordered delivery resumed? Alternatives are
-no source assignment, native queued/lost service, unavailable exact recovery,
-and local receive/ordering service. Aggregate S−T is neither claimed C nor one
-64MiB native queue. Zero client Recv-Q does not prove zero server input delay.
-
-**Smallest discriminator:** one diagnostic capture on unchanged e476308 and
-the same profile, not another ordinary performance trial. Reuse server hole/
-delivery-stall and client ACK/recovery events. Fill only absent exact range,
-instance, claim/write and receiving-frontier boundaries needed to join the
-blocking request; no per-attempt scheduler logging or aggregate cost overlay.
-Archive/reverse every temporary hook before running its frozen binary. Review
-its owner/lifetime and timestamp semantics independently before build.
-
-**Falsifier / stop:** a different or absent long forward hold is non-reproduction,
-not improvement. Exact source/range/instance joins precede blame; write completion
-is local native acceptance, not remote arrival. Accepted ownership does not
-prove protected write completion; duplicate arrival does not identify a winner.
-Follow the earliest supported held boundary and retain unknown sub-stages.
-No controller/resource/threshold correction without a real counterexample.
-
-**Execution16:06:** source and independent whole-overlay audits pass; diagnostic
-build3m34s, warning-free. Exact10-file temporary observer patch archived as
-QOS_FORWARD_PREFIX_TRACE_20260908.patch and all source hooks reversed before
-capture. Frozen qos-forward-prefix-20260908 binary now runs one unchanged
-profile. Normal e476308 stays separate. Local success is not peer receipt;
-QUIC split/coalesced byte coverage and connection-local H3 identities must be
-joined honestly. Sparse mux events may leave duplicate winner ambiguous.
-
-**Measured16:07:** complete374669312B/65.783216s, maxconfirmation5.592993s,
-maxwrite3.933834s; diagnostic performance is not ordinary acceptance.
-Independently checked18779 Original commits cover
-exactly[0,374669312); all24009 Original/copy commits have successful local
-writes, and applied ACK release matches total. Full raw capture retained in
-QOS_FORWARD_PREFIX_20260908.raw.tar.gz. No build/lab running.
-
-**Exact next boundary16:14:** QoS F185133452 andF187796428 holds3.432533/2.661961s
-release within1ms of authenticated decode. Longest late F298838412 hold4.752859s
-is won by a QUIC repair locally accepted9.751s before decode, then mux+5ms.
-At admission5490376 preceding repair payload bytes were accepted but not
-decoded; this is not yet native queue attribution. Between its predecessor
-decode and winning decode4.750s later, ordinary QUIC decodes6970816B on the
-same connection. This falsifies connection-wide decode absence but leaves
-native ordered-stream delay versus per-repair routing/reader service.
-
-**Bounded continuation / falsifier:** existing repair reader awaits routing
-after each decoded frame and also admits requalification records invisible to
-StreamData-only traces. Reuse the frozen-stage overlay and add only before-read,
-read-complete and route-complete timing for that reader (including nondata
-records), then one unchanged-profile capture. No controller/queue correction.
-Long route await identifies local ownership; prompt route completion followed
-by a held read excludes that await, but still does not measure wire arrival.
-Counterfactual lack of the old hold remains non-reproduction. Independent
-review, archive/reverse before capture, full completion/cost retained.
-
-**Continuation build16:18:** repair-reader observation passes independent
-source/semantics audit. Feature-gated local ordinal covers StreamData and
-StreamRequalifyData, no new await or clone; EOF/error/cancel remains begin-only.
-The complete reused overlay plus one reader observer is archived as
-QOS_REPAIR_READ_TRACE_20260908.patch. One build underway, no lab overlap.
-First-capture full evidence report and raw archive now retained; it disproves
-neither all native delay nor all local delay, and no policy fix was made.
-
-**Capture16:22:** diagnostic build3m32s, warning-free; frozen separately as
-qos-repair-read-20260908. All11-file observer hooks reversed and src diff
-verified empty before starting one unchanged-profile capture. No build now.
-
-**Result16:23:** exact485359616B/52.139505s, maxconfirmation7.128953s. Full
-raw53bins/accounting/read-ordinal joins retained. Four losing TCP copies lack
-positive write completion; every Original completes and final ACK/cache
-reconciles. Readoutcome without prior work availability would falsely label
-the longest7.094s read a transport stall. Actual copy appears only252ms before
-decode. This counterexample selects the earlier unclaimed-source boundary
-above. No ordinary comparison, model fix or performance acceptance follows.
-
-**Disposition / scope:** e476308 remains an isolated mechanism-correct
-intermediate checkpoint, not a promoted performance fix. Its early receive
-consumption and T improve in this realization; worse max gaps and later
-settlement prohibit uniform benefit claims. No rollback of exact ownership
-from a random average alone. Source audit of existing ACK-release cost found
-an exact potential untouched-suffix work exclusion, but it is NOT the next
-fix: no RED/implementation or new obligation follows while the observed worst
-phase is forward starvation. Keep that contingent reasoning only for a later
-cost-selected question. All global gates below are unchanged.
-
-## Completed transaction: native claimant owner admission
-
-**Ordinary pair complete15:39 — no promotion:** optimized e476308 build3m31s,
-warning-free. Parent9ea25e2 completes355532800B/44.964483s; candidate completes
-409796608B/49.163739s. Maximum confirmation5.052667→6.197568s and maximum
-write1.356326→5.462440s worsen; first confirmation.848948→.713189s and
-first write.580035→.122947s improve.63.256→66.683Mbps is not acceptance.
-Full phase/socket/cost comparison is complete; all raw data and RED/GREEN/
-build logs archived in ADVISORY_OWNER_SERVICE_20260908.raw.tar.gz. No build or
-lab running, no further runtime edit. Different work and random realizations
-prevent attributing all changes to contention. Preserve earlier adverse cases.
-
-**Pre-change decision15:23:** the completed reply/cost joins below select a
-reachable local service boundary, not a universal congestion explanation.
-Two advisory `owner.lock()` acquisitions in `claim_prepared_request_data` can
-park a native writer's executor thread while the Product actor holds its mutex
-for ACK/recovery. The final Native-fenced acquisition already uses a prearmed
-nonblocking try-lock; the two earlier acquisitions do not. Origin9720e4b
-addressed the lock cycle, but absence of a lock cycle does not ensure responsive
-native input service. An empty source check can also wait behind that owner.
-
-**Question / competing causes:** does the actual prepared producer return
-without blocking when either advisory acquisition meets retained Product
-ownership? Actor work and FIFO input backpressure remain distinct causes of
-the captured gaps. Claim elapsed includes contention and scheduling; it does
-not measure mutex waiting separately or prove it caused every held reply.
-
-**Model / predicted correction:** use the existing freshly prearmed try-lock
-at each writer acquisition and return its existing Busy outcome on contention.
-At the second cut, discard the advisory frame/receipt and retry current state
-after unlock. Preserve exact registration/source/Ready/Native checks, final
-fence, U→Original conservation, cancellation and all admission policy. Busy is
-not evidence of a bad path or authority to select Backup. Actor-side ownership
-remains serialized. No new timer, queue, coalescing, controller or threshold.
-
-**Smallest action / falsifier:** test-only actual producer controls retain the
-real Product mutex in another thread at each cut. Require Busy before release,
-no committed byte/flight/charge change, unlock-before-first-poll wake and the
-same lowest-source claim after release. Bound only test cleanup so the old
-blocking implementation fails rather than hangs. Uncontended claims and stale
-registration/terminal refusal remain opposite cases. Independently audit
-fresh arming after the first unlock: reusing a pre-own-unlock wait could spin.
-Only a real RED permits runtime editing. Then focused GREEN and one ordinary
-candidate/parent pair on the unchanged profile, retaining full completion,
-phase/gap and cost evidence. A worse/ambiguous result stops promotion; no
-diagnostic-rate acceptance or unrelated model expansion.
-
-**Pair order fixed before execution15:25:** fresh frozen ordinary9ea25e2 parent
-first, then the candidate only after actual RED/GREEN/audit. Parent capture
-can run during test-only fixture preparation, with no build running. This
-uses host time without mixing a build into the lab; the older ordinary9ea
-realization is context rather than a substituted control. No favorable retry.
-
-**RED15:32:** actual uncontended control passes; both advisory acquisition
-cases and cancellation reach the intended blocking assertion only after
-semantic held-state controls and thread cleanup.1pass/3fail,1.00s;
-warning-free build1m12s. Independent model/fixture review passes. Implement
-only the two existing prearmed try-lock acquisitions now. Fresh ordinary
-parent completes355532800B/44.964483s, maxconfirmation5.052667s; this variation
-is retained alongside the earlier11s gap rather than called acceptance.
-
-**GREEN15:34:** two advisory acquisitions changed, final fence unchanged;
-542checks pass1.28s after warning-free1m12s rebuild. Independent model and
-consumer/fixture reviews pass. Ordinary optimized candidate build next,
-no lab overlap. No practical promotion from this checkpoint.
-
-## Completed discriminator: remaining winning-reply service hold
-
-**Executed15:00:** warning-free diagnostic build3m33s; all observer hooks
-archived/reversed before capture. Runner0,366018560 exact bytes/43.726528s;
-maxconfirmation4.375291s, maxwrite4.114246s. It does NOT reproduce the ordinary
-11s gap and cannot establish better ordinary performance.4371total log lines,
-44service samples; products/probes stopped. Full raw diagnostic preserved.
-Exact winning-reply joins and aligned nested-cost analysis are complete in
-COPY_DEBT_SERVICE_20260908. No additional runtime fix, build or lab is running.
-The4.374s F639 hold is mostly before decode; F737 includes1.203s already-decoded
-local residence. F821 has at least2.722s preceding reader-send-awaited overlap,
-but different cost composition from F737/F68. Neither global ACK cost nor
-recovery cost alone explains every hold.73 winning mux advances all reach the
-local writer within4ms after mux. Native-writer owner contention is a source-
-reachable mechanism to falsify next, not a conclusion from one aggregate.
-
-**Issue / observed failure:** ordinary9ea25e2 completes254083072 exact bytes in
-48.973579s, but maximum confirmation gap remains11.042148s. Candidate Rc433
-holds10.001s (Unix1788849816832–1788849826833) while target/response production
-continues. Separate target T230311809 holds9s at1788849821825–1788849830825.
-These are real fluent-service failures, not solved by improved total Mbps.
-
-**Competing causes / exact question:** is the winning missing reply still
-before native decode, between decode and Product input/mux, or after mux at
-local delivery? Native congestion/backpressure, local routing/executor service,
-costly preparation/dispatch and local delivery remain alternatives. Ordinary
-management/socket counters do not locate the exact frame. The older local
-decode-to-mux2.226s attribution belongs to another version/realization.
-
-**Existing evidence:** COPY_DEBT_SERVICE_20260908 retains the complete ordinary
-candidate/parent pair and all raw bins/costs. PREPARED_REPLY_SERVICE_20260908
-retains100 winning-frame joins and synchronous cost buckets from the prior
-sparse diagnostic. Inside that prior held interval, Product debt changes
-6068248B between snapshots: globally frozen recovery state is disproved.
-
-**Smallest experiment:** reuse the archived sparse reply-stage and aggregate
-observer on9ea25e2. Add nested synchronous scopes for recovery range preparation
-(two phases), complete target selection, Native resolution, Product projection,
-queued-copy debt, repair Apply and its fenced bookkeeping. No per-attempt logs,
-new harness/profile, target-observation cache or runtime policy correction.
-The reused hooks plus seven scopes passed independent review and were reversed
-before running the frozen diagnostic binary. No ordinary run is active.
-
-**Falsifier / stop / acceptance:** exact winning-frame joins precede attribution.
-Prompt decode/mux rejects that local stage; prepublication/predecode delays
-remain distinct. No new long gap means non-reproduction, not ordinary repair.
-Nested elapsed totals are not independent CPU totals and cannot be added.
-Diagnostic Mbps is never ordinary acceptance. No further code correction until
-a reachable mechanism/control and a clean model justify it. If evidence selects
-a different stage, follow it rather than force the recovery-cost hypothesis.
-
-## Current source and latest practical disposition
-
-Runtime checkpoint **d999fea** restricts request ACK release work to its exact
-support prefix; RED0683286 and546focused checks pass. Ordinary pair is
-mixed/adverse; no performance promotion. **b783cd6** separates prepared stale
-preference; actual RED checkpoint f1b0900. Its earlier ordinary pair is
-mixed/adverse and not promoted.
-Parent **e476308** adds the two nonblocking advisory acquisitions above; RED
-checkpoint584b748. Its ordinary result also remains mixed/adverse in timing.
-Earlier **9ea25e2** maintains exact additive accepted-copy debt
-by attachment; RED checkpoint **3396087**, evidence checkpoint **ebad57f**.
-No shelved sampler, new Native observation policy or congestion tuning is active.
-The user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md edit is untouched and
-must remain outside commits.
-
-| Outcome | Parent b3dfef1 | Candidate9ea25e2 |
-| --- | ---: | ---: |
-| Exact completion |No,85s observation guard |Yes |
-| Confirmed / accepted bytes |93570384 /180748288 |254083072 /254083072 |
-| Elapsed seconds |85.948541 |48.973579 |
-| First / max confirmation gap seconds |.467841 /66.779472 |.397566 /11.042148 |
-| First / max write gap seconds |.154499 /15.796057 |.128872 /1.011139 |
-| Longest sampled Rc / T hold seconds |66.001 /60.000 |10.001 /9.000 |
-| Peak client / server RSS KiB |511988 /90968 |677496 /129508 |
-
-Candidate first3s target delivery is worse, but10s delivery and settlement
-improve. RSS is higher with more work. Random realizations, different duration
-and unequal accepted/confirmed bytes prevent causal rate ratios or a uniform
-non-downgrade claim. Parent reset follows guard teardown; its raw confirmation
-bins are unavailable, not zero. Candidate49 raw bins include long zero spans.
-No practical promotion or favorable third ordinary repeat.
-
-### What the last correction actually proves
-
-The real dispatcher emits the same4096B repair from69632 retained bytes and
-performs two accepted-copy-debt queries. Fragmenting only an irrelevant Original
-suffix raised visits4→130; the intended work assertion alone failed after
-semantic controls passed.9ea25e2 maintains J_i=sum(retained copy bytes on exact i)
-at append, ACK-fragment release and drain, replacing each full scan with one
-lookup. Overlaps count separately; expiry/Native ACK do not erase debt; zero
-keys retire and replacements remain distinct. Checked arithmetic is supported
-by current final admission, not a new cap. No RFC quantity or policy changed.
-
-Two independent reviews, a full-scan lifecycle oracle and538 focused checks
-pass; RED/GREEN builds1m13s each, GREEN1.28s. Ordinary build3m29s. The practical
-pair supports better settlement in this case, not attribution of every change
-or acceptable remaining latency. See COPY_DEBT_SERVICE_20260908.md/raw.tar.gz.
-
-A further Native observation-sharing shortcut is **not implemented**. It can
-be a coherent Observe–Decide policy but is not equivalent when a path changes
-mid-selection: current chosen Apply cannot recover a better omitted target.
-Do not silently package it as source cleanup.
-
-## Retained findings and boundaries
-
-| Mechanism / checkpoint | Proven scope and remaining limitation |
+**Observer18:56:** root and independent whole11-file reviews pass. Exact
+forward/repair hooks reused without policy, queue, lock or await changes;
+fresh archive POST_ACK_FORWARD_TRACE_20260908.patch preserves valid diff
+metadata. Repair read time includes scheduling/unavailable work; server F is
+mux release, not target-write completion. Product ACK debt and Native pending
+bytes have deliberately separate lifetimes; different counters are not a leak.
+The diagnostic was frozen and its hooks reversed before the unchanged capture.
+
+**Execution update:** warning-free3m32s diagnostic build completed and frozen
+as post-ack-forward-20260908. All11observer files were reversed and the source
+diff verified empty. The unchanged mixed-upload capture, post-ack-forward-0908,
+completed:436797440 exact bytes/48.135091s, maximum confirmation/write gaps
+6.095822/5.560319s;49 raw one-second bins and49 service rows. This is diagnostic
+evidence, not ordinary acceptance. [Raw archive](POST_ACK_FORWARD_SERVICE_20260908.raw.tar.gz)
+preserves exactly five results plus build/run logs; gzip integrity, exact member
+list and byte-for-byte source comparison pass. No build or lab remains active;
+target/release is diagnostic, not ordinary d999fea. Exact causal joins and the
+next discriminator remain root-owned.
+
+## Current source and ordinary disposition
+
+Current runtime **d999fea** restricts request ACK-release work to exact support;
+RED **0683286**,546focused checks. Parent **b783cd6** separates prepared stale
+preference; RED **f1b0900**,544checks. Earlier **e476308** makes the two advisory
+native-writer Product acquisitions nonblocking; RED **584b748**,542checks.
+**9ea25e2** indexes exact additive copy debt; RED **3396087**,538checks and
+evidence checkpoint **ebad57f**. All are mechanism checkpoints, not acceptance.
+No shelved sampler, Native observation-sharing policy or congestion tuning is active.
+
+| Ordinary pair | Parent → candidate exact bytes / seconds | Maximum confirmation / write gaps, seconds | Disposition / evidence |
+| --- | --- | --- | --- |
+| b3dfef1 → 9ea25e2 |93570384confirmed /180748288accepted /85.948541 →254083072 /48.973579 |66.779472 /15.796057 →11.042148 /1.011139 |Parent incomplete at guard; candidate settles, but11s gap remains. [Copy debt](COPY_DEBT_SERVICE_20260908.md) |
+| 9ea25e2 → e476308 |355532800 /44.964483 →409796608 /49.163739 |5.052667 /1.356326 →6.197568 /5.462440 |Timing mixed/adverse; no promotion. [Advisory owner](ADVISORY_OWNER_SERVICE_20260908.md) |
+| e476308 → b783cd6 |389218304 /47.562042 →326041600 /52.965807 |4.845539 /3.553143 →6.082958 /2.223001 |Less work, slower completion/larger confirmation gap; no promotion. [Stale preference](PREPARED_STALE_SERVICE_20260908.md) |
+| b783cd6 → d999fea |473104384 /47.992259 →393150464 /46.768581 |3.060424 /4.396938 →5.497708 /5.665049 |Less work and worse gaps; no promotion. [ACK support](ACK_SUPPORT_SERVICE_20260908.md) |
+
+Different work, duration and random packet realizations prevent causal rate
+ratios or uniform non-regression claims. Preserve every adverse phase; no
+favorable third run and no rollback to a proven defect from one average alone.
+For9ea25e2, first3s target service worsened while10s service/settlement improved;
+client/server peak RSS511988/90968→677496/129508KiB with more work. Parent reset
+followed guard teardown; missing confirmation bins are unavailable, not zero.
+Forb783cd6,10s target service improved but15s worsened; client peak RSS775264→
+832336KiB. Detailed first-service, full-bin, socket and cost evidence remains
+in each linked report and its raw archive.
+
+### What the recent corrections prove
+
+- **d999fea — ACK support:** fd32e60/f4206d0's global flight snapshot settled
+  exact copies;765683b preserved byte-exact ambiguity. Only starts<H=max ACK
+  end can contribute release/evidence. Extract that prefix, preserving crossing
+  flights and their H-bucket precedence; leave unrelated keys untouched.
+  When every key is eligible, keep the whole-map fast path. Real131072B Original
+  plus14600B copy fixture failed only at66versus3record work; corrected cases
+  each process2records with identical release/proof/receipt/debt/epoch/order.
+  No ACK coalescing, policy, timer, cap or RFC change. Existing exact-event
+  replay independently bounds4470499 needless suffix visits across6367ACKs;
+  this is not measured CPU savings. [Evidence](ACK_SUPPORT_SERVICE_20260908.md).
+- **b783cd6 — one stale preference:**5d660f3b's legacy fresh-output mask ignored
+  Ready;9720e4b's finite claim tiers could not restore a masked stale survivor.
+  Prepared claims now consume unmasked resource observations, then unchanged
+  full-membership Ready/fresh/backup tiers and W/P/E/final fences. Legacy
+  callers retain their policy. Actual stale-Ready claim RED0→65536B, fresh-Ready
+  opposite and no-requalification checks pass. Positive fixture is FirstPath;
+  E exhaustion is component coverage, not a falsely claimed facade test.
+  [Evidence](PREPARED_STALE_SERVICE_20260908.md).
+- **e476308 — advisory owner:** actual held-Product producer tests failed at
+  both advisory acquisitions and cancellation, with cleanup guards rather
+  than Product latency thresholds. Existing freshly prearmed try-lock/Busy
+  now applies at both cuts; final Native fence, source, readiness and
+  cancellation remain unchanged. No blocking reverse Product lock or new
+  fallback permission. This does not attribute every local hold to contention.
+  [Evidence](ADVISORY_OWNER_SERVICE_20260908.md).
+- **9ea25e2 — additive copy debt:** actual dispatcher emits the same4096B
+  repair from69632retained bytes with two queries; irrelevant fragmentation
+  raised4→130record visits before RED. J_i=sum of retained copies on exact i
+  is now maintained on append, ACK split and drain; overlap multiplicity,
+  expiry/Native-ACK nonrelease, zero-key retirement and replacement identity
+  remain exact. Full-scan lifecycle oracle and independent audits pass.
+  [Model and ordinary comparison](COPY_DEBT_SERVICE_20260908.md).
+
+## Completed discriminators — findings, not new fix queues
+
+- **Reply residence on b783cd6:**387579904B/52.491225s diagnostic,
+  maxconfirmation3.508291s. Winning[863,877) spent3.247s server-read→delivery,
+  including599ms after authenticated decode; preceding nondata reader send
+  awaited1.961027s within1.965s. Real local backpressure is established, not
+  ACK-only CPU attribution or an all-Native explanation. This selected the
+  existing ACK-work question; no new cost framework was added.
+  [Reply residence](REPLY_RESIDENCE_20260908.md), evidence checkpoint **bd3b810**.
+- **Terminal service:** ordinary b783cd6's6s postfull-target tail was not
+  reproduced. Diagnostic424017920B/56.939769s,maxconfirmation7.996908s.
+  EOF had C391950079+U32067841=final; FIN cannot omit U. Same-offset FINs
+  published with24.47MB retained cache, disproving a cache-zero prerequisite.
+  Server initially pended FIN, then final Data made it ready; target shutdown
+  and final13B reply read were prompt. Duplicate FIN replay is normal.
+  The8.909s source-EOF→publication and1.258s write→decode intervals remain
+  composite. Nonterminal replies were already read7.155s/15.686s before
+  delivery. No FIN/RFC fix justified; earlier6s tail remains unattributed.
+  [Terminal evidence](TERMINAL_SERVICE_20260908.md), checkpoint **cd97c5d**.
+- **Prepared claim service:**484507648B/44.176499s,maxconfirmation4.478852s/
+  maxwrite8.647851s.10428Originals and6367ACKs reconcile exactly; all Originals
+  write/decode, four losing TCP copies lack positive completion. Largest
+  server holds4.408347/3.514626s concern already-written QUIC Originals.
+  Pending-source C329149108 held4.987s inside a9.273s selected QUIC write;
+ 353+TCP claim attempts exclude lost notice/global critical-front explanations
+  for that interval. Separate sampled stale-Ready veto selected b783cd6;
+  it does not explain the largest holds or prove every resource was free.
+  [Claim/notice evidence](PREPARED_CLAIM_SERVICE_20260908.md).
+- **QoS forward/repair service:** first diagnostic374669312B/65.783216s,
+  maxconfirmation5.592993s;18779Originals and24009total commits reconcile.
+  QoS F185133452/F187796428 holds3.432533/2.661961s release within1ms of decode.
+  Late F298838412 was repaired9.751s after local acceptance;4.750s between
+  repair decodes coexisted with6970816B ordinary QUIC decode on that connection.
+  This excludes connection-wide silence, not native stream delay versus routing.
+  Follow-up485359616B/52.139505s,maxconfirmation7.128953s:1407completed repair
+  routes total41.466ms/max3.494ms; QoS winning-copy route27us excludes that
+  route as cause there. Long7.094s read included unavailable work: actual copy
+  was published only252ms before decode. A different F471135545 hold had
+ 14224071consumed but unclaimed bytes. Four losing TCP copies lacked positive
+  completion, not Original loss/corruption. No Native/queue/threshold fix.
+  [Both captures and raw archives](QOS_FORWARD_PREFIX_20260908.md).
+- **Earlier copy-debt service diagnostic:**366018560B/43.726528s,
+  maxconfirmation4.375291s did not reproduce ordinary11s. F639 was mostly
+  predecode; F737 had1.203s local residence; F821 had>=2.722s preceding reader
+  send-await overlap with different cost composition.73winning mux advances
+  reached local write within4ms.4786flight releases took7.808784s within
+ 8.160194s ACK-handler elapsed; contained windows include246899/285275us.
+  Nested/concurrent elapsed is not additive CPU, nor proof of a sole cause.
+  [Exact joins and cost limits](COPY_DEBT_SERVICE_20260908.md),
+  [prior sparse evidence](PREPARED_REPLY_SERVICE_20260908.md).
+
+Read/write/decode timestamps belong to their actual producer stages. Server F
+means mux release, not completed target write; local native acceptance is not
+transmission/receipt. Shared-send completion may follow concurrent dequeue.
+QUIC IDs are connection-local; TCP wire IDs and runtime indices differ, and
+per-side physical IDs are not interchangeable. Join exact byte coverage,
+including split/coalesced records. Preceding nondata waits are not ACK-only,
+and unlogged/left-censored intervals remain unknown. Losing copies, native
+pending bytes and Product debt have different lifetimes—not automatic leaks.
+
+## Retained checkpoints and unfinished boundaries
+
+| Mechanism / checkpoint | Proven scope; remaining disposition |
 | --- | --- |
-| Native reordered-packet/history corrections |Real encrypted packet counterexamples; jitter-only.585→185.313Mbps. Not all network/recovery gates |
-| Restart / late STARTUP / lifecycle ownership |Concrete scoped refusals, wake/reclamation checks;1941mixed+64single-mode churn reclaims owners. Deployed random RAM/CPU event not fully attributed |
-| Request retained recovery011aee9 and unique ACK atoms765683b |Real ownership/attribution counterexamples. Their adverse/incomplete ordinary pairs remain; component GREEN never promoted them |
-| Response retained recovery953a54f |Immutable assignment recovery, active/final admission preserved; better aggregate but worse6.080s gap in ordinary pair |
-| Ranked-prefix query445011f |Exact output with fewer irrelevant visits; average improves but gaps worsen. No universal acceptance |
-| Ordered direct structural recovery1436ff4 |Actual byte-order/overlap-work REDs; full allowance and independent-target service preserved. Ordinary early target service adverse |
-| Prepared request ownership9720e4b |U→exact Original ownership at native claim; no premature TCP assignment.533checks/audit, then ordinary75s return hold/incomplete settlement |
-| Persistent idle readinessb3dfef1 |Real all-refused two-writer retry recurrence removed;535checks/audit. Ordinary long return/target holds remain |
-| Exact copy-debt index9ea25e2 |Work and conservation proved; ordinary settlement improves,11s gaps remain |
-| Native advisory owner admissione476308 |Actual two-cut contention RED/GREEN; no blocking native Product acquisition. Ordinary completion with worse gaps; no practical promotion |
-| Single prepared stale preferenceb783cd6 |Actual sole-Ready stale claim0→64KiB with fresh-Ready opposite and unchanged qualification;544 focused checks. Ordinary slower completion/larger confirmation gap; no promotion |
-| Exact ACK-support workd999fea |Actual suffix fragmentation66versus3RED; exact prefix/saved-boundary implementation preserves release semantics,546checks. Ordinary maxconfirmation3.06→5.50s and less completed work; no promotion |
-| Shelved paired-clock request sampler |Actual[2,2,2]→[2,3,4] sampling correction; ordinary incomplete/adverse, not stacked into runtime |
+| Native reordered-packet/history corrections |Real encrypted packet counterexamples; jitter-only.585→185.313Mbps. Other network/recovery gates remain open |
+| Restart / late STARTUP / lifecycle ownership |Scoped refusals/wakes/reclamation;1941mixed+64single-mode churn reclaims owners. Deployed random RAM/CPU incident still not fully attributed |
+| Request retained recovery **011aee9**, unique ACK atoms **765683b** |Real ownership/attribution counterexamples; adverse/incomplete ordinary pairs retained, not promoted |
+| Response retained recovery **953a54f** |Immutable per-assignment recovery with active/final quantities preserved; ordinary aggregate improves but gap worsens to6.080s |
+| Ranked-prefix query **445011f** |Exact output, fewer irrelevant visits; average improves but gaps worsen |
+| Direct structural recovery **1436ff4** |Actual global-byte-order/overlap-work REDs; allowance and independent-target service preserved; ordinary early target service adverse |
+| Prepared request ownership **9720e4b** |U→Original at physical claim, no premature TCP assignment;533checks/audit, then ordinary75s return hold/incomplete settlement |
+| Persistent idle readiness **b3dfef1** |Real two-writer all-refused retry recurrence removed;535checks/audit; long ordinary return/target holds remain |
+| **9ea25e2 / e476308 / b783cd6 / d999fea** |Exact work/admission mechanisms proved above; respective ordinary comparisons remain unaccepted |
+| Shelved paired-clock request sampler |Actual[2,2,2]→[2,3,4] correction; ordinary incomplete/adverse, not stacked into runtime |
 
-Preserve prepared-source conservation and exact chosen readiness epochs:
-A=prepared source end, C=native claimed end, U=A−C, B=U+sum Original debt.
-Claim U→O does not increase B; ACK cannot exceed C; FIN waits for U=0.
-Failed protected writes retain exact ownership. Product→Native actor calls
-coexist with Native→tryProduct writer calls; no blocking reverse edge or guard
-across await. A deadlock-free graph alone is not a latency guarantee.
+Earlier exact ownership and admission evidence remains in
+[request cohort](REQUEST_COHORT_ORDINARY_20260907.md),
+[request prefix service](REQUEST_PREFIX_SERVICE_20260908.md),
+[response handoff](RESPONSE_HANDOFF_20260908.md) and
+[prepared ownership model](PREPARED_ORIGINAL_OWNERSHIP_MODEL.md).
+Historical SEEN/UNSEEN labels are dispositions, not automatic new obligations:
+[change disposition](CHANGE_DISPOSITION_20260907.md),
+[reflection](PERFORMANCE_REFLECTION_20260907.md),
+[practical acceptance](REVIEW_AND_PRACTICAL_ACCEPTANCE.md).
 
-Structural recovery is globally byte-ordered but cannot let a blocked target
-stop independently eligible work. Keep existing exact copy deadlines/J/Native
-Apply. Do not resurrect old suffix queues, ACK-per-frame structural allowance,
-renewable deadlines, scalar same-host protocol preferences or guessed capacity.
-Direction-neutral response parity remains pending; do not silently treat the
-request-only prepared migration as both-direction completion.
+Preserve A=prepared-source end, C=native-claimed end, U=A−C and
+B=U+sum Original debt. Claim U→O does not increase B; ACK cannot exceed C;
+FIN waits for U=0. Failed protected writes retain exact ownership. Preserve
+chosen readiness epoch, current exact qualification and final Native fence.
+Product→Native actor calls coexist with Native→tryProduct writer calls:
+no blocking reverse edge or guard across await. Deadlock freedom is not latency.
+Structural byte order must not block independently eligible targets; retain
+exact copy deadlines/J/Native Apply. **Response direction-neutral prepared-source
+parity remains pending**; request-only migration is not both-direction closure.
 
 Rejected static ranking, relative ACK codec, ready-feedback batching,
 wrapperless actor, absolute-delay reordering,3N1 and isolated raw-byte hysteresis
-deletion remain rejected. No broader topology-inference framework, controller
-retuning or new speculative inventory follows from these captures.
-Original-QUIC-ignored claim was disproved by actual attachment timing.
-No target/backpressure or losing-copy delay may be labelled the winning gap.
+deletion stay rejected. Do not restore whole-ready-set invalidation or
+metadata-refusal readiness churn; chosen epoch and physical idle lifetime
+have real counterexamples. No suffix queues, ACK-per-frame structural allowance,
+renewable deadlines, scalar same-host protocol preference or guessed capacity.
+Original-QUIC-ignored claim was disproved by attachment timing.
+Further Native observation-sharing is **not implemented**: an omitted better
+target cannot be restored by chosen-target Apply. It is not equivalent cleanup.
+No topology-inference framework, controller retuning or speculative inventory.
 
 ## Global gates — unchanged and not satisfied
 
 | Order | Scope | Required evidence |
 | --- | --- | --- |
 |1 |Mixed allocation, upload sampling, cold/warm startup |Exact cause/model/real RED/control/audit/GREEN plus ordinary first-body/gaps/loaded latency/completion |
-|2 |TCP/QUIC changing loss, jitter, QoS, blackhole/recovery |Both directions, same-request restart-free recovery; native receipt versus ordered user service |
+|2 |TCP/QUIC loss, jitter, QoS, blackhole/recovery |Both directions, same-request restart-free recovery; Native receipt versus ordered user service |
 |3 |Aggregation/shared contention |Single500Mbps, independent200Mbps each, shared cuts, asymmetric3–10%mean6 loss/jitter/QoS/outage combinations and ablations |
-|4 |Experience/baselines |TCP,QUIC,default; cold/warm single/concurrent/real speed.cloudflare.com; raw TCP,Xray,Hysteria2 matched topology/configuration including failures |
+|4 |Experience/baselines |TCP,QUIC,default; cold/warm single/concurrent/real speed.cloudflare.com; raw TCP,Xray,Hysteria2 with matched topology/configuration, including failures |
 |5 |Sustainability |Restart/churn, backpressure, ownership, CPU/RSS and post-load recovery; reopen only on contrary evidence |
 |6 |Publication |Full timing/latency series and costs/completion with goodput; README/PERFORMANCE and release only after competitive gates |
 
-Pinned current profile: routed/mirrored single500Mbps; upload70/20ms and
-return30/5ms delay/jitter. Five-second upload loss[3,8,5,6,10,3,5,8]%mean6;
+Pinned profile: routed/mirrored single500Mbps; upload70/20ms and return30/5ms
+delay/jitter. Five-second upload loss[3,8,5,6,10,3,5,8]%mean6;
 return[1,2,.5,3,2,.5,1,2]%. Upload10Mbps15–25s; UDP outage30–33s;40s load,
-85s runner guard/90s probe boundary. Do not tune the profile to pass.
-Random packet realizations are not identical controls; confirmation bins
-above500Mbps can be buffered observation, not wire capacity.
+85s runner guard/90s probe boundary. Do not tune it to pass. Random realizations
+are not packet-identical controls; bins above500Mbps can be buffered confirmation.
+Matched mirrored review-mirrored-0906 controls remain historical context:
+raw4.279Mbps/maxgap1.610879s completes; Xray/H2 incomplete. Nonmirrored
+raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 
 ## Execution, evidence and continuity
 
-- Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
-  overlap. Ordinary pair complete; no build/lab. Origins retained.
-- Normal frozen candidate:`./.tmp/reflection/bin/ack-support-20260908/mptunnel`.
-  Normal parent:`./.tmp/reflection/bin/prepared-stale-20260908/mptunnel`.
-  Latest diagnostic:`./.tmp/reflection/bin/reply-residence-20260908/mptunnel`.
-  target/release is ordinary d999fea after the latest optimized build.
-- Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
-  No deletion this turn; ample root space. User7lines must stay unstaged.
-- Telegram latest ordinary adverse-pair report sent10:43:44UTC; next
-  nonurgent not before11:44UTC (conservative hourly boundary). Respect the
-  hourly minimum and soft-frequency advisory.
-  No component-only success notification or unfinished completion claim.
-- Reflection: exact symbolic conservation enabled one justified work deletion,
-  but did not predict every timing phase. The ordinary pair supplies real
-  settlement progress while exposing adverse early/RSS observations. Preserve
-  those limits; trace the same winning-prefix stage instead of stacking a
-  plausible policy shortcut or repeating until a favorable average appears.
+- Root owns builds/labs. The frozen post-ack-forward-0908 capture is complete;
+  no build/lab is active, and all observer source hooks are reversed.
+  Owned Docker only: no sudo, host shaping, outside-repo work or build/lab overlap.
+- Ordinary candidate:`./.tmp/reflection/bin/ack-support-20260908/mptunnel`.
+  Ordinary parent:`./.tmp/reflection/bin/prepared-stale-20260908/mptunnel`.
+  Current diagnostic:`./.tmp/reflection/bin/post-ack-forward-20260908/mptunnel`.
+  Previous reply diagnostic:`./.tmp/reflection/bin/reply-residence-20260908/mptunnel`.
+  Do not use diagnostic target/release as an ordinary comparator.
+- Exact intermediate commits only; preserve raw evidence before scoped cleanup.
+  No deletion in this condensation. User's seven-line
+  LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
+- Telegram last ordinary adverse-pair report:10:43:44UTC; next nonurgent not
+  before11:44UTC. Respect hourly minimum/soft-frequency advice; no component-only
+  success notification or unfinished completion claim.
+- Method reflection: symbolic conservation justified exact work removal but
+  did not predict every timing phase. Follow the same winning-prefix evidence,
+  retaining adverse first-service, settlement and resource observations.
+  No plausible shortcut stack, favorable-average rerun or silent coverage waiver.
 - Universal clairvoyant optimum under arbitrary future outages is impossible;
-  that does not waive avoidable delay or practical gates. Never call unfinished
+  this does not waive avoidable delay or practical gates. Never call unfinished
   work ideal or promise cost-free capacity discovery.

@@ -7,7 +7,9 @@ use crate::runtime::path::commands::{
     reliable_path_command_channels, try_recv_reliable_path_command,
 };
 use crate::runtime::relay::io::accepted_copy_wake_is_due;
-use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
+use crate::runtime::stream::{
+    ReliablePathStream, ReliablePathStreamOutput, ReliableRelayRemoteInput,
+};
 use crate::transport::PathSpec;
 use std::time::Duration;
 
@@ -84,7 +86,7 @@ async fn restart_unbound_startup_candidate_cannot_recreate_missing_stream() {
             ),
             first_key.index,
         );
-        let remotes = ReliableRelayRemoteSet::new(first, 8);
+        let (remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 8);
         let first_instance = remotes.paths[0].instance();
         let plan = Arc::new(
             ReliableRelayReturnPlan::new(
@@ -161,7 +163,7 @@ async fn restart_terminal_reset_is_propagated_by_recovery_open() {
             test_stream(stream_id, underlay, 0, commands, TrafficClass::Latency),
             0,
         );
-        let mut remotes = ReliableRelayRemoteSet::new(initial, 8);
+        let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(initial, 8);
         let old_instance = remotes.paths[0].instance();
         drop(
             remotes
@@ -216,7 +218,7 @@ async fn restart_terminal_reset_survives_obsolete_open_generation() {
             test_stream(stream_id, underlay, 0, commands, TrafficClass::Latency),
             0,
         );
-        let mut remotes = ReliableRelayRemoteSet::new(initial, 8);
+        let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(initial, 8);
         let mut startup = singleton_return_plan(&remotes);
         let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
         let mut last_progress = Instant::now();
@@ -263,6 +265,7 @@ fn accepted_two_candidate_return_plan(
 ) -> (
     ClientReliableReturnPlan,
     ReliableRelayRemoteSet,
+    ReliableRelayRemoteInput,
     RelayPathInstance,
 ) {
     let first_key = relay_key(UnderlayProtocol::Tcp, 0);
@@ -306,7 +309,7 @@ fn accepted_two_candidate_return_plan(
         opening_ordinal: 0,
         failed_ordinals: Vec::new(),
     };
-    let mut remotes = ReliableRelayRemoteSet::new(first, 8);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 8);
     let opening = remotes.paths[0].instance();
     let mut return_plan =
         ClientReliableReturnPlan::from_initial_open(startup, opening).expect("client return state");
@@ -324,7 +327,7 @@ fn accepted_two_candidate_return_plan(
     return_plan
         .settle_accepted(1, second_instance)
         .expect("settle second startup candidate");
-    (return_plan, remotes, second_instance)
+    (return_plan, remotes, _remote_input, second_instance)
 }
 
 async fn expect_return_plan_final(
@@ -418,7 +421,7 @@ async fn exact_successor_cannot_inherit_a_frozen_startup_ordinal() {
         )
         .expect("exact return plan"),
     );
-    let remotes = ReliableRelayRemoteSet::new(first, 8);
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 8);
     let opening = remotes.paths[0].instance();
     let mut startup = ClientReliableReturnPlan::from_initial_open(
         ReliableRelayOpenedStartup {
@@ -494,7 +497,8 @@ async fn terminal_plan_classifies_later_request_attachments_as_ordinary() {
 
 #[tokio::test]
 async fn pending_slot_request_open_binds_startup_and_finalizes_before_h() {
-    let (mut startup, remotes, _second) = accepted_two_candidate_return_plan(StreamId(41));
+    let (mut startup, remotes, _remote_input, _second) =
+        accepted_two_candidate_return_plan(StreamId(41));
     let base = ReliableRelayOpenSpec::new(
         TargetAddr::Ip("127.0.0.1:9".parse().expect("target")),
         TrafficClass::Throughput,
@@ -556,7 +560,7 @@ async fn recovery_open_on_a_frozen_pending_slot_keeps_its_startup_ordinal() {
         )
         .expect("return plan"),
     );
-    let remotes = ReliableRelayRemoteSet::new(opening, 8);
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(opening, 8);
     let mut startup = ClientReliableReturnPlan::from_initial_open(
         ReliableRelayOpenedStartup {
             plan: plan.clone(),
@@ -620,7 +624,7 @@ async fn exact_h_opening_is_joined_and_delayed_fin_does_not_duplicate_it() {
         )
         .expect("return plan"),
     );
-    let remotes = ReliableRelayRemoteSet::new(opening, 8);
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(opening, 8);
     let opening_instance = remotes.paths[0].instance();
     let mut startup = ClientReliableReturnPlan::from_initial_open(
         ReliableRelayOpenedStartup {
@@ -673,7 +677,7 @@ async fn fin_before_missing_ghost_data_requires_final_settlement() {
         )
         .expect("return plan"),
     );
-    let remotes = ReliableRelayRemoteSet::new(opening, 8);
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(opening, 8);
     let mut startup = ClientReliableReturnPlan::from_initial_open(
         ReliableRelayOpenedStartup {
             plan,
@@ -706,7 +710,7 @@ async fn fin_before_missing_ghost_data_requires_final_settlement() {
 
 #[tokio::test]
 async fn final_linearization_omits_preexisting_detach_but_is_immutable_afterward() {
-    let (mut before, mut before_remotes, before_second) =
+    let (mut before, mut before_remotes, _before_remote_input, before_second) =
         accepted_two_candidate_return_plan(StreamId(43));
     drop(
         before_remotes
@@ -715,7 +719,7 @@ async fn final_linearization_omits_preexisting_detach_but_is_immutable_afterward
     );
     assert_eq!(before.prepare_final(&before_remotes), Some(&[0][..]));
 
-    let (mut after, mut after_remotes, after_second) =
+    let (mut after, mut after_remotes, _after_remote_input, after_second) =
         accepted_two_candidate_return_plan(StreamId(44));
     assert_eq!(after.prepare_final(&after_remotes), Some(&[0, 1][..]));
     drop(
@@ -755,7 +759,7 @@ async fn late_startup_failed_attempt_can_remain_in_flight_after_final_publicatio
         )
         .expect("frozen two-carrier plan"),
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opening, 8);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opening, 8);
     let mut startup = ClientReliableReturnPlan::from_initial_open(
         ReliableRelayOpenedStartup {
             plan: plan.clone(),
@@ -789,7 +793,8 @@ async fn late_startup_failed_attempt_can_remain_in_flight_after_final_publicatio
 
 #[tokio::test]
 async fn final_can_publish_empty_after_all_startup_members_leave() {
-    let (mut startup, mut remotes, second) = accepted_two_candidate_return_plan(StreamId(45));
+    let (mut startup, mut remotes, _remote_input, second) =
+        accepted_two_candidate_return_plan(StreamId(45));
     let first = remotes.paths[0].instance();
     drop(
         remotes
@@ -839,7 +844,7 @@ async fn immutable_final_retries_once_per_attachment_membership_wave() {
         ),
         first_key.index,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(first, 8);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 8);
 
     assert!(
         remotes
@@ -1066,7 +1071,7 @@ async fn product_stall_preserves_an_existing_multipath_attachment_set() {
         ),
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 4);
     assert_eq!(
         remotes.attach_candidate(second),
         ReliableRelayAttachOutcome::Attached
@@ -1099,7 +1104,7 @@ async fn product_stall_on_a_sole_carrier_requests_an_alternative() {
         ),
         0,
     );
-    let remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
 
     assert!(reliable_relay_product_stall_should_try_alternate_attach(
         &remotes
@@ -1139,7 +1144,7 @@ async fn recovery_open_adds_one_unattached_path_to_an_existing_set() {
         ),
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let (second_commands, _second_receivers) = reliable_path_command_channels(1);
     assert_eq!(
         remotes.attach_candidate(OpenedRemoteStream::pending(
@@ -1315,7 +1320,7 @@ async fn disconnected_path_open_waits_for_exact_suppression_deadline() {
         ),
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let mut startup = singleton_return_plan(&remotes);
     let failed = remotes.paths[0].instance();
     context.install_relay_path_instance_for_test(failed);
@@ -1417,7 +1422,7 @@ async fn completed_open_cleanup_cannot_hold_actor_past_accepted_copy_deadline() 
         ),
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(initial, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(initial, 4);
     let mut startup = singleton_return_plan(&remotes);
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     let mut last_stream_progress_at = Instant::now();
@@ -1552,7 +1557,7 @@ async fn additional_attachment_timeout_preserves_live_carrier_health_and_work_ac
         ),
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let membership = remotes.path_instances();
     let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
     let mut last_stream_progress_at = Instant::now();

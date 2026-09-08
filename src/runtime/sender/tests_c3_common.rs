@@ -8,7 +8,7 @@ async fn pre_model_red_bound_recovery_waits_for_ordered_terminal_before_cancella
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10712", "tcp://127.0.0.1:10713"]);
     let (target_commands, mut target_receivers) = reliable_path_command_channels(4);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, target_commands.clone()),
         4,
     );

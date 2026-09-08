@@ -25,6 +25,7 @@ use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
 use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
 #[cfg(test)]
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -617,11 +618,45 @@ pub(in crate::runtime) enum ReliableRelayAttachOutcome {
     RejectedDuplicate,
 }
 
+/// Actor-owned merged input, independent from synchronous attachment metadata.
+/// Exact path removal does not discard frames already admitted into this queue.
+pub(in crate::runtime) struct ReliableRelayRemoteInput {
+    frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
+}
+
+impl ReliableRelayRemoteInput {
+    pub(in crate::runtime) async fn recv_frame(
+        &mut self,
+    ) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
+        self.frames_rx
+            .recv()
+            .await
+            .ok_or(RuntimeError::ReliablePathSessionClosed)
+    }
+
+    /// Returns the relay-input backlog visible at this instant.
+    ///
+    /// Ready-only receive batching snapshots this value before trying frames so
+    /// producers cannot extend one actor turn indefinitely.
+    pub(in crate::runtime) fn ready_frame_count(&self) -> usize {
+        self.frames_rx.len()
+    }
+
+    /// Takes one already-queued frame without waiting.
+    pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<ReliableRelayRemoteFrame> {
+        self.frames_rx.try_recv().ok()
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn has_buffered_frame(&self) -> bool {
+        !self.frames_rx.is_empty()
+    }
+}
+
 pub(in crate::runtime) struct ReliableRelayRemoteSet {
     stream_id: StreamId,
     pub(in crate::runtime) paths: Vec<ReliableRelayRemotePath>,
     frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
-    frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
     /// Next exact attachment incarnation, or permanent exhaustion after MAX.
     next_instance_id: Option<u64>,
     membership_generation: u64,
@@ -746,14 +781,16 @@ impl ReliableRelayRemoteSet {
             .collect()
     }
 
-    pub(in crate::runtime) fn new(opened: OpenedRemoteStream, frame_queue: usize) -> Self {
+    pub(in crate::runtime) fn new(
+        opened: OpenedRemoteStream,
+        frame_queue: usize,
+    ) -> (Self, ReliableRelayRemoteInput) {
         let stream_id = opened.stream().stream_id;
         let (frames_tx, frames_rx) = mpsc::channel(frame_queue);
         let mut set = Self {
             stream_id,
             paths: Vec::new(),
             frames_tx,
-            frames_rx,
             next_instance_id: Some(0),
             membership_generation: 0,
             desired_max_data_offset: 0,
@@ -767,7 +804,7 @@ impl ReliableRelayRemoteSet {
             .attach_opened(opened)
             .expect("a fresh request stream owns attachment incarnation zero");
         debug_assert_eq!(outcome, ReliableRelayAttachOutcome::Attached);
-        set
+        (set, ReliableRelayRemoteInput { frames_rx })
     }
 
     pub(in crate::runtime) fn stream_id(&self) -> StreamId {
@@ -1253,49 +1290,34 @@ impl ReliableRelayRemoteSet {
         ReliableRelayAttachOutcome::Attached
     }
 
-    pub(in crate::runtime) async fn recv_frame(
-        &mut self,
-    ) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
-        self.frames_rx
-            .recv()
-            .await
-            .ok_or(RuntimeError::ReliablePathSessionClosed)
-    }
-
-    /// Returns the relay-input backlog visible at this instant.
-    ///
-    /// Ready-only receive batching snapshots this value before trying frames so
-    /// producers cannot extend one actor turn indefinitely.
-    pub(in crate::runtime) fn ready_frame_count(&self) -> usize {
-        self.frames_rx.len()
-    }
-
-    /// Takes one already-queued frame without waiting.
-    pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<ReliableRelayRemoteFrame> {
-        self.frames_rx.try_recv().ok()
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn has_buffered_frame(&self) -> bool {
-        !self.frames_rx.is_empty()
-    }
-
-    pub(in crate::runtime) async fn close_all(&mut self) {
-        for path in self.take_paths_for_close() {
-            path.stream.send_detach().await;
-            path.stream.close().await;
+    /// Withdraws membership now and returns owned carrier teardown work.
+    /// Construct only for the selected cleanup action, not a discarded select
+    /// alternative: withdrawal is independent of polling the returned future.
+    pub(in crate::runtime) fn close_all(&mut self) -> impl Future<Output = ()> + use<> {
+        let paths = self.take_paths_for_close();
+        async move {
+            for path in paths {
+                path.stream.send_detach().await;
+                path.stream.close().await;
+            }
         }
     }
 
     /// Product endpoint failure is terminal across every attachment. A reset
     /// prevents retention and reinjection while carrier-only failures continue
     /// to use detach and preserve the logical stream for path recovery.
-    pub(in crate::runtime) async fn reset_all(&mut self, reason: ResetReason) {
+    /// Membership withdrawal is synchronous, as for `close_all`.
+    pub(in crate::runtime) fn reset_all(
+        &mut self,
+        reason: ResetReason,
+    ) -> impl Future<Output = ()> + use<> {
         let paths = self.take_paths_for_close();
-        futures::future::join_all(paths.into_iter().map(|path| async move {
-            path.stream.reset_and_close(reason).await;
-        }))
-        .await;
+        async move {
+            futures::future::join_all(paths.into_iter().map(|path| async move {
+                path.stream.reset_and_close(reason).await;
+            }))
+            .await;
+        }
     }
 
     /// Removes every path from Product scheduling and synchronously transfers
@@ -1308,9 +1330,13 @@ impl ReliableRelayRemoteSet {
     }
 
     /// Successful retirement follows ordered FIN work on every carrier.
-    pub(in crate::runtime) async fn close_all_ordered(&mut self) {
-        for path in self.take_paths_for_close() {
-            path.stream.detach_and_close_ordered().await;
+    /// Membership withdrawal is synchronous, as for `close_all`.
+    pub(in crate::runtime) fn close_all_ordered(&mut self) -> impl Future<Output = ()> + use<> {
+        let paths = self.take_paths_for_close();
+        async move {
+            for path in paths {
+                path.stream.detach_and_close_ordered().await;
+            }
         }
     }
 

@@ -188,7 +188,8 @@ async fn request_ack_releases_load_only_after_final_original_flight() {
     )
     .expect("client context");
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(opened_request_path(stream_id, 0, commands), 8);
+    let (mut remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened_request_path(stream_id, 0, commands), 8);
     let owner = remotes.paths[0].instance();
     context.install_relay_path_instance_for_test(owner);
     let lease = context
@@ -322,7 +323,7 @@ async fn ambiguous_prefix_ack_cannot_withdraw_a_fresh_request_tail_beyond_the_ho
     .expect("client context");
 
     let (quic_commands, mut quic_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_request_path_with_underlay(stream_id, UnderlayProtocol::Udp, 0, quic_commands),
         8,
     );
@@ -458,7 +459,7 @@ async fn request_staleness_reconciles_when_first_alternate_becomes_schedulable()
     .expect("client context");
 
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_request_path_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, owner_commands),
         8,
     );
@@ -693,7 +694,7 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
     .expect("client context");
 
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_request_path(stream_id, 0, owner_commands), 8);
     consume_path_proof(&mut owner_receivers);
     let owner = remotes.paths[0].instance();

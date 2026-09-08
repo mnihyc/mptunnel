@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 10:25 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 10:43 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -298,7 +298,19 @@ owned advisory input/immutable FIN offset. Independent equivalence reviews
 pass; build1m06s,483 controls GREEN1.27s and only intended128KiB RED remains.
 No shared mutex or changed data publication yet; no speed-gain claim. Next
 extract the actual joint Product owner and writer/readiness lifecycle without
-duplicating mutable attachment authority. Never wrap whole normal planners/
+duplicating mutable attachment authority. Source review selects the smaller
+aggregate: whole synchronous sender/mux/queue/RemoteSet metadata, with merged
+input receiver and actual I/O outside. No separate per-field registry or mutex
+yet. Preserve accepted merged frames across removal and retain the input owner
+for exactly the prior actor/test lifetime; selected teardown withdraws before
+owned I/O. The actual extraction now passes483 existing controls in1.28s after
+a1m06s functional build; only the unchanged128KiB proposed-contract RED fails.
+Independent review confirms aggregate drop order, buffered-input lifetime and
+selected eager teardown; no new lock or scheduling boundary exists. Four test
+bindings then remove five new compiler warnings without changing owner lifetime.
+This is a verified preparation checkpoint, not the ownership fix or a speed
+result. Next move observation/intent/fenced Apply into safe transaction boundaries
+and integrate real writer claims. Never wrap whole normal planners/
 ACK handlers under the new lock or carry a guard across actual I/O awaits.
 Response parity and all existing global gates remain pending, not waived.
 
@@ -358,7 +370,7 @@ aggregate300/200 defaults as200each. Do not tune this profile to pass.
   preserve small evidence before scoped cache cleanup. No deletion this turn.
   User seven-line edit must remain outside commits.
 - Telegram milestone authorization: no more often than hourly. Last sent about
-  2026-09-08 01:18UTC; next nonurgent not before2026-09-08 02:18UTC. Respect advisory;
+  2026-09-08 02:26UTC; next nonurgent not before2026-09-08 03:26UTC. Respect advisory;
   ordinary gaps remain open, so do not send a completion claim.
 - Reflection: local work proof was useful and enabled a deletion, but did not
   predict every network interval. The ordinary pair moved the worst observed

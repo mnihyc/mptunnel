@@ -1057,7 +1057,10 @@ async fn open_test_relay_remote(
     fixture: &ClientOpenRaceFixture,
     connection: UdpPathConnection,
     stream_id: StreamId,
-) -> crate::runtime::stream::ReliableRelayRemoteSet {
+) -> (
+    crate::runtime::stream::ReliableRelayRemoteSet,
+    crate::runtime::stream::ReliableRelayRemoteInput,
+) {
     let accepted_stream = tokio::spawn(accept_test_stream(
         connection,
         stream_id,
@@ -1783,7 +1786,7 @@ async fn relay_carrier_lifetime_error_retires_attachment_and_exact_quic_owner() 
     let fixture = ClientOpenRaceFixture::new().await;
     let accepted_carrier = fixture.establish_current().await;
     let stream_id = StreamId(1025);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         open_test_relay_remote(&fixture, accepted_carrier.connection.clone(), stream_id).await;
     let attachment = remotes.paths[0].instance();
     let failed_instance = attachment.path_instance_id;
@@ -1814,7 +1817,7 @@ async fn relay_request_stream_abandonment_preserves_live_quic_owner_and_health()
     let fixture = ClientOpenRaceFixture::new().await;
     let accepted_carrier = fixture.establish_current().await;
     let stream_id = StreamId(1026);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         open_test_relay_remote(&fixture, accepted_carrier.connection.clone(), stream_id).await;
     let attachment = remotes.paths[0].instance();
     let mut sender = crate::runtime::sender::RequestSenderService::new(stream_id);

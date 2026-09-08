@@ -32,7 +32,7 @@ pub(in crate::runtime) use registry::{
 pub(in crate::runtime) use request::arm_client_relay_attachment_commits_for_test;
 pub(in crate::runtime) use request::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayOpenedStartup,
-    ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
-    ReliableRelayReturnCandidate, ReliableRelayReturnPlan,
+    ReliableRelayRemoteFrame, ReliableRelayRemoteInput, ReliableRelayRemotePath,
+    ReliableRelayRemoteSet, ReliableRelayReturnCandidate, ReliableRelayReturnPlan,
 };
 pub(in crate::runtime) use send_buffer::SessionSendBuffer;

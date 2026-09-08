@@ -8,6 +8,7 @@ use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, reliable_path_command_channels,
     try_recv_reliable_path_command,
 };
+use crate::runtime::stream::ReliableRelayRemoteInput;
 use crate::runtime::stream::request::{RequestAckClockOperation, RequestStreamState};
 use std::collections::HashSet;
 
@@ -15,6 +16,7 @@ struct TcpCapacityFixture {
     stream_id: StreamId,
     context: ClientPathContext,
     remotes: ReliableRelayRemoteSet,
+    _remote_input: ReliableRelayRemoteInput,
     reference: RelayPathInstance,
     candidate: RelayPathInstance,
     candidate_rx: ReliablePathCommandReceivers,
@@ -27,7 +29,7 @@ impl TcpCapacityFixture {
             "tcp://127.0.0.1:10331?initial-srtt-s=0.08&initial-rate-mbps=500",
         ]);
         let (reference_commands, mut reference_rx) = reliable_path_command_channels(8);
-        let mut remotes = ReliableRelayRemoteSet::new(
+        let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
             opened_test_relay_stream_with_underlay(
                 stream_id,
                 UnderlayProtocol::Udp,
@@ -63,6 +65,7 @@ impl TcpCapacityFixture {
             stream_id,
             context,
             remotes,
+            _remote_input,
             reference,
             candidate,
             candidate_rx,

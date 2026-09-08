@@ -29,7 +29,7 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
 use crate::runtime::sender::queue::ReliableRelayQueuedWorkKind;
-use crate::runtime::stream::ReliableRelayRemoteSet;
+use crate::runtime::stream::{ReliableRelayRemoteInput, ReliableRelayRemoteSet};
 use crate::transport::PathSpec;
 use bytes::Bytes;
 
@@ -44,6 +44,7 @@ fn data_frame(stream_id: StreamId, offset: u64, payload_bytes: usize) -> Frame {
 async fn mixed_remote_set() -> (
     ClientPathContext,
     ReliableRelayRemoteSet,
+    ReliableRelayRemoteInput,
     RelayPathInstance,
     RelayPathInstance,
 ) {
@@ -51,7 +52,7 @@ async fn mixed_remote_set() -> (
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let stream_id = StreamId(17);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
 
@@ -68,7 +69,7 @@ async fn mixed_remote_set() -> (
         .find(|path| path.key().underlay == UnderlayProtocol::Udp)
         .expect("UDP attachment")
         .instance();
-    (context, remotes, tcp, udp)
+    (context, remotes, _remote_input, tcp, udp)
 }
 
 #[tokio::test]
@@ -77,7 +78,7 @@ async fn bounded_ack_gap_uses_an_active_unmeasured_alternate() {
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let stream_id = StreamId(17);
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
@@ -169,7 +170,7 @@ async fn ordinary_data_does_not_borrow_a_successor_carriers_health() {
     ]);
     let stream_id = StreamId(172);
     let (predecessor_commands, _predecessor_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, predecessor_commands),
         8,
     );
@@ -230,7 +231,8 @@ async fn exact_current_unmeasured_attachment_keeps_startup_admission() {
     let context = client_test_context_with_paths(&["tcp://127.0.0.1:10260"]);
     let stream_id = StreamId(173);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let remotes = ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 8);
+    let (remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 8);
     let current = remotes.paths[0].instance();
     context.install_relay_path_instance_for_test(current);
     let frame = data_frame(stream_id, 0, 4096);
@@ -270,7 +272,7 @@ async fn sole_authoritative_gap_owner_keeps_its_proven_product_evidence() {
     let context = client_test_context_with_paths(&["quic://127.0.0.1:10266?initial-srtt-s=0.02"]);
     let stream_id = StreamId(177);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
         8,
     );
@@ -387,6 +389,7 @@ fn bounded_mixed_remote_set(
 ) -> (
     ClientPathContext,
     ReliableRelayRemoteSet,
+    ReliableRelayRemoteInput,
     RelayPathInstance,
     RelayPathInstance,
     crate::runtime::path::commands::ReliablePathCommandSender,
@@ -398,7 +401,7 @@ fn bounded_mixed_remote_set(
         "quic://127.0.0.1:10371?initial-srtt-s=0.02",
     ]);
     let (tcp_commands, tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
     let (udp_commands, udp_receivers) = reliable_path_command_channels(8);
@@ -419,6 +422,7 @@ fn bounded_mixed_remote_set(
     (
         context,
         remotes,
+        _remote_input,
         tcp,
         udp,
         udp_commands,
@@ -436,7 +440,7 @@ async fn request_product_acquisition_does_not_preempt_ordinary_completion_order(
         "tcp://127.0.0.1:10377?initial-srtt-s=0.005&initial-rate-mbps=1000",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
 
@@ -546,7 +550,7 @@ async fn request_ack_clock_annotation_cannot_retarget_the_ordinary_product_choic
         "tcp://127.0.0.1:10383?initial-srtt-s=0.005&initial-rate-mbps=1000",
     ]);
     let (reference_commands, mut reference_receivers) = reliable_path_command_channels(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(
             stream_id,
             UnderlayProtocol::Udp,
@@ -746,7 +750,7 @@ async fn request_ordinary_writer_failure_replans_around_a_and_commits_same_tier_
         "tcp://127.0.0.1:10380?initial-srtt-s=0.02",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, owner_commands.clone()),
         8,
     );
@@ -941,7 +945,7 @@ async fn request_native_authority_change_after_reservation_cannot_publish_produc
         instance.path_instance_id,
         crate::protocol::PathMetricDirection::ClientToServer,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 8);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 8);
     let target = remotes.paths[0].instance();
     assert_eq!(target.path_instance_id, instance.path_instance_id);
     consume_client_path_proof_for_test(&mut receivers);
@@ -1063,7 +1067,7 @@ async fn request_reinjection_commit_uses_same_stamp_current_native_recovery_cloc
             false,
         )
         .expect("initial coherent shape");
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 8);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 8);
     let target = remotes.paths[0].instance();
     consume_client_path_proof_for_test(&mut receivers);
     seed_client_bulk_evidence_for_test(&context, target);
@@ -1126,7 +1130,7 @@ async fn request_native_activation_shape_gap_falls_through_to_tcp_without_blackl
     ]);
 
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(
             stream_id,
             UnderlayProtocol::Tcp,
@@ -1216,8 +1220,16 @@ async fn request_native_activation_shape_gap_falls_through_to_tcp_without_blackl
 #[tokio::test]
 async fn request_apply_shared_stream_window_blocks_before_each_output_product_window() {
     let stream_id = StreamId(370);
-    let (context, remotes, target, sibling, target_commands, _tcp_receivers, _udp_receivers) =
-        bounded_mixed_remote_set(stream_id);
+    let (
+        context,
+        remotes,
+        _remote_input,
+        target,
+        sibling,
+        target_commands,
+        _tcp_receivers,
+        _udp_receivers,
+    ) = bounded_mixed_remote_set(stream_id);
     let windows = reliable_bulk_product_windows(context.mux_limits);
     assert_eq!(
         windows.stream_resource_limit_bytes, windows.per_output_product_limit_bytes,
@@ -1265,8 +1277,16 @@ async fn request_apply_shared_stream_window_blocks_before_each_output_product_wi
 #[tokio::test]
 async fn request_apply_additional_output_uses_e_until_exact_qualification() {
     let stream_id = StreamId(371);
-    let (context, remotes, owner, target, _target_commands, _tcp_receivers, _udp_receivers) =
-        bounded_mixed_remote_set(stream_id);
+    let (
+        context,
+        remotes,
+        _remote_input,
+        owner,
+        target,
+        _target_commands,
+        _tcp_receivers,
+        _udp_receivers,
+    ) = bounded_mixed_remote_set(stream_id);
     let mut controller = RequestMultipathController::new(stream_id);
     let owner_bytes = 4096;
     let target_entry =
@@ -1363,8 +1383,16 @@ async fn request_apply_additional_output_uses_e_until_exact_qualification() {
 #[tokio::test]
 async fn request_apply_one_ack_and_sibling_product_evidence_do_not_qualify_additional_output() {
     let stream_id = StreamId(372);
-    let (context, remotes, owner, target, _target_commands, _tcp_receivers, _udp_receivers) =
-        bounded_mixed_remote_set(stream_id);
+    let (
+        context,
+        remotes,
+        _remote_input,
+        owner,
+        target,
+        _target_commands,
+        _tcp_receivers,
+        _udp_receivers,
+    ) = bounded_mixed_remote_set(stream_id);
     let mut controller = RequestMultipathController::new(stream_id);
     let owner_end = fill_exact_original_product_debt_at(&mut controller, owner, stream_id, 0, 4096);
     let plan = original_data_apply_plan(&remotes, target);
@@ -1439,8 +1467,16 @@ async fn request_apply_one_ack_and_sibling_product_evidence_do_not_qualify_addit
 #[tokio::test]
 async fn request_apply_recomputes_target_after_unrelated_sibling_retirement() {
     let stream_id = StreamId(373);
-    let (context, mut remotes, sibling, target, target_commands, _tcp_receivers, _udp_receivers) =
-        bounded_mixed_remote_set(stream_id);
+    let (
+        context,
+        mut remotes,
+        _remote_input,
+        sibling,
+        target,
+        target_commands,
+        _tcp_receivers,
+        _udp_receivers,
+    ) = bounded_mixed_remote_set(stream_id);
     let controller = RequestMultipathController::new(stream_id);
     let frame = data_frame(stream_id, 0, 4096);
     let observation = observe_request_relay_scheduling(
@@ -1506,8 +1542,16 @@ async fn request_apply_recomputes_target_after_unrelated_sibling_retirement() {
 #[tokio::test]
 async fn request_bulk_apply_rejects_backup_displaced_by_fresh_regular_sibling() {
     let stream_id = StreamId(376);
-    let (context, remotes, sibling, target, target_commands, _tcp_receivers, _udp_receivers) =
-        bounded_mixed_remote_set(stream_id);
+    let (
+        context,
+        remotes,
+        _remote_input,
+        sibling,
+        target,
+        target_commands,
+        _tcp_receivers,
+        _udp_receivers,
+    ) = bounded_mixed_remote_set(stream_id);
     for instance in [sibling, target] {
         assert!(context.update_relay_path_usage_for_test(instance, 1, PathUsage::Backup));
     }
@@ -1539,8 +1583,16 @@ async fn request_bulk_apply_rejects_backup_displaced_by_fresh_regular_sibling() 
 #[tokio::test]
 async fn request_apply_sole_current_tier_remains_additional_behind_stale_owner() {
     let stream_id = StreamId(377);
-    let (context, remotes, owner, target, target_commands, _tcp_receivers, _udp_receivers) =
-        bounded_mixed_remote_set(stream_id);
+    let (
+        context,
+        remotes,
+        _remote_input,
+        owner,
+        target,
+        target_commands,
+        _tcp_receivers,
+        _udp_receivers,
+    ) = bounded_mixed_remote_set(stream_id);
     let mut controller = RequestMultipathController::new(stream_id);
     let next_offset =
         fill_exact_original_product_debt_at(&mut controller, owner, stream_id, 0, 4096);
@@ -1578,8 +1630,16 @@ async fn request_apply_sole_current_tier_remains_additional_behind_stale_owner()
 #[tokio::test]
 async fn request_apply_same_key_successor_does_not_inherit_contiguous_frontier() {
     let stream_id = StreamId(374);
-    let (context, remotes, target, _sibling, _target_commands, _tcp_receivers, _udp_receivers) =
-        bounded_mixed_remote_set(stream_id);
+    let (
+        context,
+        remotes,
+        _remote_input,
+        target,
+        _sibling,
+        _target_commands,
+        _tcp_receivers,
+        _udp_receivers,
+    ) = bounded_mixed_remote_set(stream_id);
     let predecessor = RelayPathInstance {
         key: target.key,
         path_instance_id: next_carrier_path_instance_id(),
@@ -1632,8 +1692,16 @@ async fn request_apply_same_key_successor_does_not_inherit_contiguous_frontier()
 #[tokio::test]
 async fn request_apply_first_assignment_becomes_exact_contiguous_frontier() {
     let stream_id = StreamId(375);
-    let (context, remotes, target, _sibling, _target_commands, _tcp_receivers, _udp_receivers) =
-        bounded_mixed_remote_set(stream_id);
+    let (
+        context,
+        remotes,
+        _remote_input,
+        target,
+        _sibling,
+        _target_commands,
+        _tcp_receivers,
+        _udp_receivers,
+    ) = bounded_mixed_remote_set(stream_id);
     let mut controller = RequestMultipathController::new(stream_id);
     let plan = original_data_apply_plan(&remotes, target);
     let first = data_frame(stream_id, 0, 4096);
@@ -1684,7 +1752,8 @@ async fn active_ack_clock_original_data_rechecks_downshifted_product_window_and_
     let context = client_test_context_with_paths(&["tcp://127.0.0.1:10270?initial-srtt-s=0.1"]);
     let stream_id = StreamId(184);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let remotes = ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 8);
+    let (remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 8);
     let owner = remotes.paths[0].instance();
     context.install_relay_path_instance_for_test(owner);
     let mut controller = RequestMultipathController::new(stream_id);
@@ -1785,7 +1854,7 @@ async fn sole_request_product_window_exhausts_until_exact_data_ack_reopens_it() 
     let context = client_test_context_with_paths(&["quic://127.0.0.1:10267?initial-srtt-s=0.1"]);
     let stream_id = StreamId(178);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
         8,
     );
@@ -1835,7 +1904,7 @@ async fn latency_request_cannot_bypass_exact_product_window() {
     let context = client_test_context_with_paths(&["quic://127.0.0.1:10268?initial-srtt-s=0.1"]);
     let stream_id = StreamId(179);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
         8,
     );
@@ -1871,7 +1940,7 @@ async fn request_product_debt_isolated_from_sibling_stream_carrier_aggregate() {
     let context = client_test_context_with_paths(&["quic://127.0.0.1:10269?initial-srtt-s=0.1"]);
     let stream_id = StreamId(180);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
         8,
     );
@@ -1907,7 +1976,7 @@ async fn request_plan_revalidates_exact_health_after_same_key_replacement() {
     ]);
     let stream_id = StreamId(174);
     let (selected_commands, mut selected_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, selected_commands.clone()),
         8,
     );
@@ -2119,7 +2188,7 @@ async fn control_only_request_path_cannot_authorize_withdrawing_a_payload_owner(
     ]);
     let stream_id = StreamId(176);
     let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
@@ -2156,7 +2225,7 @@ async fn request_plan_revalidates_same_instance_health_transitions() {
     let context = client_test_context_with_paths(&["tcp://127.0.0.1:10263?initial-srtt-s=0.005"]);
     let stream_id = StreamId(175);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 8);
     let instance = remotes.paths[0].instance();
     context.install_relay_path_instance_for_test(instance);
@@ -2213,7 +2282,7 @@ async fn request_plan_revalidates_regular_backup_set_changes() {
     ]);
     let stream_id = StreamId(176);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
     let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
@@ -2264,7 +2333,7 @@ async fn persistent_ack_gap_does_not_borrow_a_successor_carriers_rate_model() {
     ]);
     let stream_id = StreamId(170);
     let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
 
@@ -2345,7 +2414,7 @@ async fn persistent_ack_gap_does_not_time_a_predecessor_with_successor_evidence(
     ]);
     let stream_id = StreamId(171);
     let (predecessor_commands, _predecessor_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, predecessor_commands),
         8,
     );
@@ -2422,7 +2491,7 @@ async fn retained_tail_uses_only_a_measured_earlier_completion() {
     ]);
     let stream_id = StreamId(18);
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
@@ -2553,7 +2622,7 @@ async fn ack_gap_avoidance_does_not_exclude_a_same_key_replacement() {
     ]);
     let stream_id = StreamId(32);
     let (old_commands, _old_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, old_commands), 8);
     let old = remotes.paths[0].instance();
     let frame = data_frame(stream_id, 0, 4096);
@@ -2601,7 +2670,7 @@ async fn ack_gap_repair_history_remains_avoided_until_data_ack() {
     ]);
     let stream_id = StreamId(33);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, original_commands), 8);
     let original = remotes.paths[0].instance();
 
@@ -2722,7 +2791,7 @@ async fn portable_quic_repair_uses_exact_k_despite_unrelated_product_flight() {
     ]);
     let stream_id = StreamId(35);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, original_commands), 8);
     let original = remotes.paths[0].instance();
     let (quic_commands, _quic_receivers) = reliable_path_command_channels(8);
@@ -2797,7 +2866,7 @@ async fn repair_uses_reserved_lane_while_writer_has_unrelated_dequeued_bytes() {
     ]);
     let stream_id = StreamId(36);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, original_commands), 8);
     let original = remotes.paths[0].instance();
     let (quic_commands, mut quic_receivers) = reliable_path_command_channels(8);
@@ -2864,7 +2933,7 @@ async fn native_backlog_ranks_repair_but_cannot_veto_exact_k() {
     ]);
     let stream_id = StreamId(34);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(
             stream_id,
             UnderlayProtocol::Udp,
@@ -2963,7 +3032,7 @@ async fn native_backlog_ranks_repair_but_cannot_veto_exact_k() {
 
 #[tokio::test]
 async fn capacity_reference_is_the_fastest_mature_attached_path() {
-    let (context, remotes, tcp, udp) = mixed_remote_set().await;
+    let (context, remotes, _remote_input, tcp, udp) = mixed_remote_set().await;
     seed_client_bulk_evidence_for_test(&context, tcp);
     seed_client_bulk_evidence_for_test(&context, udp);
     let mut controller = RequestMultipathController::new(StreamId(17));
@@ -3015,7 +3084,7 @@ async fn normal_product_planning_does_not_enqueue_an_automatic_tcp_capacity_trai
     ]);
     let stream_id = StreamId(183);
     let (reference_commands, mut reference_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(
             stream_id,
             UnderlayProtocol::Udp,
@@ -3169,7 +3238,7 @@ fn tcp_capacity_receipt_does_not_create_request_product_evidence() {
 
 #[tokio::test]
 async fn capacity_reference_ignores_immature_higher_rate_samples() {
-    let (context, remotes, tcp, udp) = mixed_remote_set().await;
+    let (context, remotes, _remote_input, tcp, udp) = mixed_remote_set().await;
     seed_client_bulk_evidence_for_test(&context, tcp);
     seed_client_bulk_evidence_for_test(&context, udp);
     let mut controller = RequestMultipathController::new(StreamId(17));
@@ -3208,7 +3277,7 @@ async fn capacity_reference_ignores_immature_higher_rate_samples() {
 
 #[tokio::test]
 async fn capacity_reference_ignores_faster_expired_product_epoch() {
-    let (context, remotes, tcp, udp) = mixed_remote_set().await;
+    let (context, remotes, _remote_input, tcp, udp) = mixed_remote_set().await;
     seed_client_bulk_evidence_for_test(&context, tcp);
     seed_client_bulk_evidence_for_test(&context, udp);
     let now = Instant::now();
@@ -3292,7 +3361,7 @@ fn request_product_rate_after_expiry_starts_a_new_unblended_epoch() {
 
 #[tokio::test]
 async fn expired_request_product_epoch_resets_successor_boundary_only_once() {
-    let (context, remotes, _tcp, udp) = mixed_remote_set().await;
+    let (context, remotes, _remote_input, _tcp, udp) = mixed_remote_set().await;
     context.install_relay_path_instance_for_test(udp);
     let stream_id = StreamId(182);
     let now = Instant::now();
@@ -3360,7 +3429,7 @@ async fn expired_request_product_epoch_resets_successor_boundary_only_once() {
 
 #[tokio::test]
 async fn duplicated_product_ack_does_not_invent_exact_path_progress() {
-    let (context, remotes, tcp, udp) = mixed_remote_set().await;
+    let (context, remotes, _remote_input, tcp, udp) = mixed_remote_set().await;
     let stream_id = StreamId(17);
     let payload_bytes = 64 * 1024;
     let frame = data_frame(stream_id, 0, payload_bytes);
@@ -3407,7 +3476,7 @@ async fn duplicated_product_ack_does_not_invent_exact_path_progress() {
 
 #[tokio::test]
 async fn unique_sub_floor_product_ack_proves_use_but_not_assignment_qualification() {
-    let (context, remotes, _tcp, udp) = mixed_remote_set().await;
+    let (context, remotes, _remote_input, _tcp, udp) = mixed_remote_set().await;
     let stream_id = StreamId(171);
     let payload_bytes = 4096;
     let frame = data_frame(stream_id, 0, payload_bytes);
@@ -3539,7 +3608,7 @@ fn rejected_request_qualification_admission_installs_no_flight() {
 
 #[tokio::test]
 async fn request_final_product_quantum_tags_only_the_remaining_floor_byte() {
-    let (context, remotes, tcp, _udp) = mixed_remote_set().await;
+    let (context, remotes, _remote_input, tcp, _udp) = mixed_remote_set().await;
     let stream_id = StreamId(172);
     let floor = reliable_path_startup_sample_limit_bytes(MuxLimits::default());
     assert!(floor > 1);
@@ -3642,7 +3711,7 @@ async fn request_final_product_quantum_tags_only_the_remaining_floor_byte() {
 
 #[tokio::test]
 async fn request_qualification_survives_capacity_retirement_but_not_stale_lifecycle() {
-    let (context, remotes, tcp, _udp) = mixed_remote_set().await;
+    let (context, remotes, _remote_input, tcp, _udp) = mixed_remote_set().await;
     let stream_id = StreamId(173);
     let floor = reliable_path_startup_sample_limit_bytes(MuxLimits::default());
     let mut controller = RequestMultipathController::new(stream_id);
@@ -3726,7 +3795,7 @@ async fn request_qualification_survives_capacity_retirement_but_not_stale_lifecy
 
 #[tokio::test]
 async fn request_detach_scrubs_qualification_without_deleting_product_debt() {
-    let (context, mut remotes, owner, _survivor) = mixed_remote_set().await;
+    let (context, mut remotes, _remote_input, owner, _survivor) = mixed_remote_set().await;
     let stream_id = StreamId(175);
     let payload_bytes = 4096;
     let frame = data_frame(stream_id, 0, payload_bytes);
@@ -3784,7 +3853,7 @@ async fn request_detach_scrubs_qualification_without_deleting_product_debt() {
 
 #[tokio::test]
 async fn accepted_request_reinjection_removes_only_overlapping_tag_weight() {
-    let (_context, _remotes, owner, repair) = mixed_remote_set().await;
+    let (_context, _remotes, _remote_input, owner, repair) = mixed_remote_set().await;
     let stream_id = StreamId(174);
     let floor = reliable_path_startup_sample_limit_bytes(MuxLimits::default());
     let mut controller = RequestMultipathController::new(stream_id);
@@ -3825,7 +3894,7 @@ async fn accepted_request_reinjection_removes_only_overlapping_tag_weight() {
 
 #[tokio::test]
 async fn request_load_becomes_idle_only_after_final_unique_original_ack() {
-    let (context, remotes, owner, repair) = mixed_remote_set().await;
+    let (context, remotes, _remote_input, owner, repair) = mixed_remote_set().await;
     let stream_id = StreamId(17);
     let first = data_frame(stream_id, 0, 1024);
     let second = data_frame(stream_id, 1024, 1024);
@@ -3899,7 +3968,7 @@ fn pending_request_requalification(stream_id: StreamId) -> PendingRequestRequali
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let payload_bytes = 4096;
     let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, candidate_commands),
         8,
     );
@@ -4052,7 +4121,7 @@ async fn request_requalification_needs_exact_probe_then_fresh_original_ack() {
     let stream_id = StreamId(18);
     let payload_bytes = 4096;
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
@@ -4191,7 +4260,7 @@ async fn quic_only_stale_fallback_can_requalify_without_a_qualified_source() {
     let stream_id = StreamId(181);
     let payload_bytes = 4096;
     let (commands, mut receivers) = reliable_path_command_channels(8);
-    let remotes = ReliableRelayRemoteSet::new(
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
         8,
     );
@@ -4276,7 +4345,7 @@ async fn requalification_skips_draining_and_full_stale_attachments() {
     ]);
     let stream_id = StreamId(182);
     let (draining_commands, mut draining_receivers) = reliable_path_command_channels(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, draining_commands.clone()),
         8,
     );
@@ -4351,7 +4420,7 @@ async fn stale_survivor_can_finish_after_fresh_attachment_is_removed() {
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "tcp://127.0.0.1:10252"]);
     let stream_id = StreamId(184);
     let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, first_commands), 8);
     let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
     remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, second_commands));
@@ -4397,7 +4466,7 @@ async fn all_full_stale_requalification_returns_bounded_backpressure() {
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "tcp://127.0.0.1:10252"]);
     let stream_id = StreamId(183);
     let (first_commands, mut first_receivers) = reliable_path_command_channels(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, first_commands.clone()),
         8,
     );
@@ -4454,7 +4523,7 @@ async fn stale_path_is_not_selected_for_new_request_data() {
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let stream_id = StreamId(19);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
@@ -4589,7 +4658,7 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let stream_id = StreamId(20);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
     let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
@@ -4668,7 +4737,7 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
@@ -4762,7 +4831,7 @@ async fn accepted_request_copy_owns_exact_reserve_until_data_ack() {
     ]);
     let stream_id = StreamId(230);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
@@ -4893,7 +4962,7 @@ async fn request_recovery_skips_exhausted_fast_target_for_free_second_target() {
     ]);
     let stream_id = StreamId(231);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (fast_commands, mut fast_receivers) = reliable_path_command_channels(8);
@@ -5007,7 +5076,7 @@ async fn bound_request_repair_consumes_only_its_exact_targets_emergency_reserve(
     ]);
     let stream_id = StreamId(232);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
@@ -5145,7 +5214,7 @@ async fn direct_request_recovery_full_target_preserves_independent_range_service
         "tcp://127.0.0.1:10403",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (c_commands, mut c_receivers) = reliable_path_command_channels(1);
@@ -5293,7 +5362,7 @@ async fn direct_request_recovery_apply_charges_unrelated_queued_front() {
         "tcp://127.0.0.1:10412?initial-srtt-s=0.01&initial-rate-mbps=500",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
@@ -5460,7 +5529,7 @@ async fn committed_request_recovery_copy_survives_target_drain_until_retry_deadl
         "tcp://127.0.0.1:10253",
     ]);
     let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (copy_commands, _copy_receivers) = reliable_path_command_channels(8);
@@ -5528,7 +5597,7 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
     let context = client_test_context_with_paths(&["tcp://127.0.0.1:10251"]);
     let stream_id = StreamId(31);
     let (first_commands, _first_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, first_commands), 8);
     let old_instance = remotes.paths[0].instance();
     context.install_relay_path_instance_for_test(old_instance);
@@ -5677,7 +5746,7 @@ async fn retained_completion_tail_after_positive_ack(aligned_horizon: bool) {
     ]);
     let limits = context.mux_limits;
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     consume_client_path_proof_for_test(&mut owner_receivers);
     let owner = remotes.paths[0].instance();
@@ -5890,7 +5959,7 @@ async fn active_request_retained_hole_recovers_after_partial_ack_beyond_horizon(
     ]);
     let limits = context.mux_limits;
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     consume_client_path_proof_for_test(&mut owner_receivers);
     let owner = remotes.paths[0].instance();

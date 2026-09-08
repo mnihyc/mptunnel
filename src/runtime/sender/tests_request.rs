@@ -114,7 +114,7 @@ async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start()
     let (commands, mut receivers) = reliable_path_command_channels(command_capacity);
     let (opened, _frames_tx) =
         opened_request_stream_with_retained_input(stream_id, 0, commands.clone());
-    let mut remotes = ReliableRelayRemoteSet::new(opened, command_capacity);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, command_capacity);
     let proof = try_recv_reliable_path_priority_command(&mut receivers)
         .expect("attachment publishes its separate priority proof");
     assert!(matches!(
@@ -291,7 +291,7 @@ async fn request_planner_and_reservation_preserve_closed_admission_identity() {
     let (commands, mut receivers) = reliable_path_command_channels(1);
     let (opened, _frames_tx) =
         opened_request_stream_with_retained_input(stream_id, 0, commands.clone());
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     consume_client_path_proof_for_test(&mut receivers);
     let instance = remotes.paths[0].instance();
     context.install_relay_path_instance_for_test(instance);
@@ -378,7 +378,7 @@ async fn request_all_full_writers_finish_one_finite_production_pass_and_park() {
         "tcp://127.0.0.1:10716?initial-srtt-s=0.04&initial-rate-mbps=100",
     ]);
     let (first_commands, mut first_receivers) = reliable_path_command_channels(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, first_commands.clone()),
         4,
     );
@@ -490,7 +490,7 @@ async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent()
     let (target_commands, mut target_receivers) = reliable_path_command_channels(4);
     let (target_opened, _target_frames_tx) =
         opened_request_stream_with_retained_input(stream_id, 0, target_commands.clone());
-    let mut remotes = ReliableRelayRemoteSet::new(target_opened, 4);
+    let (mut remotes, mut _remote_input) = ReliableRelayRemoteSet::new(target_opened, 4);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(4);
     let (owner_opened, _owner_frames_tx) =
         opened_request_stream_with_retained_input(stream_id, 1, owner_commands);
@@ -552,7 +552,7 @@ async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent()
     );
 
     assert!(target_receivers.finish_planned_path_retirement());
-    let terminal = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+    let terminal = tokio::time::timeout(Duration::from_secs(1), _remote_input.recv_frame())
         .await
         .expect("ordered terminal deadline")
         .expect("ordered terminal frame");
@@ -594,7 +594,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(1);
     let (proof_only_commands, mut proof_only_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(
             stream_id,
             UnderlayProtocol::Udp,
@@ -839,7 +839,7 @@ async fn request_path_recovery_without_a_new_target(stale_before_dispatch: bool)
         "tcp://127.0.0.1:10323?initial-srtt-s=0.04&initial-rate-mbps=200",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (copy_commands, mut copy_receivers) = reliable_path_command_channels(8);
@@ -959,7 +959,7 @@ async fn request_recovery_orders_retained_ranges(
     ]);
     let limits = context.mux_limits;
     let (a_commands, mut a_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, a_commands), 8);
     let a = remotes.paths[0].instance();
     let (b_commands, mut b_receivers) = reliable_path_command_channels(8);
@@ -1147,7 +1147,7 @@ async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_
         "tcp://127.0.0.1:10386",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (copy_commands, mut copy_receivers) = reliable_path_command_channels(8);
@@ -1418,7 +1418,7 @@ async fn disappeared_path_recovery_target_is_reselected_at_direct_commit() {
         "tcp://127.0.0.1:10323?initial-srtt-s=0.04&initial-rate-mbps=200",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     let owner = remotes.paths[0].instance();
     let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
@@ -1501,7 +1501,7 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10341", "quic://127.0.0.1:10342"]);
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, tcp_commands),
         8,
     );
@@ -1604,7 +1604,7 @@ async fn client_live_tail_stops_at_an_already_queued_frontier_copy() {
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:11341", "quic://127.0.0.1:11342"]);
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, tcp_commands),
         8,
     );
@@ -1695,7 +1695,7 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
     )
     .expect("context");
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, owner_commands),
         8,
     );
@@ -2019,7 +2019,7 @@ async fn request_completion_tail_extent_is_percentage_invariant() {
     )
     .expect("context");
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, owner_commands),
         8,
     );
@@ -2161,7 +2161,7 @@ async fn completion_tail_uses_cache_independent_ranked_frontier_for_target_and_a
     )
     .expect("context");
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, owner_commands),
         8,
     );
@@ -2531,7 +2531,8 @@ async fn request_product_ack_preserves_exact_data_ack_progress_path() {
     let stream_id = StreamId(91);
     let context = client_test_context_with_paths(&["tcp://127.0.0.1:10263"]);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let remotes = ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 8);
+    let (remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 8);
     let owner = remotes.paths[0].instance();
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     let frame = send_stream
@@ -2568,7 +2569,7 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10361", "quic://127.0.0.1:10362"]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, owner_commands),
         8,
     );
@@ -2718,7 +2719,7 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
             TrafficClass::Control,
         )
         .expect("prefill priority queue");
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 4);
     let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
     recv_stream
@@ -2777,7 +2778,7 @@ async fn client_stream_ack_publication_resumes_at_the_exact_cumulative_chunk() {
             TrafficClass::Control,
         )
         .expect("prefill priority queue");
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 4);
     let chunks = vec![
         Frame::StreamAck {
@@ -2843,7 +2844,7 @@ async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
             TrafficClass::Control,
         )
         .expect("prefill priority queue");
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 4);
     let original_instance = remotes.paths[0].instance();
     let mut recv_stream =
@@ -2918,7 +2919,7 @@ async fn client_max_data_retries_only_the_blocked_attachment() {
         )
         .expect("prefill first priority queue");
     let (available_commands, mut available_rx) = reliable_path_command_channels(4);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, blocked_commands), 4);
     remotes.attach(opened_test_relay_stream(stream_id, 1, available_commands));
     consume_client_path_proof_for_test(&mut available_rx);
@@ -3013,7 +3014,7 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
         )
         .expect("prefill first priority queue");
     let (second_commands, mut second_rx) = reliable_path_command_channels(1);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, first_commands), 4);
     remotes.attach(opened_test_relay_stream(stream_id, 1, second_commands));
     consume_client_path_proof_for_test(&mut second_rx);
@@ -3057,7 +3058,7 @@ async fn first_nonempty_request_data_acquires_load_but_empty_data_does_not() {
         .reserve_relay_path_load(key, TrafficClass::Throughput)
         .expect("prospective initial-open load");
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, commands).with_load_lease(opening_lease),
         8,
     );
@@ -3129,7 +3130,7 @@ async fn client_path_failure_releases_path_load_without_cleanup_queue_wait() {
             TrafficClass::Throughput,
         )
         .expect("initial path load");
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         opened_test_relay_stream(stream_id, 0, commands).with_load_lease(load_lease),
         1,
     );
@@ -3185,7 +3186,7 @@ async fn client_path_failure_releases_optional_load_without_cleanup_queue_wait()
         "tcp://127.0.0.1:10332?initial-srtt-s=0.02&initial-rate-mbps=500",
     ]));
     let (service_commands, _service_rx) = reliable_path_command_channels(1);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, service_commands), 2);
     let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(1);
     candidate_commands
@@ -3283,7 +3284,7 @@ async fn client_exact_failure_recovery_keeps_full_structural_target_service() {
         "tcp://127.0.0.1:10372?initial-srtt-s=0.02&initial-rate-mbps=500",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     consume_client_path_proof_for_test(&mut owner_receivers);
     let owner = remotes.paths[0].instance();
@@ -3387,7 +3388,7 @@ async fn equal_expiry_request_candidates_preserve_one_nonstale_survivor() {
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "tcp://127.0.0.1:10252"]);
     let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, first_commands), 8);
     let first = remotes.paths[0].instance();
     let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
@@ -3421,7 +3422,7 @@ async fn exhausted_optional_budget_still_allows_one_charged_requalification_quan
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let (stale_commands, mut stale_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, stale_commands), 8);
     let stale = remotes.paths[0].instance();
     let (healthy_commands, mut healthy_receivers) = reliable_path_command_channels(8);
@@ -3504,7 +3505,7 @@ async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() 
         "tcp://127.0.0.1:10715",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
+    let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     consume_client_path_proof_for_test(&mut owner_receivers);
     let owner = remotes.paths[0].instance();

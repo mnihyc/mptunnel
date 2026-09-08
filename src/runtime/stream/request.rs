@@ -11,8 +11,8 @@ mod state;
 pub(in crate::runtime) use attachment::arm_client_relay_attachment_commits_for_test;
 pub(in crate::runtime) use attachment::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayOpenedStartup,
-    ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
-    ReliableRelayReturnCandidate, ReliableRelayReturnPlan,
+    ReliableRelayRemoteFrame, ReliableRelayRemoteInput, ReliableRelayRemotePath,
+    ReliableRelayRemoteSet, ReliableRelayReturnCandidate, ReliableRelayReturnPlan,
 };
 // Keep inferred result/state types nameable without exposing child modules.
 #[allow(unused_imports)]

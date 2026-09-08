@@ -1,6 +1,6 @@
 # Prepared Original ownership — pre-implementation model
 
-2026-09-08 10:25 +08:00. Category: bounded architectural candidate for the
+2026-09-08 10:43 +08:00. Category: bounded architectural candidate for the
 existing early ordered-upload failure. **Not accepted runtime, performance or
 RFC policy.** Read PERFORMANCE_METHOD_AND_LESSONS and CURRENT_CLOSURE_PLAN.
 REQUEST_PREFIX_SERVICE_20260908 contains the exact existing capture; this file
@@ -212,12 +212,33 @@ The smallest coherent shared aggregate includes:
 | `RequestMultipathController` |Exact flights, qualification/rate/requalification, ACK-clock operation and successful-send cursor |
 | Exact attachment admission records |Identity/generation, output/lane/proof and claimed-load ownership; no stale mirror may authorize native exposure |
 
-Keep remote receive channels/forwarder tasks, local pending response writes
-and asynchronous open/close management outside that shared lock. The optional
-traffic accounting and two live-recovery epochs can remain actor-owned around
-short shared transactions; they cannot be required by a writer's synchronous
-Original claim. Membership invalidation updates authoritative claim eligibility
+The concrete source review simplifies this partition: retain the whole
+RequestSenderService, send mux, sender queue and RemoteSet's synchronous
+membership/publication metadata as one actor-owned aggregate initially. Keep
+its existing feedback cursors, optional epochs, output handles, load/proof/lane
+authority and forwarder abort tokens; splitting each into a separate registry
+would add coordination without a demonstrated benefit. Forwarder tasks already
+own their executing receiver/sender independently; their JoinHandle only
+aborts synchronously on exact removal/Drop. Move the merged `frames_rx` into
+actor-owned input, with its existing receive/ready-count/try-receive methods.
+The set retains `frames_tx`, so empty live membership does not manufacture EOF.
+Already merged input is neither filtered nor erased on path removal.
+
+Local pending response writes and actual open/close I/O remain outside the
+aggregate. Membership invalidation updates authoritative claim eligibility
 before asynchronous teardown, retaining existing claimed debt for recovery.
+An owned close future may be created only at the selected terminal action:
+synchronous withdrawal at construction must not accidentally execute discarded
+select alternatives. No source or ownership guard may cross its later await.
+This first extraction stays actor-owned; adding a mutex before separating
+planning from Native-fenced Apply remains forbidden.
+
+The used aggregate/input extraction passes483 existing controls in1.28s after
+a1m06s build, with only the original128KiB proposed-contract RED remaining.
+Independent review confirms queue/sender/cache/membership drop order, accepted
+merged-frame preservation and eager withdrawal only in selected terminal branches.
+It creates neither a shared lock nor a new scheduling boundary. That equivalence
+checkpoint permits the next claim transaction work, not performance acceptance.
 
 Do not wrap today's whole sender/ACK/planner methods in a mutex. Normal request
 observation reads Native shapes before health observations; making that call
@@ -339,3 +360,13 @@ controls pass1.27s. The intended128KiB boundary RED remains unchanged. This
 preparation installs no shared mutex, changes no Original publication boundary
 and claims no speed gain. The next owner extraction must make captured
 membership validation real and keep native I/O outside the shared owner.
+
+The next extraction question is ownership, not a new network hypothesis:
+can the existing actor retain one authoritative send/queue/flight/membership
+aggregate while merged reception and teardown own no borrow of it? Existing
+field/method audit permits the smaller partition above. Falsifiers are changed
+accepted-input drain/drop behaviour, changed cleanup order, a duplicate mutable
+admission view or a hidden send-state borrow across I/O. Use the existing
+terminal/half-close/default producer controls, keep the intended boundary RED,
+and add no unrelated metric/queue/rate changes. This refactor is preparation
+for the same observed pre-writer waiting defect, not practical acceptance.

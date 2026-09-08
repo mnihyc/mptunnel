@@ -91,7 +91,7 @@ async fn failed_path_proof_enqueue_retries_without_sticky_state() {
             })
             .expect("fill priority queue");
     }
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     assert!(remotes.paths[0].path_proof_id.is_none());
     for _ in 0..4 {
         assert!(matches!(
@@ -113,7 +113,7 @@ async fn failed_path_proof_enqueue_retries_without_sticky_state() {
 async fn queued_path_proof_keeps_identity_until_generation_changes() {
     let context = context(&["tcp://127.0.0.1:11091"]);
     let (opened, mut receivers, _frames) = opened_stream(StreamId(108), UnderlayProtocol::Tcp, 0);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let first_proof = remotes.paths[0].path_proof_id.expect("initial proof");
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
@@ -139,7 +139,7 @@ async fn duplicate_attachment_releases_pending_stream_and_load() {
     let context = context(&["quic://127.0.0.1:11094"]);
     let (first, _first_receivers, _first_frames) =
         opened_stream(stream_id, UnderlayProtocol::Udp, 0);
-    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 4);
     let (duplicate, mut receivers, _frames) = opened_stream(stream_id, UnderlayProtocol::Udp, 0);
     let lease = context
         .reserve_relay_path_load(
@@ -179,7 +179,7 @@ async fn candidate_membership_drops_open_load_until_product_claim_commits() {
     let context = context(&["tcp://127.0.0.1:11100", "tcp://127.0.0.1:11101"]);
     let stream_id = StreamId(97);
     let (first, _receivers, _frames) = opened_stream(stream_id, UnderlayProtocol::Tcp, 0);
-    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 4);
     let (candidate, _receivers, _frames) = opened_stream(stream_id, UnderlayProtocol::Tcp, 1);
     let key = RelayPathKey {
         underlay: UnderlayProtocol::Tcp,
@@ -227,7 +227,8 @@ async fn one_hundred_idle_initial_attachments_publish_zero_active_demand() {
             .expect("prospective initial-open load");
         let (opened, receivers, frames) =
             opened_stream(StreamId(1_000 + stream), UnderlayProtocol::Tcp, 0);
-        let remotes = ReliableRelayRemoteSet::new(opened.with_load_lease(lease), 4);
+        let (remotes, _remote_input) =
+            ReliableRelayRemoteSet::new(opened.with_load_lease(lease), 4);
         assert!(!remotes.paths[0].has_load_reservation());
         assert_eq!(
             context.health().lock().expect("path health").tcp[0].active_flows,
@@ -247,7 +248,7 @@ async fn stale_ack_instance_cannot_depublish_replacement_load() {
         index: 0,
     };
     let (first, _receivers, _frames) = opened_stream(StreamId(2_000), UnderlayProtocol::Tcp, 0);
-    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 4);
     let predecessor = remotes.paths[0].instance();
     let predecessor_lease = context
         .reserve_relay_path_load(key, TrafficClass::Throughput)
@@ -291,7 +292,7 @@ async fn stale_ack_instance_cannot_depublish_replacement_load() {
 async fn membership_generation_fences_replaced_path_incarnations() {
     let stream_id = StreamId(941);
     let (first, _receivers, _frames) = opened_stream(stream_id, UnderlayProtocol::Udp, 0);
-    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 4);
     let first_generation = remotes.membership_generation();
     let first_instance = remotes.path_instances()[0];
     assert_eq!(
@@ -330,7 +331,7 @@ async fn membership_generation_fences_replaced_path_incarnations() {
 async fn attachments_are_append_only_and_counted_without_roles() {
     let stream_id = StreamId(942);
     let (first, _receivers, _frames) = opened_stream(stream_id, UnderlayProtocol::Tcp, 0);
-    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 4);
     let (second, _receivers, _frames) = opened_stream(stream_id, UnderlayProtocol::Udp, 0);
     assert_eq!(
         remotes.attach_candidate(second),
@@ -388,11 +389,25 @@ async fn close_depublishes_load_before_carrier_cleanup_waits() {
         0,
     )
     .with_load_lease(lease);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 1);
     let generation = remotes.membership_generation();
     let instance = remotes.path_instances()[0];
 
     let mut close = Box::pin(remotes.close_all());
+    assert!(
+        remotes.is_empty(),
+        "membership is withdrawn before cleanup is polled"
+    );
+    assert_ne!(remotes.membership_generation(), generation);
+    assert_eq!(
+        remotes.path_position_at_generation(generation, instance),
+        None
+    );
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        0,
+        "logical load is withdrawn before cleanup is polled"
+    );
     assert!(matches!(
         futures::poll!(&mut close),
         std::task::Poll::Pending
@@ -434,7 +449,7 @@ async fn idle_reset_retires_membership_before_blocked_carrier_publication() {
         },
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 1);
     if let Some(setup) = try_recv_reliable_path_priority_command(&mut receivers) {
         receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&setup));
     }
@@ -485,7 +500,7 @@ async fn successful_close_preserves_fin_detach_close_order() {
         },
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 1);
     if let Some(setup) = try_recv_reliable_path_priority_command(&mut receivers) {
         receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&setup));
     }
@@ -557,7 +572,7 @@ async fn terminal_product_failure_resets_before_queued_payload() {
         },
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 1);
     if let Some(setup) = try_recv_reliable_path_priority_command(&mut receivers) {
         receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&setup));
     }
@@ -665,7 +680,7 @@ async fn additional_paths_are_ranked_by_metrics_across_carriers() {
         "quic://127.0.0.1:10181?initial-srtt-s=0.02&initial-rate-mbps=200",
     ]);
     let (slow, _receivers, _frames) = opened_stream(StreamId(160), UnderlayProtocol::Udp, 0);
-    let remotes = ReliableRelayRemoteSet::new(slow, 4);
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(slow, 4);
 
     assert_eq!(
         reliable_relay_additional_path_candidates(
@@ -691,7 +706,7 @@ async fn available_path_precedes_faster_locally_configured_backup() {
         "quic://127.0.0.1:10184?initial-srtt-s=0.1&initial-rate-mbps=20",
     ]);
     let (attached, _receivers, _frames) = opened_stream(StreamId(161), UnderlayProtocol::Udp, 0);
-    let remotes = ReliableRelayRemoteSet::new(attached, 4);
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(attached, 4);
 
     let candidates = reliable_relay_additional_path_candidates(
         &context,
@@ -715,7 +730,7 @@ async fn reinjection_candidate_uses_distinct_metric_ranked_carrier() {
         "quic://127.0.0.1:11169?initial-srtt-s=0.18&initial-rate-mbps=40",
     ]);
     let (slow, _receivers, _frames) = opened_stream(StreamId(151), UnderlayProtocol::Udp, 0);
-    let remotes = ReliableRelayRemoteSet::new(slow, 4);
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(slow, 4);
 
     assert_eq!(
         reliable_relay_reinjection_path_candidates(

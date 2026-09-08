@@ -234,6 +234,20 @@ pub(in crate::runtime) struct RequestSenderService {
     after_frame_reservation: RequestAfterFrameReservationHook,
 }
 
+/// One owner for request source, claimed bytes and exact output membership.
+///
+/// The relay still serializes this aggregate; it is not shared with writers
+/// yet. Merged receive I/O and asynchronous open/close execution stay outside.
+/// Keep queue/service/cache teardown before dropping output membership, as in
+/// the previous independently declared actor fields. No mirrored admission
+/// state is needed when the native-claim transaction moves into this owner.
+pub(in crate::runtime) struct RequestProductState {
+    pub(in crate::runtime) sender_queue: ReliableRelaySenderQueue,
+    pub(in crate::runtime) sender: RequestSenderService,
+    pub(in crate::runtime) send_stream: ReliableSendStream,
+    pub(in crate::runtime) remotes: ReliableRelayRemoteSet,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct RelayRecvProgressSend {
     path: Option<PathSnapshot>,

@@ -13,7 +13,9 @@ use crate::runtime::path::commands::{
     reliable_path_command_channels, try_recv_reliable_path_command,
     try_recv_reliable_path_priority_command,
 };
-use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
+use crate::runtime::stream::{
+    ReliablePathStream, ReliablePathStreamOutput, ReliableRelayRemoteInput,
+};
 use crate::transport::PathSpec;
 use bytes::Bytes;
 use std::pin::Pin;
@@ -306,9 +308,9 @@ fn test_opened_remote_stream_on(
     )
 }
 
-async fn wait_for_buffered_remote_frame(remotes: &ReliableRelayRemoteSet) {
+async fn wait_for_buffered_remote_frame(remote_input: &ReliableRelayRemoteInput) {
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !remotes.has_buffered_frame() {
+        while !remote_input.has_buffered_frame() {
             tokio::task::yield_now().await;
         }
     })
@@ -634,7 +636,7 @@ async fn direct_recovery_service_wait_retains_capacity_release_before_next_selec
     .expect("client context");
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(1);
     let (_owner_frames, owner_frames_rx) = mpsc::channel(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         test_opened_remote_stream(stream_id, 0, owner_commands, owner_frames_rx),
         8,
     );
@@ -729,7 +731,7 @@ async fn actor_recovery_pass_selects_survivor_after_collected_target_disappears(
 
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
     let (owner_frames, owner_frames_rx) = mpsc::channel(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         test_opened_remote_stream(stream_id, 0, owner_commands, owner_frames_rx),
         8,
     );
@@ -836,7 +838,7 @@ async fn stale_path_failure_does_not_blacklist_same_key_successor() {
         .expect("client context");
     let (old_commands, _old_command_receivers) = reliable_path_command_channels(8);
     let (_old_frames_tx, old_frames_rx) = mpsc::channel(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         test_opened_remote_stream(stream_id, 0, old_commands, old_frames_rx),
         8,
     );
@@ -889,7 +891,7 @@ async fn matching_path_failure_still_removes_and_suppresses_the_failed_instance(
         .expect("client context");
     let (commands, _command_receivers) = reliable_path_command_channels(8);
     let (_frames_tx, frames_rx) = mpsc::channel(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(
         test_opened_remote_stream(stream_id, 0, commands, frames_rx),
         8,
     );
@@ -924,7 +926,7 @@ async fn quic_request_stream_abandonment_detaches_only_its_logical_attachment() 
         .expect("client context");
     let (commands, _command_receivers) = reliable_path_command_channels(8);
     let (frames_tx, frames_rx) = mpsc::channel(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (mut remotes, mut _remote_input) = ReliableRelayRemoteSet::new(
         test_opened_remote_stream_on(stream_id, 0, UnderlayProtocol::Udp, commands, frames_rx),
         8,
     );
@@ -942,8 +944,8 @@ async fn quic_request_stream_abandonment_detaches_only_its_logical_attachment() 
         )))
         .await
         .expect("publish request-stream abandonment");
-    wait_for_buffered_remote_frame(&remotes).await;
-    let ReliableRelayRemoteFrame { instance, frame } = remotes
+    wait_for_buffered_remote_frame(&_remote_input).await;
+    let ReliableRelayRemoteFrame { instance, frame } = _remote_input
         .recv_frame()
         .await
         .expect("forwarded request-stream abandonment");
@@ -980,7 +982,7 @@ async fn planned_drain_before_path_close_does_not_publish_terminal() {
     let stream_id = StreamId(909);
     let (commands, mut command_receivers) = reliable_path_command_channels(8);
     let (_frames_tx, frames_rx) = mpsc::channel(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (_remotes, mut _remote_input) = ReliableRelayRemoteSet::new(
         test_opened_remote_stream(stream_id, 0, commands.clone(), frames_rx),
         8,
     );
@@ -995,7 +997,7 @@ async fn planned_drain_before_path_close_does_not_publish_terminal() {
         "closed admission remains a nonterminal planned-drain phase"
     );
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), remotes.recv_frame())
+        tokio::time::timeout(Duration::from_millis(25), _remote_input.recv_frame())
             .await
             .is_err(),
         "planned drain cannot publish a terminal event before ordered PATH_CLOSE"
@@ -1008,7 +1010,7 @@ async fn planned_retirement_follows_every_preaccepted_frame_through_cap_one_fan_
     let stream_id = StreamId(910);
     let (commands, mut command_receivers) = reliable_path_command_channels(8);
     let (frames_tx, frames_rx) = mpsc::channel(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (remotes, mut _remote_input) = ReliableRelayRemoteSet::new(
         test_opened_remote_stream(stream_id, 0, commands.clone(), frames_rx),
         1,
     );
@@ -1022,7 +1024,7 @@ async fn planned_retirement_follows_every_preaccepted_frame_through_cap_one_fan_
         }))
         .await
         .expect("queue first carrier frame");
-    wait_for_buffered_remote_frame(&remotes).await;
+    wait_for_buffered_remote_frame(&_remote_input).await;
     frames_tx
         .send(Ok(Frame::StreamData {
             stream_id,
@@ -1041,7 +1043,7 @@ async fn planned_retirement_follows_every_preaccepted_frame_through_cap_one_fan_
     assert!(command_receivers.finish_planned_path_retirement());
     assert!(commands.is_terminal());
 
-    let first = remotes
+    let first = _remote_input
         .try_recv_frame()
         .expect("first merged carrier frame");
     assert_eq!(first.instance, instance);
@@ -1053,7 +1055,7 @@ async fn planned_retirement_follows_every_preaccepted_frame_through_cap_one_fan_
             ..
         }) if payload == Bytes::from_static(b"A")
     ));
-    let second = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+    let second = tokio::time::timeout(Duration::from_secs(1), _remote_input.recv_frame())
         .await
         .expect("second frame deadline")
         .expect("second merged carrier frame");
@@ -1067,13 +1069,13 @@ async fn planned_retirement_follows_every_preaccepted_frame_through_cap_one_fan_
         }) if payload == Bytes::from_static(b"B")
     ));
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), remotes.recv_frame())
+        tokio::time::timeout(Duration::from_millis(25), _remote_input.recv_frame())
             .await
             .is_err(),
         "terminal cannot bypass a pre-terminal input reservation"
     );
     drop(held_input_permit);
-    let terminal = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+    let terminal = tokio::time::timeout(Duration::from_secs(1), _remote_input.recv_frame())
         .await
         .expect("planned terminal deadline")
         .expect("planned terminal frame");
@@ -1089,14 +1091,14 @@ async fn unexpected_output_owner_drop_closes_retained_input_with_failure() {
     let stream_id = StreamId(908);
     let (commands, command_receivers) = reliable_path_command_channels(8);
     let (_frames_tx, frames_rx) = mpsc::channel(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (remotes, mut _remote_input) = ReliableRelayRemoteSet::new(
         test_opened_remote_stream(stream_id, 0, commands, frames_rx),
         8,
     );
     let instance = remotes.paths[0].instance();
     drop(command_receivers);
 
-    let terminal = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+    let terminal = tokio::time::timeout(Duration::from_secs(1), _remote_input.recv_frame())
         .await
         .expect("unexpected carrier terminal deadline")
         .expect("unexpected carrier terminal frame");
@@ -1135,7 +1137,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
         },
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 8);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 8);
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     let sent = send_stream
         .send_data(Bytes::from_static(b"abcdefgh"))
@@ -1487,7 +1489,7 @@ async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted(
         },
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     while try_recv_reliable_path_priority_command(&mut receivers).is_some() {}
     commands
         .try_enqueue_admitted_frame(Frame::Ping { nonce: 1 }, TrafficClass::Control)
@@ -1563,7 +1565,7 @@ async fn client_completion_retains_ack_until_every_live_attachment_accepts_it() 
     };
     let (first_commands, mut first_receivers) = reliable_path_command_channels(4);
     let (_first_frames, first) = opened(0, first_commands);
-    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first, 4);
     while try_recv_reliable_path_priority_command(&mut first_receivers).is_some() {}
 
     let (blocked_commands, mut blocked_receivers) = reliable_path_command_channels(1);
@@ -1640,7 +1642,7 @@ async fn client_completion_retains_zero_publication_requalification_ack() {
         },
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 1);
     while try_recv_reliable_path_priority_command(&mut receivers).is_some() {}
     commands
         .try_enqueue_admitted_frame(Frame::Ping { nonce: 616 }, TrafficClass::Control)

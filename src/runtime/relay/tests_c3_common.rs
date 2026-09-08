@@ -3,7 +3,9 @@ use crate::model::capacity::reliable_relay_buffer_len;
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
-use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
+use crate::runtime::stream::{
+    ReliablePathStream, ReliablePathStreamOutput, ReliableRelayRemoteInput,
+};
 use bytes::Bytes;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -49,9 +51,9 @@ fn pre_model_out_of_band_terminal(
         })
 }
 
-async fn pre_model_wait_for_buffered_remote_frame(remotes: &ReliableRelayRemoteSet) {
+async fn pre_model_wait_for_buffered_remote_frame(remote_input: &ReliableRelayRemoteInput) {
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !remotes.has_buffered_frame() {
+        while !remote_input.has_buffered_frame() {
             tokio::task::yield_now().await;
         }
     })
@@ -64,7 +66,7 @@ async fn pre_model_red_planned_drain_is_not_terminal_before_ordered_path_close()
     let stream_id = StreamId(909);
     let (commands, mut command_receivers) = reliable_path_command_channels(8);
     let (_frames_tx, frames_rx) = mpsc::channel(1);
-    let remotes = ReliableRelayRemoteSet::new(
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(
         pre_model_opened_remote_stream(stream_id, commands.clone(), frames_rx),
         8,
     );
@@ -82,7 +84,7 @@ async fn pre_model_red_terminal_cannot_bypass_preaccepted_cap_one_frame() {
     let stream_id = StreamId(910);
     let (commands, mut command_receivers) = reliable_path_command_channels(8);
     let (frames_tx, frames_rx) = mpsc::channel(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
+    let (remotes, mut _remote_input) = ReliableRelayRemoteSet::new(
         pre_model_opened_remote_stream(stream_id, commands.clone(), frames_rx),
         1,
     );
@@ -95,7 +97,7 @@ async fn pre_model_red_terminal_cannot_bypass_preaccepted_cap_one_frame() {
         }))
         .await
         .expect("RED setup failed: queue carrier frame A");
-    pre_model_wait_for_buffered_remote_frame(&remotes).await;
+    pre_model_wait_for_buffered_remote_frame(&_remote_input).await;
     frames_tx
         .send(Ok(Frame::StreamData {
             stream_id,
@@ -111,7 +113,7 @@ async fn pre_model_red_terminal_cannot_bypass_preaccepted_cap_one_frame() {
 
     commands.begin_path_drain();
     command_receivers.close_for_path_drain();
-    let first = remotes
+    let first = _remote_input
         .try_recv_frame()
         .expect("RED setup failed: merged frame A disappeared");
     assert!(matches!(
@@ -128,7 +130,7 @@ async fn pre_model_red_terminal_cannot_bypass_preaccepted_cap_one_frame() {
     );
 
     drop(held_input_permit);
-    let second = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+    let second = tokio::time::timeout(Duration::from_secs(1), _remote_input.recv_frame())
         .await
         .expect("RED: frame B remained blocked after merged capacity was released")
         .expect("RED: merged queue closed before preaccepted frame B");
@@ -147,7 +149,7 @@ async fn pre_model_control_unexpected_owner_drop_still_requires_terminal_livenes
     let stream_id = StreamId(911);
     let (commands, command_receivers) = reliable_path_command_channels(8);
     let (_frames_tx, frames_rx) = mpsc::channel(1);
-    let remotes = ReliableRelayRemoteSet::new(
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(
         pre_model_opened_remote_stream(stream_id, commands, frames_rx),
         8,
     );

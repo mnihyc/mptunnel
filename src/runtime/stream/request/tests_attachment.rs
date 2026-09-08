@@ -55,7 +55,7 @@ fn opened_stream_at(
 async fn request_membership_serializes_same_key_replacement() {
     let stream_id = StreamId(799);
     let (opened, _frames, _receivers) = opened_stream_at(stream_id, 0);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let predecessor = remotes.paths[0].instance();
 
     let (overlap, _overlap_frames, _overlap_receivers) = opened_stream_at(stream_id, 0);
@@ -86,7 +86,7 @@ async fn request_membership_serializes_same_key_replacement() {
 async fn attachment_identity_exhaustion_fails_before_request_membership_publication() {
     let stream_id = StreamId(800);
     let (opened, _frames, _receivers) = opened_stream_at(stream_id, 0);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     assert_eq!(remotes.paths[0].attachment_id, 0);
     remotes.next_instance_id = Some(u64::MAX);
 
@@ -136,7 +136,7 @@ async fn attachment_identity_exhaustion_fails_before_request_membership_publicat
 async fn carrier_failure_after_fin_remains_visible_to_attachment_owner() {
     let stream_id = StreamId(801);
     let (opened, frames_tx, command_receivers) = opened_stream(stream_id);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (_remotes, mut remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     frames_tx
         .send(Ok(Frame::StreamFin {
             stream_id,
@@ -150,14 +150,14 @@ async fn carrier_failure_after_fin_remains_visible_to_attachment_owner() {
         .expect("queue carrier failure");
 
     assert!(matches!(
-        remotes.recv_frame().await.expect("FIN frame").frame,
+        remote_input.recv_frame().await.expect("FIN frame").frame,
         Ok(Frame::StreamFin {
             stream_id: received_stream_id,
             final_offset: 8,
         }) if received_stream_id == stream_id
     ));
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+        tokio::time::timeout(Duration::from_secs(1), remote_input.recv_frame())
             .await
             .expect("carrier failure deadline")
             .expect("carrier failure frame")
@@ -171,7 +171,7 @@ async fn carrier_failure_after_fin_remains_visible_to_attachment_owner() {
 async fn product_terminal_suppresses_input_close_but_not_later_carrier_terminal() {
     let stream_id = StreamId(802);
     let (opened, frames_tx, command_receivers) = opened_stream(stream_id);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (_remotes, mut remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     frames_tx
         .send(Ok(Frame::StreamFin {
             stream_id,
@@ -182,21 +182,21 @@ async fn product_terminal_suppresses_input_close_but_not_later_carrier_terminal(
     drop(frames_tx);
 
     assert!(matches!(
-        remotes.recv_frame().await.expect("FIN frame").frame,
+        remote_input.recv_frame().await.expect("FIN frame").frame,
         Ok(Frame::StreamFin {
             stream_id: received_stream_id,
             final_offset: 0,
         }) if received_stream_id == stream_id
     ));
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), remotes.recv_frame())
+        tokio::time::timeout(Duration::from_millis(25), remote_input.recv_frame())
             .await
             .is_err(),
         "product terminal suppresses only an unclassified input close"
     );
     drop(command_receivers);
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+        tokio::time::timeout(Duration::from_secs(1), remote_input.recv_frame())
             .await
             .expect("later carrier terminal deadline")
             .expect("later carrier terminal frame")
@@ -209,7 +209,7 @@ async fn product_terminal_suppresses_input_close_but_not_later_carrier_terminal(
 async fn attachment_removal_cancels_product_terminal_lifecycle_watch() {
     let stream_id = StreamId(803);
     let (opened, frames_tx, command_receivers) = opened_stream(stream_id);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, mut remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let instance = remotes.paths[0].instance();
     frames_tx
         .send(Ok(Frame::StreamFin {
@@ -220,7 +220,7 @@ async fn attachment_removal_cancels_product_terminal_lifecycle_watch() {
         .expect("queue FIN");
     drop(frames_tx);
     assert!(matches!(
-        remotes.recv_frame().await.expect("FIN frame").frame,
+        remote_input.recv_frame().await.expect("FIN frame").frame,
         Ok(Frame::StreamFin { .. })
     ));
 
@@ -231,7 +231,7 @@ async fn attachment_removal_cancels_product_terminal_lifecycle_watch() {
     );
     drop(command_receivers);
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), remotes.recv_frame())
+        tokio::time::timeout(Duration::from_millis(25), remote_input.recv_frame())
             .await
             .is_err(),
         "removed attachment cannot publish a later stale lifecycle terminal"
@@ -242,7 +242,7 @@ async fn attachment_removal_cancels_product_terminal_lifecycle_watch() {
 async fn failed_attachment_retirement_cannot_block_healthy_sibling_scheduling() {
     let stream_id = StreamId(806);
     let (opened, _frames_tx, mut receivers) = opened_stream(stream_id);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let failed = remotes.paths[0].instance();
 
     // Consume the attachment proof, then fill the ordinary bounded control
@@ -274,7 +274,7 @@ async fn failed_attachment_retirement_cannot_block_healthy_sibling_scheduling() 
 async fn pending_exact_requalification_ack_does_not_block_healthy_path_progress() {
     let stream_id = StreamId(804);
     let (opened, _frames_tx, mut receivers) = opened_stream(stream_id);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, mut remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let stale = remotes.paths[0].instance();
     let (healthy_opened, healthy_frames, mut healthy_receivers) = opened_stream_at(stream_id, 1);
     assert_eq!(
@@ -325,7 +325,7 @@ async fn pending_exact_requalification_ack_does_not_block_healthy_path_progress(
         .send(Ok(healthy_data.clone()))
         .await
         .expect("publish healthy sibling Product frame");
-    let received = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+    let received = tokio::time::timeout(Duration::from_secs(1), remote_input.recv_frame())
         .await
         .expect("pending stale ACK must not block healthy carrier input")
         .expect("healthy carrier input");
@@ -359,7 +359,7 @@ async fn pending_exact_requalification_ack_does_not_block_healthy_path_progress(
 async fn response_requalification_ack_can_use_authenticated_sibling_return_carrier() {
     let stream_id = StreamId(807);
     let (opened, _frames_tx, mut preferred_receivers) = opened_stream(stream_id);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let observed_forward_attachment = remotes.paths[0].instance();
     let (sibling_opened, _sibling_frames, mut sibling_receivers) = opened_stream_at(stream_id, 1);
     assert_eq!(
@@ -408,7 +408,7 @@ async fn response_requalification_ack_can_use_authenticated_sibling_return_carri
 async fn response_requalification_ack_replicates_once_to_each_queue_admitting_attachment() {
     let stream_id = StreamId(808);
     let (opened, _frames_tx, mut carrying_receivers) = opened_stream(stream_id);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let carrying = remotes.paths[0].instance();
     let (sibling_opened, _sibling_frames, mut sibling_receivers) = opened_stream_at(stream_id, 1);
     assert_eq!(
@@ -489,7 +489,7 @@ async fn response_requalification_ack_does_not_complete_on_known_terminal_return
         };
     let (terminal_commands, mut terminal_receivers) = reliable_path_command_channels(4);
     let (terminal_opened, _terminal_frames) = opened(0, terminal_commands.clone());
-    let mut remotes = ReliableRelayRemoteSet::new(terminal_opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(terminal_opened, 4);
     let (healthy_commands, mut healthy_receivers) = reliable_path_command_channels(1);
     let (healthy_opened, _healthy_frames) = opened(1, healthy_commands.clone());
     assert_eq!(
@@ -546,7 +546,7 @@ async fn response_requalification_ack_remains_admissible_during_planned_drain() 
         },
         0,
     );
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     while try_recv_reliable_path_command(&mut receivers).is_some() {}
     commands.begin_path_drain();
 
@@ -572,7 +572,7 @@ async fn response_requalification_ack_remains_admissible_during_planned_drain() 
 async fn completed_response_requalification_ack_rejects_replay_without_new_fanout() {
     let stream_id = StreamId(809);
     let (opened, _frames_tx, mut receivers) = opened_stream(stream_id);
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let carrying = remotes.paths[0].instance();
     assert!(matches!(
         try_recv_reliable_path_command(&mut receivers),
@@ -628,7 +628,7 @@ async fn completed_response_requalification_ack_rejects_replay_without_new_fanou
 async fn delayed_probe_ack_cannot_replace_a_newer_pending_exact_ack() {
     let stream_id = StreamId(805);
     let (first_opened, _first_frames, mut first_receivers) = opened_stream(stream_id);
-    let mut remotes = ReliableRelayRemoteSet::new(first_opened, 4);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(first_opened, 4);
     let first = remotes.paths[0].instance();
     let (second_opened, _second_frames, mut second_receivers) = opened_stream_at(stream_id, 1);
     assert_eq!(

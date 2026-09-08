@@ -760,34 +760,27 @@ async fn request_path_recovery_without_a_new_target(stale_before_dispatch: bool)
         .earliest_reinjection_suppression_deadline(&remotes)
         .expect("accepted copy has an immutable retry deadline");
     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-    let mut queue = ReliableRelaySenderQueue::default();
-    let outcome = sender.drive_request_path_recovery(
-        &mut queue,
-        &context,
-        &remotes,
-        &send_stream,
-        TrafficClass::Throughput,
-    );
+    let queue = ReliableRelaySenderQueue::default();
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &queue);
     if stale_before_dispatch {
         assert!(sender.multipath.mark_path_stale(copy));
     }
-    if outcome.queued {
-        let dispatch = sender
-            .dispatch_client_queued_work(
-                &context,
-                TrafficClass::Throughput,
-                &mut remotes,
-                &mut send_stream,
-                &mut queue,
-                4096,
-                ReliableDataAckFrontierState::Live,
-            )
-            .await;
-        panic!("no new target must not create a command that can close the relay: {dispatch:?}");
-    }
-    assert!(outcome.blocked_for_carrier_capacity);
     assert!(
-        outcome.retry_deadline.is_none(),
+        sender
+            .dispatch_next_request_path_recovery(
+                &mut recovery,
+                &context,
+                &mut remotes,
+                &send_stream,
+                &queue,
+            )
+            .await
+            .expect("no new target must not close the relay")
+            .is_none()
+    );
+    assert!(recovery.blocked_for_carrier_capacity);
+    assert!(
+        recovery.retry_deadline.is_none(),
         "no expired timer busy loop"
     );
     assert!(queue.is_empty());
@@ -804,34 +797,22 @@ async fn request_path_recovery_without_a_new_target(stale_before_dispatch: bool)
     let fresh = remotes.paths[2].instance();
     context.install_relay_path_instance_for_test(fresh);
     assert_ne!(remotes.membership_generation(), generation_before);
-    assert!(
-        sender
-            .drive_request_path_recovery(
-                &mut queue,
-                &context,
-                &remotes,
-                &send_stream,
-                TrafficClass::Throughput,
-            )
-            .queued
-    );
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &queue);
     assert!(matches!(
         sender
-            .dispatch_client_queued_work(
+            .dispatch_next_request_path_recovery(
+                &mut recovery,
                 &context,
-                TrafficClass::Throughput,
                 &mut remotes,
-                &mut send_stream,
-                &mut queue,
-                4096,
-                ReliableDataAckFrontierState::Live,
+                &send_stream,
+                &queue,
             )
             .await
             .expect("membership publication reselects a real target"),
-        ClientQueuedDispatch::Reinjection {
+        Some(ClientQueuedDispatch::Reinjection {
             payload_bytes: 4096,
             ..
-        }
+        })
     ));
     assert!(matches!(
         try_recv_reliable_path_command(&mut fresh_receivers),
@@ -859,7 +840,7 @@ async fn request_recovery_interleaved_owners_preserve_global_range_order() {
 }
 
 #[tokio::test]
-async fn request_recovery_prequeued_suffix_yields_to_newly_due_prefix() {
+async fn request_recovery_pending_suffix_yields_to_newly_due_prefix() {
     request_recovery_orders_retained_ranges(true, false, true).await;
 }
 
@@ -897,7 +878,7 @@ async fn request_recovery_orders_retained_ranges(
         remotes.paths.swap(0, 2);
     }
     let mut sender = RequestSenderService::new(stream_id);
-    let mut queue = ReliableRelaySenderQueue::default();
+    let queue = ReliableRelaySenderQueue::default();
     // Every range fits C's unchanged startup repair envelope. This isolates
     // publication order, not exhaustion of measured native service credit.
     let q = reliable_relay_buffer_len(limits).min(limits.max_repair_bytes / 3);
@@ -975,30 +956,18 @@ async fn request_recovery_orders_retained_ranges(
                 limits,
             );
             assert_eq!(target.map(|(target, _, _)| target), Some(c));
+            let previous_batch = sender.collect_request_path_recovery(&remotes, &queue);
+            assert!(previous_batch.has_pending());
             assert!(
-                sender
-                    .drive_request_path_recovery(
-                        &mut queue,
-                        &context,
-                        &remotes,
-                        &send_stream,
-                        TrafficClass::Throughput,
-                    )
-                    .queued
+                queue.is_empty(),
+                "collection materializes no provisional copy"
             );
-            for (ranges, expected) in [(&expected_a, false), (&expected_b, true)] {
-                let frame = send_stream
-                    .retransmission_frames_for_ranges(ranges, 1)
-                    .pop()
-                    .expect("retained Original prefix remains cached");
-                assert_eq!(queue.has_queued_reinjection_overlap(&frame), expected);
-            }
             assert!(try_recv_reliable_path_command(&mut c_receivers).is_none());
             assert!(
                 sender
                     .earliest_reinjection_suppression_deadline(&remotes)
                     .is_none(),
-                "the later intent is provisional, not an accepted native copy"
+                "collected later ownership is not an accepted native copy"
             );
         }
     }
@@ -1007,12 +976,7 @@ async fn request_recovery_orders_retained_ranges(
         if suffix_first { vec![b, a] } else { vec![a, b] }
     );
     for (owner, expected) in [(a, expected_a), (b, expected_b)] {
-        let recovery = sender.multipath.path_recovery_state(
-            &context,
-            &remotes,
-            owner,
-            TrafficClass::Throughput,
-        );
+        let recovery = sender.multipath.path_recovery_state(&remotes, owner);
         assert_eq!(recovery.uncovered_ranges, expected);
         assert!(
             recovery.retry_deadline.is_none(),
@@ -1020,20 +984,9 @@ async fn request_recovery_orders_retained_ranges(
         );
     }
     assert!(try_recv_reliable_path_command(&mut c_receivers).is_none());
-    assert!(
-        sender
-            .drive_request_path_recovery(
-                &mut queue,
-                &context,
-                &remotes,
-                &send_stream,
-                TrafficClass::Throughput,
-            )
-            .queued
-    );
-    assert!(queue.request_target_queued_reinjection_bytes(c, false) <= capacity);
-    assert_eq!(queue.request_target_queued_reinjection_bytes(a, false), 0);
-    assert_eq!(queue.request_target_queued_reinjection_bytes(b, false), 0);
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &queue);
+    assert!(recovery.has_pending());
+    assert!(queue.is_empty());
     // The interleaved case observes two native handoffs; merely sorting owners
     // by their first range must not publish A's later range ahead of B's head.
     for expected_offset in if interleaved {
@@ -1042,17 +995,16 @@ async fn request_recovery_orders_retained_ranges(
         vec![0]
     } {
         let dispatch = sender
-            .dispatch_client_queued_work(
+            .dispatch_next_request_path_recovery(
+                &mut recovery,
                 &context,
-                TrafficClass::Throughput,
                 &mut remotes,
-                &mut send_stream,
-                &mut queue,
-                reliable_relay_buffer_len(limits),
-                ReliableDataAckFrontierState::Live,
+                &send_stream,
+                &queue,
             )
             .await
-            .expect("selected repair passes unchanged native admission");
+            .expect("selected repair passes unchanged native admission")
+            .expect("lowest eligible range enters native service in this batch");
         assert!(matches!(dispatch, ClientQueuedDispatch::Reinjection { .. }));
         let command = try_recv_reliable_path_command(&mut c_receivers)
             .expect("actual native command receiver observes repair commitment");
@@ -1072,7 +1024,299 @@ async fn request_recovery_orders_retained_ranges(
 }
 
 #[tokio::test]
-async fn disappeared_bound_path_recovery_target_is_cancelled_and_reselected() {
+async fn direct_request_recovery_preserves_queued_live_copy_and_accepted_deadline() {
+    request_recovery_preserves_queued_live_copy(false, false).await;
+}
+
+#[tokio::test]
+async fn direct_request_recovery_services_both_sides_of_queued_partial_copy() {
+    request_recovery_preserves_queued_live_copy(true, false).await;
+}
+
+#[tokio::test]
+async fn direct_request_recovery_resumes_after_queued_live_target_becomes_stale() {
+    request_recovery_preserves_queued_live_copy(false, true).await;
+}
+
+async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_queued: bool) {
+    let stream_id = StreamId(237);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10384",
+        "tcp://127.0.0.1:10385",
+        "tcp://127.0.0.1:10386",
+    ]);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (copy_commands, mut copy_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, copy_commands));
+    let copy = remotes.paths[1].instance();
+    let (free_commands, mut free_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, free_commands));
+    let free = remotes.paths[2].instance();
+    for receivers in [
+        &mut owner_receivers,
+        &mut copy_receivers,
+        &mut free_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [owner, copy, free] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let source_bytes = if partial_copy { 3 * 4096 } else { 4096 };
+    let original = send_stream
+        .send_data(Bytes::from(vec![0x5b; source_bytes]))
+        .expect("retained OriginalData producer");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &original);
+    let mut queue = ReliableRelaySenderQueue::default();
+    let cause = RelaySendCause::CompletionTailReinjection(ClientReinjectionOutputIdentity {
+        instance: copy,
+    });
+    let queued_range = if partial_copy {
+        OffsetRange {
+            start: 4096,
+            end: 8192,
+        }
+    } else {
+        OffsetRange {
+            start: 0,
+            end: 4096,
+        }
+    };
+    let queued_copy = send_stream
+        .retransmission_frames_for_ranges(&[queued_range], 4096)
+        .pop()
+        .expect("exact queued copy is sliced from the actual retained cache");
+    sender.enqueue_critical_reinjection_frame(&mut queue, queued_copy, cause);
+    let accounted_before = sender.optional_reinjection.reinjected_bytes();
+    assert!(sender.multipath.mark_path_stale(owner));
+    if partial_copy {
+        crate::runtime::sender::queue::take_recovery_overlap_visits_for_test();
+    }
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &queue);
+    if partial_copy {
+        assert_eq!(
+            crate::runtime::sender::queue::take_recovery_overlap_visits_for_test(),
+            (1, 0),
+            "collection observes the single queued extent once before native service"
+        );
+        // One cache chunk straddles the queued middle interval. Its uncovered
+        // prefix and suffix remain independently eligible within this batch.
+        for expected_offset in [0, 8192] {
+            let dispatch = sender
+                .dispatch_next_request_path_recovery(
+                    &mut recovery,
+                    &context,
+                    &mut remotes,
+                    &send_stream,
+                    &queue,
+                )
+                .await
+                .expect("partial queued overlap does not fence another range")
+                .expect("uncovered range has native service");
+            assert!(matches!(
+                dispatch,
+                ClientQueuedDispatch::Reinjection {
+                    payload_bytes: 4096,
+                    ..
+                }
+            ));
+            let mut observed = Vec::new();
+            for receivers in [&mut copy_receivers, &mut free_receivers] {
+                if let Some(command) = try_recv_reliable_path_command(receivers) {
+                    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(
+                        &command,
+                    ));
+                    let ReliablePathCommand::SendFrame(Frame::StreamData {
+                        offset, payload, ..
+                    }) = command
+                    else {
+                        panic!("expected exact uncovered repair command");
+                    };
+                    observed.push((offset, payload.len()));
+                }
+            }
+            assert_eq!(observed, vec![(expected_offset, 4096)]);
+        }
+        assert!(
+            sender
+                .dispatch_next_request_path_recovery(
+                    &mut recovery,
+                    &context,
+                    &mut remotes,
+                    &send_stream,
+                    &queue,
+                )
+                .await
+                .expect("finite batch terminates")
+                .is_none()
+        );
+        assert_eq!(queue.reinjection_bytes(), 4096);
+        let (_, work) = queue.front().expect("exact queued middle remains intact");
+        assert!(matches!(
+            &work.kind,
+            ReliableRelayQueuedWorkKind::Reinjection {
+                cause: retained, frame: Frame::StreamData { offset: 4096, payload, .. },
+            } if *retained == cause && payload.len() == 4096
+        ));
+        assert_eq!(
+            sender.optional_reinjection.reinjected_bytes(),
+            accounted_before + 8192
+        );
+        assert_eq!(send_stream.reinjection_bytes(), source_bytes);
+        // This current-thread test retains the same thread-local count across
+        // actual direct awaits. Target debt-accounting visits are not counted.
+        assert_eq!(
+            crate::runtime::sender::queue::take_recovery_overlap_visits_for_test(),
+            (0, 0),
+            "one serialized recovery batch must not rediscover queued overlap for each frame after collection"
+        );
+        return;
+    }
+    assert!(
+        sender
+            .dispatch_next_request_path_recovery(
+                &mut recovery,
+                &context,
+                &mut remotes,
+                &send_stream,
+                &queue,
+            )
+            .await
+            .expect("queued live repair remains authoritative")
+            .is_none()
+    );
+    assert_eq!(queue.reinjection_bytes(), 4096);
+    assert!(matches!(
+        &queue.front().expect("existing live intent remains queued").1.kind,
+        ReliableRelayQueuedWorkKind::Reinjection { cause: retained, .. } if *retained == cause
+    ));
+    assert_eq!(
+        sender.optional_reinjection.reinjected_bytes(),
+        accounted_before
+    );
+    for instance in [copy, free] {
+        assert_eq!(sender.multipath.accepted_reinjected_data_bytes(instance), 0);
+    }
+    assert!(try_recv_reliable_path_command(&mut copy_receivers).is_none());
+    assert!(try_recv_reliable_path_command(&mut free_receivers).is_none());
+
+    if cancel_queued {
+        assert!(sender.multipath.mark_path_stale(copy));
+    }
+    let dispatch = sender
+        .dispatch_client_queued_work(
+            &context,
+            TrafficClass::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut queue,
+            4096,
+            ReliableDataAckFrontierState::Live,
+        )
+        .await
+        .expect("queued live repair resolves without closing the stream");
+    if cancel_queued {
+        assert!(matches!(
+            dispatch,
+            ClientQueuedDispatch::ReinjectionDeferred
+        ));
+        assert!(queue.is_empty());
+        assert!(try_recv_reliable_path_command(&mut copy_receivers).is_none());
+        assert_eq!(sender.multipath.accepted_reinjected_data_bytes(copy), 0);
+        assert!(
+            sender
+                .earliest_reinjection_suppression_deadline(&remotes)
+                .is_none()
+        );
+        // Recollect after the real queued-removal outcome, just as a new
+        // actor recovery pass does; do not mutate or reuse its old batch.
+        let mut retry = sender.collect_request_path_recovery(&remotes, &queue);
+        assert!(matches!(
+            sender
+                .dispatch_next_request_path_recovery(
+                    &mut retry,
+                    &context,
+                    &mut remotes,
+                    &send_stream,
+                    &queue,
+                )
+                .await
+                .expect("removed queued authority exposes retained recovery"),
+            Some(ClientQueuedDispatch::Reinjection {
+                payload_bytes: 4096,
+                ..
+            })
+        ));
+        let command = try_recv_reliable_path_command(&mut free_receivers)
+            .expect("the distinct surviving target receives the formerly excluded prefix");
+        free_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        assert!(
+            matches!(command, ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0, payload, ..
+        }) if payload.len() == 4096)
+        );
+        assert_eq!(sender.multipath.accepted_reinjected_data_bytes(free), 4096);
+        assert_eq!(
+            sender.optional_reinjection.reinjected_bytes(),
+            accounted_before + 4096
+        );
+        assert!(
+            sender
+                .dispatch_next_request_path_recovery(
+                    &mut retry,
+                    &context,
+                    &mut remotes,
+                    &send_stream,
+                    &queue,
+                )
+                .await
+                .expect("one finite retry batch")
+                .is_none()
+        );
+        assert!(try_recv_reliable_path_command(&mut free_receivers).is_none());
+        assert_eq!(send_stream.reinjection_bytes(), 4096);
+        return;
+    }
+    let ClientQueuedDispatch::Reinjection {
+        accepted_copy_deadline,
+        ..
+    } = dispatch
+    else {
+        panic!("expected existing live copy commitment");
+    };
+    let command = try_recv_reliable_path_command(&mut copy_receivers)
+        .expect("bound live copy reaches its native command receiver");
+    copy_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    assert!(queue.is_empty());
+    assert_eq!(sender.multipath.accepted_reinjected_data_bytes(copy), 4096);
+    assert!(accepted_copy_deadline > Instant::now());
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &queue);
+    assert_eq!(recovery.retry_deadline, Some(accepted_copy_deadline));
+    assert!(
+        sender
+            .dispatch_next_request_path_recovery(
+                &mut recovery,
+                &context,
+                &mut remotes,
+                &send_stream,
+                &queue,
+            )
+            .await
+            .expect("accepted copy retains its immutable suppression")
+            .is_none()
+    );
+    assert!(try_recv_reliable_path_command(&mut free_receivers).is_none());
+    assert_eq!(sender.multipath.accepted_reinjected_data_bytes(free), 0);
+    assert_eq!(send_stream.reinjection_bytes(), 4096);
+}
+
+#[tokio::test]
+async fn disappeared_path_recovery_target_is_reselected_at_direct_commit() {
     let stream_id = StreamId(232);
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10321?initial-srtt-s=0.08&initial-rate-mbps=100",
@@ -1117,69 +1361,44 @@ async fn disappeared_bound_path_recovery_target_is_cancelled_and_reselected() {
     let mut sender = RequestSenderService::new(stream_id);
     sender.record_original_frame_for_test(owner, &original);
     assert!(sender.multipath.mark_path_stale(owner));
-    let mut queue = ReliableRelaySenderQueue::default();
-    assert!(
-        sender
-            .drive_request_path_recovery(
-                &mut queue,
-                &context,
-                &remotes,
-                &send_stream,
-                TrafficClass::Throughput,
-            )
-            .queued
+    let queue = ReliableRelaySenderQueue::default();
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &queue);
+    assert!(recovery.has_pending());
+    let (initial, _) = sender.multipath.reinjection_path_snapshot(
+        &context,
+        &remotes,
+        &[owner],
+        &queue,
+        send_stream.reinjection_bytes(),
+        context.mux_limits,
     );
+    assert_eq!(initial.map(|(target, _, _)| target), Some(first));
 
     drop(remotes.remove_path_instance(first));
-    let cancelled = sender
-        .dispatch_client_queued_work(
-            &context,
-            TrafficClass::Throughput,
-            &mut remotes,
-            &mut send_stream,
-            &mut queue,
-            4096,
-            ReliableDataAckFrontierState::Live,
-        )
-        .await
-        .expect("lost exact target cancels only its bound recovery work");
-    assert!(matches!(
-        cancelled,
-        ClientQueuedDispatch::PathRecoveryReinjectionCancelled
-    ));
-    assert!(queue.is_empty());
-
-    assert!(
-        sender
-            .drive_request_path_recovery(
-                &mut queue,
-                &context,
-                &remotes,
-                &send_stream,
-                TrafficClass::Throughput,
-            )
-            .queued,
-        "the uncovered range remains immediately eligible",
-    );
     assert!(matches!(
         sender
-            .dispatch_client_queued_work(
+            .dispatch_next_request_path_recovery(
+                &mut recovery,
                 &context,
-                TrafficClass::Throughput,
                 &mut remotes,
-                &mut send_stream,
-                &mut queue,
-                4096,
-                ReliableDataAckFrontierState::Live,
+                &send_stream,
+                &queue,
             )
             .await
             .expect("replacement target dispatch"),
-        ClientQueuedDispatch::Reinjection { .. }
+        Some(ClientQueuedDispatch::Reinjection { .. })
     ));
     assert!(matches!(
         try_recv_reliable_path_command(&mut second_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
     ));
+    assert!(queue.is_empty());
+    assert!(try_recv_reliable_path_command(&mut first_receivers).is_none());
+    assert_eq!(sender.multipath.accepted_reinjected_data_bytes(first), 0);
+    assert_eq!(
+        sender.multipath.accepted_reinjected_data_bytes(second),
+        4096
+    );
     assert!(try_recv_reliable_path_command(&mut owner_receivers).is_none());
 }
 
@@ -2303,39 +2522,28 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
         owner_interval_before_commit, committed_target_interval,
         "the fixture must distinguish the stale owner clock from the selected-copy clock",
     );
-    let mut sender_queue = ReliableRelaySenderQueue::default();
-    assert!(
-        sender
-            .drive_request_path_recovery(
-                &mut sender_queue,
-                &context,
-                &remotes,
-                &send_stream,
-                TrafficClass::Throughput,
-            )
-            .queued,
-        "stale retained OriginalData must enter the production recovery queue",
-    );
+    let sender_queue = ReliableRelaySenderQueue::default();
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &sender_queue);
+    assert!(recovery.has_pending());
     let accepted_before = Instant::now();
     let dispatch = sender
-        .dispatch_client_queued_work(
+        .dispatch_next_request_path_recovery(
+            &mut recovery,
             &context,
-            TrafficClass::Throughput,
             &mut remotes,
-            &mut send_stream,
-            &mut sender_queue,
-            4096,
-            ReliableDataAckFrontierState::Live,
+            &send_stream,
+            &sender_queue,
         )
         .await
-        .expect("actual queued carrier command commitment");
+        .expect("actual carrier command commitment")
+        .expect("stale retained OriginalData commits through direct recovery");
     let accepted_after = Instant::now();
     let ClientQueuedDispatch::Reinjection {
         payload_bytes: 4096,
         accepted_copy_deadline: committed_deadline,
     } = dispatch
     else {
-        panic!("queued path recovery must commit one exact reinjection: {dispatch:?}");
+        panic!("direct path recovery must commit one exact reinjection: {dispatch:?}");
     };
     assert!(sender_queue.is_empty());
     assert!(
@@ -2344,10 +2552,7 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
         "the accepted deadline must use the selected exact carrier snapshot at commitment",
     );
 
-    let committed =
-        sender
-            .multipath
-            .path_recovery_state(&context, &remotes, owner, TrafficClass::Throughput);
+    let committed = sender.multipath.path_recovery_state(&remotes, owner);
     assert_eq!(committed.retry_deadline, Some(committed_deadline));
     let accepted_at = committed_deadline
         .checked_sub(committed_target_interval)
@@ -2378,7 +2583,7 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
     assert_eq!(
         sender
             .multipath
-            .path_recovery_state(&context, &remotes, owner, TrafficClass::Throughput)
+            .path_recovery_state(&remotes, owner)
             .retry_deadline,
         committed.retry_deadline,
         "later stale-owner timing cannot move an accepted copy's absolute deadline",
@@ -2401,10 +2606,7 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
         later_dynamic_interval > committed_target_interval,
         "the selected carrier's actual RTT model must change enough to expose dynamic recomputation",
     );
-    let after_timing_growth =
-        sender
-            .multipath
-            .path_recovery_state(&context, &remotes, owner, TrafficClass::Throughput);
+    let after_timing_growth = sender.multipath.path_recovery_state(&remotes, owner);
     assert_eq!(
         after_timing_growth.retry_deadline, committed.retry_deadline,
         "later RTT/jitter/model growth cannot postpone an accepted copy's absolute deadline",
@@ -3026,7 +3228,7 @@ async fn client_exact_failure_recovery_keeps_full_structural_target_service() {
     sender.record_original_frame_for_test(owner, &retained);
     assert!(sender.fail_client_path_instance(&context, &mut remotes, owner));
 
-    let mut sender_queue = ReliableRelaySenderQueue::default();
+    let sender_queue = ReliableRelaySenderQueue::default();
     let (modeled, exhausted) = sender.multipath.reinjection_path_snapshot(
         &context,
         &remotes,
@@ -3047,17 +3249,39 @@ async fn client_exact_failure_recovery_keeps_full_structural_target_service() {
     assert!(target_service_limit > ranked_frontier_bytes);
 
     let accounted_before = sender.optional_reinjection.reinjected_bytes();
-    let outcome = sender.drive_request_path_recovery(
-        &mut sender_queue,
-        &context,
-        &remotes,
-        &send_stream,
-        TrafficClass::Throughput,
-    );
-    assert!(outcome.queued);
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &sender_queue);
+    assert!(recovery.has_pending());
+    let mut committed_bytes = 0usize;
+    while let Some(dispatch) = sender
+        .dispatch_next_request_path_recovery(
+            &mut recovery,
+            &context,
+            &mut remotes,
+            &send_stream,
+            &sender_queue,
+        )
+        .await
+        .expect("exact-failure recovery retains native admission")
+    {
+        let ClientQueuedDispatch::Reinjection { payload_bytes, .. } = dispatch else {
+            panic!("expected exact-failure native repair commitment");
+        };
+        let command = try_recv_reliable_path_command(&mut target_receivers)
+            .expect("the full service batch reaches its actual native command receiver");
+        target_receivers
+            .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        let ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset, payload, ..
+        }) = command
+        else {
+            panic!("expected exact-failure STREAM_DATA");
+        };
+        assert_eq!(offset, committed_bytes as u64);
+        assert_eq!(payload.len(), payload_bytes);
+        committed_bytes += payload_bytes;
+    }
     assert_eq!(
-        sender_queue.reinjection_bytes(),
-        target_service_limit,
+        committed_bytes, target_service_limit,
         "exact failure must retain full bounded target service rather than the live-owner frontier cap",
     );
     assert_eq!(
@@ -3067,16 +3291,11 @@ async fn client_exact_failure_recovery_keeps_full_structural_target_service() {
             .saturating_sub(accounted_before),
         target_service_limit as u64,
     );
-    while let Some((lane, work)) = sender_queue.pop_front() {
-        assert_eq!(lane, ReliableWorkClass::Reinjection);
-        assert!(matches!(
-            work.kind,
-            ReliableRelayQueuedWorkKind::Reinjection {
-                cause: RelaySendCause::ClientPathFailureReinjection(identity),
-                ..
-            } if identity.instance == target
-        ));
-    }
+    assert!(sender_queue.is_empty());
+    assert_eq!(
+        sender.multipath.accepted_reinjected_data_bytes(target),
+        committed_bytes
+    );
 }
 
 #[tokio::test]

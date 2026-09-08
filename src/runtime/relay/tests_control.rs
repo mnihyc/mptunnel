@@ -619,7 +619,100 @@ async fn prearmed_ack_gap_capacity_wait_retains_release_before_select_poll() {
 }
 
 #[tokio::test]
-async fn actor_recovery_pass_prunes_lost_target_before_reselecting_survivor() {
+async fn direct_recovery_service_wait_retains_capacity_release_before_next_select() {
+    use futures::FutureExt;
+
+    let stream_id = StreamId(920);
+    let context = ClientPathContext::new(
+        ["tcp://127.0.0.1:10922", "tcp://127.0.0.1:10923"]
+            .into_iter()
+            .map(|path| path.parse::<PathSpec>().expect("test path"))
+            .collect(),
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(1);
+    let (_owner_frames, owner_frames_rx) = mpsc::channel(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        test_opened_remote_stream(stream_id, 0, owner_commands, owner_frames_rx),
+        8,
+    );
+    let owner = remotes.paths[0].instance();
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(1);
+    let (_target_frames, target_frames_rx) = mpsc::channel(1);
+    remotes.attach_candidate(test_opened_remote_stream(
+        stream_id,
+        1,
+        target_commands.clone(),
+        target_frames_rx,
+    ));
+    let target = remotes.paths[1].instance();
+    for receivers in [&mut owner_receivers, &mut target_receivers] {
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+    }
+    for instance in [owner, target] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let original = send_stream
+        .send_data(Bytes::from(vec![0x4b; 4096]))
+        .expect("actual retained request source");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &original);
+    assert!(sender.mark_request_path_stale(&context, &remotes, owner, TrafficClass::Throughput));
+    target_commands
+        .try_enqueue_reinjection_frame(
+            Frame::StreamData {
+                stream_id: StreamId(921),
+                offset: 0,
+                payload: Bytes::from(vec![0x7a; 4096]),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("occupy the actual native repair lane");
+    assert!(matches!(
+        target_commands.try_enqueue_reinjection_frame(original, TrafficClass::Throughput),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+
+    // This is the actor's actual combined waiter, armed before observation and
+    // retained across a blocked direct attempt without ever polling it yet.
+    let service_wait = arm_request_recovery_service_wait(&context, &remotes);
+    let queue = ReliableRelaySenderQueue::default();
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &queue);
+    assert!(
+        sender
+            .dispatch_next_request_path_recovery(
+                &mut recovery,
+                &context,
+                &mut remotes,
+                &send_stream,
+                &queue,
+            )
+            .await
+            .expect("full native lane is not terminal")
+            .is_none()
+    );
+    assert!(recovery.blocked_for_carrier_capacity);
+    let filler = try_recv_reliable_path_command(&mut target_receivers)
+        .expect("native repair capacity becomes available after the attempt");
+    target_receivers.release_pending_command_bytes(
+        crate::runtime::path::commands::reliable_path_command_pending_bytes(&filler),
+    );
+    assert!(
+        service_wait.now_or_never().is_some(),
+        "the same carried waiter must observe release before the next actor select poll"
+    );
+    assert!(queue.is_empty());
+    assert_eq!(send_stream.reinjection_bytes(), 4096);
+}
+
+#[tokio::test]
+async fn actor_recovery_pass_selects_survivor_after_collected_target_disappears() {
     let stream_id = StreamId(919);
     let context = ClientPathContext::new(
         [
@@ -694,59 +787,30 @@ async fn actor_recovery_pass_prunes_lost_target_before_reselecting_survivor() {
     let mut sender = RequestSenderService::new(stream_id);
     sender.record_original_frame_for_test(owner, &original);
     assert!(sender.mark_request_path_stale(&context, &remotes, owner, TrafficClass::Throughput,));
-    let mut sender_queue = ReliableRelaySenderQueue::default();
+    let sender_queue = ReliableRelaySenderQueue::default();
+    let mut recovery = sender.collect_request_path_recovery(&remotes, &sender_queue);
+    assert!(recovery.has_pending());
     assert!(
-        sender
-            .drive_request_path_recovery(
-                &mut sender_queue,
-                &context,
-                &remotes,
-                &send_stream,
-                TrafficClass::Throughput,
-            )
-            .queued
+        sender_queue.is_empty(),
+        "collection has no provisional target reservation"
     );
 
     drop(
         remotes
             .remove_path_instance(lost)
-            .expect("retire exact queued target"),
-    );
-    let mut request_recovery_dirty = false;
-    assert_eq!(
-        prune_unavailable_request_recovery_before_drive(
-            &sender,
-            &mut sender_queue,
-            &remotes,
-            &mut request_recovery_dirty,
-        ),
-        4096,
-    );
-    assert!(request_recovery_dirty);
-
-    let recovery = sender.drive_request_path_recovery(
-        &mut sender_queue,
-        &context,
-        &remotes,
-        &send_stream,
-        TrafficClass::Throughput,
-    );
-    assert!(
-        recovery.queued,
-        "the same actor recovery pass must bind the uncovered range to the survivor",
+            .expect("retire the previously available fast target"),
     );
     let dispatch = sender
-        .dispatch_client_queued_work(
+        .dispatch_next_request_path_recovery(
+            &mut recovery,
             &context,
-            TrafficClass::Throughput,
             &mut remotes,
-            &mut send_stream,
-            &mut sender_queue,
-            4096,
-            ReliableDataAckFrontierState::Live,
+            &send_stream,
+            &sender_queue,
         )
         .await
-        .expect("survivor recovery dispatch");
+        .expect("survivor recovery dispatch")
+        .expect("the same actor pass chooses the survivor without a queued stale binding");
     assert!(matches!(dispatch, ClientQueuedDispatch::Reinjection { .. }));
     assert!(matches!(
         try_recv_reliable_path_command(&mut survivor_receivers),
@@ -756,6 +820,8 @@ async fn actor_recovery_pass_prunes_lost_target_before_reselecting_survivor() {
             ..
         })) if payload.len() == 4096
     ));
+    assert!(sender_queue.is_empty());
+    assert!(try_recv_reliable_path_command(&mut lost_receivers).is_none());
     assert!(try_recv_reliable_path_command(&mut owner_receivers).is_none());
 
     // Keep the mock attachment inputs alive until after the recovery assertion.

@@ -196,22 +196,6 @@ impl RelaySendCause {
             .or_else(|| self.completion_tail_target().map(|target| target.instance))
     }
 
-    pub(in crate::runtime::sender) fn client_path_recovery_is_bound(self) -> bool {
-        matches!(
-            self,
-            Self::ClientPathFailureReinjection(_) | Self::ClientStalePathReinjection { .. }
-        )
-    }
-
-    pub(in crate::runtime::sender) fn stale_request_owner(self) -> Option<RelayPathInstance> {
-        match self {
-            Self::StalePathReinjection(owner) | Self::ClientStalePathReinjection { owner, .. } => {
-                Some(owner)
-            }
-            _ => None,
-        }
-    }
-
     pub(in crate::runtime::sender) fn completion_tail_target(
         self,
     ) -> Option<ClientReinjectionOutputIdentity> {

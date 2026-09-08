@@ -464,10 +464,13 @@ range is therefore no later than another eligible retained range that could
 use that same service. Committing advances only the emitted range slice;
 accepted-copy flight establishes its existing D/J before native publication.
 Subsequent slices can use remaining K immediately. A target that rejects
-reservation is excluded from this batch's further placement attempts, not
-requalified or assigned synthetic capacity. Different usable targets remain
-eligible; metadata is discarded at the batch boundary so the next causal
-observation can reconsider prior failures. No persistent future suffix owns K.
+reservation is excluded while attempting the current uniform range, not
+requalified or assigned synthetic capacity. The exclusion resets when that
+range is consumed or skipped: a different range may have different ownership
+or admission. Different usable targets remain eligible. Rejected attempts can
+therefore cost ranges times targets, not targets once per batch; the published
+item budget alone does not bound those attempts. Metadata is discarded at the
+batch boundary. No persistent future suffix owns K.
 
 This argument assumes actual target selection/Apply enforce current ownership
 and the cursor does not skip a lower eligible slice because of a later slice's
@@ -483,9 +486,9 @@ per frame would recreate full-ledger work. A direct equivalence check uses
 actual send/ACK clipping and the old bulk collector's first result as oracle,
 including chunk boundaries, ACK holes, empty credit, empty cache and off-end
 ranges. This accessor adds no capacity, timer, persistent state or new byte
-geometry. The unchanged cooperative dispatch budget still bounds one batch;
-ordinary CPU/service timing must determine whether repeated batches are cheap
-enough in practice.
+geometry. The unchanged cooperative dispatch budget bounds publications, not
+all failed attempts or discovery work; ordinary CPU/service timing must
+determine whether batches are cheap enough in practice.
 
 ### Unpublished suffix discriminator
 
@@ -501,3 +504,231 @@ or accepted-copy deadline exists. After A becomes stale, another drive still
 leaves that unpublished suffix ahead of A. This is why sorting only newly
 generated ranges would be incomplete. It is not an expired-copy, native
 capacity exhaustion or timed-network test.
+
+### Implementation review before the first candidate build
+
+2026-09-08 08:28 +08:00. Source review is complete; compilation and tests are
+still pending. This is not performance acceptance.
+
+The transient plan splits at attached accepted-copy coverage and queued-live
+repair boundaries, in addition to original ownership. It does not split on
+retired-copy storage history. This prevents a queued middle copy from hiding
+uncovered prefix/suffix bytes, and preserves exact copy identity when a cache
+chunk is sliced internally. The shared legacy exact-start accessor is not
+changed. Cache lookup emits one predecessor/next-tree slice, not a bulk suffix.
+
+Review removed a redundant per-frame suppression scan that walked old flights.
+Collection already excludes current live-copy deadlines. The batch is consumed
+inside serialized Dispatch; no external ACK, qualification or membership event
+interleaves. Its own successful copies cover monotonically advancing disjoint
+slices. Queued-copy dispatch follows completion of that cursor; the batch is
+discarded at the cooperative boundary. Expiry can add future eligibility but
+cannot invalidate a currently due slice. Exact final native admission, queued
+debt and target exclusions remain. This removes duplicate work without relaxing
+copy authority or introducing another deadline.
+
+Direct publication also changes the owner of readiness. Capacity/model waits
+are armed before reservation and carried across a blocked Dispatch, so a release
+before the next select cannot be lost. A partial batch remains dirty. Review
+caught a second exclusion-lifetime gap: cancellation/defer of a queued copy,
+or preparation pruning of one, must make the retained obligation discoverable
+again. Both Dispatch removal outcomes now mark recovery changed; actual pruning
+sets dirty and same-pass requested, clearing the existing retry. No guessed
+fallback timer or unrelated future event is required.
+
+Repairs retain the existing item-only dispatch charge (ordinary Data alone
+charges the payload-byte budget). Direct work includes the unrelated queued
+front in target accounting. FIN may declare final_offset before retained repair
+arrives, but final retirement still requires retained bytes zero and both
+terminal halves. Producerless structural-queue cancellation code is removed;
+live/persistent queued recovery and direct target-bound causes remain.
+
+Independent source review found no remaining blocker in this mechanism after
+these corrections. Required controls include actual queued exclusion removal,
+native capacity release before first wait poll, partial overlap, independently
+serviceable later ranges, direct queue accounting, and cache oracle equivalence.
+These guard code paths, not a promise that the full recorded stall is solved.
+
+### Focused candidate verification
+
+2026-09-08 08:36 +08:00. The first build stopped on a missing RuntimeError
+test import and the removed lifecycle helper's unused queue import. No test
+ran and this was not Product RED. Those import-only corrections were applied;
+the coordinated functional rebuild completed in1m08s without warnings.
+
+The existing library test binary ran485 distinct checks in1.26s: request sender
+(including multipath and all three former ordering REDs), sender queue, relay,
+request flight, mux stream, plus native TCP in-flight receive after FIN and
+QUIC bidirectional repair-companion half-close controls. All485 pass; none are
+ignored. New blocked-target/independent-range, queued partial overlap, actual
+queued cancellation, prearmed capacity wake, unrelated queued-front admission,
+full structural service and cache-slice oracle controls pass within this set.
+The cancellation test uses the real queued removal then fresh collection;
+actual actor dirty propagation additionally has source review, not a claim
+that this component fixture executed the complete actor loop.
+
+Commands (functional optimizer override is not used for performance):
+
+```sh
+cargo test --release --locked -j1 --config 'profile.release.package.mptunnel.opt-level=0' --lib --no-run
+target/release/deps/mptunnel-29ba8ebb1d3edd33 runtime::sender::request runtime::sender::queue runtime::relay runtime::stream::request mux::stream::tests client_tcp_path_routes_inflight_receive_frames_to_live_stream repair_companion_is_bidirectional_survives_half_close_and_fails_only_attachment --quiet
+```
+
+Independent scoped source review and focused GREEN establish this mechanism's
+disposition only. The ordinary optimized binary is building for the predeclared
+comparison; no runtime performance, release or whole-stall attribution yet.
+
+### Pre-lab rejection: preserve the earlier queued-overlap work correction
+
+2026-09-08 08:43 +08:00. Ordinary build completed3m36s but the binary is not
+being measured or promoted. New unused-helper warnings caused root to inspect
+introducing history614dc73 before deleting its obsolete interface/tests.
+REQUEST_RECOVERY_OVERLAP_WORK_MODEL records a real old2,098,176 versus2,048
+operation-count RED and34.143s overlap/enqueue profile. The candidate's per-frame
+`has_queued_reinjection_overlap` would reintroduce Q-times-R overlap traversal.
+Passing485 tests missed it because the old count test still exercised the now
+unused helper. Removing those tests silently would hide, not resolve, this
+candidate regression. Both independent reviewers agree with this correction.
+
+Exact model: collect and normalize the existing queued union U once. Split due
+metadata at U's endpoints; each resulting range lies wholly inside or outside U.
+Record that boolean with the range. Every subsequent cache/credit-sized slice
+inherits it. The queue does not mutate during the direct cursor's lifetime;
+queued dispatch begins only after exhaustion, and a cooperative boundary or
+ACK/prune/cancel requires fresh collection. Thus whole queued ranges can be
+skipped before cache lookup without per-frame rediscovery. No capacity, traffic
+allowance or exclusion lifetime changes. Exact target-byte accounting still
+reads queued debt; this restores overlap discovery only, not globally linear
+total Dispatch cost.
+
+Before implementing, the test agent adds a small actual collector/direct-path
+overlap-visit discriminator to the existing partial-copy fixture. It must fail
+on this candidate's repeated overlap walk while preserving partial-overlap
+semantics. After correction, migrate the old helper-specific controls instead
+of retaining a producerless algorithm to claim GREEN. This is the same candidate
+transaction and a previously solved cost boundary, not another transport fix.
+No ordinary comparison, parameter change or additional global audit is started.
+
+The actual-path counter RED completed at08:46 +08:00. Its first compile stopped
+on a wrong relative module path in the test-only counter call; root corrected
+it to the existing crate-qualified module. That is not Product RED. Rebuild
+1m07s then ran five direct-recovery checks: four pass; only the partial-middle
+case fails at the intended work-count assertion, after exact prefix/suffix
+native commands, queued-middle integrity and accounting assertions all pass.
+Collection visits one queued extent once: `(snapshot, scalar)=(1,0)`.
+Subsequent direct Dispatch visits are `(0,3)`, expected `(0,0)`. This proves the
+duplicate work on the real caller, not only an unused helper. Required target
+debt/accounting scans are deliberately not instrumented. Test-only counters
+are thread-local and the fixture uses Tokio's current-thread runtime.
+
+Approved correction now replaces that scalar query with the captured uniform
+range's queued bit and skips the whole covered range. The obsolete helper and
+its two algorithm-only tests can then be removed; actual-path count/semantics
+remain. Test-fixture-only enqueue/query wrappers become cfg(test), with enqueue
+delegating to its existing production priority method. Earlier unrelated
+dead-code warnings remain outside this patch. Renewed focused GREEN and an
+ordinary optimized rebuild are required before the declared network pair.
+
+Renewed verification: functional rebuild1m08s;483 current focused checks pass
+in1.26s with none ignored. The actual direct-path counter is now `(1,0)` during
+collection and `(0,0)` during dispatch, with both uncovered native commands and
+queued-middle/accounting assertions intact. The count is two below the previous
+set because the abandoned helper's two tests were removed, not waived. This
+does not claim the old64-shift oracle was duplicated; normalization's existing
+contract, uniform-range proof and actual consumer controls support equivalence.
+Independent scoped review passes. An ordinary optimized rebuild is running;
+the prior repeated-scan binary was never used for a performance claim.
+
+## Ordinary comparison: timing mixed, promotion withheld
+
+2026-09-08 08:58 +08:00. The declared control then candidate both completed
+without errors, exact local-accepted and target-confirmed byte equality and
+valid ACK accounting. Control uses445011f; candidate uses this request-ordered
+dispatch change at both endpoints. Ordinary optimized rebuild3m23s, then no
+build/lab overlap. No diagnostics, native trace, sampler overlay, profile or
+congestion change. Raw probes, all96 confirmation bins,51/45 management/process/
+shaping samples and logs are in REQUEST_PREFIX_ORDINARY_20260908.raw.tar.gz.
+Live result directories are
+`./.tmp/reflection/results/mixed-combined-up-request-prefix-{control,candidate}-0908/`.
+
+| Outcome | Control | Candidate |
+| --- | ---: | ---: |
+| Exact confirmed/accepted bytes |475529216 |427360256 |
+| Completion seconds |50.507429 |44.919042 |
+| Whole confirmed Mbps |75.320 |76.112 |
+| First confirmation seconds |.493971 |.435791 |
+| Maximum confirmation gap seconds |6.834457 |2.829451 |
+| First local write seconds |.094643 |.116729 |
+| Maximum local-write gap seconds |10.603097 |5.414096 |
+| Client sampled first/peak/last RSS KiB |53968/1125964/1100556 |55404/801244/639628 |
+| Server sampled first/peak/last RSS KiB |30608/142732/129352 |30372/143296/137016 |
+| Upload class byte delta |653130165 |552789090 |
+| Return class byte delta |28704142 |25833457 |
+| Upload packet/drop delta |539006/9506 |458163/8670 |
+| Return packet/drop delta |157891/1928 |135426/1774 |
+
+Sample intervals0.000045--50.222449s and0.000055--44.115547s have stable process
+IDs, monotone class counters and no management errors. Client RSS peaks at
+49.222345/26.003928s; server at10.001086/34.114541s. Client sampled maximum/last
+psCPU123.0/92.2 versus70.0/62.6; server37.6/19.4 versus26.9/18.9. These are
+lifetime-average percentages, not interval CPU. Candidate transfers10.13% fewer
+useful bytes; lower total wire/RSS therefore is not normalized efficiency proof.
+Class bytes include framing, control, native retries and Product copies, not
+repair-only traffic. Fixed configured shaping does not make random realizations
+packet-identical. The same HTB quantum warning appears in both cells; no tuning.
+
+Full one-second raw confirmation series (index0 is the first interval; final
+interval can be partial). Values above500Mbps release previously buffered
+confirmations and are not physical link-rate claims:
+
+```text
+control:
+0.620,2.118,3.026,537.352,107.213,102.524,118.105,66.016,85.075,87.032,
+399.559,156.238,120.106,163.438,120.446,0.234,0,0,0.117,0,
+0,0,0,0,0,0.270,293.121,64.155,58.100,64.295,
+41.803,78.739,0,162.625,0,107.235,0,0,99.903,0,
+0,66.540,22.064,0,0,0,0,114.250,72.780,77.927,411.207
+candidate:
+2.097,7.863,8.098,18.737,15.108,6.933,8.892,7.244,9.650,6.079,
+540.017,115.535,75.785,42.083,39.181,60.958,89.417,43.656,73.452,110.529,
+0,0,38.701,0,9.437,26.214,27.691,134.454,0.384,0.428,
+0.096,0,0.096,5.575,531.670,35.182,0,81.981,368.811,90.004,
+29.874,67.921,258.998,154.045,276.006
+```
+
+### Contrary phases prevent acceptance from improved maximum gaps
+
+Candidate early delivery is substantially worse over intervals3--9. At about
+10s control ordered target T=149132841B, candidate T=11402999B. In candidate
+samples4--10, source S minus target T is approximately64MiB and server reply
+reads Rs equal client reply writes Rc. Thus this early delay is on the forward
+ordered-service side, not solely held return confirmations. Candidate T jumps
+11402999→78905079 between samples10 and11; native QUIC ACKed bytes had already
+reached60475573 by sample4 and68917544 by sample10. Native receipts include
+framing/copies and are not exact mux-prefix delivery, but they refute a completely
+idle QUIC transport. The first TCP owner's Product debt falls11468588B at1s
+to458752B at10s and0 at11s while native ACKed bytes increase. No exact blocking
+range or repair eligibility is present in these ordinary snapshots.
+
+Candidate target T also stays166199031B across server timestamps
+1788828813716--1788828818717 (about20--25s, at least5.001s sampled unchanged).
+Rc meanwhile catches732→760 reply bytes. Therefore maximum confirmation
+gap2.829451s does NOT bound ordered forward target stalls. Completion minus
+the nominal40s source phase improves10.507429→4.919042s, but it is not exact
+EOF-to-confirm drain: source reads continue after40s in both cells.
+
+Disposition: exact ordering and overlap-work defects fixed at component level;
+ordinary practical performance remains phase-mixed/ambiguous. No promotion,
+third favourable run, public README claim or release. Independent extraction
+and root agree. This pair does not establish that the new structural ordering
+caused the early slowdown. Earlier initial-membership evidence already showed
+12.19MB assigned while only TCP was attached; QUIC then attached91ms and was
+used2ms later. Do not reopen the disproved claim that an already usable QUIC
+was ignored or prescribe a protocol preference from these rows.
+
+Next exact question: which retained prefix blocks early ordered upload despite
+substantial native QUIC receipt, and what live-owner, copy and exact target
+service evidence prevents earlier recovery? Read existing live-prefix capture
+and model first; it already proves14.6KiB ACK-clocked winning chains during
+10Mbps QoS, not during500Mbps spare service. No new parameter or implementation
+is authorized until that evidence gap is resolved.

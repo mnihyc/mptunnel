@@ -166,6 +166,13 @@ does not authorize latent topology inference or a universal Internet model.
   to14600B shrink and a fresh-append renewable deadline. A passing small-frame
   fixture did not cover either countercase; keep those boundary discriminators
   instead of treating helper reuse or a test count as equivalence evidence.
+- After replacing an algorithm's caller, verify that its operation-count tests
+  still exercise the production path. Request structural dispatch passed485
+  checks while614dc73's once-per-batch overlap test covered a now-unused helper;
+  the new caller repeated the old per-frame scan. History review of the unused
+  helper caught it before the lab. An actual direct-path counter then failed
+  after semantic controls passed. Preserve the demonstrated work property in
+  the replacement, and remove obsolete helpers/tests only after that migration.
 - No untested candidate stack: retain a known comparator and attributable
   source/build identities. Intermediate correctness fixes may be necessary but
   do not bypass the unchanged final timing/experience gate.

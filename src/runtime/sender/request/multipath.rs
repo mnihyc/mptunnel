@@ -1399,16 +1399,9 @@ impl RequestMultipathController {
 
     pub(super) fn path_recovery_state(
         &self,
-        context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         original_path: RelayPathInstance,
-        lane: TrafficClass,
     ) -> RangeRecoveryState {
-        let usable_alternate_paths =
-            self.usable_reinjection_paths(context, remotes, original_path, lane);
-        if usable_alternate_paths.is_empty() {
-            return RangeRecoveryState::default();
-        }
         // Eligibility to accept a new Product copy and ownership of a copy
         // already accepted by an exact carrier are separate lifetimes. Drain,
         // lane, or policy changes fence future placement but do not erase the
@@ -1419,6 +1412,10 @@ impl RequestMultipathController {
         self.request
             .flights
             .range_recovery_state(original_path, &actor_attached_paths)
+    }
+
+    pub(super) fn recovery_copy_ranges(&self) -> Vec<(RelayPathInstance, Vec<OffsetRange>)> {
+        self.request.flights.recovery_copy_ranges()
     }
 
     pub(super) fn earliest_reinjection_suppression_deadline(
@@ -1438,22 +1435,6 @@ impl RequestMultipathController {
         self.request
             .flights
             .reinjection_suppression_deadline_for_frame(frame, &remotes.path_instances())
-    }
-
-    fn usable_reinjection_paths(
-        &self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        original_path: RelayPathInstance,
-        lane: TrafficClass,
-    ) -> Vec<RelayPathInstance> {
-        remotes
-            .paths
-            .iter()
-            .filter(|path| path.instance() != original_path)
-            .filter(|path| self.path_is_payload_schedulable(context, path, lane))
-            .map(|path| path.instance())
-            .collect()
     }
 
     fn path_is_payload_schedulable(
@@ -1495,6 +1476,7 @@ impl RequestMultipathController {
         changed
     }
 
+    #[cfg(test)]
     pub(super) fn path_is_stale(&self, instance: RelayPathInstance) -> bool {
         self.request
             .requalification
@@ -3049,27 +3031,6 @@ impl RequestMultipathController {
                 .persistent_client_target()
                 .is_none_or(|target| live_instances.contains(&target))
                 && cause.server_bound_target().is_none()
-        })
-    }
-
-    pub(super) fn discard_unavailable_client_path_recovery_reinjections(
-        &self,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        remotes: &ReliableRelayRemoteSet,
-    ) -> usize {
-        let live_instances = remotes.path_instances();
-        sender_queue.discard_unavailable_client_path_recovery_reinjections(|target| {
-            live_instances.contains(&target)
-        })
-    }
-
-    pub(super) fn discard_resolved_stale_path_reinjections(
-        &self,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        remotes: &ReliableRelayRemoteSet,
-    ) -> usize {
-        sender_queue.discard_resolved_stale_path_reinjections(|path| {
-            self.path_is_stale(path) || !remotes.contains_path_instance(path)
         })
     }
 

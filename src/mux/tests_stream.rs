@@ -283,6 +283,51 @@ fn send_stream_reinjections_tail_after_ack_frontier() {
 }
 
 #[test]
+fn first_retransmission_frame_matches_existing_cache_slices_without_mutation() {
+    for acknowledgements in [
+        vec![],
+        vec![OffsetRange { start: 2, end: 5 }],
+        vec![OffsetRange { start: 5, end: 19 }],
+        vec![OffsetRange { start: 0, end: 24 }],
+    ] {
+        let mut stream = ReliableSendStream::new(StreamId(110), limits());
+        for start in [0u8, 8, 16] {
+            stream
+                .send_data(Bytes::from((start..start + 8).collect::<Vec<_>>()))
+                .expect("ordinary contiguous cache producer");
+        }
+        stream
+            .apply_ack(&acknowledgements)
+            .expect("actual ACK clipping, including cross-chunk holes");
+        let before = stream.clone();
+        for start in 0..=25 {
+            for end in start..=25 {
+                for byte_limit in [0, 1, 7, usize::MAX] {
+                    let range = OffsetRange { start, end };
+                    assert_eq!(
+                        stream.first_retransmission_frame_for_range(range, byte_limit),
+                        stream
+                            .retransmission_frames_for_ranges(&[range], byte_limit)
+                            .into_iter()
+                            .next(),
+                        "range={range:?}, limit={byte_limit}, ACKs={acknowledgements:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            stream
+                .first_retransmission_frame_for_range(
+                    OffsetRange { start: u64::MAX - 1, end: u64::MAX },
+                    usize::MAX,
+                )
+                .is_none()
+        );
+        assert_eq!(stream, before, "view cannot change credit, offsets or cache");
+    }
+}
+
+#[test]
 fn send_stream_prepares_data_without_taking_ownership_until_commit() {
     let mut stream = ReliableSendStream::new(StreamId(1), limits());
     let frame = stream

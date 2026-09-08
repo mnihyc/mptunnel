@@ -9,14 +9,25 @@ use crate::model::path::RelayPathInstance;
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
-use crate::protocol::frame::{
-    normalize_offset_ranges, reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent,
-};
+use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange};
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::time::Instant;
+
+#[cfg(test)]
+thread_local! {
+    // Deliberately excludes required per-target debt-accounting traversals.
+    static RECOVERY_OVERLAP_VISITS: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+#[cfg(test)]
+pub(super) fn take_recovery_overlap_visits_for_test() -> (usize, usize) {
+    RECOVERY_OVERLAP_VISITS.with(|visits| visits.replace((0, 0)))
+}
 
 #[derive(Debug, Clone)]
 pub(in crate::runtime) enum ReliableRelayQueuedWorkKind {
@@ -325,6 +336,24 @@ impl ReliableRelaySenderQueue {
             .min()
     }
 
+    pub(super) fn queued_reinjection_ranges(&self) -> impl Iterator<Item = OffsetRange> + '_ {
+        self.critical_reinjection
+            .iter()
+            .chain(self.reinjection.iter())
+            .filter_map(|work| {
+                #[cfg(test)]
+                RECOVERY_OVERLAP_VISITS.with(|visits| {
+                    let (snapshot, scalar) = visits.get();
+                    visits.set((snapshot + 1, scalar));
+                });
+                let ReliableRelayQueuedWorkKind::Reinjection { frame, .. } = &work.kind else {
+                    return None;
+                };
+                let (start, end, _) = reliable_stream_frame_extent(frame)?;
+                Some(OffsetRange { start, end })
+            })
+    }
+
     pub(in crate::runtime) fn has_queued_reinjection_overlap(&self, frame: &Frame) -> bool {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return false;
@@ -333,6 +362,11 @@ impl ReliableRelaySenderQueue {
             .iter()
             .chain(self.reinjection.iter())
             .any(|work| {
+                #[cfg(test)]
+                RECOVERY_OVERLAP_VISITS.with(|visits| {
+                    let (snapshot, scalar) = visits.get();
+                    visits.set((snapshot, scalar + 1));
+                });
                 let ReliableRelayQueuedWorkKind::Reinjection { frame: queued, .. } = &work.kind
                 else {
                     return false;
@@ -343,25 +377,6 @@ impl ReliableRelaySenderQueue {
                 };
                 queued_start < end && start < queued_end
             })
-    }
-
-    /// Snapshot overlap decisions against repairs already queued in either lane.
-    /// Callers that enqueue the accepted batch must supply disjoint candidates,
-    /// so accepting an earlier candidate cannot change a later decision.
-    pub(in crate::runtime) fn queued_reinjection_overlaps(&self, frames: &[Frame]) -> Vec<bool> {
-        queued_reinjection_overlaps_for_ranges(
-            frames,
-            self.critical_reinjection
-                .iter()
-                .chain(self.reinjection.iter())
-                .filter_map(|work| {
-                    let ReliableRelayQueuedWorkKind::Reinjection { frame, .. } = &work.kind else {
-                        return None;
-                    };
-                    let (start, end, _) = reliable_stream_frame_extent(frame)?;
-                    Some(OffsetRange { start, end })
-                }),
-        )
     }
 
     pub(in crate::runtime) fn release_normalized_acked_reinjections(
@@ -403,50 +418,6 @@ impl ReliableRelaySenderQueue {
                     now,
                     &usable,
                 ));
-        self.bytes = self.bytes.saturating_sub(released);
-        released
-    }
-
-    pub(in crate::runtime) fn discard_unavailable_client_path_recovery_reinjections(
-        &mut self,
-        target_is_live: impl Fn(crate::model::path::RelayPathInstance) -> bool,
-    ) -> usize {
-        let discard = |queue: &mut VecDeque<ReliableRelayQueuedWork>| {
-            let mut released = 0usize;
-            queue.retain(|work| {
-                let keep = match &work.kind {
-                    ReliableRelayQueuedWorkKind::Reinjection { cause, .. }
-                        if cause.client_path_recovery_is_bound() =>
-                    {
-                        cause.client_target().is_some_and(&target_is_live)
-                    }
-                    _ => true,
-                };
-                if !keep {
-                    released = released.saturating_add(work.payload_bytes);
-                }
-                keep
-            });
-            released
-        };
-        let released =
-            discard(&mut self.critical_reinjection).saturating_add(discard(&mut self.reinjection));
-        self.bytes = self.bytes.saturating_sub(released);
-        released
-    }
-
-    pub(in crate::runtime) fn discard_resolved_stale_path_reinjections(
-        &mut self,
-        path_is_stale: impl Fn(crate::model::path::RelayPathInstance) -> bool,
-    ) -> usize {
-        let released = discard_resolved_stale_path_reinjection_queue(
-            &mut self.critical_reinjection,
-            &path_is_stale,
-        )
-        .saturating_add(discard_resolved_stale_path_reinjection_queue(
-            &mut self.reinjection,
-            &path_is_stale,
-        ));
         self.bytes = self.bytes.saturating_sub(released);
         released
     }
@@ -625,26 +596,6 @@ fn discard_stale_bound_reinjection_queue(
     released
 }
 
-fn discard_resolved_stale_path_reinjection_queue(
-    queue: &mut VecDeque<ReliableRelayQueuedWork>,
-    path_is_stale: &impl Fn(crate::model::path::RelayPathInstance) -> bool,
-) -> usize {
-    let mut released = 0usize;
-    queue.retain(|work| {
-        let keep = match &work.kind {
-            ReliableRelayQueuedWorkKind::Reinjection { cause, .. } => {
-                cause.stale_request_owner().is_none_or(path_is_stale)
-            }
-            _ => true,
-        };
-        if !keep {
-            released = released.saturating_add(work.payload_bytes);
-        }
-        keep
-    });
-    released
-}
-
 fn discard_resolved_stale_response_path_reinjection_queue(
     queue: &mut VecDeque<ReliableRelayQueuedWork>,
     path_is_stale: &impl Fn(ServerReinjectionOutputIdentity) -> bool,
@@ -779,23 +730,6 @@ pub(in crate::runtime) fn reliable_relay_sender_queue_read_budget(
                 .saturating_sub(sender_queue.data_bytes()),
         )
         .min(buffer_len)
-}
-
-fn queued_reinjection_overlaps_for_ranges(
-    frames: &[Frame],
-    ranges: impl Iterator<Item = OffsetRange>,
-) -> Vec<bool> {
-    let ranges = normalize_offset_ranges(ranges.collect());
-    frames
-        .iter()
-        .map(|frame| {
-            let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
-                return false;
-            };
-            let index = ranges.partition_point(|range| range.end <= start);
-            ranges.get(index).is_some_and(|range| range.start < end)
-        })
-        .collect()
 }
 
 #[cfg(test)]

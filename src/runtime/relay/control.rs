@@ -18,9 +18,9 @@ use super::io::{
 use super::lifecycle::{
     ClientReliableReturnPlan, RelayAdditionalPathOpenResult,
     attach_reliable_relay_paths_with_suppressions, cancel_pending_additional_path_opens,
-    matching_additional_path_open_pending, recover_reliable_relay_after_path_failure,
-    reliable_relay_can_send_pending_fin, reliable_relay_disconnected_retry_delay,
-    reliable_relay_lane_changed, reliable_relay_product_stall_deadline,
+    matching_additional_path_open_pending, reliable_relay_can_send_pending_fin,
+    reliable_relay_disconnected_retry_delay, reliable_relay_lane_changed,
+    reliable_relay_product_stall_deadline,
     reliable_relay_product_stall_preserves_attached_path_set,
     reliable_relay_product_stall_should_try_alternate_attach,
     reliable_relay_queued_send_blocked_for_retry, reliable_relay_receive_hole_reinjection_active,
@@ -200,22 +200,33 @@ fn client_relay_finished(
         && !remotes.has_pending_requalification_ack()
 }
 
-/// Removes recovery work whose exact destination attachment disappeared before
-/// the actor evaluates uncovered ranges. Returning the dirty flag through this
-/// ownership point lets the same pass choose a surviving target without waiting
-/// for unrelated I/O or a timer.
-fn prune_unavailable_request_recovery_before_drive(
-    sender: &RequestSenderService,
-    sender_queue: &mut ReliableRelaySenderQueue,
+/// Arm before direct recovery observes target service. The actor retains this
+/// exact future across a blocked Dispatch and its following select; rearming
+/// there would lose notify_waiters edges between failed Apply and that select.
+fn arm_request_recovery_service_wait(
+    context: &ClientPathContext,
     remotes: &ReliableRelayRemoteSet,
-    request_recovery_dirty: &mut bool,
-) -> usize {
-    let discarded =
-        sender.discard_unavailable_client_path_recovery_reinjections(sender_queue, remotes);
-    if discarded > 0 {
-        *request_recovery_dirty = true;
+) -> impl Future<Output = ()> + Send + 'static {
+    let generation = context.path_model_generation();
+    let capacity = arm_carrier_capacity_notifies(
+        remotes
+            .paths
+            .iter()
+            .flat_map(|path| path.stream.capacity_notifies())
+            .collect(),
+    );
+    let publication = context.arm_path_model_publication(generation);
+    async move {
+        tokio::select! {
+            _ = async move {
+                match capacity {
+                    Some(wait) => wait.await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            _ = publication => {}
+        }
     }
-    discarded
 }
 
 async fn resolve_client_relay_path_error(
@@ -624,6 +635,9 @@ where
     let mut request_path_staleness_dirty = true;
     let mut request_recovery_dirty = true;
     let mut request_recovery_capacity_blocked = false;
+    let mut request_recovery_service_wait: Option<
+        std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    > = None;
     let mut request_range_recovery_deadline = None::<Instant>;
     let mut request_requalification_capacity_wait = None;
     let mut accepted_copy_wake_at = None::<Instant>;
@@ -984,55 +998,12 @@ where
                 ),
             );
         }
-        // Bound path-recovery work belongs to one exact attachment. Prune a
-        // disappeared target before scanning uncovered ranges so this same
-        // serialized recovery pass can bind the range to a surviving target;
-        // setting dirty after the pass would require an unrelated wake.
-        if prune_unavailable_request_recovery_before_drive(
-            &sender,
-            &mut sender_queue,
-            &remotes,
-            &mut request_recovery_dirty,
-        ) > 0
-        {
-            state.progress.sender_retry_at = None;
-        }
         let request_range_recovery_due =
             request_range_recovery_deadline.is_some_and(|deadline| deadline <= Instant::now());
-        let request_recovery_capacity_wait = (request_recovery_dirty
-            || request_range_recovery_due
-            || request_recovery_capacity_blocked)
-            .then(|| {
-                arm_carrier_capacity_notifies(
-                    remotes
-                        .paths
-                        .iter()
-                        .flat_map(|path| path.stream.capacity_notifies())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .flatten();
-        let has_request_recovery_capacity_wait = request_recovery_capacity_wait.is_some();
-        if request_recovery_dirty || request_range_recovery_due {
-            let request_recovery = sender.drive_request_path_recovery(
-                &mut sender_queue,
-                context,
-                &remotes,
-                &send_stream,
-                request_lane,
-            );
-            if request_recovery.queued {
-                state.progress.sender_retry_at = None;
-            }
-            request_range_recovery_deadline = request_recovery.retry_deadline;
-            request_recovery_capacity_blocked = request_recovery.blocked_for_carrier_capacity;
-            request_recovery_dirty = false;
+        let mut request_recovery_requested = request_recovery_dirty || request_range_recovery_due;
+        if request_recovery_requested {
+            state.progress.sender_retry_at = None;
         }
-        let request_recovery_path_model_publication =
-            request_recovery_capacity_blocked.then(|| {
-                context
-                    .arm_path_model_publication(path_model_generation_before_recovery_observation)
-            });
         if request_requalification_capacity_wait.is_none() {
             let request_requalification_attempt = match sender.try_send_requalification_probe(
                 context,
@@ -1427,17 +1398,18 @@ where
         {
             state.progress.sender_retry_at = None;
         }
-        sender.discard_unusable_tail_reinjections(
+        let discarded_tail_reinjections = sender.discard_unusable_tail_reinjections(
             &mut sender_queue,
             context,
             &remotes,
             request_lane,
         );
-        if sender.discard_stale_bound_reinjections(&mut sender_queue, &remotes) > 0 {
+        let discarded_bound_reinjections =
+            sender.discard_stale_bound_reinjections(&mut sender_queue, &remotes);
+        if discarded_tail_reinjections > 0 || discarded_bound_reinjections > 0 {
             state.progress.sender_retry_at = None;
-        }
-        if sender.discard_resolved_stale_path_reinjections(&mut sender_queue, &remotes) > 0 {
-            state.progress.sender_retry_at = None;
+            request_recovery_dirty = true;
+            request_recovery_requested = true;
         }
         let data_ack_timer_due = state
             .progress
@@ -1593,7 +1565,7 @@ where
         let return_plan_final_blocked = remotes.has_pending_return_plan_final_publication();
         let has_return_plan_final_capacity_wait = return_plan_final_capacity_wait.is_some();
         let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
-            sender_queue.is_empty(),
+            sender_queue.is_empty() && !request_recovery_requested,
             state.progress.sender_retry_at,
         );
         let final_feedback_retry_blocked = pending_remote_fin_ready
@@ -1615,7 +1587,8 @@ where
             && (pending_local_fin_ready || terminal_fin_replay_pending);
         let timed_carrier_retry_blocked =
             queued_send_blocked || final_feedback_retry_blocked || terminal_control_retry_blocked;
-        let queued_send_ready = !sender_queue.is_empty() && !queued_send_blocked;
+        let queued_send_ready =
+            (!sender_queue.is_empty() || request_recovery_requested) && !queued_send_blocked;
         let queued_send_retry_deadline = state
             .progress
             .sender_retry_at
@@ -1771,12 +1744,14 @@ where
                 // evidence or path availability is published.
                 continue;
             }
-            _ = async move {
-                if let Some(wait) = request_recovery_capacity_wait {
-                    wait.await;
+            _ = async {
+                if let Some(wait) = request_recovery_service_wait.as_mut() {
+                    wait.as_mut().await;
                 }
-            }, if request_recovery_capacity_blocked && has_request_recovery_capacity_wait => {
+            }, if request_recovery_capacity_blocked && request_recovery_service_wait.is_some() => {
+                request_recovery_service_wait = None;
                 request_recovery_dirty = true;
+                state.progress.sender_retry_at = None;
                 continue;
             }
             _ = async {
@@ -1787,14 +1762,6 @@ where
                 // A stale target's maintenance queue is independent of
                 // ordinary Product work on every sibling writer.
                 request_requalification_capacity_wait = None;
-                continue;
-            }
-            _ = async move {
-                if let Some(publication) = request_recovery_path_model_publication {
-                    publication.await;
-                }
-            }, if request_recovery_capacity_blocked => {
-                request_recovery_dirty = true;
                 continue;
             }
             _ = wait_for_optional_deadline(request_path_recovery_deadline), if request_path_recovery_deadline.is_some() => {
@@ -2371,16 +2338,47 @@ where
             ), if !state.is_finished(&send_stream, &recv_stream, &sender_queue) => {
                 match service {
                     RelayServiceEvent::Dispatch => {
+                        let mut recovery_batch = if request_recovery_requested {
+                            request_recovery_service_wait = Some(Box::pin(
+                                arm_request_recovery_service_wait(context, &remotes),
+                            ));
+                            Some(sender.collect_request_path_recovery(&remotes, &sender_queue))
+                        } else {
+                            None
+                        };
                         let mut dispatched_items = 0usize;
                         let mut dispatched_payload_bytes = 0usize;
                         let mut blocked_by_carrier = false;
                         let mut dispatch_error = None;
-                        while !sender_queue.is_empty()
+                        let mut queued_recovery_changed = false;
+                        while (!sender_queue.is_empty()
+                            || recovery_batch.as_ref().is_some_and(|batch| batch.has_pending()))
                             && dispatched_items < sender_dispatch_item_budget
                             && (dispatched_payload_bytes < sender_dispatch_byte_budget
                                 || dispatched_items == 0)
                         {
-                            let dispatch = sender
+                            let direct_dispatch = if let Some(batch) = recovery_batch.as_mut()
+                                && batch.has_pending()
+                            {
+                                match sender.dispatch_next_request_path_recovery(
+                                    batch, context, &mut remotes, &send_stream, &sender_queue,
+                                ).await {
+                                    Ok(dispatch) => dispatch,
+                                    Err(err) => {
+                                        dispatch_error = Some(err);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let is_direct_recovery = direct_dispatch.is_some();
+                            let dispatch = if let Some(dispatch) = direct_dispatch {
+                                Ok(dispatch)
+                            } else if sender_queue.is_empty() {
+                                break;
+                            } else {
+                                sender
                                 .dispatch_client_queued_work(
                                     context,
                                     request_lane,
@@ -2396,7 +2394,8 @@ where
                                         authoritative_data_ack_gap,
                                     ),
                                 )
-                                .await;
+                                .await
+                            };
                             match dispatch {
                                 Ok(ClientQueuedDispatch::Data { payload_bytes }) => {
                                     dispatched_items = dispatched_items.saturating_add(1);
@@ -2416,18 +2415,16 @@ where
                                     );
                                     dispatched_items = dispatched_items.saturating_add(1);
                                     state.progress.last_stream_at = Instant::now();
-                                    request_recovery_dirty = true;
+                                    queued_recovery_changed |= !is_direct_recovery;
                                 }
                                 Ok(ClientQueuedDispatch::ReinjectionDeferred) => {
                                     dispatched_items = dispatched_items.saturating_add(1);
-                                }
-                                Ok(ClientQueuedDispatch::PathRecoveryReinjectionCancelled) => {
-                                    dispatched_items = dispatched_items.saturating_add(1);
-                                    request_recovery_dirty = true;
+                                    queued_recovery_changed = true;
                                 }
                                 Ok(ClientQueuedDispatch::PersistentReinjectionCancelled) => {
                                     state.progress.sender_retry_at = None;
                                     dispatched_items = dispatched_items.saturating_add(1);
+                                    queued_recovery_changed = true;
                                 }
                                 Ok(ClientQueuedDispatch::PathAttachmentRequired(err)) => {
                                     if remotes.is_empty() {
@@ -2471,6 +2468,16 @@ where
                                     break;
                                 }
                             }
+                        }
+                        if let Some(batch) = recovery_batch {
+                            request_range_recovery_deadline = batch.retry_deadline;
+                            request_recovery_capacity_blocked = batch.blocked_for_carrier_capacity;
+                            request_recovery_dirty = batch.has_pending() || queued_recovery_changed;
+                            if !request_recovery_capacity_blocked {
+                                request_recovery_service_wait = None;
+                            }
+                        } else {
+                            request_recovery_dirty |= queued_recovery_changed;
                         }
                         #[cfg(feature = "lab-diagnostics")]
                         if dispatched_items > 0 {
@@ -2654,33 +2661,13 @@ where
                                     &err,
                                 )
                                 .await;
-                                match recover_reliable_relay_after_path_failure(
-                                    &mut sender,
-                                    &mut sender_queue,
-                                    context,
-                                    &mut remotes,
-                                    &mut send_stream,
-                                    request_lane,
-                                )
-                                .await
-                                {
-                                    Ok(Some(reinjection_queued)) => {
-                                        state.progress.last_stream_at = Instant::now();
-                                        state.progress.last_response_stall_reinjection_at = Instant::now();
-                                        if reinjection_queued {
-                                            state.progress.sender_retry_at = None;
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(err) => {
-                                        crate::observability::process_event!(
-                                            Warn,
-                                            "reliable_relay",
-                                            "survivor_recovery_failed",
-                                            "reliable path-error survivor recovery failed: {err}"
-                                        );
-                                    }
+                                if !remotes.is_empty() {
+                                    send_stream.update_max_offset(remotes.max_offset());
+                                    state.progress.last_stream_at = Instant::now();
+                                    state.progress.last_response_stall_reinjection_at = Instant::now();
                                 }
+                                request_recovery_dirty = true;
+                                state.progress.sender_retry_at = None;
                                 continue;
                             }
                             Err(err) => break Err(err),
@@ -2726,6 +2713,7 @@ where
                                     payload_bytes,
                                 ) {
                                     state.progress.sender_retry_at = None;
+                                    request_recovery_dirty = true;
                                 }
                             }
                             Frame::StreamData {

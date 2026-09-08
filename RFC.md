@@ -3482,6 +3482,27 @@ that every such byte was lost. Native recovery remains active. The work is
 admitted through the existing shared receive-credit, retained-range, repair,
 queue, and native-enqueue bounds.
 
+When several stale or detached OriginalData owners have due retained ranges,
+their historical qualification-entry order MUST NOT define recovery service
+order. The sender evaluates due byte ranges in increasing Data Sequence order,
+including interleaved ranges belonging to different owners, against currently
+eligible exact targets. A blocked target MUST NOT block an independently usable
+target; accepted-copy suppression and configured-slot ownership still apply.
+This orders currently eligible structural work, not a prediction that an
+earlier Original will never arrive or that every lower range must be acknowledged
+before a later range can enter service.
+
+The preferred implementation keeps structural recovery obligations in the
+retained source/flight ledger and selects them at the existing bounded sender
+dispatch boundary. A transient range view may be collected once per dispatch
+batch; it MUST NOT become a persistent suffix reservation that prevents a newly
+eligible lower range from using the same target. Successive ranges can consume
+the existing full structural service allowance within the same batch, without
+an ACK-per-frame wait or the live-owner hedge quantum being imposed on failed-
+owner recovery. Exact target selection and native Apply remain authoritative.
+Direct recovery includes other queued repair debt in admission; it does not
+exclude an unrelated queue head as though that head were its own reservation.
+
 Recovery suppression is exact-range state, not one clock for the complete
 owner. Pre-commit overlap in the sender-service queue suppresses duplicate
 intent only until carrier commitment. After the selected exact recovery

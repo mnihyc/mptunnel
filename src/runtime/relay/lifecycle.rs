@@ -25,7 +25,6 @@ use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
-use crate::runtime::sender::{ReliableRelaySenderQueue, RequestSenderService};
 use crate::runtime::stream::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayOpenedStartup,
     ReliableRelayRemoteSet, ReliableRelayReturnCandidate, ReliableRelayReturnPlan,
@@ -344,25 +343,6 @@ impl ClientReliableReturnPlan {
 
 pub(super) fn reliable_relay_lane_changed(previous: TrafficClass, current: TrafficClass) -> bool {
     previous != current
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(in crate::runtime) async fn recover_reliable_relay_after_path_failure(
-    sender: &mut RequestSenderService,
-    sender_queue: &mut ReliableRelaySenderQueue,
-    context: &ClientPathContext,
-    remotes: &mut ReliableRelayRemoteSet,
-    send_stream: &mut ReliableSendStream,
-    lane: TrafficClass,
-) -> Result<Option<bool>, RuntimeError> {
-    if remotes.is_empty() {
-        return Ok(None);
-    }
-
-    send_stream.update_max_offset(remotes.max_offset());
-    let recovery =
-        sender.drive_request_path_recovery(sender_queue, context, remotes, send_stream, lane);
-    Ok(Some(recovery.queued))
 }
 
 #[allow(clippy::too_many_arguments)]

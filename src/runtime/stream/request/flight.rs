@@ -49,6 +49,32 @@ pub(in crate::runtime) struct RequestFlightLedger {
 }
 
 impl RequestFlightLedger {
+    /// Immutable accepted-copy coverage for one serialized recovery batch.
+    /// Splitting at these boundaries prevents an accepted copy on a prefix
+    /// from excluding its carrier for a disjoint suffix in the same cache chunk.
+    pub(in crate::runtime) fn recovery_copy_ranges(
+        &self,
+    ) -> Vec<(RelayPathInstance, Vec<OffsetRange>)> {
+        let mut copies = HashMap::<RelayPathInstance, Vec<OffsetRange>>::new();
+        for (start, flights) in &self.flights {
+            for flight in flights {
+                if flight.kind == CarrierWorkKind::ReinjectedData {
+                    copies
+                        .entry(flight.instance)
+                        .or_default()
+                        .push(OffsetRange {
+                            start: *start,
+                            end: flight.end,
+                        });
+                }
+            }
+        }
+        copies
+            .into_iter()
+            .map(|(instance, ranges)| (instance, normalize_offset_ranges(ranges)))
+            .collect()
+    }
+
     /// Exact actor-attached live-owner/accepted-copy shape at the lowest
     /// recovery frontier.  Storage chunk boundaries do not divide the result.
     pub(in crate::runtime) fn live_owner_uniform_frontier(

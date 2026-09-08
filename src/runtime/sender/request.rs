@@ -39,7 +39,7 @@ use crate::mux::stream::{
     AckOutcome, ReliableRecvStream, ReliableSendStream, StreamError, ValidatedStreamAck,
 };
 use crate::performance::MppPerformanceConfig;
-use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
+use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_accounted_bytes};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
@@ -127,7 +127,6 @@ pub(in crate::runtime) enum ClientQueuedDispatch {
         accepted_copy_deadline: Instant,
     },
     ReinjectionDeferred,
-    PathRecoveryReinjectionCancelled,
     PersistentReinjectionCancelled,
     PathAttachmentRequired(RuntimeError),
 }
@@ -139,16 +138,37 @@ pub(in crate::runtime) struct RequestProductAckOutcome {
 }
 
 #[derive(Debug, Default)]
-pub(in crate::runtime) struct RequestPathRecoveryOutcome {
-    pub(in crate::runtime) queued: bool,
+/// A single serialized Dispatch transaction, never retained across an ACK,
+/// queued-copy dispatch, or qualification change. Collection subtracts current
+/// accepted-copy deadlines; successful direct copies advance disjoint ranges.
+pub(in crate::runtime) struct RequestPathRecoveryBatch {
+    ranges: Vec<RequestPathRecoveryRange>,
+    next_range: usize,
+    rejected_targets: Vec<RelayPathInstance>,
     pub(in crate::runtime) retry_deadline: Option<Instant>,
     pub(in crate::runtime) blocked_for_carrier_capacity: bool,
 }
 
-#[derive(Debug, Default)]
-struct RequestPathRecoveryEnqueueOutcome {
+impl RequestPathRecoveryBatch {
+    pub(in crate::runtime) fn has_pending(&self) -> bool {
+        self.next_range < self.ranges.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RequestPathRecoveryRange {
+    owner: RelayPathInstance,
+    range: OffsetRange,
+    copy_owners: Vec<RelayPathInstance>,
     queued: bool,
-    blocked_for_carrier_capacity: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RequestReinjectionQueueContext<'a> {
+    queue: &'a ReliableRelaySenderQueue,
+    // Only queued publication consumes the queue's current front. A direct
+    // structural copy must charge every independently queued live intent.
+    exclude_front: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -355,16 +375,14 @@ impl RequestSenderService {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn enqueue_critical_reinjection_frame(
         &mut self,
         sender_queue: &mut ReliableRelaySenderQueue,
         frame: Frame,
         cause: RelaySendCause,
     ) {
-        debug_assert!(cause.is_reinjection());
-        let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        self.optional_reinjection.record_reinjection(payload_bytes);
-        sender_queue.push_critical_reinjection_with_cause(frame, cause);
+        self.enqueue_reinjection_frame_with_priority(sender_queue, frame, cause, true);
     }
 
     #[cfg(test)]
@@ -441,24 +459,6 @@ impl RequestSenderService {
     ) -> usize {
         self.multipath
             .discard_stale_bound_reinjections(sender_queue, remotes)
-    }
-
-    pub(in crate::runtime) fn discard_resolved_stale_path_reinjections(
-        &self,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        remotes: &ReliableRelayRemoteSet,
-    ) -> usize {
-        self.multipath
-            .discard_resolved_stale_path_reinjections(sender_queue, remotes)
-    }
-
-    pub(in crate::runtime) fn discard_unavailable_client_path_recovery_reinjections(
-        &self,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        remotes: &ReliableRelayRemoteSet,
-    ) -> usize {
-        self.multipath
-            .discard_unavailable_client_path_recovery_reinjections(sender_queue, remotes)
     }
 
     pub(in crate::runtime) fn mark_request_path_stale(
@@ -875,7 +875,10 @@ impl RequestSenderService {
                 matches!(cause, RelaySendCause::CompletionTailReinjection(_))
                     .then_some(request_lane),
                 ReliableDataAckFrontierState::Live,
-                Some(sender_queue),
+                Some(RequestReinjectionQueueContext {
+                    queue: sender_queue,
+                    exclude_front: true,
+                }),
             )
             .await;
         match dispatch {
@@ -912,15 +915,6 @@ impl RequestSenderService {
                 let discarded = sender_queue.discard_persistent_ack_gap_reinjection_batch(cause);
                 debug_assert!(discarded > 0);
                 Ok(ClientQueuedDispatch::PersistentReinjectionCancelled)
-            }
-            Err(err)
-                if cause.client_path_recovery_is_bound()
-                    && reliable_path_error_is_migratable(&err) =>
-            {
-                let (_, _) = sender_queue
-                    .commit_front()
-                    .expect("cancelled path-recovery reinjection must still be at queue front");
-                Ok(ClientQueuedDispatch::PathRecoveryReinjectionCancelled)
             }
             Err(err)
                 if matches!(
@@ -969,7 +963,7 @@ impl RequestSenderService {
         cause: RelaySendCause,
         request_lane: Option<TrafficClass>,
         frontier_state: ReliableDataAckFrontierState,
-        reinjection_queue: Option<&ReliableRelaySenderQueue>,
+        reinjection_queue: Option<RequestReinjectionQueueContext<'_>>,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         let sent_frame = frame.clone();
         let avoid_instances =
@@ -1005,7 +999,7 @@ impl RequestSenderService {
         avoid_instances: &[RelayPathInstance],
         request_lane: Option<TrafficClass>,
         frontier_state: ReliableDataAckFrontierState,
-        reinjection_queue: Option<&ReliableRelaySenderQueue>,
+        reinjection_queue: Option<RequestReinjectionQueueContext<'_>>,
     ) -> Result<(RelayPathInstance, usize, Option<Instant>), RuntimeError> {
         let mut last_error = None;
         let mut rejected_bulk_original_targets =
@@ -1231,8 +1225,11 @@ impl RequestSenderService {
                                 let Some(snapshot) = reinjection_target_snapshot else {
                                     return Err(RequestFrameAdmissionError::ServiceBlocked);
                                 };
-                                let queued_reinjection = reinjection_queue.map_or(0, |queue| {
-                                    queue.request_target_queued_reinjection_bytes(instance, true)
+                                let queued_reinjection = reinjection_queue.map_or(0, |queued| {
+                                    queued.queue.request_target_queued_reinjection_bytes(
+                                        instance,
+                                        queued.exclude_front,
+                                    )
                                 });
                                 let accepted_reinjection =
                                     self.multipath.accepted_reinjected_data_bytes(instance);
@@ -1853,154 +1850,209 @@ impl RequestSenderService {
         }
     }
 
-    pub(in crate::runtime) fn drive_request_path_recovery(
-        &mut self,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        context: &ClientPathContext,
+    /// Observe obligations once per cooperative Dispatch batch. These are
+    /// offsets and exact owners, not queued payload or reserved target service.
+    pub(in crate::runtime) fn collect_request_path_recovery(
+        &self,
         remotes: &ReliableRelayRemoteSet,
-        send_stream: &ReliableSendStream,
-        lane: TrafficClass,
-    ) -> RequestPathRecoveryOutcome {
-        let mut outcome = RequestPathRecoveryOutcome::default();
-        for original_instance in self.multipath.request_recovery_original_paths(remotes) {
-            let recovery =
-                self.multipath
-                    .path_recovery_state(context, remotes, original_instance, lane);
-            outcome.retry_deadline = match (outcome.retry_deadline, recovery.retry_deadline) {
+        sender_queue: &ReliableRelaySenderQueue,
+    ) -> RequestPathRecoveryBatch {
+        let mut batch = RequestPathRecoveryBatch::default();
+        let owners = self.multipath.request_recovery_original_paths(remotes);
+        if owners.is_empty() {
+            return batch;
+        }
+        let mut copy_ranges = self.multipath.recovery_copy_ranges();
+        copy_ranges.retain(|(instance, _)| remotes.contains_path_instance(*instance));
+        let queued_ranges =
+            normalize_offset_ranges(sender_queue.queued_reinjection_ranges().collect());
+        let mut boundaries = copy_ranges
+            .iter()
+            .flat_map(|(_, ranges)| ranges.iter().flat_map(|range| [range.start, range.end]))
+            .collect::<Vec<_>>();
+        boundaries.extend(
+            queued_ranges
+                .iter()
+                .flat_map(|range| [range.start, range.end]),
+        );
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for original_instance in owners {
+            let recovery = self
+                .multipath
+                .path_recovery_state(remotes, original_instance);
+            batch.retry_deadline = match (batch.retry_deadline, recovery.retry_deadline) {
                 (Some(current), Some(deadline)) => Some(current.min(deadline)),
                 (None, deadline) => deadline,
                 (current, None) => current,
             };
-            let cause = if remotes.contains_path_instance(original_instance) {
-                RelaySendCause::StalePathReinjection(original_instance)
+            for range in recovery.uncovered_ranges {
+                let mut start = range.start;
+                let first = boundaries.partition_point(|boundary| *boundary <= start);
+                for end in boundaries[first..]
+                    .iter()
+                    .copied()
+                    .take_while(|end| *end < range.end)
+                    .chain(std::iter::once(range.end))
+                {
+                    let queued_index = queued_ranges.partition_point(|range| range.end <= start);
+                    batch.ranges.push(RequestPathRecoveryRange {
+                        owner: original_instance,
+                        range: OffsetRange { start, end },
+                        queued: queued_ranges
+                            .get(queued_index)
+                            .is_some_and(|range| range.start < end),
+                        copy_owners: copy_ranges
+                            .iter()
+                            .filter_map(|(instance, ranges)| {
+                                let index = ranges.partition_point(|range| range.end <= start);
+                                ranges
+                                    .get(index)
+                                    .is_some_and(|range| range.start < end)
+                                    .then_some(*instance)
+                            })
+                            .collect(),
+                    });
+                    start = end;
+                }
+            }
+        }
+        batch.ranges.sort_by_key(|entry| entry.range.start);
+        batch
+    }
+
+    /// Select the lowest currently serviceable due range before assigning any
+    /// target credit. A rejected target/range remains in the flight ledger;
+    /// only this finite batch cursor advances so independent targets can run.
+    pub(in crate::runtime) async fn dispatch_next_request_path_recovery(
+        &mut self,
+        batch: &mut RequestPathRecoveryBatch,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        sender_queue: &ReliableRelaySenderQueue,
+    ) -> Result<Option<ClientQueuedDispatch>, RuntimeError> {
+        while let Some(entry) = batch.ranges.get(batch.next_range).cloned() {
+            if entry.queued {
+                // The queue union is immutable for this serialized batch and
+                // this entire range lies within it. Native credit/cache slices
+                // cannot change overlap; no per-frame queue scan is needed.
+                // Queue removal owns the actor's subsequent rediscovery wake.
+                batch.next_range += 1;
+                batch.rejected_targets.clear();
+                continue;
+            }
+            let Some(preview) =
+                send_stream.first_retransmission_frame_for_range(entry.range, usize::MAX)
+            else {
+                batch.next_range += 1;
+                batch.rejected_targets.clear();
+                continue;
+            };
+            let unbound_cause = if remotes.contains_path_instance(entry.owner) {
+                RelaySendCause::StalePathReinjection(entry.owner)
             } else {
                 RelaySendCause::PathFailureReinjection
             };
-            let enqueue = self.enqueue_path_data_for_reinjection(
-                sender_queue,
+            let mut excluded_targets =
+                self.multipath
+                    .reinjection_avoid_instances(&preview, unbound_cause, remotes);
+            if !excluded_targets.contains(&entry.owner) {
+                excluded_targets.push(entry.owner);
+            }
+            for instance in &entry.copy_owners {
+                if !excluded_targets.contains(instance) {
+                    excluded_targets.push(*instance);
+                }
+            }
+            for instance in &batch.rejected_targets {
+                if !excluded_targets.contains(instance) {
+                    excluded_targets.push(*instance);
+                }
+            }
+            let (target, _) = self.multipath.reinjection_path_snapshot(
                 context,
                 remotes,
-                send_stream,
-                original_instance.key,
-                &[original_instance],
-                recovery.uncovered_ranges,
-                cause,
+                &excluded_targets,
+                sender_queue,
+                send_stream.reinjection_bytes(),
+                context.mux_limits,
             );
-            outcome.queued |= enqueue.queued;
-            outcome.blocked_for_carrier_capacity |= enqueue.blocked_for_carrier_capacity;
-        }
-        outcome
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
-    fn enqueue_path_data_for_reinjection(
-        &mut self,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        send_stream: &ReliableSendStream,
-        failed_key: RelayPathKey,
-        failed_instances: &[RelayPathInstance],
-        ranges: Vec<OffsetRange>,
-        cause: RelaySendCause,
-    ) -> RequestPathRecoveryEnqueueOutcome {
-        if ranges.is_empty() {
-            return RequestPathRecoveryEnqueueOutcome::default();
-        }
-        let Some(frontier) = send_stream
-            .retransmission_frames_for_ranges(&ranges, 1)
-            .into_iter()
-            .next()
-        else {
-            return RequestPathRecoveryEnqueueOutcome::default();
-        };
-        let mut excluded_targets = failed_instances.to_vec();
-        for instance in self
-            .multipath
-            .reinjection_avoid_instances(&frontier, cause, remotes)
-        {
-            if !excluded_targets.contains(&instance) {
-                excluded_targets.push(instance);
-            }
-        }
-        let (reinjection_path, _) = self.multipath.reinjection_path_snapshot(
-            context,
-            remotes,
-            &excluded_targets,
-            sender_queue,
-            send_stream.reinjection_bytes(),
-            context.mux_limits,
-        );
-        let (reinjection_limit, cause) = match reinjection_path {
-            Some((target_instance, _, reinjection_limit)) => {
-                let bound_cause = match cause {
-                    RelaySendCause::StalePathReinjection(owner) => {
-                        RelaySendCause::ClientStalePathReinjection {
-                            owner,
-                            target: ClientReinjectionOutputIdentity {
-                                instance: target_instance,
-                            },
-                        }
-                    }
-                    RelaySendCause::PathFailureReinjection => {
-                        RelaySendCause::ClientPathFailureReinjection(
-                            ClientReinjectionOutputIdentity {
-                                instance: target_instance,
-                            },
-                        )
-                    }
-                    _ => cause,
-                };
-                (reinjection_limit, bound_cause)
-            }
-            None => {
-                // The retained source/flight ledger already owns this repair.
-                // No target is not a closed session, nor authority to retry a
-                // copy on an attachment that already owns the range. Existing
-                // membership, Product-model, receipt and capacity wakes retry
-                // selection without materializing target-unbound queue work.
-                return RequestPathRecoveryEnqueueOutcome {
-                    blocked_for_carrier_capacity: true,
-                    ..RequestPathRecoveryEnqueueOutcome::default()
-                };
-            }
-        };
-        if reinjection_limit == 0 {
-            return RequestPathRecoveryEnqueueOutcome::default();
-        }
-        let reinjection_frames =
-            send_stream.retransmission_frames_for_ranges(&ranges, reinjection_limit);
-        if reinjection_frames.is_empty() {
-            return RequestPathRecoveryEnqueueOutcome::default();
-        }
-        let mut queued = false;
-        let overlaps = sender_queue.queued_reinjection_overlaps(&reinjection_frames);
-        for (frame, overlaps_queued) in reinjection_frames.into_iter().zip(overlaps) {
-            let queued_frame = if overlaps_queued {
-                false
-            } else {
-                self.enqueue_critical_reinjection_frame(sender_queue, frame, cause);
-                true
+            let Some((instance, _, limit)) = target else {
+                batch.blocked_for_carrier_capacity = true;
+                batch.next_range += 1;
+                batch.rejected_targets.clear();
+                continue;
             };
-            queued |= queued_frame;
-            #[cfg(feature = "lab-diagnostics")]
-            lab_diagnostic(
-                "reinjection",
-                format_args!(
-                    "stream_id={} path_underlay={:?} path_index={} cause={} queued={}",
-                    self.multipath.stream_id().0,
-                    failed_key.underlay,
-                    failed_key.index,
-                    cause.as_str(),
-                    queued_frame,
-                ),
-            );
+            let frame = send_stream
+                .first_retransmission_frame_for_range(entry.range, limit)
+                .expect("positive exact target service and retained preview");
+            let Frame::StreamData {
+                offset,
+                ref payload,
+                ..
+            } = frame
+            else {
+                unreachable!("retained cache contains only stream data")
+            };
+            let payload_bytes = payload.len();
+            let end = offset.saturating_add(payload_bytes as u64);
+            let target = ClientReinjectionOutputIdentity { instance };
+            let cause = match unbound_cause {
+                RelaySendCause::StalePathReinjection(owner) => {
+                    RelaySendCause::ClientStalePathReinjection { owner, target }
+                }
+                _ => RelaySendCause::ClientPathFailureReinjection(target),
+            };
+            match self
+                .send_frame_at_frontier(
+                    context,
+                    remotes,
+                    frame,
+                    cause,
+                    None,
+                    ReliableDataAckFrontierState::Live,
+                    Some(RequestReinjectionQueueContext {
+                        queue: sender_queue,
+                        exclude_front: false,
+                    }),
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    // Discovery and failed Apply attempts consume no optional
+                    // traffic account. An actual committed copy counts once.
+                    self.optional_reinjection.record_reinjection(payload_bytes);
+                    let deadline = outcome
+                        .accepted_copy_deadline
+                        .expect("committed structural copy owns its exact deadline");
+                    batch.retry_deadline = Some(
+                        batch
+                            .retry_deadline
+                            .map_or(deadline, |old| old.min(deadline)),
+                    );
+                    batch.ranges[batch.next_range].range.start = end;
+                    if end >= entry.range.end {
+                        batch.next_range += 1;
+                        batch.rejected_targets.clear();
+                    }
+                    return Ok(Some(ClientQueuedDispatch::Reinjection {
+                        payload_bytes,
+                        accepted_copy_deadline: deadline,
+                    }));
+                }
+                Err(error)
+                    if matches!(error, RuntimeError::SenderServiceBlocked)
+                        || reliable_path_error_is_migratable(&error) =>
+                {
+                    batch.rejected_targets.push(instance);
+                    // Retry this same lowest range on another exact target;
+                    // only after all are unavailable can a later range run.
+                }
+                Err(error) => return Err(error),
+            }
         }
-        RequestPathRecoveryEnqueueOutcome {
-            queued,
-            blocked_for_carrier_capacity: false,
-        }
+        Ok(None)
     }
 
     fn record_decision(

@@ -419,6 +419,30 @@ impl ReliableSendStream {
         )
     }
 
+    /// The first retained cache slice intersecting an exact recovery range.
+    /// This is the single-frame equivalent of `retransmission_frames_for_ranges`;
+    /// it does not walk or materialize the retained suffix.
+    pub(crate) fn first_retransmission_frame_for_range(
+        &self,
+        range: OffsetRange,
+        byte_limit: usize,
+    ) -> Option<Frame> {
+        if byte_limit == 0 {
+            return None;
+        }
+        let key =
+            first_overlapping_reinjection_chunk(&self.reinjection_cache, range.start, range.end)?;
+        let chunk = self.reinjection_cache.get(&key)?;
+        let start = range.start.max(chunk.offset);
+        let end = range.end.min(start.saturating_add(byte_limit as u64));
+        let slice = sent_chunk_slice(chunk, start, end)?;
+        Some(Frame::StreamData {
+            stream_id: self.stream_id,
+            offset: slice.offset,
+            payload: slice.payload,
+        })
+    }
+
     pub fn retransmission_frames_for_ranges(
         &self,
         ranges: &[OffsetRange],

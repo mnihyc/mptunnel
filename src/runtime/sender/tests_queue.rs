@@ -11,103 +11,6 @@ use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use std::time::{Duration, Instant};
 
 #[test]
-fn recovery_batch_inspects_existing_queue_extents_once() {
-    let count = 2048u64;
-    let frames: Vec<_> = (0..count)
-        .map(|i| Frame::StreamData {
-            stream_id: StreamId(700),
-            offset: i * 4,
-            payload: Bytes::from_static(b"ab"),
-        })
-        .collect();
-    let inspected = std::cell::Cell::new(0usize);
-    let ranges = (0..count)
-        .map(|i| OffsetRange {
-            start: i * 4,
-            end: i * 4 + 2,
-        })
-        .inspect(|_| inspected.set(inspected.get() + 1));
-    let overlaps = queued_reinjection_overlaps_for_ranges(&frames, ranges);
-    assert!(overlaps.iter().all(|overlap| *overlap));
-    assert_eq!(
-        inspected.get(),
-        count as usize,
-        "one recovery batch must snapshot each queued extent once, not rescan it for every candidate"
-    );
-}
-
-#[test]
-fn recovery_batch_snapshot_matches_sequential_queue_checks() {
-    let stream_id = StreamId(701);
-    let mut stream = ReliableSendStream::new(stream_id, MuxLimits::default());
-    for _ in 0..8 {
-        stream.send_data(Bytes::from_static(b"abcdefgh")).unwrap();
-    }
-    stream
-        .apply_ack(&[
-            OffsetRange { start: 3, end: 5 },
-            OffsetRange { start: 20, end: 22 },
-        ])
-        .unwrap();
-    let frames = stream.retransmission_frames_for_ranges(
-        &[
-            OffsetRange { start: 31, end: 64 },
-            OffsetRange { start: 0, end: 18 },
-            OffsetRange { start: 12, end: 39 },
-        ],
-        64,
-    );
-    for pair in frames.windows(2) {
-        let (_, end, _) = reliable_stream_frame_extent(&pair[0]).unwrap();
-        let (start, _, _) = reliable_stream_frame_extent(&pair[1]).unwrap();
-        assert!(
-            end <= start,
-            "real mux recovery candidates are pairwise disjoint"
-        );
-    }
-    for shift in 0..64 {
-        let mut queue = ReliableRelaySenderQueue::default();
-        queue.push_data(Bytes::from_static(b"original"));
-        for (index, (offset, len)) in [(shift, 3usize), (shift + 1, 7), (shift + 10, 2)]
-            .into_iter()
-            .enumerate()
-        {
-            let frame = Frame::StreamData {
-                stream_id,
-                offset,
-                payload: Bytes::from(vec![0x42; len]),
-            };
-            if index % 2 == 0 {
-                queue.push_reinjection(frame);
-            } else {
-                queue
-                    .push_critical_reinjection_with_cause(frame, RelaySendCause::AckGapReinjection);
-            }
-        }
-        let before = queue.bytes();
-        let snapshot = queue.queued_reinjection_overlaps(&frames);
-        assert_eq!(queue.bytes(), before, "snapshot grants no work or credit");
-        let sequential: Vec<_> = frames
-            .iter()
-            .map(|frame| {
-                let overlaps = queue.has_queued_reinjection_overlap(frame);
-                if !overlaps {
-                    queue.push_critical_reinjection_with_cause(
-                        frame.clone(),
-                        RelaySendCause::AckGapReinjection,
-                    );
-                }
-                overlaps
-            })
-            .collect();
-        assert_eq!(
-            snapshot, sequential,
-            "overlap projection differs at shift {shift}"
-        );
-    }
-}
-
-#[test]
 fn sender_queue_read_budget_respects_stream_flow_control_credit() {
     let limits = MuxLimits {
         max_stream_window_bytes: 4,
@@ -523,15 +426,7 @@ fn sender_queue_discards_expired_bound_reinjection_on_live_output() {
 }
 
 #[test]
-fn sender_queue_discards_reinjection_after_exact_path_progress() {
-    let path = RelayPathInstance {
-        key: RelayPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            index: 4,
-        },
-        path_instance_id: CarrierPathInstanceId::from_raw(12),
-        attachment_id: 12,
-    };
+fn sender_queue_discards_response_reinjection_after_exact_path_progress() {
     let mut queue = ReliableRelaySenderQueue::default();
     let response = ServerReinjectionOutputIdentity {
         key: CarrierPathKey {
@@ -541,7 +436,6 @@ fn sender_queue_discards_reinjection_after_exact_path_progress() {
         incarnation: 17,
     };
     for (offset, cause) in [
-        (0, RelaySendCause::StalePathReinjection(path)),
         (64, RelaySendCause::StaleResponsePathReinjection(response)),
         (128, RelaySendCause::AckGapReinjection),
     ] {
@@ -559,10 +453,6 @@ fn sender_queue_discards_reinjection_after_exact_path_progress() {
         queue.discard_resolved_stale_response_path_reinjections(|candidate| {
             candidate != response
         }),
-        64
-    );
-    assert_eq!(
-        queue.discard_resolved_stale_path_reinjections(|candidate| candidate != path),
         64
     );
     assert_eq!(queue.bytes(), 64);

@@ -13,6 +13,60 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
+**Healthy attribution / next model23:56:** fcc0b22 diagnostic completes
+1748172800B/40.796490s, maxconfirmation1.728562s. All187 Original replies
+enqueue→claim<=2ms and claim→localacceptance<=3ms. All421 Data-prefetch
+boundaries return<=5ms, API→mux<=4ms; they cannot explain the large holds.
+Before any covering reply is decoded during F1970's1.729s hold, disjoint
+ordinary-QUIC reader windows contain conservatively>=1.254354s downstream
+send-await, >=.890604s while handing MAX. All healthy returnHTBdropdeltas
+are0, with67412B maximum sampled backlog. These facts establish input-service
+coupling, not earlier Native availability or exclusive MAX-handler CPU.
+READY_CREDIT_RETURN_SERVICE_20260908 preserves the complete joins/41bins,
+independent audit and7-member verified raw archive. No performance acceptance.
+
+**Replacement contract before code:** RFC8.4 already makes received credit
+one logical, directional, irreversible maximum. A proposed shared credit
+ingress at the actual attachment forwarder retains only the greatest matching
+MAX and its first exact source, plus one coalesced service wake. ACKs, Data,
+proofs and other events keep their unchanged FIFO; none are merged. The relay
+fairly takes current credit state or FIFO work; isolated credit never waits
+for more credit and sustained credit cannot starve payload/ACK work. Actual
+mux grant application, initial carrier-admission zero grant, checked C/ACK/
+qualification/Native/W/P/E authority and wire publication remain unchanged.
+
+MAX commutes with ACK validity/release at fixed C: it acknowledges no byte,
+while ACK grants no offset. Earlier availability may change assignment timing,
+not its authority. MAX also commutes with opposite-direction FIN and exact
+attachment error; neither revokes shared credit or qualifies a failed carrier.
+Independent review initially proposed per-carrier terminal watermarks, then
+withdrew them: preserving an identical scheduling trace is not a demonstrated
+correctness need. Do not add those artificial dependencies. Same-stream RESET
+ingress seals this logical credit owner; prior pending credit is exposed before
+that RESET and later updates cannot revive it. Owner cancellation closes it;
+raw StreamId equality cannot share its lifetime with another input owner.
+
+**Forecast / falsifier / execution:** current final-only folding still leaves
+97670 MAX messages traversing preceding queues; ACK-separated revisions escape
+it. Replacing event backlog with latest state at their first common owner can
+remove obsolete merged-queue occupancy and redundant relay turns, relieving
+upstream backpressure. It cannot remove wire frames, ACK work, physical loss
+or guarantee saving the measured .890604s. Material gain is plausible because
+the preceding fold improved healthy mixed205→326Mbps, but it may be zero if
+other actor/native work dominates; no precise CPU fraction or Mbps promise.
+This is a representation/performance correction, not a claim that every old
+MAX frame violates wire correctness. A test-only actual publisher/forwarder
+ACK-separated cardinality RED precedes one replacement, with fair service,
+greatest source, unchanged event order, cancellation and terminal controls.
+Replace the final fold, do not stack more folds or tune capacity thresholds.
+
+Root first freezes one ordinary fcc0b22 healthy mixed DOWN control while tests
+are authored (no compiler). Then targeted RED/GREEN/audit, one default build,
+healthy TCP/QUIC/mixed UP and affected mixed DOWN timings against retained
+controls. Only useful stable service permits the retained harsh comparison
+and broader gates. Adverse or absent benefit stops promotion and selects one
+causal decision, not another rate or queue adjustment.
+
 **Checkpoint23:39:** the bounded MAX fold and772 passing affected checks
 are preserved as an intermediary, not performance acceptance. All eight
 ordinary outcomes and348 timing bins are in READY_CREDIT_SERVICE_20260908;
@@ -41,6 +95,16 @@ planner cache, controller or threshold follows without its own causal evidence.
 Archive/review/freeze/reverse the observer before the single capture, then join
 winning exact ranges, not losing-copy ages. Root serializes build and lab.
 Telegram practical/attribution update sent15:38UTC; next nonurgent>=16:39UTC.
+
+**Observer23:42:** root and independent whole19-file reviews pass;18 files
+match the preceding observer exactly and attachment observation alone is
+adapted. Warning-free diagnostic build1m05s is frozen separately as
+ready-credit-return-20260908; all hooks are reversed and production diff is
+empty against fcc0b22. Exact archive READY_CREDIT_RETURN_TRACE_20260908.patch
+reverse-checks before removal and applies cleanly afterward. The one declared
+healthy mixed UP capture is running, without build overlap. API-return events
+are distinct from physical prefetch and actual mux application; no timing
+claim may collapse these boundaries.
 
 **Healthy candidate23:24:** ordinary build is warning-free1m20s. Same3 UP
 cells settle exactly: TCP426.610→422.069, QUIC440.804→440.581,

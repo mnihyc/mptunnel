@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-08 13:04 +08:00. Category: requested global retrospective and
+Updated: 2026-09-08 19:30 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -14,7 +14,8 @@ after compaction. Do not modify AGENTS.md. Record the following in the active
 transaction before changing runtime or running an experiment:
 
 `issue / observed failure / competing causes / exact question / existing
-evidence / falsifier / smallest next action / acceptance and stop conditions`.
+evidence / benefit or information forecast / falsifier / smallest next action /
+acceptance and stop conditions / actual outcome versus forecast`.
 
 Advance only when the preceding stage supplies its evidence; otherwise retain
 its honest unresolved or rejected disposition. A justified deviation must be
@@ -80,6 +81,98 @@ claiming clairvoyant optimality under unannounced future network changes.
 Finite state/work or eventual service is not a useful wall-clock bound.
 
 ## One closed-loop transaction
+
+### Mandatory expectation management before experiments and fixes
+
+The user explicitly required this on 2026-09-08. Before implementing or
+benchmarking a proposed correction, record a **benefit forecast** in the active
+transaction. This is a prediction to test, not a promised improvement:
+
+- **Observed impact:** identify the exact workload, direction, phase and
+  user-visible loss: stalled seconds, incomplete bytes, recovery time, sustained
+  goodput deficit, or retained resource growth. Include competing physical and
+  baseline explanations. A slow losing copy is not the critical user interval.
+- **Removable portion:** identify what this mechanism actually controls and
+  what remains outside it. Estimate a plausible gain range and an upper bound
+  when supported. State the assumptions and confidence basis; do not invent
+  precise confidence percentages or convert operation counts into Mbps. Include
+  no gain or regression when plausible. If magnitude is unknown, say so and
+  choose a cheap discriminator or defer the change; do not invent a forecast
+  to justify implementing it.
+- **Composition and cost:** explain how the local change reaches ordered user
+  delivery, first response, or recovery. Include wire amplification, CPU/RSS,
+  loaded latency, sparse work and competing-path risks. Faster service at one
+  stage need not improve a critical path dominated by another stage.
+- **Value decision:** explain why the expected practical gain is material
+  enough to pursue now. Defer small or unsupported benefits behind demonstrated
+  throughput collapse, multi-second stalls, failed recovery and resource leaks.
+  Evidence of a necessary correctness fix is a separate justification; do not
+  market it as a speed improvement.
+- **Falsifier and disposition:** predeclare what would invalidate the forecast,
+  the smallest useful comparison, and the affected non-regression checks.
+  Afterward compare forecast with actual full timing/completion/cost results.
+  Record why the forecast held or failed, including a wrong cause, a new
+  bottleneck, or unresolved measurement noise. An absent material benefit stops
+  performance promotion and prompts attribution review, not favorable reruns
+  or another compensating parameter.
+
+For fixed work taking T seconds, removing an exclusively serial critical delay
+d (0 <= d < T) can reduce elapsed time by at most d; the idealized goodput
+gain is T/(T-d)-1. This bound requires that the delay is truly on the critical
+path and creates no replacement bottleneck. Concurrent/nested elapsed totals
+cannot be summed as d. For a fraction f of baseline CPU-limited critical
+execution improved by factor k (0 <= f <= 1, k >= 1), the analogous Amdahl
+speedup factor is 1/((1-f)+f/k); fractional gain is that factor minus one.
+An arbitrary share of aggregate multicore CPU is not f. Neither equation
+predicts performance from an aggregate timer.
+
+A diagnostic experiment has an **information forecast**, not an expected speed
+gain: name the competing explanations it can separate, the next decision each
+outcome enables, and why existing evidence is insufficient. Do not call an
+observer a performance fix or add more observation if it cannot change a
+material decision.
+
+Concrete lesson from the current native-read capture: 553 completed pending
+episodes have at most 5.457ms between validated head availability and Chunk
+return (p95 440us). These measurements do not justify optimizing that boundary
+to solve an individual multi-second input wait. This is a per-episode bound,
+not a bound on cumulative critical service or all local service; it does not
+prove a transport bug.
+Any next sender/recovery proposal needs its own forecast and causal evidence.
+
+### Classify the performance shortfall before calling it a defect
+
+Impact priority (user reinforcement, 2026-09-08): focus on sustained throughput
+collapse, multi-second stalls, slow failure/recovery, failed completion and
+unbounded ownership/resource growth. A change worth roughly 1Mbps or 10ms on
+these high-capacity variable links is not a priority absent a larger demonstrated
+consequence. These are impact examples, not new Product limits or acceptance
+thresholds. Defer operation-count/micro-optimization fixes unless the measured
+critical interval shows why they can materially improve the user failure.
+
+The user reinforced this boundary on 2026-09-08: an unideal timing result
+may be physical loss/queuing, a deliberate throughput/latency tradeoff, or an
+implementation/model defect. Failure of the practical acceptance gate alone
+does not choose among them. A local operation-count RED proves avoidable work,
+not that removing it addresses the dominant user-visible delay.
+
+Compare against matched raw TCP, VMess, Hysteria2 and, where available, MPTCP
+before claiming that a delay is MPP-specific. Preserve configuration priors,
+direction, shared/independent cuts, offload/accounting, offered and completed
+work, timing distribution, wire traffic and resource pressure. A low-throughput
+baseline with a small queue is not an equal-speed latency control. Historical
+or censored baseline results are context, not a current winning comparison.
+
+Q/C is drain time for a known queue under constant service. Without the exact
+blocking byte's queue position, it is not a measured per-byte delay bound.
+Moreover, a queue that is unavoidable to drain now may have been avoidable
+before earlier sending decisions. Do not label all queued delay unavoidable,
+or tune the lab queue away to make a candidate look healthy. Separate known
+physical limits, choices on the speed/latency frontier, and a concrete causal
+defect. If evidence supports only a physical limit or tradeoff, document it
+without adding a model correction. Universal instantaneous optimality cannot
+be proved by finite experiments; do not silently replace or waive the declared
+practical acceptance gates.
 
 1. **Choose the highest-impact existing failure.** Define affected workload,
    direction, carrier set, interval and expected user-visible behaviour. Link

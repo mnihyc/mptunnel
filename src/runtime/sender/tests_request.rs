@@ -845,20 +845,29 @@ async fn request_path_recovery_without_a_new_target(stale_before_dispatch: bool)
 
 #[tokio::test]
 async fn request_recovery_prefix_first_owner_order_control() {
-    request_recovery_orders_retained_ranges(false, false).await;
+    request_recovery_orders_retained_ranges(false, false, false).await;
 }
 
 #[tokio::test]
 async fn request_recovery_suffix_first_owner_order_preserves_lowest_prefix() {
-    request_recovery_orders_retained_ranges(true, false).await;
+    request_recovery_orders_retained_ranges(true, false, false).await;
 }
 
 #[tokio::test]
 async fn request_recovery_interleaved_owners_preserve_global_range_order() {
-    request_recovery_orders_retained_ranges(false, true).await;
+    request_recovery_orders_retained_ranges(false, true, false).await;
 }
 
-async fn request_recovery_orders_retained_ranges(suffix_first: bool, interleaved: bool) {
+#[tokio::test]
+async fn request_recovery_prequeued_suffix_yields_to_newly_due_prefix() {
+    request_recovery_orders_retained_ranges(true, false, true).await;
+}
+
+async fn request_recovery_orders_retained_ranges(
+    suffix_first: bool,
+    interleaved: bool,
+    prequeue_suffix: bool,
+) {
     let stream_id = StreamId(236);
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10381",
@@ -881,6 +890,11 @@ async fn request_recovery_orders_retained_ranges(suffix_first: bool, interleaved
     }
     for instance in [a, b, c] {
         context.install_relay_path_instance_for_test(instance);
+    }
+    if prequeue_suffix {
+        // Equal default target scores resolve by attached iteration order.
+        // Keep C ahead of still-live A without changing either path's model.
+        remotes.paths.swap(0, 2);
     }
     let mut sender = RequestSenderService::new(stream_id);
     let mut queue = ReliableRelaySenderQueue::default();
@@ -924,8 +938,69 @@ async fn request_recovery_orders_retained_ranges(suffix_first: bool, interleaved
             .earliest_reinjection_suppression_deadline(&remotes)
             .is_none()
     );
-    for owner in if suffix_first { [b, a] } else { [a, b] } {
+    let (selection, exhausted) = sender.multipath.reinjection_path_snapshot(
+        &context,
+        &remotes,
+        &[a, b],
+        &queue,
+        send_stream.reinjection_bytes(),
+        limits,
+    );
+    assert!(!exhausted);
+    let (target, _, capacity) = selection.expect("fresh C has current repair authority");
+    assert_eq!(target, c);
+    assert_eq!(
+        capacity,
+        limits.max_repair_bytes.min(send_stream.reinjection_bytes())
+    );
+    assert_eq!(capacity, if interleaved { 3 * q } else { 2 * q });
+    for (position, owner) in (if suffix_first { [b, a] } else { [a, b] })
+        .into_iter()
+        .enumerate()
+    {
         assert!(sender.multipath.mark_path_stale(owner));
+        if prequeue_suffix && position == 0 {
+            assert!(!sender.multipath.path_is_stale(a));
+            assert_eq!(
+                sender.multipath.request_recovery_original_paths(&remotes),
+                vec![b],
+                "the lower Original owner is not yet due for structural recovery"
+            );
+            let (target, _) = sender.multipath.reinjection_path_snapshot(
+                &context,
+                &remotes,
+                &[b],
+                &queue,
+                send_stream.reinjection_bytes(),
+                limits,
+            );
+            assert_eq!(target.map(|(target, _, _)| target), Some(c));
+            assert!(
+                sender
+                    .drive_request_path_recovery(
+                        &mut queue,
+                        &context,
+                        &remotes,
+                        &send_stream,
+                        TrafficClass::Throughput,
+                    )
+                    .queued
+            );
+            for (ranges, expected) in [(&expected_a, false), (&expected_b, true)] {
+                let frame = send_stream
+                    .retransmission_frames_for_ranges(ranges, 1)
+                    .pop()
+                    .expect("retained Original prefix remains cached");
+                assert_eq!(queue.has_queued_reinjection_overlap(&frame), expected);
+            }
+            assert!(try_recv_reliable_path_command(&mut c_receivers).is_none());
+            assert!(
+                sender
+                    .earliest_reinjection_suppression_deadline(&remotes)
+                    .is_none(),
+                "the later intent is provisional, not an accepted native copy"
+            );
+        }
     }
     assert_eq!(
         sender.multipath.request_recovery_original_paths(&remotes),
@@ -944,22 +1019,6 @@ async fn request_recovery_orders_retained_ranges(suffix_first: bool, interleaved
             "no prior accepted-copy suppression"
         );
     }
-    let (selection, exhausted) = sender.multipath.reinjection_path_snapshot(
-        &context,
-        &remotes,
-        &[a, b],
-        &queue,
-        send_stream.reinjection_bytes(),
-        limits,
-    );
-    assert!(!exhausted);
-    let (target, _, capacity) = selection.expect("fresh C has current repair authority");
-    assert_eq!(target, c);
-    assert_eq!(
-        capacity,
-        limits.max_repair_bytes.min(send_stream.reinjection_bytes())
-    );
-    assert_eq!(capacity, if interleaved { 3 * q } else { 2 * q });
     assert!(try_recv_reliable_path_command(&mut c_receivers).is_none());
     assert!(
         sender

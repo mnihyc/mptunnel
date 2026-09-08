@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 07:54 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 08:03 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -190,14 +190,16 @@ exhaustion, physical wire timing or the entire captured stall. The first
 fixture incorrectly assumed a smaller measured C bound and failed in setup;
 that was NOT Product RED. No runtime correction or tuned limit was used.
 
-**Smallest next action:** independent reachability/model audit, then choose the
-smallest coherent retained-range service correction. Consider removing bulk
-provisional repair materialization instead of introducing a second queue
-planner. Any lazy service must refill within the existing dispatch batch, not
-make structural recovery wait one actor wake or ACK per frame. Preserve
-already accepted copies, available independent targets, exact queue accounting
-and existing full structural authority. No production edit before this model
-is settled; focused controls and ordinary timing remain mandatory.
+**Smallest next action:** implement/audit the declared no-structural-queue
+candidate in REQUEST_PREFIX_SERVICE_20260908.md. Independent reachability and
+model reviews support replacing historical owner bulk materialization with
+byte-ordered metadata collected once per existing Dispatch batch. Refill within
+that batch, not one actor wake/ACK per frame; do not rediscover the whole ledger
+per published frame. Preserve accepted copies, independent-target work, existing
+queued live repair accounting, exact Apply and full structural allowance.
+Prequeued-later/newly-due-head and native-blocked independent-target controls
+must join the two REDs. No candidate is accepted until focused GREEN and
+ordinary timing/completion/cost review. Test/evidence checkpoint is d56ccca.
 
 **Falsifier/stop:** if model gates prevent this ordering counterexample or both
 orders serve the same lowest eligible range, reject it. The capture does not
@@ -255,7 +257,9 @@ aggregate300/200 defaults as200each. Do not tune this profile to pass.
 
 - Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
   overlap. All products/probes are stopped; origin services retained.
-- No active source overlay/build/lab. Commit exact intermediate dispositions;
+- No diagnostic overlay/build/lab. The declared structural-recovery candidate
+  is being implemented; its test migration and focused verification are pending.
+  Commit exact intermediate dispositions;
   preserve small evidence before scoped cache cleanup. No deletion this turn.
   User seven-line edit must remain outside commits.
 - Telegram milestone authorization: no more often than hourly. Last sent about

@@ -411,3 +411,93 @@ receiver completion. These results do not attribute the entire captured
 fixture. A coherent byte-obligation-first correction must preserve exact target
 admission, accepted-copy ownership/deadlines and independent-target progress;
 focused GREEN and ordinary timing still remain required.
+
+## Candidate model, declared before implementation
+
+2026-09-08 08:03 +08:00. Independent reviews confirm reachable local ordering,
+not a universal advantage: if an earlier Original is about to arrive, repairing
+a later missing range first can finish the whole stream sooner. Without that
+future knowledge, historical qualification insertion order is not service
+evidence. For a serial target serving C bytes/s, an unnecessary q-byte suffix
+placed first adds q/C seconds before the lower repair, absent other arrivals.
+This is a conditional prefix-service benefit, not a predicted Mbps gain.
+
+Chosen candidate: remove bulk stale/failure payload queue materialization.
+Keep obligations in existing retained cache/flight ownership. At each existing
+bounded Dispatch batch, collect due range metadata once, merge by offset and
+consume a transient cursor. A candidate keeps its exact Original owner/cause;
+target selection and Apply retain current eligibility, accepted-copy exclusion,
+immutable D, exact K/J, regular-before-backup order and native reservation.
+After commitment, another range may immediately use remaining service within
+that same batch. No ACK-per-frame wait, smaller structural window or new timer.
+
+Unpublished suffix bindings disappear from this branch, rather than adding
+another persistent queue planner. Direct recovery includes all existing queued
+live repair in target accounting and overlap exclusion, but must not subtract
+the unrelated queue front as if it were the direct candidate. Recovery traffic
+accounting records successful direct commitment once, not every observation or
+failed reservation. Accepted/native work remains irreversible and untouched.
+
+Readiness/deadline/capacity state already owned by the relay must schedule a
+recovery batch even with no ordinary queue item. Carry forward existing copy
+deadlines, capacity/model wakes, error and terminal handling; a batch stopped by
+the existing cooperative item/byte budget remains ready. A target blocked at
+Apply must not force a later range onto that same blocked output or hide an
+independently usable target. No target leaves debt in the ledger, not an unbound
+repair or spurious session-close error. Do not rebuild the full ledger for
+every frame: collect once per batch and discard its metadata afterward.
+
+Required discriminators before promotion: order reversal; interleaved owners;
+newly due lower range after an unpublished later plan; same-range queued/accepted
+copy suppression; unavailable target with an independent usable target; filling
+the unchanged structural service allowance within one dispatch batch; existing
+qualification/removal/copy-deadline and terminal controls. Then one affected
+ordinary comparison with full completion, first service, gaps and cost. Any
+adverse result stops promotion. This proposal does not close every captured
+pause or authorize new controller/profile/threshold changes.
+
+### Reasoning obligations for the candidate
+
+Within a serialized batch, the ordered range cursor is monotone in Product
+offset. For a currently usable exact target, the first attempted eligible
+range is therefore no later than another eligible retained range that could
+use that same service. Committing advances only the emitted range slice;
+accepted-copy flight establishes its existing D/J before native publication.
+Subsequent slices can use remaining K immediately. A target that rejects
+reservation is excluded from this batch's further placement attempts, not
+requalified or assigned synthetic capacity. Different usable targets remain
+eligible; metadata is discarded at the batch boundary so the next causal
+observation can reconsider prior failures. No persistent future suffix owns K.
+
+This argument assumes actual target selection/Apply enforce current ownership
+and the cursor does not skip a lower eligible slice because of a later slice's
+ownership boundary. The implementation and independent audit must check that
+premise rather than declare the model proved by sorting alone. Existing queued
+live repairs and accepted copies still constrain eligibility. No guarantee is
+claimed for already accepted native work or unknown future Original arrivals.
+
+Discovery work is once per existing batch, not per emitted frame. Frame lookup
+must reuse the non-overlapping cache tree's existing predecessor/next search,
+then slice at most one chunk; otherwise calling the old bulk cache collector
+per frame would recreate full-ledger work. A direct equivalence check uses
+actual send/ACK clipping and the old bulk collector's first result as oracle,
+including chunk boundaries, ACK holes, empty credit, empty cache and off-end
+ranges. This accessor adds no capacity, timer, persistent state or new byte
+geometry. The unchanged cooperative dispatch budget still bounds one batch;
+ordinary CPU/service timing must determine whether repeated batches are cheap
+enough in practice.
+
+### Unpublished suffix discriminator
+
+2026-09-08 08:01 +08:00: functional rebuild1m07s on unchanged runtime445011f.
+The new `request_recovery_prequeued_suffix_yields_to_newly_due_prefix` also
+fails at its intended native-command offset assertion:524288 instead of0.
+The six-test filter has three passing controls and three intended ordering
+failures. Initially only B is stale; the lower owner A is explicitly not a
+structural candidate. With identical default path snapshots, C is placed first
+in attached iteration to resolve an actual equal-score tie, and selection is
+asserted to choose C. The first drive queues only B's suffix; no repair command
+or accepted-copy deadline exists. After A becomes stale, another drive still
+leaves that unpublished suffix ahead of A. This is why sorting only newly
+generated ranges would be incomplete. It is not an expired-copy, native
+capacity exhaustion or timed-network test.

@@ -26,13 +26,13 @@ use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 #[cfg(test)]
 type ClientRelayAttachmentCommitRegistry =
@@ -478,8 +478,93 @@ impl Drop for ReliableRelayInputForwarder {
     }
 }
 
+#[derive(Default)]
+struct ReliableRelayCreditState {
+    greatest: Option<(RelayPathInstance, u64)>,
+    pending: bool,
+    sealed: bool,
+}
+
+/// Received credit belongs to this logical input lifetime, not its carrier
+/// queues. This retains evidence only; the relay's mux still applies the grant.
+struct ReliableRelayCreditIngress {
+    stream_id: StreamId,
+    state: Mutex<ReliableRelayCreditState>,
+    changed: Notify,
+}
+
+impl ReliableRelayCreditIngress {
+    fn new(stream_id: StreamId) -> Self {
+        Self {
+            stream_id,
+            state: Mutex::new(ReliableRelayCreditState::default()),
+            changed: Notify::new(),
+        }
+    }
+
+    fn publish(&self, instance: RelayPathInstance, max_offset: u64) {
+        let wake = {
+            let mut state = self.state.lock().expect("request credit ingress lock");
+            if state.sealed
+                || state
+                    .greatest
+                    .is_some_and(|(_, greatest)| max_offset <= greatest)
+            {
+                return;
+            }
+            // A strict advance keeps its actual source; equal siblings cannot
+            // replace that source or create another pending service event.
+            state.greatest = Some((instance, max_offset));
+            !std::mem::replace(&mut state.pending, true)
+        };
+        if wake {
+            self.changed.notify_one();
+        }
+    }
+
+    fn take_pending(&self) -> Option<ReliableRelayRemoteFrame> {
+        let mut state = self.state.lock().expect("request credit ingress lock");
+        if !std::mem::take(&mut state.pending) {
+            return None;
+        }
+        let (instance, max_offset) = state.greatest.expect("pending credit has a value");
+        Some(ReliableRelayRemoteFrame {
+            instance,
+            frame: Ok(Frame::StreamMaxData {
+                stream_id: self.stream_id,
+                max_offset,
+            }),
+        })
+    }
+
+    fn has_pending(&self) -> bool {
+        self.state
+            .lock()
+            .expect("request credit ingress lock")
+            .pending
+    }
+
+    fn seal(&self) {
+        self.state
+            .lock()
+            .expect("request credit ingress lock")
+            .sealed = true;
+    }
+
+    fn close(&self) {
+        {
+            let mut state = self.state.lock().expect("request credit ingress lock");
+            state.sealed = true;
+            state.pending = false;
+            state.greatest = None;
+        }
+        self.changed.notify_waiters();
+    }
+}
+
 async fn forward_reliable_relay_attachment_frame(
     frames_tx: &mpsc::Sender<ReliableRelayRemoteFrame>,
+    credit: &ReliableRelayCreditIngress,
     instance: RelayPathInstance,
     frame: Result<Frame, RuntimeError>,
     product_terminal_received: &mut bool,
@@ -488,18 +573,44 @@ async fn forward_reliable_relay_attachment_frame(
         &frame,
         Ok(Frame::StreamFin { .. } | Frame::StreamReset { .. })
     );
+    if let Ok(Frame::StreamMaxData {
+        stream_id,
+        max_offset,
+    }) = &frame
+        && *stream_id == credit.stream_id
+    {
+        // Absorbing state must not keep a retired recipient's forwarder alive.
+        let forwarded = if frames_tx.is_closed() {
+            false
+        } else {
+            credit.publish(instance, *max_offset);
+            !frames_tx.is_closed()
+        };
+        #[cfg(test)]
+        tests::observe_attachment_input_processed(instance);
+        return forwarded;
+    }
+    if matches!(&frame, Ok(Frame::StreamReset { stream_id, .. }) if *stream_id == credit.stream_id)
+    {
+        // Preserve prior pending credit, but no later attachment can revive
+        // credit after this logical RESET. FIN and carrier errors do not seal.
+        credit.seal();
+    }
     let carrier_terminal = frame.is_err();
-    frames_tx
+    let forwarded = frames_tx
         .send(ReliableRelayRemoteFrame { instance, frame })
         .await
-        .is_ok()
-        && !carrier_terminal
+        .is_ok();
+    #[cfg(test)]
+    tests::observe_attachment_input_processed(instance);
+    forwarded && !carrier_terminal
 }
 
 async fn drain_reliable_relay_attachment_after_terminal(
     instance: RelayPathInstance,
     frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
     frames_tx: &mpsc::Sender<ReliableRelayRemoteFrame>,
+    credit: &ReliableRelayCreditIngress,
     cause: ReliablePathCarrierTerminalCause,
     mut product_terminal_received: bool,
 ) {
@@ -510,6 +621,7 @@ async fn drain_reliable_relay_attachment_after_terminal(
     while let Some(frame) = frames.recv().await {
         if !forward_reliable_relay_attachment_frame(
             frames_tx,
+            credit,
             instance,
             frame,
             &mut product_terminal_received,
@@ -534,6 +646,7 @@ async fn forward_reliable_relay_attachment_frames(
     instance: RelayPathInstance,
     mut frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
     frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
+    credit: Arc<ReliableRelayCreditIngress>,
     terminal: ReliablePathCarrierTerminalSignal,
 ) {
     let mut product_terminal_received = false;
@@ -546,6 +659,7 @@ async fn forward_reliable_relay_attachment_frames(
                 instance,
                 &mut frames,
                 &frames_tx,
+                &credit,
                 cause,
                 product_terminal_received,
             )
@@ -586,6 +700,7 @@ async fn forward_reliable_relay_attachment_frames(
                 };
                 if !forward_reliable_relay_attachment_frame(
                     &frames_tx,
+                    &credit,
                     instance,
                     frame,
                     &mut product_terminal_received,
@@ -600,6 +715,7 @@ async fn forward_reliable_relay_attachment_frames(
                     instance,
                     &mut frames,
                     &frames_tx,
+                    &credit,
                     cause,
                     product_terminal_received,
                 )
@@ -618,71 +734,49 @@ pub(in crate::runtime) enum ReliableRelayAttachOutcome {
     RejectedDuplicate,
 }
 
-/// Actor-owned merged input, independent from synchronous attachment metadata.
-/// Exact path removal does not discard frames already admitted into this queue.
+/// Actor-owned credit state and ordered event FIFO, independent from synchronous
+/// attachment metadata. Exact path removal does not discard admitted input.
 pub(in crate::runtime) struct ReliableRelayRemoteInput {
     frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
-    /// First ordering boundary encountered by a ready-only credit fold.
+    credit: Arc<ReliableRelayCreditIngress>,
+    /// A dequeued FIFO item retained while current credit is returned first.
     pending_frame: Option<ReliableRelayRemoteFrame>,
+    prefer_credit: bool,
 }
 
 impl ReliableRelayRemoteInput {
     pub(in crate::runtime) async fn recv_frame(
         &mut self,
     ) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
-        let first = match self.pending_frame.take() {
-            Some(frame) => frame,
-            None => self
-                .frames_rx
-                .recv()
-                .await
-                .ok_or(RuntimeError::ReliablePathSessionClosed)?,
-        };
-        Ok(self.fold_ready_max_data(first))
-    }
-
-    /// MAX_DATA is a shared monotonic grant, not byte receipt or path proof.
-    /// Fold only already-ready consecutive grants: intermediate values need
-    /// no separate relay preparation, while isolated credit never waits.
-    fn fold_ready_max_data(
-        &mut self,
-        mut greatest: ReliableRelayRemoteFrame,
-    ) -> ReliableRelayRemoteFrame {
-        let (stream_id, mut max_offset) = match &greatest.frame {
-            Ok(Frame::StreamMaxData {
-                stream_id,
-                max_offset,
-            }) => (*stream_id, *max_offset),
-            _ => return greatest,
-        };
-        // Snapshot work before draining: concurrent producers cannot extend
-        // this turn. The first nonmatching item remains an exact boundary.
-        let ready = self.frames_rx.len();
-        for _ in 0..ready {
-            let Ok(next) = self.frames_rx.try_recv() else {
-                break;
-            };
-            match &next.frame {
-                Ok(Frame::StreamMaxData {
-                    stream_id: next_stream_id,
-                    max_offset: next_max,
-                }) if *next_stream_id == stream_id => {
-                    if *next_max > max_offset {
-                        max_offset = *next_max;
-                        greatest = next;
+        // Ready credit has no MPSC receive of its own. Keep a cooperative
+        // boundary even when both kinds of input are continuously ready.
+        tokio::task::coop::cooperative(async {
+            let credit = self.credit.clone();
+            loop {
+                let changed = credit.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if let Some(frame) = self.try_recv_frame() {
+                    return Ok(frame);
+                }
+                tokio::select! {
+                    () = &mut changed => {}
+                    frame = self.frames_rx.recv() => {
+                        match frame {
+                            // Store ownership before another await, including
+                            // cancellation of this receive by service arbitration.
+                            Some(frame) => self.pending_frame = Some(frame),
+                            None => return self.try_recv_frame()
+                                .ok_or(RuntimeError::ReliablePathSessionClosed),
+                        }
                     }
                 }
-                _ => {
-                    debug_assert!(self.pending_frame.is_none());
-                    self.pending_frame = Some(next);
-                    break;
-                }
             }
-        }
-        greatest
+        })
+        .await
     }
 
-    /// Returns the relay-input backlog visible at this instant.
+    /// Returns the visible FIFO backlog plus one current credit-state item.
     ///
     /// Ready-only receive batching snapshots this value before trying frames so
     /// producers cannot extend one actor turn indefinitely.
@@ -690,20 +784,39 @@ impl ReliableRelayRemoteInput {
         self.frames_rx
             .len()
             .saturating_add(usize::from(self.pending_frame.is_some()))
+            .saturating_add(usize::from(self.credit.has_pending()))
     }
 
-    /// Takes one already-queued frame without waiting.
+    /// Takes ready credit or a FIFO item without waiting. When both stay ready,
+    /// alternate their service; a sealed RESET has at most one preceding grant.
     pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<ReliableRelayRemoteFrame> {
-        let first = self
-            .pending_frame
-            .take()
-            .or_else(|| self.frames_rx.try_recv().ok())?;
-        Some(self.fold_ready_max_data(first))
+        if self.pending_frame.is_none() {
+            self.pending_frame = self.frames_rx.try_recv().ok();
+        }
+        let before_reset = self.pending_frame.as_ref().is_some_and(|item| {
+            matches!(&item.frame, Ok(Frame::StreamReset { stream_id, .. }) if *stream_id == self.credit.stream_id)
+        });
+        if (self.prefer_credit || before_reset || self.pending_frame.is_none())
+            && let Some(credit) = self.credit.take_pending()
+        {
+            self.prefer_credit = false;
+            return Some(credit);
+        }
+        let frame = self.pending_frame.take()?;
+        self.prefer_credit = true;
+        Some(frame)
     }
 
     #[cfg(test)]
     pub(in crate::runtime) fn has_buffered_frame(&self) -> bool {
-        self.pending_frame.is_some() || !self.frames_rx.is_empty()
+        self.ready_frame_count() > 0
+    }
+}
+
+impl Drop for ReliableRelayRemoteInput {
+    fn drop(&mut self) {
+        self.credit.close();
+        self.frames_rx.close();
     }
 }
 
@@ -711,6 +824,7 @@ pub(in crate::runtime) struct ReliableRelayRemoteSet {
     stream_id: StreamId,
     pub(in crate::runtime) paths: Vec<ReliableRelayRemotePath>,
     frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
+    credit: Arc<ReliableRelayCreditIngress>,
     /// Next exact attachment incarnation, or permanent exhaustion after MAX.
     next_instance_id: Option<u64>,
     membership_generation: u64,
@@ -841,10 +955,12 @@ impl ReliableRelayRemoteSet {
     ) -> (Self, ReliableRelayRemoteInput) {
         let stream_id = opened.stream().stream_id;
         let (frames_tx, frames_rx) = mpsc::channel(frame_queue);
+        let credit = Arc::new(ReliableRelayCreditIngress::new(stream_id));
         let mut set = Self {
             stream_id,
             paths: Vec::new(),
             frames_tx,
+            credit: credit.clone(),
             next_instance_id: Some(0),
             membership_generation: 0,
             desired_max_data_offset: 0,
@@ -862,7 +978,9 @@ impl ReliableRelayRemoteSet {
             set,
             ReliableRelayRemoteInput {
                 frames_rx,
+                credit,
                 pending_frame: None,
+                prefer_credit: true,
             },
         )
     }
@@ -1323,8 +1441,9 @@ impl ReliableRelayRemoteSet {
         drop(load_lease.take());
         let (stream, frames, terminal) = stream.into_handle_and_frames();
         let frames_tx = self.frames_tx.clone();
+        let credit = self.credit.clone();
         let input_forwarder = ReliableRelayInputForwarder(tokio::spawn(
-            forward_reliable_relay_attachment_frames(instance, frames, frames_tx, terminal),
+            forward_reliable_relay_attachment_frames(instance, frames, frames_tx, credit, terminal),
         ));
         let mut path = ReliableRelayRemotePath {
             path_index,

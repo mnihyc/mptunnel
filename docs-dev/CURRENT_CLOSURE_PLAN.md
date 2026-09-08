@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 23:39 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 00:10 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,107 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Reverse pair / one ablation 00:35:** DOWN throughput deficit recurs: latest
+state384.475560Mbps versus retained413.225355. Across both orders the candidate
+is384–387, controls413Mbps. Latency is not systematically worse: reverse
+candidate maxread .206452s/echo p95 .362593s/max .662985s versus control
+.275026/.634428/1.162301s; all80/80 and76/76 echoes succeed. Preserve both
+orders and the original adverse maxima, not a favorable selection.
+
+Next exact question is one temporary architectural ablation: remove only the
+new nested cooperative wrapper around RemoteInput.recv_frame. The sole
+production caller remains inside RelayServiceTurn::select's existing whole-turn
+cooperative wrapper (59fbd22); Input/Dispatch/Read rotation, actual MPSC await,
+finite ready Data collection, logical-state/FIFO fairness, cancellation and
+RESET remain unchanged. A direct unbounded consumer would invalidate this
+proof; root and independent search find none. Do not remove outer cooperation
+or call the historical uncooperative-actor defect fixed by an inner helper.
+
+Information forecast: nested charging can change yield timing and is the one
+candidate-introduced scheduling difference found on Data-only input; its actual
+critical cost and Mbps effect are unknown. An ordinary ablation can distinguish
+that from retained state/Native-distribution effects. Recovering the recurrent
+26–29Mbps loss is plausible only if this boundary is causal; no gain/regression
+is also plausible. First run existing actor-yield/fairness tests and latest-state
+controls, then one ordinary build and affected mixed DOWN and UP. No new knobs,
+timers, profile or best-run repeat. Absent benefit stops this branch; restored
+DOWN cannot authorize sacrificing the demonstrated mixed-UP gain or latency.
+The current state model and all adverse evidence are an intermediary checkpoint,
+not a release/performance promotion.
+
+**Ordinary result 00:26:** all three uploads settle exact bytes. TCP
+422.069→421.608Mbps, QUIC440.581→437.934, mixed325.867→412.793. Mixed
+max confirmation1.192361→.697809s improves; max local write .434806→.540541s
+is adverse. Mixed target service improves in every fixed body window, not only
+reply accounting. Q first confirmation1.112591→.209224s improves while max
+later gap .307224→.896869s worsens; its first bin carries only .096Mbps.
+This suggests a split startup episode but does not locate the exact max gap.
+
+Mixed DOWN is adverse/ambiguous:412.872664→386.554728Mbps, max read gap
+.265968→.385547s; echoes79/79→78/78, p50 .362451→.305074s and p95
+.576166→.556878s improve, max .667799→.826614s worsens. Do not declare
+non-downgrade from the upload gain. The immediate bounded discriminator is
+existing DOWN path/native/queue/resource telemetry plus old/new Data-only
+input service comparison. There is no new trace, runtime edit, threshold or
+stress rerun yet. Determine whether evidence supports a changed service rule,
+path allocation/Native realization, or insufficient attribution. If only the
+last is supported, one predeclared reverse-order healthy DOWN pair (candidate
+then retained control), with every outcome retained, can test recurrence;
+it is not permission for repeated best-run selection. A systematic adverse
+result stops promotion and requires its critical-path evidence before code.
+
+**DOWN discriminator 00:29:** independent/root review finds identical pure
+Data FIFO order, entry-count batching, payload quantum and receive ceiling.
+Current empty-input async fallback can incur an additional cooperation boundary;
+pending advancing MAX can interrupt a Data batch earlier. Neither is shown to
+cause the measured deficit. MAX here grants client request bytes, not the bulk
+download bytes: do not invent a high-volume reverse-credit dependency. The
+bounded extra-lock/Notify/yield hypothesis is not authorization to tweak code.
+
+Telemetry L2→L41 shows server-to-client Native ACK totals near2.2945/2.2922GB
+despite less candidate useful body. TCP shares redistribute and QUIC increases;
+this is not winning-Original attribution or a proved copy count. Candidate
+client TCP Recv-Q peak falls237472→26064B and is0 in samples around its worst
+gap. Different transport/queue histories remain a competing explanation;
+no measured client-input critical interval selects a new owner. The predeclared
+candidate-then-control reverse pair is running unchanged; preserve it entirely.
+
+**Latest-state checks 00:18:** all five actual-input/lifecycle/fairness controls
+pass, as do 773 affected sender/request/response/TCP/QUIC/control/server checks
+in 3.68s. Default test build is warning-free 1m32s. Root and independent runtime
+review find no scope/authority/wake/cancellation blocker. The old final-only fold
+is removed; only matching logical MAX enters shared state. Source is frozen for
+one default-feature release build, followed by the four declared healthy cells.
+The comparator report LATEST_CREDIT_SERVICE_20260909 retains all 166 bulk bins
+and 79 echo samples; no candidate or performance acceptance is implied by GREEN.
+
+**Latest-state RED 00:10:** both actual publisher/attachment-forwarder tests
+reach the intended two versus one credit-turn assertion after isolated credit,
+greatest exact source, unchanged ACK/Data FIFO/content and full drain checks.
+The two prior closed/order controls pass; the default test build is warning-free
+59.13s. LATEST_CREDIT_INPUT_RED_20260909.patch preserves the test-only state.
+The completion witness observes the actual forwarding boundary independently
+of queue representation, not an invented raw-queue occupancy condition.
+
+Implementation is now authorized only for one shared latest-credit ingress in
+request/attachment.rs, replacing the final-only fold. Independent test work
+migrates the obsolete MAX/ACK barrier expectation and adds the declared logical
+RESET, fairness, cancellation and provenance controls. The model's authority
+claim is max(max(a,b),c)=max(a,max(b,c)); ACK/Data events remain untouched.
+Neither that algebra nor RED proves a wall-clock gain. Fair arbitration permits
+at most one pending-credit delivery between continuously ready FIFO deliveries;
+an isolated credit has no batching wait. This is service ordering, not a new
+time/byte/rate threshold. Same-stream RESET is the only protocol credit seal;
+opposite FIN and carrier failure do not revoke already received logical credit.
+
+The retained ordinary mixed DOWN control is complete: 2064426284B in
+40.001220s (412.872664Mbps), first body .580507s, max read gap .265968s;
+79/79 echoes, p95 576.166ms. This 40s download is intentionally partial, not a
+completed 8GiB response. Healthy UP controls remain TCP422.069, QUIC440.581,
+mixed325.867Mbps with mixed max confirmation1.192361s. Freeze the replacement
+once after GREEN/audit, then compare these affected four cells; no lab/build
+overlap, no parameter or impairment adjustment, no claimed acceptance yet.
 
 **Healthy attribution / next model23:56:** fcc0b22 diagnostic completes
 1748172800B/40.796490s, maxconfirmation1.728562s. All187 Original replies
@@ -952,13 +1053,14 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 
 - Root owns builds/labs. Response claim comparisons and the subsequent MAX-fold
   mechanism/ordinary UP pair are complete; all adverse outcomes remain visible.
-  Current production candidate is the finite ready-MAX input fold only.
-  Next is its healthy mixed response-service observer as declared above.
+  The current replacement candidate is shared latest-credit input state; its
+  predecessor is fcc0b22's finite ready-MAX fold. The completed healthy observer
+  selected this bounded transaction; do not repeat that capture without cause.
   Owned Docker only: no sudo, host shaping, outside-repo work or build/lab overlap.
 - Ordinary candidate:`./.tmp/reflection/bin/ready-credit-20260908/mptunnel`.
   Ordinary comparator:`./.tmp/reflection/bin/response-claim-20260908/mptunnel`.
   Earlier comparator:`./.tmp/reflection/bin/ack-support-20260908/mptunnel`.
-  Current diagnostic:`./.tmp/reflection/bin/response-return-service-20260908/mptunnel`.
+  Current diagnostic:`./.tmp/reflection/bin/ready-credit-return-20260908/mptunnel`.
   Previous forward diagnostic:`./.tmp/reflection/bin/post-ack-forward-20260908/mptunnel`.
   Previous reply diagnostic:`./.tmp/reflection/bin/reply-residence-20260908/mptunnel`.
   Do not use diagnostic target/release as an ordinary comparator.

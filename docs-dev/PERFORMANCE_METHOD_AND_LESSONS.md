@@ -262,6 +262,16 @@ does not authorize latent topology inference or a universal Internet model.
   to force aggregation, permanent exploration starvation or renewable waits.
 - No proof of new ordering without half-close/cancel/finalization boundaries;
   no actor-fairness claim without executor cooperation and finite handler work.
+- Do not mistake preservation of an old event trace for a required authority
+  boundary. The final-only MAX fold retained ACK barriers even though RFC8.4
+  makes credit one shared monotonic maximum independent of byte receipt. It
+  improved healthy mixed throughput but left long confirmation gaps and
+  ACK-separated superseded credit work. The replacement therefore tests one
+  logical state owner, not progressively wider event batching. A proposed
+  per-carrier terminal watermark was withdrawn because no authority violation
+  justified it; logical RESET/cancellation still closes the owner. This removes
+  an unsupported dependency, not permission to reorder ACK/Data evidence or
+  predict practical speed from the max algebra alone.
 - More validation is not automatically safer service. The prepared-source
   candidate froze every writer's ready/occupied generation. An unselected
   loser withdrawing then invalidated the unchanged winner; two real retries

@@ -10,6 +10,8 @@ use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStre
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use bytes::Bytes;
 use futures::FutureExt;
+use std::sync::Weak;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 fn opened_stream(
@@ -56,6 +58,54 @@ fn opened_stream_at(
 
 // The receive boundary starts at actually published/decoded Product frames;
 // it is not an encrypted transport or full relay-performance fixture.
+type InputForwarderObservers = HashMap<RelayPathInstance, Weak<AtomicUsize>>;
+static INPUT_FORWARDER_OBSERVERS: OnceLock<Mutex<InputForwarderObservers>> = OnceLock::new();
+
+pub(super) fn observe_attachment_input_processed(instance: RelayPathInstance) {
+    if let Some(completed) = INPUT_FORWARDER_OBSERVERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(&instance)
+        .and_then(Weak::upgrade)
+    {
+        completed.fetch_add(1, Ordering::Release);
+    }
+}
+
+struct InputForwarderWitness {
+    instance: RelayPathInstance,
+    completed: Arc<AtomicUsize>,
+}
+
+impl InputForwarderWitness {
+    fn new(instance: RelayPathInstance) -> Self {
+        let completed = Arc::new(AtomicUsize::new(0));
+        assert!(
+            INPUT_FORWARDER_OBSERVERS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap()
+                .insert(instance, Arc::downgrade(&completed))
+                .is_none()
+        );
+        Self {
+            instance,
+            completed,
+        }
+    }
+}
+
+impl Drop for InputForwarderWitness {
+    fn drop(&mut self) {
+        INPUT_FORWARDER_OBSERVERS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&self.instance);
+    }
+}
+
 struct ReadyMaxDataInput {
     remotes: ReliableRelayRemoteSet,
     input: ReliableRelayRemoteInput,
@@ -63,6 +113,7 @@ struct ReadyMaxDataInput {
     _client_commands: [ReliablePathCommandReceivers; 2],
     publisher: std::sync::Arc<ResponseStreamBinding>,
     publication_commands: [ReliablePathCommandReceivers; 2],
+    processed: [InputForwarderWitness; 2],
 }
 
 impl ReadyMaxDataInput {
@@ -92,6 +143,7 @@ impl ReadyMaxDataInput {
             ),
             ResponseStreamAttachOutcome::Attached,
         );
+        let processed = [remotes.paths[0].instance(), remotes.paths[1].instance()];
         Self {
             remotes,
             input,
@@ -99,6 +151,7 @@ impl ReadyMaxDataInput {
             _client_commands: [a_commands, b_commands],
             publisher,
             publication_commands: [a_publications, b_publications],
+            processed: processed.map(InputForwarderWitness::new),
         }
     }
 
@@ -125,7 +178,8 @@ impl ReadyMaxDataInput {
         })
     }
 
-    async fn admit(&mut self, path: usize, frame: Result<Frame, RuntimeError>, ready: usize) {
+    async fn admit(&mut self, path: usize, frame: Result<Frame, RuntimeError>) {
+        let completed = self.processed[path].completed.load(Ordering::Acquire);
         self.frames[path]
             .send(frame)
             .await
@@ -133,40 +187,49 @@ impl ReadyMaxDataInput {
         // This bounds fixture scheduling/cleanup only; it is not a Product
         // latency target, batching timer, or change to any queue capacity.
         tokio::time::timeout(Duration::from_secs(1), async {
-            while self.input.ready_frame_count() < ready {
+            while self.processed[path].completed.load(Ordering::Acquire) == completed {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the real forwarder must fill the finite ready backlog");
-        assert_eq!(self.input.ready_frame_count(), ready);
+        .expect("the actual attachment forwarder must finish processing this admitted input");
     }
 
     fn take_ready(&mut self, asynchronous: bool) -> ReliableRelayRemoteFrame {
+        Self::take_ready_input(&mut self.input, asynchronous)
+    }
+
+    fn take_ready_input(
+        input: &mut ReliableRelayRemoteInput,
+        asynchronous: bool,
+    ) -> ReliableRelayRemoteFrame {
         if asynchronous {
-            self.input
+            input
                 .recv_frame()
                 .now_or_never()
-                .expect("ready-only folding must never wait for another grant")
+                .expect("ready input must never wait for another grant")
                 .expect("admitted input")
         } else {
-            self.input.try_recv_frame().expect("admitted ready input")
+            input.try_recv_frame().expect("admitted ready input")
         }
     }
 }
 
-async fn ready_max_data_prefix_case(asynchronous: bool) {
+async fn latest_max_data_crosses_ack_case(asynchronous: bool) {
     let stream_id = StreamId(809);
     let mut fixture = ReadyMaxDataInput::new(stream_id);
     assert!(fixture.input.recv_frame().now_or_never().is_none());
     assert!(fixture.input.try_recv_frame().is_none());
     let limits = MuxLimits::default();
     let initial = limits.max_stream_window_bytes;
-    let greatest = initial
+    let first = initial
         .checked_add(reliable_relay_buffer_len(limits) as u64)
         .unwrap();
-    let [a_initial, b_initial] = fixture.publish(initial);
-    fixture.admit(1, Ok(b_initial.clone()), 1).await;
+    let greatest = first
+        .checked_add(reliable_relay_buffer_len(limits) as u64)
+        .unwrap();
+    let [_a_initial, b_initial] = fixture.publish(initial);
+    fixture.admit(1, Ok(b_initial.clone())).await;
     let isolated = fixture.take_ready(asynchronous);
     assert_eq!(isolated.instance, fixture.remotes.paths[1].instance());
     assert!(matches!(isolated.frame, Ok(frame) if frame == b_initial));
@@ -175,19 +238,27 @@ async fn ready_max_data_prefix_case(asynchronous: bool) {
         "an isolated grant is not delayed"
     );
 
-    let [a_latest, b_latest] = fixture.publish(greatest);
-    fixture.admit(0, Ok(a_initial), 1).await;
-    fixture.admit(1, Ok(b_latest.clone()), 2).await;
-    fixture.admit(0, Ok(a_latest), 3).await;
+    let [a_first, _] = fixture.publish(first);
+    let [_, b_latest] = fixture.publish(greatest);
+    let ack = Frame::StreamAck {
+        stream_id,
+        complete: false,
+        ranges: vec![OffsetRange { start: 0, end: 1 }],
+    };
     let data = Frame::StreamData {
         stream_id,
         offset: 0,
         payload: Bytes::from_static(b"ready response"),
     };
-    fixture.admit(0, Ok(data.clone()), 4).await;
+    // All four inputs cross the real forwarders before any actor receive.
+    // ACK is kept as evidence, but is not an authority barrier for MAX.
+    fixture.admit(0, Ok(a_first)).await;
+    fixture.admit(0, Ok(ack.clone())).await;
+    fixture.admit(1, Ok(b_latest)).await;
+    fixture.admit(1, Ok(data.clone())).await;
     let ready_before = fixture.input.ready_frame_count();
     let mut grants = Vec::new();
-    let mut response = None;
+    let mut non_credit = Vec::new();
     for _ in 0..ready_before {
         let incoming = fixture.take_ready(asynchronous);
         match incoming.frame {
@@ -196,17 +267,23 @@ async fn ready_max_data_prefix_case(asynchronous: bool) {
                 max_offset,
             }) => {
                 assert_eq!(id, stream_id);
-                assert!(max_offset == initial || max_offset == greatest);
+                assert!(max_offset == first || max_offset == greatest);
                 grants.push((incoming.instance, max_offset));
             }
             Ok(frame) => {
-                response = Some((incoming.instance, frame));
-                break;
+                non_credit.push((incoming.instance, frame));
             }
             Err(error) => panic!("legal publication/input must not fail: {error}"),
         }
     }
-    assert_eq!(response, Some((fixture.remotes.paths[0].instance(), data)));
+    assert_eq!(
+        non_credit,
+        vec![
+            (fixture.remotes.paths[0].instance(), ack),
+            (fixture.remotes.paths[1].instance(), data),
+        ],
+        "every ACK and Data frame retains its exact contents, source and non-credit FIFO order",
+    );
     assert_eq!(grants.iter().map(|(_, grant)| *grant).max(), Some(greatest));
     assert_eq!(
         grants
@@ -215,36 +292,38 @@ async fn ready_max_data_prefix_case(asynchronous: bool) {
             .unwrap()
             .0,
         fixture.remotes.paths[1].instance(),
-        "the first greatest grant retains its actual source; an equal sibling cannot replace it",
+        "the greatest grant retains its actual publishing attachment",
     );
     assert_eq!(fixture.input.ready_frame_count(), 0);
     assert!(fixture.input.try_recv_frame().is_none());
-    // Proposed MAX-only receive-fold model RED: all authority, order, exact
-    // source, and payload checks above pass before counting actor input turns.
+    // Proposed logical latest-credit model RED, not a pre-existing RFC
+    // violation or a CPU/time assertion. The consecutive-fold implementation
+    // passes all conservation/authority checks above before failing here.
     assert_eq!(
         grants.len(),
         1,
-        "one finite ready MAX prefix must expose one greatest grant, not one actor preparation turn per superseded grant"
+        "ACK-separated already-admitted MAX revisions must expose one latest grant, not two actor credit turns"
     );
     assert_eq!(grants[0], (fixture.remotes.paths[1].instance(), greatest));
 }
 
 #[tokio::test]
-async fn ready_max_data_prefix_folds_before_response_async() {
-    ready_max_data_prefix_case(true).await;
+async fn latest_max_data_crosses_ack_before_response_async() {
+    latest_max_data_crosses_ack_case(true).await;
 }
 
 #[tokio::test]
-async fn ready_max_data_prefix_folds_before_response_try() {
-    ready_max_data_prefix_case(false).await;
+async fn latest_max_data_crosses_ack_before_response_try() {
+    latest_max_data_crosses_ack_case(false).await;
 }
 
 #[tokio::test]
-async fn ready_max_data_prefix_preserves_every_nonmatching_boundary() {
+async fn latest_max_data_preserves_fifo_identity_and_reset_fence() {
     let stream_id = StreamId(810);
     for asynchronous in [false, true] {
-        // The different-stream frame is a defensive malformed-input boundary,
-        // not a claim that the real carrier demultiplexer accepts it.
+        // Credit may cross these events; each event itself remains unchanged.
+        // The different-stream MAX is a defensive malformed-input check, not
+        // a claim that the authenticating carrier accepts another stream ID.
         let boundaries = [
             Some(Frame::StreamAck {
                 stream_id,
@@ -260,10 +339,6 @@ async fn ready_max_data_prefix_preserves_every_nonmatching_boundary() {
                 stream_id,
                 final_offset: 0,
             }),
-            Some(Frame::StreamReset {
-                stream_id,
-                reason: ResetReason::RemoteClosed,
-            }),
             Some(Frame::StreamMaxData {
                 stream_id: StreamId(stream_id.0 + 1),
                 max_offset: u64::MAX,
@@ -274,46 +349,102 @@ async fn ready_max_data_prefix_preserves_every_nonmatching_boundary() {
             let mut fixture = ReadyMaxDataInput::new(stream_id);
             let first = MuxLimits::default().max_stream_window_bytes;
             let [a_first, _b_first] = fixture.publish(first);
-            let [_a_last, b_last] = fixture.publish(first + 1);
-            fixture.admit(0, Ok(a_first.clone()), 1).await;
+            let [a_last, b_last] = fixture.publish(first + 1);
+            let older = a_first.clone();
+            let equal = b_last.clone();
+            fixture.admit(0, Ok(a_first)).await;
             fixture
                 .admit(
                     0,
                     boundary
                         .clone()
                         .ok_or(RuntimeError::ReliablePathSessionClosed),
-                    2,
                 )
                 .await;
-            fixture.admit(1, Ok(b_last.clone()), 3).await;
-            let first_input = fixture.take_ready(asynchronous);
-            assert_eq!(first_input.instance, fixture.remotes.paths[0].instance());
-            assert!(matches!(first_input.frame, Ok(frame) if frame == a_first));
-            assert_eq!(
-                fixture.input.ready_frame_count(),
-                2,
-                "a deferred boundary remains visible to ready-batch accounting"
-            );
-            let middle = fixture.take_ready(asynchronous);
-            assert_eq!(middle.instance, fixture.remotes.paths[0].instance());
-            match boundary {
-                Some(expected) => assert!(matches!(middle.frame, Ok(frame) if frame == expected)),
-                None => assert!(matches!(
-                    middle.frame,
-                    Err(RuntimeError::ReliablePathSessionClosed)
-                )),
+            fixture.admit(1, Ok(b_last.clone())).await;
+            if boundary.is_some() {
+                fixture.admit(0, Ok(a_last)).await;
+            } else {
+                // A's actual error terminates that forwarder, not the shared
+                // authority: B remains able to publish and repeat the grant.
+                fixture.admit(1, Ok(b_last)).await;
             }
-            assert_eq!(fixture.input.ready_frame_count(), 1);
-            let last = fixture.take_ready(asynchronous);
-            assert_eq!(last.instance, fixture.remotes.paths[1].instance());
-            assert!(matches!(last.frame, Ok(frame) if frame == b_last));
+            let mut grants = Vec::new();
+            let mut preserved = 0;
+            while fixture.input.has_buffered_frame() {
+                let incoming = fixture.take_ready(asynchronous);
+                match incoming.frame {
+                    Ok(Frame::StreamMaxData {
+                        stream_id: id,
+                        max_offset,
+                    }) if id == stream_id => {
+                        grants.push((incoming.instance, max_offset));
+                    }
+                    other => {
+                        assert_eq!(incoming.instance, fixture.remotes.paths[0].instance());
+                        match &boundary {
+                            Some(expected) => {
+                                assert!(matches!(other, Ok(frame) if frame == *expected))
+                            }
+                            None => assert!(matches!(
+                                other,
+                                Err(RuntimeError::ReliablePathSessionClosed)
+                            )),
+                        }
+                        preserved += 1;
+                    }
+                }
+            }
+            assert_eq!(preserved, 1);
             assert_eq!(fixture.input.ready_frame_count(), 0);
+            assert_eq!(
+                grants,
+                vec![(fixture.remotes.paths[1].instance(), first + 1)],
+                "only the strict greatest matching-stream grant survives; its equal sibling cannot replace the first greatest instance"
+            );
+            fixture.admit(1, Ok(equal)).await;
+            fixture.admit(1, Ok(older)).await;
+            assert!(
+                !fixture.input.has_buffered_frame(),
+                "equal and older grants cannot create new credit turns after the greatest was consumed"
+            );
+            assert!(fixture.input.try_recv_frame().is_none());
         }
+
+        let mut fixture = ReadyMaxDataInput::new(stream_id);
+        let first = MuxLimits::default().max_stream_window_bytes;
+        let [a_first, _] = fixture.publish(first);
+        fixture.admit(0, Ok(a_first.clone())).await;
+        let isolated = fixture.take_ready(asynchronous);
+        assert_eq!(isolated.instance, fixture.remotes.paths[0].instance());
+        assert!(matches!(isolated.frame, Ok(frame) if frame == a_first));
+        // Consuming the isolated grant makes ordinary fairness prefer FIFO.
+        // The later pending grant must nevertheless be returned before RESET.
+        let [_, b_greatest] = fixture.publish(first + 1);
+        let [_, b_after_reset] = fixture.publish(first + 2);
+        let reset = Frame::StreamReset {
+            stream_id,
+            reason: ResetReason::RemoteClosed,
+        };
+        fixture.admit(1, Ok(b_greatest.clone())).await;
+        fixture.admit(0, Ok(reset.clone())).await;
+        fixture.admit(1, Ok(b_after_reset)).await;
+        let before_reset = fixture.take_ready(asynchronous);
+        assert_eq!(before_reset.instance, fixture.remotes.paths[1].instance());
+        assert!(matches!(before_reset.frame, Ok(frame) if frame == b_greatest));
+        let terminal = fixture.take_ready(asynchronous);
+        assert_eq!(terminal.instance, fixture.remotes.paths[0].instance());
+        assert!(matches!(terminal.frame, Ok(frame) if frame == reset));
+        assert!(
+            !fixture.input.has_buffered_frame(),
+            "same-stream RESET seals the logical credit owner; an already-processed later grant cannot resurrect it"
+        );
+        assert!(fixture.input.try_recv_frame().is_none());
     }
 }
 
 #[tokio::test]
-async fn ready_max_data_prefix_drains_closed_input_without_waiting() {
+async fn latest_max_data_drains_closed_input_and_cancelled_wait() {
     for asynchronous in [false, true] {
         let stream_id = StreamId(811);
         let mut fixture = ReadyMaxDataInput::new(stream_id);
@@ -322,22 +453,150 @@ async fn ready_max_data_prefix_drains_closed_input_without_waiting() {
             stream_id,
             final_offset: 0,
         };
-        fixture.admit(0, Ok(grant.clone()), 1).await;
-        fixture.admit(0, Ok(fin.clone()), 2).await;
-        fixture.input.frames_rx.close();
-        let first = fixture.take_ready(asynchronous);
-        assert!(matches!(first.frame, Ok(frame) if frame == grant));
-        assert_eq!(fixture.input.ready_frame_count(), 1);
-        assert!(fixture.input.has_buffered_frame());
-        let last = fixture.take_ready(asynchronous);
-        assert!(matches!(last.frame, Ok(frame) if frame == fin));
-        assert_eq!(fixture.input.ready_frame_count(), 0);
-        assert!(!fixture.input.has_buffered_frame());
-        assert!(fixture.input.try_recv_frame().is_none());
+        assert!(fixture.input.recv_frame().now_or_never().is_none());
+        fixture.admit(0, Ok(grant.clone())).await;
+        fixture.admit(0, Ok(fin.clone())).await;
+        let instance = fixture.remotes.paths[0].instance();
+        let ReadyMaxDataInput {
+            mut remotes,
+            mut input,
+            frames,
+            _client_commands,
+            publisher: _publisher,
+            publication_commands: _publication_commands,
+            processed: _processed,
+        } = fixture;
+        // Exact attachment removal cannot revoke admitted shared credit.
+        // Drop both real forwarding owners and wait only for task cleanup,
+        // leaving the input to drain its already-admitted state and FIFO.
+        drop(remotes.remove_path_instance(instance));
+        drop(remotes);
+        for sender in &frames {
+            tokio::time::timeout(Duration::from_secs(1), sender.closed())
+                .await
+                .expect("removed attachment input closes");
+        }
+        assert_eq!(input.ready_frame_count(), 2);
+        let mut seen_grant = false;
+        let mut seen_fin = false;
+        for remaining in [1, 0] {
+            let incoming = ReadyMaxDataInput::take_ready_input(&mut input, asynchronous);
+            assert_eq!(incoming.instance, instance);
+            match incoming.frame {
+                Ok(frame) if frame == grant => {
+                    assert!(!seen_grant);
+                    seen_grant = true;
+                }
+                Ok(frame) if frame == fin => {
+                    assert!(!seen_fin);
+                    seen_fin = true;
+                }
+                _ => panic!("closed logical input must preserve both admitted frames"),
+            }
+            assert_eq!(input.ready_frame_count(), remaining);
+        }
+        assert!(seen_grant && seen_fin);
+        assert!(!input.has_buffered_frame());
+        assert!(input.try_recv_frame().is_none());
         assert!(matches!(
-            fixture.input.recv_frame().now_or_never(),
+            input.recv_frame().now_or_never(),
             Some(Err(RuntimeError::ReliablePathSessionClosed))
         ));
+
+        let mut fixture = ReadyMaxDataInput::new(stream_id);
+        assert!(fixture.input.recv_frame().now_or_never().is_none());
+        let [grant, _] = fixture.publish(MuxLimits::default().max_stream_window_bytes);
+        fixture.admit(0, Ok(grant.clone())).await;
+        assert!(matches!(fixture.take_ready(asynchronous).frame, Ok(frame) if frame == grant));
+        let later = fixture.publish(MuxLimits::default().max_stream_window_bytes + 1);
+        drop(fixture.input);
+        for (sender, grant) in fixture.frames.iter().zip(later) {
+            let _ = sender.send(Ok(grant)).await;
+            tokio::time::timeout(Duration::from_secs(1), sender.closed())
+                .await
+                .expect("cancelled logical input must release each real forwarder");
+        }
+        // Raw stream-ID reuse is not reuse of the cancelled input owner.
+        let mut replacement = ReadyMaxDataInput::new(stream_id);
+        assert!(replacement.input.try_recv_frame().is_none());
+        assert!(replacement.input.recv_frame().now_or_never().is_none());
+    }
+}
+
+#[tokio::test]
+async fn latest_max_data_and_ready_fifo_have_fair_service() {
+    for asynchronous in [false, true] {
+        let stream_id = StreamId(812);
+        let mut fixture = ReadyMaxDataInput::new(stream_id);
+        let expected = vec![
+            Frame::StreamAck {
+                stream_id,
+                complete: false,
+                ranges: vec![
+                    OffsetRange { start: 0, end: 3 },
+                    OffsetRange { start: 4, end: 7 },
+                ],
+            },
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from_static(b"ordered"),
+            },
+            Frame::StreamAck {
+                stream_id,
+                complete: true,
+                ranges: vec![OffsetRange { start: 0, end: 7 }],
+            },
+        ];
+        for frame in &expected {
+            fixture.admit(0, Ok(frame.clone())).await;
+        }
+        let mut preserved = Vec::new();
+        let mut classes = Vec::new();
+        // There are two continuously ready input classes. Replenish actual
+        // credit before each take; one pair of turns must service both classes,
+        // not drain an unbounded stream of credits before the queued FIFO.
+        for revision in 0..2 * expected.len() {
+            let offset = MuxLimits::default().max_stream_window_bytes + revision as u64;
+            let [_, grant] = fixture.publish(offset);
+            fixture.admit(1, Ok(grant)).await;
+            let incoming = fixture.take_ready(asynchronous);
+            match incoming.frame {
+                Ok(Frame::StreamMaxData {
+                    stream_id: id,
+                    max_offset,
+                }) => {
+                    assert_eq!(id, stream_id);
+                    assert_eq!(max_offset, offset);
+                    assert_eq!(incoming.instance, fixture.remotes.paths[1].instance());
+                    classes.push(true);
+                }
+                Ok(frame) => {
+                    assert_eq!(incoming.instance, fixture.remotes.paths[0].instance());
+                    preserved.push(frame);
+                    classes.push(false);
+                }
+                Err(error) => panic!("ready source input cannot fail: {error}"),
+            }
+        }
+        assert_eq!(
+            preserved, expected,
+            "both ACKs and the Data frame retain exact FIFO evidence"
+        );
+        assert!(
+            classes.chunks_exact(2).all(|pair| pair[0] != pair[1]),
+            "a continuously updated latest grant and a ready FIFO each receive service"
+        );
+        assert!(fixture.input.ready_frame_count() <= 1);
+        if fixture.input.has_buffered_frame() {
+            let incoming = fixture.take_ready(asynchronous);
+            assert_eq!(incoming.instance, fixture.remotes.paths[1].instance());
+            assert!(
+                matches!(incoming.frame, Ok(Frame::StreamMaxData { stream_id: id, .. }) if id == stream_id)
+            );
+        }
+        assert_eq!(fixture.input.ready_frame_count(), 0);
+        assert!(fixture.input.try_recv_frame().is_none());
     }
 }
 

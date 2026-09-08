@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 14:55 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 15:23 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -10,7 +10,58 @@ approaches, remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`.
 Detailed evidence is linked below; shortening obsolete next-action prose does
 not discard findings, adverse results or acceptance gates.
 
-## Active transaction: remaining winning-reply service hold
+## Active transaction: native claimant owner admission
+
+**Pre-change decision15:23:** the completed reply/cost joins below select a
+reachable local service boundary, not a universal congestion explanation.
+Two advisory `owner.lock()` acquisitions in `claim_prepared_request_data` can
+park a native writer's executor thread while the Product actor holds its mutex
+for ACK/recovery. The final Native-fenced acquisition already uses a prearmed
+nonblocking try-lock; the two earlier acquisitions do not. Origin9720e4b
+addressed the lock cycle, but absence of a lock cycle does not ensure responsive
+native input service. An empty source check can also wait behind that owner.
+
+**Question / competing causes:** does the actual prepared producer return
+without blocking when either advisory acquisition meets retained Product
+ownership? Actor work and FIFO input backpressure remain distinct causes of
+the captured gaps. Claim elapsed includes contention and scheduling; it does
+not measure mutex waiting separately or prove it caused every held reply.
+
+**Model / predicted correction:** use the existing freshly prearmed try-lock
+at each writer acquisition and return its existing Busy outcome on contention.
+At the second cut, discard the advisory frame/receipt and retry current state
+after unlock. Preserve exact registration/source/Ready/Native checks, final
+fence, U→Original conservation, cancellation and all admission policy. Busy is
+not evidence of a bad path or authority to select Backup. Actor-side ownership
+remains serialized. No new timer, queue, coalescing, controller or threshold.
+
+**Smallest action / falsifier:** test-only actual producer controls retain the
+real Product mutex in another thread at each cut. Require Busy before release,
+no committed byte/flight/charge change, unlock-before-first-poll wake and the
+same lowest-source claim after release. Bound only test cleanup so the old
+blocking implementation fails rather than hangs. Uncontended claims and stale
+registration/terminal refusal remain opposite cases. Independently audit
+fresh arming after the first unlock: reusing a pre-own-unlock wait could spin.
+Only a real RED permits runtime editing. Then focused GREEN and one ordinary
+candidate/parent pair on the unchanged profile, retaining full completion,
+phase/gap and cost evidence. A worse/ambiguous result stops promotion; no
+diagnostic-rate acceptance or unrelated model expansion.
+
+## Completed discriminator: remaining winning-reply service hold
+
+**Executed15:00:** warning-free diagnostic build3m33s; all observer hooks
+archived/reversed before capture. Runner0,366018560 exact bytes/43.726528s;
+maxconfirmation4.375291s, maxwrite4.114246s. It does NOT reproduce the ordinary
+11s gap and cannot establish better ordinary performance.4371total log lines,
+44service samples; products/probes stopped. Full raw diagnostic preserved.
+Exact winning-reply joins and aligned nested-cost analysis are complete in
+COPY_DEBT_SERVICE_20260908. No additional runtime fix, build or lab is running.
+The4.374s F639 hold is mostly before decode; F737 includes1.203s already-decoded
+local residence. F821 has at least2.722s preceding reader-send-awaited overlap,
+but different cost composition from F737/F68. Neither global ACK cost nor
+recovery cost alone explains every hold.73 winning mux advances all reach the
+local writer within4ms after mux. Native-writer owner contention is a source-
+reachable mechanism to falsify next, not a conclusion from one aggregate.
 
 **Issue / observed failure:** ordinary9ea25e2 completes254083072 exact bytes in
 48.973579s, but maximum confirmation gap remains11.042148s. Candidate Rc433
@@ -36,9 +87,8 @@ observer on9ea25e2. Add nested synchronous scopes for recovery range preparation
 (two phases), complete target selection, Native resolution, Product projection,
 queued-copy debt, repair Apply and its fenced bookkeeping. No per-attempt logs,
 new harness/profile, target-observation cache or runtime policy correction.
-The reused hooks plus seven scopes are temporarily applied; diagnostic build
-is running. Independent review precedes capture; archive and reverse all hooks
-before executing the frozen diagnostic binary. No ordinary run is active.
+The reused hooks plus seven scopes passed independent review and were reversed
+before running the frozen diagnostic binary. No ordinary run is active.
 
 **Falsifier / stop / acceptance:** exact winning-frame joins precede attribution.
 Prompt decode/mux rejects that local stage; prepublication/predecode delays
@@ -151,10 +201,11 @@ above500Mbps can be buffered observation, not wire capacity.
 ## Execution, evidence and continuity
 
 - Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
-  overlap. Products/probes stopped; origins retained. Diagnostic build running.
+  overlap. Products/probes stopped; origins retained. No build/lab running.
 - Normal frozen candidate:`./.tmp/reflection/bin/copy-debt-20260908/mptunnel`.
   Normal parent:`./.tmp/reflection/bin/prepared-idle-20260908/mptunnel`.
-  target/release is being rebuilt for diagnostics: do not use it as ordinary.
+  Diagnostic: `./.tmp/reflection/bin/copy-debt-service-20260908/mptunnel`.
+  target/release is the diagnostic binary: do not use it as ordinary.
 - Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
   No deletion this turn; ample root space. User7lines must stay unstaged.
 - Telegram last meaningful report about2026-09-08 06:23UTC; next nonurgent

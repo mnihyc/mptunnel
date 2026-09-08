@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 15:49 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 16:14 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -40,6 +40,48 @@ is local native acceptance, not remote arrival. Accepted ownership does not
 prove protected write completion; duplicate arrival does not identify a winner.
 Follow the earliest supported held boundary and retain unknown sub-stages.
 No controller/resource/threshold correction without a real counterexample.
+
+**Execution16:06:** source and independent whole-overlay audits pass; diagnostic
+build3m34s, warning-free. Exact10-file temporary observer patch archived as
+QOS_FORWARD_PREFIX_TRACE_20260908.patch and all source hooks reversed before
+capture. Frozen qos-forward-prefix-20260908 binary now runs one unchanged
+profile. Normal e476308 stays separate. Local success is not peer receipt;
+QUIC split/coalesced byte coverage and connection-local H3 identities must be
+joined honestly. Sparse mux events may leave duplicate winner ambiguous.
+
+**Measured16:07:** complete374669312B/65.783216s, maxconfirmation5.592993s,
+maxwrite3.933834s; diagnostic performance is not ordinary acceptance.
+Independently checked18779 Original commits cover
+exactly[0,374669312); all24009 Original/copy commits have successful local
+writes, and applied ACK release matches total. Full raw capture retained in
+QOS_FORWARD_PREFIX_20260908.raw.tar.gz. No build/lab running.
+
+**Exact next boundary16:14:** QoS F185133452 andF187796428 holds3.432533/2.661961s
+release within1ms of authenticated decode. Longest late F298838412 hold4.752859s
+is won by a QUIC repair locally accepted9.751s before decode, then mux+5ms.
+At admission5490376 preceding repair payload bytes were accepted but not
+decoded; this is not yet native queue attribution. Between its predecessor
+decode and winning decode4.750s later, ordinary QUIC decodes6970816B on the
+same connection. This falsifies connection-wide decode absence but leaves
+native ordered-stream delay versus per-repair routing/reader service.
+
+**Bounded continuation / falsifier:** existing repair reader awaits routing
+after each decoded frame and also admits requalification records invisible to
+StreamData-only traces. Reuse the frozen-stage overlay and add only before-read,
+read-complete and route-complete timing for that reader (including nondata
+records), then one unchanged-profile capture. No controller/queue correction.
+Long route await identifies local ownership; prompt route completion followed
+by a held read excludes that await, but still does not measure wire arrival.
+Counterfactual lack of the old hold remains non-reproduction. Independent
+review, archive/reverse before capture, full completion/cost retained.
+
+**Continuation build16:18:** repair-reader observation passes independent
+source/semantics audit. Feature-gated local ordinal covers StreamData and
+StreamRequalifyData, no new await or clone; EOF/error/cancel remains begin-only.
+The complete reused overlay plus one reader observer is archived as
+QOS_REPAIR_READ_TRACE_20260908.patch. One build underway, no lab overlap.
+First-capture full evidence report and raw archive now retained; it disproves
+neither all native delay nor all local delay, and no policy fix was made.
 
 **Disposition / scope:** e476308 remains an isolated mechanism-correct
 intermediate checkpoint, not a promoted performance fix. Its early receive
@@ -274,11 +316,11 @@ above500Mbps can be buffered observation, not wire capacity.
 ## Execution, evidence and continuity
 
 - Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
-  overlap. Products/probes stopped; origins retained. No build/lab running.
+  overlap. Products/probes stopped; one diagnostic build, no lab. Origins retained.
 - Normal frozen candidate:`./.tmp/reflection/bin/advisory-owner-20260908/mptunnel`.
   Normal parent:`./.tmp/reflection/bin/copy-debt-20260908/mptunnel`.
-  Diagnostic: `./.tmp/reflection/bin/copy-debt-service-20260908/mptunnel`.
-  target/release is now the completed ordinarye476308 binary.
+  Current diagnostic:`./.tmp/reflection/bin/qos-forward-prefix-20260908/mptunnel`.
+  target/release is that temporary diagnostic, not the ordinary executable.
 - Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
   No deletion this turn; ample root space. User7lines must stay unstaged.
 - Telegram last meaningful report before2026-09-08 07:26UTC; next nonurgent

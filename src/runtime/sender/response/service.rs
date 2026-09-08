@@ -3,21 +3,26 @@
 //! The service owns queued product work. Planning and carrier dispatch remain
 //! separate so queue mutation cannot silently become path-selection policy.
 
+#[cfg(test)]
+use super::dispatch::emit_planned_response_data_frame;
 use super::dispatch::{
-    ResponseReinjectionServiceModel, emit_planned_response_data_frame,
-    emit_response_frame_from_sender_service, response_frame_has_carrier_credit,
-    select_observed_switchable_response_target_for_extent, select_switchable_response_target,
-    select_switchable_response_target_for_extent,
+    ResponseReinjectionServiceModel, emit_response_frame_from_sender_service,
+    response_frame_has_carrier_credit, select_observed_switchable_response_target_for_extent,
+    select_switchable_response_target, select_switchable_response_target_for_extent,
 };
+#[cfg(test)]
 use super::multipath::plan_response_data_payload_with_data_ack_outstanding_impl;
 use super::response_reinjection_avoid_outputs;
 use super::scheduling::response_completion_snapshot;
+#[cfg(all(test, feature = "lab-diagnostics"))]
+use crate::lab_diagnostics::lab_perf_record;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
-    lab_diagnostic, lab_diagnostic_event_enabled, lab_perf_record, lab_sender_service_decision,
+    lab_diagnostic, lab_diagnostic_event_enabled, lab_sender_service_decision,
     lab_server_response_stream_data,
 };
 use crate::model::admission::ReliableDataAckFrontierState;
+#[cfg(test)]
 use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
 use crate::model::multipath::{LiveOwnerFrontierFloorEpoch, OptionalReinjectionLedger};
 use crate::model::path::CarrierPathKey;
@@ -55,7 +60,7 @@ use crate::scheduler::{self, PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::time::{Duration, Instant};
 
-fn response_data_dispatch_lane(
+pub(super) fn response_data_dispatch_lane(
     queued_lane: Option<TrafficClass>,
     current_lane: TrafficClass,
 ) -> TrafficClass {
@@ -146,6 +151,7 @@ fn lab_server_stale_output_recovery(
     );
 }
 
+#[cfg(test)]
 fn response_dispatch_payload_bytes(
     path_stream: &ReliablePathStream,
     send_stream: &ReliableSendStream,
@@ -176,6 +182,7 @@ fn response_dispatch_payload_bytes(
 /// Applies the requester's one-shot return-topology ceiling without granting
 /// any carrier credit or changing ordinary scheduling. Fixed/singleton output
 /// retains the exact prior sequence.
+#[cfg(test)]
 fn response_startup_dispatch_payload_bytes(
     path_stream: &ReliablePathStream,
     send_stream: &ReliableSendStream,
@@ -621,10 +628,66 @@ impl ServerResponseSenderService {
         path_stream.set_sender_queue_bytes(self.queue.bytes());
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn queued_send_ready(&self) -> bool {
         self.queue.front().is_some()
     }
 
+    pub(in crate::runtime) fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    fn nondata_front(&self) -> Option<(ReliableWorkClass, &ReliableRelayQueuedWork)> {
+        self.queue
+            .front_reinjection()
+            .map(|work| (ReliableWorkClass::Reinjection, work))
+            .or_else(|| {
+                (self.queue.data_bytes() == 0)
+                    .then(|| self.queue.front())
+                    .flatten()
+            })
+    }
+
+    pub(in crate::runtime) fn queued_nondata_ready(&self) -> bool {
+        self.nondata_front().is_some()
+    }
+
+    pub(in crate::runtime) fn front_nondata_has_carrier_credit_at_frontier(
+        &mut self,
+        path_stream: &ReliablePathStream,
+        send_stream: &ReliableSendStream,
+        relay_lane: TrafficClass,
+        _mux_limits: MuxLimits,
+        _data_ack_outstanding_bytes: usize,
+        _frontier_state: ReliableDataAckFrontierState,
+    ) -> bool {
+        let Some((_, queued)) = self.nondata_front() else {
+            return false;
+        };
+        match &queued.kind {
+            ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => {
+                response_frame_has_carrier_credit(
+                    path_stream,
+                    frame,
+                    relay_lane,
+                    CarrierEmitMode::Classified,
+                    Some(*cause),
+                    Some(self.reinjection_service_model(send_stream, true, true)),
+                )
+            }
+            ReliableRelayQueuedWorkKind::Control(frame) => {
+                let (lane, mode) = if queued.stream_ordered_carrier_emit {
+                    (relay_lane, CarrierEmitMode::StreamOrdered)
+                } else {
+                    (TrafficClass::Control, CarrierEmitMode::Classified)
+                };
+                response_frame_has_carrier_credit(path_stream, frame, lane, mode, None, None)
+            }
+            ReliableRelayQueuedWorkKind::Data(_) => false,
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn front_has_carrier_credit_at_frontier(
         &mut self,
         path_stream: &ReliablePathStream,
@@ -950,6 +1013,7 @@ impl ServerResponseSenderService {
         self.queue.has_queued_reinjection_overlap(frame)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn dispatch_next(
         &mut self,
         path_stream: &ReliablePathStream,
@@ -966,6 +1030,7 @@ impl ServerResponseSenderService {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn dispatch_next_with_data_ack_outstanding(
         &mut self,
         path_stream: &ReliablePathStream,
@@ -984,6 +1049,7 @@ impl ServerResponseSenderService {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn dispatch_next_at_frontier(
         &mut self,
         path_stream: &ReliablePathStream,
@@ -1000,10 +1066,11 @@ impl ServerResponseSenderService {
             mux_limits,
             data_ack_outstanding_bytes,
             frontier_state,
+            false,
         )
     }
 
-    fn dispatch_next_attempt_with_data_ack_outstanding(
+    pub(in crate::runtime) fn dispatch_next_nondata_at_frontier(
         &mut self,
         path_stream: &ReliablePathStream,
         send_stream: &mut ReliableSendStream,
@@ -1012,10 +1079,33 @@ impl ServerResponseSenderService {
         data_ack_outstanding_bytes: usize,
         frontier_state: ReliableDataAckFrontierState,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
-        let (queued_lane, queued) = self
-            .queue
-            .front()
-            .expect("queued_send_ready requires a queued frame");
+        self.dispatch_next_attempt_with_data_ack_outstanding(
+            path_stream,
+            send_stream,
+            relay_lane,
+            mux_limits,
+            data_ack_outstanding_bytes,
+            frontier_state,
+            true,
+        )
+    }
+
+    fn dispatch_next_attempt_with_data_ack_outstanding(
+        &mut self,
+        path_stream: &ReliablePathStream,
+        send_stream: &mut ReliableSendStream,
+        relay_lane: TrafficClass,
+        _mux_limits: MuxLimits,
+        _data_ack_outstanding_bytes: usize,
+        _frontier_state: ReliableDataAckFrontierState,
+        nondata_only: bool,
+    ) -> Result<ServerResponseDispatch, RuntimeError> {
+        let (queued_lane, queued) = if nondata_only {
+            self.nondata_front()
+        } else {
+            self.queue.front()
+        }
+        .expect("queued_send_ready requires a queued frame");
         let enqueue_id = {
             #[cfg(feature = "lab-diagnostics")]
             {
@@ -1039,69 +1129,79 @@ impl ServerResponseSenderService {
         let (frame, dispatch_lane_name, reinjection_cause) = match &queued.kind {
             ReliableRelayQueuedWorkKind::Control(frame) => (frame.clone(), "control", None),
             ReliableRelayQueuedWorkKind::Data(payload) => {
-                let data_lane = response_data_dispatch_lane(queued.data_lane, relay_lane);
-                let dispatch_payload_bytes = response_dispatch_payload_bytes(
-                    path_stream,
-                    send_stream,
-                    data_lane,
-                    mux_limits,
-                    payload.len(),
-                )
-                .ok_or(RuntimeError::SenderServiceBlocked)?;
-                // Re-evaluate the non-refilling startup coordinate at apply;
-                // the earlier readiness preview is advisory and may race FINAL.
-                let dispatch_payload_bytes = response_startup_dispatch_payload_bytes(
-                    path_stream,
-                    send_stream,
-                    dispatch_payload_bytes,
-                )
-                .ok_or(RuntimeError::SenderServiceBlocked)?;
-                let (dispatch_payload_bytes, planned) =
-                    plan_response_data_payload_with_data_ack_outstanding_impl(
+                // Original publication belongs exclusively to the imminent
+                // writer. The former producer remains only as a test oracle.
+                #[cfg(not(test))]
+                {
+                    let _ = payload;
+                    return Err(RuntimeError::SenderServiceBlocked);
+                }
+                #[cfg(test)]
+                {
+                    let data_lane = response_data_dispatch_lane(queued.data_lane, relay_lane);
+                    let dispatch_payload_bytes = response_dispatch_payload_bytes(
                         path_stream,
+                        send_stream,
                         data_lane,
-                        send_stream.next_offset(),
+                        _mux_limits,
+                        payload.len(),
+                    )
+                    .ok_or(RuntimeError::SenderServiceBlocked)?;
+                    // Re-evaluate the non-refilling startup coordinate at apply;
+                    // the earlier readiness preview is advisory and may race FINAL.
+                    let dispatch_payload_bytes = response_startup_dispatch_payload_bytes(
+                        path_stream,
+                        send_stream,
                         dispatch_payload_bytes,
-                        data_ack_outstanding_bytes,
-                        frontier_state,
-                    )?;
-                let dispatch_payload = payload.slice(..dispatch_payload_bytes);
-                #[cfg(feature = "lab-diagnostics")]
-                let mux_started = Instant::now();
-                let frame = send_stream.send_data(dispatch_payload)?;
-                #[cfg(feature = "lab-diagnostics")]
-                lab_perf_record(
-                    "mux.send_data",
-                    mux_started.elapsed(),
-                    dispatch_payload_bytes,
-                );
-                match emit_planned_response_data_frame(
-                    path_stream,
-                    planned,
-                    frame.clone(),
-                    reliable_path_effective_frame_lane(&frame, data_lane),
-                ) {
-                    Ok(selected_path) => {
-                        let committed = self
-                            .queue
-                            .commit_front_data_prefix(dispatch_payload_bytes)
-                            .expect("dispatched queued data must still be at queue front");
-                        return self.finish_dispatched_work(
+                    )
+                    .ok_or(RuntimeError::SenderServiceBlocked)?;
+                    let (dispatch_payload_bytes, planned) =
+                        plan_response_data_payload_with_data_ack_outstanding_impl(
                             path_stream,
-                            relay_lane,
-                            queued_lane,
-                            committed,
-                            frame,
-                            selected_path,
-                            None,
-                            "data",
-                            enqueue_id,
-                            queue_delay_ms,
-                        );
-                    }
-                    Err(err) => {
-                        let _ = send_stream.rollback_committed_data(&frame);
-                        return Err(err);
+                            data_lane,
+                            send_stream.next_offset(),
+                            dispatch_payload_bytes,
+                            _data_ack_outstanding_bytes,
+                            _frontier_state,
+                        )?;
+                    let dispatch_payload = payload.slice(..dispatch_payload_bytes);
+                    #[cfg(feature = "lab-diagnostics")]
+                    let mux_started = Instant::now();
+                    let frame = send_stream.send_data(dispatch_payload)?;
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_perf_record(
+                        "mux.send_data",
+                        mux_started.elapsed(),
+                        dispatch_payload_bytes,
+                    );
+                    match emit_planned_response_data_frame(
+                        path_stream,
+                        planned,
+                        frame.clone(),
+                        reliable_path_effective_frame_lane(&frame, data_lane),
+                    ) {
+                        Ok(selected_path) => {
+                            let committed = self
+                                .queue
+                                .commit_front_data_prefix(dispatch_payload_bytes)
+                                .expect("dispatched queued data must still be at queue front");
+                            return self.finish_dispatched_work(
+                                path_stream,
+                                relay_lane,
+                                queued_lane,
+                                committed,
+                                frame,
+                                selected_path,
+                                None,
+                                "data",
+                                enqueue_id,
+                                queue_delay_ms,
+                            );
+                        }
+                        Err(err) => {
+                            let _ = send_stream.rollback_committed_data(&frame);
+                            return Err(err);
+                        }
                     }
                 }
             }
@@ -1151,10 +1251,16 @@ impl ServerResponseSenderService {
                 Some(self.reinjection_service_model(send_stream, true, true)),
             )?,
         };
-        let (_, committed) = self
-            .queue
-            .commit_front()
-            .expect("dispatched queued work must still be at queue front");
+        let committed = if nondata_only && queued_lane == ReliableWorkClass::Reinjection {
+            self.queue
+                .commit_front_reinjection()
+                .expect("selected response repair remains first")
+        } else {
+            self.queue
+                .commit_front()
+                .expect("dispatched queued work remains at queue front")
+                .1
+        };
         self.finish_dispatched_work(
             path_stream,
             relay_lane,

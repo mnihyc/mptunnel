@@ -16,11 +16,10 @@ pub(in crate::runtime) use feedback::{
     reliable_stream_recv_progress_interval,
 };
 #[cfg(test)]
-pub(in crate::runtime) use handle::FixedReliablePathOutput;
+pub(in crate::runtime) use handle::{FixedReliablePathOutput, reliable_work_lane_to_carrier_lane};
 pub(in crate::runtime) use handle::{
     ReliablePathStream, ReliablePathStreamHandle, ReliablePathStreamOutput, RequalificationAttempt,
-    TargetCarrierCapacityWait, arm_carrier_capacity_notifies, reliable_work_lane_to_carrier_lane,
-    wait_for_carrier_capacity_notifies,
+    TargetCarrierCapacityWait, arm_carrier_capacity_notifies, wait_for_carrier_capacity_notifies,
 };
 #[cfg(test)]
 pub(in crate::runtime) use registry::ServerReliableStreamOpen;

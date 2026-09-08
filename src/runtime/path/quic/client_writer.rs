@@ -19,7 +19,7 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::input::{CarrierInputRoute, PendingMailboxFrame};
 use crate::runtime::path::proof::PathProofTracker;
-use crate::runtime::sender::RequestPreparedClaim;
+use crate::runtime::sender::PreparedOriginalClaim;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -109,15 +109,16 @@ pub(super) async fn drain_client_udp_stream_commands(
         }
         let should_close = match command {
             ReliablePathCommand::PreparedOriginal(work) => {
-                if work.stream_id() != stream_id
-                    || work.instance().path_instance_id != path_instance_id
+                if work.request_instance().is_none()
+                    || work.stream_id() != stream_id
+                    || work.path_instance_id() != path_instance_id
                 {
                     // An obsolete weak subscription owns neither payload nor
                     // carrier failure authority.
                     false
                 } else if let Some(ready) = commands.writer_ready_boundary(path_instance_id) {
                     match work.try_claim(ready) {
-                        RequestPreparedClaim::Claimed(frame) => {
+                        PreparedOriginalClaim::Claimed(frame) => {
                             let bytes = commands.register_claimed_writer_frame(&frame);
                             let encoded_bytes =
                                 crate::protocol::codec::encoded_frame_capacity_hint(&frame).max(1);
@@ -134,13 +135,13 @@ pub(super) async fn drain_client_udp_stream_commands(
                             // after the first actual claim and before flush.
                             work.requeue();
                         }
-                        RequestPreparedClaim::Busy(wait) => {
+                        PreparedOriginalClaim::Busy(wait) => {
                             commands.defer_prepared_work(work, wait);
                         }
-                        RequestPreparedClaim::Blocked(wait) => {
+                        PreparedOriginalClaim::Blocked(wait) => {
                             commands.defer_prepared_work(work, wait);
                         }
-                        RequestPreparedClaim::Empty => {}
+                        PreparedOriginalClaim::Empty => {}
                     }
                     false
                 } else {

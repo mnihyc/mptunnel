@@ -15,8 +15,10 @@ use crate::model::service_rate::{DirectionalServiceRate, DirectionalServiceRateS
 use crate::model::timing::{
     reliable_data_retransmission_interval, transport_rate_sample_freshness_horizon,
 };
+#[cfg(test)]
+use crate::model::work::ReliableWorkClass;
 use crate::model::work::{
-    CarrierWorkKind, RangeRecoveryState, ReliableReinjectionTargetWork, ReliableWorkClass,
+    CarrierWorkKind, RangeRecoveryState, ReliableReinjectionTargetWork,
     reliable_reinjection_service_limit_bytes,
 };
 use crate::mux::MuxLimits;
@@ -1468,11 +1470,13 @@ impl FixedReliablePathOutput {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn can_assign_original_data(&self, lane: TrafficClass) -> bool {
         self.try_send_path_snapshot_at(lane, Instant::now())
             .is_some_and(crate::model::admission::original_data_assignment_has_product_headroom)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn try_enqueue_original_data_frame(
         &self,
         frame: &Frame,
@@ -1492,6 +1496,7 @@ impl FixedReliablePathOutput {
         self.commit_reserved_original_data_frame(command, rate_decision, offset, end, bytes, lane)
     }
 
+    #[cfg(test)]
     fn commit_reserved_original_data_frame(
         &self,
         command: ReliablePathFrameReservation<'_>,
@@ -2186,6 +2191,7 @@ impl ReliablePathStreamOutput {
     }
 }
 
+#[cfg(test)]
 pub(in crate::runtime) fn reliable_work_lane_to_carrier_lane(
     work_lane: ReliableWorkClass,
     relay_lane: TrafficClass,

@@ -410,6 +410,7 @@ async fn run_server_udp_reliable_stream_loop(
         // Finishing the server send half must not STOP the client's final
         // feedback. Drain the independent receive half to explicit detach.
         if let Some(deadline) = terminal_drain_deadline {
+            commands_rx.withdraw_writer_ready();
             let input = tokio::time::timeout_at(deadline, async {
                 match deferred_input.take() {
                     Some(input) => Some(input),
@@ -587,6 +588,11 @@ async fn run_server_udp_reliable_stream_loop(
             }
             continue;
         }
+        if deferred_input.is_none() {
+            let _ = commands_rx.writer_ready_boundary(path_registration.path_instance_id());
+        } else {
+            commands_rx.withdraw_writer_ready();
+        }
         tokio::select! {
             biased;
             frame = async {
@@ -595,6 +601,7 @@ async fn run_server_udp_reliable_stream_loop(
                     None => carrier_frames.recv().await,
                 }
             } => {
+                commands_rx.withdraw_writer_ready();
                 match frame {
                     Some(Ok(frame @ Frame::StreamRequalifyData {
                         stream_id: received_stream_id,

@@ -22,7 +22,7 @@ use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
     recv_reliable_path_command, reliable_path_command_channels,
-    reliable_path_command_pending_bytes,
+    reliable_path_command_pending_bytes, try_recv_reliable_path_priority_command,
 };
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::quic::client::ClientUdpCarrierReconciliation;
@@ -47,9 +47,13 @@ use crate::runtime::path::{
     ServerTargetAdmission,
 };
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
-use crate::runtime::sender::ServerReinjectionOutputIdentity;
+use crate::runtime::sender::{
+    PreparedResponseSource, ResponseProductState, ServerReinjectionOutputIdentity,
+    ServerResponseSenderService, SharedResponseProduct, publish_prepared_response_work,
+};
 use crate::runtime::stream::{
-    AcceptedServerReliableStream, ReliablePathStreamOutput, ServerReliableStreamRegistry,
+    AcceptedServerReliableStream, ReliablePathStream, ReliablePathStreamOutput,
+    ServerReliableStreamRegistry,
 };
 use crate::scheduler::TrafficClass;
 use crate::transport::{
@@ -217,6 +221,14 @@ impl ServerUdpTerminalWriterFixture {
         stream_id: StreamId,
         max_streams: Option<usize>,
     ) -> (Self, mpsc::UnboundedReceiver<AcceptedServerReliableStream>) {
+        Self::open_with_native_authority(stream_id, max_streams, false).await
+    }
+
+    async fn open_with_native_authority(
+        stream_id: StreamId,
+        max_streams: Option<usize>,
+        bind_native_authority: bool,
+    ) -> (Self, mpsc::UnboundedReceiver<AcceptedServerReliableStream>) {
         let shared_secret = SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret");
         let security = ServerSecurityConfig::for_test(shared_secret.clone());
@@ -262,36 +274,7 @@ impl ServerUdpTerminalWriterFixture {
                     .expect("test validation instant"),
             },
         );
-        let (commands_tx, commands_rx) = reliable_path_command_channels(8);
         let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-        let outcome = context
-            .reliable_streams
-            .open_or_attach(ServerStreamOpenRequest {
-                session_id,
-                stream_id,
-                target: target.clone(),
-                initial_demand: StreamDemandHint::Throughput,
-                return_plan: Default::default(),
-                attachment: ServerStreamPathAttachment {
-                    path_registration: path_registration.clone(),
-                    commands: commands_tx.clone(),
-                    max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
-                        context.codec_limits,
-                        context.mux_limits,
-                    ),
-                },
-                mux_limits: context.mux_limits,
-            })
-            .await
-            .expect("open server QUIC response stream");
-        assert_eq!(
-            outcome,
-            ServerStreamOpenOutcome::New(TrafficClass::Throughput)
-        );
-        let accepted = accepted_rx
-            .recv()
-            .await
-            .expect("receive accepted server QUIC response stream");
 
         let reserved =
             std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve server QUIC address");
@@ -381,6 +364,64 @@ impl ServerUdpTerminalWriterFixture {
                 .expect("server QUIC stream timeout")
                 .expect("accept server QUIC stream");
 
+        let (commands_tx, commands_rx) = reliable_path_command_channels(8);
+        let commands_tx = if bind_native_authority {
+            let scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+                path_registration.path_instance_id(),
+                crate::protocol::PathMetricDirection::ServerToClient,
+            );
+            let authority = server_connection
+                .bind_native_rate_authority(
+                    scope,
+                    ServerLocalPathProperties::default().startup_rate_prior,
+                )
+                .await
+                .expect("bind the actual protected QUIC writer authority");
+            let shape = authority
+                .refresh_scheduling_shape(scope)
+                .expect("read actual QUIC scheduling shape");
+            assert!(
+                authority
+                    .commit_if_current(shape.stamp(), || {
+                        context
+                            .reliable_streams
+                            .stage_native_scheduling_shape(&path_registration, shape)
+                    })
+                    .expect("stage exact current QUIC scheduling shape")
+            );
+            commands_tx.with_native_rate_authority(authority)
+        } else {
+            commands_tx
+        };
+        let outcome = context
+            .reliable_streams
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: target.clone(),
+                initial_demand: StreamDemandHint::Throughput,
+                return_plan: Default::default(),
+                attachment: ServerStreamPathAttachment {
+                    path_registration: path_registration.clone(),
+                    commands: commands_tx.clone(),
+                    max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
+                        context.codec_limits,
+                        context.mux_limits,
+                    ),
+                },
+                mux_limits: context.mux_limits,
+            })
+            .await
+            .expect("open server QUIC response stream");
+        assert_eq!(
+            outcome,
+            ServerStreamOpenOutcome::New(TrafficClass::Throughput)
+        );
+        let accepted = accepted_rx
+            .recv()
+            .await
+            .expect("receive accepted server QUIC response stream");
+
         (
             Self {
                 context,
@@ -458,6 +499,319 @@ impl ServerUdpTerminalWriterFixture {
             }
         );
     }
+
+    async fn publish_latency_source(
+        &mut self,
+        payload: Bytes,
+    ) -> (SharedResponseProduct, ReliablePathStream) {
+        let mut stream = self.accepted.take_stream();
+        let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
+            panic!("shared response binding");
+        };
+        let binding = binding.clone();
+        let limits = self.context.mux_limits;
+        let lane = TrafficClass::Latency;
+        let quantum = crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit(
+            None,
+            lane,
+            limits,
+            udp_path_max_stream_payload_bytes(self.context.codec_limits, limits),
+        );
+        assert!(!payload.is_empty() && payload.len() <= quantum);
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(self.stream_id, limits, 0);
+        self.context
+            .reliable_streams
+            .route_frame(
+                &self._path_registration,
+                self.stream_id,
+                Frame::StreamMaxData {
+                    stream_id: self.stream_id,
+                    max_offset: limits.max_stream_window_bytes,
+                },
+            )
+            .await
+            .expect("route actual response receive credit");
+        let Frame::StreamMaxData { max_offset, .. } =
+            stream.recv_frame().await.expect("receive routed credit")
+        else {
+            panic!("expected response receive credit");
+        };
+        send_stream.update_max_offset(max_offset);
+        assert!(send_stream.send_credit_bytes() >= payload.len());
+        let owner = SharedResponseProduct::new(
+            ResponseProductState {
+                sender: ServerResponseSenderService::new(self.session_id, self.stream_id),
+                send_stream,
+                last_send_ack: Default::default(),
+                prepared: PreparedResponseSource::new(lane, quantum),
+            },
+            binding,
+        );
+        {
+            let mut state = owner.lock();
+            state.sender.enqueue_data_for_lane(payload, lane);
+            publish_prepared_response_work(&mut state, &owner, lane, quantum, true);
+        }
+        (owner, stream)
+    }
+
+    async fn drain_normal_command(
+        &mut self,
+        command: ReliablePathCommand,
+    ) -> Result<bool, RuntimeError> {
+        let mut pending = Vec::new();
+        let mut proofs = PathProofTracker::default();
+        let (_input_tx, mut input_rx) = mpsc::channel(1);
+        let mut deferred = None;
+        drain_server_udp_reliable_commands(
+            command,
+            self.commands_rx.as_mut().unwrap(),
+            self.server_send.as_mut().unwrap(),
+            &self.context,
+            self.stream_id,
+            self.path_id,
+            &self._path_registration,
+            &mut pending,
+            &mut proofs,
+            &mut input_rx,
+            &mut deferred,
+        )
+        .await
+    }
+
+    async fn finish_prepared_write(&mut self, owner: &SharedResponseProduct, payload: &Bytes) {
+        // Run the same connection-owned cadence service as the real server,
+        // scoped to this completion. It owns retryable Native refresh/stage/
+        // fanout, including central stamp changes caused by actual control I/O.
+        // Dropping these futures releases the service; no spawned task leaks.
+        let metrics = crate::runtime::path::quic::metrics::run_server_quic_path_metrics(
+            self.context.clone(),
+            self._path_registration.clone(),
+            self._server_connection.clone(),
+        );
+        let service = async {
+            loop {
+                let claimed = {
+                    let state = owner.lock();
+                    assert!(state.prepared.pending_error.is_none());
+                    if state.send_stream.next_offset() == 0 {
+                        assert_eq!(state.sender.data_bytes(), payload.len());
+                        assert_eq!(state.send_stream.reinjection_bytes(), 0);
+                    }
+                    state.send_stream.next_offset()
+                };
+                if claimed != 0 {
+                    assert_eq!(claimed, payload.len() as u64);
+                    break;
+                }
+                let targets = owner
+                    .binding()
+                    .sender_path_targets(TrafficClass::Latency, payload.len());
+                assert_eq!(targets.len(), 1);
+                assert_eq!(targets[0].observation.original_data_in_flight_bytes, 0);
+                assert_eq!(self.commands_tx.pending_bytes(), 0);
+                assert_eq!(self.commands_tx.writer_pending_bytes(), 0);
+                let notice = recv_reliable_path_command(self.commands_rx.as_mut().unwrap())
+                    .await
+                    .expect("actual Native cadence wakes the existing parked notice");
+                assert!(matches!(&notice, ReliablePathCommand::PreparedOriginal(_)));
+                assert!(!self.drain_normal_command(notice).await.unwrap());
+            }
+            assert_eq!(
+                udp_path_read_frame(
+                    self.client_recv.as_mut().unwrap(),
+                    self.context.codec_limits
+                )
+                .await
+                .unwrap(),
+                Frame::StreamData {
+                    stream_id: self.stream_id,
+                    offset: 0,
+                    payload: payload.clone(),
+                }
+            );
+        };
+        tokio::pin!(metrics, service);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                () = &mut service => {}
+                () = &mut metrics => panic!("Native metrics service ended before response completion"),
+            }
+        })
+        .await
+        .expect("unchanged response completion guard includes Native retries and peer read");
+    }
+}
+
+#[tokio::test]
+async fn server_quic_prepared_latency_waits_for_deferred_probe_then_writes_prefix() {
+    let stream_id = StreamId(406);
+    let (mut fixture, _accepted_rx) =
+        ServerUdpTerminalWriterFixture::open_with_native_authority(stream_id, None, true).await;
+    fixture.drain_zero_credit_admission().await;
+    let payload = Bytes::from_static(b"unclaimed latency response");
+    let (owner, _stream) = fixture.publish_latency_source(payload.clone()).await;
+    let instance = fixture._path_registration.path_instance_id();
+    let ready = fixture
+        .commands_rx
+        .as_mut()
+        .unwrap()
+        .writer_ready_boundary(instance)
+        .unwrap()
+        .receipt();
+    let notice = try_recv_reliable_path_priority_command(fixture.commands_rx.as_mut().unwrap())
+        .expect("actual latency publisher uses the priority lane");
+    assert!(matches!(&notice, ReliablePathCommand::PreparedOriginal(_)));
+    assert_eq!(reliable_path_command_pending_bytes(&notice), 0);
+    let probe = Frame::StreamRequalifyData {
+        stream_id,
+        probe_id: 24,
+        offset: 8192,
+        payload: Bytes::from(vec![0x5c; 256]),
+    };
+    let mut deferred: Option<Result<Frame, RuntimeError>> = Some(Ok(probe.clone()));
+    let mut proofs = PathProofTracker::default();
+    let continued = drain_one_server_udp_command_while_input_deferred(
+        notice,
+        fixture.commands_rx.as_mut().unwrap(),
+        fixture.server_send.as_mut().unwrap(),
+        &fixture.context,
+        stream_id,
+        &fixture._path_registration,
+        &mut proofs,
+    )
+    .await;
+    {
+        let state = owner.lock();
+        assert_eq!(state.sender.data_bytes(), payload.len());
+        assert_eq!(state.send_stream.next_offset(), 0);
+        assert_eq!(state.send_stream.reinjection_bytes(), 0);
+    }
+    assert_eq!(fixture.commands_tx.pending_bytes(), 0);
+    assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);
+    assert!(
+        !ready.is_current(),
+        "retained input occupies the actual writer"
+    );
+    assert!(matches!(&deferred, Some(Ok(frame)) if frame == &probe));
+    assert!(
+        matches!(continued, Ok(false)),
+        "legal priority source must park, not terminate QUIC: {continued:?}"
+    );
+    assert!(
+        try_recv_reliable_path_priority_command(fixture.commands_rx.as_mut().unwrap()).is_none(),
+        "unchanged occupied boundary must not requeue the notice"
+    );
+
+    // Preserve the existing exact-ACK escape while this same input slot is full.
+    let ack = Frame::StreamRequalifyAck {
+        stream_id,
+        probe_id: 23,
+        offset: 4096,
+        payload_bytes: 256,
+    };
+    fixture
+        .commands_tx
+        .try_enqueue_admitted_frame(ack.clone(), TrafficClass::Control)
+        .unwrap();
+    let command =
+        try_recv_reliable_path_priority_command(fixture.commands_rx.as_mut().unwrap()).unwrap();
+    assert!(
+        !drain_one_server_udp_command_while_input_deferred(
+            command,
+            fixture.commands_rx.as_mut().unwrap(),
+            fixture.server_send.as_mut().unwrap(),
+            &fixture.context,
+            stream_id,
+            &fixture._path_registration,
+            &mut proofs,
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        udp_path_read_frame(
+            fixture.client_recv.as_mut().unwrap(),
+            fixture.context.codec_limits
+        )
+        .await
+        .unwrap(),
+        ack
+    );
+    assert!(matches!(deferred.take(), Some(Ok(frame)) if frame == probe));
+    fixture
+        .commands_rx
+        .as_mut()
+        .unwrap()
+        .writer_ready_boundary(instance)
+        .unwrap();
+    let notice = try_recv_reliable_path_priority_command(fixture.commands_rx.as_mut().unwrap())
+        .expect("actual Ready publication wakes the parked source");
+    assert!(matches!(&notice, ReliablePathCommand::PreparedOriginal(_)));
+    assert!(!fixture.drain_normal_command(notice).await.unwrap());
+    fixture.finish_prepared_write(&owner, &payload).await;
+    let state = owner.lock();
+    assert_eq!(state.sender.data_bytes(), 0);
+    assert_eq!(state.send_stream.next_offset(), payload.len() as u64);
+    assert_eq!(state.send_stream.reinjection_bytes(), payload.len());
+    assert_eq!(fixture.commands_tx.pending_bytes(), 0);
+    assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn server_quic_prepared_latency_busy_preserves_idle_writer_epoch() {
+    use futures::FutureExt;
+
+    let stream_id = StreamId(407);
+    let (mut fixture, _accepted_rx) =
+        ServerUdpTerminalWriterFixture::open_with_native_authority(stream_id, None, true).await;
+    fixture.drain_zero_credit_admission().await;
+    let payload = Bytes::from_static(b"response after Product unlock");
+    let (owner, _stream) = fixture.publish_latency_source(payload.clone()).await;
+    let instance = fixture._path_registration.path_instance_id();
+    let ready = fixture
+        .commands_rx
+        .as_mut()
+        .unwrap()
+        .writer_ready_boundary(instance)
+        .unwrap()
+        .receipt();
+    let command =
+        try_recv_reliable_path_priority_command(fixture.commands_rx.as_mut().unwrap()).unwrap();
+    assert!(matches!(&command, ReliablePathCommand::PreparedOriginal(_)));
+    let state = owner.lock();
+    // Poll only the real metadata drain. Busy must return without an await or
+    // I/O while Product is owned; this is not a wall-clock scheduling assertion.
+    assert!(matches!(
+        fixture.drain_normal_command(command).now_or_never(),
+        Some(Ok(false))
+    ));
+    assert!(
+        ready.is_current(),
+        "metadata refusal is not writer occupancy"
+    );
+    assert_eq!(state.sender.data_bytes(), payload.len());
+    assert_eq!(state.send_stream.next_offset(), 0);
+    assert_eq!(state.send_stream.reinjection_bytes(), 0);
+    assert!(
+        try_recv_reliable_path_priority_command(fixture.commands_rx.as_mut().unwrap()).is_none()
+    );
+    drop(state);
+    let notice = try_recv_reliable_path_priority_command(fixture.commands_rx.as_mut().unwrap())
+        .expect("Product unlock wakes the parked wait and requeues the same weak notice");
+    assert!(ready.is_current());
+    assert!(!fixture.drain_normal_command(notice).await.unwrap());
+    fixture.finish_prepared_write(&owner, &payload).await;
+    assert!(
+        !ready.is_current(),
+        "actual claim/write consumes the idle epoch"
+    );
+    let state = owner.lock();
+    assert_eq!(state.sender.data_bytes(), 0);
+    assert_eq!(state.send_stream.next_offset(), payload.len() as u64);
+    assert_eq!(fixture.commands_tx.pending_bytes(), 0);
+    assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);
 }
 
 #[tokio::test]

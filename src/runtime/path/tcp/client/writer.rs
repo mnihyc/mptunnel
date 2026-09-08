@@ -34,7 +34,7 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::commands::{TcpCapacityProbeCommand, reliable_path_writer_frame_queue};
 use crate::runtime::path::input::PendingMailboxFrame;
 use crate::runtime::recent_ids::RecentIdCache;
-use crate::runtime::sender::RequestPreparedClaim;
+use crate::runtime::sender::PreparedOriginalClaim;
 use std::collections::HashMap;
 #[cfg(any(test, feature = "lab-diagnostics"))]
 use std::time::Instant;
@@ -109,7 +109,8 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
             ReliablePathCommand::PreparedOriginal(work) => {
                 // A notice carries no payload or offset. Only this physical
                 // writer, after higher lanes have arbitrated, may claim it.
-                if work.instance().path_instance_id != connection.path_instance_id
+                if work.request_instance().is_none()
+                    || work.path_instance_id() != connection.path_instance_id
                     || !streams
                         .get(&work.stream_id())
                         .is_some_and(|stream| stream.pending_open.is_none())
@@ -121,7 +122,7 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                     break;
                 };
                 match work.try_claim(ready) {
-                    RequestPreparedClaim::Claimed(frame) => {
+                    PreparedOriginalClaim::Claimed(frame) => {
                         let bytes = commands.register_claimed_writer_frame(&frame);
                         #[cfg(feature = "lab-diagnostics")]
                         let encoded_bytes =
@@ -151,13 +152,13 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                         )
                         .await?;
                     }
-                    RequestPreparedClaim::Busy(wait) => {
+                    PreparedOriginalClaim::Busy(wait) => {
                         commands.defer_prepared_work(work, wait);
                     }
-                    RequestPreparedClaim::Blocked(wait) => {
+                    PreparedOriginalClaim::Blocked(wait) => {
                         commands.defer_prepared_work(work, wait);
                     }
-                    RequestPreparedClaim::Empty => {}
+                    PreparedOriginalClaim::Empty => {}
                 }
                 // Preserve one protected TCP transaction, then arbitrate all
                 // lanes and streams again without a Product actor roundtrip.

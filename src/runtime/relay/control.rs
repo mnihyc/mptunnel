@@ -133,7 +133,8 @@ pub(in crate::runtime) fn publish_prepared_request_work(
         prepared.claims_active
             && registration.lane() == request_lane
             && product.remotes.paths.iter().any(|path| {
-                path.instance() == registration.instance() && path.stream.product_admission_active()
+                Some(path.instance()) == registration.request_instance()
+                    && path.stream.product_admission_active()
             })
     });
     changed |= previous_len != prepared.registrations.len();
@@ -143,7 +144,7 @@ pub(in crate::runtime) fn publish_prepared_request_work(
                 || prepared
                     .registrations
                     .iter()
-                    .any(|registration| registration.instance() == path.instance())
+                    .any(|registration| registration.request_instance() == Some(path.instance()))
             {
                 continue;
             }

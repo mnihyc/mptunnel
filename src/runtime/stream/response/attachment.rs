@@ -1203,6 +1203,7 @@ impl ResponseSenderPathTarget {
         self.command_queue.can_enqueue_stream_ordered_frame()
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn can_enqueue_stream_data(&self, lane: TrafficClass) -> bool {
         self.command_queue.can_enqueue_lane(lane)
     }

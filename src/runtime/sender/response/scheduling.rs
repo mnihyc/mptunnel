@@ -20,7 +20,7 @@ use crate::mux::MuxLimits;
 use crate::protocol::Frame;
 use crate::runtime::sender::response::ResponseOutputIdentity;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
-use crate::runtime::stream::response::ResponseSenderPathTarget;
+use crate::runtime::stream::response::{ResponseAcquisitionOutputId, ResponseSenderPathTarget};
 use crate::scheduler::{self, TrafficClass};
 
 /// Selects the path for the next unique connection-data range.
@@ -76,6 +76,7 @@ pub(super) fn select_response_data_path_at_frontier(
     .map(|selection| selection.target)
 }
 
+#[cfg(test)]
 pub(super) fn select_response_data_path_with_payload(
     targets: &[ResponseSenderPathTarget],
     lane: TrafficClass,
@@ -84,6 +85,58 @@ pub(super) fn select_response_data_path_with_payload(
     lower_flights: &[CarrierPathFlightDebt],
     connection_ordering_debt_bytes: usize,
     frontier_state: ReliableDataAckFrontierState,
+) -> Option<ResponseDataPathSelection> {
+    select_response_data_path_with_service(
+        targets,
+        lane,
+        payload_bytes,
+        mux_limits,
+        lower_flights,
+        connection_ordering_debt_bytes,
+        frontier_state,
+        ResponseOriginalService::Queued,
+    )
+}
+
+pub(super) fn select_prepared_response_data_path(
+    targets: &[ResponseSenderPathTarget],
+    lane: TrafficClass,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    lower_flights: &[CarrierPathFlightDebt],
+    connection_ordering_debt_bytes: usize,
+    frontier_state: ReliableDataAckFrontierState,
+    ready: &[ResponseAcquisitionOutputId],
+) -> Option<ResponseDataPathSelection> {
+    select_response_data_path_with_service(
+        targets,
+        lane,
+        payload_bytes,
+        mux_limits,
+        lower_flights,
+        connection_ordering_debt_bytes,
+        frontier_state,
+        ResponseOriginalService::Prepared(ready),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ResponseOriginalService<'a> {
+    #[cfg(test)]
+    Queued,
+    Prepared(&'a [ResponseAcquisitionOutputId]),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_response_data_path_with_service(
+    targets: &[ResponseSenderPathTarget],
+    lane: TrafficClass,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    lower_flights: &[CarrierPathFlightDebt],
+    connection_ordering_debt_bytes: usize,
+    frontier_state: ReliableDataAckFrontierState,
+    service: ResponseOriginalService<'_>,
 ) -> Option<ResponseDataPathSelection> {
     let nonstale_live_paths = targets
         .iter()
@@ -123,7 +176,13 @@ pub(super) fn select_response_data_path_with_payload(
             .iter()
             .filter(|target| allow_stale || !target.observation.stale_for_original_data)
             .filter(|target| target.product_admission_active)
-            .filter(|target| target.can_enqueue_stream_data(lane))
+            .filter(|target| match service {
+                #[cfg(test)]
+                ResponseOriginalService::Queued => target.can_enqueue_stream_data(lane),
+                ResponseOriginalService::Prepared(ready) => {
+                    ready.contains(&ResponseAcquisitionOutputId::from(*target))
+                }
+            })
             // Registration follows the carrier's TCP/QUIC establishment and
             // authenticated PATH_JOIN/SESSION_READY exchange. That is the
             // MPTUN equivalent of an established MPTCP subflow; a second
@@ -340,12 +399,12 @@ pub(super) fn select_response_data_path_with_payload(
     select(false, false)
         .or_else(|| select(true, false))
         .or_else(|| {
-            (!has_nonstale_live_path)
+            (!has_nonstale_live_path || matches!(service, ResponseOriginalService::Prepared(_)))
                 .then(|| select(false, true))
                 .flatten()
         })
         .or_else(|| {
-            (!has_nonstale_live_path)
+            (!has_nonstale_live_path || matches!(service, ResponseOriginalService::Prepared(_)))
                 .then(|| select(true, true))
                 .flatten()
         })

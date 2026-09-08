@@ -1756,7 +1756,7 @@ async fn prepared_request_actor_keeps_eof_source_claimable_until_final_offset() 
     use crate::runtime::path::commands::{
         reliable_path_command_pending_bytes, reliable_path_command_queue,
     };
-    use crate::runtime::sender::RequestPreparedClaim;
+    use crate::runtime::sender::PreparedOriginalClaim;
 
     struct EofObservedSource {
         remaining: Bytes,
@@ -1901,10 +1901,10 @@ async fn prepared_request_actor_keeps_eof_source_claimable_until_final_offset() 
             match command {
                 ReliablePathCommand::PreparedOriginal(work) => {
                     let ready = receivers
-                        .writer_ready_boundary(work.instance().path_instance_id)
+                        .writer_ready_boundary(work.path_instance_id())
                         .expect("actual fixture writer enters its next native transaction");
                     match work.try_claim(ready) {
-                        RequestPreparedClaim::Claimed(frame) => {
+                        PreparedOriginalClaim::Claimed(frame) => {
                             let charged = receivers.register_claimed_writer_frame(&frame);
                             let Frame::StreamData {
                                 stream_id: actual,
@@ -1923,10 +1923,10 @@ async fn prepared_request_actor_keeps_eof_source_claimable_until_final_offset() 
                             receivers.release_pending_command_bytes(charged);
                             work.requeue();
                         }
-                        RequestPreparedClaim::Empty => {
+                        PreparedOriginalClaim::Empty => {
                             // An exhausted or superseded weak notice owns no bytes.
                         }
-                        RequestPreparedClaim::Busy(_) | RequestPreparedClaim::Blocked(_) => {
+                        PreparedOriginalClaim::Busy(_) | PreparedOriginalClaim::Blocked(_) => {
                             panic!("the sole ready healthy writer must claim admitted EOF source");
                         }
                     }

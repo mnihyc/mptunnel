@@ -4,6 +4,7 @@
 //! binding to revalidate and commit, and enqueues one carrier command.
 
 use super::ResponseOutputIdentity;
+#[cfg(test)]
 use super::multipath::ResponseDataDispatchTarget;
 use super::response_reinjection_avoid_outputs;
 use super::scheduling::{response_completion_snapshot, select_response_frame_path_for_extent};
@@ -42,6 +43,18 @@ pub(super) struct ResponseReinjectionServiceModel<'a> {
     pub(super) require_full_frame: bool,
 }
 
+impl ResponseReinjectionServiceModel<'_> {
+    fn queued_bytes(self, identity: ServerReinjectionOutputIdentity) -> usize {
+        if self.exclude_front_work {
+            self.queue
+                .response_target_queued_reinjection_bytes_for_repair_dispatch(identity)
+        } else {
+            self.queue
+                .response_target_queued_reinjection_bytes(identity, false)
+        }
+    }
+}
+
 fn response_reinjection_target_has_service_credit(
     stream: &ReliablePathStream,
     target: &ResponseSenderPathTarget,
@@ -58,12 +71,7 @@ fn response_reinjection_target_has_service_credit(
     let available = reliable_reinjection_service_limit_bytes(
         ReliableReinjectionTargetWork::new(
             Some(response_completion_snapshot(target)),
-            service_model
-                .queue
-                .response_target_queued_reinjection_bytes(
-                    identity,
-                    service_model.exclude_front_work,
-                ),
+            service_model.queued_bytes(identity),
             binding.accepted_reinjected_data_in_flight_bytes_at(identity),
         ),
         payload_bytes.min(service_model.reinjection_debt_bytes),
@@ -313,6 +321,7 @@ pub(super) fn response_frame_has_carrier_credit(
     }
 }
 
+#[cfg(test)]
 pub(super) fn emit_planned_response_data_frame(
     stream: &ReliablePathStream,
     target: ResponseDataDispatchTarget,
@@ -397,12 +406,7 @@ pub(super) fn emit_response_frame_from_sender_service(
                         return Err(RuntimeError::SenderServiceBlocked);
                     };
                     let identity = fixed.reinjection_output_identity();
-                    let queued_reinjection_bytes = service_model
-                        .queue
-                        .response_target_queued_reinjection_bytes(
-                            identity,
-                            service_model.exclude_front_work,
-                        );
+                    let queued_reinjection_bytes = service_model.queued_bytes(identity);
                     Some(fixed.try_enqueue_reinjected_frame(
                         &frame,
                         lane,
@@ -466,12 +470,7 @@ pub(super) fn emit_response_frame_from_sender_service(
                         key: target.observation.key,
                         incarnation: target.observation.incarnation,
                     };
-                    let queued_reinjection_bytes = service_model
-                        .queue
-                        .response_target_queued_reinjection_bytes(
-                            identity,
-                            service_model.exclude_front_work,
-                        );
+                    let queued_reinjection_bytes = service_model.queued_bytes(identity);
                     binding
                         .try_enqueue_reinjected_frame_for_target(
                             &dispatch_target,

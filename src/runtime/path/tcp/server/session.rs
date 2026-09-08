@@ -24,6 +24,7 @@ use crate::runtime::path::commands::{
     try_recv_reliable_path_command,
 };
 use crate::runtime::path::input::PendingMailboxFrame;
+use crate::runtime::path::prepared::PreparedOriginalClaim;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
     ServerCarrierPathRegistration, ServerDatagramOpenRequest, ServerStreamFrameRoute,
@@ -177,6 +178,7 @@ impl ServerTcpPathSession {
         // expiry all retire this exact registry instance explicitly. Ordered
         // successful drain already began the same idempotent transaction and
         // remains the only path that writes PATH_CLOSE.
+        self.commands_rx.withdraw_writer_ready();
         let _ = self.path_registration.begin_retirement();
         result
     }
@@ -184,8 +186,12 @@ impl ServerTcpPathSession {
     async fn run_active(&mut self) -> Result<(), RuntimeError> {
         loop {
             let event = if let Some(frame) = self.deferred_input.take() {
+                self.commands_rx.withdraw_writer_ready();
                 Some(ServerTcpPathEvent::Frame(frame))
             } else {
+                let _ = self
+                    .commands_rx
+                    .writer_ready_boundary(self.path_registration.path_instance_id());
                 recv_server_tcp_path_event(
                     &mut self.path_frames,
                     &mut self.commands_rx,
@@ -197,6 +203,12 @@ impl ServerTcpPathSession {
             let Some(event) = event else {
                 return Ok(());
             };
+            if !matches!(
+                &event,
+                ServerTcpPathEvent::Command(ReliablePathCommand::PreparedOriginal(_))
+            ) {
+                self.commands_rx.withdraw_writer_ready();
+            }
             self.evidence
                 .observe_periodic(&self.context, &self.path_registration, self.path_id);
             match event {
@@ -241,6 +253,7 @@ impl ServerTcpPathSession {
     }
 
     async fn run_path_drain(&mut self) -> Result<(), RuntimeError> {
+        self.commands_rx.withdraw_writer_ready();
         let deadline = self
             .commands_tx
             .path_drain_signal()
@@ -766,12 +779,68 @@ impl ServerTcpPathSession {
                 break;
             };
             let pending_bytes = reliable_path_command_pending_bytes(&command);
+            if !matches!(&command, ReliablePathCommand::PreparedOriginal(_)) {
+                self.commands_rx.withdraw_writer_ready();
+            }
             #[cfg(feature = "lab-diagnostics")]
             let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
             if let ReliablePathCommand::SendFrame(Frame::DatagramClose { flow_id }) = &command {
                 self.datagrams.remove(*flow_id);
             }
             match command {
+                ReliablePathCommand::PreparedOriginal(work) => {
+                    let instance = self.path_registration.path_instance_id();
+                    if !POLL_READY
+                        || self.state != ServerTcpCarrierState::Active
+                        || work.response_instance().is_none()
+                        || work.path_instance_id() != instance
+                    {
+                        break;
+                    }
+                    let Some(ready) = self.commands_rx.writer_ready_boundary(instance) else {
+                        break;
+                    };
+                    match work.try_claim(ready) {
+                        PreparedOriginalClaim::Claimed(frame) => {
+                            let bytes = self.commands_rx.register_claimed_writer_frame(&frame);
+                            writer_pending_bytes = writer_pending_bytes.checked_add(bytes).ok_or(
+                                RuntimeError::Protocol(
+                                    "server TCP writer transaction byte overflow",
+                                ),
+                            )?;
+                            #[cfg(feature = "lab-diagnostics")]
+                            {
+                                sent_bytes = sent_bytes.saturating_add(
+                                    crate::protocol::codec::encoded_frame_capacity_hint(&frame)
+                                        .max(1),
+                                );
+                                sent_items = sent_items.saturating_add(1);
+                            }
+                            self.writer.stage_transaction_frame(frame)?;
+                            work.requeue();
+                            if matches!(
+                                self.commit_transaction_respecting_deferred_input(
+                                    &mut writer_pending_bytes
+                                )
+                                .await?,
+                                ServerTcpSessionDisposition::Stop
+                            ) {
+                                return Ok(ServerTcpSessionDisposition::Stop);
+                            }
+                        }
+                        PreparedOriginalClaim::Busy(wait) => {
+                            self.commands_rx.defer_prepared_work(work, wait)
+                        }
+                        PreparedOriginalClaim::Blocked(wait) => {
+                            self.commands_rx.defer_prepared_work(work, wait)
+                        }
+                        PreparedOriginalClaim::Empty => {}
+                    }
+                    // A source notice is not a future payload queue. Successful
+                    // claims use the same one-frame protected transaction;
+                    // refusals preserve the idle epoch and defer on real change.
+                    break;
+                }
                 ReliablePathCommand::SendFrame(frame)
                     if reliable_path_frame_requires_capacity_command(&frame) =>
                 {
@@ -860,7 +929,6 @@ impl ServerTcpPathSession {
                     }
                 }
                 ReliablePathCommand::PrepareConnection { .. }
-                | ReliablePathCommand::PreparedOriginal(_)
                 | ReliablePathCommand::OpenStream { .. }
                 | ReliablePathCommand::OpenDatagramAttachment { .. }
                 | ReliablePathCommand::OpenDatagramFlow { .. }

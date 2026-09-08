@@ -9,6 +9,7 @@ mod data_commit;
 mod delivery;
 mod diagnostics;
 mod evidence;
+mod prepared;
 mod requalification;
 mod session;
 mod snapshot;
@@ -44,6 +45,7 @@ pub(super) use delivery::{
 pub(in crate::runtime) use delivery::{ResponseDataAckRecoveryCandidate, ResponseDataAckRelease};
 pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
+pub(in crate::runtime) use prepared::{ResponsePreparedNativeInputs, ResponsePreparedOutput};
 pub(in crate::runtime) use session::{ServerSessionRegistration, ServerSessionTracker};
 pub(in crate::runtime) use startup::ResponseStartupFinalOutcome;
 pub(super) use startup::validate_return_plan_shape;

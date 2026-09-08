@@ -14,6 +14,7 @@ use crate::runtime::path::commands::{
     reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
     try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
+use crate::runtime::path::prepared::PreparedOriginalClaim;
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{ServerCarrierPathRegistration, ServerStreamFrameRoute};
@@ -37,8 +38,19 @@ pub(super) async fn drain_one_server_udp_command_while_input_deferred(
     path_registration: &ServerCarrierPathRegistration,
     path_proofs: &mut PathProofTracker,
 ) -> Result<bool, RuntimeError> {
+    commands.withdraw_writer_ready();
     let pending_bytes = reliable_path_command_pending_bytes(&command);
     match command {
+        ReliablePathCommand::PreparedOriginal(work) => {
+            // Latency source notices share the priority lane with the exact
+            // ACK being drained. The retained input still occupies this writer;
+            // do not claim source or treat a legal notice as a protocol error.
+            if let Some(wait) = work.writer_change_wait() {
+                commands.defer_prepared_work(work, wait);
+            }
+            commands.release_pending_command_bytes(pending_bytes);
+            Ok(false)
+        }
         ReliablePathCommand::SendFrame(frame) => {
             if reliable_path_frame_requires_capacity_command(&frame) {
                 commands.release_pending_command_bytes(pending_bytes);
@@ -96,7 +108,6 @@ pub(super) async fn drain_one_server_udp_command_while_input_deferred(
             Ok(true)
         }
         ReliablePathCommand::PrepareConnection { .. }
-        | ReliablePathCommand::PreparedOriginal(_)
         | ReliablePathCommand::OpenStream { .. }
         | ReliablePathCommand::OpenDatagramAttachment { .. }
         | ReliablePathCommand::OpenDatagramFlow { .. }
@@ -140,21 +151,23 @@ pub(super) async fn drain_server_udp_reliable_commands(
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
     let mut pending_frame_command_bytes = 0usize;
+    let mut has_prepared_claim = false;
 
     loop {
         let Some(command) = next_command
             .take()
             .or_else(|| try_recv_reliable_path_command(commands))
         else {
-            if try_coalesce_reliable_path_writer_run(
-                commands,
-                &mut next_command,
-                sent_items,
-                sent_bytes,
-                byte_budget,
-                item_budget,
-            )
-            .await
+            if !has_prepared_claim
+                && try_coalesce_reliable_path_writer_run(
+                    commands,
+                    &mut next_command,
+                    sent_items,
+                    sent_bytes,
+                    byte_budget,
+                    item_budget,
+                )
+                .await
             {
                 continue;
             }
@@ -194,8 +207,44 @@ pub(super) async fn drain_server_udp_reliable_commands(
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
+        if !matches!(&command, ReliablePathCommand::PreparedOriginal(_)) {
+            commands.withdraw_writer_ready();
+        }
         let mut pending_released_by_batch = false;
         let should_close = match command {
+            ReliablePathCommand::PreparedOriginal(work) => {
+                let instance = path_registration.path_instance_id();
+                if work.response_instance().is_some()
+                    && work.stream_id() == stream_id
+                    && work.path_instance_id() == instance
+                    && let Some(ready) = commands.writer_ready_boundary(instance)
+                {
+                    match work.try_claim(ready) {
+                        PreparedOriginalClaim::Claimed(frame) => {
+                            let bytes = commands.register_claimed_writer_frame(&frame);
+                            pending_frame_command_bytes = pending_frame_command_bytes
+                                .checked_add(bytes)
+                                .ok_or(RuntimeError::Protocol(
+                                    "server QUIC writer transaction byte overflow",
+                                ))?;
+                            sent_bytes = sent_bytes.saturating_add(
+                                crate::protocol::codec::encoded_frame_capacity_hint(&frame).max(1),
+                            );
+                            pending_frames.push(frame);
+                            has_prepared_claim = true;
+                            work.requeue();
+                        }
+                        PreparedOriginalClaim::Busy(wait) => {
+                            commands.defer_prepared_work(work, wait)
+                        }
+                        PreparedOriginalClaim::Blocked(wait) => {
+                            commands.defer_prepared_work(work, wait)
+                        }
+                        PreparedOriginalClaim::Empty => {}
+                    }
+                }
+                false
+            }
             ReliablePathCommand::SendFrame(frame)
                 if reliable_path_frame_requires_capacity_command(&frame) =>
             {
@@ -329,7 +378,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 }
             }
             ReliablePathCommand::PrepareConnection { .. }
-            | ReliablePathCommand::PreparedOriginal(_)
             | ReliablePathCommand::OpenStream { .. }
             | ReliablePathCommand::OpenDatagramAttachment { .. }
             | ReliablePathCommand::OpenDatagramFlow { .. }
@@ -426,6 +474,9 @@ async fn flush_server_udp_frame_batch(
     carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
     deferred_input: &mut Option<Result<Frame, RuntimeError>>,
 ) -> Result<(), RuntimeError> {
+    if !pending_frames.is_empty() {
+        commands.withdraw_writer_ready();
+    }
     let result = flush_udp_frame_batch_with_path_proofs_interlocked(
         send,
         pending_frames,

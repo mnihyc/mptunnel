@@ -1,0 +1,525 @@
+//! Response bytes receive their first DSN and path owner at native claim.
+
+use super::scheduling::select_prepared_response_data_path;
+use super::service::response_data_dispatch_lane;
+use super::{ServerResponseSenderService, SharedResponseProduct};
+use crate::model::admission::ReliableDataAckFrontierState;
+use crate::mux::stream::{ReliableSendStream, StreamError};
+use crate::protocol::{Frame, UnderlayProtocol};
+use crate::runtime::RuntimeError;
+use crate::runtime::path::prepared::{
+    PreparedOriginalClaim, PreparedOriginalRegistration, PreparedOriginalWait,
+};
+use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
+use crate::runtime::relay::io::{
+    AuthoritativeStreamAckSnapshot, stream_ack_ranges_expose_authoritative_gap,
+};
+use crate::runtime::sender::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
+use crate::runtime::stream::response::{
+    ResponseAcquisitionOutputId, ResponseDispatchTarget, ResponsePreparedNativeInputs,
+    ResponsePreparedOutput,
+};
+use crate::scheduler::TrafficClass;
+use bytes::Bytes;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Notify;
+
+pub(in crate::runtime) struct ResponseProductState {
+    pub(in crate::runtime) sender: ServerResponseSenderService,
+    pub(in crate::runtime) send_stream: ReliableSendStream,
+    pub(in crate::runtime) last_send_ack: AuthoritativeStreamAckSnapshot,
+    pub(in crate::runtime) prepared: PreparedResponseSource,
+}
+
+pub(in crate::runtime) struct PreparedResponseSource {
+    pub(in crate::runtime) response_lane: TrafficClass,
+    pub(in crate::runtime) data_quantum_bytes: usize,
+    pub(in crate::runtime) claims_active: bool,
+    pub(in crate::runtime) registrations: Vec<Arc<PreparedOriginalRegistration>>,
+    pub(in crate::runtime) work_changed: Arc<Notify>,
+    pub(in crate::runtime) pending_error: Option<RuntimeError>,
+    pub(in crate::runtime) first_claimed_at: Option<Instant>,
+    pub(in crate::runtime) last_claimed_at: Option<Instant>,
+}
+
+impl PreparedResponseSource {
+    pub(in crate::runtime) fn new(response_lane: TrafficClass, data_quantum_bytes: usize) -> Self {
+        Self {
+            response_lane,
+            data_quantum_bytes,
+            claims_active: true,
+            registrations: Vec::new(),
+            work_changed: Arc::new(Notify::new()),
+            pending_error: None,
+            first_claimed_at: None,
+            last_claimed_at: None,
+        }
+    }
+}
+
+pub(in crate::runtime) fn publish_prepared_response_work(
+    state: &mut ResponseProductState,
+    owner: &SharedResponseProduct,
+    lane: TrafficClass,
+    quantum: usize,
+    changed: bool,
+) {
+    let lane = state
+        .sender
+        .queue
+        .front()
+        .filter(|(_, work)| matches!(work.kind, ReliableRelayQueuedWorkKind::Data(_)))
+        .map_or(lane, |(_, work)| {
+            response_data_dispatch_lane(work.data_lane, lane)
+        });
+    let policy_changed =
+        state.prepared.response_lane != lane || state.prepared.data_quantum_bytes != quantum;
+    state.prepared.response_lane = lane;
+    state.prepared.data_quantum_bytes = quantum;
+    if !state.prepared.claims_active {
+        state.prepared.registrations.clear();
+        state.prepared.work_changed.notify_waiters();
+        return;
+    }
+    let outputs = owner.binding().prepared_outputs();
+    let old_len = state.prepared.registrations.len();
+    state.prepared.registrations.retain(|registration| {
+        registration.lane() == lane
+            && outputs
+                .iter()
+                .any(|output| registration.response_instance() == Some(output.identity))
+    });
+    let mut membership_changed = old_len != state.prepared.registrations.len();
+    for output in outputs {
+        if state
+            .prepared
+            .registrations
+            .iter()
+            .any(|registration| registration.response_instance() == Some(output.identity))
+        {
+            continue;
+        }
+        state
+            .prepared
+            .registrations
+            .push(PreparedOriginalRegistration::new_response(
+                owner.downgrade(),
+                state.sender.stream_id(),
+                output.identity,
+                output.commands,
+                lane,
+            ));
+        membership_changed = true;
+    }
+    if changed || policy_changed || membership_changed {
+        state.prepared.work_changed.notify_waiters();
+        if state.sender.data_bytes() > 0 {
+            for registration in &state.prepared.registrations {
+                registration.notify();
+            }
+        }
+    }
+}
+
+fn current(
+    state: &ResponseProductState,
+    identity: ResponseAcquisitionOutputId,
+    registration: &PreparedOriginalRegistration,
+) -> bool {
+    state.prepared.claims_active
+        && registration.response_instance() == Some(identity)
+        && registration.lane() == state.prepared.response_lane
+        && state
+            .prepared
+            .registrations
+            .iter()
+            .any(|current| std::ptr::eq(current.as_ref(), registration))
+}
+
+fn frontier(state: &ResponseProductState) -> ReliableDataAckFrontierState {
+    ReliableDataAckFrontierState::from_authoritative_gap(
+        stream_ack_ranges_expose_authoritative_gap(
+            state.last_send_ack.complete(),
+            state.last_send_ack.ranges(),
+        ),
+    )
+}
+
+fn arm_notify(notify: Arc<Notify>) -> PreparedOriginalWait {
+    let mut wait = Box::pin(notify.notified_owned());
+    wait.as_mut().enable();
+    wait
+}
+
+fn arm_work_change(
+    state: &ResponseProductState,
+    identity: ResponseAcquisitionOutputId,
+    outputs: &[ResponsePreparedOutput],
+    mut updates: tokio::sync::watch::Receiver<u64>,
+) -> PreparedOriginalWait {
+    let mut waits = vec![
+        arm_notify(state.prepared.work_changed.clone()),
+        Box::pin(async move {
+            let _ = updates.changed().await;
+        }) as PreparedOriginalWait,
+    ];
+    for output in outputs {
+        if output.identity != identity {
+            waits.push(arm_notify(
+                output.commands.writer_boundary().change_notify(),
+            ));
+        }
+        if let Some(authority) = output.commands.native_rate_authority() {
+            let mut updates = authority.accepted_change_cursor();
+            waits.push(Box::pin(async move {
+                let _ = updates.changed().await;
+            }));
+        }
+    }
+    Box::pin(async move {
+        let _ = futures::future::select_all(waits).await;
+    })
+}
+
+fn ready_outputs(outputs: &[ResponsePreparedOutput]) -> Vec<ResponseAcquisitionOutputId> {
+    outputs
+        .iter()
+        .filter(|output| {
+            output
+                .commands
+                .writer_boundary()
+                .snapshot()
+                .is_some_and(|ready| ready.instance() == output.identity.path_instance_id)
+        })
+        .map(|output| output.identity)
+        .collect()
+}
+
+fn source_prefix(state: &ResponseProductState) -> Option<&Bytes> {
+    let (_, work) = state.sender.queue.front()?;
+    match &work.kind {
+        ReliableRelayQueuedWorkKind::Data(payload) => Some(payload),
+        _ => None,
+    }
+}
+
+fn source_error(state: &mut ResponseProductState, error: RuntimeError) {
+    state.prepared.pending_error = Some(error);
+    state.prepared.claims_active = false;
+    state.prepared.work_changed.notify_waiters();
+}
+
+pub(in crate::runtime) enum ResponsePreparedCommitError {
+    Blocked,
+    Source(RuntimeError),
+}
+
+/// Borrowed source transaction, never a second queue or owner. Qualification
+/// refusal rolls back only the just-committed mux range before source removal.
+pub(in crate::runtime) struct ResponsePreparedSourceCommit<'a> {
+    pub(in crate::runtime) send_stream: &'a mut ReliableSendStream,
+    pub(in crate::runtime) queue: &'a mut ReliableRelaySenderQueue,
+}
+
+impl ResponsePreparedSourceCommit<'_> {
+    pub(in crate::runtime) fn finish(&mut self, bytes: usize) {
+        self.queue
+            .commit_front_data_prefix(bytes)
+            .expect("validated prepared response source prefix");
+    }
+    pub(in crate::runtime) fn matches(&self, frame: &Frame) -> bool {
+        let Frame::StreamData {
+            offset, payload, ..
+        } = frame
+        else {
+            return false;
+        };
+        let Some((_, work)) = self.queue.front() else {
+            return false;
+        };
+        matches!(&work.kind, ReliableRelayQueuedWorkKind::Data(source)
+            if *offset == self.send_stream.next_offset() && !payload.is_empty()
+                && payload.len() <= source.len() && payload.as_ptr() == source.as_ptr())
+    }
+}
+
+pub(in crate::runtime) fn claim_prepared_response_data(
+    owner: &SharedResponseProduct,
+    identity: ResponseAcquisitionOutputId,
+    ready: &ReliableWriterReadyGuard,
+    registration: &PreparedOriginalRegistration,
+) -> PreparedOriginalClaim {
+    if ready.receipt().instance() != identity.path_instance_id {
+        return PreparedOriginalClaim::Empty;
+    }
+    let state = match owner.arm_claim().try_lock() {
+        Ok(state) => state,
+        Err(wait) => return PreparedOriginalClaim::Busy(wait),
+    };
+    if !current(&state, identity, registration) {
+        return PreparedOriginalClaim::Empty;
+    }
+    // Subscribe before observing membership; a replacement between capture
+    // and resolution must remain a pending wake if its receipt is rejected.
+    let updates = owner.binding().subscribe_updates();
+    let outputs = owner.binding().prepared_outputs();
+    let wake = arm_work_change(&state, identity, &outputs, updates);
+    let Some(output) = outputs
+        .iter()
+        .find(|output| output.identity == identity)
+        .cloned()
+    else {
+        return PreparedOriginalClaim::Empty;
+    };
+    if state.sender.data_bytes() == 0 {
+        return PreparedOriginalClaim::Empty;
+    }
+    let Some(source) = source_prefix(&state) else {
+        return PreparedOriginalClaim::Blocked(wake);
+    };
+    let lane = state.prepared.response_lane;
+    let quantum = state.prepared.data_quantum_bytes;
+    let credit = owner
+        .binding()
+        .mux_limits()
+        .max_repair_bytes
+        .saturating_sub(state.send_stream.reinjection_bytes());
+    let Some(proposed) = owner
+        .binding()
+        .response_startup_fresh_data_limit(
+            state.send_stream.next_offset(),
+            source.len().min(quantum).min(credit),
+        )
+        .filter(|bytes| *bytes > 0)
+    else {
+        return PreparedOriginalClaim::Blocked(wake);
+    };
+    let source = source.slice(..proposed);
+    let offset = state.send_stream.next_offset();
+    drop(state);
+    let mut inputs = ResponsePreparedNativeInputs::resolve(outputs.clone());
+    let mut state = match owner.arm_claim().try_lock() {
+        Ok(state) => state,
+        Err(wait) => return PreparedOriginalClaim::Busy(wait),
+    };
+    if !current(&state, identity, registration) {
+        return PreparedOriginalClaim::Empty;
+    }
+    if state.prepared.data_quantum_bytes != quantum
+        || state.send_stream.next_offset() != offset
+        || !source_prefix(&state).is_some_and(|current| {
+            current.as_ptr() == source.as_ptr() && current.len() >= source.len()
+        })
+        || !ready.receipt().is_current()
+    {
+        return PreparedOriginalClaim::Blocked(wake);
+    }
+    let Some(observation) = owner
+        .binding()
+        .observe_prepared_original(&inputs, lane, offset)
+    else {
+        return PreparedOriginalClaim::Blocked(wake);
+    };
+    let Some(selection) = select_prepared_response_data_path(
+        &observation.targets,
+        lane,
+        source.len(),
+        owner.binding().mux_limits(),
+        &observation.lower_flights,
+        state.send_stream.reinjection_bytes(),
+        frontier(&state),
+        &ready_outputs(&outputs),
+    ) else {
+        return PreparedOriginalClaim::Blocked(wake);
+    };
+    let selected_identity = ResponseAcquisitionOutputId::from(&selection.target);
+    if selected_identity != identity {
+        let selected = state
+            .prepared
+            .registrations
+            .iter()
+            .find(|registration| registration.response_instance() == Some(selected_identity))
+            .cloned();
+        drop(state);
+        if let Some(selected) = selected {
+            selected.notify();
+        }
+        return PreparedOriginalClaim::Blocked(wake);
+    }
+    let frame = match state
+        .send_stream
+        .prepare_data(source.slice(..selection.payload_bytes))
+    {
+        Ok(frame) => frame,
+        Err(
+            StreamError::FlowControlBlocked { .. }
+            | StreamError::ReinjectionCacheFull { .. }
+            | StreamError::TooManyReinjectionCacheChunks { .. },
+        ) => return PreparedOriginalClaim::Blocked(wake),
+        Err(error) => {
+            source_error(&mut state, RuntimeError::Stream(error));
+            return PreparedOriginalClaim::Empty;
+        }
+    };
+    let target = ResponseDispatchTarget::from(&selection.target);
+    drop(state);
+    let attempt = owner.arm_claim();
+    let mut selected_elsewhere = None;
+    let commit = |shape| {
+        let mut state = match attempt.try_lock() {
+            Ok(state) => state,
+            Err(wait) => return Some(PreparedOriginalClaim::Busy(wait)),
+        };
+        if !current(&state, identity, registration) {
+            return Some(PreparedOriginalClaim::Empty);
+        }
+        if state.prepared.data_quantum_bytes != quantum || !ready.receipt().is_current() {
+            return None;
+        }
+        {
+            let ResponseProductState {
+                sender,
+                send_stream,
+                ..
+            } = &mut *state;
+            if !(ResponsePreparedSourceCommit {
+                send_stream,
+                queue: &mut sender.queue,
+            })
+            .matches(&frame)
+            {
+                return None;
+            }
+        }
+        if let Some(shape) = shape {
+            inputs.replace_fenced_target(identity, shape);
+        }
+        let observation = owner
+            .binding()
+            .observe_prepared_original(&inputs, lane, offset)?;
+        let current_plan = select_prepared_response_data_path(
+            &observation.targets,
+            lane,
+            source.len(),
+            owner.binding().mux_limits(),
+            &observation.lower_flights,
+            state.send_stream.reinjection_bytes(),
+            frontier(&state),
+            &ready_outputs(&outputs),
+        )?;
+        let selected = ResponseAcquisitionOutputId::from(&current_plan.target);
+        if selected != identity {
+            selected_elsewhere = state
+                .prepared
+                .registrations
+                .iter()
+                .find(|registration| registration.response_instance() == Some(selected))
+                .cloned();
+            return None;
+        }
+        if current_plan.payload_bytes != selection.payload_bytes {
+            return None;
+        }
+        let ResponseProductState {
+            sender,
+            send_stream,
+            ..
+        } = &mut *state;
+        let result = owner
+            .binding()
+            .commit_prepared_original_for_dispatch_target(
+                &ResponseDispatchTarget::from(&current_plan.target),
+                &frame,
+                lane,
+                observation.model_generation,
+                current_plan.position,
+                shape,
+                ready,
+                &mut ResponsePreparedSourceCommit {
+                    send_stream,
+                    queue: &mut sender.queue,
+                },
+            );
+        match result {
+            Ok(()) => {
+                let claimed_at = Instant::now();
+                state.prepared.first_claimed_at.get_or_insert(claimed_at);
+                state.prepared.last_claimed_at = Some(claimed_at);
+                state.prepared.work_changed.notify_waiters();
+                #[cfg(feature = "lab-diagnostics")]
+                if let Frame::StreamData {
+                    offset, payload, ..
+                } = &frame
+                {
+                    crate::lab_diagnostics::lab_server_response_stream_data(
+                        state.sender.session_id.0,
+                        state.sender.stream_id.0,
+                        *offset,
+                        payload.len(),
+                    );
+                }
+                Some(PreparedOriginalClaim::Claimed(frame.clone()))
+            }
+            Err(ResponsePreparedCommitError::Blocked) => None,
+            Err(ResponsePreparedCommitError::Source(error)) => {
+                source_error(&mut state, error);
+                Some(PreparedOriginalClaim::Empty)
+            }
+        }
+    };
+    let result = match (
+        output.commands.native_rate_authority(),
+        target.native_authority_stamp,
+    ) {
+        (Some(authority), Some(stamp)) => authority
+            .commit_with_current_scheduling_shape(stamp, |shape| commit(Some(shape)))
+            .ok()
+            .flatten(),
+        (None, None) if identity.key.underlay == UnderlayProtocol::Tcp => commit(None),
+        _ => None,
+    };
+    if let Some(selected) = selected_elsewhere {
+        selected.notify();
+    }
+    result.unwrap_or(PreparedOriginalClaim::Blocked(wake))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::path::CarrierPathKey;
+    use crate::protocol::{PathId, StreamId};
+    use crate::runtime::sender::{RelaySendCause, ServerReinjectionOutputIdentity};
+
+    #[test]
+    fn prepared_source_does_not_double_charge_selected_ordinary_repair() {
+        let mut queue = ReliableRelaySenderQueue::default();
+        queue.push_data(Bytes::from_static(b"unclaimed source"));
+        let frame = Frame::StreamData {
+            stream_id: StreamId(715),
+            offset: 0,
+            payload: Bytes::from_static(b"repair"),
+        };
+        queue.push_reinjection_with_cause(frame, RelaySendCause::TailReinjection);
+        let target = ServerReinjectionOutputIdentity {
+            key: CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(0),
+            },
+            incarnation: 1,
+        };
+        assert_eq!(
+            queue.response_target_queued_reinjection_bytes(target, true),
+            6,
+            "generic global-front accounting remains unchanged"
+        );
+        assert_eq!(
+            queue.response_target_queued_reinjection_bytes_for_repair_dispatch(target),
+            0,
+            "the selected repair is excluded once even while Data stays shared"
+        );
+        queue.commit_front_reinjection().unwrap();
+        assert_eq!(queue.data_bytes(), b"unclaimed source".len());
+    }
+}

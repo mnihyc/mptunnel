@@ -40,6 +40,9 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
+#[path = "tests_prepared_response.rs"]
+mod prepared_response;
+
 struct PolicyDenyDatagramBackend;
 
 impl ServerDatagramPortBackend for PolicyDenyDatagramBackend {
@@ -284,13 +287,15 @@ async fn server_tcp_test_session(
     mpsc::Sender<Result<Frame, EncryptedFramedTransportError>>,
     crate::runtime::relay::ServerReliableRelayService,
 ) {
-    server_tcp_test_session_with_mode(session_id, path_id, crate::config::ForwardingMode::L4).await
+    server_tcp_test_session_with_mode(session_id, path_id, crate::config::ForwardingMode::L4, None)
+        .await
 }
 
 async fn server_tcp_test_session_with_mode(
     session_id: SessionId,
     path_id: PathId,
     forwarding_mode: crate::config::ForwardingMode,
+    command_capacity: Option<usize>,
 ) -> (
     ServerTcpPathSession,
     EncryptedFramedStream<TcpStream>,
@@ -365,7 +370,7 @@ async fn server_tcp_test_session_with_mode(
         path_id,
         ServerLocalPathProperties::default(),
     );
-    let (commands_tx, commands_rx) = reliable_path_command_channels(8);
+    let (commands_tx, commands_rx) = reliable_path_command_channels(command_capacity.unwrap_or(8));
     let commands = commands_tx.clone();
     let (path_frames_tx, path_frames) = mpsc::channel(1);
     let evidence = ServerTcpEvidenceState::new(None, None, context.mux_limits);
@@ -774,6 +779,7 @@ async fn server_tcp_l3_mode_rejects_l4_forwarding_opens() {
             SessionId(207),
             PathId(0),
             crate::config::ForwardingMode::L3,
+            None,
         )
         .await;
     let stream_id = StreamId(1);

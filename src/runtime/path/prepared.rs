@@ -1,13 +1,15 @@
-//! Payload-free wake ownership for shared prepared request source.
+//! Payload-free wake ownership for either direction's shared prepared source.
 
 use super::commands::ReliablePathCommandSender;
 use super::writer_boundary::ReliableWriterReadyGuard;
-use crate::model::path::RelayPathInstance;
-use crate::protocol::StreamId;
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
+use crate::protocol::{Frame, StreamId};
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::sender::{
-    RequestPreparedClaim, WeakSharedRequestProduct, claim_prepared_request_data,
+    WeakSharedRequestProduct, WeakSharedResponseProduct, claim_prepared_request_data,
+    claim_prepared_response_data,
 };
+use crate::runtime::stream::response::ResponseAcquisitionOutputId;
 use crate::scheduler::TrafficClass;
 use std::future::Future;
 use std::pin::Pin;
@@ -23,13 +25,46 @@ const NOTIFIED_AGAIN: u8 = 2;
 pub(in crate::runtime) type PreparedOriginalWait =
     Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+pub(in crate::runtime) enum PreparedOriginalClaim {
+    Claimed(Frame),
+    Busy(Pin<Box<tokio::sync::futures::OwnedNotified>>),
+    Blocked(PreparedOriginalWait),
+    Empty,
+}
+
+enum PreparedOriginalSource {
+    Request {
+        product: WeakSharedRequestProduct,
+        context: ClientPathContext,
+        instance: RelayPathInstance,
+    },
+    Response {
+        product: WeakSharedResponseProduct,
+        instance: ResponseAcquisitionOutputId,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PreparedOriginalInstance {
+    Request(RelayPathInstance),
+    Response(ResponseAcquisitionOutputId),
+}
+
+impl PreparedOriginalInstance {
+    fn path_instance_id(self) -> CarrierPathInstanceId {
+        match self {
+            Self::Request(instance) => instance.path_instance_id,
+            Self::Response(instance) => instance.path_instance_id,
+        }
+    }
+}
+
 /// Product alone retains this registration. A queued or waiting notice holds
 /// only Weak, so carrier work cannot keep cancelled logical source alive.
 pub(in crate::runtime) struct PreparedOriginalRegistration {
-    product: WeakSharedRequestProduct,
-    context: ClientPathContext,
+    source: PreparedOriginalSource,
     stream_id: StreamId,
-    instance: RelayPathInstance,
+    instance: PreparedOriginalInstance,
     commands: ReliablePathCommandSender,
     lane: TrafficClass,
     state: AtomicU8,
@@ -58,10 +93,13 @@ impl PreparedOriginalRegistration {
         lane: TrafficClass,
     ) -> Arc<Self> {
         Arc::new(Self {
-            product,
-            context,
+            source: PreparedOriginalSource::Request {
+                product,
+                context,
+                instance,
+            },
             stream_id,
-            instance,
+            instance: PreparedOriginalInstance::Request(instance),
             commands,
             lane,
             state: AtomicU8::new(0),
@@ -70,8 +108,37 @@ impl PreparedOriginalRegistration {
         })
     }
 
-    pub(in crate::runtime) fn instance(&self) -> RelayPathInstance {
-        self.instance
+    pub(in crate::runtime) fn new_response(
+        product: WeakSharedResponseProduct,
+        stream_id: StreamId,
+        instance: ResponseAcquisitionOutputId,
+        commands: ReliablePathCommandSender,
+        lane: TrafficClass,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            source: PreparedOriginalSource::Response { product, instance },
+            stream_id,
+            instance: PreparedOriginalInstance::Response(instance),
+            commands,
+            lane,
+            state: AtomicU8::new(0),
+            notified: Arc::new(Notify::new()),
+            dropped: Arc::new(Notify::new()),
+        })
+    }
+
+    pub(in crate::runtime) fn request_instance(&self) -> Option<RelayPathInstance> {
+        match self.instance {
+            PreparedOriginalInstance::Request(instance) => Some(instance),
+            PreparedOriginalInstance::Response(_) => None,
+        }
+    }
+
+    pub(in crate::runtime) fn response_instance(&self) -> Option<ResponseAcquisitionOutputId> {
+        match self.instance {
+            PreparedOriginalInstance::Response(instance) => Some(instance),
+            PreparedOriginalInstance::Request(_) => None,
+        }
     }
     pub(in crate::runtime) fn lane(&self) -> TrafficClass {
         self.lane
@@ -112,7 +179,7 @@ impl Drop for PreparedOriginalRegistration {
 pub(in crate::runtime) struct PreparedOriginalWork {
     registration: Weak<PreparedOriginalRegistration>,
     stream_id: StreamId,
-    instance: RelayPathInstance,
+    instance: PreparedOriginalInstance,
     lane: TrafficClass,
 }
 
@@ -120,8 +187,20 @@ impl PreparedOriginalWork {
     pub(in crate::runtime) fn stream_id(&self) -> StreamId {
         self.stream_id
     }
-    pub(in crate::runtime) fn instance(&self) -> RelayPathInstance {
-        self.instance
+    pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
+        self.instance.path_instance_id()
+    }
+    pub(in crate::runtime) fn request_instance(&self) -> Option<RelayPathInstance> {
+        match self.instance {
+            PreparedOriginalInstance::Request(instance) => Some(instance),
+            PreparedOriginalInstance::Response(_) => None,
+        }
+    }
+    pub(in crate::runtime) fn response_instance(&self) -> Option<ResponseAcquisitionOutputId> {
+        match self.instance {
+            PreparedOriginalInstance::Response(instance) => Some(instance),
+            PreparedOriginalInstance::Request(_) => None,
+        }
     }
     pub(in crate::runtime) fn lane(&self) -> TrafficClass {
         self.lane
@@ -130,31 +209,57 @@ impl PreparedOriginalWork {
     pub(in crate::runtime) fn try_claim(
         &self,
         ready: &ReliableWriterReadyGuard,
-    ) -> RequestPreparedClaim {
+    ) -> PreparedOriginalClaim {
         let Some(registration) = self.registration.upgrade() else {
-            return RequestPreparedClaim::Empty;
+            return PreparedOriginalClaim::Empty;
         };
         // A fresh claim observes all work notifications preceding this point.
         // A later notification survives in NOTIFIED_AGAIN until token release.
         registration
             .state
             .fetch_and(!NOTIFIED_AGAIN, Ordering::AcqRel);
-        let Some(product) = registration.product.upgrade() else {
-            return RequestPreparedClaim::Empty;
-        };
-        claim_prepared_request_data(
-            &product,
-            &registration.context,
-            self.instance,
-            ready,
-            &registration,
-        )
+        match &registration.source {
+            PreparedOriginalSource::Request {
+                product,
+                context,
+                instance,
+            } => {
+                let Some(product) = product.upgrade() else {
+                    return PreparedOriginalClaim::Empty;
+                };
+                claim_prepared_request_data(&product, context, *instance, ready, &registration)
+            }
+            PreparedOriginalSource::Response { product, instance } => {
+                let Some(product) = product.upgrade() else {
+                    return PreparedOriginalClaim::Empty;
+                };
+                claim_prepared_response_data(&product, *instance, ready, &registration)
+            }
+        }
     }
 
     pub(in crate::runtime) fn requeue(self) {
         if let Some(registration) = self.registration.upgrade() {
             registration.commands.enqueue_prepared_work(self);
         }
+    }
+
+    /// An occupied writer has observed this notice without claiming source.
+    /// Wait for its next physical boundary; retain no source or registration.
+    pub(in crate::runtime::path) fn writer_change_wait(&self) -> Option<PreparedOriginalWait> {
+        let registration = self.registration.upgrade()?;
+        registration
+            .state
+            .fetch_and(!NOTIFIED_AGAIN, Ordering::AcqRel);
+        let mut wait = Box::pin(
+            registration
+                .commands
+                .writer_boundary()
+                .change_notify()
+                .notified_owned(),
+        );
+        wait.as_mut().enable();
+        Some(wait)
     }
 
     /// Arm while holding a temporary upgrade, then retain no strong owner in

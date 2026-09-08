@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 21:06 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 22:05 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,123 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Ordinary diagnostic outcome22:10:** mixed down's longest gap improves
+7.418→3.720s, but first body0.546→1.055s and echo42/75→30/75 are adverse.
+Echo disconnects at18.477s rather than24.362s; faster bulk cannot hide lost
+service. Mixed up settles419823616 exact bytes/49.378940s, but maximum
+confirmation gap is5.164575s versus4.004233s in the current ordinary control.
+This is a mechanism-correct candidate, not a practically accepted stall fix.
+No gain/window/queue/controller compensation follows. Preserve the complete
+report/raw result and commit the independently verified ownership migration
+as an intermediary checkpoint, explicitly withholding performance acceptance.
+
+**Next discriminator / forecast:** use the existing reorder-recovery scenario:
+500Mbps, initial3% forward/1% return loss and70/20+30/5ms delay/jitter; at8s
+remove loss/jitter but keep500Mbps and100ms RTT for the remaining32s.
+Compare ordinary control mixed, candidate mixed, candidate QUIC, then Hysteria2
+sequentially on that same scenario. This is a new restored-high-capacity
+question, not a favorable repeat of the harsh pair: does retained mixed state
+continue to damage service after impairment ends while singleton/baseline
+recovers? Existing runner/probes only; keep priors and all40 bins, echo failures,
+resource/wire data. A restored persistent deficit selects retained allocation/
+recovery for exact attribution; comparable prompt recovery rejects that claim
+for this scenario and leaves the harsh receive/native boundary unresolved.
+No universal recovery, heterogeneous aggregation or final release claim from
+four finite cells. Root serializes labs and builds; no runtime change for this
+discriminator. Record actual recovery timing, not just40s averages.
+
+**Mechanism checks22:07:** the final test-only fixture drives the actual scoped
+server Native metrics service, rather than a one-time staged shape. Both legal
+QUIC latency-notice cases now complete exact peer delivery; four lifecycle
+checks pass in0.28s and all692 affected regressions pass in3.71s. Test build6
+is warning-free39.06s. The ordinary binary remains release2: no production
+change was needed for those missing fixture refreshes. The declared harsh
+mixed-down comparison is running; no build overlaps it.
+
+**Healthy outcome22:05:** all six ordinary control/candidate cells completed.
+TCP411.785→420.820Mbps, QUIC433.960→427.082, mixed410.025→404.191;
+there is no high-BDP pipeline collapse. Mixed maximum read gap0.551→0.399s
+and echo p950.707→0.652s improve, but first body0.441→0.613s and server
+process-lifetime-average CPU maximum158→196% are adverse. TCP first body
+0.448→0.580s, echo p951.177→1.212s and server CPU73.5→118% are also adverse;
+QUIC echo p950.165→0.215s. Single cells do not prove causal CPU attribution.
+Full bins, failures, resources and startup remain in the response service
+report; no clean improvement or release acceptance is claimed.
+
+**Next bounded comparison:** finish the test-only actual Native cadence
+fixture build and the unchanged affected lifecycle/regression cohort. Then
+execute the already-declared mixed down/up harsh diagnostic cells on the
+frozen ordinary candidate, without changing controllers, queues, hints or
+impairment. The question is whether eliminating private pre-native ownership
+reduces the captured ordering failure, not whether aggregate exceeds100Mbps.
+An adverse pair stops promotion and selects attribution, not another tweak.
+The upload handoff and already-native hold are still separate unresolved
+mechanisms. Healthy adverse costs cannot be waived by a harsh-profile win.
+
+**Integration21:36:** response source/binding/actor and actual TCP/QUIC writer
+consumers now form one uncommitted candidate. Native writers acquire Product
+only via prearmed try-lock; actor Product-to-Native repair remains legal because
+there is no blocking reverse edge. Independent review withdrew its conditional
+deadlock concern after checking those actual edges; no repair rewrite followed.
+The first compiler pass exposed only the common claim enum's missing test import
+and unused bindings, now corrected; this is integration, not a platform defect.
+An independent review also caught two real candidate priority-path errors:
+latency source notices are legal in QUIC's priority lane, including while an
+exact probe awaits ACK credit. Such a notice now waits weakly for physical
+writer availability rather than throwing Protocol; ordinary metadata refusal
+does not withdraw idle Ready. The existing real QUIC fixture covers this
+composition, without changing its ACK-drain-before-input ordering.
+
+**Verification contract:** actual protected-writer prefix/started-owner/ACK/
+cancellation controls, Native source/Busy controls, EOF-with-U and post-FIN
+repair, then affected request/server/QUIC regressions. Build one ordinary
+candidate with diagnostics disabled only after those pass. Compare its
+TCP/QUIC/mixed healthy cells against the three frozen controls below, then
+mixed download/upload in the unchanged harsh diagnostic profile against the
+current ordinary baseline cohort. Preserve all timing bins, failures and costs.
+Any high-BDP underfeeding or worse service stops performance promotion; do not
+compensate with a gain/window/queue adjustment. An already-native hold and the
+separate upload receive-handoff boundary remain open even if prefix placement
+passes. No new model is accepted or speed improvement claimed yet.
+
+**Checks21:39:** seven real prepared-writer/Native controls pass, as do601
+sender/response/TCP/QUIC/control regressions. Actor controls give87pass/1failure;
+the new EOF test also fails. Review identifies fixture assumptions: EOF watches
+only A although unchanged control placement may select empty B; the old idle
+source test expects SendFrame rather than driving its new real Ready claim.
+Migrate those consumers and rerun the same assertions, not their deadlines.
+An ordinary non-test build is running concurrently with test-only repair to
+expose stale production-only dependencies; this expedites the earlier build
+ordering but does not authorize labs before lifecycle checks pass. No labs
+overlap compilation. Independent audit also identifies potential extra actor
+turns and two selection projections per claim; healthy timing/resource results
+must determine their material cost, not speculation or a compensating tweak.
+
+**Lifecycle21:51:** corrected actor consumers now reach closure and exact
+post-FIN repair. The expected128-byte statistic initially returned130:
+the inherited4f584213 non-reinjection branch counted one resource-accounting
+unit per FIN/replay as payload. Only that nondata payload-stat mutation and its
+unused plumbing are removed; queue charges, budgets and wire behavior remain.
+EOF/recovery and idle-source requalification then pass. QUIC Busy preserves
+Ready and writes successfully. The deferred-probe test proves no Protocol,
+unchanged U/cache and actual ACK receipt, then exposes Native
+TransportSourceChanged with C=0/U=26/cache=0. Its helper-only fixture omitted
+the real server's metrics cadence: refresh scheduling shape, fenced registry
+stage and binding fanout. Replay that actual lifecycle and consume its retained
+wake; do not fabricate capacity or change the timeout. No delivery failure or
+new production Native defect follows from a never-claimed source.
+
+**Execution deviation21:55:** the latest real-lifecycle cohort passes691/692;
+the repaired deferred-probe case passes, while Busy's later single claim now
+hits the same missing fixture cadence (its Busy/Ready/wake assertions passed
+and it previously delivered). Completing the shared real cadence fixture is
+test-only. Run the already-built/frozen ordinary candidate's three healthy
+cells now, with no compiler or runtime edits in parallel, instead of blocking
+real-service observation on another fixture-only rebuild. This is a diagnostic
+acceptance step, not a waiver: all checks must pass before committing runtime
+or promoting performance. Source identity: response-claim-20260908, default
+features, including exact C-only payload stats and no observer/controller edits.
 
 **Current decision21:06:** the two frozen captures are complete. UP's current
 useful replies have1.112s already-decoded residence and a6.403s frontier hold
@@ -63,6 +180,26 @@ retaining that mask would revive the b783cd6 liveness counterexample. Legacy
 non-prepared callers retain their policy. No new rate or score tuning.
 All16 raw archive members pass gzip integrity and byte-for-byte comparison;
 the report's100 timing bins and29 successful echo latencies match probe files.
+
+**Healthy comparator forecast21:21:** while the disjoint source migration is
+being implemented (no compiler), freeze ordinary d999fea TCP/QUIC/mixed download
+service on the existing500Mbps/100ms routed profile with loss/jitter/QoS/outage
+explicitly disabled. This is the healthy high-BDP ablation, not replacement of
+the harsh diagnostic or final real-Internet proof. Existing runner and full
+body/echo timing only; tag response-claim-healthy-control-0908. The candidate
+must preserve singleton and mixed pipelining here, not merely reduce the harsh
+gap by underfeeding native service. One control per mode now, no favorable
+reruns or diagnostic binaries; root serializes labs and subsequent builds.
+
+**Healthy controls21:25:** all three ordinary cells complete their40s observation.
+TCP/QUIC/mixed rates are411.785/433.960/410.025Mbps, maximum read gaps
+0.402/0.101/0.551s, first body0.448/0.414/0.441s. Echo succeeds48/48,80/80,
+74/74 respectively; p95 is1177/165/707ms. The rates are healthy, but slower
+loaded interactive service remains visible; no throughput-only acceptance.
+These are the candidate's high-BDP controls, not a random-Internet comparison.
+No lab/build is active after the third cell. Telegram attribution update sent
+13:25UTC; next nonurgent not before14:26UTC. Stable notification keys:
+task=mptunnel-performance-closure, session=mptunnel-20260908.
 
 **User direction20:33:** the all-baselines-poor combined profile is diagnostic,
 not a final performance claim or a100Mbps objective. Keep the stall and default
@@ -354,9 +491,9 @@ list and byte-for-byte source comparison pass. No build or lab remains active;
 target/release is diagnostic, not ordinary d999fea. Exact causal joins and the
 next discriminator remain root-owned.
 
-## Current source and ordinary disposition
+## Comparator source and retained ordinary disposition
 
-Current runtime **d999fea** restricts request ACK-release work to exact support;
+Comparator runtime **d999fea** restricts request ACK-release work to exact support;
 RED **0683286**,546focused checks. Parent **b783cd6** separates prepared stale
 preference; RED **f1b0900**,544checks. Earlier **e476308** makes the two advisory
 native-writer Product acquisitions nonblocking; RED **584b748**,542checks.
@@ -508,8 +645,9 @@ chosen readiness epoch, current exact qualification and final Native fence.
 Product→Native actor calls coexist with Native→tryProduct writer calls:
 no blocking reverse edge or guard across await. Deadlock freedom is not latency.
 Structural byte order must not block independently eligible targets; retain
-exact copy deadlines/J/Native Apply. **Response direction-neutral prepared-source
-parity remains pending**; request-only migration is not both-direction closure.
+exact copy deadlines/J/Native Apply. **Response prepared-source parity now passes
+mechanism checks, but its practical comparison remains adverse/mixed** as above;
+this is not both-direction stall closure.
 
 Rejected static ranking, relative ACK codec, ready-feedback batching,
 wrapperless actor, absolute-delay reordering,3N1 and isolated raw-byte hysteresis
@@ -544,11 +682,11 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 
 ## Execution, evidence and continuity
 
-- Root owns builds/labs. The frozen native-read-service-0908 capture is complete;
-  no build/lab is active, and all observer source hooks are reversed.
+- Root owns builds/labs. Response claim verification and the declared ordinary
+  healthy/harsh comparisons are complete; no observer hooks are active.
   Owned Docker only: no sudo, host shaping, outside-repo work or build/lab overlap.
-- Ordinary candidate:`./.tmp/reflection/bin/ack-support-20260908/mptunnel`.
-  Ordinary parent:`./.tmp/reflection/bin/prepared-stale-20260908/mptunnel`.
+- Ordinary candidate:`./.tmp/reflection/bin/response-claim-20260908/mptunnel`.
+  Ordinary comparator:`./.tmp/reflection/bin/ack-support-20260908/mptunnel`.
   Current diagnostic:`./.tmp/reflection/bin/native-read-service-20260908/mptunnel`.
   Previous forward diagnostic:`./.tmp/reflection/bin/post-ack-forward-20260908/mptunnel`.
   Previous reply diagnostic:`./.tmp/reflection/bin/reply-residence-20260908/mptunnel`.
@@ -556,8 +694,8 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram last full-comparison/redesign report:12:23UTC; next nonurgent not
-  before13:24UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram last attribution/comparison report:13:25UTC; next nonurgent not
+  before14:26UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

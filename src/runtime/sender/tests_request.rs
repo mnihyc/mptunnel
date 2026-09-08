@@ -16,6 +16,7 @@ use crate::runtime::path::commands::{
     reliable_path_command_pending_bytes, try_recv_reliable_path_command,
     try_recv_reliable_path_priority_command,
 };
+use crate::runtime::sender::PreparedOriginalClaim;
 use crate::runtime::sender::response::ServerResponseSenderService;
 use crate::runtime::stream::response::ResponseStreamBinding;
 use crate::runtime::stream::{
@@ -368,7 +369,7 @@ async fn prepared_request_ready_alternate_claims_one_shared_prefix_without_queue
         .writer_ready_boundary(b.path_instance_id)
         .expect("actual B writer boundary");
     let first_claim_started = std::time::Instant::now();
-    let RequestPreparedClaim::Claimed(first) = b_work.try_claim(b_ready) else {
+    let PreparedOriginalClaim::Claimed(first) = b_work.try_claim(b_ready) else {
         panic!("the only ready exact writer must claim the first admitted shared prefix");
     };
     let first_claim_finished = std::time::Instant::now();
@@ -461,7 +462,7 @@ async fn prepared_request_ready_alternate_claims_one_shared_prefix_without_queue
         assert_eq!(state.send_stream.reinjection_bytes(), quantum);
     }
     let second_claim_started = std::time::Instant::now();
-    let RequestPreparedClaim::Claimed(second) = a_work.try_claim(a_ready) else {
+    let PreparedOriginalClaim::Claimed(second) = a_work.try_claim(a_ready) else {
         panic!("the next ready output must use unchanged whole-frame Product authority");
     };
     let second_claim_finished = std::time::Instant::now();
@@ -512,7 +513,7 @@ async fn prepared_request_ready_alternate_claims_one_shared_prefix_without_queue
         .unwrap();
     assert!(matches!(
         b_work.try_claim(ready),
-        RequestPreparedClaim::Empty
+        PreparedOriginalClaim::Empty
     ));
     let state = shared.lock();
     assert_eq!(state.send_stream.next_offset(), (2 * quantum) as u64);
@@ -846,7 +847,7 @@ async fn prepared_native_rejection_preserves_uncommitted_source() {
                 .unwrap();
             assert_eq!(ready.receipt(), ready_receipt);
             assert!(
-                matches!(work.try_claim(ready), RequestPreparedClaim::Blocked(_)),
+                matches!(work.try_claim(ready), PreparedOriginalClaim::Blocked(_)),
                 "an unpublished Native successor must retain unclaimed source"
             );
         }
@@ -4336,7 +4337,7 @@ async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() 
     let ready = owner_receivers
         .writer_ready_boundary(owner.path_instance_id)
         .unwrap();
-    let RequestPreparedClaim::Claimed(original) = work.try_claim(ready) else {
+    let PreparedOriginalClaim::Claimed(original) = work.try_claim(ready) else {
         panic!("the actual sole A writer must claim the retained original");
     };
     owner_receivers.register_claimed_writer_frame(&original);
@@ -4555,7 +4556,7 @@ async fn prepared_request_deferred_notice_wakes_before_poll_and_does_not_retain_
         );
         state.prepared.registrations[1].clone()
     };
-    assert_eq!(registration.instance(), b);
+    assert_eq!(registration.request_instance(), Some(b));
     let weak_registration = Arc::downgrade(&registration);
     let take_b_notice =
         |receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers| {
@@ -4577,7 +4578,7 @@ async fn prepared_request_deferred_notice_wakes_before_poll_and_does_not_retain_
         .writer_ready_boundary(b.path_instance_id)
         .unwrap();
     let b_idle_receipt = ready.receipt();
-    let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
+    let PreparedOriginalClaim::Blocked(wait) = work.try_claim(ready) else {
         panic!("B must defer to the eligible ordinary A writer");
     };
     b_receivers.defer_prepared_work(work, wait);
@@ -4599,7 +4600,7 @@ async fn prepared_request_deferred_notice_wakes_before_poll_and_does_not_retain_
         .writer_ready_boundary(b.path_instance_id)
         .unwrap();
     assert_eq!(ready.receipt(), b_idle_receipt);
-    let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
+    let PreparedOriginalClaim::Blocked(wait) = work.try_claim(ready) else {
         panic!("unchanged ordinary selection must still choose A");
     };
     b_receivers.defer_prepared_work(work, wait);
@@ -4867,7 +4868,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                 // control work withdraws only B's epoch before A resumes.
                 let mut receivers = receivers.lock().unwrap();
                 let b_ready = receivers.writer_ready_boundary(b.path_instance_id).unwrap();
-                let RequestPreparedClaim::Blocked(wait) = b_work.try_claim(b_ready) else {
+                let PreparedOriginalClaim::Blocked(wait) = b_work.try_claim(b_ready) else {
                     panic!("the unchanged default ordinary choice must be A, not B");
                 };
                 commands
@@ -4904,7 +4905,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
             });
         }
         match a_work.try_claim(a_ready) {
-            RequestPreparedClaim::Claimed(frame) => {
+            PreparedOriginalClaim::Claimed(frame) => {
                 assert!(
                     !matches!(
                         case,
@@ -4964,7 +4965,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                 }
                 return (state.send_stream.next_offset(), quantum);
             }
-            RequestPreparedClaim::Blocked(wait) => {
+            PreparedOriginalClaim::Blocked(wait) => {
                 if case == PreparedWriterClaimCase::StaleFallback {
                     let state = shared.lock();
                     assert_eq!(state.send_stream.next_offset(), 0);
@@ -5002,7 +5003,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                         let mut receivers = b_receivers.lock().unwrap();
                         let ready = receivers.writer_ready_boundary(b.path_instance_id).unwrap();
                         assert_eq!(ready.receipt(), receipt);
-                        let RequestPreparedClaim::Claimed(frame) =
+                        let PreparedOriginalClaim::Claimed(frame) =
                             b_work.take().unwrap().try_claim(ready)
                         else {
                             panic!("the newly ready regular must claim the unchanged shared head");
@@ -5069,7 +5070,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                 // The next round consumes both actual receiver-deferred wakes.
                 // No source, ACK, Native, policy or capacity event is injected.
             }
-            RequestPreparedClaim::Empty if case == PreparedWriterClaimCase::SelectedDrains => {
+            PreparedOriginalClaim::Empty if case == PreparedWriterClaimCase::SelectedDrains => {
                 let state = shared.lock();
                 assert_eq!(state.send_stream.reinjection_bytes(), 0);
                 assert_eq!(state.sender_queue.data_bytes(), quantum);
@@ -5281,7 +5282,7 @@ fn prepared_blocked_writer_idle_retry_case(path_count: usize) -> [usize; 2] {
             .writer_ready_boundary(instances[index].path_instance_id)
             .unwrap();
         assert_eq!(ready.receipt(), idle_receipts[index]);
-        let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
+        let PreparedOriginalClaim::Blocked(wait) = work.try_claim(ready) else {
             panic!("current policy refusal must park this otherwise live physical writer");
         };
         receivers.defer_prepared_work(work, wait);
@@ -5315,7 +5316,7 @@ fn prepared_blocked_writer_idle_retry_case(path_count: usize) -> [usize; 2] {
                 .writer_ready_boundary(instances[index].path_instance_id)
                 .unwrap();
             assert_eq!(ready.receipt(), idle_receipts[index]);
-            let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
+            let PreparedOriginalClaim::Blocked(wait) = work.try_claim(ready) else {
                 panic!("unchanged policy cannot authorize a claim during the retry cycle");
             };
             receivers.defer_prepared_work(work, wait);
@@ -5570,12 +5571,12 @@ fn prepared_advisory_lock_case(cut: PreparedAdvisoryLockCut, cancel_after_busy: 
     };
 
     let frame = if cut == PreparedAdvisoryLockCut::Uncontended {
-        let RequestPreparedClaim::Claimed(frame) = first_claim else {
+        let PreparedOriginalClaim::Claimed(frame) = first_claim else {
             panic!("same real source and writer must claim without contention");
         };
         frame
     } else {
-        let RequestPreparedClaim::Busy(wait) = first_claim else {
+        let PreparedOriginalClaim::Busy(wait) = first_claim else {
             panic!("advisory Product contention must return the existing Busy outcome");
         };
         // Poll before acquiring any validation guard: its later unlock must
@@ -5592,7 +5593,10 @@ fn prepared_advisory_lock_case(cut: PreparedAdvisoryLockCut, cancel_after_busy: 
                 .writer_ready_boundary(instance.path_instance_id)
                 .unwrap();
             assert_eq!(ready.receipt(), idle);
-            assert!(matches!(work.try_claim(ready), RequestPreparedClaim::Empty));
+            assert!(matches!(
+                work.try_claim(ready),
+                PreparedOriginalClaim::Empty
+            ));
             assert_eq!(
                 snapshot(&shared.lock()),
                 before,
@@ -5608,7 +5612,7 @@ fn prepared_advisory_lock_case(cut: PreparedAdvisoryLockCut, cancel_after_busy: 
             idle,
             "a failed metadata attempt preserves idle ownership"
         );
-        let RequestPreparedClaim::Claimed(frame) = work.try_claim(ready) else {
+        let PreparedOriginalClaim::Claimed(frame) = work.try_claim(ready) else {
             panic!("identical current source and writer must claim after the actual unlock");
         };
         frame

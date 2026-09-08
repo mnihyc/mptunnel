@@ -181,11 +181,31 @@ impl ReliableRelaySenderQueue {
         target: ServerReinjectionOutputIdentity,
         exclude_front: bool,
     ) -> usize {
-        let mut reinjection_bytes = 0usize;
         let exclude_first_reinjection = exclude_front
             && self
                 .front()
                 .is_some_and(|(lane, _)| lane == ReliableWorkClass::Reinjection);
+        self.response_target_queued_reinjection_bytes_with_exclusion(
+            target,
+            exclude_first_reinjection,
+        )
+    }
+
+    /// The response actor selects the first repair independently of unclaimed
+    /// source Data. Exclude precisely that selected repair, not global front.
+    pub(super) fn response_target_queued_reinjection_bytes_for_repair_dispatch(
+        &self,
+        target: ServerReinjectionOutputIdentity,
+    ) -> usize {
+        self.response_target_queued_reinjection_bytes_with_exclusion(target, true)
+    }
+
+    fn response_target_queued_reinjection_bytes_with_exclusion(
+        &self,
+        target: ServerReinjectionOutputIdentity,
+        exclude_first_reinjection: bool,
+    ) -> usize {
+        let mut reinjection_bytes = 0usize;
         let mut skipped_front = false;
         for work in self
             .critical_reinjection

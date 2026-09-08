@@ -2,8 +2,8 @@
 
 use super::multipath::{RequestMultipathPlan, RequestRelayNativeCapture};
 use super::{
-    RequestFrameAdmissionError, RequestFrameProductCommit, RequestProductLockWait,
-    RequestProductState, RequestQueuedSourceCommit, SharedRequestProduct,
+    RequestFrameAdmissionError, RequestFrameProductCommit, RequestProductState,
+    RequestQueuedSourceCommit, SharedRequestProduct,
 };
 use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::path::RelayPathInstance;
@@ -11,7 +11,7 @@ use crate::mux::stream::StreamError;
 use crate::protocol::Frame;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
-use crate::runtime::path::prepared::PreparedOriginalRegistration;
+use crate::runtime::path::prepared::{PreparedOriginalClaim, PreparedOriginalRegistration};
 use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
 use crate::runtime::relay::io::stream_ack_ranges_expose_authoritative_gap;
 use crate::runtime::sender::queue::ReliableRelayQueuedWorkKind;
@@ -26,13 +26,6 @@ use tokio::sync::Notify;
 
 pub(in crate::runtime) type RequestPreparedWake =
     Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
-pub(in crate::runtime) enum RequestPreparedClaim {
-    Claimed(Frame),
-    Busy(RequestProductLockWait),
-    Blocked(RequestPreparedWake),
-    Empty,
-}
 
 /// Policy and wake ownership live beside the source they govern. Neither a
 /// queued notice nor a writer carries a second mutable copy of these values.
@@ -66,7 +59,7 @@ fn registration_is_current(
     registration: &PreparedOriginalRegistration,
 ) -> bool {
     state.prepared.claims_active
-        && registration.instance() == instance
+        && registration.request_instance() == Some(instance)
         && registration.lane() == state.prepared.request_lane
         && state
             .prepared
@@ -180,25 +173,25 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     instance: RelayPathInstance,
     ready: &ReliableWriterReadyGuard,
     registration: &PreparedOriginalRegistration,
-) -> RequestPreparedClaim {
+) -> PreparedOriginalClaim {
     if ready.receipt().instance() != instance.path_instance_id {
-        return RequestPreparedClaim::Empty;
+        return PreparedOriginalClaim::Empty;
     }
     let mut state = match owner.arm_claim().try_lock() {
         Ok(state) => state,
-        Err(wait) => return RequestPreparedClaim::Busy(wait),
+        Err(wait) => return PreparedOriginalClaim::Busy(wait),
     };
     if !registration_is_current(&state, instance, registration) {
-        return RequestPreparedClaim::Empty;
+        return PreparedOriginalClaim::Empty;
     }
     let wake = arm_work_change(&state, context, instance);
     let lane = state.prepared.request_lane;
     let quantum = state.prepared.data_quantum_bytes;
     let Some((_, queued)) = state.sender_queue.front() else {
-        return RequestPreparedClaim::Empty;
+        return PreparedOriginalClaim::Empty;
     };
     let ReliableRelayQueuedWorkKind::Data(payload) = &queued.kind else {
-        return RequestPreparedClaim::Blocked(wake);
+        return PreparedOriginalClaim::Blocked(wake);
     };
     let payload = payload.slice(..quantum.min(payload.len()).max(1));
     let frame = match state.send_stream.prepare_data(payload) {
@@ -207,10 +200,10 @@ pub(in crate::runtime) fn claim_prepared_request_data(
             StreamError::FlowControlBlocked { .. }
             | StreamError::ReinjectionCacheFull { .. }
             | StreamError::TooManyReinjectionCacheChunks { .. },
-        ) => return RequestPreparedClaim::Blocked(wake),
+        ) => return PreparedOriginalClaim::Blocked(wake),
         Err(error) => {
             record_source_error(&mut state, RuntimeError::Stream(error));
-            return RequestPreparedClaim::Empty;
+            return PreparedOriginalClaim::Empty;
         }
     };
     {
@@ -222,11 +215,11 @@ pub(in crate::runtime) fn claim_prepared_request_data(
             .prepare_original_claim(context, remotes, &frame)
             .is_err()
         {
-            return RequestPreparedClaim::Blocked(wake);
+            return PreparedOriginalClaim::Blocked(wake);
         }
     }
     if !ready.receipt().is_current() {
-        return RequestPreparedClaim::Blocked(wake);
+        return PreparedOriginalClaim::Blocked(wake);
     }
     let capture =
         RequestRelayNativeCapture::new(state.remotes.membership_generation(), &state.remotes.paths);
@@ -238,13 +231,13 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     // competing holder. Busy discards this advisory capture and retries fresh.
     let mut state = match owner.arm_claim().try_lock() {
         Ok(state) => state,
-        Err(wait) => return RequestPreparedClaim::Busy(wait),
+        Err(wait) => return PreparedOriginalClaim::Busy(wait),
     };
     if !registration_is_current(&state, instance, registration) {
-        return RequestPreparedClaim::Empty;
+        return PreparedOriginalClaim::Empty;
     }
     if !source_matches(&mut state, &frame, lane, quantum) || !ready.receipt().is_current() {
-        return RequestPreparedClaim::Blocked(wake);
+        return PreparedOriginalClaim::Blocked(wake);
     }
     let include_bulk = lane.is_bulk()
         && (state.remotes.paths.len() > 1
@@ -257,7 +250,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         include_bulk,
         inputs.clone(),
     ) else {
-        return RequestPreparedClaim::Blocked(wake);
+        return PreparedOriginalClaim::Blocked(wake);
     };
     {
         let RequestProductState {
@@ -274,7 +267,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
             true,
             inputs.clone(),
         ) else {
-            return RequestPreparedClaim::Blocked(wake);
+            return PreparedOriginalClaim::Blocked(wake);
         };
         Some(authority)
     } else {
@@ -292,20 +285,20 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         &ready_instances,
     ) {
         Ok(plan) => plan,
-        Err(_) => return RequestPreparedClaim::Blocked(wake),
+        Err(_) => return PreparedOriginalClaim::Blocked(wake),
     };
     if plan.target().1 != instance {
         let selected = state
             .prepared
             .registrations
             .iter()
-            .find(|current| current.instance() == plan.target().1)
+            .find(|current| current.request_instance() == Some(plan.target().1))
             .cloned();
         drop(state);
         if let Some(selected) = selected {
             selected.notify();
         }
-        return RequestPreparedClaim::Blocked(wake);
+        return PreparedOriginalClaim::Blocked(wake);
     }
     let Some(commands) = state.remotes.paths.iter().find_map(|path| {
         if path.instance() != instance {
@@ -316,7 +309,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
             ReliablePathStreamOutput::Switchable(_) => None,
         }
     }) else {
-        return RequestPreparedClaim::Blocked(wake);
+        return PreparedOriginalClaim::Blocked(wake);
     };
     drop(state);
 
@@ -325,10 +318,10 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     let result = plan.commit_with_current_native_shape(&commands, |shape| {
         let mut state = match attempt.try_lock() {
             Ok(state) => state,
-            Err(wait) => return Some(RequestPreparedClaim::Busy(wait)),
+            Err(wait) => return Some(PreparedOriginalClaim::Busy(wait)),
         };
         if !registration_is_current(&state, instance, registration) {
-            return Some(RequestPreparedClaim::Empty);
+            return Some(PreparedOriginalClaim::Empty);
         }
         if !source_matches(&mut state, &frame, lane, quantum) || !ready.receipt().is_current() {
             return None;
@@ -385,7 +378,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
                 .prepared
                 .registrations
                 .iter()
-                .find(|current| current.instance() == current_plan.target().1)
+                .find(|current| current.request_instance() == Some(current_plan.target().1))
                 .cloned();
             return None;
         }
@@ -449,15 +442,15 @@ pub(in crate::runtime) fn claim_prepared_request_data(
             Ok(_) => {
                 state.prepared.last_claimed_at = Some(Instant::now());
                 state.prepared.work_changed.notify_waiters();
-                Some(RequestPreparedClaim::Claimed(frame.clone()))
+                Some(PreparedOriginalClaim::Claimed(frame.clone()))
             }
             Err(RequestFrameAdmissionError::Source(error)) => {
                 record_source_error(&mut state, RuntimeError::Stream(error));
-                Some(RequestPreparedClaim::Empty)
+                Some(PreparedOriginalClaim::Empty)
             }
             Err(RequestFrameAdmissionError::Runtime(error)) => {
                 record_source_error(&mut state, error);
-                Some(RequestPreparedClaim::Empty)
+                Some(PreparedOriginalClaim::Empty)
             }
             Err(
                 RequestFrameAdmissionError::ServiceBlocked
@@ -471,5 +464,5 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     }
     result
         .flatten()
-        .unwrap_or(RequestPreparedClaim::Blocked(wake))
+        .unwrap_or(PreparedOriginalClaim::Blocked(wake))
 }

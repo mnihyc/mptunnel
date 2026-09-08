@@ -9,6 +9,7 @@ mod request;
 mod response;
 mod work;
 
+pub(in crate::runtime) use crate::runtime::path::prepared::PreparedOriginalClaim;
 #[cfg(not(test))]
 pub(in crate::runtime) use queue::{
     ReliableRelayQueuedWork, ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue,
@@ -17,12 +18,16 @@ pub(in crate::runtime) use queue::{
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use request::{
-    ClientQueuedDispatch, RelayRecvProgressSend, RequestPreparedClaim, RequestPreparedSource,
-    RequestProductState, RequestSenderService, SharedRequestProduct, WeakSharedRequestProduct,
+    ClientQueuedDispatch, RelayRecvProgressSend, RequestPreparedSource, RequestProductState,
+    RequestSenderService, SharedRequestProduct, WeakSharedRequestProduct,
     claim_prepared_request_data,
 };
 #[cfg(not(test))]
-pub(in crate::runtime) use response::ServerResponseSenderService;
+pub(in crate::runtime) use response::{
+    PreparedResponseSource, ResponsePreparedCommitError, ResponsePreparedSourceCommit,
+    ResponseProductState, ServerResponseSenderService, SharedResponseProduct,
+    WeakSharedResponseProduct, claim_prepared_response_data, publish_prepared_response_work,
+};
 #[cfg(not(test))]
 pub(in crate::runtime) use work::{
     CarrierEmitMode, RelaySendCause, ServerReinjectionOutputIdentity,

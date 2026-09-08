@@ -2758,7 +2758,7 @@ native TCP, QUIC, MPTCP, or HTTP/3 timers.
 Within the regular or backup set selected by Section 7, ordinary original-data
 placement uses the implementation's existing advisory candidate order subject
 to shared receive credit, configured Product resources, current attachment/
-output lifecycle, reorder bounds, and exact writer reservation. Core Profile 7
+output lifecycle, reorder bounds, and an imminent exact writer claim. Core Profile 7
 does not require that candidate order to consume the Section 10.2 action-score
 component. That component has no sustained allocation owner in this revision
 and therefore cannot replace the existing order merely by repeatedly selecting
@@ -2860,14 +2860,16 @@ An authoritative-gap frontier and a sole currently enqueueable survivor whose
 lower range belongs to another output are additional outputs under this rule.
 For an exact pending OriginalData quantum of N bytes, commitment requires
 O+N <= W and O_i+N <= L_i, plus shared receive credit, structural eligibility,
-reorder authority, and a real bounded writer-command reservation. The complete
+reorder authority, and a current opportunity in the actual native writer's
+bounded transaction. Queue vacancy alone is not such an opportunity. The complete
 quantum must fit; there is no overshoot exception.
 
-After obtaining the writer reservation, the sender revalidates the exact
+At that writer boundary, the sender revalidates the exact
 output and attachment incarnations, output-admission epoch, current position
-and qualification, W, P_i, E_i, receive credit, and source frontier. It then
-records Product ownership before publishing the command. Failed revalidation
-refunds the uncommitted reservation and changes no Product range. Data ACK or
+and qualification, W, P_i, E_i, receive credit, source frontier, selected writer
+readiness and native authority. It atomically commits the source prefix, mux
+cache and exact Original ownership before the native transaction can expose
+bytes. Failed revalidation changes no Product range or source frontier. Data ACK or
 terminal Product cleanup releases O and O_i exactly once; native ACK does not.
 
 Core Profile 7 ordinary placement retains the implementation's existing legacy
@@ -2894,15 +2896,39 @@ that demand. Detach removes demand synchronously before asynchronous wire
 cleanup; old-incarnation Product debt remains available for ACK and recovery
 and MUST NOT be projected into a same-key physical successor.
 
-Fresh OriginalData is reserved in the shared bounded carrier command queue
-before Product flight is published. That queue is the staging resource and
-reservation linearization point for Product actors sharing one native writer.
-Its pending-byte accounting is resource state, not renewable send credit. The
-writer may continue through a bounded sequence of reserved commands without
-waiting for a native ACK, but re-enters class and dependency arbitration after
-each command. Control and ReinjectedData retain their priority admission while
-the common queue and configured Product envelopes bound aggregate memory and
-ordering debt.
+Unclaimed source belongs to the logical direction, not to a future carrier
+command. Let A be its source end, C the committed wire-offset end and U=A-C
+the unnumbered prepared bytes. Preparation increases retained resource use;
+claim converts an exact prefix of U into O_i without increasing U+O. Do not
+charge the conversion as another source admission, qualify a path from U,
+accept an ACK above C, or freeze FIN at C while U remains. EOF closes A;
+FIN may publish that final offset after U is empty, without waiting for O=0.
+
+TCP and QUIC in both directions use the same ownership boundary. A queued
+prepared notice carries only weak source identity, not payload, offset or
+Product credit. After normal class/dependency arbitration, an actual writer
+claims its imminent protected transaction from the shared prefix. The source
+remains available to other eligible writers until that claim commits. Already
+claimed bytes cannot be returned to U merely because another path looks faster;
+their exact ownership and recovery rules remain unchanged.
+
+Readiness is separate from membership, qualification and native capacity. Keep
+the full attachment set when deriving first/frontier/additional authority, and
+try the existing eligible preference tiers using current Ready opportunities.
+An occupied preferred writer must not mask the sole eligible Ready survivor.
+Only the selected exact Ready epoch is consumed; an unselected writer's
+withdrawal does not invalidate unchanged chosen authority. Busy claimants arm
+their owner/change wake before a nonblocking attempt; they do not wait while
+retaining a native fence or keep cancelled source alive. No ownership guard
+crosses native I/O.
+
+The writer may synchronously claim successive bounded transactions without a
+Product actor roundtrip or native/Data ACK between quanta. It re-enters class
+and dependency arbitration at the existing transaction boundary; a claimed
+batch must not wait for future coalescing work before its first write. Control
+and ReinjectedData retain their existing priority admission and exact byte
+accounting. Their queues, shared prepared source and configured Product/native
+envelopes still bound resources; late claiming adds no new rate/window limit.
 
 Current local controller application-limited state is separate from the
 application-limited provenance of a qualified rate epoch. Retaining, replacing,

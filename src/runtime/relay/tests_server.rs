@@ -57,6 +57,314 @@ fn tracked_tail_recovery_candidate(
     })
 }
 
+#[tokio::test]
+async fn response_actor_eof_waits_for_prepared_original_and_retains_post_fin_recovery() {
+    use crate::runtime::path::prepared::PreparedOriginalClaim;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    // Observe the actual target read's EOF, not a hand-built pending-FIN flag.
+    struct EofObserved {
+        inner: tokio::io::DuplexStream,
+        eof: Arc<AtomicBool>,
+    }
+    impl AsyncRead for EofObserved {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buffer.filled().len();
+            let had_room = buffer.remaining() > 0;
+            let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+            if matches!(result, Poll::Ready(Ok(()))) && had_room && buffer.filled().len() == before
+            {
+                self.eof.store(true, Ordering::Release);
+            }
+            result
+        }
+    }
+    impl AsyncWrite for EofObserved {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, bytes)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let limits = MuxLimits::default();
+    let session_id = SessionId(716);
+    let stream_id = StreamId(716);
+    let lane = TrafficClass::Latency;
+    let original_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let (commands, mut receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new_with_limits(
+        session_id,
+        original_key.underlay,
+        original_key.path_id,
+        commands.clone(),
+        lane,
+        limits,
+    );
+    let repair_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (repair_commands, mut repair_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            repair_key.underlay,
+            repair_key.path_id,
+            repair_commands,
+            lane
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let (frames_tx, frames_rx) = mpsc::channel(8);
+    let mut path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: limits.max_stream_window_bytes,
+        lane,
+        underlay: original_key.underlay,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frames_rx.into(),
+    };
+    let outbound_id = crate::product::OutboundId::parse("test-direct").expect("outbound ID");
+    let outbound_registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: outbound_id.clone(),
+            config: OutboundConfig::Direct,
+            connect_timeout: Duration::from_secs(1),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("outbound registry");
+    let router = ClientIngressRouter::new(
+        &ProductPolicyConfig {
+            generation: 1,
+            routes: vec![RouteRuleSpec::new(
+                RuleId::parse("default").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(outbound_id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )],
+        },
+        outbound_registry,
+    )
+    .expect("router");
+    let context = ServerReliableRelayContext {
+        router,
+        inbound: InboundId::parse("test-inbound").expect("inbound ID"),
+        performance: MppPerformanceConfig::default(),
+        mux_limits: limits,
+        max_paths_per_session: ResourceLimits::default().max_paths,
+        session_retention_timeout: Duration::from_secs(60),
+        flow_idle_timeout: None,
+        telemetry: RuntimeTelemetry::new(1),
+    };
+    let (mut application, relay_side) = tokio::io::duplex(4096);
+    let payload = Bytes::from(vec![0x5a; 128]);
+    application
+        .write_all(&payload)
+        .await
+        .expect("target response source");
+    application.shutdown().await.expect("target EOF");
+    let eof = Arc::new(AtomicBool::new(false));
+    let mut close = ServerRelayClose { sent: false, lane };
+    let mut relay = Box::pin(relay_reliable_stream_body(
+        EofObserved {
+            inner: relay_side,
+            eof: eof.clone(),
+        },
+        &mut path_stream,
+        &context,
+        session_id,
+        crate::runtime::stream::SessionSendBuffer::from_limits(limits),
+        &mut close,
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !eof.load(Ordering::Acquire) {
+            tokio::select! {
+                result = relay.as_mut() => panic!("unclaimed source must retain actor: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("actor observes real EOF with U retained");
+
+    let mut notice = None;
+    for (original_output, receiver) in [(true, &mut receivers), (false, &mut repair_receivers)] {
+        while let Some(command) = try_recv_reliable_path_command(receiver) {
+            let bytes = reliable_path_command_pending_bytes(&command);
+            match command {
+                ReliablePathCommand::PreparedOriginal(work) => {
+                    if original_output {
+                        assert!(
+                            notice.replace(work).is_none(),
+                            "one coalesced source notice"
+                        );
+                    }
+                }
+                ReliablePathCommand::SendFrame(
+                    Frame::StreamFin { .. } | Frame::StreamData { .. },
+                ) => {
+                    panic!(
+                        "EOF must not publish FIN or bind prepared source before a writer claim"
+                    );
+                }
+                ReliablePathCommand::SendFrame(
+                    Frame::PathProofData { .. } | Frame::StreamMaxData { .. },
+                ) => {}
+                _ => panic!("unexpected setup command"),
+            }
+            receiver.release_pending_command_bytes(bytes);
+        }
+    }
+    assert_eq!(
+        binding
+            .sender_path_targets(lane, payload.len())
+            .iter()
+            .map(|target| target.observation.original_data_in_flight_bytes)
+            .sum::<u64>(),
+        0,
+        "actual EOF has not manufactured Original ownership",
+    );
+    let notice = notice.expect("actual actor publishes prepared source");
+    let ready = receivers
+        .writer_ready_boundary(notice.path_instance_id())
+        .expect("actual idle writer");
+    let original = match notice.try_claim(ready) {
+        PreparedOriginalClaim::Claimed(frame) => frame,
+        _ => panic!("unchanged initial writer may claim the retained source after EOF"),
+    };
+    assert!(
+        matches!(&original, Frame::StreamData { stream_id: id, offset: 0, payload: bytes }
+        if *id == stream_id && *bytes == payload)
+    );
+    let pending_bytes = receivers.register_claimed_writer_frame(&original);
+    assert!(pending_bytes > 0);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let (command, on_repair_output) = tokio::select! {
+                result = relay.as_mut() => panic!("unacknowledged Original must retain actor: {result:?}"),
+                command = recv_reliable_path_command(&mut receivers) => (command, false),
+                command = recv_reliable_path_command(&mut repair_receivers) => (command, true),
+            };
+            let command = command.expect("live response carrier");
+            let bytes = reliable_path_command_pending_bytes(&command);
+            let fin = matches!(command, ReliablePathCommand::SendFrame(Frame::StreamFin {
+                stream_id: id, final_offset: 128,
+            }) if id == stream_id);
+            if on_repair_output {
+                repair_receivers.release_pending_command_bytes(bytes);
+            } else {
+                receivers.release_pending_command_bytes(bytes);
+            }
+            // FIN keeps the existing output selection policy; it need not
+            // follow the output that claimed the final Original.
+            if fin {
+                break;
+            }
+        }
+    }).await.expect("last real source claim wakes FIN publication at exact C");
+    assert_eq!(
+        binding
+            .sender_path_targets(lane, payload.len())
+            .iter()
+            .map(|target| target.observation.original_data_in_flight_bytes)
+            .sum::<u64>(),
+        128,
+        "FIN does not discard unacknowledged Original ownership",
+    );
+    receivers.release_pending_command_bytes(pending_bytes);
+
+    // A real attachment loss after FIN still recovers retained bytes. No new
+    // source, forged ACK horizon, shortened recovery timer, or direct helper
+    // enqueue substitutes for the actor's existing failed-owner path.
+    binding.detach(original_key, &commands);
+    let repair = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                result = relay.as_mut() => panic!("retained post-FIN bytes must recover: {result:?}"),
+                command = recv_reliable_path_command(&mut repair_receivers) => {
+                    let command = command.expect("live replacement response output");
+                    let bytes = reliable_path_command_pending_bytes(&command);
+                    repair_receivers.release_pending_command_bytes(bytes);
+                    if let ReliablePathCommand::SendFrame(frame @ Frame::StreamData { .. }) = command {
+                        break frame;
+                    }
+                }
+            }
+        }
+    }).await.expect("actual post-FIN failed-owner recovery dispatch");
+    assert_eq!(repair, original);
+    let mut peer = ReliableRecvStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let Frame::StreamData {
+        offset,
+        payload: repair_payload,
+        ..
+    } = repair
+    else {
+        unreachable!()
+    };
+    let received = peer
+        .receive_data(offset, repair_payload)
+        .expect("ordered peer delivery");
+    assert_eq!(received.delivered.concat().as_slice(), payload.as_ref());
+    frames_tx
+        .send(Ok(Frame::StreamAck {
+            stream_id,
+            complete: true,
+            ranges: vec![OffsetRange { start: 0, end: 128 }],
+        }))
+        .await
+        .expect("exact Product ACK");
+    frames_tx
+        .send(Ok(Frame::StreamFin {
+            stream_id,
+            final_offset: 0,
+        }))
+        .await
+        .expect("request half closes independently");
+    let stats = tokio::time::timeout(Duration::from_secs(1), relay.as_mut())
+        .await
+        .expect("both Product directions finish")
+        .expect("clean actor result");
+    assert_eq!(
+        stats.payload_bytes, 128,
+        "Original C delta counted once, repair excluded"
+    );
+    assert!(
+        binding
+            .sender_path_targets(lane, 1)
+            .iter()
+            .all(|target| target.observation.original_data_in_flight_bytes == 0)
+    );
+}
+
 #[test]
 fn server_ack_gap_timer_uses_the_evaluation_epoch() {
     let now = Instant::now();
@@ -331,6 +639,8 @@ async fn stream_owned_requalification_ack_capacity_release_wakes_an_idle_respons
 
 #[tokio::test]
 async fn exact_requalification_capacity_release_wakes_an_open_idle_source() {
+    use crate::runtime::path::prepared::PreparedOriginalClaim;
+
     let limits = MuxLimits::default();
     let session_id = SessionId(713);
     let stream_id = StreamId(713);
@@ -452,16 +762,41 @@ async fn exact_requalification_capacity_release_wakes_an_open_idle_source() {
             let command = recv_reliable_path_command(&mut tcp_receivers)
                 .await
                 .expect("healthy TCP command queue");
+            if let ReliablePathCommand::PreparedOriginal(work) = command {
+                let ready = tcp_receivers
+                    .writer_ready_boundary(work.path_instance_id())
+                    .expect("healthy TCP reaches an actual idle writer boundary");
+                match work.try_claim(ready) {
+                    PreparedOriginalClaim::Claimed(frame) => {
+                        assert!(matches!(
+                            &frame,
+                            Frame::StreamData { stream_id: id, offset: 0, payload }
+                                if *id == stream_id
+                                    && payload == &Bytes::from_static(b"retained response source")
+                        ));
+                        let bytes = tcp_receivers.register_claimed_writer_frame(&frame);
+                        tcp_receivers.release_pending_command_bytes(bytes);
+                        break;
+                    }
+                    PreparedOriginalClaim::Busy(wait) => {
+                        tcp_receivers.defer_prepared_work(work, wait);
+                    }
+                    PreparedOriginalClaim::Blocked(wait) => {
+                        tcp_receivers.defer_prepared_work(work, wait);
+                    }
+                    PreparedOriginalClaim::Empty => {}
+                }
+                continue;
+            }
             let pending_bytes = reliable_path_command_pending_bytes(&command);
-            let original = matches!(
-                command,
-                ReliablePathCommand::SendFrame(Frame::StreamData { ref payload, .. })
-                    if payload == &Bytes::from_static(b"retained response source")
+            assert!(
+                !matches!(
+                    command,
+                    ReliablePathCommand::SendFrame(Frame::StreamData { .. })
+                ),
+                "Original source must be claimed rather than prebound in a Data command"
             );
             tcp_receivers.release_pending_command_bytes(pending_bytes);
-            if original {
-                break;
-            }
         }
     })
     .await

@@ -91,12 +91,8 @@ mod multipath;
 mod owner;
 mod prepared;
 mod scheduling;
-pub(in crate::runtime) use owner::{
-    RequestProductLockWait, SharedRequestProduct, WeakSharedRequestProduct,
-};
-pub(in crate::runtime) use prepared::{
-    RequestPreparedClaim, RequestPreparedSource, claim_prepared_request_data,
-};
+pub(in crate::runtime) use owner::{SharedRequestProduct, WeakSharedRequestProduct};
+pub(in crate::runtime) use prepared::{RequestPreparedSource, claim_prepared_request_data};
 #[cfg(test)]
 mod tcp_capacity;
 #[cfg(test)]

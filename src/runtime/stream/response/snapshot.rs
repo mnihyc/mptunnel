@@ -33,6 +33,7 @@ use crate::runtime::path::model::{default_path_srtt_ms, startup_rate_prediction_
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -91,6 +92,7 @@ impl ResponseStreamBinding {
             .collect()
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn response_model_generation(&self) -> u64 {
         self.response_model_generation.load(Ordering::Acquire)
     }
@@ -121,54 +123,28 @@ impl ResponseStreamBinding {
             .expect("server reliable stream request feedback ingress lock");
         let now = Instant::now();
 
-        let targets =
-            outputs
-                .entries
-                .iter()
-                .filter(|entry| !entry.commands.is_closed())
-                .map(|entry| {
-                    let snapshot = server_bulk_output_snapshot_at(
-                        entry,
-                        outputs.data_level_queue_bytes,
-                        lane,
-                        self.mux_limits,
-                        now,
-                    );
-                    ResponseSenderPathTarget {
-                        native_authority_stamp: entry
-                            .native_scheduling_shape
-                            .map(|shape| shape.stamp()),
-                        observation: ResponsePathObservation {
-                            key: entry.key,
-                            path_instance_id: entry.path_instance_id,
-                            incarnation: entry.incarnation,
-                            snapshot,
-                            native_queue_bytes: server_output_native_queue_bytes(entry),
-                            native_drain_observed: server_output_local_path_metrics(entry)
-                                .is_some_and(|metrics| metrics.native_drain_observed),
-                            #[cfg(test)]
-                            writer_pending_bytes: entry.commands.writer_pending_bytes(),
-                            original_data_in_flight_bytes: entry.original_data_in_flight_bytes,
-                            is_request_feedback: request_feedback_ingress.is_some_and(|ingress| {
-                                ingress.key == entry.key
-                                    && ingress.path_instance_id == entry.path_instance_id
-                            }),
-                            stale_for_original_data: entry.qualification.stale_for_original_data(),
-                            #[cfg(test)]
-                            has_path_proof_evidence: entry.path_proof.is_some(),
-                            product_assignment_qualified:
-                                server_output_product_assignment_qualified(entry, self.mux_limits),
-                            has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_at(
-                                entry,
-                                self.mux_limits,
-                                now,
-                            ),
-                        },
-                        product_admission_active: entry.commands.product_admission_active(),
-                        command_queue: entry.commands.queue_snapshot(),
-                    }
-                })
-                .collect();
+        let targets = outputs
+            .entries
+            .iter()
+            .filter(|entry| !entry.commands.is_closed())
+            .map(|entry| {
+                let snapshot = server_bulk_output_snapshot_at(
+                    entry,
+                    outputs.data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                    now,
+                );
+                server_sender_path_target_at(
+                    entry,
+                    snapshot,
+                    lane,
+                    self.mux_limits,
+                    request_feedback_ingress,
+                    now,
+                )
+            })
+            .collect();
         drop(outputs);
         targets
     }
@@ -179,6 +155,43 @@ impl ResponseStreamBinding {
 
     pub(in crate::runtime) fn session_id(&self) -> SessionId {
         self.session_id
+    }
+}
+
+pub(super) fn server_sender_path_target_at(
+    entry: &ResponseStreamOutputEntry,
+    snapshot: PathSnapshot,
+    _lane: TrafficClass,
+    mux_limits: MuxLimits,
+    request_feedback_ingress: Option<super::RequestFeedbackIngress>,
+    now: Instant,
+) -> ResponseSenderPathTarget {
+    ResponseSenderPathTarget {
+        native_authority_stamp: entry.native_scheduling_shape.map(|shape| shape.stamp()),
+        observation: ResponsePathObservation {
+            key: entry.key,
+            path_instance_id: entry.path_instance_id,
+            incarnation: entry.incarnation,
+            snapshot,
+            native_queue_bytes: server_output_native_queue_bytes(entry),
+            native_drain_observed: server_output_local_path_metrics(entry)
+                .is_some_and(|metrics| metrics.native_drain_observed),
+            #[cfg(test)]
+            writer_pending_bytes: entry.commands.writer_pending_bytes(),
+            original_data_in_flight_bytes: entry.original_data_in_flight_bytes,
+            is_request_feedback: request_feedback_ingress.is_some_and(|ingress| {
+                ingress.key == entry.key && ingress.path_instance_id == entry.path_instance_id
+            }),
+            stale_for_original_data: entry.qualification.stale_for_original_data(),
+            #[cfg(test)]
+            has_path_proof_evidence: entry.path_proof.is_some(),
+            product_assignment_qualified: server_output_product_assignment_qualified(
+                entry, mux_limits,
+            ),
+            has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_at(entry, mux_limits, now),
+        },
+        product_admission_active: entry.commands.product_admission_active(),
+        command_queue: entry.commands.queue_snapshot(),
     }
 }
 

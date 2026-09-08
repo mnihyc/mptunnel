@@ -55,6 +55,9 @@ pub(in crate::runtime) struct ReliablePathCommandReceivers {
     // writer helpers retain &mut Self, not a shared receiver across await.
     prepared_waits: mpsc::UnboundedReceiver<PreparedOriginalWait>,
     deferred_prepared: FuturesUnordered<PreparedOriginalWait>,
+    // One capability belongs to this physical writer, not a metadata claim
+    // or logical stream. Refused claims leave the same idle epoch current.
+    writer_ready: Option<ReliableWriterReadyGuard>,
     retirement: mpsc::UnboundedReceiver<ReliablePathRetirementCommand>,
     pending_retirement_close: Option<StreamId>,
     control: mpsc::Receiver<QueuedReliablePathCommand>,
@@ -824,7 +827,7 @@ impl ReliablePathCommandReceivers {
             return;
         }
         self.metrics.lifecycle.begin_drain();
-        self.metrics.writer_boundary.invalidate();
+        self.withdraw_writer_ready();
         self.prepared_waits.close();
         self.deferred_prepared.clear();
         while self.prepared_waits.try_recv().is_ok() {}
@@ -846,21 +849,36 @@ impl ReliablePathCommandReceivers {
         self.metrics.lifecycle.finish_planned_retirement()
     }
 
-    /// Called by the physical writer only when it can accept the next work.
-    /// Queue capacity and authentication do not publish this owner boundary.
+    /// Called by the physical writer only at an idle/imminent-action boundary.
+    /// Metadata refusal does not end idleness. Borrow the one current capability
+    /// synchronously; never retain this borrow across receiver I/O or await.
     pub(in crate::runtime) fn writer_ready_boundary(
-        &self,
+        &mut self,
         instance: CarrierPathInstanceId,
-    ) -> Option<ReliableWriterReadyGuard> {
+    ) -> Option<&ReliableWriterReadyGuard> {
         if !self.metrics.lifecycle.is_active() {
+            self.withdraw_writer_ready();
             return None;
         }
-        let guard = self.metrics.writer_boundary.publish(instance)?;
+        let current = self.writer_ready.as_ref().is_some_and(|guard| {
+            let receipt = guard.receipt();
+            receipt.instance() == instance && receipt.is_current()
+        });
+        if !current {
+            self.withdraw_writer_ready();
+            self.writer_ready = self.metrics.writer_boundary.publish(instance);
+        }
         if !self.metrics.lifecycle.is_active() {
-            drop(guard);
+            self.withdraw_writer_ready();
             return None;
         }
-        Some(guard)
+        self.writer_ready.as_ref()
+    }
+
+    /// Real work occupies the physical writer. Logical cancellation alone
+    /// does not: another stream may still claim at this same idle boundary.
+    pub(in crate::runtime) fn withdraw_writer_ready(&mut self) {
+        drop(self.writer_ready.take());
     }
 
     fn take_queued_command(&self, command: QueuedReliablePathCommand) -> ReliablePathCommand {
@@ -1947,6 +1965,7 @@ pub(in crate::runtime) fn reliable_path_command_channels(
         ReliablePathCommandReceivers {
             prepared_waits: prepared_waits_rx,
             deferred_prepared: FuturesUnordered::new(),
+            writer_ready: None,
             retirement: retirement_rx,
             pending_retirement_close: None,
             control: control_rx,

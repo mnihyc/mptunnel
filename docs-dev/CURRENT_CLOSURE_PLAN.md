@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 13:24 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 13:51 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -430,7 +430,8 @@ Recv-Q (~1.8MB); only111979B is consumed across16–85s. Server return sockets
 are rwnd-limited. Client lifetime CPU is elevated; this alone does not locate
 the cause. Actual source Read turns continue in portions of the hold, excluding
 a continuously blocked local-response-write loop as the entire explanation.
-Locate exact response frontier267 through receive/decode/handoff and service;
+Rc267 is the delivered reply prefix, not an observed mux frontier. Locate the
+exact missing response range through receive/decode/handoff and service;
 do not assume response parity or queue-size changes solve it.
 
 Source review additionally finds an actual native-loop recurrence:
@@ -451,15 +452,23 @@ exclusive physical command receiver, borrowed by synchronous claims. Refusal
 does not occupy the writer or create a new epoch. Consume on successful claim;
 explicitly withdraw before real write/input-route/drain. No sticky source grant
 or separate eligibility flag. Current native loops/tests must migrate to that
-one owner; guard borrowing cannot span receiver I/O. Implementation is next.
+one owner; guard borrowing cannot span receiver I/O. The correction is now
+implemented and independently reviewed. Warning-free build1m12s;535 focused
+checks pass1.27s, including actual pair/singleton recurrence and opposite-case
+physical I/O/teardown controls. Next ordinary optimized build/run reuses the
+unchanged failed profile and archived9720e4b comparator. Exact question: does
+the proved metadata-loop removal restore return consumption and settlement,
+while preserving early service? No component-only user-facing milestone. If
+the same practical failure remains, stop promotion and trace its exact stage;
+do not keep trying realizations or stack response parity/controller changes.
 
 Normal build also exposed an obsolete Original dispatcher kept alive only by
 tests. Its deletion is code/test reachability cleanup, not a performance fix:
 ten repair controls move to the production repair API; actual claim and used
 core-commit tests replace old MPSC Original assertions. Test/diagnostic-only
 facades receive exact cfg gates, no blanket dead-code suppression. This source
-cleanup is separate from the frozen9720e4b performance result; verification is
-in progress. Direction-neutral response parity/RFC amendment remain pending,
+cleanup is separate from the frozen9720e4b performance result;533checks passed
+before its36a2c4e commit. Direction-neutral response parity/RFC amendment remain pending,
 not a prerequisite excuse to skip the current adverse-stage diagnosis.
 Response parity and all existing global gates remain pending, not waived.
 
@@ -514,8 +523,9 @@ aggregate300/200 defaults as200each. Do not tune this profile to pass.
   overlap. All products/probes are stopped; origin services retained.
 - No diagnostic overlay or active lab. Request prepared-claim candidate533GREEN/
   audit has failed its ordinary comparison. Products/probes stopped; all full
-  raw evidence/comparators retained. Cleanup verification and bounded
-  all-refused-writer recurrence discriminator are active, not accepted fixes.
+  raw evidence/comparators retained. Cleanup verification is complete; the
+  all-refused-writer correction has535checks/audit, and its ordinary practical
+  comparison is the next action, not an accepted speed result.
   Commit exact intermediate dispositions;
   preserve small evidence before scoped cache cleanup. No deletion this turn.
   User seven-line edit must remain outside commits.

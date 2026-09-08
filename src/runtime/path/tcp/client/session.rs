@@ -279,6 +279,7 @@ async fn run_client_tcp_path_session_inner(
         return;
     }
 
+    commands.withdraw_writer_ready();
     let error = terminal_reason.map_or(RuntimeError::ReliablePathSessionClosed, |reason| {
         RuntimeError::RemoteClosed(reason)
     });
@@ -308,6 +309,7 @@ async fn run_client_tcp_path_session_active(
 
     loop {
         if state.connection.is_none() {
+            commands.withdraw_writer_ready();
             tokio::select! {
                 biased;
                 _ = &mut drain_requested => {
@@ -393,13 +395,15 @@ async fn run_client_tcp_path_session_active(
             .connection
             .as_mut()
             .expect("checked connected TCP path session");
-        let mut writer_ready = (!draining && command_may_recv)
-            .then(|| commands.writer_ready_boundary(connection.path_instance_id))
-            .flatten();
+        if !draining && command_may_recv {
+            let _ = commands.writer_ready_boundary(connection.path_instance_id);
+        } else {
+            commands.withdraw_writer_ready();
+        }
         tokio::select! {
             biased;
             _ = &mut drain_requested, if !draining => {
-                drop(writer_ready.take());
+                commands.withdraw_writer_ready();
                 if drain_signal.is_terminal() {
                     let error = RuntimeError::ReliablePathSessionClosed;
                     fail_client_tcp_products(
@@ -430,11 +434,11 @@ async fn run_client_tcp_path_session_active(
                 );
             }
             _ = &mut path_drain_timer, if draining => {
-                drop(writer_ready.take());
+                commands.withdraw_writer_ready();
                 drop_connection = true;
             }
             _ = &mut request_probe_cancelled, if request_probe_pending => {
-                drop(writer_ready.take());
+                commands.withdraw_writer_ready();
                 connection.capacity.discard_pending_receipt();
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -443,7 +447,7 @@ async fn run_client_tcp_path_session_active(
                 );
             }
             _ = &mut request_probe_timer, if request_probe_pending => {
-                drop(writer_ready.take());
+                commands.withdraw_writer_ready();
                 connection.capacity.discard_pending_receipt();
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -452,7 +456,7 @@ async fn run_client_tcp_path_session_active(
                 );
             }
             _ = &mut pending_open_timer, if pending_open_deadline.is_some() && !draining => {
-                drop(writer_ready.take());
+                commands.withdraw_writer_ready();
                 if let Err(err) = expire_client_tcp_pending_opens(
                     connection,
                     &mut state.streams,
@@ -474,7 +478,7 @@ async fn run_client_tcp_path_session_active(
                 }
             }
             request_id = connection.peer_status.recv_request(), if !draining => {
-                drop(writer_ready.take());
+                commands.withdraw_writer_ready();
                 if let Some(request_id) = request_id {
                     let result = async {
                         connection
@@ -506,7 +510,7 @@ async fn run_client_tcp_path_session_active(
                 }
             }
             frame = connection.carrier.frames.recv() => {
-                drop(writer_ready.take());
+                commands.withdraw_writer_ready();
                 match frame {
                     Some(Ok(frame)) => {
                         let result = match frame {
@@ -623,7 +627,6 @@ async fn run_client_tcp_path_session_active(
                 }
             }
             command = recv_client_tcp_command(commands, draining), if command_may_recv => {
-                drop(writer_ready.take());
                 match command {
                     Some(command) => {
                         let result = if draining {
@@ -693,7 +696,7 @@ async fn run_client_tcp_path_session_active(
                 }
             }
             _ = &mut heartbeat_timer, if !request_probe_pending && !draining => {
-                drop(writer_ready.take());
+                commands.withdraw_writer_ready();
                 if let Err(err) = connection.carrier.tick_heartbeat().await
                 {
                     fail_client_tcp_products(

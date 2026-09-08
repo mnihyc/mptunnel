@@ -102,6 +102,9 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         #[cfg(feature = "lab-diagnostics")]
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
+        if !matches!(&command, ReliablePathCommand::PreparedOriginal(_)) {
+            commands.withdraw_writer_ready();
+        }
         match command {
             ReliablePathCommand::PreparedOriginal(work) => {
                 // A notice carries no payload or offset. Only this physical
@@ -463,6 +466,7 @@ async fn commit_client_tcp_command_frame_transaction(
     if frames.is_empty() {
         return ensure_client_tcp_transaction_closed(frames, *writer_pending_bytes);
     }
+    commands.withdraw_writer_ready();
     commit_client_tcp_frame_transaction_interlocked(
         connection,
         frames,

@@ -128,7 +128,9 @@ transfer; do not reconstruct bins from unrelated counters. The control's
 ## Next bounded question
 
 Locate the actual client receive/decode/handoff wait holding already-arrived
-return bytes, and whether missing response frontier267 is inside that backlog.
+return bytes. Rc=267 is the delivered reply prefix, NOT an observed mux frontier;
+a pending local batch can put the mux ahead of Rc. Identify the exact missing
+range before attributing it to that backlog.
 Competing causes include costly synchronous service, writer/reader interlock,
 blocked forwarding, and claim-notification recurrence without useful admission
 change. Source review excludes neither all of these nor the exact missing frame

@@ -178,7 +178,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     owner: &SharedRequestProduct,
     context: &ClientPathContext,
     instance: RelayPathInstance,
-    ready: ReliableWriterReadyGuard,
+    ready: &ReliableWriterReadyGuard,
     registration: &PreparedOriginalRegistration,
 ) -> RequestPreparedClaim {
     if ready.receipt().instance() != instance.path_instance_id {

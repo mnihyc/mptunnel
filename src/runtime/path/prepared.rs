@@ -129,7 +129,7 @@ impl PreparedOriginalWork {
 
     pub(in crate::runtime) fn try_claim(
         &self,
-        ready: ReliableWriterReadyGuard,
+        ready: &ReliableWriterReadyGuard,
     ) -> RequestPreparedClaim {
         let Some(registration) = self.registration.upgrade() else {
             return RequestPreparedClaim::Empty;

@@ -1935,6 +1935,7 @@ async fn prepared_request_actor_keeps_eof_source_claimable_until_final_offset() 
                     stream_id: actual,
                     final_offset,
                 }) => {
+                    receivers.withdraw_writer_ready();
                     assert_eq!(actual, stream_id);
                     assert_eq!(claimed.as_slice(), source.as_ref());
                     receivers.release_pending_command_bytes(pending);
@@ -1945,7 +1946,9 @@ async fn prepared_request_actor_keeps_eof_source_claimable_until_final_offset() 
                         "unclaimed source must use the actual writer claim, not payload commands"
                     );
                 }
-                ReliablePathCommand::SendFrame(_) => {}
+                ReliablePathCommand::SendFrame(_) => {
+                    receivers.withdraw_writer_ready();
+                }
                 _ => panic!("unexpected lifecycle command before the EOF final offset"),
             }
             receivers.release_pending_command_bytes(pending);

@@ -869,17 +869,26 @@ fn physical_writer_boundary_is_shared_and_invalidated_by_queue_lifecycle() {
     use crate::model::path::CarrierPathInstanceId;
 
     for drain in [false, true] {
-        let (commands, receivers) = reliable_path_command_channels(4);
+        let (commands, mut receivers) = reliable_path_command_channels(4);
         let sibling = commands.clone();
         let boundary = commands.writer_boundary();
         assert!(
             boundary.snapshot().is_none(),
             "an empty queue is not a ready writer"
         );
-        let ready = receivers
+        let receipt = receivers
             .writer_ready_boundary(CarrierPathInstanceId::from_raw(1))
-            .unwrap();
-        assert_eq!(sibling.writer_boundary().snapshot(), Some(ready.receipt()));
+            .unwrap()
+            .receipt();
+        assert_eq!(sibling.writer_boundary().snapshot(), Some(receipt.clone()));
+        assert_eq!(
+            receivers
+                .writer_ready_boundary(CarrierPathInstanceId::from_raw(1))
+                .unwrap()
+                .receipt(),
+            receipt,
+            "reobserving the same idle physical owner does not republish readiness",
+        );
         if drain {
             sibling.begin_path_drain();
             assert!(
@@ -891,8 +900,9 @@ fn physical_writer_boundary_is_shared_and_invalidated_by_queue_lifecycle() {
         } else {
             drop(receivers);
         }
-        assert!(!ready.receipt().is_current());
-        assert!(!ready.try_consume());
+        // A claim borrowing the receiver-owned guard after receiver Drop is
+        // unrepresentable. The surviving observation cannot retain authority.
+        assert!(!receipt.is_current());
         assert!(boundary.snapshot().is_none());
     }
 }

@@ -814,15 +814,19 @@ async fn prepared_native_rejection_preserves_uncommitted_source() {
         else {
             panic!("Original source must not enter the Data command lane");
         };
-        let ready = receivers
+        let ready_receipt = receivers
             .writer_ready_boundary(instance.path_instance_id)
-            .expect("actual exclusive writer reaches its ready boundary");
+            .expect("actual exclusive writer reaches its ready boundary")
+            .receipt();
         let mut receivers = Some(receivers);
         let capture_cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if close_receiver {
-            // Withdrawal follows actual notice and Ready publication, not a
-            // fabricated receipt or a failed setup before claim entry.
+            // Drop invalidates the actual owned epoch. Claim-after-Drop is
+            // borrow-unreachable; retaining only its receipt cannot recreate
+            // an owner or claim authority. Actual concurrent drain rejection
+            // is separately exercised by the claim-boundary control.
             drop(receivers.take());
+            assert!(!ready_receipt.is_current());
         } else {
             let capture_cut = capture_cut.clone();
             shared.before_prepared_native_resolve_once_for_test(move || {
@@ -836,13 +840,16 @@ async fn prepared_native_rejection_preserves_uncommitted_source() {
                 // Original command-reservation path.
             });
         }
-        assert!(
-            matches!(
-                work.try_claim(ready),
-                RequestPreparedClaim::Blocked(_) | RequestPreparedClaim::Empty
-            ),
-            "neither a withdrawn writer nor an unpublished Native successor may claim source",
-        );
+        if let Some(receivers) = receivers.as_mut() {
+            let ready = receivers
+                .writer_ready_boundary(instance.path_instance_id)
+                .unwrap();
+            assert_eq!(ready.receipt(), ready_receipt);
+            assert!(
+                matches!(work.try_claim(ready), RequestPreparedClaim::Blocked(_)),
+                "an unpublished Native successor must retain unclaimed source"
+            );
+        }
         let state = shared.lock();
         assert_eq!(
             (
@@ -4433,6 +4440,7 @@ async fn prepared_request_deferred_notice_wakes_before_poll_and_does_not_retain_
     let ready = b_receivers
         .writer_ready_boundary(b.path_instance_id)
         .unwrap();
+    let b_idle_receipt = ready.receipt();
     let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
         panic!("B must defer to the eligible ordinary A writer");
     };
@@ -4444,13 +4452,17 @@ async fn prepared_request_deferred_notice_wakes_before_poll_and_does_not_retain_
     let work = take_b_notice(&mut b_receivers);
     assert!(try_recv_request_command_after_path_proofs_for_test(&mut b_receivers).is_none());
     assert!(a_commands.writer_boundary().snapshot().is_some());
-    assert!(b_commands.writer_boundary().snapshot().is_none());
+    assert_eq!(
+        b_commands.writer_boundary().snapshot(),
+        Some(b_idle_receipt.clone())
+    );
 
     // Without a fresh notification the same real failed claim stays parked;
-    // withdrawing B's own Ready guard must not trigger an immediate retry.
+    // a refused metadata attempt retains B's one physical idle epoch.
     let ready = b_receivers
         .writer_ready_boundary(b.path_instance_id)
         .unwrap();
+    assert_eq!(ready.receipt(), b_idle_receipt);
     let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
         panic!("unchanged ordinary selection must still choose A");
     };
@@ -4579,26 +4591,41 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
         let a_ready = a_receivers
             .writer_ready_boundary(a.path_instance_id)
             .unwrap();
-        let mut b_ready = (!a_is_backup).then(|| {
+        if !a_is_backup {
             b_receivers
                 .lock()
                 .unwrap()
                 .writer_ready_boundary(b.path_instance_id)
-                .unwrap()
-        });
+                .unwrap();
+        }
         let parked_b = Arc::new(std::sync::Mutex::new(None));
         let newly_ready_b = Arc::new(std::sync::Mutex::new(None));
         if case == PreparedWriterClaimCase::LoserWithdraws {
             let parked_b = parked_b.clone();
             let b_work = b_work.take().unwrap();
-            let b_ready = b_ready.take().unwrap();
+            let receivers = b_receivers.clone();
+            let commands = b_commands.clone();
             shared.before_prepared_native_resolve_once_for_test(move || {
-                // A is paused after its full Ready capture with Product
-                // unlocked. B makes its real ordinary decision, selects A,
-                // and relinquishes only B's own Ready epoch before A resumes.
+                // A is paused with Product unlocked. B's metadata refusal
+                // preserves idle readiness; its subsequent genuine queued
+                // control work withdraws only B's epoch before A resumes.
+                let mut receivers = receivers.lock().unwrap();
+                let b_ready = receivers.writer_ready_boundary(b.path_instance_id).unwrap();
                 let RequestPreparedClaim::Blocked(wait) = b_work.try_claim(b_ready) else {
                     panic!("the unchanged default ordinary choice must be A, not B");
                 };
+                commands
+                    .try_enqueue_admitted_frame(Frame::Ping { nonce: 721 }, TrafficClass::Control)
+                    .expect("actual occupying control work on B");
+                let control = try_recv_request_command_after_path_proofs_for_test(&mut receivers)
+                    .expect("the real B writer selects its queued control");
+                assert!(matches!(
+                    control,
+                    ReliablePathCommand::SendFrame(Frame::Ping { nonce: 721 })
+                ));
+                receivers.withdraw_writer_ready();
+                receivers
+                    .release_pending_command_bytes(reliable_path_command_pending_bytes(&control));
                 *parked_b.lock().unwrap() = Some((b_work, wait));
             });
         } else if case == PreparedWriterClaimCase::SelectedDrains {
@@ -4611,12 +4638,13 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
             let newly_ready_b = newly_ready_b.clone();
             assert!(b_commands.writer_boundary().snapshot().is_none());
             shared.before_prepared_native_resolve_once_for_test(move || {
-                let ready = receivers
+                let receipt = receivers
                     .lock()
                     .unwrap()
                     .writer_ready_boundary(b.path_instance_id)
-                    .expect("healthy regular B reaches its actual writer boundary");
-                *newly_ready_b.lock().unwrap() = Some(ready);
+                    .expect("healthy regular B reaches its actual writer boundary")
+                    .receipt();
+                *newly_ready_b.lock().unwrap() = Some(receipt);
             });
         }
         match a_work.try_claim(a_ready) {
@@ -4663,15 +4691,21 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                         assert_eq!(state.send_stream.reinjection_bytes(), 0);
                         assert_eq!(state.sender_queue.data_bytes(), quantum);
                     }
-                    let ready = newly_ready_b
+                    let receipt = newly_ready_b
                         .lock()
                         .unwrap()
                         .take()
                         .expect("regular B became ready during A's unlocked observation");
-                    let RequestPreparedClaim::Claimed(frame) =
-                        b_work.take().unwrap().try_claim(ready)
-                    else {
-                        panic!("the newly ready regular must claim the unchanged shared head");
+                    let frame = {
+                        let mut receivers = b_receivers.lock().unwrap();
+                        let ready = receivers.writer_ready_boundary(b.path_instance_id).unwrap();
+                        assert_eq!(ready.receipt(), receipt);
+                        let RequestPreparedClaim::Claimed(frame) =
+                            b_work.take().unwrap().try_claim(ready)
+                        else {
+                            panic!("the newly ready regular must claim the unchanged shared head");
+                        };
+                        frame
                     };
                     assert_eq!(
                         reliable_stream_frame_extent(&frame),
@@ -4901,15 +4935,14 @@ fn prepared_blocked_writer_idle_retry_case(path_count: usize) -> [usize; 2] {
     // Establish every real initial idle opportunity before arming any claim
     // wait. Otherwise the first sibling appearance is a legitimate wake and
     // must not be mistaken for refusal-generated recurrence.
-    let mut parked_ready: Vec<_> = writers
-        .iter()
+    let idle_receipts: Vec<_> = writers
+        .iter_mut()
         .zip(&instances)
         .map(|((_, receivers), instance)| {
-            Some(
-                receivers
-                    .writer_ready_boundary(instance.path_instance_id)
-                    .unwrap(),
-            )
+            receivers
+                .writer_ready_boundary(instance.path_instance_id)
+                .unwrap()
+                .receipt()
         })
         .collect();
     for index in 0..path_count {
@@ -4920,17 +4953,23 @@ fn prepared_blocked_writer_idle_retry_case(path_count: usize) -> [usize; 2] {
         else {
             panic!("no source payload may precede the actual claim");
         };
-        let ready = parked_ready[index]
-            .take()
-            .expect("established initial idle epoch");
+        let ready = receivers
+            .writer_ready_boundary(instances[index].path_instance_id)
+            .unwrap();
+        assert_eq!(ready.receipt(), idle_receipts[index]);
         let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
             panic!("current policy refusal must park this otherwise live physical writer");
         };
         receivers.defer_prepared_work(work, wait);
-        // Current native loops publish their outer idle epoch after a refused
-        // metadata attempt. No source or Native work occurred in that attempt.
-        parked_ready[index] = receivers.writer_ready_boundary(instances[index].path_instance_id);
-        assert!(parked_ready[index].is_some());
+        // The actual receiver owns one persistent idle epoch. Refused metadata
+        // borrows it without producing Native work or a false transition.
+        assert_eq!(
+            receivers
+                .writer_ready_boundary(instances[index].path_instance_id)
+                .unwrap()
+                .receipt(),
+            idle_receipts[index],
+        );
     }
     assert_retained_refusal();
     let stable_model = context.path_model_generation();
@@ -4946,21 +4985,23 @@ fn prepared_blocked_writer_idle_retry_case(path_count: usize) -> [usize; 2] {
                 panic!("only a receiver-deferred weak retry can recur here");
             };
             *retry_count += 1;
-            // Mirror the current native selected-command path: withdraw the
-            // outer idle guard, run one synchronous weak-notice claim, then
-            // return idle after refusal. This is the lifecycle under test,
-            // not an externally imposed genuine I/O transition to suppress.
-            drop(parked_ready[index].take());
+            // Mirror the current native metadata path: borrow the receiver's
+            // unchanged idle owner. Only real occupying work may withdraw it.
             let ready = receivers
                 .writer_ready_boundary(instances[index].path_instance_id)
                 .unwrap();
+            assert_eq!(ready.receipt(), idle_receipts[index]);
             let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
                 panic!("unchanged policy cannot authorize a claim during the retry cycle");
             };
             receivers.defer_prepared_work(work, wait);
-            parked_ready[index] =
-                receivers.writer_ready_boundary(instances[index].path_instance_id);
-            assert!(parked_ready[index].is_some());
+            assert_eq!(
+                receivers
+                    .writer_ready_boundary(instances[index].path_instance_id)
+                    .unwrap()
+                    .receipt(),
+                idle_receipts[index],
+            );
         }
         assert_retained_refusal();
         assert_eq!(context.path_model_generation(), stable_model);

@@ -45,10 +45,12 @@ pub(super) async fn run_client_udp_stream(
     loop {
         let command_may_recv = !reliable_path_receivers_closed(&commands);
         if !command_may_recv {
+            commands.withdraw_writer_ready();
             let _ = udp_path_finish_stream(&mut send).await;
             return;
         }
         if let Some(input) = deferred_input.take() {
+            commands.withdraw_writer_ready();
             if input.as_ref().is_err_and(udp_path_input_finished) {
                 if !product_terminal_received {
                     let _ = frames
@@ -105,11 +107,11 @@ pub(super) async fn run_client_udp_stream(
             }
             continue;
         }
-        let mut writer_ready = commands.writer_ready_boundary(path_instance_id);
+        let _ = commands.writer_ready_boundary(path_instance_id);
         tokio::select! {
             biased;
             frame = carrier_frames.recv(), if carrier_input_open => {
-                drop(writer_ready.take());
+                commands.withdraw_writer_ready();
                 let input = frame.unwrap_or(Err(RuntimeError::ReliablePathSessionClosed));
                 if input.as_ref().is_err_and(udp_path_input_finished) {
                     if !product_terminal_received {
@@ -164,7 +166,6 @@ pub(super) async fn run_client_udp_stream(
                 }
             }
             command = recv_reliable_path_command(&mut commands), if command_may_recv => {
-                drop(writer_ready.take());
                 if let Some(command) = command {
                     let result = drain_client_udp_stream_commands(
                         command,

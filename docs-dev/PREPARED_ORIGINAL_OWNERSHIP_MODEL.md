@@ -587,3 +587,25 @@ another admission flag. A synchronous claim borrows the guard; that borrow
 ends before receiver mutation or await. Receiver destruction invalidates its
 receipt; claiming after destroying the physical owner is no longer a reachable
 borrow-safe operation, not a regression case to preserve artificially.
+
+Executed13:51: the receiver-owned correction builds warning-free in1m12s;
+535 focused checks pass1.27s. The actual pair now parks without regenerated
+metadata attempts, while the singleton control still parks. Genuine control
+occupation/selected withdrawal, stale incarnation, successful consumption,
+drain/drop, independent-source cancellation, source/flight conservation,
+claim-clock and actual TCP/QUIC multi-quantum/EOF cases remain GREEN.
+Independent audit confirms all normal admission refusals precede Ready
+consumption. Post-consume source errors disable claims; qualification rejection
+requires violated serialized ownership/configuration invariants, not ordinary
+unchanged capacity. Do not add an unproven late-refusal workaround.
+
+Practical question before the next ordinary run: does eliminating this proved
+zero-progress recurrence remove the candidate's persistent client receive hold
+and settlement failure without losing its early delivery improvement? Use the
+same mixed/asymmetric500Mbps profile and ordinary optimized binary, no observer,
+no configuration changes and no build overlap. Compare with the already
+preserved9720e4b failure; a single changed-mechanism realization can falsify
+recovery but cannot attribute all timing differences or establish universal
+acceptance. Stop promotion if it still holds or fails settlement, then locate
+the exact receive/decode/handoff stage. Component GREEN is internal tracking,
+not a user-facing performance milestone.

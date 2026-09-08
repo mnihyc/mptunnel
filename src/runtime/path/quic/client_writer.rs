@@ -104,6 +104,9 @@ pub(super) async fn drain_client_udp_stream_commands(
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
+        if !matches!(&command, ReliablePathCommand::PreparedOriginal(_)) {
+            commands.withdraw_writer_ready();
+        }
         let should_close = match command {
             ReliablePathCommand::PreparedOriginal(work) => {
                 if work.stream_id() != stream_id
@@ -344,6 +347,11 @@ async fn flush_client_udp_frame_batch(
     deferred_input: &mut Option<Result<Frame, RuntimeError>>,
     carrier_input_open: bool,
 ) -> Result<(), RuntimeError> {
+    if !pending_frames.is_empty() {
+        // A refused metadata claim may leave the idle epoch current. The
+        // already-claimed batch must withdraw it before entering native I/O.
+        commands.withdraw_writer_ready();
+    }
     let result = if carrier_input_open {
         flush_udp_frame_batch_with_path_proofs_interlocked(
             send,

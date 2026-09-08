@@ -70,6 +70,56 @@ REPLY_RESIDENCE_20260908 and T06_RECOVERY_SERVICE_MODEL. The longest9.567s
 native episode loses to an already-delivered TCP copy and is not a useful
 9.567s recovery opportunity. Historical witnesses are not current recurrence.
 
+### Current-source audit and contrary evidence
+
+Independent review of the frozen source finds an exact cross-direction
+dependency: `relay/control.rs` takes the request Product mutex before response
+reassembly (3413), before response ACK/startup publication (3498), and before
+the first local-write poll (3549 versus3620). Meanwhile a real prepared request
+claim holds that owner during observation/planning at
+`sender/request/prepared.rs:241–326`. Thus available response bytes can wait
+for opposite-direction planning with no blocked target or missing response
+prefix. This contradicts the proposed isolation contract, not automatically
+the existing RFC's serialized-handler contract. A deliberately paused planner
+proves dependence, not a current multi-second cost or performance gain.
+
+The coherent replacement separates response reassembly/partial-write ownership
+from expensive request planning while retaining a small authoritative owner
+for shared attachment, terminal and control publication. Positive ACK retention,
+credit after actual delivery, startup return-plan ordering, final-offset checks
+and cancellation remain prerequisites. This is not three opportunistic
+try-locks, duplicated membership or a cached capacity estimate.
+
+The response producer independently commits source/Original ownership at
+command publication, before TCP/QUIC consumes that command. A newly usable
+writer cannot take this still-unwritten prefix as an Original. A real-source,
+real-protected-writer two-output counterexample can establish the benefit of
+late placement; the combined fixture has not been executed. Existing scoring
+already includes command/pending queue cost: this is not a queue-blind selector.
+
+Crucial contrary evidence limits its priority: REPLY_RESIDENCE's121 response
+Originals have read-to-publication at most6ms and publication-to-local-write
+at most4ms. PREPARED_REPLY_SERVICE's100 winning publications take at most2ms
+to local write; RESPONSE_HANDOFF's149 TCP transactions have each observed
+publication/stage/write/flush step at most1ms. Response parity is therefore
+**not a supported fix for the captured multi-second upload reply delays**.
+It cannot retract native-accepted bytes. Do not move it ahead of the actual
+critical receive/recovery boundary merely because the symmetry is attractive.
+
+### Fresh ordinary product comparison
+
+The initial twelve-cell comparison is complete in
+[REDESIGN_BASELINE_20260908](REDESIGN_BASELINE_20260908.md). On the unchanged
+500Mbps changing-loss/QoS/outage profile, downstream QUIC versus mixed is
+69.511 versus37.212Mbps, with4.838 versus7.418s maximum read gaps. Upstream
+is97.046 versus66.846Mbps, but mixed has the better maximum confirmation gap
+(4.004 versus5.294s). Raw/VMess preserve all downstream echo attempts at much
+lower rates; all MPP modes and H2 lose their persistent echo probe. TCP,VMess
+and H2 upstream do not settle exactly. These observations reject acceptance,
+not establish a single causal mixed-mode penalty or a universal ranking.
+Preserve the full histories, incomplete outcomes and cost/prior differences;
+do not select whichever direction or aggregate supports a preferred redesign.
+
 ## Required service boundaries
 
 For each logical direction retain these distinct boundaries:

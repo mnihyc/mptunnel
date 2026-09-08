@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 19:39 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 20:21 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -61,6 +61,31 @@ provides an honest baseline snapshot; it is not a statistical universal ranking.
 Retain all gaps, echo failures and censored outcomes. Stop only the failed cell,
 verify its owned probe has exited before proceeding, and do not change profile
 or protocol to obtain favorable results. No runtime candidate yet.
+
+**Comparison complete20:20:** all twelve ordinary cells have outcomes;
+TCP/H2 upload reached the existing settlement guard and their probes exited
+before continuation. VMess upload ended before exact terminal confirmation.
+No lab/build remains active. [Full current cohort](REDESIGN_BASELINE_20260908.md)
+replaces historical controls as this transaction's comparison basis, not as
+a statistical ranking or public release gate. QUIC/mixed downstream rates
+69.511/37.212Mbps and gaps4.838/7.418s; upstream97.046/66.846Mbps, gaps5.294/
+4.004s. All MPP downstream persistent echo probes time out; raw/VMess preserve
+80/80 attempts at lower throughput. H2 also fails severely. Mixed is not
+uniformly worse on every timing measure; single-mode stalls remain material.
+
+**Architecture audit / next decision:** current response delivery takes the
+request Product owner before reassembly and first local-write polling while
+request claims plan under that same mutex. Independent review confirms the
+dependency, not a present multi-second duration. Separate directional receive/
+write ownership from expensive opposite planning; preserve small authoritative
+attachment/terminal/ACK publication transitions. Before implementation, the
+real claimant/receiver control must prove dependency and current useful-byte
+residence must identify the material removable portion. No three try-lock
+tweaks or guessed capacity. Response late placement is a separate boundary:
+current small-reply captures bound publication-to-write to2–4ms, so it must
+not be promoted as the upload-seconds fix. A bulk-response alternate-writer
+counterexample remains needed. Both findings and exact preserved prerequisites
+are in the redesign proposal. No further Native tuning or new audit inventory.
 
 ## Completed discriminator: native ordered-read service during recovery
 
@@ -403,8 +428,8 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram last ordinary adverse-pair report:10:43:44UTC; next nonurgent not
-  before11:44UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram last full-comparison/redesign report:12:23UTC; next nonurgent not
+  before13:24UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

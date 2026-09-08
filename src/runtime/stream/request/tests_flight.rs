@@ -1,5 +1,6 @@
 use super::RequestFlightLedger;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
+use crate::model::work::CarrierWorkKind;
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::stream::request::RequestPathStates;
 use bytes::Bytes;
@@ -46,6 +47,51 @@ fn assert_original_data_cache(
         assert_eq!(
             ledger.original_data_in_flight_bytes(*instance),
             scanned_instance,
+        );
+        assert_eq!(scanned_instance, *expected_bytes);
+    }
+}
+
+fn assert_reinjected_data_totals(
+    ledger: &RequestFlightLedger,
+    expected_instances: &[(RelayPathInstance, usize)],
+) {
+    assert_eq!(
+        ledger.reinjected_data_in_flight_bytes_by_instance,
+        expected_instances
+            .iter()
+            .filter(|(_, bytes)| *bytes != 0)
+            .map(|(instance, bytes)| (*instance, *bytes as u64))
+            .collect(),
+        "only exact instances with retained copies own aggregate entries"
+    );
+    let scanned_total = ledger
+        .flights
+        .values()
+        .flat_map(|flights| flights.iter())
+        .filter(|flight| flight.kind == CarrierWorkKind::ReinjectedData)
+        .map(|flight| flight.bytes)
+        .sum::<usize>();
+    assert_eq!(
+        scanned_total,
+        expected_instances
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .sum::<usize>(),
+    );
+    for (instance, expected_bytes) in expected_instances {
+        let scanned_instance = ledger
+            .flights
+            .values()
+            .flat_map(|flights| flights.iter())
+            .filter(|flight| {
+                flight.instance == *instance && flight.kind == CarrierWorkKind::ReinjectedData
+            })
+            .map(|flight| flight.bytes)
+            .sum::<usize>();
+        assert_eq!(
+            ledger.reinjected_data_in_flight_bytes(*instance),
+            scanned_instance
         );
         assert_eq!(scanned_instance, *expected_bytes);
     }
@@ -281,6 +327,186 @@ fn every_unacked_request_reinjection_flight_consumes_its_exact_target_reserve() 
         ledger.reinjected_data_in_flight_bytes(repair),
         4096,
         "expiry may open another target but cannot renew this reliable incarnation",
+    );
+}
+
+#[test]
+fn accepted_copy_totals_preserve_multiplicity_instance_and_ack_lifecycle() {
+    let owner = path(UnderlayProtocol::Tcp, 0, 1);
+    let target = path(UnderlayProtocol::Udp, 1, 11);
+    let replacement = path(UnderlayProtocol::Udp, 1, 12);
+    let other = path(UnderlayProtocol::Tcp, 2, 21);
+    let targets = [target, replacement, other];
+    let mut ledger = RequestFlightLedger::default();
+    assert_eq!(
+        ledger.record_original_frame_instance(owner, &data_frame(0, 12_288)),
+        12_288
+    );
+
+    // These are accepted ledger publications, not a claim that admission must
+    // choose them: repeated and overlapping copies each retain their own debt.
+    for (instance, offset, bytes, expected_instance_bytes) in [
+        (target, 0, 8192, 8192),
+        (target, 0, 8192, 16_384),
+        (target, 4096, 8192, 24_576),
+        (replacement, 2048, 4096, 4096),
+        (other, 10_240, 2048, 2048),
+    ] {
+        let (recorded, deadline) = ledger
+            .record_reinjection_frame_instance_with_suppression_interval(
+                instance,
+                &data_frame(offset, bytes),
+                Duration::from_secs(60),
+            );
+        assert_eq!(recorded, bytes);
+        assert!(deadline.is_some());
+        assert_eq!(
+            ledger.reinjected_data_in_flight_bytes(instance),
+            expected_instance_bytes
+        );
+    }
+    assert_reinjected_data_totals(
+        &ledger,
+        &[
+            (owner, 0),
+            (target, 24_576),
+            (replacement, 4096),
+            (other, 2048),
+        ],
+    );
+    assert_original_data_cache(&ledger, 12_288, &[(owner, 12_288), (target, 0)]);
+
+    let middle = [OffsetRange {
+        start: 3072,
+        end: 5120,
+    }];
+    assert!(!ledger.release_normalized_acked_ranges(&middle).is_empty());
+    assert_reinjected_data_totals(
+        &ledger,
+        &[
+            (owner, 0),
+            (target, 19_456),
+            (replacement, 2048),
+            (other, 2048),
+        ],
+    );
+    assert_original_data_cache(&ledger, 10_240, &[(owner, 10_240)]);
+
+    let disjoint = [
+        OffsetRange {
+            start: 0,
+            end: 1024,
+        },
+        OffsetRange {
+            start: 7168,
+            end: 11_264,
+        },
+    ];
+    assert!(!ledger.release_normalized_acked_ranges(&disjoint).is_empty());
+    assert_reinjected_data_totals(
+        &ledger,
+        &[
+            (owner, 0),
+            (target, 11_264),
+            (replacement, 2048),
+            (other, 1024),
+        ],
+    );
+    assert_original_data_cache(&ledger, 5120, &[(owner, 5120)]);
+    assert!(ledger.release_normalized_acked_ranges(&middle).is_empty());
+    assert!(ledger.release_normalized_acked_ranges(&disjoint).is_empty());
+
+    let suppressed = ledger.range_recovery_state(owner, &targets);
+    assert!(suppressed.uncovered_ranges.is_empty());
+    assert!(suppressed.retry_deadline.is_some());
+    ledger.age_reinjected_flights_for_test(Duration::from_secs(120));
+    assert_eq!(
+        ledger.earliest_reinjection_suppression_deadline(&targets),
+        None
+    );
+    let expired = ledger.range_recovery_state(owner, &targets);
+    assert_eq!(expired.retry_deadline, None);
+    assert_eq!(
+        expired.uncovered_ranges,
+        ledger.latest_unacked_ranges_for_path_instance(owner)
+    );
+    assert_reinjected_data_totals(
+        &ledger,
+        &[
+            (owner, 0),
+            (target, 11_264),
+            (replacement, 2048),
+            (other, 1024),
+        ],
+    );
+
+    // Settle this exact replacement completely without settling its predecessor
+    // or the disjoint target; then reuse the zero-debt instance on a live tail.
+    let replacement_remainder = [
+        OffsetRange {
+            start: 2048,
+            end: 3072,
+        },
+        OffsetRange {
+            start: 5120,
+            end: 6144,
+        },
+    ];
+    ledger.release_normalized_acked_ranges(&replacement_remainder);
+    assert_reinjected_data_totals(
+        &ledger,
+        &[(owner, 0), (target, 6144), (replacement, 0), (other, 1024)],
+    );
+    assert_original_data_cache(&ledger, 3072, &[(owner, 3072)]);
+    assert!(
+        ledger
+            .release_normalized_acked_ranges(&replacement_remainder)
+            .is_empty()
+    );
+    assert_eq!(
+        ledger.record_reinjection_frame_instance(replacement, &data_frame(11_264, 1024)),
+        1024,
+    );
+    assert_reinjected_data_totals(
+        &ledger,
+        &[
+            (owner, 0),
+            (target, 6144),
+            (replacement, 1024),
+            (other, 1024),
+        ],
+    );
+
+    let drained = ledger.drain_all();
+    for (instance, expected) in [
+        (owner, 3072),
+        (target, 6144),
+        (replacement, 1024),
+        (other, 1024),
+    ] {
+        assert_eq!(
+            drained
+                .iter()
+                .filter(|release| release.instance == instance)
+                .map(|release| release.bytes)
+                .sum::<usize>(),
+            expected,
+        );
+    }
+    assert!(drained.iter().all(|release| !release.path_proving));
+    assert_reinjected_data_totals(
+        &ledger,
+        &[(owner, 0), (target, 0), (replacement, 0), (other, 0)],
+    );
+    assert_original_data_cache(&ledger, 0, &[(owner, 0)]);
+    assert!(ledger.drain_all().is_empty());
+    assert!(
+        ledger
+            .release_normalized_acked_ranges(&[OffsetRange {
+                start: 0,
+                end: 12_288
+            }])
+            .is_empty()
     );
 }
 

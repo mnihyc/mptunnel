@@ -44,6 +44,27 @@ versus4, with the same two accepted-copy debt queries, exact4096B native repair,
 unchanged69632B retained source and identical accounting. This proves avoidable
 query work, not attribution of the entire2.226s hold or a speed improvement.
 
+**Pre-change audit14:36:** exact per-instance aggregate selected; only append,
+normalized ACK release/split and final drain mutate byte ownership. Store the
+sum in u64 beside the existing Original sum, add each accepted transmission,
+subtract each actually released copy atom, remove zero keys and clear on drain.
+Final Apply already enforces q<=cap−sat(J+queued), with cap<=usize::MAX; hence
+legal J+q cannot overflow. Checked arithmetic verifies conservation, not a new
+limit. Expiry, Native drain/ACK, membership withdrawal and evidence invalidation
+do not erase retained copy debt. No Native snapshot or scheduling cache is added.
+This implements the existing RFC quantity; no RFC policy change is needed.
+
+**Executed14:38:** correction and two independent diff reviews pass. Warning-free
+functional build1m13s;538 focused checks pass1.28s, including the actual query
+RED/control and new full-scan lifecycle oracle. Queries now perform no flight
+iteration, retaining exact Apply's current J. No practical promotion follows.
+Next normal optimized candidate build, then one planned candidate/parent pair
+on the pinned mixed-upload profile (candidate first reverses previous pair
+ordering). Parent is the frozen ordinary b3dfef1 executable, not the diagnostic
+target/release binary. No build/lab overlap, favorable third run or profile edit.
+Compare full timing/completion/cost and phase histories; random realizations
+are not identical packets, and a remaining severe gap still stops promotion.
+
 **Latest executed result14:22:** sparse diagnostic completes440598528B/45.810536s,
 but is not ordinary acceptance. All100 winning replies join exact stages.
 Largest3.460s mux hold includes2.226s AFTER the winning TCP reply was decoded

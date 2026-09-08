@@ -55,6 +55,10 @@ pub(in crate::runtime) struct RequestFlightLedger {
     /// Exact un-DataACKed OriginalData bytes by physical attachment instance.
     /// Reconnect successors must start at zero even when they reuse a path key.
     original_data_in_flight_bytes_by_instance: HashMap<RelayPathInstance, u64>,
+    /// Additive accepted-copy debt, not the union of covered offsets. The same
+    /// serialized append/ACK/drain owner maintains it as the exact flight sum;
+    /// target queries must not rescan unrelated OriginalData for every repair.
+    reinjected_data_in_flight_bytes_by_instance: HashMap<RelayPathInstance, u64>,
 }
 
 impl RequestFlightLedger {
@@ -231,6 +235,16 @@ impl RequestFlightLedger {
                 .entry(instance)
                 .or_default();
             *instance_bytes = instance_bytes.saturating_add(bytes as u64);
+        } else if kind == CarrierWorkKind::ReinjectedData {
+            let instance_bytes = self
+                .reinjected_data_in_flight_bytes_by_instance
+                .entry(instance)
+                .or_default();
+            // Final admission subtracts existing J from the target allowance
+            // before accepting these bytes, so legal per-target debt fits usize.
+            *instance_bytes = instance_bytes
+                .checked_add(bytes as u64)
+                .expect("admitted request copy debt fits exact target accounting");
         }
         (bytes, reinjection_suppression_deadline)
     }
@@ -294,6 +308,18 @@ impl RequestFlightLedger {
                         self.original_data_in_flight_bytes_by_instance
                             .remove(&flight.instance);
                     }
+                } else if flight.kind == CarrierWorkKind::ReinjectedData {
+                    let instance_bytes = self
+                        .reinjected_data_in_flight_bytes_by_instance
+                        .get_mut(&flight.instance)
+                        .expect("request exact-instance copy debt covers released flight");
+                    *instance_bytes = instance_bytes
+                        .checked_sub(bytes as u64)
+                        .expect("request exact-instance copy debt covers released bytes");
+                    if *instance_bytes == 0 {
+                        self.reinjected_data_in_flight_bytes_by_instance
+                            .remove(&flight.instance);
+                    }
                 }
                 let path_proving = flight.evidence_eligible
                     && flight.kind.is_original_transmission()
@@ -345,6 +371,7 @@ impl RequestFlightLedger {
         let mut released = Vec::new();
         self.original_data_in_flight_bytes = 0;
         self.original_data_in_flight_bytes_by_instance.clear();
+        self.reinjected_data_in_flight_bytes_by_instance.clear();
         for (start, flights) in std::mem::take(&mut self.flights) {
             for flight in flights {
                 released.push(RequestPathRelease {
@@ -446,18 +473,13 @@ impl RequestFlightLedger {
             let (calls, visits) = work.get();
             work.set((calls + 1, visits));
         });
-        self.flights
-            .values()
-            .flat_map(|flights| flights.iter())
-            .filter(|flight| {
-                #[cfg(test)]
-                REINJECTION_DEBT_QUERY_WORK.with(|work| {
-                    let (calls, visits) = work.get();
-                    work.set((calls, visits + 1));
-                });
-                flight.instance == instance && flight.kind == CarrierWorkKind::ReinjectedData
-            })
-            .fold(0usize, |bytes, flight| bytes.saturating_add(flight.bytes))
+        usize::try_from(
+            self.reinjected_data_in_flight_bytes_by_instance
+                .get(&instance)
+                .copied()
+                .unwrap_or(0),
+        )
+        .unwrap_or(usize::MAX)
     }
 
     /// Earliest immutable accepted-copy expiry overlapping one exact range on

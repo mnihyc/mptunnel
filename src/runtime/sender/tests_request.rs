@@ -102,6 +102,113 @@ fn opened_request_stream_with_retained_input(
     )
 }
 
+#[tokio::test]
+async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start() {
+    // Proposed PREPARED_ORIGINAL_OWNERSHIP_MODEL RED, not a mismatch with the
+    // current early-binding contract. No writer is spawned or data command
+    // consumed: preparation alone must not become a native Original claim.
+    let stream_id = StreamId(714);
+    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10714"]);
+    let limits = context.mux_limits;
+    let command_capacity = crate::runtime::path::commands::reliable_path_command_queue(limits);
+    let (commands, mut receivers) = reliable_path_command_channels(command_capacity);
+    let (opened, _frames_tx) =
+        opened_request_stream_with_retained_input(stream_id, 0, commands.clone());
+    let mut remotes = ReliableRelayRemoteSet::new(opened, command_capacity);
+    let proof = try_recv_reliable_path_priority_command(&mut receivers)
+        .expect("attachment publishes its separate priority proof");
+    assert!(matches!(
+        proof,
+        ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+    let owner = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(owner);
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let mut queue = ReliableRelaySenderQueue::default();
+
+    let admission = sender.reliable_stream_source_admission(
+        &context,
+        &remotes,
+        TrafficClass::Throughput,
+        reliable_relay_buffer_len(limits),
+    );
+    let selected = admission
+        .selected_path
+        .expect("the ordinary singleton target is eligible without fabricated rate proof");
+    let quantum = crate::model::capacity::adaptive_reliable_relay_chunk_bytes(
+        Some(selected),
+        TrafficClass::Throughput,
+        limits,
+    );
+    let source_bytes = 2 * quantum;
+    assert!(command_capacity > 2);
+    assert!(source_bytes <= admission.window_bytes);
+    assert!(source_bytes <= limits.max_repair_bytes);
+    assert!(source_bytes <= send_stream.send_credit_bytes());
+    assert_eq!(remotes.paths.len(), 1, "no alternate or migration is required");
+    assert!(commands.can_enqueue_lane_now(TrafficClass::Throughput));
+    let source = Bytes::from(vec![0x71; source_bytes]);
+    queue.push_data(source.clone());
+    assert!(matches!(
+        queue.front().map(|(_, work)| &work.kind),
+        Some(ReliableRelayQueuedWorkKind::Data(payload)) if payload == &source
+    ));
+    assert_eq!(queue.data_bytes(), source_bytes);
+    assert_eq!(send_stream.next_offset(), 0);
+    assert!(
+        sender
+            .multipath
+            .latest_unacked_ranges_for_path_instance(owner)
+            .is_empty()
+    );
+
+    for _ in 0..2 {
+        match sender
+            .dispatch_client_queued_work(
+                &context,
+                TrafficClass::Throughput,
+                &mut remotes,
+                &mut send_stream,
+                &mut queue,
+                quantum,
+                ReliableDataAckFrontierState::Live,
+            )
+            .await
+            .expect("two legal source quanta fit the unchanged ordinary admission")
+        {
+            ClientQueuedDispatch::Data { payload_bytes } => {
+                assert_eq!(payload_bytes, quantum);
+            }
+            _ => panic!("ordinary preparation must not require another attachment"),
+        }
+    }
+    // Conservation, not a required storage placement. If preparation moves
+    // into a shared owner, use its actual prepared-byte view in this sum.
+    assert_eq!(
+        queue.data_bytes() + send_stream.reinjection_bytes(),
+        source_bytes
+    );
+    assert_eq!(queue.reinjection_bytes(), 0);
+    assert_eq!(
+        commands.writer_pending_bytes(),
+        0,
+        "no command reached a writer"
+    );
+    assert!(commands.can_enqueue_lane_now(TrafficClass::Throughput));
+
+    let assigned = sender
+        .multipath
+        .latest_unacked_ranges_for_path_instance(owner);
+    assert_eq!(
+        (send_stream.next_offset(), assigned.is_empty()),
+        (0, true),
+        "prepared but unconsumed source must not advance the wire horizon or own \
+         exact Original ranges on a future writer; assigned={assigned:?}"
+    );
+}
+
 #[test]
 fn request_dispatch_preserves_classified_and_stream_ordered_queues() {
     let (commands, mut receivers) = reliable_path_command_channels(1);

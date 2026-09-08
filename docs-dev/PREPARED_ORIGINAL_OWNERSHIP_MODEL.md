@@ -1,6 +1,6 @@
 # Prepared Original ownership — pre-implementation model
 
-2026-09-08 09:40 +08:00. Category: bounded architectural candidate for the
+2026-09-08 10:07 +08:00. Category: bounded architectural candidate for the
 existing early ordered-upload failure. **Not accepted runtime, performance or
 RFC policy.** Read PERFORMANCE_METHOD_AND_LESSONS and CURRENT_CLOSURE_PLAN.
 REQUEST_PREFIX_SERVICE_20260908 contains the exact existing capture; this file
@@ -145,8 +145,23 @@ silently replace the existing policy with whichever thread acquires a lock
 first. A writer still inside a protected transaction has no new claim boundary.
 If the preferred output is not at a claim boundary, it cannot reserve an
 arbitrary future prepared suffix or make independent ready work wait for it.
-If several exact writers are at boundaries, their candidate ordering and
-cooperative successor service must be specified before implementation.
+For the request candidate, retain the existing full-membership ordinary
+observation, advisory ordering and successful-claim cursor. Add an exact
+writer-boundary predicate separately from structural membership. The current
+`current_request_original_data_tier` omits queue availability; preserve that
+tier and its FirstPath/frontier/AdditionalPath baseline rather than filtering
+the member set to ready writers. This candidate does not promote backup solely
+because regular writers are busy or requalify a stale owner to obtain a claim.
+
+A caller claims only when the coherent finite decision selects that caller's
+exact ready writer. If another currently ready writer wins, leave U untouched
+and coalescing-wake the selected writer; install no sticky payload grant. A
+later attempt revalidates full membership, current readiness and authority.
+The losing writer arms/rechecks the corresponding generations and parks rather
+than spinning. Withdraw readiness before every operation that can occupy the
+writer, including control writes and awaited input forwarding. This rule
+must be checked against existing persistence/hysteresis and tier controls;
+those tests, not task wake order, determine whether migration preserved policy.
 
 This readiness representation is not a per-frame actor handshake. A singleton
 writer must synchronously claim its next prepared action immediately after its
@@ -155,6 +170,61 @@ claim may cover the existing imminent encoder transaction geometry, but not
 prefetch another fixed-target private suffix waiting behind it. No guard may
 span native I/O. The lock/fence order and cancellation of ready claims remain
 explicit implementation-proof obligations; their absence would block code.
+
+## Concrete request migration boundary
+
+Existing `dispatch_client_data_work` calls `ReliableSendStream::send_data`,
+then installs per-target ownership through `RequestSenderService` and publishes
+the carrier command. Failed publication rolls the mux commit back. The new
+boundary must preserve that transaction's effects while moving it to claim;
+do not keep early `send_data` and merely relabel the command as prepared.
+
+The smallest coherent shared aggregate includes:
+
+| Existing owner | Why it belongs to the claim transaction |
+| --- | --- |
+| `ReliableSendStream` |C, receiver credit, retained claimed cache, positive ACK validation/release |
+| `ReliableRelaySenderQueue` |Unnumbered Data and its joint bounded accounting with repair/control queues; splitting Data alone would need another reservation protocol |
+| `RequestMultipathController` |Exact flights, qualification/rate/requalification, ACK-clock operation and successful-send cursor |
+| Exact attachment admission records |Identity/generation, output/lane/proof and claimed-load ownership; no stale mirror may authorize native exposure |
+
+Keep remote receive channels/forwarder tasks, local pending response writes
+and asynchronous open/close management outside that shared lock. The optional
+traffic accounting and two live-recovery epochs can remain actor-owned around
+short shared transactions; they cannot be required by a writer's synchronous
+Original claim. Membership invalidation updates authoritative claim eligibility
+before asynchronous teardown, retaining existing claimed debt for recovery.
+
+Do not wrap today's whole sender/ACK/planner methods in a mutex. Normal request
+observation reads Native shapes before health observations; making that call
+under Product ownership would invert the existing Native-to-Product direction.
+Advisory observation obtains native inputs outside the Product lock. Final
+QUIC claim reuses `commit_with_current_scheduling_shape`: activation fence,
+coordinator, shape, then Product ownership and applicable health bookkeeping.
+Under that fence use the supplied target shape and suppress other Native reads,
+as the current native-override Apply already does. Release every guard before
+encoding/native I/O. Actor ACK/recovery must either operate only on captured
+non-Native inputs under Product ownership or follow the same Native-first
+transaction; no Product-to-Native callback is permitted.
+
+Existing request structural-recovery batches assume one serialized Dispatch.
+After this migration, a writer may append a higher-offset Original while the
+actor retains that batch. Such an append cannot silently invalidate the old
+range's ownership/copy exclusions. Membership, ACK/requalification and queued
+copy mutations still require batch invalidation; each final Apply rechecks
+current target P/K and membership. Preserve the once-per-batch overlap work
+property without retaining its obsolete no-concurrent-mutation premise.
+
+Writer integration starts after the existing retirement/control/priority/
+repair/data lane arbitration. TCP claims immediately before its protected
+ordinary transaction. QUIC claims the imminent bounded transaction only after
+any optional coalescing yield, not when filling a private `pending_frames`
+prefetch. A coalesced weak source notification can occupy the existing Original
+lane without claiming payload bytes. Exact writer readiness is a new owner,
+not authentication readiness, an empty queue, or zero sampled pending bytes.
+TCP shares that writer across streams; QUIC's attachment writers still share
+connection-native capacity. Notifications must neither obstruct independent
+ready streams nor retain cancelled sources through reference cycles.
 
 ## Conditional benefit and limits
 
@@ -183,11 +253,19 @@ roundtrip or locks across awaits, reject it before performance experiments.
 Before migrating production, map the unnumbered preparation representation
 and actual source/cache/claim/native/ACK lifecycle in both directions, and close
 the remaining readiness/arbitration/fence ownership obligations above.
-The first producer fixture must hold TCP before its next protected transaction,
-prepare multiple legal quanta, then make QUIC genuinely able to claim an
-Original under unchanged authority. The lower unclaimed prefix must enter
-that writer with no old-writer submission and no duplicate bytes. A fixture
-that simply lowers queue capacity or cannot satisfy P/E is not the intended RED.
+The first boundary fixture uses actual request source dispatch into the
+unchanged default command queue, with no data-command consumption or writer.
+Two normal source quanta must remain conserved without a claimed wire horizon
+or exact target Original ownership under the proposed contract. This identifies
+the current early-binding boundary; it is not a current RFC-mismatch test and
+does not prove alternate service or a future timing benefit.
+
+The subsequent integration discriminator must hold TCP before its next
+protected transaction, prepare multiple legal quanta, then make QUIC genuinely
+able to claim an Original under unchanged authority. The lower unclaimed prefix
+must enter that writer with no old-writer submission and no duplicate bytes.
+A fixture that simply lowers queue capacity or cannot satisfy P/E is not that
+intended migration proof. Keep these two claims separate.
 
 Necessary adverse controls are: old writer claims first; no alternate; current
 P/E/receive credit exhausted; shared QUIC credit exhausted; carrier replacement;
@@ -201,3 +279,21 @@ RED/GREEN follows; then ordinary affected first-body, ordered forward progress,
 read gaps, loaded latency, complete bytes and CPU/RSS/wire costs under the
 unchanged profile. Stop promotion on an adverse or ambiguous pair. No new rate
 prior, timer, percentage, queue size or favourable third run may make it pass.
+
+## Producer boundary result — 2026-09-08 10:06 +08:00
+
+`prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start` uses
+the real request sender, default carrier queue, retained live attachment input
+and two normal64KiB source quanta. Only the attachment proof is consumed;
+no data command reaches a writer. Source/retained conservation, ordinary target
+eligibility, credit, absence of repair and non-full queue controls all pass.
+The final proposed-contract assertion alone fails: wire horizon131072 and
+exact TCP Original[0,131072), versus an unclaimed horizon0 and no Original.
+The existing483 focused sender/queue/relay/request/mux/interlock controls pass
+in1.27s. Functional build1m11s; no optimized build or lab for this boundary test.
+
+This is a real producer counterexample to the proposed ownership contract,
+not proof that current code violates its current early-publication RFC. The
+live pre-native waiting evidence supplies the practical reason to consider
+changing that contract. Alternate claiming, singleton feeding, migration cost
+and ordinary timing remain unproved. Do not waive them after this RED.

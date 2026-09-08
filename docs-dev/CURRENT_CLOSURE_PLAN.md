@@ -47,6 +47,20 @@ candidate/parent pair on the unchanged profile, retaining full completion,
 phase/gap and cost evidence. A worse/ambiguous result stops promotion; no
 diagnostic-rate acceptance or unrelated model expansion.
 
+**Pair order fixed before execution15:25:** fresh frozen ordinary9ea25e2 parent
+first, then the candidate only after actual RED/GREEN/audit. Parent capture
+can run during test-only fixture preparation, with no build running. This
+uses host time without mixing a build into the lab; the older ordinary9ea
+realization is context rather than a substituted control. No favorable retry.
+
+**RED15:32:** actual uncontended control passes; both advisory acquisition
+cases and cancellation reach the intended blocking assertion only after
+semantic held-state controls and thread cleanup.1pass/3fail,1.00s;
+warning-free build1m12s. Independent model/fixture review passes. Implement
+only the two existing prearmed try-lock acquisitions now. Fresh ordinary
+parent completes355532800B/44.964483s, maxconfirmation5.052667s; this variation
+is retained alongside the earlier11s gap rather than called acceptance.
+
 ## Completed discriminator: remaining winning-reply service hold
 
 **Executed15:00:** warning-free diagnostic build3m33s; all observer hooks
@@ -208,8 +222,8 @@ above500Mbps can be buffered observation, not wire capacity.
   target/release is the diagnostic binary: do not use it as ordinary.
 - Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
   No deletion this turn; ample root space. User7lines must stay unstaged.
-- Telegram last meaningful report about2026-09-08 06:23UTC; next nonurgent
-  not before07:23UTC. Respect hourly minimum and soft-frequency advisory.
+- Telegram last meaningful report before2026-09-08 07:26UTC; next nonurgent
+  not before08:27UTC. Respect hourly minimum and soft-frequency advisory.
   No component-only success notification or unfinished completion claim.
 - Reflection: exact symbolic conservation enabled one justified work deletion,
   but did not predict every timing phase. The ordinary pair supplies real

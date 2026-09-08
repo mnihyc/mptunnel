@@ -5162,3 +5162,310 @@ async fn prepared_blocked_writers_do_not_regenerate_idle_retries() {
         "refused metadata attempts must not regenerate sibling retries in successive idle cycles without source, policy, Native or admission progress",
     );
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparedAdvisoryLockCut {
+    Uncontended,
+    Initial,
+    AfterNativeCapture,
+}
+
+fn prepared_advisory_lock_case(cut: PreparedAdvisoryLockCut, cancel_after_busy: bool) {
+    use futures::FutureExt;
+    use std::sync::mpsc;
+
+    // This bounds a deliberately blocked test thread, not Product latency or
+    // any runtime policy. Both old blocking paths must release/join on RED.
+    const CLAIM_COMPLETION_GUARD: Duration = Duration::from_secs(1);
+    struct ReleaseHolder {
+        start: mpsc::Sender<()>,
+        release: mpsc::Sender<()>,
+    }
+    impl Drop for ReleaseHolder {
+        fn drop(&mut self) {
+            // Also start a not-yet-reached hook's holder during unwinding, so
+            // scoped joining never strands it waiting for an acquisition.
+            let _ = self.start.send(());
+            let _ = self.release.send(());
+        }
+    }
+
+    let stream_id = StreamId(723);
+    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10726"]);
+    let limits = context.mux_limits;
+    let capacity = crate::runtime::path::commands::reliable_path_command_queue(limits);
+    let (commands, mut receivers) = reliable_path_command_channels(capacity);
+    let (opened, _source_input) =
+        opened_request_stream_with_retained_input(stream_id, 0, commands.clone());
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, capacity);
+    let instance = remotes.paths[0].instance();
+    let initial_proof = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
+    assert!(matches!(
+        initial_proof,
+        ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&initial_proof));
+    context.install_relay_path_instance_for_test(instance);
+    remotes.retry_pending_path_proofs(&context);
+    let proof = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
+    let ReliablePathCommand::SendFrame(frame @ Frame::PathProofData { .. }) = &proof else {
+        panic!("acknowledge the actual current attachment challenge");
+    };
+    let mut tracker = crate::runtime::path::PathProofTracker::from_limits(limits);
+    tracker.record_sent_frame(frame);
+    let Frame::PathProofData {
+        path_id,
+        proof_id,
+        payload,
+    } = frame
+    else {
+        unreachable!();
+    };
+    let receipt = tracker
+        .acknowledge(*path_id, *proof_id, payload.len().try_into().unwrap())
+        .unwrap();
+    context.mark_relay_path_proof_observation(
+        instance.key.underlay,
+        instance.key.index,
+        instance.path_instance_id,
+        receipt,
+    );
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+    let sender = RequestSenderService::new(stream_id);
+    let admission = sender.reliable_stream_source_admission(
+        &context,
+        &remotes,
+        TrafficClass::Throughput,
+        reliable_relay_buffer_len(limits),
+    );
+    let selected = admission
+        .selected_path
+        .expect("actual default singleton admission");
+    let quantum = crate::model::capacity::adaptive_reliable_relay_chunk_bytes(
+        Some(selected),
+        TrafficClass::Throughput,
+        limits,
+    );
+    assert!(quantum > 0 && quantum <= admission.window_bytes);
+    let source = Bytes::from(vec![0x7d; quantum]);
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(source.clone());
+    let shared = SharedRequestProduct::new(RequestProductState {
+        sender,
+        sender_queue: queue,
+        send_stream: ReliableSendStream::new(stream_id, limits),
+        last_send_ack: Default::default(),
+        remotes,
+        prepared: RequestPreparedSource::new(TrafficClass::Throughput, quantum),
+    });
+    let actor_lifetime = shared.actor_lifetime();
+    {
+        let mut state = shared.lock();
+        crate::runtime::relay::control::publish_prepared_request_work(
+            &mut state,
+            &shared,
+            &context,
+            TrafficClass::Throughput,
+            quantum,
+            true,
+        );
+    }
+    let ReliablePathCommand::PreparedOriginal(work) =
+        try_recv_request_command_after_path_proofs_for_test(&mut receivers).unwrap()
+    else {
+        panic!("the actual producer must publish an unbound weak notice");
+    };
+    let idle = receivers
+        .writer_ready_boundary(instance.path_instance_id)
+        .unwrap()
+        .receipt();
+    let snapshot = |state: &RequestProductState| {
+        (
+            state.send_stream.next_offset(),
+            state.send_stream.reinjection_bytes(),
+            state.sender_queue.data_bytes(),
+            state.sender_queue.front().map(|(_, work)| match &work.kind {
+                ReliableRelayQueuedWorkKind::Data(payload) => payload.clone(),
+                _ => panic!("same retained source kind"),
+            }),
+            state
+                .sender
+                .multipath
+                .latest_unacked_ranges_for_path_instance(instance),
+            state.prepared.last_claimed_at,
+            commands.pending_bytes(),
+            commands.writer_pending_bytes(),
+            commands.writer_boundary().snapshot(),
+        )
+    };
+    let before = snapshot(&shared.lock());
+    assert_eq!(before.0, 0);
+    assert_eq!(before.1, 0);
+    assert_eq!(before.2, quantum);
+    assert_eq!(before.3.as_ref(), Some(&source));
+    assert!(before.4.is_empty());
+    assert_eq!(before.5, None);
+    assert_eq!((before.6, before.7), (0, 0));
+    assert_eq!(before.8.as_ref(), Some(&idle));
+
+    let (work, mut receivers, first_claim) = if cut == PreparedAdvisoryLockCut::Uncontended {
+        let ready = receivers
+            .writer_ready_boundary(instance.path_instance_id)
+            .unwrap();
+        let claim = work.try_claim(ready);
+        (work, receivers, claim)
+    } else {
+        std::thread::scope(|scope| {
+            let (start_tx, start_rx) = mpsc::channel();
+            let (held_tx, held_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release = ReleaseHolder {
+                start: start_tx.clone(),
+                release: release_tx,
+            };
+            let owner = &shared;
+            let take_snapshot = &snapshot;
+            let holder = scope.spawn(move || {
+                start_rx.recv().expect("start actual Product holder");
+                let state = owner.lock();
+                let _ = held_tx.send(());
+                release_rx.recv().expect("bounded test releases Product");
+                // Taken before dropping P: even old blocking code cannot
+                // modify these fields between this snapshot and release.
+                take_snapshot(&state)
+            });
+            if cut == PreparedAdvisoryLockCut::Initial {
+                start_tx.send(()).unwrap();
+                held_rx
+                    .recv_timeout(CLAIM_COMPLETION_GUARD)
+                    .expect("holder acquires Product before the initial claim");
+            } else {
+                shared.before_prepared_native_resolve_once_for_test(move || {
+                    start_tx.send(()).unwrap();
+                    held_rx
+                        .recv_timeout(CLAIM_COMPLETION_GUARD)
+                        .expect("holder acquires Product after the first guard is released");
+                });
+            }
+            let (returned_tx, returned_rx) = mpsc::channel();
+            let runtime = tokio::runtime::Handle::current();
+            let writer = scope.spawn(move || {
+                let _runtime = runtime.enter();
+                let ready = receivers
+                    .writer_ready_boundary(instance.path_instance_id)
+                    .unwrap();
+                let result = work.try_claim(ready);
+                let _ = returned_tx.send(());
+                (work, receivers, result)
+            });
+            let returned_while_held = returned_rx
+                .recv_timeout(CLAIM_COMPLETION_GUARD)
+                .is_ok();
+            drop(release);
+            let held_snapshot = holder
+                .join()
+                .expect("holder exits without poisoning Product");
+            let result = writer.join().expect("writer finishes after bounded cleanup");
+            assert_eq!(
+                held_snapshot, before,
+                "contention must not mutate source, C, cache, flight, charges or readiness"
+            );
+            assert!(
+                returned_while_held,
+                "actual prepared writer advisory Product lock must return Busy before the holder releases; the 1s guard is test-thread cleanup, not desired runtime latency",
+            );
+            result
+        })
+    };
+
+    let frame = if cut == PreparedAdvisoryLockCut::Uncontended {
+        let RequestPreparedClaim::Claimed(frame) = first_claim else {
+            panic!("same real source and writer must claim without contention");
+        };
+        frame
+    } else {
+        let RequestPreparedClaim::Busy(wait) = first_claim else {
+            panic!("advisory Product contention must return the existing Busy outcome");
+        };
+        // Poll before acquiring any validation guard: its later unlock must
+        // not mask a missing notification from the actual contending holder.
+        assert_eq!(
+            wait.now_or_never(),
+            Some(()),
+            "unlock before the first poll must survive"
+        );
+        assert_eq!(snapshot(&shared.lock()), before);
+        if cancel_after_busy {
+            drop(actor_lifetime);
+            let ready = receivers
+                .writer_ready_boundary(instance.path_instance_id)
+                .unwrap();
+            assert_eq!(ready.receipt(), idle);
+            assert!(matches!(work.try_claim(ready), RequestPreparedClaim::Empty));
+            assert_eq!(
+                snapshot(&shared.lock()),
+                before,
+                "Busy is not authority to claim after logical cancellation"
+            );
+            return;
+        }
+        let ready = receivers
+            .writer_ready_boundary(instance.path_instance_id)
+            .unwrap();
+        assert_eq!(
+            ready.receipt(),
+            idle,
+            "a failed metadata attempt preserves idle ownership"
+        );
+        let RequestPreparedClaim::Claimed(frame) = work.try_claim(ready) else {
+            panic!("identical current source and writer must claim after the actual unlock");
+        };
+        frame
+    };
+    assert!(matches!(&frame, Frame::StreamData { offset: 0, payload, .. } if payload == &source));
+    let charge = receivers.register_claimed_writer_frame(&frame);
+    assert!(charge >= quantum);
+    assert_eq!(commands.pending_bytes(), charge as u64);
+    assert_eq!(commands.writer_pending_bytes(), charge as u64);
+    {
+        let state = shared.lock();
+        assert_eq!(state.send_stream.next_offset(), quantum as u64);
+        assert_eq!(state.send_stream.reinjection_bytes(), quantum);
+        assert_eq!(state.sender_queue.data_bytes(), 0);
+        assert_eq!(
+            state
+                .sender
+                .multipath
+                .latest_unacked_ranges_for_path_instance(instance),
+            vec![OffsetRange {
+                start: 0,
+                end: quantum as u64
+            }]
+        );
+    }
+    receivers.release_pending_command_bytes(charge);
+    assert_eq!(
+        (commands.pending_bytes(), commands.writer_pending_bytes()),
+        (0, 0)
+    );
+}
+
+#[tokio::test]
+async fn prepared_advisory_product_lock_uncontended_claim_control() {
+    prepared_advisory_lock_case(PreparedAdvisoryLockCut::Uncontended, false);
+}
+
+#[tokio::test]
+async fn prepared_advisory_product_lock_initial_returns_busy() {
+    prepared_advisory_lock_case(PreparedAdvisoryLockCut::Initial, false);
+}
+
+#[tokio::test]
+async fn prepared_advisory_product_lock_after_native_capture_returns_busy() {
+    prepared_advisory_lock_case(PreparedAdvisoryLockCut::AfterNativeCapture, false);
+}
+
+#[tokio::test]
+async fn prepared_advisory_product_lock_busy_cancellation_preserves_source() {
+    prepared_advisory_lock_case(PreparedAdvisoryLockCut::Initial, true);
+}

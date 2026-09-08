@@ -609,3 +609,60 @@ recovery but cannot attribute all timing differences or establish universal
 acceptance. Stop promotion if it still holds or fails settlement, then locate
 the exact receive/decode/handoff stage. Component GREEN is internal tracking,
 not a user-facing performance milestone.
+
+## Native callback service: advisory owner contention
+
+2026-09-08 15:25 +08:00. Pre-change model for the bounded transaction in
+CURRENT_CLOSURE_PLAN. The completed COPY_DEBT_SERVICE_20260908 trace proves
+winning-reply delays before and after local decode, with different cost
+composition across phases. It does not measure individual mutex waits.
+
+Origin9720e4b deliberately kept two advisory Product acquisitions outside
+Native and made only the final Native-fenced acquisition nonblocking. That
+satisfies the earlier deadlock argument. It leaves a different reachable
+service failure: an actual native writer synchronously executing either
+advisory std-mutex acquisition parks its executor thread and cannot process
+its other ready input until the Product holder releases ownership. An empty
+source inspection can wait too. The correction is a stronger implementation
+service contract, not a claim that the earlier RFC specified try-locks.
+
+Every Product acquisition inside a native writer claim should use the existing
+prearmed nonblocking protocol. Initial contention returns Busy without reading
+or mutating Product. Second-cut contention drops the advisory frame/receipts;
+the successor starts again from current state. Each cut freshly arms after the
+preceding guard has been released. A notification armed before its own unlock
+must not become a reusable release credit. Final Native fencing and all exact
+registration, lane, source, Ready, qualification and authority checks remain.
+
+Busy grants no payload, DSN, flight, admission failure or Backup preference.
+The writer defers its weak work token on owner release/cancellation and keeps
+the same physically idle Ready epoch. It does not await owner release inline
+or change actor-side serialized ownership. Therefore contention contributes
+no blocking Product-acquisition edge to the native callback, while successful
+claims preserve U→Original conservation and exact final publication. This is
+not a starvation bound or a bound on other synchronous callback work.
+
+Tradeoffs must be measured: two extra prearmed OwnedNotified allocations on
+an uncontended successful claim; deferred requeue latency for short contention;
+discarded/repeated advisory work at the second cut; and more simultaneous
+release wakeups. Existing Notify-all semantics are not an excuse to invent a
+new wake policy here. Expensive Product handlers and other Native/context
+locks remain unchanged. This alone cannot promise removal of multi-second gaps.
+
+Required actual producer controls retain the real owner across each cut,
+observe Busy before releasing it, preserve bytes/flight/charges/readiness,
+then release before first wait poll and retry the same lowest source. The old
+implementation must reach this intended blocking assertion after cleanup,
+not fail a fixture premise. Uncontended and cancellation/current-registration
+opposites remain. Only then implement; focused GREEN/audit precede ordinary
+full timing/completion/cost comparison. RFC serialized ownership, zero-commit
+wakes and final arbitration are unchanged; request/response parity is still
+a separate retained obligation, not silently completed by this correction.
+
+Executed15:32: warning-free RED build1m12s. The real uncontended producer
+control passes; both advisory cuts and the cancellation case reach only the
+intended returned-before-release assertion after unchanged held-state checks
+and complete thread cleanup.1pass/3fail in1.00s; no fixture/admission failure.
+Independent review confirms the current proof/source/Ready provenance and
+that no extra validation unlock masks the tested notification. This establishes
+the actual native claim's blocking mechanism, not its share of ordinary gaps.

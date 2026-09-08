@@ -1,9 +1,28 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 13:51 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 14:22 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 ## Active transaction — 2026-09-08 14:01 +08:00
+
+**Latest executed result14:22:** sparse diagnostic completes440598528B/45.810536s,
+but is not ordinary acceptance. All100 winning replies join exact stages.
+Largest3.460s mux hold includes2.226s AFTER the winning TCP reply was decoded
+(1.832s before native routing). Recovery-dispatch elapsed is.846837/.869930s
+in the surrounding one-second buckets. Other long gaps precede publication or
+decode; neither that cost nor QUIC congestion explains all of them. Full joins,
+contrary cases, costs, raw bins and observer limits are in
+PREPARED_REPLY_SERVICE_20260908.md/patch/raw archive. No further ordinary run.
+
+**Next concrete discriminator:** inspect repeated recovery target/range queries
+under held service, preserving1436ff4's globally ordered and independently
+eligible recovery. Actual cost is established; redundant equivalent work is
+NOT assumed. Prove a real query/operation-count counterexample and opposite
+Native/ownership-change controls before any work-sharing correction. No cap,
+threshold, feedback delay, response-parity stack or controller change.
+Build/capture are complete, hooks reversed, products/probes stopped; only
+the user's seven-line source-worktree edit remains. Older next-action prose
+below is historical and subordinate to this latest disposition.
 
 **Ordinary result:**b3dfef1 eliminates the proved idle retry recurrence, but
 the unchanged mixed upload still has15.955s confirmation gaps and31s sampled
@@ -569,8 +588,9 @@ aggregate300/200 defaults as200each. Do not tune this profile to pass.
   Commit exact intermediate dispositions;
   preserve small evidence before scoped cache cleanup. No deletion this turn.
   User seven-line edit must remain outside commits.
-- Telegram milestone authorization: no more often than hourly. Last sent about
-  2026-09-08 05:07UTC; next nonurgent not before2026-09-08 06:07UTC. Respect advisory;
+- Telegram milestone authorization: no more often than hourly. Latest measured
+  local-stall report sent about2026-09-08 06:23UTC; next nonurgent not before
+  2026-09-08 07:23UTC. Respect the soft-frequency advisory;
   ordinary gaps remain open, so do not send a completion claim.
 - Reflection: local work proof was useful and enabled a deletion, but did not
   predict every network interval. The ordinary pair moved the worst observed

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 22:05 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 22:34 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,77 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Next existing stall boundary22:37 — diagnostic, not another fix:** the
+current ordinary UP has Rc966 held across41.189–45.189s while T advances65MB
+and Rs966→1190. Earlier positively decoded replies also spent1.112s locally.
+Response late placement cannot be called their cure; the three measured
+owner sections (max13.405ms) already reject a single multi-second lock hold.
+The meaningful discriminator is exact current response source/claim/write/
+decode/handoff/mux/local-delivery, with typed preceding reader work instead
+of assuming every nondata predecessor is ACK processing.
+
+Reuse the archived reply observer, adapting Original commitment to the new
+prepared success and source reads to their actual Product enqueue sites.
+Retain exact response-only path/stream/range identities and successful-write
+semantics. Aggregate preceding QUIC-reader handoff counts and sum/max intervals
+by Frame kind; do not log each request ACK or revive the three owner timers.
+One unchanged harsh mixed upload on diagnostic0449b9f asks whether current
+winning replies wait unclaimed, before read starts, during read, or after
+decode. Native missing-input versus local polling remains unresolved if only
+a long read-await is observed; do not add Quinn/Cargo hooks automatically.
+
+Information forecast: a material current postdecode/late-read-entry hold with
+typed predecessor waits selects that existing service owner for a bounded
+counterexample; prompt local stages reject that attribution and retain the
+predecode branch. The benefit is choosing the correct seconds-scale mechanism,
+not improved diagnostic Mbps. Root/independent review before one build;
+archive/freeze/reverse every observer hook before capture. No runtime policy,
+queue, timing, sampler, controller, model or ordinary comparison substitution.
+
+**Capacity-drop outcome22:34:** all five QoS-only cells complete. Final10s
+means: control mixed405.506, candidate QUIC439.528/mixed451.067, raw455.680,
+H2470.396Mbps. No persistent bulk collapse after500Mbps restoration in these
+cells; no equivalent proof for every QoS/loss combination. All systems,
+including raw/H2, time out one echo at the10Mbps cut. Later unavailable slots
+follow the probe closing that same connection, not fresh postrestore attempts.
+Do not turn this common timeout into an MPP-specific fix.
+
+Mixed candidate's2.833589s maximum bulk gap is during the cut (control.936306,
+QUIC.106309). Interior matched snapshots send9,881,946 physical class bytes
+while locally delivering3,473,408 logical bytes; backlog stays38.86→32.08MB.
+The cut is busy: neither unused capacity nor exact duplicate/copy fraction
+follows. Pending lower-prefix/suffix/native service needs exact-range evidence;
+do not respond by reducing queues or guessing a protocol preference. After
+initial-loss restoration the candidate mixed remains slower than its control;
+the later QoS recovery win does not erase that earlier adverse case.
+
+Telegram full checkpoint/recovery report sent14:34UTC; next nonurgent not
+before15:35UTC. The report explicitly withholds performance acceptance.
+
+**Checkpoint / restored result22:22:**0449b9f commits the verified response
+ownership migration and all ten ordinary outcomes, explicitly not accepting
+performance. The70-member archive passes integrity/member/byte comparisons.
+Existing reorder-recovery cells now complete for control mixed, candidate
+mixed/QUIC and H2. All echoes succeed. Final20s means: mixed control421.332,
+mixed candidate392.256, QUIC438.824Mbps; H2 is approximately467Mbps. The
+old control already recovers without restart; no persistent severe post-loss
+collapse is reproduced here. Candidate mixed retains adverse tail throughput
+and echo p95 versus control, despite higher whole-run bulk. Source remains
+0449b9f, no new fix or controller/queue change.
+
+**Existing QoS symptom / next ablation forecast:** initial loss recovery is not
+the reported capacity-collapse recovery. Reuse combined with loss/jitter and
+blackhole disabled:500Mbps/100ms, shared forward10Mbps at15–25s, then500Mbps
+to40s. One control mixed, candidate QUIC/mixed, raw TCP and H2 comparison
+with identical capacity schedule, existing configured priors and full timings.
+This isolates queue/congestion-history recovery from continued erasure, using
+the existing runner. The10Mbps interval is diagnostic; regained500Mbps service
+and loaded-latency history decide the question. No arbitrary rate threshold
+or wait for a favorable run. If MPP remains stalled after the cut clears while
+baselines recover, locate exact forward/return/native authority next; otherwise
+do not invent that defect. Keep the earlier adverse evidence and remaining
+upload receive boundary open. No new lab infrastructure or runtime edits.
 
 **Ordinary diagnostic outcome22:10:** mixed down's longest gap improves
 7.418→3.720s, but first body0.546→1.055s and echo42/75→30/75 are adverse.

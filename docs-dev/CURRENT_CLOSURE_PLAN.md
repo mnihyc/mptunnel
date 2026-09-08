@@ -52,6 +52,25 @@ not a favorable retry. Expected benefit is removing avoidable fallback
 starvation; cost risk is more service on a stale path, bounded by unchanged
 authority. Critical queue priority and native recovery stay unchanged.
 
+**RED preparation17:18:** minimal extension of the existing competing-writer
+fixture uses actual source publication, current Native/member capture and
+mark_request_path_stale. A pre-stale plan identifies A; current post-stale
+authority is recomputed independently of selection, without changing observed
+flags. This positive case is legitimately FirstPath, not an Additional/E
+exhaustion proof. Fresh Ready opposite and stale-ACK no-requalification checks
+are included; existing selected withdrawal stays intact. Independent fixture
+audit passes; functional RED build now runs with no lab overlap. Fresh ordinary
+parent already completed389218304B/47.562042s, maxconfirmation4.845539s and
+maxwrite3.553143s. Runtime remains unchanged until the intended assertion fails.
+
+**RED17:21:** warning-free1m12s build; actual two-test run finishes.01s.
+Fresh-Ready opposite passes. Stale-Ready claim alone fails at the intended
+0versus65536-byte assertion after current authority, source, membership and
+Ready controls pass. No fabricated snapshot flags or setup failure. Implement
+only the agreed observation/policy separation now; independent review and
+focused GREEN precede the ordinary candidate. Existing W/P/E helper controls
+are not misrepresented as an actual stale-Ready E-exhaustion claim test.
+
 ## Completed discriminator: available request source is not claimed
 
 **Observed failure / priority:** second capture's largest target hold is

@@ -201,6 +201,10 @@ does not authorize latent topology inference or a universal Internet model.
   diagnostics are for causality, ordinary builds for performance. One build
   per coherent test batch, minute-scale polling and independent read-only work
   in parallel; preserve small evidence artifacts before scoped cache cleanup.
+- Start a new delegated assignment with followup_task, which also activates an
+  idle agent; send_message only updates a running assignment. Verify task
+  state at ownership transitions. A queued message to a completed agent is
+  not work in progress; this caused an avoidable preparation pause on09-08.
 
 ## Next decision, not another architecture expansion
 

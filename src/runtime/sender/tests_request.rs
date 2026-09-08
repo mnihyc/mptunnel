@@ -4635,6 +4635,8 @@ enum PreparedWriterClaimCase {
     SelectedDrains,
     BackupFallback,
     RegularBecomesReady,
+    StaleFallback,
+    FreshReadyDisplacesStale,
 }
 
 fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, usize) {
@@ -4727,7 +4729,125 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
         let a_ready = a_receivers
             .writer_ready_boundary(a.path_instance_id)
             .unwrap();
-        if !a_is_backup {
+        let stale_case = matches!(
+            case,
+            PreparedWriterClaimCase::StaleFallback
+                | PreparedWriterClaimCase::FreshReadyDisplacesStale
+        );
+        if stale_case {
+            assert!(a_ready.receipt().is_current());
+            assert!(b_commands.writer_boundary().snapshot().is_none());
+            let mut state = shared.lock();
+            let Some((_, queued)) = state.sender_queue.front() else {
+                panic!("actual admitted source is present");
+            };
+            let ReliableRelayQueuedWorkKind::Data(payload) = &queued.kind else {
+                panic!("the source producer retained raw unclaimed data");
+            };
+            let frame = state.send_stream.prepare_data(payload.clone()).unwrap();
+            let RequestProductState {
+                sender, remotes, ..
+            } = &mut *state;
+            sender
+                .multipath
+                .prepare_original_claim(&context, remotes, &frame)
+                .expect("actual current membership has no missing Original incarnation");
+            let observe = |state: &RequestProductState| {
+                let inputs = super::multipath::RequestRelayNativeCapture::new(
+                    state.remotes.membership_generation(),
+                    &state.remotes.paths,
+                )
+                .resolve();
+                state
+                    .sender
+                    .multipath
+                    .observe_original_claim_from_inputs(
+                        &context,
+                        &state.remotes,
+                        &frame,
+                        TrafficClass::Throughput,
+                        true,
+                        inputs,
+                    )
+                    .expect("actual exact current Native/attachment receipt")
+            };
+            let fresh = observe(&state);
+            let plan = state
+                .sender
+                .multipath
+                .plan_original_claim_from_observation(
+                    &context,
+                    &fresh,
+                    &fresh,
+                    &state.remotes,
+                    &frame,
+                    TrafficClass::Throughput,
+                    ReliableDataAckFrontierState::Live,
+                    &[a],
+                )
+                .expect("the actual sole Ready A has a valid ordinary plan before staleness");
+            assert_eq!(plan.target().1, a);
+            let RequestProductState {
+                sender, remotes, ..
+            } = &mut *state;
+            assert!(
+                sender.mark_request_path_stale(&context, remotes, a, TrafficClass::Throughput,)
+            );
+            assert!(sender.request_path_is_stale(a));
+            assert!(!sender.request_path_is_stale(b));
+            let current = observe(&state);
+            assert_eq!(current.paths.len(), 2);
+            assert_eq!(
+                current.membership_generation,
+                state.remotes.membership_generation()
+            );
+            assert!(current.paths.iter().any(|path| path.instance == a));
+            let b_snapshot = current
+                .paths
+                .iter()
+                .find(|path| path.instance == b)
+                .and_then(|path| path.shared_snapshot)
+                .expect("fresh B is an actual scorable output");
+            assert!(
+                crate::scheduler::score_path(b_snapshot, TrafficClass::Throughput, quantum,)
+                    .is_some()
+            );
+            assert!(
+                state
+                    .remotes
+                    .paths
+                    .iter()
+                    .find(|path| path.instance() == b)
+                    .unwrap()
+                    .stream
+                    .product_admission_active()
+            );
+            // The prior plan supplies only the exact A identity/load expectation.
+            // This production helper recomputes CURRENT debt, position and W/P/E
+            // after stale qualification was reset; no observation flag is changed.
+            // F=0 is legitimately FirstPath, not an Additional/E-exhaustion test.
+            assert!(
+                state
+                    .sender
+                    .multipath
+                    .bulk_original_data_authority_from_observation(
+                        &context,
+                        &state.remotes,
+                        &plan,
+                        &frame,
+                        ReliableDataAckFrontierState::Live,
+                        plan.load_expectation().is_some(),
+                        &current,
+                    )
+                    .expect("stale A still has exact current Product authority")
+                    .has_headroom()
+            );
+            assert_eq!(state.send_stream.next_offset(), 0);
+            assert_eq!(state.send_stream.reinjection_bytes(), 0);
+            assert_eq!(state.sender_queue.data_bytes(), quantum);
+            assert!(state.send_stream.send_credit_bytes() >= quantum);
+        }
+        if !a_is_backup && case != PreparedWriterClaimCase::StaleFallback {
             b_receivers
                 .lock()
                 .unwrap()
@@ -4790,6 +4910,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                         case,
                         PreparedWriterClaimCase::SelectedDrains
                             | PreparedWriterClaimCase::RegularBecomesReady
+                            | PreparedWriterClaimCase::FreshReadyDisplacesStale
                     ),
                     "A cannot commit after its drain or a newly ready regular B"
                 );
@@ -4797,7 +4918,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                     reliable_stream_frame_extent(&frame),
                     Some((0, quantum as u64, quantum))
                 );
-                let state = shared.lock();
+                let mut state = shared.lock();
                 assert_eq!(state.sender_queue.data_bytes(), 0);
                 assert_eq!(state.send_stream.reinjection_bytes(), quantum);
                 assert_eq!(
@@ -4817,21 +4938,66 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                         .latest_unacked_ranges_for_path_instance(b)
                         .is_empty()
                 );
+                if stale_case {
+                    assert!(state.sender.request_path_is_stale(a));
+                    let ranges = [OffsetRange {
+                        start: 0,
+                        end: quantum as u64,
+                    }];
+                    state.send_stream.apply_ack(&ranges).unwrap();
+                    let RequestProductState {
+                        sender, remotes, ..
+                    } = &mut *state;
+                    let release = sender.multipath.apply_product_ack(
+                        &context,
+                        remotes,
+                        &ranges,
+                        std::time::Instant::now(),
+                    );
+                    assert_eq!(release.idle_original_data_instances.as_slice(), &[a]);
+                    assert!(
+                        release.data_ack_progress_paths.is_empty(),
+                        "stale fallback delivery cannot manufacture proving/qualification progress"
+                    );
+                    assert!(sender.request_path_is_stale(a));
+                    assert_eq!(state.send_stream.reinjection_bytes(), 0);
+                }
                 return (state.send_stream.next_offset(), quantum);
             }
             RequestPreparedClaim::Blocked(wait) => {
-                if case == PreparedWriterClaimCase::RegularBecomesReady {
+                if case == PreparedWriterClaimCase::StaleFallback {
+                    let state = shared.lock();
+                    assert_eq!(state.send_stream.next_offset(), 0);
+                    assert_eq!(state.send_stream.reinjection_bytes(), 0);
+                    assert_eq!(state.sender_queue.data_bytes(), quantum);
+                    assert!(state.sender.request_path_is_stale(a));
+                    assert!(a_ready.receipt().is_current());
+                    assert!(b_commands.writer_boundary().snapshot().is_none());
+                    return (0, quantum);
+                }
+                if matches!(
+                    case,
+                    PreparedWriterClaimCase::RegularBecomesReady
+                        | PreparedWriterClaimCase::FreshReadyDisplacesStale
+                ) {
                     {
                         let state = shared.lock();
                         assert_eq!(state.send_stream.next_offset(), 0);
                         assert_eq!(state.send_stream.reinjection_bytes(), 0);
                         assert_eq!(state.sender_queue.data_bytes(), quantum);
                     }
-                    let receipt = newly_ready_b
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .expect("regular B became ready during A's unlocked observation");
+                    let receipt = if case == PreparedWriterClaimCase::FreshReadyDisplacesStale {
+                        b_commands
+                            .writer_boundary()
+                            .snapshot()
+                            .expect("fresh B is Ready")
+                    } else {
+                        newly_ready_b
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .expect("regular B became ready during A's unlocked observation")
+                    };
                     let frame = {
                         let mut receivers = b_receivers.lock().unwrap();
                         let ready = receivers.writer_ready_boundary(b.path_instance_id).unwrap();
@@ -4848,6 +5014,10 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                         Some((0, quantum as u64, quantum))
                     );
                     let state = shared.lock();
+                    if stale_case {
+                        assert!(state.sender.request_path_is_stale(a));
+                        assert!(!state.sender.request_path_is_stale(b));
+                    }
                     assert_eq!(state.sender_queue.data_bytes(), 0);
                     assert!(
                         state
@@ -4956,6 +5126,24 @@ async fn prepared_request_ready_claim_new_regular_displaces_backup() {
     );
     let (claimed, quantum) =
         prepared_competing_writer_claim_case(PreparedWriterClaimCase::RegularBecomesReady);
+    assert_eq!(claimed, quantum as u64);
+}
+
+#[tokio::test]
+async fn prepared_request_stale_ready_claim_ignores_nonready_fresh_preference() {
+    let (claimed, quantum) =
+        prepared_competing_writer_claim_case(PreparedWriterClaimCase::StaleFallback);
+    assert_eq!(
+        claimed, quantum as u64,
+        "a fresh but non-Ready attachment must not veto the sole Ready stale writer \
+         after exact current Product authority has passed"
+    );
+}
+
+#[tokio::test]
+async fn prepared_request_stale_ready_claim_yields_to_fresh_ready_writer() {
+    let (claimed, quantum) =
+        prepared_competing_writer_claim_case(PreparedWriterClaimCase::FreshReadyDisplacesStale);
     assert_eq!(claimed, quantum as u64);
 }
 
@@ -5284,10 +5472,13 @@ fn prepared_advisory_lock_case(cut: PreparedAdvisoryLockCut, cancel_after_busy: 
             state.send_stream.next_offset(),
             state.send_stream.reinjection_bytes(),
             state.sender_queue.data_bytes(),
-            state.sender_queue.front().map(|(_, work)| match &work.kind {
-                ReliableRelayQueuedWorkKind::Data(payload) => payload.clone(),
-                _ => panic!("same retained source kind"),
-            }),
+            state
+                .sender_queue
+                .front()
+                .map(|(_, work)| match &work.kind {
+                    ReliableRelayQueuedWorkKind::Data(payload) => payload.clone(),
+                    _ => panic!("same retained source kind"),
+                }),
             state
                 .sender
                 .multipath
@@ -5358,14 +5549,14 @@ fn prepared_advisory_lock_case(cut: PreparedAdvisoryLockCut, cancel_after_busy: 
                 let _ = returned_tx.send(());
                 (work, receivers, result)
             });
-            let returned_while_held = returned_rx
-                .recv_timeout(CLAIM_COMPLETION_GUARD)
-                .is_ok();
+            let returned_while_held = returned_rx.recv_timeout(CLAIM_COMPLETION_GUARD).is_ok();
             drop(release);
             let held_snapshot = holder
                 .join()
                 .expect("holder exits without poisoning Product");
-            let result = writer.join().expect("writer finishes after bounded cleanup");
+            let result = writer
+                .join()
+                .expect("writer finishes after bounded cleanup");
             assert_eq!(
                 held_snapshot, before,
                 "contention must not mutate source, C, cache, flight, charges or readiness"

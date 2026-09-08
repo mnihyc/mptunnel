@@ -1,0 +1,495 @@
+diff --git a/src/runtime/path/quic/client.rs b/src/runtime/path/quic/client.rs
+index eac0c46..7392a53 100644
+--- a/src/runtime/path/quic/client.rs
++++ b/src/runtime/path/quic/client.rs
+@@ -1818,7 +1818,13 @@ async fn open_client_udp_datagram_stream(
+ ) -> Result<ClientUdpDatagramStream, RuntimeError> {
+     let (mut send, recv) = carrier.connection.open_bi().await?;
+     send.set_traffic_class(TrafficClass::RealtimeDatagram)?;
+-    let frames = spawn_quic_path_reader(recv, runtime.codec_limits, runtime.stream_frame_queue);
++    let frames = spawn_quic_path_reader(
++        recv,
++        runtime.codec_limits,
++        runtime.stream_frame_queue,
++        #[cfg(feature = "lab-diagnostics")]
++        None,
++    );
+     Ok(ClientUdpDatagramStream {
+         send,
+         frames,
+diff --git a/src/runtime/path/quic/client_stream.rs b/src/runtime/path/quic/client_stream.rs
+index c3f23b2..63535dd 100644
+--- a/src/runtime/path/quic/client_stream.rs
++++ b/src/runtime/path/quic/client_stream.rs
+@@ -33,7 +33,24 @@ pub(super) async fn run_client_udp_stream(
+     mut commands: ReliablePathCommandReceivers,
+     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
+ ) {
+-    let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
++    #[cfg(feature = "lab-diagnostics")]
++    crate::lab_diagnostics::lab_diagnostic(
++        "terminal_service",
++        format_args!(
++            "stage=quic_stream_binding role=client underlay=Udp path_index={} path_instance_id={} request_stream_id={} stream_id={}",
++            path_index,
++            path_instance_id.as_u64(),
++            send.request_stream_id(),
++            stream_id.0,
++        ),
++    );
++    let mut carrier_frames = spawn_quic_path_reader(
++        recv,
++        codec_limits,
++        reader_queue_size,
++        #[cfg(feature = "lab-diagnostics")]
++        None,
++    );
+     let mut pending_frames = Vec::<Frame>::new();
+     let mut path_proofs = PathProofTracker::from_limits(mux_limits);
+     let mut deferred_input: Option<Result<Frame, RuntimeError>> = None;
+diff --git a/src/runtime/path/quic/datagram.rs b/src/runtime/path/quic/datagram.rs
+index d364ec2..35e483c 100644
+--- a/src/runtime/path/quic/datagram.rs
++++ b/src/runtime/path/quic/datagram.rs
+@@ -58,6 +58,8 @@ pub(super) async fn handle_server_udp_datagram_stream(
+         recv,
+         context.codec_limits,
+         udp_path_command_queue(context.mux_limits, context.codec_limits),
++        #[cfg(feature = "lab-diagnostics")]
++        None,
+     );
+     let mut flows = Vec::<AcceptedServerDatagramFlow>::new();
+     let mut tombstones = ServerDatagramTombstoneCache::new(context.max_udp_flows_per_session);
+diff --git a/src/runtime/path/quic/io.rs b/src/runtime/path/quic/io.rs
+index da9e216..844910c 100644
+--- a/src/runtime/path/quic/io.rs
++++ b/src/runtime/path/quic/io.rs
+@@ -392,10 +392,41 @@ pub(in crate::runtime) async fn udp_path_write_frame(
+     codec_limits: CodecLimits,
+ ) -> Result<(), RuntimeError> {
+     ensure_quic_data_plane_frames(std::slice::from_ref(frame))?;
++    #[cfg(feature = "lab-diagnostics")]
++    trace_terminal_quic_write(
++        "fin_write_begin",
++        send.request_stream_id(),
++        std::slice::from_ref(frame),
++    );
+     quic_transport::write_frame(&mut send.stream, frame, codec_limits).await?;
++    #[cfg(feature = "lab-diagnostics")]
++    trace_terminal_quic_write(
++        "fin_write_complete",
++        send.request_stream_id(),
++        std::slice::from_ref(frame),
++    );
+     Ok(())
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn trace_terminal_quic_write(stage: &str, request_stream_id: u64, frames: &[Frame]) {
++    for frame in frames {
++        if let Frame::StreamFin {
++            stream_id,
++            final_offset,
++        } = frame
++        {
++            crate::lab_diagnostics::lab_diagnostic(
++                "terminal_service",
++                format_args!(
++                    "stage={} underlay=Udp request_stream_id={} stream_id={} final_offset={}",
++                    stage, request_stream_id, stream_id.0, final_offset,
++                ),
++            );
++        }
++    }
++}
++
+ pub(super) async fn udp_path_write_datagram_refusal(
+     send: &mut UdpPathSendStream,
+     flow_id: DatagramFlowId,
+@@ -430,7 +461,11 @@ async fn udp_path_write_frames(
+     codec_limits: CodecLimits,
+ ) -> Result<(), RuntimeError> {
+     ensure_quic_data_plane_frames(frames)?;
++    #[cfg(feature = "lab-diagnostics")]
++    trace_terminal_quic_write("fin_write_begin", send.request_stream_id(), frames);
+     quic_transport::write_frames(&mut send.stream, frames, codec_limits).await?;
++    #[cfg(feature = "lab-diagnostics")]
++    trace_terminal_quic_write("fin_write_complete", send.request_stream_id(), frames);
+     Ok(())
+ }
+ 
+@@ -706,6 +741,7 @@ pub(super) fn spawn_quic_path_reader(
+     mut recv: UdpPathRecvStream,
+     codec_limits: CodecLimits,
+     queue_size: usize,
++    #[cfg(feature = "lab-diagnostics")] terminal_identity: Option<(u64, u16, u64, u64)>,
+ ) -> mpsc::Receiver<Result<Frame, RuntimeError>> {
+     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
+     tokio::spawn(async move {
+@@ -727,6 +763,28 @@ pub(super) fn spawn_quic_path_reader(
+                 }
+                 Err(err) => Err(err),
+             };
++            #[cfg(feature = "lab-diagnostics")]
++            if let (
++                Some((session_id, path_id, path_instance_id, request_stream_id)),
++                Ok(Frame::StreamFin {
++                    stream_id,
++                    final_offset,
++                }),
++            ) = (terminal_identity, &frame)
++            {
++                crate::lab_diagnostics::lab_diagnostic(
++                    "terminal_service",
++                    format_args!(
++                        "stage=fin_decoded role=server underlay=Udp session_id={} path_id={} path_instance_id={} request_stream_id={} stream_id={} final_offset={}",
++                        session_id,
++                        path_id,
++                        path_instance_id,
++                        request_stream_id,
++                        stream_id.0,
++                        final_offset,
++                    ),
++                );
++            }
+             let done = frame.is_err();
+             if frames_tx.send(frame).await.is_err() || done {
+                 return;
+diff --git a/src/runtime/path/quic/server_stream.rs b/src/runtime/path/quic/server_stream.rs
+index 41b37f7..50f78b9 100644
+--- a/src/runtime/path/quic/server_stream.rs
++++ b/src/runtime/path/quic/server_stream.rs
+@@ -401,8 +401,18 @@ async fn run_server_udp_reliable_stream_loop(
+     } = stream_context;
+     let carrier_frame_queue =
+         udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits);
+-    let mut carrier_frames =
+-        spawn_quic_path_reader(recv, context.codec_limits, carrier_frame_queue);
++    let mut carrier_frames = spawn_quic_path_reader(
++        recv,
++        context.codec_limits,
++        carrier_frame_queue,
++        #[cfg(feature = "lab-diagnostics")]
++        Some((
++            session_id.0,
++            path_id.0,
++            path_registration.path_instance_id().as_u64(),
++            send.request_stream_id(),
++        )),
++    );
+     let mut pending_frames = Vec::<Frame>::new();
+     let mut deferred_input = None;
+     let mut terminal_drain_deadline = None;
+diff --git a/src/runtime/path/tcp/client/writer.rs b/src/runtime/path/tcp/client/writer.rs
+index 825316f..3780cbc 100644
+--- a/src/runtime/path/tcp/client/writer.rs
++++ b/src/runtime/path/tcp/client/writer.rs
+@@ -522,6 +522,26 @@ async fn commit_client_tcp_frame_transaction_interlocked(
+     deferred_frame: &mut Option<Frame>,
+ ) -> Result<(), RuntimeError> {
+     let mut routed_frames = 0usize;
++    #[cfg(feature = "lab-diagnostics")]
++    for frame in frames.iter() {
++        if let Frame::StreamFin {
++            stream_id,
++            final_offset,
++        } = frame
++        {
++            lab_diagnostic(
++                "terminal_service",
++                format_args!(
++                    "stage=fin_write_begin role=client underlay=Tcp session_id={} path_index={} path_instance_id={} stream_id={} final_offset={}",
++                    runtime.session_id.0,
++                    runtime.path_index,
++                    connection.path_instance_id.as_u64(),
++                    stream_id.0,
++                    final_offset,
++                ),
++            );
++        }
++    }
+     if deferred_frame.is_some() {
+         connection.carrier.writer.write_frames(frames).await?;
+         connection.carrier.writer.flush().await?;
+@@ -578,6 +598,26 @@ async fn commit_client_tcp_frame_transaction_interlocked(
+         }
+     }
+     // The successful write+flush is the transaction boundary.
++    #[cfg(feature = "lab-diagnostics")]
++    for frame in frames.iter() {
++        if let Frame::StreamFin {
++            stream_id,
++            final_offset,
++        } = frame
++        {
++            lab_diagnostic(
++                "terminal_service",
++                format_args!(
++                    "stage=fin_write_complete role=client underlay=Tcp session_id={} path_index={} path_instance_id={} stream_id={} final_offset={} result=ok",
++                    runtime.session_id.0,
++                    runtime.path_index,
++                    connection.path_instance_id.as_u64(),
++                    stream_id.0,
++                    final_offset,
++                ),
++            );
++        }
++    }
+     publish_client_tcp_frame_transaction(connection, frames, runtime);
+     #[cfg(not(feature = "lab-diagnostics"))]
+     let _ = routed_frames;
+diff --git a/src/runtime/path/tcp/server.rs b/src/runtime/path/tcp/server.rs
+index 2c59753..ff87110 100644
+--- a/src/runtime/path/tcp/server.rs
++++ b/src/runtime/path/tcp/server.rs
+@@ -222,10 +222,30 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
+     let observed_path_state = path_registration.state_handle();
+     let observed_context = context.clone();
+     let terminal_commands = commands_tx.clone();
++    #[cfg(feature = "lab-diagnostics")]
++    let terminal_path_instance = path_registration.path_instance_id();
+     let (path_frames, native_terminal) = spawn_encrypted_tcp_reader_with_terminal_result(
+         reader,
+         reliable_path_writer_frame_queue(context.mux_limits),
+         move |frame| {
++            #[cfg(feature = "lab-diagnostics")]
++            if let Frame::StreamFin {
++                stream_id,
++                final_offset,
++            } = frame
++            {
++                crate::lab_diagnostics::lab_diagnostic(
++                    "terminal_service",
++                    format_args!(
++                        "stage=fin_decoded role=server underlay=Tcp session_id={} path_id={} path_instance_id={} stream_id={} final_offset={}",
++                        session_id.0,
++                        path_id.0,
++                        terminal_path_instance.as_u64(),
++                        stream_id.0,
++                        final_offset,
++                    ),
++                );
++            }
+             observe_authenticated_server_tcp_frame(
+                 frame,
+                 session_id,
+diff --git a/src/runtime/relay/control.rs b/src/runtime/relay/control.rs
+index e24293e..45c79fe 100644
+--- a/src/runtime/relay/control.rs
++++ b/src/runtime/relay/control.rs
+@@ -802,6 +802,8 @@ where
+         adaptive_reliable_relay_chunk_bytes(None, TrafficClass::Latency, context.mux_limits);
+     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
+     let mut state = ClientRelayState::new();
++    #[cfg(feature = "lab-diagnostics")]
++    let mut terminal_pending_observed = false;
+     let sender = RequestSenderService::new_with_performance(stream_id, performance);
+     let mut response_flow_demand = ReliableRelayFlowDemandTracker::with_initial_lane(initial_lane);
+     let mut request_flow_demand = ReliableRelayFlowDemandTracker::with_initial_lane(initial_lane);
+@@ -2049,6 +2051,22 @@ where
+                 state.endpoint.pending_local_fin,
+                 sender_queue.is_empty(),
+             );
++            #[cfg(feature = "lab-diagnostics")]
++            if state.endpoint.pending_local_fin && !terminal_pending_observed {
++                terminal_pending_observed = true;
++                lab_diagnostic(
++                    "terminal_service",
++                    format_args!(
++                        "stage=fin_pending_first role=client stream_id={} claimed_end={} queue_bytes={} data_bytes={} ready={} retry_pending={}",
++                        stream_id.0,
++                        send_stream.next_offset(),
++                        sender_queue.bytes(),
++                        sender_queue.data_bytes(),
++                        pending_local_fin_ready,
++                        state.progress.sender_retry_at.is_some(),
++                    ),
++                );
++            }
+             let terminal_fin_replay_pending = stream_terminal_fin_replay_required(
+                 state.endpoint.local_fin_sent,
+                 state.endpoint.terminal_fin_replayed,
+@@ -3181,6 +3199,10 @@ where
+                         permit.retain(&mut send_buffer_reservation, read);
+                         if read == 0 {
+                             state.record_local_eof();
++                            #[cfg(feature = "lab-diagnostics")]
++                            lab_diagnostic("terminal_service", format_args!(
++                                "stage=source_eof role=client stream_id={} opportunistic=false", stream_id.0,
++                            ));
+                             prepared_work_changed = true;
+                         } else {
+                             state.record_local_payload(request_lane);
+@@ -3233,6 +3255,10 @@ where
+                                 permit.retain(&mut send_buffer_reservation, read);
+                                 if read == 0 {
+                                     state.record_local_eof();
++                                    #[cfg(feature = "lab-diagnostics")]
++                                    lab_diagnostic("terminal_service", format_args!(
++                                        "stage=source_eof role=client stream_id={} opportunistic=true", stream_id.0,
++                                    ));
+                                     prepared_work_changed = true;
+                                     break;
+                                 }
+@@ -3714,6 +3740,15 @@ where
+                                         }
+                                     }
+                                 };
++                                #[cfg(feature = "lab-diagnostics")]
++                                if let Ok(bytes) = &write {
++                                    if *bytes > 0 {
++                                        lab_diagnostic("terminal_service", format_args!(
++                                            "stage=reply_delivered role=client stream_id={} bytes={} receive_frontier={} request_open={} fin_sent={}",
++                                            stream_id.0, bytes, recv_stream.next_offset(), state.endpoint.local_open, state.endpoint.local_fin_sent,
++                                        ));
++                                    }
++                                }
+                                 if let Err(err) = write {
+                                     break Err(err);
+                                 }
+diff --git a/src/runtime/relay/remote.rs b/src/runtime/relay/remote.rs
+index 9864d2b..60e8a85 100644
+--- a/src/runtime/relay/remote.rs
++++ b/src/runtime/relay/remote.rs
+@@ -107,6 +107,14 @@ fn send_request_attach_control_frames(
+             stream_id: path_stream.stream_id,
+             final_offset,
+         })?;
++        #[cfg(feature = "lab-diagnostics")]
++        crate::lab_diagnostics::lab_diagnostic(
++            "terminal_service",
++            format_args!(
++                "stage=fin_attach_published role=client stream_id={} final_offset={}",
++                path_stream.stream_id.0, final_offset,
++            ),
++        );
+     }
+     Ok(())
+ }
+diff --git a/src/runtime/relay/server.rs b/src/runtime/relay/server.rs
+index e70c981..4607aee 100644
+--- a/src/runtime/relay/server.rs
++++ b/src/runtime/relay/server.rs
+@@ -3252,6 +3252,11 @@ where
+                         last_recv_progress_sent_at = Instant::now();
+                     }
+                     if pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset) {
++                        #[cfg(feature = "lab-diagnostics")]
++                        lab_diagnostic("terminal_service", format_args!(
++                            "stage=fin_ready role=server session_id={} stream_id={} final_offset={} source=data",
++                            session_id.0, stream_id.0, recv_stream.next_offset(),
++                        ));
+                         if enqueue_tcp_recv_progress(
+                             path_stream,
+                             &mut recv_stream,
+@@ -3268,7 +3273,17 @@ where
+                             response_sender_retry_at = None;
+                             last_recv_progress_sent_at = Instant::now();
+                         }
++                        #[cfg(feature = "lab-diagnostics")]
++                        lab_diagnostic("terminal_service", format_args!(
++                            "stage=target_shutdown_begin role=server session_id={} stream_id={} final_offset={} source=data",
++                            session_id.0, stream_id.0, recv_stream.next_offset(),
++                        ));
+                         local.shutdown().await?;
++                        #[cfg(feature = "lab-diagnostics")]
++                        lab_diagnostic("terminal_service", format_args!(
++                            "stage=target_shutdown_complete role=server session_id={} stream_id={} final_offset={} source=data result=ok",
++                            session_id.0, stream_id.0, recv_stream.next_offset(),
++                        ));
+                         remote_open = false;
+                         pending_remote_fin_offset = None;
+                     }
+@@ -3460,11 +3475,17 @@ where
+                     stream_id: fin_stream_id,
+                     final_offset,
+                 } if fin_stream_id == stream_id => {
+-                    if receive_stream_fin(
++                    let fin_ready = receive_stream_fin(
+                         &recv_stream,
+                         &mut pending_remote_fin_offset,
+                         final_offset,
+-                    )? {
++                    )?;
++                    #[cfg(feature = "lab-diagnostics")]
++                    lab_diagnostic("terminal_service", format_args!(
++                        "stage=fin_received role=server session_id={} stream_id={} final_offset={} receive_frontier={} ready={}",
++                        session_id.0, stream_id.0, final_offset, recv_stream.next_offset(), fin_ready,
++                    ));
++                    if fin_ready {
+                         if enqueue_tcp_recv_progress(
+                             path_stream,
+                             &mut recv_stream,
+@@ -3481,7 +3502,17 @@ where
+                             response_sender_retry_at = None;
+                             last_recv_progress_sent_at = Instant::now();
+                         }
++                        #[cfg(feature = "lab-diagnostics")]
++                        lab_diagnostic("terminal_service", format_args!(
++                            "stage=target_shutdown_begin role=server session_id={} stream_id={} final_offset={} source=fin",
++                            session_id.0, stream_id.0, final_offset,
++                        ));
+                         local.shutdown().await?;
++                        #[cfg(feature = "lab-diagnostics")]
++                        lab_diagnostic("terminal_service", format_args!(
++                            "stage=target_shutdown_complete role=server session_id={} stream_id={} final_offset={} source=fin result=ok",
++                            session_id.0, stream_id.0, final_offset,
++                        ));
+                         remote_open = false;
+                         pending_remote_fin_offset = None;
+                     }
+@@ -3850,6 +3881,11 @@ where
+             let (read, permit) = read;
+             let (read, payload) = read?;
+             permit.retain(&mut send_buffer_reservation, read);
++            #[cfg(feature = "lab-diagnostics")]
++            lab_diagnostic("terminal_service", format_args!(
++                "stage=target_reply_read role=server session_id={} stream_id={} bytes={} request_open={} response_claimed_end={} response_queued_bytes={} opportunistic=false",
++                session_id.0, stream_id.0, read, remote_open, send_stream.next_offset(), response_sender.data_bytes(),
++            ));
+             if read == 0 {
+                 pending_local_fin = true;
+                 local_open = false;
+@@ -3921,6 +3957,11 @@ where
+                     let (read, permit) = read;
+                     let (read, payload) = read?;
+                     permit.retain(&mut send_buffer_reservation, read);
++                    #[cfg(feature = "lab-diagnostics")]
++                    lab_diagnostic("terminal_service", format_args!(
++                        "stage=target_reply_read role=server session_id={} stream_id={} bytes={} request_open={} response_claimed_end={} response_queued_bytes={} opportunistic=true",
++                        session_id.0, stream_id.0, read, remote_open, send_stream.next_offset(), response_sender.data_bytes(),
++                    ));
+                     if read == 0 {
+                         pending_local_fin = true;
+                         local_open = false;
+diff --git a/src/runtime/sender/request.rs b/src/runtime/sender/request.rs
+index f9a6c00..8d31cd9 100644
+--- a/src/runtime/sender/request.rs
++++ b/src/runtime/sender/request.rs
+@@ -1325,6 +1325,26 @@ impl RequestSenderService {
+             };
+             match publish_result {
+                 Ok((payload_bytes, accepted_copy_deadline)) => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    if let Frame::StreamFin {
++                        stream_id,
++                        final_offset,
++                    } = &frame
++                    {
++                        lab_diagnostic(
++                            "terminal_service",
++                            format_args!(
++                                "stage=fin_published role=client stream_id={} final_offset={} underlay={:?} path_index={} path_instance_id={} attachment_id={} cause={}",
++                                stream_id.0,
++                                final_offset,
++                                instance.key.underlay,
++                                instance.key.index,
++                                instance.path_instance_id.as_u64(),
++                                instance.attachment_id,
++                                cause.as_str(),
++                            ),
++                        );
++                    }
+                     return Ok((instance, payload_bytes, accepted_copy_deadline));
+                 }
+                 Err(

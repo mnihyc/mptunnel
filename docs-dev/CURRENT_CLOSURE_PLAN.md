@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 17:41 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 18:15 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -10,7 +10,73 @@ approaches, remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`.
 Detailed evidence is linked below; shortening obsolete next-action prose does
 not discard findings, adverse results or acceptance gates.
 
-## Active discriminator: upload terminal service after full target delivery
+## Active discriminator: already-read response service residence
+
+**Observed failure / exact question:** terminal capture on unchanged b783cd6
+completes424017920B/56.939769s but contains a7.996908s confirmation gap.
+Client reply F999@Unix1788861542294→F1013@1550291; the winning14bytes were
+already read by server at1543136, leaving7.155s after server read. A later
+exact reply range[1041,1055) spans server read1544756→clientdelivery1560442,
+15.686s. All1208reply bytes reconcile across both observers. Which stage
+retains these bytes: response admission/publication, native write/receipt,
+client input routing/Product mux, or local delivery? No native attribution
+from these end-to-end timestamps, and no whole-interval blocked actor claim.
+
+**Existing evidence / model / competing causes:** earlier reply-stage
+captures already contain reusable exact frame/write/decode/mux observations;
+their different-version intervals are not silently attributed to this run.
+The current terminal-only capture lacks these intervening payload boundaries.
+T391950079 separately remains flat for14.999s in sampled server observations;
+source EOF has32MB unclaimed data. Product work/feedback service, Native
+ordered delay and unavailable exact source admission remain distinct owners.
+No invariant or threshold is changed to force a selected cause.
+
+**Smallest next action / falsifier / stop:** read and reuse the smallest
+existing reply-stage observer on current source before authoring more hooks.
+Observe exact server publication/native-write/client-decode/mux boundaries
+for small reverse replies only, retaining the existing source/read/delivery
+timestamps. Prompt write/decode excludes those stages; delayed publication
+selects its actual authority/service owner. Exact same-range joins precede
+any fix or wider Native packet/timer capture. No large cost framework, new
+harness, favorable repeat or performance promotion from diagnostic throughput.
+**Preflight18:08:** reuse existing sparse reply-chain hooks only: server
+enqueue/dispatch/copy acceptance; TCP/QUIC write and client authenticated
+decode; shared input and mux application; terminal observer's reply read and
+successful delivery endpoints. Retain existing QUIC preceding-nondata
+mailbox-wait aggregate to distinguish local reader blocking from Native delay.
+No new seam, cost scope, request/copy-debt/claim counter or packet trace is
+needed. Selective temporary adaptation is authorized; two independent reviews,
+archive/freeze/reverse before one unchanged capture. No runtime correction,
+build or lab is running at this entry.
+
+**Observer18:15:** root and independent whole18-file reviews pass. Existing
+write/route results, admission, queue charges and awaits are unchanged. TCP
+decode lacks physical identity and requires session/wire-path joins; QUIC H3
+IDs are connection-local. Full interlocked mailboxes remain pending, and
+preceding nondata send-await time is not packet delay or ACK-only CPU time.
+Sparse exact range coverage, not record counts, will determine winning service.
+REPLY_RESIDENCE_TRACE_20260908.patch archives the whole temporary overlay.
+One diagnostic build is running with no lab; freeze/reverse before capture.
+
+## Completed discriminator: upload terminal service after full target delivery
+
+**Result17:59 — prior terminal geometry not reproduced:** warning-free
+3m31s build,203 total diagnostic lines,57service samples, exact424017920B
+in56.939769s. Maxconfirmation7.996908s/maxwrite4.374934s are not ordinary
+performance. At source EOF1552966, C391950079+U32067841 equals final424017920;
+all queued bytes are unclaimed Data. FIN cannot declare current C then without
+excluding those bytes. This does not prove the entire8.909s prepublication
+wait necessary: no intervening claim/refusal trace was enabled.
+
+Two same-offset FIN publications/native writes at1561875 retain24.47MB
+Product cache, excluding a cache-zero prerequisite. Server decodes3133,
+handles3134 with F419210455 (not yet final), and final Data makes FIN ready
+at3384. Target shutdown starts/completes that same millisecond; final13B reply
+read3385, client27B delivery3421 and clean completion3422. Duplicate FINs are
+normal replay, not conflicting offsets. The1.258s FINwrite→decode remains
+composite predecode service, not measured packet delay. No terminal/RFC
+correction is justified by this capture. Earlier postfull-target6s tail stays
+unattributed; detailed raw/evidence in TERMINAL_SERVICE_20260908.
 
 **Observed failure / current owner:** ordinary b783cd6 completes326041600B
 in52.965807s, with6.082958s maximum confirmation gap. Candidate service rows
@@ -46,6 +112,26 @@ and any coherent fix. The earlier already-written QUIC predecode payload
 stalls remain distinct and unresolved. No policy tuning or favorable rerun.
 Native receipt/hole/timer source preflight is retained only as an alternative
 if later evidence selects it; no Native observer or correction implemented.
+
+**Observer17:51:** root and independent whole-patch audits pass. Temporary
+11-file terminal_service hooks cover both actual source EOF reads, first
+already-owned pending-FIN state, successful selected publication/attach replay,
+actual TCP/QUIC FIN write and authenticated decode, both server FIN-ready/
+target-shutdown branches, server reply reads and successful client delivery.
+No new await/lock/payload clone/authority read or policy change. Write success
+is local acceptance, not peer delivery; reply read is not sink emission time.
+QUIC H3 IDs are connection-local; correlate existing bindings and retain
+ambiguity if reused. Attach replay publication lacks exact path identity.
+Patch archived as TERMINAL_SERVICE_TRACE_20260908.patch. One diagnostic
+build running, no lab; freeze/reverse all hooks before the declared capture.
+
+**Capture17:58:** warning-free3m31s diagnostic build frozen separately as
+terminal-service-20260908. All11runtime-file hooks reversed with source diff
+verified empty before one unchanged-profile capture. Enabled only
+terminal_service, terminal_fin_replay, client_stream_fin_received and
+client_relay_result. No compilation now; target/release is the temporary
+diagnostic, not the ordinary b783cd6 binary. Failure remains begin-only;
+post-publication observations are not an earlier commit timestamp.
 
 ## Completed transaction: one owner for prepared stale-path preference
 
@@ -550,8 +636,8 @@ above500Mbps can be buffered observation, not wire capacity.
   overlap. Products/probes stopped; no build/lab. Origins retained.
 - Normal frozen candidate:`./.tmp/reflection/bin/prepared-stale-20260908/mptunnel`.
   Normal parent:`./.tmp/reflection/bin/advisory-owner-20260908/mptunnel`.
-  Current diagnostic:`./.tmp/reflection/bin/prepared-claim-service-20260908/mptunnel`.
-  target/release is ordinary b783cd6 after the latest optimized build.
+  Current diagnostic:`./.tmp/reflection/bin/terminal-service-20260908/mptunnel`.
+  target/release is the temporary terminal diagnostic, not the ordinary binary.
 - Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
   No deletion this turn; ample root space. User7lines must stay unstaged.
 - Telegram latest ordinary adverse-pair report sent during09:38UTC; next

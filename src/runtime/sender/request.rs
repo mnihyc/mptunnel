@@ -130,9 +130,6 @@ fn sender_service_frame_kind(frame: &Frame) -> &'static str {
 
 #[derive(Debug)]
 pub(in crate::runtime) enum ClientQueuedDispatch {
-    Data {
-        payload_bytes: usize,
-    },
     Reinjection {
         payload_bytes: usize,
         accepted_copy_deadline: Instant,
@@ -700,27 +697,6 @@ impl RequestSenderService {
             .record_reinjected_frame_for_test(instance, frame);
     }
 
-    fn send_stream_data_for_request_lane(
-        &mut self,
-        context: &ClientPathContext,
-        remotes: &mut ReliableRelayRemoteSet,
-        frame: Frame,
-        request_lane: TrafficClass,
-        frontier_state: ReliableDataAckFrontierState,
-        source_commit: RequestQueuedSourceCommit<'_>,
-    ) -> Result<RelaySendOutcome, RuntimeError> {
-        self.send_frame_at_frontier(
-            context,
-            remotes,
-            frame,
-            RelaySendCause::StreamData,
-            Some(request_lane),
-            frontier_state,
-            None,
-            Some(source_commit),
-        )
-    }
-
     pub(in crate::runtime) fn send_control_frame(
         &mut self,
         context: &ClientPathContext,
@@ -832,88 +808,6 @@ impl RequestSenderService {
         model
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::runtime) fn dispatch_client_queued_work(
-        &mut self,
-        context: &ClientPathContext,
-        request_lane: TrafficClass,
-        remotes: &mut ReliableRelayRemoteSet,
-        send_stream: &mut ReliableSendStream,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        data_quantum_bytes: usize,
-        frontier_state: ReliableDataAckFrontierState,
-    ) -> Result<ClientQueuedDispatch, RuntimeError> {
-        let queued_kind = sender_queue
-            .front()
-            .map(|(_, queued)| queued.kind.clone())
-            .expect("queued_send_ready requires queued data");
-        match queued_kind {
-            ReliableRelayQueuedWorkKind::Control(_) => {
-                Err(RuntimeError::Protocol("client sender queue control item"))
-            }
-            ReliableRelayQueuedWorkKind::Data(payload) => self.dispatch_client_data_work(
-                context,
-                request_lane,
-                remotes,
-                send_stream,
-                sender_queue,
-                payload,
-                data_quantum_bytes,
-                frontier_state,
-            ),
-            ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => self
-                .dispatch_client_reinjection_work(
-                    context,
-                    request_lane,
-                    remotes,
-                    sender_queue,
-                    frame,
-                    cause,
-                ),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_client_data_work(
-        &mut self,
-        context: &ClientPathContext,
-        request_lane: TrafficClass,
-        remotes: &mut ReliableRelayRemoteSet,
-        send_stream: &mut ReliableSendStream,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        payload: Bytes,
-        data_quantum_bytes: usize,
-        frontier_state: ReliableDataAckFrontierState,
-    ) -> Result<ClientQueuedDispatch, RuntimeError> {
-        let dispatch_payload_bytes = data_quantum_bytes.min(payload.len()).max(1);
-        let dispatch_payload = payload.slice(..dispatch_payload_bytes);
-        let frame = send_stream
-            .prepare_data(dispatch_payload)
-            .map_err(RuntimeError::Stream)?;
-        // Queue priority stays duplex-aware, but request exploration must not
-        // borrow bulk classification from reverse-direction response bytes.
-        match self.send_stream_data_for_request_lane(
-            context,
-            remotes,
-            frame,
-            request_lane,
-            frontier_state,
-            RequestQueuedSourceCommit {
-                send_stream,
-                sender_queue,
-            },
-        ) {
-            Ok(_) => Ok(ClientQueuedDispatch::Data {
-                payload_bytes: dispatch_payload_bytes,
-            }),
-            Err(RuntimeError::SenderServiceBlocked) => Err(RuntimeError::SenderServiceBlocked),
-            Err(err) if reliable_path_error_is_migratable(&err) => {
-                Ok(ClientQueuedDispatch::PathAttachmentRequired(err))
-            }
-            Err(err) => Err(err),
-        }
-    }
-
     /// Prepared Original source belongs to native claimants. The Product
     /// actor still publishes the same exact repair work, without removing or
     /// assigning any bytes from the prepared Data lane.
@@ -964,7 +858,6 @@ impl RequestSenderService {
                 queue: sender_queue,
                 exclude_front: true,
             }),
-            None,
         );
         match dispatch {
             Ok(outcome) => {
@@ -1035,7 +928,6 @@ impl RequestSenderService {
             request_lane,
             ReliableDataAckFrontierState::Live,
             None,
-            None,
         )
     }
 
@@ -1049,7 +941,6 @@ impl RequestSenderService {
         request_lane: Option<TrafficClass>,
         frontier_state: ReliableDataAckFrontierState,
         reinjection_queue: Option<RequestReinjectionQueueContext<'_>>,
-        source_commit: Option<RequestQueuedSourceCommit<'_>>,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         let sent_frame = frame.clone();
         let avoid_instances =
@@ -1064,7 +955,6 @@ impl RequestSenderService {
             request_lane,
             frontier_state,
             reinjection_queue,
-            source_commit,
         )?;
         let path_key = instance.key;
         self.record_decision(path_key, payload_bytes, &sent_frame, cause);
@@ -1085,7 +975,6 @@ impl RequestSenderService {
         request_lane: Option<TrafficClass>,
         frontier_state: ReliableDataAckFrontierState,
         reinjection_queue: Option<RequestReinjectionQueueContext<'_>>,
-        mut source_commit: Option<RequestQueuedSourceCommit<'_>>,
     ) -> Result<(RelayPathInstance, usize, Option<Instant>), RuntimeError> {
         let mut last_error = None;
         let mut rejected_bulk_original_targets =
@@ -1410,7 +1299,7 @@ impl RequestSenderService {
                                         reinjection_target_snapshot,
                                         request_load_claim,
                                     },
-                                    source_commit.as_mut(),
+                                    None,
                                 )?;
                             command.commit();
                             Ok((payload_bytes, accepted_copy_deadline))
@@ -2197,7 +2086,6 @@ impl RequestSenderService {
                     queue: sender_queue,
                     exclude_front: false,
                 }),
-                None,
             ) {
                 Ok(outcome) => {
                     // Discovery and failed Apply attempts consume no optional

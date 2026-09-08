@@ -747,6 +747,7 @@ impl<T> ReadyStreamDataBatch<T> {
         }
     }
 
+    #[cfg(any(test, feature = "lab-diagnostics"))]
     pub(in crate::runtime) fn len(&self) -> usize {
         self.items.len()
     }

@@ -3052,9 +3052,6 @@ where
                                 }
                             };
                             match dispatch {
-                                Ok(ClientQueuedDispatch::Data { .. }) => {
-                                    unreachable!("repair dispatch cannot claim prepared Original data");
-                                }
                                 Ok(ClientQueuedDispatch::Reinjection {
                                     payload_bytes,
                                     accepted_copy_deadline,

@@ -314,6 +314,7 @@ impl UdpPathConnection {
         self.connection.write_activity_notify()
     }
 
+    #[cfg(any(test, feature = "lab-diagnostics"))]
     pub(super) fn is_locally_closed(&self) -> bool {
         self.connection.is_locally_closed()
     }

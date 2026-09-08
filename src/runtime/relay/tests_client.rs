@@ -5,7 +5,6 @@ use super::{
     update_request_path_staleness,
 };
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
-use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::{
     MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PathRateSample, adaptive_reliable_relay_reinjection_bytes,
     reliable_bulk_carrier_feed_quantum_bytes, reliable_bulk_product_windows,
@@ -1319,15 +1318,13 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
     );
 
     let committed_copy = sender
-        .dispatch_client_queued_work(
+        .dispatch_client_repair_work(
             &context,
             TrafficClass::Throughput,
             &mut remotes,
-            &mut send_stream,
             &mut sender_queue,
-            scored_frontier_bytes,
-            ReliableDataAckFrontierState::AuthoritativeGap,
         )
+        .map(|dispatch| dispatch.expect("the exact queued repair remains present"))
         .unwrap_or_else(|error| {
             panic!(
                 "the natural planner-admitted batch must commit its exact front: error={error:?} target={:?} planner_P={} planner_O={} planner_repair_cap={} planner_B=0 planner_U=0 planner_J={} planner_K={} batch={} apply_P={} apply_O={} apply_repair_cap={} apply_B_plus_U_after_front={} apply_J={} apply_K_after_front={} front={}",

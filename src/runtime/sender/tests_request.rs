@@ -580,7 +580,7 @@ async fn prepared_request_ready_alternate_claims_one_shared_prefix_without_queue
 }
 
 #[tokio::test]
-async fn queued_request_source_validation_preserves_the_attached_carrier() {
+async fn fenced_request_source_commit_validates_and_preserves_product_state() {
     let stream_id = StreamId(715);
     let context = client_test_context_with_paths(&["tcp://127.0.0.1:10715"]);
     let limits = context.mux_limits;
@@ -603,6 +603,47 @@ async fn queued_request_source_validation_preserves_the_attached_carrier() {
     let mut queue = ReliableRelaySenderQueue::default();
     let payload = Bytes::from(vec![0x72; 4096]);
     queue.push_data(payload.clone());
+    // Exercise the shared Product commit used by actual prepared claims. This
+    // is a transaction-unit control, not an obsolete Data-command publication
+    // path or proof of physical writer scheduling.
+    let prepared = send_stream.prepare_data(payload.clone()).unwrap();
+    sender
+        .multipath
+        .prepare_original_claim(&context, &mut remotes, &prepared)
+        .expect("normal Original preparation establishes the actual request state");
+    let inputs = super::multipath::RequestRelayNativeCapture::new(
+        remotes.membership_generation(),
+        &remotes.paths,
+    )
+    .resolve();
+    let observation = sender
+        .multipath
+        .observe_original_claim_from_inputs(
+            &context,
+            &remotes,
+            &prepared,
+            TrafficClass::Throughput,
+            true,
+            inputs,
+        )
+        .expect("actual singleton Product observation");
+    let plan = sender
+        .multipath
+        .plan_original_claim_from_observation(
+            &context,
+            &observation,
+            &observation,
+            &remotes,
+            &prepared,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            &[owner],
+        )
+        .expect("unchanged actual singleton admission");
+    assert_eq!(plan.target().1, owner);
+    let position = plan
+        .target_position_for_apply(&remotes, TrafficClass::Throughput)
+        .unwrap();
 
     for source_replaced in [false, true] {
         let mut frame = send_stream.prepare_data(payload.clone()).unwrap();
@@ -619,23 +660,34 @@ async fn queued_request_source_validation_preserves_the_attached_carrier() {
             };
             *offset += 1;
         }
-        let result = sender.send_stream_data_for_request_lane(
+        let result = sender.commit_fenced_frame_product(
             &context,
             &mut remotes,
-            frame,
-            TrafficClass::Throughput,
-            ReliableDataAckFrontierState::Live,
-            RequestQueuedSourceCommit {
+            RequestFrameProductCommit {
+                plan: &plan,
+                frame: &frame,
+                cause: RelaySendCause::StreamData,
+                position,
+                path_count: 1,
+                reinjection_target_snapshot: None,
+                request_load_claim: None,
+            },
+            Some(&mut RequestQueuedSourceCommit {
                 send_stream: &mut send_stream,
                 sender_queue: &mut queue,
-            },
+            }),
         );
         if source_replaced {
-            assert!(matches!(result, Err(RuntimeError::SenderServiceBlocked)));
+            assert!(matches!(
+                result,
+                Err(RequestFrameAdmissionError::SourceChanged)
+            ));
         } else {
             assert!(matches!(
                 result,
-                Err(RuntimeError::Stream(StreamError::InvalidPreparedFrame))
+                Err(RequestFrameAdmissionError::Source(
+                    StreamError::InvalidPreparedFrame
+                ))
             ));
         }
         assert_eq!(
@@ -656,20 +708,43 @@ async fn queued_request_source_validation_preserves_the_attached_carrier() {
         assert!(try_recv_request_command_after_path_proofs_for_test(&mut receivers).is_none());
     }
 
+    let (_, queued) = queue.front().unwrap();
+    let ReliableRelayQueuedWorkKind::Data(current) = &queued.kind else {
+        unreachable!()
+    };
+    let frame = send_stream.prepare_data(current.clone()).unwrap();
+    let request_load_claim = plan
+        .load_expectation()
+        .map(|(_, active, latency_sensitive)| {
+            context
+                .try_reserve_relay_path_load_if_unchanged(
+                    owner,
+                    TrafficClass::Throughput,
+                    active,
+                    latency_sensitive,
+                )
+                .expect("the rejected transactions did not consume the path load lease")
+        });
     let result = sender
-        .dispatch_client_queued_work(
+        .commit_fenced_frame_product(
             &context,
-            TrafficClass::Throughput,
             &mut remotes,
-            &mut send_stream,
-            &mut queue,
-            payload.len(),
-            ReliableDataAckFrontierState::Live,
+            RequestFrameProductCommit {
+                plan: &plan,
+                frame: &frame,
+                cause: RelaySendCause::StreamData,
+                position,
+                path_count: 1,
+                reinjection_target_snapshot: None,
+                request_load_claim,
+            },
+            Some(&mut RequestQueuedSourceCommit {
+                send_stream: &mut send_stream,
+                sender_queue: &mut queue,
+            }),
         )
-        .expect("the unchanged live carrier accepts the actual current source");
-    assert!(
-        matches!(result, ClientQueuedDispatch::Data { payload_bytes } if payload_bytes == payload.len())
-    );
+        .expect("the same Product core accepts the actual current source once");
+    assert_eq!(result, (payload.len(), None));
     assert_eq!(queue.data_bytes(), 0);
     assert_eq!(
         (send_stream.next_offset(), send_stream.reinjection_bytes()),
@@ -684,17 +759,12 @@ async fn queued_request_source_validation_preserves_the_attached_carrier() {
             end: payload.len() as u64
         }]
     );
-    let command = try_recv_reliable_path_command(&mut receivers).expect("one committed Original");
-    assert!(
-        matches!(&command, ReliablePathCommand::SendFrame(Frame::StreamData { stream_id: actual, offset: 0, payload: actual_payload }) if *actual == stream_id && actual_payload == &payload)
-    );
-    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
-    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert!(try_recv_request_command_after_path_proofs_for_test(&mut receivers).is_none());
     assert_eq!(commands.pending_bytes(), 0);
 }
 
 #[tokio::test]
-async fn rejected_native_request_admission_preserves_uncommitted_source() {
+async fn prepared_native_rejection_preserves_uncommitted_source() {
     for close_receiver in [false, true] {
         let stream_id = StreamId(716);
         let context = client_test_context_with_paths(&["quic://127.0.0.1:10716"]);
@@ -711,76 +781,98 @@ async fn rejected_native_request_admission_preserves_uncommitted_source() {
             Some(100_000_000),
         );
         let native = native.expect("actual attached QUIC authority");
-        let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, capacity);
-        let owner = remotes.paths[0].instance();
-        let proof = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
-        assert!(matches!(
-            proof,
-            ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
-        ));
-        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
-        seed_client_bulk_evidence_for_test(&context, owner);
-        let mut receivers = Some(receivers);
-        let mut sender = RequestSenderService::new(stream_id);
-        let mut send_stream = ReliableSendStream::new(stream_id, limits);
-        let mut queue = ReliableRelaySenderQueue::default();
+        let (remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, capacity);
+        let instance = remotes.paths[0].instance();
+        consume_client_path_proof_for_test(&mut receivers);
+        seed_client_bulk_evidence_for_test(&context, instance);
         let payload = Bytes::from(vec![0x73; 4096]);
+        let mut queue = ReliableRelaySenderQueue::default();
         queue.push_data(payload.clone());
-        let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shared = SharedRequestProduct::new(RequestProductState {
+            sender: RequestSenderService::new(stream_id),
+            send_stream: ReliableSendStream::new(stream_id, limits),
+            sender_queue: queue,
+            last_send_ack: Default::default(),
+            remotes,
+            prepared: RequestPreparedSource::new(TrafficClass::Throughput, payload.len()),
+        });
+        let _actor_lifetime = shared.actor_lifetime();
+        {
+            let mut state = shared.lock();
+            crate::runtime::relay::control::publish_prepared_request_work(
+                &mut state,
+                &shared,
+                &context,
+                TrafficClass::Throughput,
+                payload.len(),
+                true,
+            );
+        }
+        let ReliablePathCommand::PreparedOriginal(work) =
+            try_recv_request_command_after_path_proofs_for_test(&mut receivers)
+                .expect("actual weak prepared-source notice")
+        else {
+            panic!("Original source must not enter the Data command lane");
+        };
+        let ready = receivers
+            .writer_ready_boundary(instance.path_instance_id)
+            .expect("actual exclusive writer reaches its ready boundary");
+        let mut receivers = Some(receivers);
+        let capture_cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if close_receiver {
+            // Withdrawal follows actual notice and Ready publication, not a
+            // fabricated receipt or a failed setup before claim entry.
             drop(receivers.take());
         } else {
-            let observed_reservation = reserved.clone();
-            sender.set_after_frame_reservation_for_test(move || {
-                observed_reservation.store(true, std::sync::atomic::Ordering::SeqCst);
+            let capture_cut = capture_cut.clone();
+            shared.before_prepared_native_resolve_once_for_test(move || {
+                capture_cut.store(true, std::sync::atomic::Ordering::SeqCst);
                 native.advance_transport_activation_for_test(2).unwrap();
                 native
                     .publish_observation_for_test(2, 8, Some(100_000_000))
                     .unwrap();
-                // No successor scheduling shape exists yet. The old exact
-                // Native receipt must not commit the queued source.
+                // The current activation has no coherent shape. This is the
+                // actual claim's unlocked Native capture cut, not the removed
+                // Original command-reservation path.
             });
         }
-        let frame = send_stream.prepare_data(payload.clone()).unwrap();
-        let result = sender.send_stream_data_for_request_lane(
-            &context,
-            &mut remotes,
-            frame,
-            TrafficClass::Throughput,
-            ReliableDataAckFrontierState::Live,
-            RequestQueuedSourceCommit {
-                send_stream: &mut send_stream,
-                sender_queue: &mut queue,
-            },
-        );
         assert!(
-            result.is_err(),
-            "neither a closed carrier nor an unpublished successor can claim source"
+            matches!(
+                work.try_claim(ready),
+                RequestPreparedClaim::Blocked(_) | RequestPreparedClaim::Empty
+            ),
+            "neither a withdrawn writer nor an unpublished Native successor may claim source",
         );
+        let state = shared.lock();
         assert_eq!(
-            (send_stream.next_offset(), send_stream.reinjection_bytes()),
+            (
+                state.send_stream.next_offset(),
+                state.send_stream.reinjection_bytes()
+            ),
             (0, 0)
         );
-        assert_eq!(queue.data_bytes(), payload.len());
+        assert_eq!(state.sender_queue.data_bytes(), payload.len());
         assert!(
-            matches!(queue.front().map(|(_, work)| &work.kind), Some(ReliableRelayQueuedWorkKind::Data(current)) if current == &payload)
+            matches!(state.sender_queue.front().map(|(_, work)| &work.kind),
+                Some(ReliableRelayQueuedWorkKind::Data(current)) if current == &payload)
         );
         assert!(
-            sender
+            state
+                .sender
                 .multipath
-                .latest_unacked_ranges_for_path_instance(owner)
+                .latest_unacked_ranges_for_path_instance(instance)
                 .is_empty()
         );
+        assert_eq!(
+            state.remotes.paths.len(),
+            1,
+            "rejected source admission is not carrier retirement"
+        );
+        assert_eq!(state.remotes.paths[0].instance(), instance);
+        assert_eq!(state.prepared.last_claimed_at, None);
         assert_eq!(commands.pending_bytes(), 0);
         if let Some(receivers) = receivers.as_mut() {
-            assert!(reserved.load(std::sync::atomic::Ordering::SeqCst));
-            assert!(matches!(result, Err(RuntimeError::SenderServiceBlocked)));
-            assert_eq!(
-                remotes.paths.len(),
-                1,
-                "a stale Native receipt is not carrier failure"
-            );
-            assert_eq!(remotes.paths[0].instance(), owner);
+            assert!(capture_cut.load(std::sync::atomic::Ordering::SeqCst));
             assert!(try_recv_request_command_after_path_proofs_for_test(receivers).is_none());
         }
     }
@@ -1104,15 +1196,14 @@ async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent()
     target_commands.begin_path_drain();
     target_receivers.close_for_path_drain();
     assert!(matches!(
-        sender.dispatch_client_queued_work(
-            &context,
-            TrafficClass::Throughput,
-            &mut remotes,
-            &mut send_stream,
-            &mut sender_queue,
-            6,
-            ReliableDataAckFrontierState::Live,
-        ),
+        sender
+            .dispatch_client_repair_work(
+                &context,
+                TrafficClass::Throughput,
+                &mut remotes,
+                &mut sender_queue,
+            )
+            .map(|dispatch| dispatch.expect("the exact queued repair remains present")),
         Err(RuntimeError::SenderServiceBlocked)
     ));
     assert!(
@@ -1142,15 +1233,13 @@ async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent()
     );
     assert!(matches!(
         sender
-            .dispatch_client_queued_work(
+            .dispatch_client_repair_work(
                 &context,
                 TrafficClass::Throughput,
                 &mut remotes,
-                &mut send_stream,
                 &mut sender_queue,
-                6,
-                ReliableDataAckFrontierState::Live,
             )
+            .map(|dispatch| dispatch.expect("the exact queued repair remains present"))
             .expect("absent exact target cancels the retained queued batch"),
         ClientQueuedDispatch::PersistentReinjectionCancelled
     ));
@@ -1339,15 +1428,8 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
     let mut queue = ReliableRelaySenderQueue::default();
     sender.enqueue_critical_reinjection_frame(&mut queue, blocked.clone(), bound_cause);
     let dispatch = sender
-        .dispatch_client_queued_work(
-            &context,
-            TrafficClass::Throughput,
-            &mut remotes,
-            &mut send_stream,
-            &mut queue,
-            4096,
-            ReliableDataAckFrontierState::Live,
-        )
+        .dispatch_client_repair_work(&context, TrafficClass::Throughput, &mut remotes, &mut queue)
+        .map(|dispatch| dispatch.expect("the exact queued repair remains present"))
         .expect("queued bound repair uses headroom independent of shared writer work");
     assert!(matches!(dispatch, ClientQueuedDispatch::Reinjection { .. }));
     assert!(queue.is_empty());
@@ -1377,15 +1459,8 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         "bound repair must retain exact recovery debt while queued",
     );
     let dispatch = sender
-        .dispatch_client_queued_work(
-            &context,
-            TrafficClass::Throughput,
-            &mut remotes,
-            &mut send_stream,
-            &mut queue,
-            4096,
-            ReliableDataAckFrontierState::Live,
-        )
+        .dispatch_client_repair_work(&context, TrafficClass::Throughput, &mut remotes, &mut queue)
+        .map(|dispatch| dispatch.expect("the exact queued repair remains present"))
         .expect("stale bound reinjection is cancelled without aborting the stream");
     assert!(matches!(
         dispatch,
@@ -1881,15 +1956,8 @@ async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_
         assert!(sender.multipath.mark_path_stale(copy));
     }
     let dispatch = sender
-        .dispatch_client_queued_work(
-            &context,
-            TrafficClass::Throughput,
-            &mut remotes,
-            &mut send_stream,
-            &mut queue,
-            4096,
-            ReliableDataAckFrontierState::Live,
-        )
+        .dispatch_client_repair_work(&context, TrafficClass::Throughput, &mut remotes, &mut queue)
+        .map(|dispatch| dispatch.expect("the exact queued repair remains present"))
         .expect("queued live repair resolves without closing the stream");
     if cancel_queued {
         assert!(matches!(
@@ -2142,15 +2210,13 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
     ));
     assert!(matches!(
         sender
-            .dispatch_client_queued_work(
+            .dispatch_client_repair_work(
                 &context,
                 TrafficClass::Latency,
                 &mut remotes,
-                &mut send_stream,
                 &mut sender_queue,
-                64,
-                ReliableDataAckFrontierState::Live,
             )
+            .map(|dispatch| dispatch.expect("the exact queued repair remains present"))
             .expect("live tail dispatch"),
         ClientQueuedDispatch::Reinjection {
             payload_bytes: 64,
@@ -2525,15 +2591,8 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
     ));
     assert_eq!(queue.reinjection_bytes(), 32);
     let dispatch = sender
-        .dispatch_client_queued_work(
-            &context,
-            TrafficClass::Throughput,
-            &mut remotes,
-            &mut send_stream,
-            &mut queue,
-            32,
-            ReliableDataAckFrontierState::Live,
-        )
+        .dispatch_client_repair_work(&context, TrafficClass::Throughput, &mut remotes, &mut queue)
+        .map(|dispatch| dispatch.expect("the exact queued repair remains present"))
         .expect("the M-bound completion target remains dispatchable after Apply shrinks to F");
     assert!(matches!(
         dispatch,
@@ -4079,14 +4138,14 @@ async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() 
         "tcp://127.0.0.1:10715",
     ]);
     let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let (mut remotes, _remote_input) =
+    let (remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
     consume_client_path_proof_for_test(&mut owner_receivers);
     let owner = remotes.paths[0].instance();
     seed_client_bulk_evidence_for_test(&context, owner);
 
-    // Consume real carrier commands; proof refreshes are separate from the
-    // original/copy publication whose immutable ownership is under test.
+    // Copies still use real carrier commands. Original ownership below comes
+    // from the production shared-source claim, not the retired dispatcher.
     let take_data =
         |receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers| {
             loop {
@@ -4103,119 +4162,145 @@ async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() 
                 }
             }
         };
-    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
-    let mut sender = RequestSenderService::new(stream_id);
     let mut queue = ReliableRelaySenderQueue::default();
     queue.push_data(Bytes::from(vec![0x71; 4096]));
-    assert!(matches!(
-        sender
-            .dispatch_client_queued_work(
-                &context,
-                TrafficClass::Throughput,
-                &mut remotes,
-                &mut send_stream,
-                &mut queue,
-                4096,
-                ReliableDataAckFrontierState::Live,
-            )
-            .expect("ordinary original commitment on sole A"),
-        ClientQueuedDispatch::Data {
-            payload_bytes: 4096
-        }
-    ));
-    let original = take_data(&mut owner_receivers);
+    let shared = SharedRequestProduct::new(RequestProductState {
+        sender: RequestSenderService::new(stream_id),
+        send_stream: ReliableSendStream::new(stream_id, context.mux_limits),
+        sender_queue: queue,
+        last_send_ack: Default::default(),
+        remotes,
+        prepared: RequestPreparedSource::new(TrafficClass::Throughput, 4096),
+    });
+    let _actor_lifetime = shared.actor_lifetime();
+    {
+        let mut state = shared.lock();
+        crate::runtime::relay::control::publish_prepared_request_work(
+            &mut state,
+            &shared,
+            &context,
+            TrafficClass::Throughput,
+            4096,
+            true,
+        );
+    }
+    let ReliablePathCommand::PreparedOriginal(work) =
+        try_recv_request_command_after_path_proofs_for_test(&mut owner_receivers)
+            .expect("actual sole-owner prepared notice")
+    else {
+        panic!("source is unbound until its writer claims it");
+    };
+    let ready = owner_receivers
+        .writer_ready_boundary(owner.path_instance_id)
+        .unwrap();
+    let RequestPreparedClaim::Claimed(original) = work.try_claim(ready) else {
+        panic!("the actual sole A writer must claim the retained original");
+    };
+    owner_receivers.register_claimed_writer_frame(&original);
+    owner_receivers.release_pending_command_bytes(
+        crate::protocol::frame::reliable_path_frame_pacing_bytes(&original),
+    );
     assert_eq!(
         reliable_stream_frame_extent(&original),
         Some((0, 4096, 4096))
     );
-    assert!(queue.is_empty());
+    assert!(shared.lock().sender_queue.is_empty());
 
     let (copy_commands, mut copy_receivers) = reliable_path_command_channels(8);
-    assert_eq!(
-        remotes.attach(opened_test_relay_stream(stream_id, 1, copy_commands)),
-        ReliableRelayAttachOutcome::Attached
-    );
-    consume_client_path_proof_for_test(&mut copy_receivers);
-    let copy = remotes
-        .paths
-        .iter()
-        .find(|path| path.key().index == 1)
-        .expect("B is the sole alternate")
-        .instance();
-    seed_client_bulk_evidence_for_test(&context, copy);
+    let copy = {
+        let mut state = shared.lock();
+        let remotes = &mut state.remotes;
+        assert_eq!(
+            remotes.attach(opened_test_relay_stream(stream_id, 1, copy_commands)),
+            ReliableRelayAttachOutcome::Attached
+        );
+        consume_client_path_proof_for_test(&mut copy_receivers);
+        let copy = remotes
+            .paths
+            .iter()
+            .find(|path| path.key().index == 1)
+            .expect("B is the sole alternate")
+            .instance();
+        seed_client_bulk_evidence_for_test(&context, copy);
+        copy
+    };
     let owner_interval = crate::model::timing::reliable_data_retransmission_interval(
         Some(owner.key.underlay),
         context.reliable_path_snapshot_for_instance(owner),
     );
     tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
-    assert!(
-        sender
-            .enqueue_retained_frontier_reinjection(
-                &mut queue,
-                &context,
-                &remotes,
-                &send_stream,
-                TrafficClass::Throughput,
-            )
-            .queued,
-        "A must mature before the first actual recovery commitment on B"
-    );
-    let dispatch = sender
-        .dispatch_client_queued_work(
-            &context,
-            TrafficClass::Throughput,
-            &mut remotes,
-            &mut send_stream,
-            &mut queue,
-            4096,
-            ReliableDataAckFrontierState::Live,
-        )
-        .expect("real first-copy reservation and commitment");
-    let ClientQueuedDispatch::Reinjection {
-        payload_bytes: 4096,
-        accepted_copy_deadline,
-    } = dispatch
-    else {
-        panic!("B must own an accepted recovery copy: {dispatch:?}");
-    };
-    assert_eq!(take_data(&mut copy_receivers), original);
-    assert!(queue.is_empty());
-    assert_eq!(
-        sender.reinjection_suppression_deadline_for_frame(&original, &remotes),
-        Some(accepted_copy_deadline),
-        "draining B's writer command cannot release its un-DataACKed copy",
-    );
-
     let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(8);
-    assert_eq!(
-        remotes.attach(opened_test_relay_stream(stream_id, 2, alternate_commands)),
-        ReliableRelayAttachOutcome::Attached
-    );
-    consume_client_path_proof_for_test(&mut alternate_receivers);
-    let alternate = remotes
-        .paths
-        .iter()
-        .find(|path| path.key().index == 2)
-        .expect("C is a distinct vacant alternate")
-        .instance();
-    seed_client_bulk_evidence_for_test(&context, alternate);
-    assert!(context.relay_path_instance_has_bulk_model_evidence(alternate));
-    assert!(remotes.contains_path_instance(copy));
-    assert!(
-        Instant::now() < accepted_copy_deadline,
-        "the RED assertion must run before B's actual immutable deadline"
-    );
-    let suppressed = sender.enqueue_retained_frontier_reinjection(
-        &mut queue,
-        &context,
-        &remotes,
-        &send_stream,
-        TrafficClass::Throughput,
-    );
-    assert!(
-        !suppressed.queued && queue.is_empty(),
-        "a fresh vacant C does not bypass B's global same-range repeat delay: {suppressed:?}"
-    );
+    let (accepted_copy_deadline, alternate) = {
+        let mut state = shared.lock();
+        let RequestProductState {
+            sender,
+            send_stream,
+            sender_queue: queue,
+            remotes,
+            ..
+        } = &mut *state;
+        assert!(
+            sender
+                .enqueue_retained_frontier_reinjection(
+                    queue,
+                    &context,
+                    remotes,
+                    send_stream,
+                    TrafficClass::Throughput,
+                )
+                .queued,
+            "A must mature before the first actual recovery commitment on B"
+        );
+        let dispatch = sender
+            .dispatch_client_repair_work(&context, TrafficClass::Throughput, remotes, queue)
+            .expect("real first-copy reservation and commitment")
+            .expect("the exact queued repair remains present");
+        let ClientQueuedDispatch::Reinjection {
+            payload_bytes: 4096,
+            accepted_copy_deadline,
+        } = dispatch
+        else {
+            panic!("B must own an accepted recovery copy: {dispatch:?}");
+        };
+        assert_eq!(take_data(&mut copy_receivers), original);
+        assert!(queue.is_empty());
+        assert_eq!(
+            sender.reinjection_suppression_deadline_for_frame(&original, remotes),
+            Some(accepted_copy_deadline),
+            "draining B's writer command cannot release its un-DataACKed copy",
+        );
+
+        assert_eq!(
+            remotes.attach(opened_test_relay_stream(stream_id, 2, alternate_commands)),
+            ReliableRelayAttachOutcome::Attached
+        );
+        consume_client_path_proof_for_test(&mut alternate_receivers);
+        let alternate = remotes
+            .paths
+            .iter()
+            .find(|path| path.key().index == 2)
+            .expect("C is a distinct vacant alternate")
+            .instance();
+        seed_client_bulk_evidence_for_test(&context, alternate);
+        assert!(context.relay_path_instance_has_bulk_model_evidence(alternate));
+        assert!(remotes.contains_path_instance(copy));
+        assert!(
+            Instant::now() < accepted_copy_deadline,
+            "the RED assertion must run before B's actual immutable deadline"
+        );
+        let suppressed = sender.enqueue_retained_frontier_reinjection(
+            queue,
+            &context,
+            remotes,
+            send_stream,
+            TrafficClass::Throughput,
+        );
+        assert!(
+            !suppressed.queued && queue.is_empty(),
+            "a fresh vacant C does not bypass B's global same-range repeat delay: {suppressed:?}"
+        );
+        (accepted_copy_deadline, alternate)
+    };
 
     // Same live B and same exact retained range: expiry permits C, but never
     // makes B's own publication slot vacant or releases Product ownership.
@@ -4224,13 +4309,21 @@ async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() 
             + Duration::from_millis(10),
     )
     .await;
+    let mut state = shared.lock();
+    let RequestProductState {
+        sender,
+        send_stream,
+        sender_queue: queue,
+        remotes,
+        ..
+    } = &mut *state;
     assert!(
         sender
             .enqueue_retained_frontier_reinjection(
-                &mut queue,
+                queue,
                 &context,
-                &remotes,
-                &send_stream,
+                remotes,
+                send_stream,
                 TrafficClass::Throughput,
             )
             .queued,

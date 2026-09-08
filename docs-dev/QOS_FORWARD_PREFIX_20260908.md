@@ -189,3 +189,105 @@ performance. No controller, threshold, resource or recovery change is justified
 solely by these observations; a model-level counterexample is still required.
 The ordinary pair, distinct return holds, unchanged global acceptance gates
 and absence of release promotion remain intact.
+
+## Continuation: repair read/route discriminator, 2026-09-08
+
+The second capture uses unchanged e476308 and the same profile above. The
+[QOS_REPAIR_READ_TRACE overlay](QOS_REPAIR_READ_TRACE_20260908.patch) reuses
+the first hooks and adds only repair-reader read/route boundaries, including
+StreamRequalifyData. Its warning-free build took3m32s; all11 source-file hooks
+were reversed before running the separately frozen
+`./.tmp/reflection/bin/qos-repair-read-20260908/mptunnel`. Evidence is
+`./.tmp/reflection/results/mixed-combined-up-qos-repair-read-0908/`, preserved in
+[QOS_REPAIR_READ_20260908.raw.tar.gz](QOS_REPAIR_READ_20260908.raw.tar.gz).
+There are98192/49347 client/server log lines. This continuation does not
+retroactively identify the cause of the first capture's4750ms repair pause.
+
+The probe completes exactly485359616 accepted/target-confirmed bytes in
+52.139505s,74.471Mbps, with one complete stream, zero failed streams/errors and
+exit0. First confirmation/write are.544772/.269165s; maximum confirmation/write
+gaps are7.128953/4.925427s. Runner duration53.1968s is a different boundary.
+All53 raw one-second confirmation bins follow; indices are zero-based and the
+last bin is partial. The561.941Mbps confirmation burst is not proof of a
+physical500Mbps link exceeding its configured service rate.
+
+```text
+ 0: 2.097, 6.291, 9.437, 10.057, 561.941, 62.507, 82.817, 64.391, 452.557, 49.304
+10: 73.38, 23.069, 26.118, 48.235, 65.536, 0, 0, 0, 0, 0
+20: 368.147, 64.915, 0, 28.429, 0, 27.787, 141.537, 43.516, 327.893, 19.09
+30: 80.364, 80.281, .075, .096, 3.478, 4.386, 13.823, 137.267, 347.626, 2.097
+40: 1.004, 10.184, 106.06, 0, 0, 0, 0, 0, 0, 180.383
+50: 242.909, .446, 113.346
+```
+
+Exact accounting still holds. The13438 Original commits form precisely
+[0,485359616), with matching write-begin and positive completion for each.
+An additional2620 repair commits account for41384032 copied bytes. QUIC
+ordinary12684 successful write ranges align in byte order with40832 decoded
+ranges/444484143B; repair391 writes align with1396 decoded StreamData
+ranges/14355944B, including encoder splitting/coalescing.
+
+Do not generalize this to all16058 Product commits completing native writes:
+16055 writer begins and16054 positive completions are observed. Four losing
+TCP physical2 repair transactions remain incomplete in the trace:
+[461631705,461643705) has commit C96437 and begin C96470 but no completion;
+[461643705,461644489),[461691705,461697241),[461697241,461706305) have commits
+C96439/C96478/C96480 but no begin. Applied ACKs C96476/C96482 cover these
+ranges. This is not missing unique data; cancellation versus outstanding
+writer service is not established by these hooks. All7913 applied ACKs release
+exactly485359616B and preserve monotonic F<=C. Final C98190 at
+Unix1788855777660 has C=F=485359616 and zero retained bytes.
+
+For the following joins C/S again denote one-based log lines, but short times
+now subtract1788855700000 from Unix milliseconds. The exact session string is
+5050659630538301190, stream0. Client QUIC is runtime0/physical1/attachment2,
+ordinary H3 request4 and repair8. The relevant Original TCP is client
+runtime1/physical2/attachment1, wire PathId2; server identities remain separately
+owned. Do not reuse the first capture's identity mapping.
+
+| Actual delivery gap | Publication and winning path | Read/route/mux boundary |
+| --- | --- | --- |
+|F238223201 /5.138138s, QoS phase |TCP Original C47255@36318, local flush C47262@36319; winning QUIC copy C57953/C57956@40636 |Repair ordinal235 begins S22871@40440, decodes S23028/S23029@45535, route S23030=27us, mux S23032@45536 |
+|F471135545 /6.295860s, largest |F reached S47121@70186; Original only C94200–02@74162; winning QUIC copy C96800/C96803@76229 |Repair ordinal1371 decodes S48028/S48029@76481, read16us, route S48030=18us, mux S48036@76482 |
+
+The QoS winner spends4899ms from successful local write to decode, followed
+by approximately1ms to mux. Its5095096us read await starts196ms before that
+write; the route await is not its multi-second delay. TCP Original decodes
+later at S23040@45592. During the accepted-copy wait, ordinary QUIC decodes149
+records/1626400B (S22876@40856 through S23026@42647), excluding connection-wide
+decode silence. Ordered native availability/loss and task service remain
+unsplit: read-await time is not physical-wire waiting alone.
+
+The largest delivery-gap record has a different explanation boundary. When
+F471135545 is reached at70186, reordered bytes are zero; its missing Original
+is not claimed until74162, approximately3976ms later.
+Source S is already485359616 at clientUnix1788855768480 and remains unchanged;
+C is471135545 from C89457@68064 until C94200@74162. Thus14224071 consumed-source
+bytes await claim. Applied ACKs continue, from C91838@70172 F423163193 to
+C94190@74152 F435960841, still with C471135545. This identifies a claim-service
+boundary, not its refusing predicate. Its winning repair takes
+only approximately253ms from local completion to mux. Preceding repair
+ordinal1369 appears to wait7094009us (S46134@69387 to S48020@76481), but the
+eventual [471070009,471082009) copy is not published until C96794@76228 and
+locally completed C96797@76229. Approximately6841ms of that read precedes
+publication, not accepted native service. That earlier range had already
+arrived by TCP at S47108@70185; its covering ACK reaches the client only at
+C96798@76229. Neither delayed sender knowledge nor a read waiting for future
+work proves spurious loss inference or a seven-second native repair backlog.
+
+The new observer is internally consistent:1408 read-begins,1407 successful
+read-completes and1407 successful route-completes, with matching ordinal,
+kind/range metadata and phase order. Completed kinds are1396 StreamData and11
+StreamRequalifyData. Final ordinal1408 at S49249@77624 is begin-only, not a
+fabricated completion. Total measured route awaits are41466us; maximum3494us
+at S25593@51610, ordinal683, is the only route above1ms. Thus this capture
+contains no multi-second repair registry-route await. Its longest read,
+7535273us at ordinal1223 (S28184@52317 to S33819@59853), returns
+StreamRequalifyData rather than the winning payload; it cannot be assigned
+wholesale to an ordered-data stall.
+
+The discriminator closes this capture's route-await alternative, not every
+native/read/task alternative or the earlier capture's uncaptured boundary.
+It also exposes why delivery-gap records require source-publication joins.
+Completion with multi-second gaps remains non-acceptance; no runtime change,
+threshold adjustment or release promotion follows from this continuation.

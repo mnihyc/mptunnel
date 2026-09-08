@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 16:14 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 16:35 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -10,7 +10,50 @@ approaches, remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`.
 Detailed evidence is linked below; shortening obsolete next-action prose does
 not discard findings, adverse results or acceptance gates.
 
-## Active transaction: QoS forward-prefix stall
+## Active transaction: available request source is not claimed
+
+**Observed failure / priority:** second capture's largest target hold is
+F471135545 for6.295860s. Source S already485359616 atUnix1788855768480, but
+Original C stays471135545 until1788855774162;14224071 consumed-source bytes
+are unclaimed. Server reaches F at5770186, almost4s before that next claim.
+Client ACKs keep advancing F423163193→435960841 during that interval. This
+is not source starvation, already-assigned native delay, or a7s repair backlog.
+QOS_FORWARD_PREFIX_20260908 continuation records exact proof and contrary case.
+
+**Exact question / competing causes:** what prevents a physical Ready writer
+from claiming the lowest prepared range while source exists? Separate owner
+Busy at three cuts, critical queue-front precedence, mux window/cache refusal,
+missing Original incarnation, no Ready/eligible lead or whole-frame Product
+authority, and final source/Native/Ready/proof/load revalidation. Capture the
+actual failing predicate; aggregate management/native flight cannot infer it.
+
+**Origin/model:**9720e4b preserves byte conservation/late native assignment and
+inherits the combined queue's critical-repair-before-Data front at both initial
+read and RequestQueuedSourceCommit validation. A TCP-bound critical intent
+could therefore veto independent QUIC source, but this is only a candidate
+cause. RFC10.4's final-writer priority is not proof that this global barrier is
+necessary. A missing retained Original incarnation is a separate pre-planning
+gate; do not mislabel it as absence of every possible copy transmitter.
+
+**Smallest discriminator / acceptance:** one diagnostic on unchanged e476308
+and unchanged profile, using existing stage events plus bounded per-stage
+claim counts and first/last actual state at the existing1s diagnostic cadence.
+Observe queue front kind/cause/range/bound target, C/F/source bytes, Ready
+identities and already-computed admission/refusal inputs. No per-attempt log
+flood, extra Native sampling, queue scan for display, reservation or policy
+change. Independently review, archive/reverse, then capture once. A long hold
+must join actual refusals; absent holds are non-reproduction. Test a focused
+real producer counterexample before any model correction. Do not jump from
+empty native flight to removal of proven Product ownership.
+
+**Retained alternative:** the same second capture has a different QoS5.138s
+hold: repair local acceptance→decode4.899s, route27us. All1407 completed repair
+routes total41.466ms/max3.494ms. That route alternative is closed for this
+capture; native ordered delivery/task service remains unresolved. No threshold
+change follows. Native reorder tolerance/priority source inspection is context,
+not measured missing-packet attribution. No native trace/retuning now.
+
+## Completed discriminator: QoS forward-prefix stall
 
 **Issue / evidence:** the completed e476308 ordinary run has a5.000s sampled
 T173608233 hold during15–20s. By16s S−T=64MiB, Rs=Rc435 and all client TCP
@@ -82,6 +125,18 @@ The complete reused overlay plus one reader observer is archived as
 QOS_REPAIR_READ_TRACE_20260908.patch. One build underway, no lab overlap.
 First-capture full evidence report and raw archive now retained; it disproves
 neither all native delay nor all local delay, and no policy fix was made.
+
+**Capture16:22:** diagnostic build3m32s, warning-free; frozen separately as
+qos-repair-read-20260908. All11-file observer hooks reversed and src diff
+verified empty before starting one unchanged-profile capture. No build now.
+
+**Result16:23:** exact485359616B/52.139505s, maxconfirmation7.128953s. Full
+raw53bins/accounting/read-ordinal joins retained. Four losing TCP copies lack
+positive write completion; every Original completes and final ACK/cache
+reconciles. Readoutcome without prior work availability would falsely label
+the longest7.094s read a transport stall. Actual copy appears only252ms before
+decode. This counterexample selects the earlier unclaimed-source boundary
+above. No ordinary comparison, model fix or performance acceptance follows.
 
 **Disposition / scope:** e476308 remains an isolated mechanism-correct
 intermediate checkpoint, not a promoted performance fix. Its early receive
@@ -316,15 +371,15 @@ above500Mbps can be buffered observation, not wire capacity.
 ## Execution, evidence and continuity
 
 - Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
-  overlap. Products/probes stopped; one diagnostic build, no lab. Origins retained.
+  overlap. Products/probes stopped; no build/lab. Origins retained.
 - Normal frozen candidate:`./.tmp/reflection/bin/advisory-owner-20260908/mptunnel`.
   Normal parent:`./.tmp/reflection/bin/copy-debt-20260908/mptunnel`.
-  Current diagnostic:`./.tmp/reflection/bin/qos-forward-prefix-20260908/mptunnel`.
+  Current diagnostic:`./.tmp/reflection/bin/qos-repair-read-20260908/mptunnel`.
   target/release is that temporary diagnostic, not the ordinary executable.
 - Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
   No deletion this turn; ample root space. User7lines must stay unstaged.
-- Telegram last meaningful report before2026-09-08 07:26UTC; next nonurgent
-  not before08:27UTC. Respect hourly minimum and soft-frequency advisory.
+- Telegram last meaningful report2026-09-08 08:30:59UTC; next nonurgent
+  not before09:31UTC. Respect hourly minimum and soft-frequency advisory.
   No component-only success notification or unfinished completion claim.
 - Reflection: exact symbolic conservation enabled one justified work deletion,
   but did not predict every timing phase. The ordinary pair supplies real

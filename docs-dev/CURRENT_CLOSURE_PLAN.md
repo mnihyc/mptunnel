@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08. Active observer18:56 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 19:39 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -48,6 +48,59 @@ build; archive/freeze/reverse before one unchanged capture. No runtime policy,
 queue, rate, timer, sampler or RFC correction is justified yet. No favorable
 rerun or performance promotion from diagnostic Mbps/non-reproduction. Prove
 an actual causal defect before implementing a correction.
+
+**Execution19:18:** root and independent whole19-file reviews pass. Sparse
+Native episodes preserve actual no-data Pending, validated ingestion and
+nonempty Chunk boundaries; all bindings are lock-free existing identities.
+New diagnostic fields are cfg-only, initialized/reset on every Recv lifetime.
+Native clock/sequence are distinct from Product logs; canceled reads remain
+broad local-service/censored cases. NATIVE_READ_SERVICE_TRACE_20260908.patch
+archives the complete temporary overlay and validates as a reverse diff.
+One diagnostic build is running, no lab. Freeze/reverse every source/Cargo
+observer change before the unchanged capture; no runtime correction yet.
+
+**Classification correction19:23:** the user's challenge is binding: an
+unideal result can be physical loss/queuing, a throughput/latency tradeoff,
+or a real defect. Q/C does not locate the blocking byte, and an already-created
+queue does not prove earlier sending decisions optimal. Historical matched
+raw completes4.279Mbps/maxgap1.611s; VMess and H2 are incomplete (H2 at the
+observation boundary), with unequal work and no current exact MPTCP counterpart.
+These do not establish an MPP-specific defect or universal superiority.
+Compare matched controls before further model corrections; the current sparse
+trace only separates Native processed-input availability from local service.
+The mandatory method now explicitly records this classification rule.
+
+**Capture19:23:** warning-free3m57s diagnostic build frozen separately as
+native-read-service-20260908. All19source/Cargo changes reversed and their
+diff verified empty before one unchanged-profile mixed upload; no build/lab
+overlap. Exact runtime remains d999fea; target/release is diagnostic-only.
+
+**Method requirement19:39:** before any next experiment or implementation,
+record expected material user benefit, its removable critical portion,
+plausible range/upper bound, assumptions, uncertainty, costs and falsifier;
+compare the actual outcome against that forecast afterward. Diagnostics need
+an explicit information/decision forecast instead of a promised speed gain.
+Defer unsupported or negligible opportunities; correctness-only necessity
+must not be presented as a performance improvement. This is mandatory in
+PERFORMANCE_METHOD_AND_LESSONS, not a new numerical Product threshold.
+
+**Completed native result:**391184384 exact bytes settle in49.043824s;
+maximum confirmation/write gaps are3.594738/6.955278s. All553 completed
+native Pending→availability→Chunk episodes reconcile. Availability→return
+is at most5.457ms (p95 440us), excluding that local step as a multi-second
+wait within these episodes. The winning repair for F165558377 has3.021829s
+before processed head availability and72us afterward. The longest9.567s
+native wait is not a useful winner: source work was initially absent and
+TCP already advanced the frontier before that QUIC decode. Do not attribute
+all native elapsed time to useful blocked work, transport defects or physical
+loss. No runtime correction or ordinary performance promotion follows.
+Root whole-report review and independent accounting/cost checks pass;
+[exact joins and full timing history](NATIVE_READ_SERVICE_20260908.md) retain
+the raw archive and observer patch. No next experiment is running. The next
+causal decision must distinguish missing processed input from sender service,
+physical loss/queuing and earlier placement; this observation alone does not
+select a correction or justify another diagnostic without an information
+forecast. Previously observed preclaim/return holds remain separate boundaries.
 
 ## Completed discriminator: forward prefix after ACK work reduction
 
@@ -287,12 +340,13 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 
 ## Execution, evidence and continuity
 
-- Root owns builds/labs. The frozen post-ack-forward-0908 capture is complete;
+- Root owns builds/labs. The frozen native-read-service-0908 capture is complete;
   no build/lab is active, and all observer source hooks are reversed.
   Owned Docker only: no sudo, host shaping, outside-repo work or build/lab overlap.
 - Ordinary candidate:`./.tmp/reflection/bin/ack-support-20260908/mptunnel`.
   Ordinary parent:`./.tmp/reflection/bin/prepared-stale-20260908/mptunnel`.
-  Current diagnostic:`./.tmp/reflection/bin/post-ack-forward-20260908/mptunnel`.
+  Current diagnostic:`./.tmp/reflection/bin/native-read-service-20260908/mptunnel`.
+  Previous forward diagnostic:`./.tmp/reflection/bin/post-ack-forward-20260908/mptunnel`.
   Previous reply diagnostic:`./.tmp/reflection/bin/reply-residence-20260908/mptunnel`.
   Do not use diagnostic target/release as an ordinary comparator.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.

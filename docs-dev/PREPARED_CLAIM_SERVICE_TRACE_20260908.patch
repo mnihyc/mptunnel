@@ -1,0 +1,1654 @@
+diff --git a/src/lab_diagnostics.rs b/src/lab_diagnostics.rs
+index 4551942..5493261 100644
+--- a/src/lab_diagnostics.rs
++++ b/src/lab_diagnostics.rs
+@@ -26,6 +26,76 @@ pub(crate) fn lab_diagnostic_event_enabled(event: &str) -> bool {
+     lab_diagnostic_event_filter().is_none_or(|filter| filter.contains(event))
+ }
+ 
++/// Temporary claim-service observation. Counts cover every enabled occurrence;
++/// fields are a sampled actual state, not a reconstruction of intervening
++/// states. One-second reporting follows the existing diagnostic cadence and
++/// never gates Product work. Keys are process-local stream/physical identities
++/// for this bounded single-session capture, not a new global identity model.
++pub(crate) fn lab_counted_diagnostic(
++    event: &'static str,
++    stream_id: u64,
++    path_instance_id: u64,
++    stage: &'static str,
++    fields: impl FnOnce() -> String,
++) {
++    if !lab_diagnostic_event_enabled(event) {
++        return;
++    }
++    type Key = (&'static str, u64, u64, &'static str);
++    struct Count {
++        count: u64,
++        first_ms: u128,
++        last_ms: u128,
++        next_report: Instant,
++    }
++    static COUNTS: OnceLock<Mutex<HashMap<Key, Count>>> = OnceLock::new();
++    let now = Instant::now();
++    let unix_ms = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_millis();
++    let sample = {
++        let mut counts = COUNTS
++            .get_or_init(Default::default)
++            .lock()
++            .expect("lab claim counts");
++        let value = counts
++            .entry((event, stream_id, path_instance_id, stage))
++            .or_insert(Count {
++                count: 0,
++                first_ms: unix_ms,
++                last_ms: unix_ms,
++                next_report: now,
++            });
++        value.count = value.count.saturating_add(1);
++        value.first_ms = value.first_ms.min(unix_ms);
++        value.last_ms = value.last_ms.max(unix_ms);
++        if now < value.next_report {
++            None
++        } else {
++            value.next_report = now + Duration::from_secs(1);
++            Some((value.count, value.first_ms, value.last_ms))
++        }
++    };
++    // Neither caller state formatting nor output executes under the aggregate
++    // mutex. Busy callers supply no new Product snapshot or Native read.
++    if let Some((count, first_ms, last_ms)) = sample {
++        lab_diagnostic(
++            event,
++            format_args!(
++                "stream_id={} path_instance_id={} stage={} count={} first_unix_ms={} last_unix_ms={} {}",
++                stream_id,
++                path_instance_id,
++                stage,
++                count,
++                first_ms,
++                last_ms,
++                fields(),
++            ),
++        );
++    }
++}
++
+ #[cfg(not(test))]
+ fn lab_diagnostics_requested() -> bool {
+     static ENABLED: OnceLock<bool> = OnceLock::new();
+diff --git a/src/runtime/path/prepared.rs b/src/runtime/path/prepared.rs
+index 928d71f..ad0f6d8 100644
+--- a/src/runtime/path/prepared.rs
++++ b/src/runtime/path/prepared.rs
+@@ -20,6 +20,32 @@ use tokio::sync::Notify;
+ const OUTSTANDING: u8 = 1;
+ const NOTIFIED_AGAIN: u8 = 2;
+ 
++#[cfg(feature = "lab-diagnostics")]
++pub(in crate::runtime::path) fn diagnostic_prepared_notice(
++    stream_id: StreamId,
++    instance: RelayPathInstance,
++    lane: TrafficClass,
++    stage: &'static str,
++    fields: impl FnOnce() -> String,
++) {
++    crate::lab_diagnostics::lab_counted_diagnostic(
++        "prepared_notice",
++        stream_id.0,
++        instance.path_instance_id.as_u64(),
++        stage,
++        || {
++            format!(
++                "underlay={:?} path_index={} attachment_id={} lane={:?} {}",
++                instance.key.underlay,
++                instance.key.index,
++                instance.attachment_id,
++                lane,
++                fields(),
++            )
++        },
++    );
++}
++
+ pub(in crate::runtime) type PreparedOriginalWait =
+     Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+ 
+@@ -77,6 +103,11 @@ impl PreparedOriginalRegistration {
+         self.lane
+     }
+ 
++    #[cfg(feature = "lab-diagnostics")]
++    pub(in crate::runtime) fn diagnostic_stream_id(&self) -> StreamId {
++        self.stream_id
++    }
++
+     pub(in crate::runtime) fn notify(self: &Arc<Self>) {
+         let previous = self
+             .state
+@@ -88,6 +119,18 @@ impl PreparedOriginalRegistration {
+                 })
+             })
+             .expect("prepared notice state update always succeeds");
++        #[cfg(feature = "lab-diagnostics")]
++        diagnostic_prepared_notice(
++            self.stream_id,
++            self.instance,
++            self.lane,
++            if previous & OUTSTANDING != 0 {
++                "notify_coalesced"
++            } else {
++                "notify_publish"
++            },
++            || format!("previous_state={previous}"),
++        );
+         if previous & OUTSTANDING != 0 {
+             self.notified.notify_waiters();
+             return;
+@@ -117,6 +160,15 @@ pub(in crate::runtime) struct PreparedOriginalWork {
+ }
+ 
+ impl PreparedOriginalWork {
++    #[cfg(feature = "lab-diagnostics")]
++    pub(in crate::runtime::path) fn diagnostic(
++        &self,
++        stage: &'static str,
++        fields: impl FnOnce() -> String,
++    ) {
++        diagnostic_prepared_notice(self.stream_id, self.instance, self.lane, stage, fields);
++    }
++
+     pub(in crate::runtime) fn stream_id(&self) -> StreamId {
+         self.stream_id
+     }
+@@ -131,7 +183,11 @@ impl PreparedOriginalWork {
+         &self,
+         ready: &ReliableWriterReadyGuard,
+     ) -> RequestPreparedClaim {
++        #[cfg(feature = "lab-diagnostics")]
++        self.diagnostic("claim_entry", String::new);
+         let Some(registration) = self.registration.upgrade() else {
++            #[cfg(feature = "lab-diagnostics")]
++            self.diagnostic("claim_registration_gone", String::new);
+             return RequestPreparedClaim::Empty;
+         };
+         // A fresh claim observes all work notifications preceding this point.
+@@ -140,6 +196,8 @@ impl PreparedOriginalWork {
+             .state
+             .fetch_and(!NOTIFIED_AGAIN, Ordering::AcqRel);
+         let Some(product) = registration.product.upgrade() else {
++            #[cfg(feature = "lab-diagnostics")]
++            self.diagnostic("claim_product_gone", String::new);
+             return RequestPreparedClaim::Empty;
+         };
+         claim_prepared_request_data(
+@@ -152,6 +210,8 @@ impl PreparedOriginalWork {
+     }
+ 
+     pub(in crate::runtime) fn requeue(self) {
++        #[cfg(feature = "lab-diagnostics")]
++        self.diagnostic("requeue", String::new);
+         if let Some(registration) = self.registration.upgrade() {
+             registration.commands.enqueue_prepared_work(self);
+         }
+@@ -184,13 +244,26 @@ impl PreparedOriginalWork {
+         });
+         Box::pin(async move {
+             let (Some(cancelled), Some(notified)) = (cancellation, notification) else {
++                #[cfg(feature = "lab-diagnostics")]
++                self.diagnostic("wait_registration_gone", String::new);
+                 return;
+             };
+             tokio::select! {
+                 biased;
+-                () = cancelled => {}
+-                () = notified => self.requeue(),
+-                () = wait => self.requeue(),
++                () = cancelled => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    self.diagnostic("wait_cancelled", String::new);
++                }
++                () = notified => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    self.diagnostic("wait_notified", String::new);
++                    self.requeue();
++                }
++                () = wait => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    self.diagnostic("wait_supplied", String::new);
++                    self.requeue();
++                }
+             }
+         })
+     }
+diff --git a/src/runtime/path/queue.rs b/src/runtime/path/queue.rs
+index 5397651..ccc1f7b 100644
+--- a/src/runtime/path/queue.rs
++++ b/src/runtime/path/queue.rs
+@@ -2,6 +2,8 @@ use super::authority::NativeCarrierRateAuthorityHandle;
+ use super::commands::ReliablePathCommand;
+ #[cfg(test)]
+ use super::commands::{RequestTcpCapacityProbeRequest, TcpCapacityProbeCommand};
++#[cfg(feature = "lab-diagnostics")]
++use super::prepared::diagnostic_prepared_notice;
+ use super::prepared::{PreparedOriginalWait, PreparedOriginalWork};
+ use super::writer_boundary::{ReliableWriterBoundary, ReliableWriterReadyGuard};
+ #[cfg(feature = "lab-diagnostics")]
+@@ -968,6 +970,10 @@ impl ReliablePathCommandReceivers {
+         work: PreparedOriginalWork,
+         wait: impl std::future::Future<Output = ()> + Send + 'static,
+     ) {
++        #[cfg(feature = "lab-diagnostics")]
++        work.diagnostic("receiver_defer", || {
++            format!("deferred_waits_before={}", self.deferred_prepared.len())
++        });
+         self.deferred_prepared.push(work.after_wait(Box::pin(wait)));
+     }
+ 
+@@ -1064,8 +1070,12 @@ impl ReliablePathCommandSender {
+     /// owns only one weak registration wait, never a reserved source payload.
+     pub(in crate::runtime::path) fn enqueue_prepared_work(&self, work: PreparedOriginalWork) {
+         if !self.metrics.lifecycle.admits_new_command(true) {
++            #[cfg(feature = "lab-diagnostics")]
++            work.diagnostic("enqueue_lifecycle_refused", String::new);
+             return;
+         }
++        #[cfg(feature = "lab-diagnostics")]
++        let diagnostic_identity = (work.stream_id(), work.instance(), work.lane());
+         let queue = if reliable_path_frame_uses_priority_queue(work.lane()) {
+             &self.priority
+         } else {
+@@ -1079,11 +1089,29 @@ impl ReliablePathCommandSender {
+                         0,
+                         self.metrics.clone(),
+                     ));
++                    #[cfg(feature = "lab-diagnostics")]
++                    diagnostic_prepared_notice(
++                        diagnostic_identity.0,
++                        diagnostic_identity.1,
++                        diagnostic_identity.2,
++                        "enqueue_success",
++                        String::new,
++                    );
++                } else {
++                    #[cfg(feature = "lab-diagnostics")]
++                    work.diagnostic("enqueue_reserved_lifecycle_refused", String::new);
+                 }
+             }
+-            Err(mpsc::error::TrySendError::Closed(_)) => {}
++            Err(mpsc::error::TrySendError::Closed(_)) => {
++                #[cfg(feature = "lab-diagnostics")]
++                work.diagnostic("enqueue_closed", String::new);
++            }
+             Err(mpsc::error::TrySendError::Full(_)) => {
++                #[cfg(feature = "lab-diagnostics")]
++                work.diagnostic("enqueue_full", String::new);
+                 let Some(cancelled) = work.cancellation_wait() else {
++                    #[cfg(feature = "lab-diagnostics")]
++                    work.diagnostic("enqueue_full_registration_gone", String::new);
+                     return;
+                 };
+                 let queue = queue.clone();
+@@ -1091,11 +1119,25 @@ impl ReliablePathCommandSender {
+                 let wait: PreparedOriginalWait = Box::pin(async move {
+                     tokio::select! {
+                         biased;
+-                        () = cancelled => {}
++                        () = cancelled => {
++                            #[cfg(feature = "lab-diagnostics")]
++                            work.diagnostic("capacity_wait_cancelled", String::new);
++                        }
+                         permit = queue.reserve_owned() => {
+                             if let Ok(permit) = permit
+                                 && metrics.lifecycle.admits_new_command(true) {
+                                 permit.send(QueuedReliablePathCommand::new(ReliablePathCommand::PreparedOriginal(work), 0, metrics));
++                                #[cfg(feature = "lab-diagnostics")]
++                                diagnostic_prepared_notice(
++                                    diagnostic_identity.0,
++                                    diagnostic_identity.1,
++                                    diagnostic_identity.2,
++                                    "capacity_wait_enqueued",
++                                    String::new,
++                                );
++                            } else {
++                                #[cfg(feature = "lab-diagnostics")]
++                                work.diagnostic("capacity_wait_unavailable", String::new);
+                             }
+                         }
+                     }
+diff --git a/src/runtime/path/quic/client.rs b/src/runtime/path/quic/client.rs
+index eac0c46..7392a53 100644
+--- a/src/runtime/path/quic/client.rs
++++ b/src/runtime/path/quic/client.rs
+@@ -1818,7 +1818,13 @@ async fn open_client_udp_datagram_stream(
+ ) -> Result<ClientUdpDatagramStream, RuntimeError> {
+     let (mut send, recv) = carrier.connection.open_bi().await?;
+     send.set_traffic_class(TrafficClass::RealtimeDatagram)?;
+-    let frames = spawn_quic_path_reader(recv, runtime.codec_limits, runtime.stream_frame_queue);
++    let frames = spawn_quic_path_reader(
++        recv,
++        runtime.codec_limits,
++        runtime.stream_frame_queue,
++        #[cfg(feature = "lab-diagnostics")]
++        None,
++    );
+     Ok(ClientUdpDatagramStream {
+         send,
+         frames,
+diff --git a/src/runtime/path/quic/client_stream.rs b/src/runtime/path/quic/client_stream.rs
+index c3f23b2..3290cf0 100644
+--- a/src/runtime/path/quic/client_stream.rs
++++ b/src/runtime/path/quic/client_stream.rs
+@@ -33,7 +33,13 @@ pub(super) async fn run_client_udp_stream(
+     mut commands: ReliablePathCommandReceivers,
+     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
+ ) {
+-    let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
++    let mut carrier_frames = spawn_quic_path_reader(
++        recv,
++        codec_limits,
++        reader_queue_size,
++        #[cfg(feature = "lab-diagnostics")]
++        None,
++    );
+     let mut pending_frames = Vec::<Frame>::new();
+     let mut path_proofs = PathProofTracker::from_limits(mux_limits);
+     let mut deferred_input: Option<Result<Frame, RuntimeError>> = None;
+diff --git a/src/runtime/path/quic/datagram.rs b/src/runtime/path/quic/datagram.rs
+index d364ec2..35e483c 100644
+--- a/src/runtime/path/quic/datagram.rs
++++ b/src/runtime/path/quic/datagram.rs
+@@ -58,6 +58,8 @@ pub(super) async fn handle_server_udp_datagram_stream(
+         recv,
+         context.codec_limits,
+         udp_path_command_queue(context.mux_limits, context.codec_limits),
++        #[cfg(feature = "lab-diagnostics")]
++        None,
+     );
+     let mut flows = Vec::<AcceptedServerDatagramFlow>::new();
+     let mut tombstones = ServerDatagramTombstoneCache::new(context.max_udp_flows_per_session);
+diff --git a/src/runtime/path/quic/io.rs b/src/runtime/path/quic/io.rs
+index da9e216..6b19eeb 100644
+--- a/src/runtime/path/quic/io.rs
++++ b/src/runtime/path/quic/io.rs
+@@ -392,7 +392,24 @@ pub(in crate::runtime) async fn udp_path_write_frame(
+     codec_limits: CodecLimits,
+ ) -> Result<(), RuntimeError> {
+     ensure_quic_data_plane_frames(std::slice::from_ref(frame))?;
+-    quic_transport::write_frame(&mut send.stream, frame, codec_limits).await?;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_quic_write(
++        send,
++        std::slice::from_ref(frame),
++        "frame",
++        "write_begin",
++        "pending",
++    );
++    let result = quic_transport::write_frame(&mut send.stream, frame, codec_limits).await;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_quic_write(
++        send,
++        std::slice::from_ref(frame),
++        "frame",
++        "write_complete",
++        if result.is_ok() { "ok" } else { "error" },
++    );
++    result?;
+     Ok(())
+ }
+ 
+@@ -430,10 +447,99 @@ async fn udp_path_write_frames(
+     codec_limits: CodecLimits,
+ ) -> Result<(), RuntimeError> {
+     ensure_quic_data_plane_frames(frames)?;
+-    quic_transport::write_frames(&mut send.stream, frames, codec_limits).await?;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_quic_write(send, frames, "batch", "write_begin", "pending");
++    let result = quic_transport::write_frames(&mut send.stream, frames, codec_limits).await;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_quic_write(
++        send,
++        frames,
++        "batch",
++        "write_complete",
++        if result.is_ok() { "ok" } else { "error" },
++    );
++    result?;
+     Ok(())
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn observe_request_quic_write(
++    send: &UdpPathSendStream,
++    frames: &[Frame],
++    mode: &str,
++    phase: &str,
++    result: &str,
++) {
++    if !crate::lab_diagnostics::lab_diagnostic_event_enabled("request_writer")
++        || std::env::var("MPTUNNEL_LAB_ROLE").as_deref() != Ok("client")
++    {
++        return;
++    }
++    for frame in frames {
++        if let Frame::StreamData {
++            stream_id,
++            offset,
++            payload,
++        } = frame
++        {
++            // H3 identity is connection-local. This shared helper does not
++            // own a runtime path incarnation; completion is local acceptance.
++            crate::lab_diagnostics::lab_diagnostic(
++                "request_writer",
++                format_args!(
++                    "phase={} underlay=Udp mode={} native_request_stream_id={} stream_id={} frame_start={} frame_end={} result={}",
++                    phase,
++                    mode,
++                    send.request_stream_id(),
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(payload.len() as u64),
++                    result,
++                ),
++            );
++        }
++    }
++}
++
++#[cfg(feature = "lab-diagnostics")]
++#[derive(Clone, Copy)]
++pub(super) struct RequestQuicReaderIdentity {
++    pub(super) session_id: u64,
++    pub(super) path_id: u16,
++    pub(super) path_instance_id: u64,
++    pub(super) native_request_stream_id: u64,
++}
++
++#[cfg(feature = "lab-diagnostics")]
++impl RequestQuicReaderIdentity {
++    pub(super) fn observe_decoded(self, domain: &str, frame: &Frame) {
++        if !crate::lab_diagnostics::lab_diagnostic_event_enabled("request_reader") {
++            return;
++        }
++        if let Frame::StreamData {
++            stream_id,
++            offset,
++            payload,
++        } = frame
++        {
++            crate::lab_diagnostics::lab_diagnostic(
++                "request_reader",
++                format_args!(
++                    "phase=decoded domain={} session_id={} path_id={} path_instance_id={} native_request_stream_id={} stream_id={} frame_start={} frame_end={}",
++                    domain,
++                    self.session_id,
++                    self.path_id,
++                    self.path_instance_id,
++                    self.native_request_stream_id,
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(payload.len() as u64),
++                ),
++            );
++        }
++    }
++}
++
+ fn ensure_quic_data_plane_frames(frames: &[Frame]) -> Result<(), RuntimeError> {
+     if frames.iter().any(Frame::is_path_capacity) {
+         return Err(RuntimeError::Protocol(
+@@ -706,6 +812,7 @@ pub(super) fn spawn_quic_path_reader(
+     mut recv: UdpPathRecvStream,
+     codec_limits: CodecLimits,
+     queue_size: usize,
++    #[cfg(feature = "lab-diagnostics")] diagnostic: Option<RequestQuicReaderIdentity>,
+ ) -> mpsc::Receiver<Result<Frame, RuntimeError>> {
+     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
+     tokio::spawn(async move {
+@@ -728,6 +835,12 @@ pub(super) fn spawn_quic_path_reader(
+                 Err(err) => Err(err),
+             };
+             let done = frame.is_err();
++            #[cfg(feature = "lab-diagnostics")]
++            if let (Some(identity), Ok(frame)) = (diagnostic, frame.as_ref()) {
++                // Complete MPP decode, before the existing bounded reader
++                // mailbox send. This is not Product mux application.
++                identity.observe_decoded("quic_ordinary", frame);
++            }
+             if frames_tx.send(frame).await.is_err() || done {
+                 return;
+             }
+diff --git a/src/runtime/path/quic/server_stream.rs b/src/runtime/path/quic/server_stream.rs
+index 41b37f7..16737aa 100644
+--- a/src/runtime/path/quic/server_stream.rs
++++ b/src/runtime/path/quic/server_stream.rs
+@@ -335,6 +335,13 @@ pub(super) async fn handle_server_udp_reliable_stream(
+         let (repair_send, repair_recv) = repair_streams
+             .await
+             .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
++        #[cfg(feature = "lab-diagnostics")]
++        let repair_diagnostic = super::io::RequestQuicReaderIdentity {
++            session_id: session_id.0,
++            path_id: path_id.0,
++            path_instance_id: repair_registration.path_instance_id().as_u64(),
++            native_request_stream_id: repair_send.request_stream_id(),
++        };
+         super::repair::run_repair_channel(
+             repair_send,
+             repair_recv,
+@@ -342,6 +349,10 @@ pub(super) async fn handle_server_udp_reliable_stream(
+             stream_id,
+             repair_context.codec_limits,
+             |frame| {
++                // The repair reader invokes this closure immediately after
++                // exact-stream validation, before awaiting Product routing.
++                #[cfg(feature = "lab-diagnostics")]
++                repair_diagnostic.observe_decoded("quic_repair", &frame);
+                 repair_context
+                     .reliable_streams
+                     .route_frame(&repair_registration, stream_id, frame)
+@@ -401,8 +412,18 @@ async fn run_server_udp_reliable_stream_loop(
+     } = stream_context;
+     let carrier_frame_queue =
+         udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits);
+-    let mut carrier_frames =
+-        spawn_quic_path_reader(recv, context.codec_limits, carrier_frame_queue);
++    let mut carrier_frames = spawn_quic_path_reader(
++        recv,
++        context.codec_limits,
++        carrier_frame_queue,
++        #[cfg(feature = "lab-diagnostics")]
++        Some(super::io::RequestQuicReaderIdentity {
++            session_id: session_id.0,
++            path_id: path_id.0,
++            path_instance_id: path_registration.path_instance_id().as_u64(),
++            native_request_stream_id: send.request_stream_id(),
++        }),
++    );
+     let mut pending_frames = Vec::<Frame>::new();
+     let mut deferred_input = None;
+     let mut terminal_drain_deadline = None;
+diff --git a/src/runtime/path/tcp/client/writer.rs b/src/runtime/path/tcp/client/writer.rs
+index 825316f..88724c3 100644
+--- a/src/runtime/path/tcp/client/writer.rs
++++ b/src/runtime/path/tcp/client/writer.rs
+@@ -522,6 +522,8 @@ async fn commit_client_tcp_frame_transaction_interlocked(
+     deferred_frame: &mut Option<Frame>,
+ ) -> Result<(), RuntimeError> {
+     let mut routed_frames = 0usize;
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_tcp_write(connection, frames, runtime, "write_begin");
+     if deferred_frame.is_some() {
+         connection.carrier.writer.write_frames(frames).await?;
+         connection.carrier.writer.flush().await?;
+@@ -578,6 +580,8 @@ async fn commit_client_tcp_frame_transaction_interlocked(
+         }
+     }
+     // The successful write+flush is the transaction boundary.
++    #[cfg(feature = "lab-diagnostics")]
++    observe_request_tcp_write(connection, frames, runtime, "flush_complete");
+     publish_client_tcp_frame_transaction(connection, frames, runtime);
+     #[cfg(not(feature = "lab-diagnostics"))]
+     let _ = routed_frames;
+@@ -596,6 +600,38 @@ async fn commit_client_tcp_frame_transaction_interlocked(
+     Ok(())
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn observe_request_tcp_write(
++    connection: &ClientTcpPathConnection,
++    frames: &[Frame],
++    runtime: &ClientTcpPathSessionRuntime,
++    phase: &str,
++) {
++    if !crate::lab_diagnostics::lab_diagnostic_event_enabled("request_writer") {
++        return;
++    }
++    for frame in frames {
++        if let Frame::StreamData { stream_id, offset, payload } = frame {
++            // Local protected write/flush, not peer receipt. Error or
++            // cancellation before flush deliberately has no completion row.
++            lab_diagnostic(
++                "request_writer",
++                format_args!(
++                    "phase={} underlay=Tcp mode=transaction session_id={} path_index={} path_id={:?} path_instance_id={} stream_id={} offset={} end={}",
++                    phase,
++                    runtime.session_id.0,
++                    runtime.path_index,
++                    runtime.path_id.map(|path_id| path_id.0),
++                    connection.path_instance_id.as_u64(),
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(payload.len() as u64),
++                ),
++            );
++        }
++    }
++}
++
+ /// Writes one ordered frame batch while preserving an inbound barrier for the
+ /// caller that owns the next lifecycle transition. The batch is one commit:
+ /// neither proof evidence nor frame ownership moves before the final flush.
+diff --git a/src/runtime/path/tcp/server.rs b/src/runtime/path/tcp/server.rs
+index 2c59753..b5a98ac 100644
+--- a/src/runtime/path/tcp/server.rs
++++ b/src/runtime/path/tcp/server.rs
+@@ -222,10 +222,34 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
+     let observed_path_state = path_registration.state_handle();
+     let observed_context = context.clone();
+     let terminal_commands = commands_tx.clone();
++    #[cfg(feature = "lab-diagnostics")]
++    let observed_path_instance_id = path_registration.path_instance_id();
+     let (path_frames, native_terminal) = spawn_encrypted_tcp_reader_with_terminal_result(
+         reader,
+         reliable_path_writer_frame_queue(context.mux_limits),
+         move |frame| {
++            #[cfg(feature = "lab-diagnostics")]
++            if let Frame::StreamData {
++                stream_id,
++                offset,
++                payload,
++            } = frame
++            {
++                // Existing callback: authenticated complete decode, before
++                // the bounded native-actor mailbox, not Product delivery.
++                crate::lab_diagnostics::lab_diagnostic(
++                    "request_reader",
++                    format_args!(
++                        "phase=decoded domain=tcp session_id={} path_id={} path_instance_id={} stream_id={} frame_start={} frame_end={}",
++                        session_id.0,
++                        path_id.0,
++                        observed_path_instance_id.as_u64(),
++                        stream_id.0,
++                        offset,
++                        offset.saturating_add(payload.len() as u64),
++                    ),
++                );
++            }
+             observe_authenticated_server_tcp_frame(
+                 frame,
+                 session_id,
+diff --git a/src/runtime/relay/client.rs b/src/runtime/relay/client.rs
+index 23783ec..64867dd 100644
+--- a/src/runtime/relay/client.rs
++++ b/src/runtime/relay/client.rs
+@@ -805,6 +805,8 @@ pub(super) fn apply_client_stream_ack(
+     let normalized_ranges = validated_ack.ranges();
+     #[cfg(feature = "lab-diagnostics")]
+     let previous_reinjection_bytes = send_stream.reinjection_bytes();
++    #[cfg(feature = "lab-diagnostics")]
++    let ack_frontier_before = send_stream.data_ack_frontier();
+     let ack_outcome =
+         sender.apply_request_product_ack(context, remotes, send_stream, &validated_ack)?;
+     for instance in ack_outcome.idle_original_data_instances.iter().copied() {
+@@ -844,10 +846,12 @@ pub(super) fn apply_client_stream_ack(
+     #[cfg(not(feature = "lab-diagnostics"))]
+     let _ = reinjection;
+     #[cfg(feature = "lab-diagnostics")]
++    let ack_first_gap = normalized_stream_ack_first_gap(normalized_ranges);
++    #[cfg(feature = "lab-diagnostics")]
+     lab_diagnostic(
+         "stream_ack_received",
+         format_args!(
+-            "stream_id={} complete={} ranges={} largest_end={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={}",
++            "stream_id={} applied=true complete={} ranges={} largest_end={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={} claimed_end={} frontier_before={} frontier_after={} ack_frame_frontier={} first_range_start={} first_range_end={} first_gap_present={} first_gap_start={} first_gap_end={} authoritative_horizon={:?}",
+             stream_id.0,
+             complete,
+             normalized_ranges.len(),
+@@ -864,6 +868,16 @@ pub(super) fn apply_client_stream_ack(
+             path_snapshot.map(|snapshot| snapshot.underlay),
+             reinjection.has_multipath_alternative,
+             reinjection.persistent_ready,
++            send_stream.next_offset(),
++            ack_frontier_before,
++            send_stream.data_ack_frontier(),
++            crate::protocol::frame::stream_ack_contiguous_frontier(normalized_ranges),
++            normalized_ranges.first().map_or(0, |range| range.start),
++            normalized_ranges.first().map_or(0, |range| range.end),
++            ack_first_gap.is_some(),
++            ack_first_gap.map_or(0, |gap| gap.0),
++            ack_first_gap.map_or(0, |gap| gap.1),
++            last_send_ack.horizon(),
+         ),
+     );
+     state.progress.last_stream_at = Instant::now();
+diff --git a/src/runtime/relay/server.rs b/src/runtime/relay/server.rs
+index e70c981..18e9370 100644
+--- a/src/runtime/relay/server.rs
++++ b/src/runtime/relay/server.rs
+@@ -588,6 +588,9 @@ impl ServerReceiveHoleDiagnostics {
+         stream_id: StreamId,
+         recv_stream: &ReliableRecvStream,
+         delivered_bytes: usize,
++        frame_start: u64,
++        frame_end: u64,
++        frontier_before: u64,
+     ) {
+         let now = Instant::now();
+         let reorder_bytes = recv_stream.reorder_bytes();
+@@ -598,13 +601,16 @@ impl ServerReceiveHoleDiagnostics {
+             lab_diagnostic(
+                 "server_receive_hole",
+                 format_args!(
+-                    "stream_id={} state=open next_offset={} reorder_bytes={} range_count={} first_gap_start={} first_gap_end={}",
++                    "stream_id={} state=open next_offset={} reorder_bytes={} range_count={} first_gap_start={} first_gap_end={} frame_start={} frame_end={} frontier_before={}",
+                     stream_id.0,
+                     recv_stream.next_offset(),
+                     reorder_bytes,
+                     ranges.len(),
+                     first_gap.map_or(0, |gap| gap.0),
+                     first_gap.map_or(0, |gap| gap.1),
++                    frame_start,
++                    frame_end,
++                    frontier_before,
+                 ),
+             );
+         } else if reorder_bytes == 0
+@@ -613,11 +619,14 @@ impl ServerReceiveHoleDiagnostics {
+             lab_diagnostic(
+                 "server_receive_hole",
+                 format_args!(
+-                    "stream_id={} state=clear duration_us={} next_offset={} delivered_bytes={}",
++                    "stream_id={} state=clear duration_us={} next_offset={} delivered_bytes={} frame_start={} frame_end={} frontier_before={}",
+                     stream_id.0,
+                     now.saturating_duration_since(opened_at).as_micros(),
+                     recv_stream.next_offset(),
+                     delivered_bytes,
++                    frame_start,
++                    frame_end,
++                    frontier_before,
+                 ),
+             );
+         }
+@@ -630,7 +639,7 @@ impl ServerReceiveHoleDiagnostics {
+                     lab_diagnostic(
+                         "server_receive_delivery_stall",
+                         format_args!(
+-                            "stream_id={} duration_us={} delivered_bytes={} next_offset={} reorder_bytes={} range_count={} first_gap_start={} first_gap_end={} hole_open={}",
++                            "stream_id={} duration_us={} delivered_bytes={} next_offset={} reorder_bytes={} range_count={} first_gap_start={} first_gap_end={} hole_open={} frame_start={} frame_end={} frontier_before={}",
+                             stream_id.0,
+                             delivery_gap.as_micros(),
+                             delivered_bytes,
+@@ -640,6 +649,9 @@ impl ServerReceiveHoleDiagnostics {
+                             first_gap.map_or(0, |gap| gap.0),
+                             first_gap.map_or(0, |gap| gap.1),
+                             self.opened_at.is_some(),
++                            frame_start,
++                            frame_end,
++                            frontier_before,
+                         ),
+                     );
+                 }
+@@ -3210,6 +3222,8 @@ where
+                             )?;
+                             #[cfg(feature = "lab-diagnostics")]
+                             let mux_started = Instant::now();
++                            #[cfg(feature = "lab-diagnostics")]
++                            let frontier_before = recv_stream.next_offset();
+                             let outcome = recv_stream.receive_data(offset, payload)?;
+                             #[cfg(feature = "lab-diagnostics")]
+                             lab_perf_record(
+@@ -3226,6 +3240,9 @@ where
+                                     .iter()
+                                     .map(|chunk| chunk.len())
+                                     .sum(),
++                                offset,
++                                offset.saturating_add(payload_len as u64),
++                                frontier_before,
+                             );
+                             for chunk in outcome.delivered.iter() {
+                                 stats.record_payload_bytes(chunk.len());
+diff --git a/src/runtime/sender/request.rs b/src/runtime/sender/request.rs
+index f9a6c00..76218f2 100644
+--- a/src/runtime/sender/request.rs
++++ b/src/runtime/sender/request.rs
+@@ -1440,6 +1440,32 @@ impl RequestSenderService {
+         // the final queue publication under the same fence.
+         self.multipath
+             .commit_enqueued_request_product_send(context, frame, plan, position, path_count);
++        #[cfg(feature = "lab-diagnostics")]
++        if let Frame::StreamData {
++            stream_id,
++            offset,
++            payload,
++        } = frame
++        {
++            // Successful Product ownership only. The native writer/command
++            // publication follows this boundary; this is not wire delivery.
++            lab_diagnostic(
++                "request_product_commit",
++                format_args!(
++                    "stream_id={} frame_start={} frame_end={} payload_bytes={} cause={} kind={} underlay={:?} path_index={} path_instance_id={} attachment_id={}",
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(payload.len() as u64),
++                    payload.len(),
++                    cause.as_str(),
++                    if plan.assigns_original_data() { "original" } else { "reinjection" },
++                    instance.key.underlay,
++                    instance.key.index,
++                    instance.path_instance_id.as_u64(),
++                    instance.attachment_id,
++                ),
++            );
++        }
+         Ok((payload_bytes, accepted_copy_deadline))
+     }
+ 
+diff --git a/src/runtime/sender/request/multipath.rs b/src/runtime/sender/request/multipath.rs
+index d0436c7..9627135 100644
+--- a/src/runtime/sender/request/multipath.rs
++++ b/src/runtime/sender/request/multipath.rs
+@@ -1098,18 +1098,61 @@ impl RequestMultipathController {
+         ] {
+             let mut tier = observation.clone();
+             for path in &mut tier.paths {
++                #[cfg(feature = "lab-diagnostics")]
++                let mut gate = "writer_not_ready";
+                 let eligible = ready.contains(&path.instance)
+-                    && request_path_eligibility(path.shared_snapshot, lane) == eligibility
+-                    && self
+-                        .request
+-                        .requalification
+-                        .stale_for_original_data(path.instance)
+-                        == stale
+-                    && remotes.paths.iter().any(|remote| {
+-                        remote.instance() == path.instance
+-                            && remote.stream.product_admission_active()
+-                            && payload_bytes <= remote.stream.max_frame_payload_bytes
+-                    });
++                    && {
++                        #[cfg(feature = "lab-diagnostics")]
++                        {
++                            gate = "wrong_tier";
++                        }
++                        request_path_eligibility(path.shared_snapshot, lane) == eligibility
++                    }
++                    && {
++                        #[cfg(feature = "lab-diagnostics")]
++                        {
++                            gate = "wrong_stale_class";
++                        }
++                        self.request
++                            .requalification
++                            .stale_for_original_data(path.instance)
++                            == stale
++                    }
++                    && {
++                        #[cfg(feature = "lab-diagnostics")]
++                        {
++                            gate = "remote_or_frame_refused";
++                        }
++                        remotes.paths.iter().any(|remote| {
++                            remote.instance() == path.instance
++                                && remote.stream.product_admission_active()
++                                && payload_bytes <= remote.stream.max_frame_payload_bytes
++                        })
++                    };
++                #[cfg(feature = "lab-diagnostics")]
++                crate::lab_diagnostics::lab_counted_diagnostic(
++                    "request_prepared_plan",
++                    self.stream_id.0,
++                    path.instance.path_instance_id.as_u64(),
++                    if eligible { "tier_eligible" } else { gate },
++                    || {
++                        format!(
++                            "underlay={:?} path_index={} attachment_id={} C={} q={} tier={:?} stale_class={} raw_can_enqueue={} raw_stream_lane={} native_unavailable={} snapshot_present={} ready_instances={:?}",
++                            path.instance.key.underlay,
++                            path.instance.key.index,
++                            path.instance.attachment_id,
++                            reliable_stream_frame_extent(frame).map_or(0, |(start, _, _)| start),
++                            payload_bytes,
++                            eligibility,
++                            stale,
++                            path.can_enqueue_frame,
++                            path.can_enqueue_stream_lane,
++                            path.native_authority_unavailable,
++                            path.shared_snapshot.is_some(),
++                            ready,
++                        )
++                    },
++                );
+                 path.can_enqueue_frame &= eligible;
+                 path.can_enqueue_stream_lane &= eligible;
+             }
+@@ -1129,7 +1172,7 @@ impl RequestMultipathController {
+                 };
+                 let target = plan.target.instance;
+                 let allowed = if lane.is_bulk() {
+-                    self.bulk_original_data_authority_from_observation(
++                    let authority = self.bulk_original_data_authority_from_observation(
+                         context,
+                         remotes,
+                         &plan,
+@@ -1137,8 +1180,40 @@ impl RequestMultipathController {
+                         frontier_state,
+                         plan.load_expectation().is_some(),
+                         authority_observation,
+-                    )
+-                    .is_some_and(RequestOriginalDataApplyAuthority::has_headroom)
++                    );
++                    let has_headroom =
++                        authority.is_some_and(RequestOriginalDataApplyAuthority::has_headroom);
++                    #[cfg(feature = "lab-diagnostics")]
++                    crate::lab_diagnostics::lab_counted_diagnostic(
++                        "request_prepared_plan",
++                        self.stream_id.0,
++                        target.path_instance_id.as_u64(),
++                        "whole_frame_authority",
++                        || {
++                            let mut fields = format!(
++                                "underlay={:?} path_index={} attachment_id={} C={} q={} authority_present={}",
++                                target.key.underlay,
++                                target.key.index,
++                                target.attachment_id,
++                                reliable_stream_frame_extent(frame)
++                                    .map_or(0, |(start, _, _)| start),
++                                payload_bytes,
++                                authority.is_some(),
++                            );
++                            if let Some(authority) = authority {
++                                fields.push_str(&format!(
++                                    " position={:?} total_O={} W={} O_i={} P_i={} E_i={} assignment_limit={} assignment_q={} allowed={}",
++                                    authority.position, authority.stream_outstanding_bytes,
++                                    authority.stream_limit_bytes, authority.output_outstanding_bytes,
++                                    authority.output.product_limit_bytes, authority.output.exploration_limit_bytes,
++                                    authority.output.assignment_limit_bytes, authority.output.assignment_payload_bytes,
++                                    has_headroom,
++                                ));
++                            }
++                            fields
++                        },
++                    );
++                    has_headroom
+                 } else {
+                     self.plan_retains_exact_product_headroom(&plan)
+                 };
+@@ -2363,6 +2438,21 @@ impl RequestMultipathController {
+                 .flights
+                 .has_missing_original_transmission_before_offset(offset, &remotes.path_instances())
+         {
++            #[cfg(feature = "lab-diagnostics")]
++            crate::lab_diagnostics::lab_counted_diagnostic(
++                "request_prepared_plan",
++                self.stream_id.0,
++                0,
++                "missing_original_instance",
++                || {
++                    format!(
++                        "path_instance_present=false C={} q={} attached_paths={}",
++                        reliable_stream_frame_extent(frame).map_or(0, |(start, _, _)| start),
++                        reliable_stream_frame_accounted_bytes(frame),
++                        remotes.paths.len()
++                    )
++                },
++            );
+             return Err(RequestMultipathPlanError::ServiceBlocked);
+         }
+         self.next_send_index %= remotes.paths.len();
+diff --git a/src/runtime/sender/request/prepared.rs b/src/runtime/sender/request/prepared.rs
+index 47c7b54..a1280d4 100644
+--- a/src/runtime/sender/request/prepared.rs
++++ b/src/runtime/sender/request/prepared.rs
+@@ -171,6 +171,74 @@ fn current_ready_instances(state: &RequestProductState) -> Vec<RelayPathInstance
+         .collect()
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn trace_prepared_claim(
++    stage: &'static str,
++    stream_id: u64,
++    instance: RelayPathInstance,
++    state: Option<&RequestProductState>,
++    ready: &ReliableWriterReadyGuard,
++    detail: impl FnOnce() -> String,
++) {
++    crate::lab_diagnostics::lab_counted_diagnostic(
++        "request_prepared_claim",
++        stream_id,
++        instance.path_instance_id.as_u64(),
++        stage,
++        || {
++            let mut fields = format!(
++                "underlay={:?} path_index={} attachment_id={} own_ready_current={} state_present={}",
++                instance.key.underlay,
++                instance.key.index,
++                instance.attachment_id,
++                ready.receipt().is_current(),
++                state.is_some(),
++            );
++            if let Some(state) = state {
++                fields.push_str(&format!(
++                    " C={} F={} data_bytes={} q={} send_credit_bytes={} cache_bytes={} claims_active={} frontier_mode={:?}",
++                    state.send_stream.next_offset(), state.send_stream.data_ack_frontier(),
++                    state.sender_queue.data_bytes(), state.prepared.data_quantum_bytes,
++                    state.send_stream.send_credit_bytes(), state.send_stream.reinjection_bytes(),
++                    state.prepared.claims_active, frontier(state),
++                ));
++                if let Some((_, queued)) = state.sender_queue.front() {
++                    let (kind, frame, cause) = match &queued.kind {
++                        ReliableRelayQueuedWorkKind::Data(_) => ("data", None, None),
++                        ReliableRelayQueuedWorkKind::Control(frame) => {
++                            ("control", Some(frame), None)
++                        }
++                        ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => {
++                            ("reinjection", Some(frame), Some(*cause))
++                        }
++                    };
++                    let extent =
++                        frame.and_then(crate::protocol::frame::reliable_stream_frame_extent);
++                    let target = cause.and_then(RelaySendCause::request_reinjection_target);
++                    fields.push_str(&format!(
++                        " front_kind={} front_enqueue_id={} front_bytes={} front_age_us={} front_cause={} front_range_present={} front_start={} front_end={} front_bound_present={}",
++                        kind, queued.enqueue_id, queued.payload_bytes, queued.queued_at.elapsed().as_micros(),
++                        cause.map(RelaySendCause::as_str).unwrap_or("none"), extent.is_some(),
++                        extent.map_or(0, |(start, _, _)| start), extent.map_or(0, |(_, end, _)| end),
++                        target.is_some(),
++                    ));
++                    if let Some(target) = target {
++                        fields.push_str(&format!(
++                            " front_target_underlay={:?} front_target_index={} front_target_instance_id={} front_target_attachment_id={}",
++                            target.key.underlay, target.key.index, target.path_instance_id.as_u64(), target.attachment_id,
++                        ));
++                    }
++                } else {
++                    fields.push_str(" front_kind=empty");
++                }
++            }
++            fields.push(' ');
++            fields.push_str(&detail());
++            fields
++        },
++    );
++}
++
+ /// Every owner acquisition is nonblocking so contention cannot park the native
+ /// writer's input service. No await or Native read occurs between the final
+ /// owner lock and Product commit. Refused source remains shared and unclaimed.
+@@ -181,34 +249,60 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+     ready: &ReliableWriterReadyGuard,
+     registration: &PreparedOriginalRegistration,
+ ) -> RequestPreparedClaim {
++    macro_rules! trace {
++        ($stage:expr, $state:expr, $($arg:tt)*) => {
++            #[cfg(feature = "lab-diagnostics")]
++            trace_prepared_claim($stage, registration.diagnostic_stream_id().0, instance,
++                $state, ready, || format!($($arg)*));
++        };
++    }
+     if ready.receipt().instance() != instance.path_instance_id {
++        trace!("wrong_writer_instance", None, "");
+         return RequestPreparedClaim::Empty;
+     }
+     let mut state = match owner.arm_claim().try_lock() {
+         Ok(state) => state,
+-        Err(wait) => return RequestPreparedClaim::Busy(wait),
++        Err(wait) => {
++            trace!("busy_initial", None, "");
++            return RequestPreparedClaim::Busy(wait);
++        }
+     };
+     if !registration_is_current(&state, instance, registration) {
++        trace!("registration_initial", Some(&state), "");
+         return RequestPreparedClaim::Empty;
+     }
+     let wake = arm_work_change(&state, context, instance);
+     let lane = state.prepared.request_lane;
+     let quantum = state.prepared.data_quantum_bytes;
+     let Some((_, queued)) = state.sender_queue.front() else {
++        trace!("source_empty", Some(&state), "");
+         return RequestPreparedClaim::Empty;
+     };
+     let ReliableRelayQueuedWorkKind::Data(payload) = &queued.kind else {
++        trace!("source_front_not_data", Some(&state), "");
+         return RequestPreparedClaim::Blocked(wake);
+     };
+     let payload = payload.slice(..quantum.min(payload.len()).max(1));
+     let frame = match state.send_stream.prepare_data(payload) {
+         Ok(frame) => frame,
+         Err(
+-            StreamError::FlowControlBlocked { .. }
++            error @ (StreamError::FlowControlBlocked { .. }
+             | StreamError::ReinjectionCacheFull { .. }
+-            | StreamError::TooManyReinjectionCacheChunks { .. },
+-        ) => return RequestPreparedClaim::Blocked(wake),
++            | StreamError::TooManyReinjectionCacheChunks { .. }),
++        ) => {
++            #[cfg(feature = "lab-diagnostics")]
++            let stage = match &error {
++                StreamError::FlowControlBlocked { .. } => "mux_credit",
++                StreamError::ReinjectionCacheFull { .. } => "mux_cache_bytes",
++                _ => "mux_cache_chunks",
++            };
++            trace!(stage, Some(&state), "error={:?}", error);
++            #[cfg(not(feature = "lab-diagnostics"))]
++            let _ = error;
++            return RequestPreparedClaim::Blocked(wake);
++        }
+         Err(error) => {
++            trace!("mux_source_error", Some(&state), "error={:?}", error);
+             record_source_error(&mut state, RuntimeError::Stream(error));
+             return RequestPreparedClaim::Empty;
+         }
+@@ -217,15 +311,23 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+         let RequestProductState {
+             sender, remotes, ..
+         } = &mut *state;
+-        if sender
++        if let Err(error) = sender
+             .multipath
+             .prepare_original_claim(context, remotes, &frame)
+-            .is_err()
+         {
++            trace!(
++                "prepare_original_refused",
++                Some(&state),
++                "error={:?}",
++                error
++            );
++            #[cfg(not(feature = "lab-diagnostics"))]
++            let _ = error;
+             return RequestPreparedClaim::Blocked(wake);
+         }
+     }
+     if !ready.receipt().is_current() {
++        trace!("ready_before_capture", Some(&state), "");
+         return RequestPreparedClaim::Blocked(wake);
+     }
+     let capture =
+@@ -238,12 +340,27 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+     // competing holder. Busy discards this advisory capture and retries fresh.
+     let mut state = match owner.arm_claim().try_lock() {
+         Ok(state) => state,
+-        Err(wait) => return RequestPreparedClaim::Busy(wait),
++        Err(wait) => {
++            trace!("busy_after_capture", None, "");
++            return RequestPreparedClaim::Busy(wait);
++        }
+     };
+     if !registration_is_current(&state, instance, registration) {
++        trace!("registration_after_capture", Some(&state), "");
+         return RequestPreparedClaim::Empty;
+     }
+-    if !source_matches(&mut state, &frame, lane, quantum) || !ready.receipt().is_current() {
++    let source_current = source_matches(&mut state, &frame, lane, quantum);
++    if !source_current || !ready.receipt().is_current() {
++        trace!(
++            if source_current {
++                "ready_after_capture"
++            } else {
++                "source_after_capture"
++            },
++            Some(&state),
++            "planned_frame={:?}",
++            crate::protocol::frame::reliable_stream_frame_extent(&frame)
++        );
+         return RequestPreparedClaim::Blocked(wake);
+     }
+     let include_bulk = lane.is_bulk()
+@@ -257,6 +374,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+         include_bulk,
+         inputs.clone(),
+     ) else {
++        trace!("membership_after_capture", Some(&state), "");
+         return RequestPreparedClaim::Blocked(wake);
+     };
+     {
+@@ -274,6 +392,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+             true,
+             inputs.clone(),
+         ) else {
++            trace!("authority_membership_after_capture", Some(&state), "");
+             return RequestPreparedClaim::Blocked(wake);
+         };
+         Some(authority)
+@@ -292,9 +411,27 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+         &ready_instances,
+     ) {
+         Ok(plan) => plan,
+-        Err(_) => return RequestPreparedClaim::Blocked(wake),
++        Err(error) => {
++            trace!(
++                "plan_refused",
++                Some(&state),
++                "error={:?} ready_instances={:?}",
++                error,
++                ready_instances
++            );
++            #[cfg(not(feature = "lab-diagnostics"))]
++            let _ = error;
++            return RequestPreparedClaim::Blocked(wake);
++        }
+     };
+     if plan.target().1 != instance {
++        trace!(
++            "other_selected",
++            Some(&state),
++            "selected={:?} ready_instances={:?}",
++            plan.target().1,
++            ready_instances
++        );
+         let selected = state
+             .prepared
+             .registrations
+@@ -316,6 +453,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+             ReliablePathStreamOutput::Switchable(_) => None,
+         }
+     }) else {
++        trace!("selected_output_absent", Some(&state), "");
+         return RequestPreparedClaim::Blocked(wake);
+     };
+     drop(state);
+@@ -325,12 +463,27 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+     let result = plan.commit_with_current_native_shape(&commands, |shape| {
+         let mut state = match attempt.try_lock() {
+             Ok(state) => state,
+-            Err(wait) => return Some(RequestPreparedClaim::Busy(wait)),
++            Err(wait) => {
++                trace!("busy_fenced", None, "");
++                return Some(RequestPreparedClaim::Busy(wait));
++            }
+         };
+         if !registration_is_current(&state, instance, registration) {
++            trace!("registration_fenced", Some(&state), "");
+             return Some(RequestPreparedClaim::Empty);
+         }
+-        if !source_matches(&mut state, &frame, lane, quantum) || !ready.receipt().is_current() {
++        let source_current = source_matches(&mut state, &frame, lane, quantum);
++        if !source_current || !ready.receipt().is_current() {
++            trace!(
++                if source_current {
++                    "ready_fenced"
++                } else {
++                    "source_fenced"
++                },
++                Some(&state),
++                "planned_frame={:?}",
++                crate::protocol::frame::reliable_stream_frame_extent(&frame)
++            );
+             return None;
+         }
+         let current_inputs = match shape {
+@@ -348,6 +501,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+             include_bulk,
+             current_inputs.clone(),
+         ) else {
++            trace!("membership_fenced", Some(&state), "");
+             return None;
+         };
+         let full_authority = if lane.is_bulk() && !include_bulk {
+@@ -359,6 +513,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+                 true,
+                 current_inputs,
+             ) else {
++                trace!("authority_membership_fenced", Some(&state), "");
+                 return None;
+             };
+             Some(authority)
+@@ -378,9 +533,27 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+                 &ready_instances,
+             ) {
+                 Ok(plan) => plan,
+-                Err(_) => return None,
++                Err(error) => {
++                    trace!(
++                        "replan_refused",
++                        Some(&state),
++                        "error={:?} ready_instances={:?}",
++                        error,
++                        ready_instances
++                    );
++                    #[cfg(not(feature = "lab-diagnostics"))]
++                    let _ = error;
++                    return None;
++                }
+             };
+         if current_plan.target().1 != instance {
++            trace!(
++                "other_selected_fenced",
++                Some(&state),
++                "selected={:?} ready_instances={:?}",
++                current_plan.target().1,
++                ready_instances
++            );
+             other_selected = state
+                 .prepared
+                 .registrations
+@@ -393,6 +566,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+             .proof_expectation()
+             .is_some_and(|proof| !context.relay_path_proof_epoch_is_current(instance.key, proof))
+         {
++            trace!("proof_changed", Some(&state), "");
+             return None;
+         }
+         let request_load_claim =
+@@ -403,6 +577,13 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+                     active,
+                     latency_sensitive,
+                 ) else {
++                    trace!(
++                        "load_changed",
++                        Some(&state),
++                        "expected_active={} expected_latency={}",
++                        active,
++                        latency_sensitive
++                    );
+                     return None;
+                 };
+                 Some(claim)
+@@ -410,14 +591,17 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+                 None
+             };
+         let Some(position) = current_plan.target_position_for_apply(&state.remotes, lane) else {
++            trace!("target_position_changed", Some(&state), "");
+             return None;
+         };
+         if !current_plan.target_retains_exact_eligibility(context, lane) {
++            trace!("eligibility_changed", Some(&state), "");
+             return None;
+         }
+         // This is an imminent native action, not admission to a future Data
+         // command queue. Consuming the writer epoch cannot create W/P/E credit.
+         if !ready.try_consume() {
++            trace!("ready_consume_refused", Some(&state), "");
+             return None;
+         }
+         let RequestProductState {
+@@ -449,23 +633,39 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+             Ok(_) => {
+                 state.prepared.last_claimed_at = Some(Instant::now());
+                 state.prepared.work_changed.notify_waiters();
++                trace!(
++                    "claimed",
++                    Some(&state),
++                    "claimed_frame={:?}",
++                    crate::protocol::frame::reliable_stream_frame_extent(&frame)
++                );
+                 Some(RequestPreparedClaim::Claimed(frame.clone()))
+             }
+             Err(RequestFrameAdmissionError::Source(error)) => {
++                trace!("commit_source_error", Some(&state), "error={:?}", error);
+                 record_source_error(&mut state, RuntimeError::Stream(error));
+                 Some(RequestPreparedClaim::Empty)
+             }
+             Err(RequestFrameAdmissionError::Runtime(error)) => {
++                trace!("commit_runtime_error", Some(&state), "error={:?}", error);
+                 record_source_error(&mut state, error);
+                 Some(RequestPreparedClaim::Empty)
+             }
+             Err(
+-                RequestFrameAdmissionError::ServiceBlocked
++                error @ (RequestFrameAdmissionError::ServiceBlocked
+                 | RequestFrameAdmissionError::OrderedTerminalPending
+-                | RequestFrameAdmissionError::SourceChanged,
+-            ) => None,
++                | RequestFrameAdmissionError::SourceChanged),
++            ) => {
++                trace!("commit_refused", Some(&state), "error={:?}", error);
++                #[cfg(not(feature = "lab-diagnostics"))]
++                let _ = error;
++                None
++            }
+         }
+     });
++    if result.is_none() {
++        trace!("native_fence_refused", None, "");
++    }
+     if let Some(selected) = other_selected {
+         selected.notify();
+     }
+diff --git a/src/runtime/sender/request/scheduling.rs b/src/runtime/sender/request/scheduling.rs
+index 4e7ec9f..fe64f4f 100644
+--- a/src/runtime/sender/request/scheduling.rs
++++ b/src/runtime/sender/request/scheduling.rs
+@@ -928,6 +928,42 @@ struct BulkRelayCandidateDiagnostics {
+     snapshot: Option<PathSnapshot>,
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn trace_prepared_candidate(
++    normal_bulk_send: bool,
++    stream_id: StreamId,
++    path: &RequestRelayPathObservation,
++    offset: u64,
++    payload_bytes: usize,
++    stage: &'static str,
++    detail: impl FnOnce() -> String,
++) {
++    if !normal_bulk_send {
++        return;
++    }
++    crate::lab_diagnostics::lab_counted_diagnostic(
++        "request_prepared_plan",
++        stream_id.0,
++        path.instance.path_instance_id.as_u64(),
++        stage,
++        || {
++            format!(
++                "underlay={:?} path_index={} attachment_id={} C={} q={} masked_can_enqueue={} native_unavailable={} bulk_evidence={} snapshot_present={} {}",
++                path.instance.key.underlay,
++                path.instance.key.index,
++                path.instance.attachment_id,
++                offset,
++                payload_bytes,
++                path.can_enqueue_frame,
++                path.native_authority_unavailable,
++                path.has_bulk_model_evidence,
++                path.shared_snapshot.is_some(),
++                detail(),
++            )
++        },
++    );
++}
++
+ #[cfg(feature = "lab-diagnostics")]
+ impl BulkRelayCandidateDiagnostics {
+     fn skipped(
+@@ -1403,6 +1439,26 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+             // frontier exists, ordinary metric ranking remains authoritative.
+             return BulkRelayPathChoice::Selected(paths[position].instance());
+         }
++        #[cfg(feature = "lab-diagnostics")]
++        crate::lab_diagnostics::lab_counted_diagnostic(
++            "request_prepared_plan",
++            stream_id.0,
++            0,
++            "no_lead",
++            || {
++                format!(
++                    "path_instance_present=false C={} q={} paths={} reference={:?} lower_owner={:?} admitted_keys={:?} restrict_to_admitted={} lower_owner_ordering_debt={}",
++                    offset,
++                    payload_bytes,
++                    paths.len(),
++                    reference_key,
++                    lower_flight_owner,
++                    admitted_bulk_keys,
++                    restrict_to_admitted,
++                    lower_owner_cross_path_debt,
++                )
++            },
++        );
+         return BulkRelayPathChoice::Blocked;
+     }
+     let lead_key = lead.map(|lead| lead.key);
+@@ -1439,6 +1495,21 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+                 && !path.has_bulk_model_evidence
+                 && !validated_path
+             {
++                #[cfg(feature = "lab-diagnostics")]
++                trace_prepared_candidate(
++                    normal_bulk_send,
++                    stream_id,
++                    path,
++                    offset,
++                    payload_bytes,
++                    "candidate_proof_refused",
++                    || {
++                        format!(
++                            "capacity_unproven={} tcp_ack_clock_unproven={} validated={}",
++                            is_uncapacity_admitted, lacks_tcp_capacity_proof, validated_path
++                        )
++                    },
++                );
+                 #[cfg(feature = "lab-diagnostics")]
+                 log_bulk_relay_candidate_decision(
+                     BulkRelayCandidateDiagnostics::skipped(
+@@ -1459,6 +1530,16 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+             }
+         }
+         if normal_bulk_send && !path.can_enqueue_frame {
++            #[cfg(feature = "lab-diagnostics")]
++            trace_prepared_candidate(
++                normal_bulk_send,
++                stream_id,
++                path,
++                offset,
++                payload_bytes,
++                "candidate_masked",
++                String::new,
++            );
+             #[cfg(feature = "lab-diagnostics")]
+             log_bulk_relay_candidate_decision(
+                 BulkRelayCandidateDiagnostics::skipped(
+@@ -1496,6 +1577,21 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+             let owns_lower_frontier = lower_flight_owner == Some(key);
+             if restrict_to_admitted {
+                 if !owns_lower_frontier && !admitted_bulk_keys.contains(&key) {
++                    #[cfg(feature = "lab-diagnostics")]
++                    trace_prepared_candidate(
++                        normal_bulk_send,
++                        stream_id,
++                        path,
++                        offset,
++                        payload_bytes,
++                        "candidate_not_admitted",
++                        || {
++                            format!(
++                                "flow_local_shadow={} admitted_keys={:?}",
++                                exact_flow_local_candidate, admitted_bulk_keys
++                            )
++                        },
++                    );
+                     #[cfg(feature = "lab-diagnostics")]
+                     log_bulk_relay_candidate_decision(
+                         BulkRelayCandidateDiagnostics::skipped(
+@@ -1520,6 +1616,21 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+                     continue;
+                 }
+             } else if !owns_lower_frontier && Some(key) != reference_key {
++                #[cfg(feature = "lab-diagnostics")]
++                trace_prepared_candidate(
++                    normal_bulk_send,
++                    stream_id,
++                    path,
++                    offset,
++                    payload_bytes,
++                    "candidate_unproven_additional",
++                    || {
++                        format!(
++                            "flow_local_shadow={} reference={:?}",
++                            exact_flow_local_candidate, reference_key
++                        )
++                    },
++                );
+                 #[cfg(feature = "lab-diagnostics")]
+                 log_bulk_relay_candidate_decision(
+                     BulkRelayCandidateDiagnostics::skipped(
+@@ -1554,6 +1665,16 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+                 || request_path_has_exact_flow_local_delivery_evidence(path, request_state)
+                 || request_path_is_validated(path))
+         {
++            #[cfg(feature = "lab-diagnostics")]
++            trace_prepared_candidate(
++                normal_bulk_send,
++                stream_id,
++                path,
++                offset,
++                payload_bytes,
++                "candidate_no_sender_evidence",
++                || format!("flow_local_shadow={}", flow_local_shadow_gate.is_some()),
++            );
+             #[cfg(feature = "lab-diagnostics")]
+             if flow_local_shadow_gate.is_none() {
+                 log_bulk_relay_candidate_decision(
+@@ -1584,6 +1705,16 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+             request_state,
+             path.load_owned,
+         ) else {
++            #[cfg(feature = "lab-diagnostics")]
++            trace_prepared_candidate(
++                normal_bulk_send,
++                stream_id,
++                path,
++                offset,
++                payload_bytes,
++                "candidate_no_snapshot",
++                String::new,
++            );
+             #[cfg(feature = "lab-diagnostics")]
+             if flow_local_shadow_gate.is_none() {
+                 log_bulk_relay_candidate_decision(
+@@ -1739,6 +1870,29 @@ fn choose_bulk_relay_path_for_extent_with_mode(
+             };
+             let ordering_suppression = bulk_product_candidate_resource_suppression(admission_check);
+             if let Some(reason) = ordering_suppression {
++                #[cfg(feature = "lab-diagnostics")]
++                trace_prepared_candidate(
++                    normal_bulk_send,
++                    stream_id,
++                    path,
++                    offset,
++                    payload_bytes,
++                    reason,
++                    || {
++                        format!(
++                            "position={:?} qualified={} O_i={} projected_P_i={} ordering_debt={} product_queue_debt={} carrier_queue_debt={} native_flight={} native_limit={}",
++                            position,
++                            admission_check.product_assignment_qualified,
++                            snapshot.data_level_bytes_in_flight,
++                            snapshot.data_level_limit_bytes,
++                            admission_ordering_debt,
++                            snapshot.data_level_queue_bytes,
++                            snapshot.queue_bytes,
++                            snapshot.bytes_in_flight,
++                            snapshot.carrier_inflight_limit_bytes,
++                        )
++                    },
++                );
+                 #[cfg(feature = "lab-diagnostics")]
+                 if let Some(diagnostics) = candidate_diagnostics {
+                     if flow_local_shadow_gate.is_none() {
+@@ -2011,7 +2165,7 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
+         })
+         .filter_map(|path| {
+             let key = path.key();
+-            let (snapshot, eta_ms) = scored_relay_path_snapshot_for_bulk_choice(
++            let Some((snapshot, eta_ms)) = scored_relay_path_snapshot_for_bulk_choice(
+                 observation,
+                 path.instance(),
+                 reference_key,
+@@ -2019,7 +2173,20 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
+                 payload_bytes,
+                 request_state,
+                 path.load_owned,
+-            )?;
++            ) else {
++                #[cfg(feature = "lab-diagnostics")]
++                crate::lab_diagnostics::lab_counted_diagnostic(
++                    "request_prepared_plan", observation.stream_id.0,
++                    path.instance.path_instance_id.as_u64(), "lead_no_score",
++                    || format!(
++                        "C_present=false underlay={:?} path_index={} attachment_id={} q={} reference={:?} lower_owner={:?} snapshot_present={} native_unavailable={} masked_can_enqueue={}",
++                        key.underlay, key.index, path.instance.attachment_id, payload_bytes,
++                        reference_key, lower_flight_owner, path.shared_snapshot.is_some(),
++                        path.native_authority_unavailable, path.can_enqueue_frame,
++                    ),
++                );
++                return None;
++            };
+             let stream_ordering_debt_bytes = if lower_flight_owner == Some(key) {
+                 lower_owner_cross_path_debt
+             } else {

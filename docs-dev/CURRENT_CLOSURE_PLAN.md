@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 16:35 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 17:03 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -10,7 +10,49 @@ approaches, remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`.
 Detailed evidence is linked below; shortening obsolete next-action prose does
 not discard findings, adverse results or acceptance gates.
 
-## Active transaction: available request source is not claimed
+## Active transaction: one owner for prepared stale-path preference
+
+**Observed failure / exact cause boundary:** latest capture completes484507648B
+in44.176499s but maxconfirmation4.478852s/maxwrite8.647851s remain. Longest
+C329149108 hold4.987s has a9.273s already-selected QUIC write across it;
+TCP writers attempt353+ claims inside the hold. No lost notice or critical
+queue-front cause is supported for that interval. Separate lateC471356880
+has Ready QUIC, positive unclaimed source and plan refusals atUnix1788857702445
+and7703448; stale tier eligibility is true but its input can_enqueue is false,
+while fresh TCP writers are not Ready. These sampled predicates select the
+double policy filter, not a claim that every downstream resource is free.
+
+**Origin / model / competing cause:**5d660f3b allowed stale fallback only when
+no attached active/scorable nonstale output exists. Its useful intent was to
+avoid feeding a stale output while permitting sole survivors.9720e4b later
+introduced finite Ready+fresh/stale tiers but reused that prefiltered snapshot.
+The first mask ignores writer Ready and downstream Product admission; the
+second tier can only AND it and cannot recover an eligible stale survivor.
+This is a false availability premise, not insufficient congestion aggression.
+The capture's largest actual server stalls remain already-written/predecode;
+they are not attributed to this narrower gate or waived by its correction.
+
+**Predicted bounded correction / falsifier:** separate resource observation
+from the legacy nonstale preference. Legacy callers retain their current
+wrapper/policy; prepared claims consume unmasked resource observations and
+apply their existing finite four-tier policy exactly once. Preserve full
+membership/Original debt, W/P/E, qualification, actual Ready, source and Native
+fences. No new rate, timer, hint or synthetic can_enqueue override. Test the
+actual producer with fresh active/scorable but non-Ready output and stale
+Ready output having positive exact authority. Require same lowest-source
+claim, without requalification or minting credit. Opposites: fresh Ready wins,
+selected withdrawal refuses, and exhausted stale P/E still refuses. No
+runtime edit until semantic controls pass and intended assertion is RED.
+
+**Acceptance / stop / order:** independent model/fixture audit, focused GREEN,
+then fresh ordinary e476308 parent first and candidate second on unchanged
+mixed upload. Parent may run during test-only preparation, never compilation.
+Retain full completion/timing/cost; adverse or ambiguous pair stops promotion,
+not a favorable retry. Expected benefit is removing avoidable fallback
+starvation; cost risk is more service on a stale path, bounded by unchanged
+authority. Critical queue priority and native recovery stay unchanged.
+
+## Completed discriminator: available request source is not claimed
 
 **Observed failure / priority:** second capture's largest target hold is
 F471135545 for6.295860s. Source S already485359616 atUnix1788855768480, but
@@ -37,7 +79,9 @@ gate; do not mislabel it as absence of every possible copy transmitter.
 
 **Smallest discriminator / acceptance:** one diagnostic on unchanged e476308
 and unchanged profile, using existing stage events plus bounded per-stage
-claim counts and first/last actual state at the existing1s diagnostic cadence.
+claim counts, first/last occurrence timestamps and sampled actual state at
+the existing1s diagnostic cadence. Counts are through each emitted sample,
+not a promised final total; no intermediate state is reconstructed.
 Observe queue front kind/cause/range/bound target, C/F/source bytes, Ready
 identities and already-computed admission/refusal inputs. No per-attempt log
 flood, extra Native sampling, queue scan for display, reservation or policy
@@ -46,12 +90,44 @@ must join actual refusals; absent holds are non-reproduction. Test a focused
 real producer counterexample before any model correction. Do not jump from
 empty native flight to removal of proven Product ownership.
 
+**Observer preparation16:40:** count notice publication/coalescing, dequeue/
+claim entry and deferred completion too: zero claims alone cannot distinguish
+no notice, parked wait and a genuinely occupied writer. Do not add a select
+or strong Product lifetime to instrument wake outcomes. A process-local
+bounded-capture helper formats state only when emitting and releases its own
+counter mutex before formatting/output; Busy has no new Product read. Reuse
+the first exact forward-range overlay, not the now-answered repair-route trace.
+
 **Retained alternative:** the same second capture has a different QoS5.138s
 hold: repair local acceptance→decode4.899s, route27us. All1407 completed repair
 routes total41.466ms/max3.494ms. That route alternative is closed for this
 capture; native ordered delivery/task service remains unresolved. No threshold
 change follows. Native reorder tolerance/priority source inspection is context,
 not measured missing-packet attribution. No native trace/retuning now.
+
+**Observer audit16:49:** actual claim-return stages and already-computed
+ planner inputs are sampled separately from notice/wake outcomes. Planner
+ counts are branch visits, not claim totals; shared candidate instrumentation
+ excludes repair-mode calls. Queue acceptance is separate from notification
+ activation. Biased wake labels identify selected branches, not exclusive
+ causes; physical-key counts may merge attachment generations. Root and
+ independent source reviews preserve all policy/Native reads and ownership.
+ Exact16-file overlay retained in PREPARED_CLAIM_SERVICE_TRACE_20260908.patch;
+ one diagnostic build next, no simultaneous lab. No runtime fix proposed.
+
+**Capture16:54:** warning-free optimized diagnostic build3m33s. Frozen as
+prepared-claim-service-20260908; all16 observer files reversed and src diff
+verified empty before capture. One unchanged-profile mixed upload now runs,
+with exact forward events plus request_prepared_claim/request_prepared_plan/
+prepared_notice. No build/lab overlap; target/release is diagnostic-only.
+
+**Result16:55:** runner0,45service samples,484507648 exactB/44.176499s.
+10428Originals cover complete source;6367ACKs release exactly that total.
+All Originals write/decode; four losing TCP copies lack positive completion.
+Top actual server holds4.408347/3.514626s concern already-written QUIC Originals.
+The prior long unclaimed-head geometry is not identically reproduced. Root
+and independent joins exclude lost notice/global critical front as causes of
+the largest pending-source interval. No runtime/performance acceptance.
 
 ## Completed discriminator: QoS forward-prefix stall
 
@@ -374,7 +450,7 @@ above500Mbps can be buffered observation, not wire capacity.
   overlap. Products/probes stopped; no build/lab. Origins retained.
 - Normal frozen candidate:`./.tmp/reflection/bin/advisory-owner-20260908/mptunnel`.
   Normal parent:`./.tmp/reflection/bin/copy-debt-20260908/mptunnel`.
-  Current diagnostic:`./.tmp/reflection/bin/qos-repair-read-20260908/mptunnel`.
+  Current diagnostic:`./.tmp/reflection/bin/prepared-claim-service-20260908/mptunnel`.
   target/release is that temporary diagnostic, not the ordinary executable.
 - Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
   No deletion this turn; ample root space. User7lines must stay unstaged.

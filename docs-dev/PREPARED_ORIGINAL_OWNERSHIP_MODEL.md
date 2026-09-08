@@ -675,3 +675,46 @@ idle recurrence, selected withdrawal, half-close and actual TCP/QUIC EOF.
 Two independent source/fixture reviews pass. The ordinary optimized candidate
 build and unchanged-profile pair follow; this checkpoint is not performance
 acceptance and does not supersede the control's5.052667s maximum gap.
+
+## One stale-preference owner — pre-change proof, 2026-09-08 17:07 +08:00
+
+PREPARED_CLAIM_SERVICE_20260908 separates two observed boundaries. The longest
+pending-source interval overlaps an occupied QUIC write and repeated TCP
+claims; its server's lower blocking range is already assigned. A different
+late sample has stale QUIC physically Ready but raw can_enqueue=false while
+fresh TCP writers are occupied. Neither observation alone proves all target
+resource authority is available. Do not equate a source-hold interval with a
+same-duration user-visible hold or claim that fallback repairs native delay.
+
+The source exposes a definite composition error to test. Let R_i mean current
+exact resource eligibility and D_i actual imminent writer readiness. The
+prepared chooser must attempt its ordered fresh/stale Regular/Backup classes
+over R_i AND D_i, retaining full membership for exact debt/position authority.
+Its reused legacy observation instead applies an earlier gate:
+
+    G_i = NOT stale_i OR NOT(any active/scorable nonstale attachment)
+
+so the chooser receives R_i AND G_i and cannot restore a candidate later.
+With fresh A occupied (D_A=false), stale B Ready (D_B=true), and positive
+current B authority, G_B=false even though A cannot claim. Every tier then
+refuses B. Repeated source/ACK/native wakes cannot repair this unchanged false
+predicate. This contradicts the earlier imminent-opportunity contract.
+
+Origin5d660f3b's gate usefully enabled stale sole-survivor fallback instead of
+an unconditional stale ban.9720e4b introduced a Ready-aware failed-pass model
+but retained the earlier attached-set policy. The correction is separation,
+not removal of stale preference: named legacy observation keeps its policy
+and short-circuit probe order; prepared resource observation omits that policy,
+and its existing finite tier pass owns the preference exactly once. Share the
+existing captured-evidence projection, not another Native read or cached view.
+
+The real-producer RED must first establish legal current source/proof/credit,
+actual stale transition and actual Ready ownership, then expose the refusal.
+Fresh Ready selection, exhausted stale P/E, selected withdrawal, byte/flight
+conservation and no false requalification are opposite controls. Successful
+stale service must keep its existing evidence-ineligible provenance. No lower
+resource limit, increased E, implicit protocol preference or new timer follows.
+Conditional benefit is earlier legitimate Original assignment when preferred
+writers cannot act; possible cost is use of a worse path under unchanged
+resource authority. The ordinary paired timing/completion/cost gate determines
+practical disposition; the large already-native stalls remain distinct.

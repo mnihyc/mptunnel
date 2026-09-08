@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 00:40 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 01:13 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,66 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Echo discriminator01:13:** preserve the completed twelve-cell comparison in
+HIGH_CAPACITY_REFERENCE_20260909 (407 available bins,445 attempts,64-member
+verified archive). One temporary diagnostic build on4c7e232 will observe only
+the actual echo logical stream, bound at its target-aware opening, not the
+management display ID. No change to ordinary authority, classification,
+placement, native transport, profile or probe workload is authorized.
+
+Information forecast: one healthy mixed DOWN capture can locate the material
+~0.4s loaded-echo excess relative to matched baselines among pre-output service,
+claim/selected transaction, post-handoff native/network ordering, and client
+delivery. Include the echo's exact eligible attachments and claim selection;
+existing aggregate path/queue data cannot prove an alternative existed. If no
+critical slow echo recurs or the trace cannot join its boundaries, retain that
+limit and do not infer a model fix. Diagnostic speed is not ordinary speed.
+Any proposed correction must explain why it removes the measured critical wait
+without reinstating rejected completion-rate admission vetoes or sacrificing
+bulk, sparse work, native ownership and failure/recovery. This is potentially
+hundreds of milliseconds per common request, not a ten-millisecond microfix.
+
+**Matched panel complete 00:58:** current ordinary4c7e232 behavior yields
+MPP TCP/QUIC/mixed UP421.445/441.123/415.285Mbps, all exact complete;
+DOWN420.435/424.650/403.212Mbps, all duration-partial successful bodies.
+Raw DOWN445.190, Xray444.097, Hysteria2466.401Mbps. Crucially loaded echo
+p95 is raw126ms/Xray127ms/H2114ms, versus MPP TCP1247ms/QUIC191ms/mixed501ms.
+All actual DOWN echo attempts succeed; fewer TCP attempts result from slower
+sequential echo completion, not omitted failures. This is not near-perfect
+experience, even though mixed-UP bulk and confirmation gaps improved materially.
+
+Raw UP459.960Mbps settles exactly. Xray435.647/H2467.542 are confirmed
+lower-bound observations only: both lose terminal sink acknowledgement after
+the load and leave11588312/11272003 locally accepted bytes unconfirmed.
+The runner/probe exit0 is not completion. The current probe suppresses raw bins
+when it marks ACK accounting invalid; those curves are unavailable, not zeros.
+Do not invent missing histories, call these completed baseline uploads, blame
+their protocols without exact closure evidence, or claim an MPP win from this
+probe/half-close limitation. DOWN comparisons are independently complete.
+
+**Next highest-impact existing owner:** short-request latency and mixed-path
+interference under bulk, now demonstrated on the high-capacity matched panel.
+TCP server queue_bytes is tcpi_notsent_bytes (native socket FIFO), whereas
+inflight_limit_bytes is cwnd*MSS, not a socket-buffer cap. Row21 unsent
+18.2/13.7/17.9MB versus cwnd3.99/3.72/5.62MB is not a proved cap violation.
+The exact physical writer can reopen Ready after native write/flush acceptance,
+before delivery; priority cannot preempt bytes already in that TCP FIFO.
+RFC10.4/15.1 and65edae3 intentionally retain this boundary rather than using a
+rate-derived admission veto. Do not restore that veto or invent a queue cap.
+
+One exact slow-echo timeline is the next discriminator: request/target receipt,
+positive response-source read, Original claim, physical write begin/end, client
+decode and local delivery, joined with logical stream/range/exact carrier and
+the echo's actual eligible attachments. Prompt claim/write followed by late
+decode selects post-handoff ordered/native or network debt; late write selects
+the selected transaction; late source selects pre-output work; late postdecode
+selects local service. Session-wide four-path presence does not establish that
+QUIC was eligible for this echo. Mixed Native RTT333–366ms versus Q-only101ms
+supports shared-queue suspicion, not exact attribution or unavoidable delay.
+Reuse the existing response observer with echo-only selection; no large bulk
+trace, new Native hook, rate/pool/queue threshold or runtime fix before evidence.
+The full reference report/archive is verified; no new lab is running yet.
 
 **Ablation outcome / next evidence 00:44:** ordinary mixed DOWN403.212112Mbps
 recovers part of the repeated384–387Mbps cost but remains below both413Mbps

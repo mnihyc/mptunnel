@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 18:15 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 18:39 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -10,7 +10,46 @@ approaches, remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`.
 Detailed evidence is linked below; shortening obsolete next-action prose does
 not discard findings, adverse results or acceptance gates.
 
-## Active transaction: exact ACK-support work exclusion
+## Active discriminator: forward prefix after ACK work reduction
+
+**Observed failure / question:** ordinary d999fea still has5.497708s maximum
+confirmation gap. QoS T234499808/Rs556 stay fixed for5.999s at server
+Unix1788863964962→3970961; S298391872→301608672, Rc528→556. During separate
+outage/recovery L32–36, S367394816/T300285952/Rs=Rc738 stay flat4.001s with
+exact64MiB S−T. TCP Recv-Q is0, TCP native ACKs advance7.31MB, but exact
+QUIC physical3 native ACK and62.97MB Product-debt counters remain flat.
+These facts select forward-prefix service, not all-Native or local-reader
+attribution. Which exact Original/copy owns the blocking byte; is it unclaimed,
+not locally written, predecode, or decoded but not delivered to target?
+
+**Model / existing evidence / alternatives:** preserve source A, claimed C,
+retained Original/copy ownership, native acceptance and receiver ordered F as
+distinct boundaries. Aggregate S−T and queue gauges cannot reconstruct C/F or
+the winning carrier. Existing QOS_FORWARD_PREFIX and QOS_REPAIR_READ observers
+already cover these boundaries, including repair-reader read/route residence.
+No new cost/claim framework or Native-controller inference is necessary yet.
+
+**Smallest next action / falsifier / stop:** reuse the archived11-file exact
+forward+repair-service observer on unchanged d999fea, omitting noisy general
+reinjection events. One unchanged diagnostic after independent review and
+archive/freeze/reverse. Join all Original claims/write/decode and ACK totals,
+then the actual winning-prefix interval. Prompt local delivery after decode
+excludes that stage; source/commit absence selects assignment rather than
+transport. Predecode alone still cannot assign Native loss/timer blame.
+No new or resurrected correction before a reachable real counterexample;
+diagnostic rate and non-reproduction are not ordinary improvement.
+
+## Completed transaction: exact ACK-support work exclusion
+
+**Ordinary pair18:40 — not promoted:** parent473104384B/47.992259s versus
+candidate393150464B/46.768581s, both exact/complete. Maxconfirmation
+3.060424→5.497708s and maxwrite4.396938→5.665049s worsen; firstconfirmation
+.368903→.378394s/firstwrite.091815→.115526s.78.863→67.250Mbps is not
+acceptance; earlier finish transfers less work. Independent fullphase/cost
+analysis retained in ACK_SUPPORT_SERVICE_20260908.md/raw.tar.gz (16files,
+95rawbins; integrity/range checks pass). Sourcework/exactsemantics remain proven, but
+there is no ordinary timing promotion or rollback to fullsuffix work from
+one randomaverage. No favorable repeat. New strongest hold is forward above.
 
 **Issue / measured motivation:** current reply capture completes387579904B
 in52.491225s, maxconfirmation3.508291s. Winning reply[863,877) has3.247s
@@ -94,6 +133,10 @@ The real suffix-fragmentation cases now each process2records; observed RED
 was3versus66. No rate/deadline/ACK/evidence policy changed. Checkpoint runtime,
 then one ordinary optimized build and fixed paired candidate. Component
 GREEN is not performance acceptance. Reply-chain evidence committed bd3b810.
+
+**Candidate18:39:** warning-free optimized build3m29s; ordinary d999fea frozen
+as ack-support-20260908. Source clean except user's7lines. Candidate now runs
+the unchanged mixed-upload profile, no diagnostic events/build overlap.
 
 ## Completed discriminator: already-read response service residence
 
@@ -617,8 +660,11 @@ a different stage, follow it rather than force the recovery-cost hypothesis.
 
 ## Current source and latest practical disposition
 
-Runtime checkpoint **b783cd6** separates prepared stale preference; actual RED
-checkpoint f1b0900. Its ordinary pair above is mixed/adverse and not promoted.
+Runtime checkpoint **d999fea** restricts request ACK release work to its exact
+support prefix; RED0683286 and546focused checks pass. Ordinary pair is
+mixed/adverse; no performance promotion. **b783cd6** separates prepared stale
+preference; actual RED checkpoint f1b0900. Its earlier ordinary pair is
+mixed/adverse and not promoted.
 Parent **e476308** adds the two nonblocking advisory acquisitions above; RED
 checkpoint584b748. Its ordinary result also remains mixed/adverse in timing.
 Earlier **9ea25e2** maintains exact additive accepted-copy debt
@@ -680,6 +726,7 @@ Do not silently package it as source cleanup.
 | Exact copy-debt index9ea25e2 |Work and conservation proved; ordinary settlement improves,11s gaps remain |
 | Native advisory owner admissione476308 |Actual two-cut contention RED/GREEN; no blocking native Product acquisition. Ordinary completion with worse gaps; no practical promotion |
 | Single prepared stale preferenceb783cd6 |Actual sole-Ready stale claim0→64KiB with fresh-Ready opposite and unchanged qualification;544 focused checks. Ordinary slower completion/larger confirmation gap; no promotion |
+| Exact ACK-support workd999fea |Actual suffix fragmentation66versus3RED; exact prefix/saved-boundary implementation preserves release semantics,546checks. Ordinary maxconfirmation3.06→5.50s and less completed work; no promotion |
 | Shelved paired-clock request sampler |Actual[2,2,2]→[2,3,4] sampling correction; ordinary incomplete/adverse, not stacked into runtime |
 
 Preserve prepared-source conservation and exact chosen readiness epochs:
@@ -724,15 +771,15 @@ above500Mbps can be buffered observation, not wire capacity.
 ## Execution, evidence and continuity
 
 - Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
-  overlap. Products/probes stopped; no build/lab. Origins retained.
-- Normal frozen candidate:`./.tmp/reflection/bin/prepared-stale-20260908/mptunnel`.
-  Normal parent:`./.tmp/reflection/bin/advisory-owner-20260908/mptunnel`.
-  Current diagnostic:`./.tmp/reflection/bin/terminal-service-20260908/mptunnel`.
-  target/release is the temporary terminal diagnostic, not the ordinary binary.
+  overlap. Ordinary pair complete; no build/lab. Origins retained.
+- Normal frozen candidate:`./.tmp/reflection/bin/ack-support-20260908/mptunnel`.
+  Normal parent:`./.tmp/reflection/bin/prepared-stale-20260908/mptunnel`.
+  Latest diagnostic:`./.tmp/reflection/bin/reply-residence-20260908/mptunnel`.
+  target/release is ordinary d999fea after the latest optimized build.
 - Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
   No deletion this turn; ample root space. User7lines must stay unstaged.
-- Telegram latest ordinary adverse-pair report sent during09:38UTC; next
-  nonurgent not before10:42UTC (conservative hourly boundary). Respect the
+- Telegram latest ordinary adverse-pair report sent10:43:44UTC; next
+  nonurgent not before11:44UTC (conservative hourly boundary). Respect the
   hourly minimum and soft-frequency advisory.
   No component-only success notification or unfinished completion claim.
 - Reflection: exact symbolic conservation enabled one justified work deletion,

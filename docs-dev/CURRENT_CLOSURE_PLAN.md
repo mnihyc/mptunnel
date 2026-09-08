@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 13:05 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 13:24 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -12,7 +12,10 @@ Shortening this ledger discards neither failures nor gates.
 
 ## Current source and disposition
 
-Last ordinary performance-tested runtime **1436ff4**: globally ordered direct request structural recovery,
+Latest ordinary candidate **9720e4b**: prepared request claim migration;533
+focused checks/audit, but the ordinary mixed upload fails settlement. Full
+evidence: PREPARED_ORIGINAL_ORDINARY_20260908.md and raw archive. **No promotion.**
+Its comparator **1436ff4** has globally ordered direct request structural recovery,
 483 current focused checks plus independent review; ordinary comparison is
 phase-mixed and not performance-accepted. Its frozen comparator **445011f**
 remains available. Earlier89a1a63 retains that comparator's own mixed/adverse
@@ -29,6 +32,7 @@ LIVE_OWNER_FRONTIER_WORK_BOUND.md addition remains untouched.
 | Response retained assignment recovery,953a54f |333checks; no-ACK/H<F and immutable head deadline, preserved active/final admission |35.608->43.611Mbps but maxgap4.799931->6.080193s; no practical promotion |
 | Ranked-prefix query,445011f |321checks; equal exact output, fewer irrelevant visits |36.394->71.344Mbps but maxgap4.260012->4.627694s; no practical promotion |
 | Ordered direct request structural recovery,1436ff4 |Three publication-order REDs, actual overlap-count RED;483current GREEN/audit |75.320->76.112Mbps and lower maxgap, but severe adverse early delivery; no promotion |
+| Prepared request ownership,9720e4b |Actual source/claim, retry-cycle/clock RED→GREEN;533checks/audit |Early T@10s4.86→142.11MB, then75s return hold/69s target plateau; incomplete, no promotion |
 | Shelved paired-clock request sampler |Actual pipelined[2,2,2]->[2,3,4];23checks |TCP incomplete/adverse, not stacked into runtime |
 
 Random realizations and unequal accepted work prevent a simple causal
@@ -410,15 +414,43 @@ it is discarded as verification, not counted as new RED or GREEN. Recorded
 GREEN is from the completed rebuild. Small raw logs are retained with this
 checkpoint; no ordinary speed or ideality claim follows.
 
-**Next exact transaction:** commit this coherent request-only mechanism
-checkpoint, then build the normal optimized binary. Compare1436ff4 control
-against this candidate, both endpoints, on the pinned ordinary mixed-upload
-profile. Preserve exact bytes/completion, first service, forward/return series,
-gaps, recovery and wire/CPU/RSS cost. Stop promotion on adverse or ambiguous
-evidence; no favourable third trial, profile tuning or response implementation
-stack. The candidate has changed the request placement boundary, not the final
-direction-neutral RFC contract: response parity and RFC amendment remain
-explicit obligations before model acceptance.
+**Ordinary comparison executed; promotion stopped:**9720e4b committed, normal
+optimized build3m29s, frozen candidate and1436ff4 control used at both endpoints.
+Control262668288 exact bytes/52.186854s/40.266Mbps; candidate incomplete,
+106114466 confirmed/197984256 locally accepted at85.671962s. Runner settlement
+guard terminates products; final reset is teardown, not an independently proven
+network failure. Candidate raw confirmation bins unavailable, not reconstructed.
+Its max completed gap1.464514s hides a75.001s sampled final return hold; it is
+not a latency improvement. Early target progress improves (10s4.86→142.11MB),
+then target holds178383138B for69s. S is consumed source, not claimed C; S−T
+is131072B at16s and2.56MB at85s, not a full64MiB undelivered window.
+
+**Next exact transaction:** substantial return bytes are already in client TCP
+Recv-Q (~1.8MB); only111979B is consumed across16–85s. Server return sockets
+are rwnd-limited. Client lifetime CPU is elevated; this alone does not locate
+the cause. Actual source Read turns continue in portions of the hold, excluding
+a continuously blocked local-response-write loop as the entire explanation.
+Locate exact response frontier267 through receive/decode/handoff and service;
+do not assume response parity or queue-size changes solve it.
+
+Source review additionally finds an actual native-loop recurrence candidate:
+when all writer claims refuse unchanged admission, each publish/drop of Ready
+wakes the other's deferred token. OUTSTANDING coalesces tokens, not retries.
+The earlier valid-winner race test does not cover all-refused service. Next
+construct real prepared source + actual admission withdrawal, singleton park
+control and two real receiver/deferred-loop RED before any fix. This is a
+bounded candidate CPU-churn defect, NOT yet the75s ordinary root cause. Do not
+invent zero receiver credit with impossible prepared U; retain actual producer
+and conservation premises. No timer/rate/queue tweak or ordinary repeat.
+
+Normal build also exposed an obsolete Original dispatcher kept alive only by
+tests. Its deletion is code/test reachability cleanup, not a performance fix:
+ten repair controls move to the production repair API; actual claim and used
+core-commit tests replace old MPSC Original assertions. Test/diagnostic-only
+facades receive exact cfg gates, no blanket dead-code suppression. This source
+cleanup is separate from the frozen9720e4b performance result; verification is
+in progress. Direction-neutral response parity/RFC amendment remain pending,
+not a prerequisite excuse to skip the current adverse-stage diagnosis.
 Response parity and all existing global gates remain pending, not waived.
 
 **Falsifier/stop:** if head work was already promptly published, pursue its
@@ -471,14 +503,14 @@ aggregate300/200 defaults as200each. Do not tune this profile to pass.
 - Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
   overlap. All products/probes are stopped; origin services retained.
 - No diagnostic overlay or active lab. Request prepared-claim candidate533GREEN/
-  audit; ordinary candidate comparison is next. Performance promotion remains
-  stopped on earlier adverse delivery. Products/probes stopped; comparators and
-  raw evidence retained.
+  audit has failed its ordinary comparison. Products/probes stopped; all full
+  raw evidence/comparators retained. Cleanup verification and bounded
+  all-refused-writer recurrence discriminator are active, not accepted fixes.
   Commit exact intermediate dispositions;
   preserve small evidence before scoped cache cleanup. No deletion this turn.
   User seven-line edit must remain outside commits.
 - Telegram milestone authorization: no more often than hourly. Last sent about
-  2026-09-08 02:26UTC; next nonurgent not before2026-09-08 03:26UTC. Respect advisory;
+  2026-09-08 05:07UTC; next nonurgent not before2026-09-08 06:07UTC. Respect advisory;
   ordinary gaps remain open, so do not send a completion claim.
 - Reflection: local work proof was useful and enabled a deletion, but did not
   predict every network interval. The ordinary pair moved the worst observed

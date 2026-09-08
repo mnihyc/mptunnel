@@ -100,7 +100,7 @@ Finite state/work or eventual service is not a useful wall-clock bound.
    falsifier, expected practical benefit, cost and likely regression case.
    Check sparse work, unknown paths, shared contention, failure/recovery and
    executor service where they affect this mechanism. Formal scope must match
-   the claim; a correct local equation is not a sustained allocator.
+the claim; a correct local equation is not a sustained allocator.
 5. **Prove reachability cheaply.** Use real producer/admission/ACK paths and a
    control before changing runtime. A fixture that fails before its intended
    assertion is not Product RED. If existing captures suffice, do not rerun.
@@ -187,8 +187,14 @@ does not authorize latent topology inference or a universal Internet model.
   after semantic controls passed. Preserve the demonstrated work property in
   the replacement, and remove obsolete helpers/tests only after that migration.
 - No untested candidate stack: retain a known comparator and attributable
-  source/build identities. Intermediate correctness fixes may be necessary but
-  do not bypass the unchanged final timing/experience gate.
+   source/build identities. Intermediate correctness fixes may be necessary but
+   do not bypass the unchanged final timing/experience gate.
+- User-facing milestones must contain demonstrated practical outcomes, not
+  merely component GREEN followed by a promise of future verification. The
+  user explicitly reinforced this on2026-09-08:9720e4b improved early target
+  delivery4.86→142.11MB at10s but then failed settlement with a75s return hold.
+  Report that failed practical result plainly. Component/test checkpoints
+  remain useful internal tracking; they are not successful speed milestones.
 - No reopening disproved or rejected approaches without new contrary evidence;
   no unused theoretical framework as a compulsory release prerequisite.
 - No large diagnostic stream unless it distinguishes current hypotheses;

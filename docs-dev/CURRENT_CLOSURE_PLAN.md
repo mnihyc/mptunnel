@@ -71,6 +71,24 @@ only the agreed observation/policy separation now; independent review and
 focused GREEN precede the ordinary candidate. Existing W/P/E helper controls
 are not misrepresented as an actual stale-Ready E-exhaustion claim test.
 
+**Implementation17:29:** only shared resource capture/projection and named
+legacy/prepared entrypoints changed, plus the existing batch-type internal
+re-export. Root reviewed every advisory/final prepared caller: both consume
+the same resource projection and retain the unchanged current four-tier,
+full-membership W/P/E, selected proof/load/Ready/source/Native checks. Legacy
+short-circuit/read order remains identical. One coherent GREEN rebuild is
+running; independent consumer review pending, no ordinary build/lab overlap.
+
+**GREEN17:32:** warning-free1m09s rebuild;544 focused checks pass1.27s.
+Both new actual stale/fresh controls and unchanged W/P/E exhaustion, selected
+withdrawal, Native refusal, idle/wake, half-close and real TCP/QUIC EOF controls
+pass. Independent consumer audit passes. Coverage disposition: current stale
+producer is FirstPath; E refusal is covered by unchanged exact-authority
+component tests, not a falsely claimed facade exhaustion test. Implementing
+that additional real-claim setup is unnecessary to change this policy mask.
+Checkpoint the isolated correction, then one ordinary optimized candidate
+build and the already-fixed paired comparison. No performance promotion yet.
+
 ## Completed discriminator: available request source is not claimed
 
 **Observed failure / priority:** second capture's largest target hold is

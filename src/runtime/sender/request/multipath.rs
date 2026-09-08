@@ -61,7 +61,9 @@ use crate::runtime::path::authority::{
     NativeCarrierRateAuthorityHandle, NativeCarrierSchedulingShapeSnapshot,
 };
 use crate::runtime::path::commands::ReliablePathCommandSender;
-use crate::runtime::path::{ClientPathContext, ReliableRequestNativeShape};
+use crate::runtime::path::{
+    ClientPathContext, ReliableRequestNativeShape, ReliableRequestPathBatchObservation,
+};
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestFlightLedger, RequestPathRelease, RequestStreamState,
 };
@@ -307,14 +309,14 @@ pub(super) fn observe_request_relay_scheduling_from_native_inputs(
     requalification: &StreamPathRequalification<RelayPathInstance>,
     native_inputs: RequestRelayNativeInputs,
 ) -> Option<RequestRelaySchedulingObservation> {
-    if !native_inputs.matches_membership(membership_generation, remote_paths) {
-        return None;
-    }
-    let path_evidence = context.observe_reliable_request_paths(
-        native_inputs.attached_paths,
+    let path_evidence = observe_request_relay_path_evidence_from_native_inputs(
+        context,
+        membership_generation,
+        remote_paths,
         payload_bytes,
         include_bulk_admission,
-    );
+        native_inputs,
+    )?;
     let has_nonstale_product_output =
         remote_paths
             .iter()
@@ -326,6 +328,86 @@ pub(super) fn observe_request_relay_scheduling_from_native_inputs(
                         scheduler::score_path(snapshot, lane, payload_bytes).is_some()
                     })
             });
+    Some(project_request_relay_scheduling_observation(
+        context,
+        stream_id,
+        membership_generation,
+        remote_paths,
+        frame,
+        lane,
+        path_evidence,
+        |instance| {
+            !requalification.stale_for_original_data(instance) || !has_nonstale_product_output
+        },
+    ))
+}
+
+/// Prepared work has no future command-queue reservation. Its current writer
+/// opportunities and freshness preference belong to the finite claim tier
+/// pass, not to the legacy attached-output preference above.
+#[allow(clippy::too_many_arguments)]
+fn observe_prepared_request_relay_scheduling_from_native_inputs(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    membership_generation: u64,
+    remote_paths: &[ReliableRelayRemotePath],
+    lane: TrafficClass,
+    payload_bytes: usize,
+    include_bulk_admission: bool,
+    native_inputs: RequestRelayNativeInputs,
+) -> Option<RequestRelaySchedulingObservation> {
+    let path_evidence = observe_request_relay_path_evidence_from_native_inputs(
+        context,
+        membership_generation,
+        remote_paths,
+        payload_bytes,
+        include_bulk_admission,
+        native_inputs,
+    )?;
+    Some(project_request_relay_scheduling_observation(
+        context,
+        stream_id,
+        membership_generation,
+        remote_paths,
+        None,
+        lane,
+        path_evidence,
+        |_| true,
+    ))
+}
+
+fn observe_request_relay_path_evidence_from_native_inputs(
+    context: &ClientPathContext,
+    membership_generation: u64,
+    remote_paths: &[ReliableRelayRemotePath],
+    payload_bytes: usize,
+    include_bulk_admission: bool,
+    native_inputs: RequestRelayNativeInputs,
+) -> Option<ReliableRequestPathBatchObservation> {
+    if !native_inputs.matches_membership(membership_generation, remote_paths) {
+        return None;
+    }
+    Some(context.observe_reliable_request_paths(
+        native_inputs.attached_paths,
+        payload_bytes,
+        include_bulk_admission,
+    ))
+}
+
+/// Project one captured resource batch. Keep legacy policy before frame queue
+/// probes so a refused output still short-circuits those observations; both
+/// callers retain the same per-path sampling order and exact membership.
+#[allow(clippy::too_many_arguments)]
+fn project_request_relay_scheduling_observation(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    membership_generation: u64,
+    remote_paths: &[ReliableRelayRemotePath],
+    frame: Option<&Frame>,
+    lane: TrafficClass,
+    path_evidence: ReliableRequestPathBatchObservation,
+    original_data_eligible: impl Fn(RelayPathInstance) -> bool,
+) -> RequestRelaySchedulingObservation {
     let paths = remote_paths
         .iter()
         .zip(path_evidence.paths)
@@ -333,8 +415,7 @@ pub(super) fn observe_request_relay_scheduling_from_native_inputs(
             let instance = evidence.instance;
             debug_assert_eq!(path.instance(), instance);
             let exact_instance_live = evidence.shared_snapshot.is_some();
-            let original_data_eligible =
-                !requalification.stale_for_original_data(instance) || !has_nonstale_product_output;
+            let original_data_eligible = original_data_eligible(instance);
             RequestRelayPathObservation {
                 instance,
                 can_enqueue_frame: exact_instance_live
@@ -363,7 +444,7 @@ pub(super) fn observe_request_relay_scheduling_from_native_inputs(
             }
         })
         .collect();
-    Some(RequestRelaySchedulingObservation {
+    RequestRelaySchedulingObservation {
         stream_id,
         membership_generation,
         mux_limits: context.mux_limits,
@@ -379,7 +460,7 @@ pub(super) fn observe_request_relay_scheduling_from_native_inputs(
             .collect(),
         latency_pressure: path_evidence.latency_pressure,
         observed_at: Instant::now(),
-    })
+    }
 }
 
 fn relay_path_can_enqueue_frame_for_cause_now(
@@ -1048,8 +1129,9 @@ impl RequestMultipathController {
         })
     }
 
-    /// Reuses normal Product projection with no command-queue reservation.
-    /// Writer-boundary readiness is applied separately by the claim planner.
+    /// Reuses exact resource projection with no command-queue reservation or
+    /// legacy stale-output preference. The claim planner owns both current
+    /// writer readiness and its finite fresh/stale eligibility tiers.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn observe_original_claim_from_inputs(
         &self,
@@ -1060,16 +1142,14 @@ impl RequestMultipathController {
         include_bulk_admission: bool,
         inputs: RequestRelayNativeInputs,
     ) -> Option<RequestRelaySchedulingObservation> {
-        observe_request_relay_scheduling_from_native_inputs(
+        observe_prepared_request_relay_scheduling_from_native_inputs(
             context,
             self.stream_id,
             remotes.membership_generation(),
             &remotes.paths,
-            None,
             lane,
             reliable_stream_frame_accounted_bytes(frame),
             include_bulk_admission,
-            &self.request.requalification,
             inputs,
         )
     }

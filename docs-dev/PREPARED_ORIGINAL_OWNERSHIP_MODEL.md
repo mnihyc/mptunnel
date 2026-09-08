@@ -718,3 +718,14 @@ Conditional benefit is earlier legitimate Original assignment when preferred
 writers cannot act; possible cost is use of a worse path under unchanged
 resource authority. The ordinary paired timing/completion/cost gate determines
 practical disposition; the large already-native stalls remain distinct.
+
+Executed17:21–17:32: actual stale-Ready claim is RED at0versus65536B after
+semantic controls; fresh Ready opposite passes. Separating prepared and legacy
+observation fixes this intended assertion, including stale ACK refusal of
+qualification.544 focused checks pass after independent runtime/consumer
+review. The new producer case is FirstPath. Additional E, P and shared W
+exhaustion remain covered by unchanged exact-authority tests, not a new claimed
+stale-Ready exhaustion facade. Final/advisory claim paths both consume the
+correct resource projection and retain all current authority checks. The
+ordinary paired result, not this component checkpoint, determines practical
+promotion. No Native/critical-queue/controller change occurred.

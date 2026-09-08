@@ -3,6 +3,46 @@
 Updated: 2026-09-08 13:51 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
+## Active transaction — 2026-09-08 14:01 +08:00
+
+**Ordinary result:**b3dfef1 eliminates the proved idle retry recurrence, but
+the unchanged mixed upload still has15.955s confirmation gaps and31s sampled
+target hold.212402176 exact bytes finish at85.399950s; the runner independently
+raises its85s guard. Probe output precedes the last telemetry flush by160ms,
+and teardown occurs after that flush: do NOT attribute completion to teardown.
+This is real terminal confirmation at the observation boundary, not normal
+runner success or usable performance. No third favorable ordinary trial.
+
+**Issue/observed failure:** already-arrived return traffic is consumed slowly;
+reply progress is intermittent (roughly14B per several seconds), while the
+target/source can advance independently. Native read/route→attachment→shared
+actor→mux→local delivery is the unresolved stage, not another assumed controller
+defect. The proved Ready recurrence alone does not close it.
+
+**Competing causes/exact question:** expensive synchronous preparation/claim/
+ACK work, logical writer/reader interlock, queued input service, local delivery,
+or missing reply bytes still before decode. Which stage contains the actual
+winning missing reply prefix, and what work/wait occupies its owner then?
+Read-only audit excludes a receive-held Product-lock cycle; ordinary bounded
+backpressure is not excluded. Rc is delivered bytes, not mux frontier F.
+
+**Smallest next action:** one temporary diagnostic overlay reusing the archived
+RESPONSE_CLIENT_COST_TRACE structure: sparse response StreamData publication,
+native write/decode, route/shared enqueue/dequeue, mux F and local-delivery
+stages. Reuse existing aggregate cost accounting for synchronous claim,
+preparation, ACK and dispatch regions, separating nested scopes and awaits.
+No per-ACK/reinjection flood or new harness/profile. Same single ordinary
+profile, diagnosis only; archive/reverse hooks before any performance claim.
+
+**Falsifiers/stop:** prompt mux F but held Rc selects local delivery; prompt
+decode but late mux selects local handoff/actor; prompt publication/write but
+late decode selects predecode service; late publication rejects a solely client
+claim-cost explanation. A completed-wait aggregate cannot identify a still-
+pending wait; log sparse begin/end for reply frames, or retain that limitation.
+No new runtime correction follows until exact reachability/model/real control
+support it. Global gates below remain unchanged. This active transaction
+supersedes older "next" prose retained below as execution history.
+
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
 transaction and after compaction. This is the active scope/next-action ledger,
 not a new issue inventory. Detailed completed transactions remain in

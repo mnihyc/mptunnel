@@ -61,6 +61,7 @@ use crate::runtime::stream::{
     ReliablePathStreamOutput, ReliableRecvProgress, ReliableRelayRemoteSet, RequalificationAttempt,
 };
 use crate::scheduler::{PathSnapshot, TrafficClass};
+#[cfg(test)]
 use bytes::Bytes;
 use std::time::{Duration, Instant};
 

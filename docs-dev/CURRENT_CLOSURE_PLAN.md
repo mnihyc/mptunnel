@@ -1,9 +1,48 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 14:22 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 14:31 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
-## Active transaction — 2026-09-08 14:01 +08:00
+## Active transaction — 2026-09-08 14:31 +08:00
+
+**Issue / evidence:** the completed sparse capture locates a winning reply's
+2.226s decode-to-mux delay beside expensive structural recovery dispatch.
+Inside that interval Product debt changes by6,068,248B between two samples;
+globally frozen ownership or native service is disproved, not an optimization
+premise. The precise next question is narrower: must accepted-copy debt J for
+one target be rediscovered by scanning every unrelated Original flight?
+
+**Origin / model:**3a6d0ea already computes additive J from the flight ledger;
+1436ff4 correctly orders structural recovery but invokes that query for each
+candidate/range. Exact-instance J must include every retained copy separately,
+including overlaps, until Product ACK or final drain. It is not range union,
+deadline state, native outstanding bytes, or a rate estimate. RFC15's current
+Apply, byte order and independent-target service remain unchanged.
+
+**Prediction / falsifier:** with identical retained bytes, owner and head repair,
+fragmenting only an irrelevant Original suffix currently increases records
+visited in the actual dispatcher's copy-debt query. The actual command, credit,
+cache and accepted-copy identities must agree before the work assertion. If
+they do not, this is not an equivalence RED. A cached exact additive aggregate
+beside the existing Original aggregate is the candidate; audit all three ledger
+mutation boundaries before implementing. Partial/duplicate ACK, overlap,
+expiry, replacement and drain must agree with the full-scan oracle.
+
+**Smallest action / acceptance:** real dispatcher operation-count RED/control,
+then the smallest equivalent accounting correction if the audit agrees. Do not
+cache Native observations, skip ranges, alter admission, or add a threshold.
+Focused opposite-case controls and independent review precede an ordinary
+optimized run on the pinned profile. Full completion, first service, gaps and
+cost—not test GREEN—decide practical promotion. If stalls remain, retain the
+adverse evidence and follow their exact stage; no favorable repeat.
+
+### Previous completed diagnostic
+
+**Executed14:34:** warning-free RED build1m13s. Actual dispatcher control passes;
+fragmentation case fails only its intended work assertion:130 flight visits
+versus4, with the same two accepted-copy debt queries, exact4096B native repair,
+unchanged69632B retained source and identical accounting. This proves avoidable
+query work, not attribution of the entire2.226s hold or a speed improvement.
 
 **Latest executed result14:22:** sparse diagnostic completes440598528B/45.810536s,
 but is not ordinary acceptance. All100 winning replies join exact stages.

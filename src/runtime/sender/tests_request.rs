@@ -1588,6 +1588,142 @@ async fn request_recovery_prefix_first_owner_order_control() {
 }
 
 #[tokio::test]
+async fn request_recovery_copy_debt_query_control() {
+    let (calls, _) = request_recovery_copy_debt_query_work(false).await;
+    assert!(
+        calls > 0,
+        "the actual dispatcher queries accepted-copy debt"
+    );
+}
+
+#[tokio::test]
+async fn request_recovery_copy_debt_query_ignores_original_suffix_fragmentation() {
+    let control = request_recovery_copy_debt_query_work(false).await;
+    let fragmented = request_recovery_copy_debt_query_work(true).await;
+    assert!(
+        control.0 > 0,
+        "the actual dispatcher queries accepted-copy debt"
+    );
+    assert_eq!(fragmented.0, control.0, "identical repair query count");
+    assert_eq!(
+        fragmented.1, control.1,
+        "accepted-copy debt discovery must not revisit irrelevant Original suffix fragments when the exact repair and target debt are unchanged"
+    );
+}
+
+async fn request_recovery_copy_debt_query_work(fragmented_suffix: bool) -> (usize, usize) {
+    use crate::runtime::stream::request::RequestFlightLedger;
+
+    let stream_id = StreamId(237);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10384", "tcp://127.0.0.1:10385"]);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let (mut remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, target_commands));
+    let target = remotes.paths[1].instance();
+    for receivers in [&mut owner_receivers, &mut target_receivers] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [owner, target] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+
+    let q = 4096;
+    let suffix_bytes = 64 * 1024;
+    let suffix_chunk = if fragmented_suffix {
+        1024
+    } else {
+        suffix_bytes
+    };
+    let retained_bytes = q + suffix_bytes;
+    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let mut sender = RequestSenderService::new(stream_id);
+    let head = send_stream
+        .send_data(Bytes::from(vec![0x73; q]))
+        .expect("legal unchanged head cache quantum");
+    // The production cache and exact Original-flight producers establish the
+    // fixture; this does not assert that Original packets crossed a network.
+    sender.record_original_frame_for_test(owner, &head);
+    for _ in 0..suffix_bytes / suffix_chunk {
+        let suffix = send_stream
+            .send_data(Bytes::from(vec![0x74; suffix_chunk]))
+            .expect("legal suffix fragmentation within unchanged default bounds");
+        sender.record_original_frame_for_test(owner, &suffix);
+    }
+    assert_eq!(send_stream.data_ack_frontier(), 0);
+    assert_eq!(send_stream.next_offset(), retained_bytes as u64);
+    assert_eq!(send_stream.reinjection_bytes(), retained_bytes);
+    assert_eq!(sender.multipath.accepted_reinjected_data_bytes(target), 0);
+    assert!(
+        sender
+            .earliest_reinjection_suppression_deadline(&remotes)
+            .is_none()
+    );
+    assert!(sender.multipath.mark_path_stale(owner));
+    let queue = ReliableRelaySenderQueue::default();
+    let (selection, exhausted) = sender.multipath.reinjection_path_snapshot(
+        &context,
+        &remotes,
+        &[owner],
+        &queue,
+        retained_bytes,
+        context.mux_limits,
+    );
+    assert!(!exhausted);
+    let (selected, _, service_limit) =
+        selection.expect("ordinary target has real repair authority");
+    assert_eq!(selected, target);
+    assert_eq!(
+        service_limit,
+        context.mux_limits.max_repair_bytes.min(retained_bytes)
+    );
+    assert!(service_limit >= q);
+    assert!(try_recv_reliable_path_command(&mut target_receivers).is_none());
+    let mut batch = sender.collect_request_path_recovery(&remotes, &queue);
+    assert!(batch.has_pending());
+
+    RequestFlightLedger::take_reinjection_debt_query_work_for_test();
+    // The counter interval contains one actual synchronous dispatcher call,
+    // with no await or post-dispatch assertion queries mixed into its counts.
+    let dispatch = sender.dispatch_next_request_path_recovery(
+        &mut batch,
+        &context,
+        &mut remotes,
+        &send_stream,
+        &queue,
+    );
+    let work = RequestFlightLedger::take_reinjection_debt_query_work_for_test();
+    assert!(matches!(
+        dispatch.expect("unchanged exact native admission"),
+        Some(ClientQueuedDispatch::Reinjection { payload_bytes, .. }) if payload_bytes == q
+    ));
+    let command = try_recv_reliable_path_command(&mut target_receivers)
+        .expect("actual target receiver observes committed repair");
+    target_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    assert!(matches!(
+        command,
+        ReliablePathCommand::SendFrame(Frame::StreamData { stream_id: actual, offset: 0, payload })
+            if actual == stream_id && payload == Bytes::from(vec![0x73; q])
+    ));
+    assert!(try_recv_reliable_path_command(&mut target_receivers).is_none());
+    assert!(try_recv_reliable_path_command(&mut owner_receivers).is_none());
+    assert_eq!(sender.multipath.accepted_reinjected_data_bytes(target), q);
+    assert_eq!(sender.multipath.accepted_reinjected_data_bytes(owner), 0);
+    assert_eq!(sender.optional_reinjection.reinjected_bytes(), q as u64);
+    assert_eq!(send_stream.data_ack_frontier(), 0);
+    assert_eq!(send_stream.next_offset(), retained_bytes as u64);
+    assert_eq!(send_stream.reinjection_bytes(), retained_bytes);
+    assert!(
+        queue.is_empty(),
+        "direct repair adds no provisional source debt"
+    );
+    work
+}
+
+#[tokio::test]
 async fn request_recovery_suffix_first_owner_order_preserves_lowest_prefix() {
     request_recovery_orders_retained_ranges(true, false, false).await;
 }

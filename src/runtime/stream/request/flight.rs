@@ -18,6 +18,15 @@ use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+thread_local! {
+    // Only exact accepted-copy debt discovery: query calls and flight records
+    // inspected, excluding cache lookup, queue accounting and qualification.
+    static REINJECTION_DEBT_QUERY_WORK: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct RequestPathRelease {
     pub(in crate::runtime) instance: RelayPathInstance,
@@ -49,6 +58,11 @@ pub(in crate::runtime) struct RequestFlightLedger {
 }
 
 impl RequestFlightLedger {
+    #[cfg(test)]
+    pub(in crate::runtime) fn take_reinjection_debt_query_work_for_test() -> (usize, usize) {
+        REINJECTION_DEBT_QUERY_WORK.with(|work| work.replace((0, 0)))
+    }
+
     /// Immutable accepted-copy coverage for one serialized recovery batch.
     /// Splitting at these boundaries prevents an accepted copy on a prefix
     /// from excluding its carrier for a disjoint suffix in the same cache chunk.
@@ -427,10 +441,20 @@ impl RequestFlightLedger {
         &self,
         instance: RelayPathInstance,
     ) -> usize {
+        #[cfg(test)]
+        REINJECTION_DEBT_QUERY_WORK.with(|work| {
+            let (calls, visits) = work.get();
+            work.set((calls + 1, visits));
+        });
         self.flights
             .values()
             .flat_map(|flights| flights.iter())
             .filter(|flight| {
+                #[cfg(test)]
+                REINJECTION_DEBT_QUERY_WORK.with(|work| {
+                    let (calls, visits) = work.get();
+                    work.set((calls, visits + 1));
+                });
                 flight.instance == instance && flight.kind == CarrierWorkKind::ReinjectedData
             })
             .fold(0usize, |bytes, flight| bytes.saturating_add(flight.bytes))

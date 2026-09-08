@@ -9,7 +9,7 @@ use super::open::{
     ReliableRelayOpenSpec, open_remote_stream_for_relay_path, relay_path_open_error_is_retryable,
 };
 use super::remote::{
-    ReliableRelayAttachMode, ReliableRelayPathLanes,
+    ReliableRelayAttachInput, ReliableRelayAttachMode, ReliableRelayPathLanes,
     attach_reliable_relay_paths_with_claims_and_suppressions,
     reliable_relay_additional_path_open_payload_bytes, reliable_relay_attach_payload_bytes,
     reliable_relay_path_open_candidates_after_suppression,
@@ -352,9 +352,7 @@ pub(super) async fn switch_reliable_relay_to_best_path(
     lanes: ReliableRelayPathLanes,
     remotes: &mut ReliableRelayRemoteSet,
     startup: &mut ClientReliableReturnPlan,
-    send_stream: &ReliableSendStream,
-    resend_fin: bool,
-    mode: ReliableRelayAttachMode,
+    input: ReliableRelayAttachInput,
     path_open_suppressions: &ClientRelayPathOpenSuppressions,
     pending_additional_path_opens: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
 ) -> Result<bool, RuntimeError> {
@@ -368,9 +366,7 @@ pub(super) async fn switch_reliable_relay_to_best_path(
         lanes,
         remotes,
         startup,
-        send_stream,
-        resend_fin,
-        mode,
+        input,
         path_open_suppressions,
         &inflight_path_claims,
     )
@@ -1236,9 +1232,7 @@ pub(super) async fn attach_reliable_relay_paths_with_suppressions(
     lanes: ReliableRelayPathLanes,
     remotes: &mut ReliableRelayRemoteSet,
     startup: &mut ClientReliableReturnPlan,
-    send_stream: &ReliableSendStream,
-    resend_fin: bool,
-    mode: ReliableRelayAttachMode,
+    input: ReliableRelayAttachInput,
     path_open_suppressions: &ClientRelayPathOpenSuppressions,
     pending_additional_path_opens: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
 ) -> Result<usize, RuntimeError> {
@@ -1254,9 +1248,7 @@ pub(super) async fn attach_reliable_relay_paths_with_suppressions(
         lanes,
         remotes,
         startup,
-        send_stream,
-        resend_fin,
-        mode,
+        input,
         path_open_suppressions,
         &inflight_path_claims,
     )

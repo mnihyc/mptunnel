@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 10:07 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 10:25 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -277,8 +277,12 @@ coherent, not proof of overall speed or a ready implementation.
 send mux, whole bounded sender queue, multipath state and exact attachment
 admission synchronize; async receive/open/local-write state stays outside.
 Reuse Native-first fenced Apply with no other Native read under Product lock.
-Full-membership/tier/cursor remain; only an exact selected ready writer claims,
-otherwise coalescing-wake that writer without reserving a sticky payload.
+Full membership/cursor and claimed-owner position remain; only an exact
+selected ready writer claims, otherwise coalescing-wake that writer without
+reserving a sticky payload. Regular-before-backup uses a finite failed exact
+pass and generation revalidation. Pre-code review rejected the draft's blanket
+busy-regular veto: it would narrow current latency fallback and confuse bulk's
+structural tier helper with the RFC's complete claim policy.
 The real-producer preparation/binding RED now reaches its intended assertion:
 two default64KiB quanta, no data-command/writer consumption, but wire horizon
 131072 and exact Original[0,131072). All483 existing focused controls pass1.27s;
@@ -287,13 +291,15 @@ that current implementation violates its current RFC or migration already works.
 Preserve full preparation capacity and immediate singleton native feeding;
 no lock across await, actor roundtrip, queue shrink, executor-luck policy or
 private prefetch. Real producer RED/control precedes migration; no unused
-model code or ordinary rerun now. The next coherent implementation step is to
-expose existing synchronous request transactions and separate their immutable
-Native observation inputs before moving live ownership. All10 request sender
-async methods currently complete synchronously; removing their wrappers is an
-ownership-migration preparation, not a performance correction. Never wrap
-whole normal planners/ACK handlers under the new lock. Attachment opening must
-not carry a send-state borrow/guard through its actual network await.
+model code or ordinary rerun now. The used preparation refactor is complete:
+10 non-yielding async wrappers removed; Native inputs split into consumed
+values with unchanged read order/override; both attachment-open wrappers use
+owned advisory input/immutable FIN offset. Independent equivalence reviews
+pass; build1m06s,483 controls GREEN1.27s and only intended128KiB RED remains.
+No shared mutex or changed data publication yet; no speed-gain claim. Next
+extract the actual joint Product owner and writer/readiness lifecycle without
+duplicating mutable attachment authority. Never wrap whole normal planners/
+ACK handlers under the new lock or carry a guard across actual I/O awaits.
 Response parity and all existing global gates remain pending, not waived.
 
 **Falsifier/stop:** if head work was already promptly published, pursue its

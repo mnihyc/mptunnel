@@ -48,8 +48,7 @@ async fn pre_model_red_bound_recovery_waits_for_ordered_terminal_before_cancella
 
     target_commands.begin_path_drain();
     target_receivers.close_for_path_drain();
-    let result = tokio::time::timeout(
-        Duration::from_secs(1),
+    let result = tokio::time::timeout(Duration::from_secs(1), async {
         sender.dispatch_client_queued_work(
             &context,
             TrafficClass::Throughput,
@@ -58,8 +57,8 @@ async fn pre_model_red_bound_recovery_waits_for_ordered_terminal_before_cancella
             &mut sender_queue,
             6,
             ReliableDataAckFrontierState::Live,
-        ),
-    )
+        )
+    })
     .await
     .expect("RED: old dispatch hung while fresh admission was closed");
     assert!(

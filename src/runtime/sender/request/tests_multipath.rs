@@ -982,7 +982,6 @@ async fn request_native_authority_change_after_reservation_cannot_publish_produc
             RelaySendCause::StreamData,
             Some(TrafficClass::Throughput),
         )
-        .await
         .expect("stale Native authority replans the same live path");
     assert_eq!(outcome.path_key, target.key);
 
@@ -1105,7 +1104,6 @@ async fn request_reinjection_commit_uses_same_stamp_current_native_recovery_cloc
             }),
             Some(TrafficClass::Throughput),
         )
-        .await
         .expect("same-stamp current Native shape remains publishable");
     let accepted_after = Instant::now();
     let committed_deadline = outcome
@@ -1186,7 +1184,6 @@ async fn request_native_activation_shape_gap_falls_through_to_tcp_without_blackl
             RelaySendCause::StreamData,
             Some(TrafficClass::Throughput),
         )
-        .await
         .expect("the healthy TCP peer wins while QUIC shape is unpublished");
     assert_eq!(outcome.path_key, tcp.key);
     assert_eq!(
@@ -4383,7 +4380,6 @@ async fn stale_survivor_can_finish_after_fresh_attachment_is_removed() {
     };
     sender
         .send_control_frame(&context, &mut remotes, fin, RelaySendCause::StreamFin)
-        .await
         .expect("stale payload evidence must not manufacture a session close at FIN");
     assert!(sender.request_path_is_stale(survivor));
     assert!(remotes.contains_path_instance(survivor));
@@ -5230,7 +5226,6 @@ async fn direct_request_recovery_full_target_preserves_independent_range_service
             &send_stream,
             &queue,
         )
-        .await
         .expect("C backpressure must not become an attachment failure");
     assert!(matches!(
         dispatch,
@@ -5273,7 +5268,6 @@ async fn direct_request_recovery_full_target_preserves_independent_range_service
                 &send_stream,
                 &queue,
             )
-            .await
             .expect("released C command capacity can serve the retained lower range"),
         Some(ClientQueuedDispatch::Reinjection { payload_bytes, .. }) if payload_bytes == q
     ));
@@ -5391,7 +5385,6 @@ async fn direct_request_recovery_apply_charges_unrelated_queued_front() {
                 &send_stream,
                 &queue,
             )
-            .await
             .expect("exhausted repair authority is retained, not a closed session")
             .is_none()
     );
@@ -5405,20 +5398,18 @@ async fn direct_request_recovery_apply_charges_unrelated_queued_front() {
         observed_reservation.store(true, std::sync::atomic::Ordering::SeqCst);
     });
     assert!(matches!(
-        sender
-            .send_frame_at_frontier(
-                &context,
-                &mut remotes,
-                direct.clone(),
-                cause,
-                Some(TrafficClass::Throughput),
-                ReliableDataAckFrontierState::Live,
-                Some(RequestReinjectionQueueContext {
-                    queue: &queue,
-                    exclude_front: false
-                }),
-            )
-            .await,
+        sender.send_frame_at_frontier(
+            &context,
+            &mut remotes,
+            direct.clone(),
+            cause,
+            Some(TrafficClass::Throughput),
+            ReliableDataAckFrontierState::Live,
+            Some(RequestReinjectionQueueContext {
+                queue: &queue,
+                exclude_front: false
+            }),
+        ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
     assert!(
@@ -5449,7 +5440,6 @@ async fn direct_request_recovery_apply_charges_unrelated_queued_front() {
                 exclude_front: false,
             }),
         )
-        .await
         .expect("identical direct Apply succeeds once that reserve is genuinely free");
     assert!(outcome.accepted_copy_deadline.is_some());
     assert_eq!(sender.multipath.accepted_reinjected_data_bytes(target), q);
@@ -5638,7 +5628,6 @@ async fn commit_request_rate_cohort(
                 RelaySendCause::StreamData,
                 Some(TrafficClass::Throughput),
             )
-            .await
             .expect("ordinary planning, exact admission, reservation and Product commit succeed");
         loop {
             match try_recv_reliable_path_command(receivers) {

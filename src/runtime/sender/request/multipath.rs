@@ -91,6 +91,53 @@ fn request_native_scheduling_shape(path: &ReliableRelayRemotePath) -> ReliableRe
         .unwrap_or(ReliableRequestNativeShape::Unavailable)
 }
 
+/// Owned Native inputs, captured before Product/health observation. These are
+/// advisory values, not a replacement for the selected output's fenced Apply.
+pub(super) struct RequestRelayNativeInputs {
+    attached_paths: SmallVec<
+        [(
+            RelayPathInstance,
+            Option<RelayPathProofEpoch>,
+            ReliableRequestNativeShape,
+        ); 4],
+    >,
+}
+
+pub(super) fn capture_request_relay_native_inputs(
+    remote_paths: &[ReliableRelayRemotePath],
+    native_override: Option<(RelayPathInstance, NativeCarrierSchedulingShapeSnapshot)>,
+) -> RequestRelayNativeInputs {
+    // Resolve attachment-owned Native shapes before entering the health-lock
+    // observation. Native publication/apply uses Native -> health ordering;
+    // leaving this iterator lazy would invert that order as health -> Native.
+    let attached_paths = remote_paths
+        .iter()
+        .map(|path| {
+            let instance = path.instance();
+            let shape = match native_override {
+                Some((target, shape)) if target == instance => {
+                    ReliableRequestNativeShape::Current(shape)
+                }
+                // The override is evaluated while the target Native fence is
+                // held. Do not acquire another carrier authority lock here;
+                // other candidates remain advisory health observations.
+                Some(_) => ReliableRequestNativeShape::NotApplicable,
+                None => request_native_scheduling_shape(path),
+            };
+            (
+                instance,
+                path.path_proof_id.map(|proof_id| RelayPathProofEpoch {
+                    proof_id,
+                    proof_generation: path.path_proof_generation,
+                    attached_at: path.attached_at,
+                }),
+                shape,
+            )
+        })
+        .collect();
+    RequestRelayNativeInputs { attached_paths }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn observe_request_relay_scheduling(
     context: &ClientPathContext,
@@ -130,36 +177,40 @@ fn observe_request_relay_scheduling_with_native_override(
     requalification: &StreamPathRequalification<RelayPathInstance>,
     native_override: Option<(RelayPathInstance, NativeCarrierSchedulingShapeSnapshot)>,
 ) -> RequestRelaySchedulingObservation {
-    // Resolve attachment-owned Native shapes before entering the health-lock
-    // observation. Native publication/apply uses Native -> health ordering;
-    // leaving this iterator lazy would invert that order as health -> Native.
-    let attached_paths = remote_paths
-        .iter()
-        .map(|path| {
-            let instance = path.instance();
-            let shape = match native_override {
-                Some((target, shape)) if target == instance => {
-                    ReliableRequestNativeShape::Current(shape)
-                }
-                // The override is evaluated while the target Native fence is
-                // held. Do not acquire another carrier authority lock here;
-                // other candidates remain advisory health observations.
-                Some(_) => ReliableRequestNativeShape::NotApplicable,
-                None => request_native_scheduling_shape(path),
-            };
-            (
-                instance,
-                path.path_proof_id.map(|proof_id| RelayPathProofEpoch {
-                    proof_id,
-                    proof_generation: path.path_proof_generation,
-                    attached_at: path.attached_at,
-                }),
-                shape,
-            )
-        })
-        .collect::<SmallVec<[_; 4]>>();
+    let native_inputs = capture_request_relay_native_inputs(remote_paths, native_override);
+    observe_request_relay_scheduling_from_native_inputs(
+        context,
+        stream_id,
+        membership_generation,
+        remote_paths,
+        frame,
+        lane,
+        payload_bytes,
+        include_bulk_admission,
+        requalification,
+        native_inputs,
+    )
+}
+
+/// Consumes already captured Native values without entering a Native authority.
+/// The caller must preserve the exact attachment order/membership between
+/// capture and observation; final publication still validates its own fence.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn observe_request_relay_scheduling_from_native_inputs(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    membership_generation: u64,
+    remote_paths: &[ReliableRelayRemotePath],
+    frame: Option<&Frame>,
+    lane: TrafficClass,
+    payload_bytes: usize,
+    include_bulk_admission: bool,
+    requalification: &StreamPathRequalification<RelayPathInstance>,
+    native_inputs: RequestRelayNativeInputs,
+) -> RequestRelaySchedulingObservation {
+    debug_assert_eq!(remote_paths.len(), native_inputs.attached_paths.len());
     let path_evidence = context.observe_reliable_request_paths(
-        attached_paths,
+        native_inputs.attached_paths,
         payload_bytes,
         include_bulk_admission,
     );
@@ -169,7 +220,7 @@ fn observe_request_relay_scheduling_with_native_override(
             .zip(path_evidence.paths.iter())
             .any(|(path, evidence)| {
                 path.stream.product_admission_active()
-                    && !requalification.stale_for_original_data(path.instance())
+                    && !requalification.stale_for_original_data(evidence.instance)
                     && evidence.shared_snapshot.is_some_and(|snapshot| {
                         scheduler::score_path(snapshot, lane, payload_bytes).is_some()
                     })
@@ -178,8 +229,8 @@ fn observe_request_relay_scheduling_with_native_override(
         .iter()
         .zip(path_evidence.paths)
         .map(|(path, evidence)| {
-            let instance = path.instance();
-            debug_assert_eq!(instance, evidence.instance);
+            let instance = evidence.instance;
+            debug_assert_eq!(path.instance(), instance);
             let exact_instance_live = evidence.shared_snapshot.is_some();
             let original_data_eligible =
                 !requalification.stale_for_original_data(instance) || !has_nonstale_product_output;

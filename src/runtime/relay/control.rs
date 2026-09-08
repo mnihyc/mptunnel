@@ -32,7 +32,7 @@ use super::lifecycle::{
     try_drain_completed_additional_path_opens, try_handle_additional_path_open_result,
 };
 use super::open::ReliableRelayOpenSpec;
-use super::remote::{ReliableRelayAttachMode, ReliableRelayPathLanes};
+use super::remote::{ReliableRelayAttachInput, ReliableRelayAttachMode, ReliableRelayPathLanes};
 use super::service::{RelayServiceEvent, RelayServiceTurn};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
@@ -515,7 +515,7 @@ fn settle_matching_client_additional_path_open(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn apply_client_additional_path_open_postaction(
+fn apply_client_additional_path_open_postaction(
     attached_mode: Option<ReliableRelayAttachMode>,
     sender: &mut RequestSenderService,
     sender_queue: &mut ReliableRelaySenderQueue,
@@ -535,16 +535,13 @@ async fn apply_client_additional_path_open_postaction(
     }
     let response_path_snapshot =
         remotes.lowest_eta_path_snapshot(context, response_lane, PATH_OPEN_SCORE_BYTES);
-    match sender
-        .send_recv_progress(
-            remotes,
-            context,
-            recv_stream,
-            &mut state.progress.recv_progress,
-            RelayRecvProgressSend::new(response_path_snapshot, response_lane, true),
-        )
-        .await
-    {
+    match sender.send_recv_progress(
+        remotes,
+        context,
+        recv_stream,
+        &mut state.progress.recv_progress,
+        RelayRecvProgressSend::new(response_path_snapshot, response_lane, true),
+    ) {
         Ok(sent) => state.record_recv_progress_sent(sent),
         Err(err) if reliable_path_error_is_migratable(&err) => {
             state.progress.sender_retry_at = None;
@@ -821,7 +818,6 @@ where
                                 &mut state.progress.recv_progress,
                                 recv_progress_send,
                             )
-                            .await
                         {
                             Ok(sent) => {
                                 record_final_recv_progress_enqueue(&mut state, sent, path_snapshot);
@@ -1167,9 +1163,13 @@ where
                 ReliableRelayPathLanes::new(topology_lane, request_lane),
                 &mut remotes,
                 &mut return_plan,
-                &send_stream,
-                !state.endpoint.local_open,
-                ReliableRelayAttachMode::BulkStriping,
+                ReliableRelayAttachInput::capture(
+                    &send_stream,
+                    topology_lane,
+                    context.mux_limits,
+                    !state.endpoint.local_open,
+                    ReliableRelayAttachMode::BulkStriping,
+                ),
                 &state.recovery.path_open_suppressions,
                 &state.recovery.pending_additional_path_opens,
             )
@@ -1780,7 +1780,6 @@ where
                         &mut state.progress.recv_progress,
                         RelayRecvProgressSend::final_ack(response_path_snapshot, response_lane),
                     )
-                    .await
                 {
                     Ok(sent) => {
                         record_final_recv_progress_enqueue(
@@ -1833,7 +1832,6 @@ where
                             true,
                         ),
                     )
-                    .await
                 {
                     Ok(sent) => state.record_recv_progress_sent(sent),
                     Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -1916,7 +1914,6 @@ where
                             true,
                         ),
                     )
-                    .await
                     {
                         Ok(sent) => state.record_recv_progress_sent(sent),
                         Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -1989,7 +1986,6 @@ where
                     &mut state.progress.recv_progress,
                     RelayRecvProgressSend::new(response_path_snapshot, response_lane, true),
                 )
-                .await
                 {
                     Ok(sent) => state.record_recv_progress_sent(sent),
                     Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -2003,9 +1999,13 @@ where
                             ReliableRelayPathLanes::new(response_lane, request_lane),
                             &mut remotes,
                             &mut return_plan,
-                            &send_stream,
-                            !state.endpoint.local_open,
-                            ReliableRelayAttachMode::Any,
+                            ReliableRelayAttachInput::capture(
+                                &send_stream,
+                                response_lane,
+                                context.mux_limits,
+                                !state.endpoint.local_open,
+                                ReliableRelayAttachMode::Any,
+                            ),
                             &state.recovery.path_open_suppressions,
                             &state.recovery.pending_additional_path_opens,
                         )
@@ -2025,7 +2025,6 @@ where
                                             true,
                                         ),
                                     )
-                                    .await
                                 {
                                     Ok(sent) => state.record_recv_progress_sent(sent),
                                     Err(recovery_err)
@@ -2069,7 +2068,6 @@ where
                     &mut state.progress.recv_progress,
                     recv_progress_send,
                 )
-                .await
                 {
                     Ok(sent) => {
                         if sent {
@@ -2087,9 +2085,13 @@ where
                             ReliableRelayPathLanes::new(response_lane, request_lane),
                             &mut remotes,
                             &mut return_plan,
-                            &send_stream,
-                            !state.endpoint.local_open,
-                            ReliableRelayAttachMode::Any,
+                            ReliableRelayAttachInput::capture(
+                                &send_stream,
+                                response_lane,
+                                context.mux_limits,
+                                !state.endpoint.local_open,
+                                ReliableRelayAttachMode::Any,
+                            ),
                             &state.recovery.path_open_suppressions,
                             &state.recovery.pending_additional_path_opens,
                         )
@@ -2119,7 +2121,6 @@ where
                         },
                         RelaySendCause::StreamFin,
                     )
-                    .await
                 {
                     Ok(_) => state.record_local_fin_sent(),
                     Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -2132,9 +2133,13 @@ where
                             ReliableRelayPathLanes::new(request_lane, request_lane),
                             &mut remotes,
                             &mut return_plan,
-                            &send_stream,
-                            true,
-                            ReliableRelayAttachMode::Any,
+                            ReliableRelayAttachInput::capture(
+                                &send_stream,
+                                request_lane,
+                                context.mux_limits,
+                                true,
+                                ReliableRelayAttachMode::Any,
+                            ),
                             &state.recovery.path_open_suppressions,
                             &state.recovery.pending_additional_path_opens,
                         )
@@ -2169,7 +2174,6 @@ where
                         },
                         RelaySendCause::StreamFin,
                     )
-                    .await
                 {
                     Ok(_) => {
                         state.record_terminal_fin_replayed();
@@ -2195,9 +2199,13 @@ where
                             ReliableRelayPathLanes::new(request_lane, request_lane),
                             &mut remotes,
                             &mut return_plan,
-                            &send_stream,
-                            true,
-                            ReliableRelayAttachMode::Any,
+                            ReliableRelayAttachInput::capture(
+                                &send_stream,
+                                request_lane,
+                                context.mux_limits,
+                                true,
+                                ReliableRelayAttachMode::Any,
+                            ),
                             &state.recovery.path_open_suppressions,
                             &state.recovery.pending_additional_path_opens,
                         )
@@ -2288,7 +2296,6 @@ where
                     request_lane,
                     response_lane,
                 )
-                .await
                 {
                     break Err(err);
                 }
@@ -2362,7 +2369,7 @@ where
                             {
                                 match sender.dispatch_next_request_path_recovery(
                                     batch, context, &mut remotes, &send_stream, &sender_queue,
-                                ).await {
+                                ) {
                                     Ok(dispatch) => dispatch,
                                     Err(err) => {
                                         dispatch_error = Some(err);
@@ -2394,7 +2401,6 @@ where
                                         authoritative_data_ack_gap,
                                     ),
                                 )
-                                .await
                             };
                             match dispatch {
                                 Ok(ClientQueuedDispatch::Data { payload_bytes }) => {
@@ -2437,9 +2443,13 @@ where
                                         ReliableRelayPathLanes::new(request_lane, request_lane),
                                         &mut remotes,
                                         &mut return_plan,
-                                        &send_stream,
-                                        !state.endpoint.local_open,
-                                        ReliableRelayAttachMode::Any,
+                                        ReliableRelayAttachInput::capture(
+                                            &send_stream,
+                                            request_lane,
+                                            context.mux_limits,
+                                            !state.endpoint.local_open,
+                                            ReliableRelayAttachMode::Any,
+                                        ),
                                         &state.recovery.path_open_suppressions,
                                         &state.recovery.pending_additional_path_opens,
                                     )
@@ -2602,9 +2612,13 @@ where
                                     ReliableRelayPathLanes::new(topology_lane, request_lane),
                                     &mut remotes,
                                     &mut return_plan,
-                                    &send_stream,
-                                    !state.endpoint.local_open,
-                                    ReliableRelayAttachMode::Any,
+                                    ReliableRelayAttachInput::capture(
+                                        &send_stream,
+                                        topology_lane,
+                                        context.mux_limits,
+                                        !state.endpoint.local_open,
+                                        ReliableRelayAttachMode::Any,
+                                    ),
                                     &state.recovery.path_open_suppressions,
                                     &state.recovery.pending_additional_path_opens,
                                 )
@@ -2830,7 +2844,6 @@ where
                                             response_lane,
                                         ),
                                     )
-                                    .await
                                 {
                                     Ok(sent) => state.record_recv_progress_sent(sent),
                                     Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -2977,7 +2990,6 @@ where
                                                                 response_lane,
                                                             ),
                                                         )
-                                                        .await
                                                     {
                                                         Ok(sent) => state.record_recv_progress_sent(sent),
                                                         Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -3039,7 +3051,6 @@ where
                                             request_lane,
                                             response_lane,
                                         )
-                                        .await
                                         {
                                             break 'postactions Err(err);
                                         }
@@ -3068,7 +3079,6 @@ where
                                         false,
                                     ),
                                 )
-                                .await
                                 {
                                     Ok(sent) => state.record_recv_progress_sent(sent),
                                     Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -3081,9 +3091,13 @@ where
                                             ReliableRelayPathLanes::new(response_lane, request_lane),
                                             &mut remotes,
                                             &mut return_plan,
-                                            &send_stream,
-                                            !state.endpoint.local_open,
-                                            ReliableRelayAttachMode::Any,
+                                            ReliableRelayAttachInput::capture(
+                                                &send_stream,
+                                                response_lane,
+                                                context.mux_limits,
+                                                !state.endpoint.local_open,
+                                                ReliableRelayAttachMode::Any,
+                                            ),
                                             &state.recovery.path_open_suppressions,
                                             &state.recovery.pending_additional_path_opens,
                                         )
@@ -3115,7 +3129,6 @@ where
                                             response_lane,
                                         ),
                                     )
-                                    .await
                                     {
                                         Ok(sent) => {
                                             record_final_recv_progress_enqueue(
@@ -3179,7 +3192,6 @@ where
                                             },
                                             RelaySendCause::StreamFin,
                                         )
-                                        .await
                                     {
                                         Ok(_) => state.record_local_fin_sent(),
                                         Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -3192,9 +3204,13 @@ where
                                                 ReliableRelayPathLanes::new(request_lane, request_lane),
                                                 &mut remotes,
                                                 &mut return_plan,
-                                                &send_stream,
-                                                true,
-                                                ReliableRelayAttachMode::Any,
+                                                ReliableRelayAttachInput::capture(
+                                                    &send_stream,
+                                                    request_lane,
+                                                    context.mux_limits,
+                                                    true,
+                                                    ReliableRelayAttachMode::Any,
+                                                ),
                                                 &state.recovery.path_open_suppressions,
                                                 &state.recovery.pending_additional_path_opens,
                                             )
@@ -3271,7 +3287,6 @@ where
                                             response_lane,
                                         ),
                                     )
-                                    .await
                                     {
                                         Ok(sent) => {
                                             record_final_recv_progress_enqueue(
@@ -3320,7 +3335,6 @@ where
                                             true,
                                         ),
                                     )
-                                .await
                                 {
                                     Ok(sent) => state.record_recv_progress_sent(sent),
                                     Err(err) if reliable_path_error_is_migratable(&err) => {}

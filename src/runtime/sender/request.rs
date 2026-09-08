@@ -627,7 +627,7 @@ impl RequestSenderService {
             .record_reinjected_frame_for_test(instance, frame);
     }
 
-    async fn send_stream_data_for_request_lane(
+    fn send_stream_data_for_request_lane(
         &mut self,
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
@@ -644,10 +644,9 @@ impl RequestSenderService {
             frontier_state,
             None,
         )
-        .await
     }
 
-    pub(in crate::runtime) async fn send_control_frame(
+    pub(in crate::runtime) fn send_control_frame(
         &mut self,
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
@@ -655,7 +654,7 @@ impl RequestSenderService {
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         debug_assert!(!cause.is_reinjection());
-        self.send_frame(context, remotes, frame, cause, None).await
+        self.send_frame(context, remotes, frame, cause, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -759,7 +758,7 @@ impl RequestSenderService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::runtime) async fn dispatch_client_queued_work(
+    pub(in crate::runtime) fn dispatch_client_queued_work(
         &mut self,
         context: &ClientPathContext,
         request_lane: TrafficClass,
@@ -777,35 +776,30 @@ impl RequestSenderService {
             ReliableRelayQueuedWorkKind::Control(_) => {
                 Err(RuntimeError::Protocol("client sender queue control item"))
             }
-            ReliableRelayQueuedWorkKind::Data(payload) => {
-                self.dispatch_client_data_work(
-                    context,
-                    request_lane,
-                    remotes,
-                    send_stream,
-                    sender_queue,
-                    payload,
-                    data_quantum_bytes,
-                    frontier_state,
-                )
-                .await
-            }
-            ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => {
-                self.dispatch_client_reinjection_work(
+            ReliableRelayQueuedWorkKind::Data(payload) => self.dispatch_client_data_work(
+                context,
+                request_lane,
+                remotes,
+                send_stream,
+                sender_queue,
+                payload,
+                data_quantum_bytes,
+                frontier_state,
+            ),
+            ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => self
+                .dispatch_client_reinjection_work(
                     context,
                     request_lane,
                     remotes,
                     sender_queue,
                     frame,
                     cause,
-                )
-                .await
-            }
+                ),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_client_data_work(
+    fn dispatch_client_data_work(
         &mut self,
         context: &ClientPathContext,
         request_lane: TrafficClass,
@@ -823,16 +817,13 @@ impl RequestSenderService {
             .map_err(RuntimeError::Stream)?;
         // Queue priority stays duplex-aware, but request exploration must not
         // borrow bulk classification from reverse-direction response bytes.
-        match self
-            .send_stream_data_for_request_lane(
-                context,
-                remotes,
-                frame.clone(),
-                request_lane,
-                frontier_state,
-            )
-            .await
-        {
+        match self.send_stream_data_for_request_lane(
+            context,
+            remotes,
+            frame.clone(),
+            request_lane,
+            frontier_state,
+        ) {
             Ok(_) => {
                 let committed = sender_queue
                     .commit_front_data_prefix(dispatch_payload_bytes)
@@ -857,7 +848,7 @@ impl RequestSenderService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_client_reinjection_work(
+    fn dispatch_client_reinjection_work(
         &mut self,
         context: &ClientPathContext,
         request_lane: TrafficClass,
@@ -866,21 +857,18 @@ impl RequestSenderService {
         frame: Frame,
         cause: RelaySendCause,
     ) -> Result<ClientQueuedDispatch, RuntimeError> {
-        let dispatch = self
-            .send_frame_at_frontier(
-                context,
-                remotes,
-                frame,
-                cause,
-                matches!(cause, RelaySendCause::CompletionTailReinjection(_))
-                    .then_some(request_lane),
-                ReliableDataAckFrontierState::Live,
-                Some(RequestReinjectionQueueContext {
-                    queue: sender_queue,
-                    exclude_front: true,
-                }),
-            )
-            .await;
+        let dispatch = self.send_frame_at_frontier(
+            context,
+            remotes,
+            frame,
+            cause,
+            matches!(cause, RelaySendCause::CompletionTailReinjection(_)).then_some(request_lane),
+            ReliableDataAckFrontierState::Live,
+            Some(RequestReinjectionQueueContext {
+                queue: sender_queue,
+                exclude_front: true,
+            }),
+        );
         match dispatch {
             Ok(outcome) => {
                 let (_, committed) = sender_queue
@@ -934,7 +922,7 @@ impl RequestSenderService {
         }
     }
 
-    async fn send_frame(
+    fn send_frame(
         &mut self,
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
@@ -951,11 +939,10 @@ impl RequestSenderService {
             ReliableDataAckFrontierState::Live,
             None,
         )
-        .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn send_frame_at_frontier(
+    fn send_frame_at_frontier(
         &mut self,
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
@@ -969,18 +956,16 @@ impl RequestSenderService {
         let avoid_instances =
             self.multipath
                 .reinjection_avoid_instances(&sent_frame, cause, remotes);
-        let (instance, payload_bytes, accepted_copy_deadline) = self
-            .emit_relay_frame(
-                context,
-                remotes,
-                frame,
-                cause,
-                &avoid_instances,
-                request_lane,
-                frontier_state,
-                reinjection_queue,
-            )
-            .await?;
+        let (instance, payload_bytes, accepted_copy_deadline) = self.emit_relay_frame(
+            context,
+            remotes,
+            frame,
+            cause,
+            &avoid_instances,
+            request_lane,
+            frontier_state,
+            reinjection_queue,
+        )?;
         let path_key = instance.key;
         self.record_decision(path_key, payload_bytes, &sent_frame, cause);
         Ok(RelaySendOutcome {
@@ -990,7 +975,7 @@ impl RequestSenderService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn emit_relay_frame(
+    fn emit_relay_frame(
         &mut self,
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
@@ -1371,7 +1356,7 @@ impl RequestSenderService {
         Err(last_error.unwrap_or(RuntimeError::ReliablePathSessionClosed))
     }
 
-    pub(in crate::runtime) async fn send_recv_progress(
+    pub(in crate::runtime) fn send_recv_progress(
         &mut self,
         remotes: &mut ReliableRelayRemoteSet,
         context: &ClientPathContext,
@@ -1924,7 +1909,7 @@ impl RequestSenderService {
     /// Select the lowest currently serviceable due range before assigning any
     /// target credit. A rejected target/range remains in the flight ledger;
     /// only this finite batch cursor advances so independent targets can run.
-    pub(in crate::runtime) async fn dispatch_next_request_path_recovery(
+    pub(in crate::runtime) fn dispatch_next_request_path_recovery(
         &mut self,
         batch: &mut RequestPathRecoveryBatch,
         context: &ClientPathContext,
@@ -2004,21 +1989,18 @@ impl RequestSenderService {
                 }
                 _ => RelaySendCause::ClientPathFailureReinjection(target),
             };
-            match self
-                .send_frame_at_frontier(
-                    context,
-                    remotes,
-                    frame,
-                    cause,
-                    None,
-                    ReliableDataAckFrontierState::Live,
-                    Some(RequestReinjectionQueueContext {
-                        queue: sender_queue,
-                        exclude_front: false,
-                    }),
-                )
-                .await
-            {
+            match self.send_frame_at_frontier(
+                context,
+                remotes,
+                frame,
+                cause,
+                None,
+                ReliableDataAckFrontierState::Live,
+                Some(RequestReinjectionQueueContext {
+                    queue: sender_queue,
+                    exclude_front: false,
+                }),
+            ) {
                 Ok(outcome) => {
                     // Discovery and failed Apply attempts consume no optional
                     // traffic account. An actual committed copy counts once.

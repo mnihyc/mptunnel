@@ -147,7 +147,11 @@ async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start()
     assert!(source_bytes <= admission.window_bytes);
     assert!(source_bytes <= limits.max_repair_bytes);
     assert!(source_bytes <= send_stream.send_credit_bytes());
-    assert_eq!(remotes.paths.len(), 1, "no alternate or migration is required");
+    assert_eq!(
+        remotes.paths.len(),
+        1,
+        "no alternate or migration is required"
+    );
     assert!(commands.can_enqueue_lane_now(TrafficClass::Throughput));
     let source = Bytes::from(vec![0x71; source_bytes]);
     queue.push_data(source.clone());
@@ -175,7 +179,6 @@ async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start()
                 quantum,
                 ReliableDataAckFrontierState::Live,
             )
-            .await
             .expect("two legal source quanta fit the unchanged ordinary admission")
         {
             ClientQueuedDispatch::Data { payload_bytes } => {
@@ -434,16 +437,15 @@ async fn request_all_full_writers_finish_one_finite_production_pass_and_park() {
         payload: Bytes::from_static(b"pending Product quantum"),
     };
     let mut sender = RequestSenderService::new(stream_id);
-    let outcome = tokio::time::timeout(
-        Duration::from_millis(250),
+    let outcome = tokio::time::timeout(Duration::from_millis(250), async {
         sender.send_frame(
             &context,
             &mut remotes,
             pending,
             RelaySendCause::StreamData,
             Some(TrafficClass::Throughput),
-        ),
-    )
+        )
+    })
     .await
     .expect("the finite candidate pass must park without spinning");
     assert!(matches!(outcome, Err(RuntimeError::SenderServiceBlocked)));
@@ -528,17 +530,15 @@ async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent()
     target_commands.begin_path_drain();
     target_receivers.close_for_path_drain();
     assert!(matches!(
-        sender
-            .dispatch_client_queued_work(
-                &context,
-                TrafficClass::Throughput,
-                &mut remotes,
-                &mut send_stream,
-                &mut sender_queue,
-                6,
-                ReliableDataAckFrontierState::Live,
-            )
-            .await,
+        sender.dispatch_client_queued_work(
+            &context,
+            TrafficClass::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut sender_queue,
+            6,
+            ReliableDataAckFrontierState::Live,
+        ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
     assert!(
@@ -577,7 +577,6 @@ async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent()
                 6,
                 ReliableDataAckFrontierState::Live,
             )
-            .await
             .expect("absent exact target cancels the retained queued batch"),
         ClientQueuedDispatch::PersistentReinjectionCancelled
     ));
@@ -775,7 +774,6 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
             4096,
             ReliableDataAckFrontierState::Live,
         )
-        .await
         .expect("queued bound repair uses headroom independent of shared writer work");
     assert!(matches!(dispatch, ClientQueuedDispatch::Reinjection { .. }));
     assert!(queue.is_empty());
@@ -814,7 +812,6 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
             4096,
             ReliableDataAckFrontierState::Live,
         )
-        .await
         .expect("stale bound reinjection is cancelled without aborting the stream");
     assert!(matches!(
         dispatch,
@@ -881,7 +878,6 @@ async fn request_path_recovery_without_a_new_target(stale_before_dispatch: bool)
                 &send_stream,
                 &queue,
             )
-            .await
             .expect("no new target must not close the relay")
             .is_none()
     );
@@ -914,7 +910,6 @@ async fn request_path_recovery_without_a_new_target(stale_before_dispatch: bool)
                 &send_stream,
                 &queue,
             )
-            .await
             .expect("membership publication reselects a real target"),
         Some(ClientQueuedDispatch::Reinjection {
             payload_bytes: 4096,
@@ -1109,7 +1104,6 @@ async fn request_recovery_orders_retained_ranges(
                 &send_stream,
                 &queue,
             )
-            .await
             .expect("selected repair passes unchanged native admission")
             .expect("lowest eligible range enters native service in this batch");
         assert!(matches!(dispatch, ClientQueuedDispatch::Reinjection { .. }));
@@ -1222,7 +1216,6 @@ async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_
                     &send_stream,
                     &queue,
                 )
-                .await
                 .expect("partial queued overlap does not fence another range")
                 .expect("uncovered range has native service");
             assert!(matches!(
@@ -1258,7 +1251,6 @@ async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_
                     &send_stream,
                     &queue,
                 )
-                .await
                 .expect("finite batch terminates")
                 .is_none()
         );
@@ -1293,7 +1285,6 @@ async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_
                 &send_stream,
                 &queue,
             )
-            .await
             .expect("queued live repair remains authoritative")
             .is_none()
     );
@@ -1325,7 +1316,6 @@ async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_
             4096,
             ReliableDataAckFrontierState::Live,
         )
-        .await
         .expect("queued live repair resolves without closing the stream");
     if cancel_queued {
         assert!(matches!(
@@ -1352,7 +1342,6 @@ async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_
                     &send_stream,
                     &queue,
                 )
-                .await
                 .expect("removed queued authority exposes retained recovery"),
             Some(ClientQueuedDispatch::Reinjection {
                 payload_bytes: 4096,
@@ -1381,7 +1370,6 @@ async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_
                     &send_stream,
                     &queue,
                 )
-                .await
                 .expect("one finite retry batch")
                 .is_none()
         );
@@ -1413,7 +1401,6 @@ async fn request_recovery_preserves_queued_live_copy(partial_copy: bool, cancel_
                 &send_stream,
                 &queue,
             )
-            .await
             .expect("accepted copy retains its immutable suppression")
             .is_none()
     );
@@ -1491,7 +1478,6 @@ async fn disappeared_path_recovery_target_is_reselected_at_direct_commit() {
                 &send_stream,
                 &queue,
             )
-            .await
             .expect("replacement target dispatch"),
         Some(ClientQueuedDispatch::Reinjection { .. })
     ));
@@ -1591,7 +1577,6 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
                 64,
                 ReliableDataAckFrontierState::Live,
             )
-            .await
             .expect("live tail dispatch"),
         ClientQueuedDispatch::Reinjection {
             payload_bytes: 64,
@@ -1975,7 +1960,6 @@ async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_
             32,
             ReliableDataAckFrontierState::Live,
         )
-        .await
         .expect("the M-bound completion target remains dispatchable after Apply shrinks to F");
     assert!(matches!(
         dispatch,
@@ -2641,7 +2625,6 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
             &send_stream,
             &sender_queue,
         )
-        .await
         .expect("actual carrier command commitment")
         .expect("stale retained OriginalData commits through direct recovery");
     let accepted_after = Instant::now();
@@ -2752,7 +2735,6 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
             &mut progress,
             RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
         )
-        .await
         .expect("recv progress backpressure should not close the product stream");
 
     assert!(!sent, "blocked advisory progress must report no frame sent");
@@ -2877,7 +2859,6 @@ async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
             &mut progress,
             RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
         )
-        .await
         .expect("blocked MAX_DATA publication is retryable");
 
     assert!(!sent);
@@ -2955,7 +2936,6 @@ async fn client_max_data_retries_only_the_blocked_attachment() {
                 &mut progress,
                 RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
             )
-            .await
             .expect("one live attachment publishes shared credit")
     );
     let Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
@@ -3052,7 +3032,6 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
             &mut progress,
             RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
         )
-        .await
         .expect("available alternate control queue should accept recv progress");
 
     assert!(sent);
@@ -3103,7 +3082,6 @@ async fn first_nonempty_request_data_acquires_load_but_empty_data_does_not() {
             RelaySendCause::StreamData,
             Some(TrafficClass::Throughput),
         )
-        .await
         .expect("empty stream data remains harmless carrier work");
     assert!(!remotes.paths[0].has_load_reservation());
     assert_eq!(
@@ -3124,7 +3102,6 @@ async fn first_nonempty_request_data_acquires_load_but_empty_data_does_not() {
             RelaySendCause::StreamData,
             Some(TrafficClass::Throughput),
         )
-        .await
         .expect("first OriginalData assignment");
     assert!(remotes.paths[0].has_load_reservation());
     assert_eq!(
@@ -3367,7 +3344,6 @@ async fn client_exact_failure_recovery_keeps_full_structural_target_service() {
             &send_stream,
             &sender_queue,
         )
-        .await
         .expect("exact-failure recovery retains native admission")
     {
         let ClientQueuedDispatch::Reinjection { payload_bytes, .. } = dispatch else {
@@ -3567,7 +3543,6 @@ async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() 
                 4096,
                 ReliableDataAckFrontierState::Live,
             )
-            .await
             .expect("ordinary original commitment on sole A"),
         ClientQueuedDispatch::Data {
             payload_bytes: 4096
@@ -3620,7 +3595,6 @@ async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() 
             4096,
             ReliableDataAckFrontierState::Live,
         )
-        .await
         .expect("real first-copy reservation and commitment");
     let ClientQueuedDispatch::Reinjection {
         payload_bytes: 4096,

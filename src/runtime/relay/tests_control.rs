@@ -693,7 +693,6 @@ async fn direct_recovery_service_wait_retains_capacity_release_before_next_selec
                 &send_stream,
                 &queue,
             )
-            .await
             .expect("full native lane is not terminal")
             .is_none()
     );
@@ -808,7 +807,6 @@ async fn actor_recovery_pass_selects_survivor_after_collected_target_disappears(
             &send_stream,
             &sender_queue,
         )
-        .await
         .expect("survivor recovery dispatch")
         .expect("the same actor pass chooses the survivor without a queued stale binding");
     assert!(matches!(dispatch, ClientQueuedDispatch::Reinjection { .. }));

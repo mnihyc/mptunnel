@@ -1318,7 +1318,6 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
             scored_frontier_bytes,
             ReliableDataAckFrontierState::AuthoritativeGap,
         )
-        .await
         .unwrap_or_else(|error| {
             panic!(
                 "the natural planner-admitted batch must commit its exact front: error={error:?} target={:?} planner_P={} planner_O={} planner_repair_cap={} planner_B=0 planner_U=0 planner_J={} planner_K={} batch={} apply_P={} apply_O={} apply_repair_cap={} apply_B_plus_U_after_front={} apply_J={} apply_K_after_front={} front={}",

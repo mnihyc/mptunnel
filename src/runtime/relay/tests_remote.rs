@@ -763,7 +763,7 @@ fn pending_fin_is_enqueued_before_attachment_publish() {
         .send_data(Bytes::from_static(b"request"))
         .expect("request data");
 
-    send_request_attach_control_frames(opened.stream(), &send_stream, true)
+    send_request_attach_control_frames(opened.stream(), Some(send_stream.next_offset()))
         .expect("enqueue final offset");
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),

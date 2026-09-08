@@ -53,15 +53,59 @@ impl ReliableRelayPathLanes {
     }
 }
 
+/// Owned send-state inputs for an attachment open. Capture these before the
+/// network await so opening a carrier does not retain a send-state borrow.
+/// The caller retains the existing responsibility for FIN eligibility.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReliableRelayAttachInput {
+    mode: ReliableRelayAttachMode,
+    payload_bytes: usize,
+    prefer_reinjection_alternative: bool,
+    final_offset: Option<u64>,
+}
+
+impl ReliableRelayAttachInput {
+    pub(super) fn capture(
+        send_stream: &ReliableSendStream,
+        selection_lane: TrafficClass,
+        mux_limits: MuxLimits,
+        resend_fin: bool,
+        mode: ReliableRelayAttachMode,
+    ) -> Self {
+        let payload_bytes = match mode {
+            ReliableRelayAttachMode::Startup
+            | ReliableRelayAttachMode::Any
+            | ReliableRelayAttachMode::Recovery => {
+                reliable_relay_attach_payload_bytes(send_stream, selection_lane, mux_limits)
+            }
+            ReliableRelayAttachMode::BulkStriping => {
+                reliable_relay_bulk_striping_payload_bytes(send_stream, mux_limits)
+            }
+        };
+        let prefer_reinjection_alternative = matches!(mode, ReliableRelayAttachMode::Recovery)
+            || reliable_relay_should_open_reinjection_alternative(
+                selection_lane,
+                send_stream,
+                resend_fin,
+                mode,
+            );
+        Self {
+            mode,
+            payload_bytes,
+            prefer_reinjection_alternative,
+            final_offset: resend_fin.then(|| send_stream.next_offset()),
+        }
+    }
+}
+
 fn send_request_attach_control_frames(
     path_stream: &ReliablePathStream,
-    send_stream: &ReliableSendStream,
-    resend_fin: bool,
+    final_offset: Option<u64>,
 ) -> Result<(), RuntimeError> {
-    if resend_fin {
+    if let Some(final_offset) = final_offset {
         path_stream.try_enqueue_request_control_frame(Frame::StreamFin {
             stream_id: path_stream.stream_id,
-            final_offset: send_stream.next_offset(),
+            final_offset,
         })?;
     }
     Ok(())
@@ -70,8 +114,7 @@ fn send_request_attach_control_frames(
 struct RelayPathAttachRequest<'a> {
     spec: &'a ReliableRelayOpenSpec,
     output_lane: TrafficClass,
-    send_stream: &'a ReliableSendStream,
-    resend_fin: bool,
+    final_offset: Option<u64>,
     candidates: Vec<RelayPathKey>,
 }
 
@@ -125,11 +168,8 @@ async fn attach_relay_path_candidates(
                     }
                     continue;
                 }
-                let attach_control_result = send_request_attach_control_frames(
-                    opened.stream(),
-                    request.send_stream,
-                    request.resend_fin,
-                );
+                let attach_control_result =
+                    send_request_attach_control_frames(opened.stream(), request.final_offset);
                 match attach_control_result {
                     Ok(()) => {
                         let attach_outcome = remotes.try_attach_candidate(opened)?;
@@ -203,23 +243,12 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
     lanes: ReliableRelayPathLanes,
     remotes: &mut ReliableRelayRemoteSet,
     startup: &mut ClientReliableReturnPlan,
-    send_stream: &ReliableSendStream,
-    resend_fin: bool,
-    mode: ReliableRelayAttachMode,
+    input: ReliableRelayAttachInput,
     path_open_suppressions: &ClientRelayPathOpenSuppressions,
     inflight_path_claims: &HashSet<RelayPathKey>,
 ) -> Result<usize, RuntimeError> {
-    let payload_bytes = match mode {
-        ReliableRelayAttachMode::Startup
-        | ReliableRelayAttachMode::Any
-        | ReliableRelayAttachMode::Recovery => {
-            reliable_relay_attach_payload_bytes(send_stream, lanes.selection, context.mux_limits)
-        }
-        ReliableRelayAttachMode::BulkStriping => {
-            reliable_relay_bulk_striping_payload_bytes(send_stream, context.mux_limits)
-        }
-    };
-    if matches!(mode, ReliableRelayAttachMode::BulkStriping) {
+    let payload_bytes = input.payload_bytes;
+    if matches!(input.mode, ReliableRelayAttachMode::BulkStriping) {
         let result = attach_relay_path_candidates(
             context,
             remotes,
@@ -227,8 +256,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
             RelayPathAttachRequest {
                 spec,
                 output_lane: lanes.output,
-                send_stream,
-                resend_fin,
+                final_offset: input.final_offset,
                 candidates: reliable_relay_exclude_inflight_open_claims(
                     reliable_relay_path_open_candidates_after_suppression(
                         context,
@@ -248,14 +276,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
             Err(err) => return Err(err),
         }
     }
-    let prefer_reinjection_alternative = matches!(mode, ReliableRelayAttachMode::Recovery)
-        || reliable_relay_should_open_reinjection_alternative(
-            lanes.selection,
-            send_stream,
-            resend_fin,
-            mode,
-        );
-    if prefer_reinjection_alternative {
+    if input.prefer_reinjection_alternative {
         let result = attach_relay_path_candidates(
             context,
             remotes,
@@ -263,8 +284,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
             RelayPathAttachRequest {
                 spec,
                 output_lane: lanes.output,
-                send_stream,
-                resend_fin,
+                final_offset: input.final_offset,
                 candidates: reliable_relay_exclude_inflight_open_claims(
                     reliable_relay_path_open_candidates_after_suppression(
                         context,
@@ -290,8 +310,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
         RelayPathAttachRequest {
             spec,
             output_lane: lanes.output,
-            send_stream,
-            resend_fin,
+            final_offset: input.final_offset,
             candidates: reliable_relay_exclude_inflight_open_claims(
                 reliable_relay_path_open_candidates_after_suppression(
                     context,

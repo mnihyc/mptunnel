@@ -1,6 +1,6 @@
 # Prepared Original ownership — pre-implementation model
 
-2026-09-08 10:07 +08:00. Category: bounded architectural candidate for the
+2026-09-08 10:25 +08:00. Category: bounded architectural candidate for the
 existing early ordered-upload failure. **Not accepted runtime, performance or
 RFC policy.** Read PERFORMANCE_METHOD_AND_LESSONS and CURRENT_CLOSURE_PLAN.
 REQUEST_PREFIX_SERVICE_20260908 contains the exact existing capture; this file
@@ -17,6 +17,14 @@ Product Apply irrevocably binds a frame before publishing it to a private
 writer queue. Queue capacity was intentionally retained for high-BDP and
 concurrent-actor pipelines. The undesirable coupling is early path ownership,
 not the existence or size of a prepared-work resource queue.
+
+RFC15.1 explicitly requires the bounded command reservation followed by
+Product ownership before publication, and describes that queue as the staging
+linearization point. The wording is present at3a6d0ea; the dispatch function's
+current source boundary was named in4139704. This candidate changes that
+particular placement contract while retaining the RFC's separate resource,
+qualification, no-native-ACK-credit and protected-write intentions. It must
+not be described as merely bringing current code into RFC compliance.
 
 T06's one-quantum live hedge cannot provide sustained migration by itself;
 conditional repair service is8Q/tau when each succeeding quantum waits for
@@ -148,10 +156,26 @@ arbitrary future prepared suffix or make independent ready work wait for it.
 For the request candidate, retain the existing full-membership ordinary
 observation, advisory ordering and successful-claim cursor. Add an exact
 writer-boundary predicate separately from structural membership. The current
-`current_request_original_data_tier` omits queue availability; preserve that
-tier and its FirstPath/frontier/AdditionalPath baseline rather than filtering
-the member set to ready writers. This candidate does not promote backup solely
-because regular writers are busy or requalify a stale owner to obtain a claim.
+FirstPath/frontier/AdditionalPath classification must retain actual claimed
+ownership rather than filtering the member set to ready writers. Regular-before-
+backup follows the RFC's finite exact-attempt rule: try every current regular
+candidate in the applicable freshness/policy class first. Backup is eligible
+only after that pass fails, with its exhausted membership, authority and writer-
+readiness generations revalidated. A busy regular is unavailable for this
+imminent claim, not stale, dead or permanently demoted. Its return to readiness
+before backup commit invalidates the failed pass. Never requalify a stale owner
+or classify a filtered survivor as a fresh FirstPath merely to claim bytes.
+
+Pre-code cross-check rejected this draft's earlier blanket ban on backup while
+regular writers are busy. Current latency selection is queue-aware and can use
+backup after all regular choices fail; blindly reusing the bulk Apply helper
+`current_request_original_data_tier` would instead impose its structural-
+membership veto and narrow that behaviour. The existing blocked-regular test
+still has an enqueueable regular QUIC reference and does not justify an all-
+regular-blocked ban. The new claim arbiter must implement the full failed-pass
+and generation rule above, not treat that helper as the whole policy. This is
+a model-migration obligation found before writer code, not a separate new
+runtime fix or evidence that an arbitrary busy instant grants backup priority.
 
 A caller claims only when the coherent finite decision selects that caller's
 exact ready writer. If another currently ready writer wins, leave U untouched
@@ -297,3 +321,21 @@ not proof that current code violates its current early-publication RFC. The
 live pre-native waiting evidence supplies the practical reason to consider
 changing that contract. Alternate claiming, singleton feeding, migration cost
 and ordinary timing remain unproved. Do not waive them after this RED.
+
+## Used preparation refactor — 2026-09-08 10:24 +08:00
+
+All10 request sender async methods were transitively non-yielding. Their
+wrappers and immediate caller awaits are removed; the two deferred timeout
+fixtures retain lazy async blocks. Actual open, receive, native I/O and close
+awaits remain. Native capture now supplies an owned, consumed value seam with
+the same eager read order and target-only override; it is not yet a concurrent
+membership receipt. Both attachment wrappers now take owned advisory inputs
+and an optional immutable FIN offset captured before opening. All9 actor
+callers retain their prior lane, mode and FIN flag. Current actor serialization
+makes this offset equal to the previous post-open read.
+
+Independent source reviews passed; functional rebuild1m06s and the existing483
+controls pass1.27s. The intended128KiB boundary RED remains unchanged. This
+preparation installs no shared mutex, changes no Original publication boundary
+and claims no speed gain. The next owner extraction must make captured
+membership validation real and keep native I/O outside the shared owner.

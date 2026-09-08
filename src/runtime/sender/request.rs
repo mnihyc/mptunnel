@@ -5,8 +5,8 @@
 //! QUIC path use is gated by validation and native writer backpressure.
 
 use self::multipath::{
-    RequestMultipathController, RequestMultipathPlanError, RequestRelayNativeCapture,
-    RequestRelayNativeInputs,
+    RequestMultipathController, RequestMultipathPlan, RequestMultipathPlanError,
+    RequestRelayNativeCapture, RequestRelayNativeInputs,
 };
 use super::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
 use super::work::{
@@ -47,13 +47,13 @@ use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_acco
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
-use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::{
     ReliablePathCommandSender, ReliablePathFrameReservation, reliable_path_effective_frame_lane,
 };
+use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::relay::io::{
-    exact_contiguous_retransmission_frames, normalized_stream_ack_first_gap,
-    preserve_reinjection_frontier_quantum,
+    AuthoritativeStreamAckSnapshot, exact_contiguous_retransmission_frames,
+    normalized_stream_ack_first_gap, preserve_reinjection_frontier_quantum,
 };
 #[cfg(test)]
 use crate::runtime::stream::ReliablePathStreamHandle;
@@ -174,6 +174,18 @@ struct RequestReinjectionQueueContext<'a> {
     exclude_front: bool,
 }
 
+/// The exact admitted frame's Product commit inputs, borrowed only for the
+/// synchronous fenced transaction. These are not a second mutable owner.
+struct RequestFrameProductCommit<'a> {
+    plan: &'a RequestMultipathPlan,
+    frame: &'a Frame,
+    cause: RelaySendCause,
+    position: usize,
+    path_count: usize,
+    reinjection_target_snapshot: Option<PathSnapshot>,
+    request_load_claim: Option<RelayPathLoadLease>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::runtime) struct RequestCompletionTailEnqueueOutcome {
     pub(in crate::runtime) queued: bool,
@@ -248,6 +260,7 @@ pub(in crate::runtime) struct RequestProductState {
     pub(in crate::runtime) sender_queue: ReliableRelaySenderQueue,
     pub(in crate::runtime) sender: RequestSenderService,
     pub(in crate::runtime) send_stream: ReliableSendStream,
+    pub(in crate::runtime) last_send_ack: AuthoritativeStreamAckSnapshot,
     pub(in crate::runtime) remotes: ReliableRelayRemoteSet,
 }
 
@@ -1313,42 +1326,20 @@ impl RequestSenderService {
                                     return Err(RequestFrameAdmissionError::ServiceBlocked);
                                 }
                             }
-                            let (payload_bytes, accepted_copy_deadline) = self
-                                .multipath
-                                .record_emitted_frame(
+                            let (payload_bytes, accepted_copy_deadline) =
+                                self.commit_fenced_frame_product(
                                     context,
-                                    instance,
-                                    &frame,
-                                    cause,
-                                    reinjection_target_snapshot,
-                                )
-                                .map_err(|_| RequestFrameAdmissionError::ServiceBlocked)?;
-                            if let Some(claim) = request_load_claim {
-                                let remote = &mut remotes.paths[position];
-                                // The exact path owns the lease after queue
-                                // reservation and before carrier publication;
-                                // path removal or relay cancellation releases it.
-                                assert!(
-                                    remote.load_lease.is_none(),
-                                    "conditionally claimed path load must remain unowned before transfer"
-                                );
-                                remote.load_lease = Some(claim);
-                                #[cfg(feature = "lab-diagnostics")]
-                                lab_diagnostic(
-                                    "request_startup_selection",
-                                    format_args!(
-                                        "phase=claim_committed stream_id={} path_index={} instance_id={}",
-                                        self.multipath.stream_id().0,
-                                        instance.key.index,
-                                        instance.attachment_id,
-                                    ),
-                                );
-                            }
-                            // Exact Product ownership and its receipt precede
-                            // the final queue publication under the same fence.
-                            self.multipath.commit_enqueued_request_product_send(
-                                context, &frame, &plan, position, path_count,
-                            );
+                                    remotes,
+                                    RequestFrameProductCommit {
+                                        plan: &plan,
+                                        frame: &frame,
+                                        cause,
+                                        position,
+                                        path_count,
+                                        reinjection_target_snapshot,
+                                        request_load_claim,
+                                    },
+                                )?;
                             command.commit();
                             Ok((payload_bytes, accepted_copy_deadline))
                         })
@@ -1394,6 +1385,57 @@ impl RequestSenderService {
             }
         }
         Err(last_error.unwrap_or(RuntimeError::ReliablePathSessionClosed))
+    }
+
+    /// Commits already validated Product ownership inside the selected Native
+    /// fence. Publication must follow synchronously; this helper does not read
+    /// Native, reserve a future writer, or validate a stale decision by itself.
+    fn commit_fenced_frame_product(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        commit: RequestFrameProductCommit<'_>,
+    ) -> Result<(usize, Option<Instant>), RequestFrameAdmissionError> {
+        let RequestFrameProductCommit {
+            plan,
+            frame,
+            cause,
+            position,
+            path_count,
+            reinjection_target_snapshot,
+            request_load_claim,
+        } = commit;
+        let (_, instance) = plan.target();
+        let (payload_bytes, accepted_copy_deadline) = self
+            .multipath
+            .record_emitted_frame(context, instance, frame, cause, reinjection_target_snapshot)
+            .map_err(|_| RequestFrameAdmissionError::ServiceBlocked)?;
+        if let Some(claim) = request_load_claim {
+            let remote = &mut remotes.paths[position];
+            // The exact path owns the lease after queue
+            // reservation and before carrier publication;
+            // path removal or relay cancellation releases it.
+            assert!(
+                remote.load_lease.is_none(),
+                "conditionally claimed path load must remain unowned before transfer"
+            );
+            remote.load_lease = Some(claim);
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "request_startup_selection",
+                format_args!(
+                    "phase=claim_committed stream_id={} path_index={} instance_id={}",
+                    self.multipath.stream_id().0,
+                    instance.key.index,
+                    instance.attachment_id,
+                ),
+            );
+        }
+        // Exact Product ownership and its receipt precede
+        // the final queue publication under the same fence.
+        self.multipath
+            .commit_enqueued_request_product_send(context, frame, plan, position, path_count);
+        Ok((payload_bytes, accepted_copy_deadline))
     }
 
     pub(in crate::runtime) fn send_recv_progress(

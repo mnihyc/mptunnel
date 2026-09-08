@@ -1,6 +1,6 @@
 # Prepared Original ownership — pre-implementation model
 
-2026-09-08 10:57 +08:00. Category: bounded architectural candidate for the
+2026-09-08 11:10 +08:00. Category: bounded architectural candidate for the
 existing early ordered-upload failure. **Not accepted runtime, performance or
 RFC policy.** Read PERFORMANCE_METHOD_AND_LESSONS and CURRENT_CLOSURE_PLAN.
 REQUEST_PREFIX_SERVICE_20260908 contains the exact existing capture; this file
@@ -280,6 +280,20 @@ its cost is not a claimed optimization and ordinary migration cost remains a
 gate. A first test read the fixture's undecorated command clone rather than its
 attached Native output and failed setup; correcting that fixture is not a
 Product fix or a waived invariant.
+
+The used extraction keeps three responsibilities explicit: the existing
+Original chooser consumes its observation without Native reads; the fenced
+Product commit records flight, qualification, load and cursor; the selected
+reserved publication follows synchronously under the same fence. Legacy repair
+selection must not blindly reuse the Original observation: its bulk-evidence
+flag is gated differently and would wrongly exclude persistent repairs.
+Neither helper alone authorizes concurrent claims. Source C/prepared head,
+ACK/qualification changes, readiness and current exact admission must be
+revalidated by the final shared transaction before it calls the commit helper.
+The sole ACK snapshot is also now a Product field, still passed by actual borrow
+through current actor ACK/recovery orchestration. Independent equivalence audits
+pass; warning-free1m08s build and485 GREEN1.27s, unchanged128KiB boundary RED.
+No mutex, weak writer subscription or native-claim boundary is active yet.
 
 Existing request structural-recovery batches assume one serialized Dispatch.
 After this migration, a writer may append a higher-offset Original while the

@@ -8,10 +8,10 @@ use super::flow::{
     ReliableRelayFlowDemandTracker, ReliableRelayFlowPathEvidence, ReliableRelayFlowSignals,
 };
 use super::io::{
-    ReadyStreamDataBatchBounds, ReadyStreamDataDirection, accepted_copy_wake_is_due,
-    apply_ready_stream_data_batch, collect_ready_stream_data_batch, pending_stream_fin_ready,
-    read_reliable_relay_payload, receive_stream_fin, reconcile_accepted_copy_wake,
-    resize_reliable_relay_buffer, retain_accepted_copy_wake,
+    AuthoritativeStreamAckSnapshot, ReadyStreamDataBatchBounds, ReadyStreamDataDirection,
+    accepted_copy_wake_is_due, apply_ready_stream_data_batch, collect_ready_stream_data_batch,
+    pending_stream_fin_ready, read_reliable_relay_payload, receive_stream_fin,
+    reconcile_accepted_copy_wake, resize_reliable_relay_buffer, retain_accepted_copy_wake,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required, write_applied_ready_stream_data_batch,
 };
@@ -672,15 +672,17 @@ where
         sender_queue: ReliableRelaySenderQueue::default(),
         sender,
         send_stream,
+        last_send_ack: AuthoritativeStreamAckSnapshot::default(),
         remotes,
     };
     // These are disjoint borrows of one actual owner, not duplicate views of
     // path admission or Product debt. Keep the current actor transaction order
     // while the native claim boundary is migrated separately.
-    let (sender_queue, sender, send_stream, remotes) = (
+    let (sender_queue, sender, send_stream, last_send_ack, remotes) = (
         &mut request_product.sender_queue,
         &mut request_product.sender,
         &mut request_product.send_stream,
+        &mut request_product.last_send_ack,
         &mut request_product.remotes,
     );
     let mut deferred_remote_frame = None::<ReliableRelayRemoteFrame>;
@@ -965,6 +967,7 @@ where
         if request_path_staleness_dirty || request_path_staleness_due {
             if update_request_path_staleness(
                 &mut state,
+                last_send_ack,
                 sender,
                 context,
                 remotes,
@@ -985,7 +988,7 @@ where
             context,
             sender,
             remotes,
-            state.progress.last_send_ack.horizon().unwrap_or(0),
+            last_send_ack.horizon().unwrap_or(0),
             path_model_generation_before_recovery_observation,
         );
         let request_path_staleness_model_wait_active =
@@ -1428,8 +1431,8 @@ where
             state.progress.data_ack_reinjection_at = None;
         }
         let authoritative_data_ack_gap = stream_ack_ranges_expose_authoritative_gap(
-            state.progress.last_send_ack.complete(),
-            state.progress.last_send_ack.ranges(),
+            last_send_ack.complete(),
+            last_send_ack.ranges(),
         );
         let data_ack_capacity_wait_arm_active =
             reliable_relay_client_ack_gap_capacity_wait_arm_active(
@@ -1457,6 +1460,7 @@ where
         // exact timer event, without adding polling or another retry clock.
         let data_ack_reinjection = evaluate_client_data_ack_reinjection(
             &mut state,
+            last_send_ack,
             sender,
             sender_queue,
             context,
@@ -3171,6 +3175,7 @@ where
                                         context,
                                         remotes: remotes,
                                         send_stream: send_stream,
+                                        last_send_ack,
                                         path_snapshot,
                                         relay_lane: request_lane,
                                     },

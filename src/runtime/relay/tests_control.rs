@@ -1147,12 +1147,13 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
     let mut sender_queue = ReliableRelaySenderQueue::default();
     sender_queue.push_reinjection(sent.clone());
     let mut state = ClientRelayState::new();
+    let mut last_send_ack = AuthoritativeStreamAckSnapshot::default();
 
     let stream_before = send_stream.clone();
     let queue_bytes_before = sender_queue.bytes();
     let last_stream_at_before = state.progress.last_stream_at;
     let frontier_before = state.progress.last_send_ack_frontier;
-    let snapshot_before = state.progress.last_send_ack.clone();
+    let snapshot_before = last_send_ack.clone();
     let rejected = apply_client_stream_ack(
         ClientStreamAckContext {
             state: &mut state,
@@ -1161,6 +1162,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
             context: &context,
             remotes: &mut remotes,
             send_stream: &mut send_stream,
+            last_send_ack: &mut last_send_ack,
             path_snapshot: None,
             relay_lane: TrafficClass::Throughput,
         },
@@ -1185,7 +1187,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
     assert!(!sender_queue.is_empty(), "queued repair was released");
     assert_eq!(state.progress.last_stream_at, last_stream_at_before);
     assert_eq!(state.progress.last_send_ack_frontier, frontier_before);
-    assert_eq!(state.progress.last_send_ack, snapshot_before);
+    assert_eq!(last_send_ack, snapshot_before);
     let released = apply_client_stream_ack(
         ClientStreamAckContext {
             state: &mut state,
@@ -1194,6 +1196,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
             context: &context,
             remotes: &mut remotes,
             send_stream: &mut send_stream,
+            last_send_ack: &mut last_send_ack,
             path_snapshot: None,
             relay_lane: TrafficClass::Throughput,
         },
@@ -1204,7 +1207,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
     .expect("exact assigned ACK commits");
     assert_eq!(released, 8);
     assert!(sender_queue.is_empty());
-    assert_eq!(state.progress.last_send_ack.horizon(), Some(8));
+    assert_eq!(last_send_ack.horizon(), Some(8));
 }
 
 async fn closed_output_relay(

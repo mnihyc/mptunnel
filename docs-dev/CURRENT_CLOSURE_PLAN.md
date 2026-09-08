@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 10:57 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 11:10 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -12,7 +12,7 @@ Shortening this ledger discards neither failures nor gates.
 
 ## Current source and disposition
 
-Current runtime checkpoint **1436ff4**: globally ordered direct request structural recovery,
+Last ordinary performance-tested runtime **1436ff4**: globally ordered direct request structural recovery,
 483 current focused checks plus independent review; ordinary comparison is
 phase-mixed and not performance-accepted. Its frozen comparator **445011f**
 remains available. Earlier89a1a63 retains that comparator's own mixed/adverse
@@ -323,9 +323,17 @@ to the actual attachment output, not waived or labelled Product RED. No deployed
 defect or speed claim follows from exposing this future concurrency obligation.
 Preserve the actor's actual negative-ACK frontier authority when moving claims;
 positive mux F alone is not equivalent. No guard may span actual I/O awaits.
-Next move that one existing ACK snapshot into Product, preserving its update
-order and actor-only timing; then make the existing frame intent/fenced commit
-boundary explicit for the real writer claim. No copied mutable snapshot,
+That one existing ACK snapshot now belongs to Product, preserving its update
+order and actor-only timing. Original selection now consumes an explicit
+observation without Native reads; the existing flight/qualification/load/cursor
+commit is a used synchronous helper, followed immediately by reserved command
+publication inside the same Native fence. Independent reviews pass; warning-free
+build1m08s and485 existing controls GREEN1.27s, only unchanged128KiB RED remains.
+Legacy repair selection is unchanged: blindly sharing Original's bulk-gated
+evidence flag would have blocked persistent repairs and was rejected before code.
+These are preparation, not a completed writer claim. Next integrate the real
+shared source/claim and writer-readiness lifecycle under the stated constraints.
+No copied mutable snapshot,
 extra controller, claim policy change or new performance run is authorized by
 these source-equivalence preparation checkpoints alone.
 Response parity and all existing global gates remain pending, not waived.

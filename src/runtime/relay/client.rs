@@ -58,7 +58,6 @@ pub(super) struct ClientRelayProgressState {
     pub(super) request_path_staleness: ReliableRequestPathStaleness,
     pub(super) last_recv_progress_sent_at: Instant,
     pub(super) last_send_ack_frontier: u64,
-    pub(super) last_send_ack: AuthoritativeStreamAckSnapshot,
     pub(super) data_ack_reinjection_at: Option<tokio::time::Instant>,
     pub(super) sender_retry_at: Option<tokio::time::Instant>,
     #[cfg(feature = "lab-diagnostics")]
@@ -226,7 +225,6 @@ impl ClientRelayState {
                 request_path_staleness: ReliableRequestPathStaleness::default(),
                 last_recv_progress_sent_at: now,
                 last_send_ack_frontier: 0,
-                last_send_ack: AuthoritativeStreamAckSnapshot::default(),
                 data_ack_reinjection_at: None,
                 sender_retry_at: None,
                 #[cfg(feature = "lab-diagnostics")]
@@ -430,6 +428,7 @@ pub(super) struct ClientStreamAckContext<'a> {
     pub(super) context: &'a ClientPathContext,
     pub(super) remotes: &'a mut ReliableRelayRemoteSet,
     pub(super) send_stream: &'a mut ReliableSendStream,
+    pub(super) last_send_ack: &'a mut AuthoritativeStreamAckSnapshot,
     pub(super) path_snapshot: Option<PathSnapshot>,
     pub(super) relay_lane: TrafficClass,
 }
@@ -440,6 +439,7 @@ pub(super) struct ClientStreamAckContext<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_request_path_staleness(
     state: &mut ClientRelayState,
+    last_send_ack: &AuthoritativeStreamAckSnapshot,
     sender: &mut RequestSenderService,
     context: &ClientPathContext,
     remotes: &ReliableRelayRemoteSet,
@@ -447,7 +447,7 @@ pub(super) fn update_request_path_staleness(
     lane: TrafficClass,
     stream_id: StreamId,
 ) -> bool {
-    let authoritative_horizon = state.progress.last_send_ack.horizon().unwrap_or(0);
+    let authoritative_horizon = last_send_ack.horizon().unwrap_or(0);
     let candidates = sender.unacked_original_paths_before(remotes, authoritative_horizon);
     let observations = candidates
         .iter()
@@ -521,6 +521,7 @@ fn request_target_reinjection_service_limit(
 #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
 pub(super) fn evaluate_client_data_ack_reinjection(
     state: &mut ClientRelayState,
+    last_send_ack: &AuthoritativeStreamAckSnapshot,
     sender: &mut RequestSenderService,
     sender_queue: &mut ReliableRelaySenderQueue,
     context: &ClientPathContext,
@@ -532,8 +533,8 @@ pub(super) fn evaluate_client_data_ack_reinjection(
 ) -> ClientDataAckReinjectionOutcome {
     let has_multipath_reinjection_alternative =
         sender.has_multipath_reinjection_alternative(context, remotes, relay_lane);
-    let authoritative_ack_complete = state.progress.last_send_ack.complete();
-    let authoritative_ack_ranges = state.progress.last_send_ack.ranges();
+    let authoritative_ack_complete = last_send_ack.complete();
+    let authoritative_ack_ranges = last_send_ack.ranges();
     if !stream_ack_ranges_expose_authoritative_gap(
         authoritative_ack_complete,
         authoritative_ack_ranges,
@@ -784,12 +785,7 @@ pub(super) fn apply_client_stream_ack(
     // Capture one immutable send-assignment extent before touching any ACK-owned
     // cache, flight, queue, reservation, or recovery evidence.
     let validated_ack = begin_reliable_stream_ack(ack_context.send_stream, complete, ranges)?;
-    if ack_context
-        .state
-        .progress
-        .last_send_ack
-        .subsumes(&validated_ack)
-    {
+    if ack_context.last_send_ack.subsumes(&validated_ack) {
         ack_context.state.progress.last_stream_at = Instant::now();
         return Ok(0);
     }
@@ -802,6 +798,7 @@ pub(super) fn apply_client_stream_ack(
         context,
         remotes,
         send_stream,
+        last_send_ack,
         path_snapshot,
         relay_lane,
     } = ack_context;
@@ -814,10 +811,7 @@ pub(super) fn apply_client_stream_ack(
         remotes.depublish_path_instance_load(instance);
     }
     let previous_ack_frontier = state.progress.last_send_ack_frontier;
-    update_reinjection_authoritative_ack_snapshot(
-        &mut state.progress.last_send_ack,
-        &validated_ack,
-    );
+    update_reinjection_authoritative_ack_snapshot(last_send_ack, &validated_ack);
     state.progress.last_send_ack_frontier = send_stream.data_ack_frontier();
     if state.progress.last_send_ack_frontier > previous_ack_frontier {
         sender.record_live_owner_data_ack_frontier_progress(Instant::now());
@@ -827,6 +821,7 @@ pub(super) fn apply_client_stream_ack(
     sender_queue.release_normalized_acked_reinjections(normalized_ranges);
     update_request_path_staleness(
         state,
+        last_send_ack,
         sender,
         context,
         remotes,
@@ -836,6 +831,7 @@ pub(super) fn apply_client_stream_ack(
     );
     let reinjection = evaluate_client_data_ack_reinjection(
         state,
+        last_send_ack,
         sender,
         sender_queue,
         context,

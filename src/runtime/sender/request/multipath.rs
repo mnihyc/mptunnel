@@ -2354,78 +2354,14 @@ impl RequestMultipathController {
         );
         if let Some(payload_bytes) = prepared.unique_data_payload_bytes {
             self.reconcile_request_path_state(context, remotes);
-            let request_state = RequestSchedulingState {
-                operation: self.request.ack_clock_operation,
-                path_states: &self.request.path_states,
-                flights: Some(&self.request.flights),
-            };
-            let ordinary = choose_ordinary_bulk_relay_path_avoiding(BulkRelayFrameRequest {
-                observation: &relay_observation,
-                lane,
+            return self.plan_original_relay_path_send_from_observation(
+                &relay_observation,
+                remotes,
                 frame,
-                cursor: self.next_send_index,
+                lane,
                 avoid_instances,
-                path_flights: Some(&self.request.flights),
-                request_state: Some(RequestSchedulingState {
-                    operation: self.request.ack_clock_operation,
-                    path_states: &self.request.path_states,
-                    flights: Some(&self.request.flights),
-                }),
                 frontier_state,
-            });
-            let instance = match ordinary {
-                BulkRelayPathChoice::Selected(instance) => instance,
-                BulkRelayPathChoice::Blocked => {
-                    return Err(blocked_attachment_set_error(remotes));
-                }
-                BulkRelayPathChoice::SelectedAckClockMeasurement { .. }
-                | BulkRelayPathChoice::NotApplicable => {
-                    match choose_observed_ordinary_data_path(
-                        &relay_observation,
-                        lane,
-                        payload_bytes,
-                        self.next_send_index,
-                        avoid_instances,
-                        Some(request_state),
-                    ) {
-                        ObservedOrdinaryPathChoice::Selected(instance) => instance,
-                        ObservedOrdinaryPathChoice::Blocked => {
-                            return Err(blocked_attachment_set_error(remotes));
-                        }
-                        ObservedOrdinaryPathChoice::NoLivePath => {
-                            if relay_observation
-                                .paths
-                                .iter()
-                                .any(|path| path.native_authority_unavailable)
-                            {
-                                return Err(RequestMultipathPlanError::ServiceBlocked);
-                            }
-                            return Err(RequestMultipathPlanError::OutputUnavailable);
-                        }
-                    }
-                }
-            };
-            let (product_mutation, proof) = self.ordinary_request_product_mutation(
-                &relay_observation,
-                lane,
-                frame,
                 payload_bytes,
-                instance,
-            )?;
-            let mut selection = RequestMultipathPlan::new(
-                RequestMultipathTarget {
-                    membership_generation: relay_observation.membership_generation,
-                    instance,
-                },
-                product_mutation,
-            );
-            selection.request_load_expectation =
-                observed_request_load_expectation(&relay_observation, instance)?;
-            selection.request_proof_expectation = proof;
-            return selection.with_eligibility_expectation(
-                &relay_observation,
-                lane,
-                Some(request_state),
             );
         }
         let position = self.choose_lowest_eta_relay_path(
@@ -2457,6 +2393,91 @@ impl RequestMultipathController {
                 flights: Some(&self.request.flights),
             }),
         )
+    }
+
+    /// Plans OriginalData from captured scheduling evidence and current Product
+    /// state. The caller owns preparation/reconciliation and Native collection;
+    /// this decision neither samples Native state nor publishes work.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_original_relay_path_send_from_observation(
+        &self,
+        relay_observation: &RequestRelaySchedulingObservation,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+        avoid_instances: &[RelayPathInstance],
+        frontier_state: ReliableDataAckFrontierState,
+        payload_bytes: usize,
+    ) -> Result<RequestMultipathPlan, RequestMultipathPlanError> {
+        let request_state = RequestSchedulingState {
+            operation: self.request.ack_clock_operation,
+            path_states: &self.request.path_states,
+            flights: Some(&self.request.flights),
+        };
+        let ordinary = choose_ordinary_bulk_relay_path_avoiding(BulkRelayFrameRequest {
+            observation: relay_observation,
+            lane,
+            frame,
+            cursor: self.next_send_index,
+            avoid_instances,
+            path_flights: Some(&self.request.flights),
+            request_state: Some(RequestSchedulingState {
+                operation: self.request.ack_clock_operation,
+                path_states: &self.request.path_states,
+                flights: Some(&self.request.flights),
+            }),
+            frontier_state,
+        });
+        let instance = match ordinary {
+            BulkRelayPathChoice::Selected(instance) => instance,
+            BulkRelayPathChoice::Blocked => {
+                return Err(blocked_attachment_set_error(remotes));
+            }
+            BulkRelayPathChoice::SelectedAckClockMeasurement { .. }
+            | BulkRelayPathChoice::NotApplicable => {
+                match choose_observed_ordinary_data_path(
+                    relay_observation,
+                    lane,
+                    payload_bytes,
+                    self.next_send_index,
+                    avoid_instances,
+                    Some(request_state),
+                ) {
+                    ObservedOrdinaryPathChoice::Selected(instance) => instance,
+                    ObservedOrdinaryPathChoice::Blocked => {
+                        return Err(blocked_attachment_set_error(remotes));
+                    }
+                    ObservedOrdinaryPathChoice::NoLivePath => {
+                        if relay_observation
+                            .paths
+                            .iter()
+                            .any(|path| path.native_authority_unavailable)
+                        {
+                            return Err(RequestMultipathPlanError::ServiceBlocked);
+                        }
+                        return Err(RequestMultipathPlanError::OutputUnavailable);
+                    }
+                }
+            }
+        };
+        let (product_mutation, proof) = self.ordinary_request_product_mutation(
+            relay_observation,
+            lane,
+            frame,
+            payload_bytes,
+            instance,
+        )?;
+        let mut selection = RequestMultipathPlan::new(
+            RequestMultipathTarget {
+                membership_generation: relay_observation.membership_generation,
+                instance,
+            },
+            product_mutation,
+        );
+        selection.request_load_expectation =
+            observed_request_load_expectation(relay_observation, instance)?;
+        selection.request_proof_expectation = proof;
+        selection.with_eligibility_expectation(relay_observation, lane, Some(request_state))
     }
 
     pub(super) fn commit_enqueued_request_product_send(

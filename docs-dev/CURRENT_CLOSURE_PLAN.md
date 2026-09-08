@@ -13,6 +13,27 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
+**Queue-opportunity discriminator01:54:** same-observer Q control sustains
+438.794Mbps during restriction and442.089after,80/80echoes,max301ms. Last
+reported ACK is134221frames/3606579B, every frame single-range, versus mixed
+396286frames/47375035B/6562914ranges. ACK fixed21B framing accounts8.322MB
+of mixed; packed range support39.053MB. Half the observed20.959Mbps ACKpeak
+plus unchangedMAX still exceeds10Mbps before native overhead. Savings may be
+material but only if they preserve the facts; no claimed throughput multiplier.
+
+Next exact question: are obsolete COMPLETE ACK/MAX snapshots still queued at
+MPP's cancellable boundary, or already handed to native transport? A temporary
+feature-only queue shadow counts actual accepted enqueues, take/drop, pending
+same-kind revisions and same-stream barriers. Bounded bookkeeping/no payload
+retention, actual frame counts/range counts rather than allocation-size 'bytes'.
+This is an opportunity upper bound under the unchanged schedule, not predicted
+saved wire. One unchanged mixed feedback-restriction capture, same codec observer,
+no runtime policy. Low opportunity rejects this queue-state implementation;
+high opportunity selects a producer-owned exact-incarnation latest envelope,
+whose first publication is immediate and whose frame is sealed at dequeue.
+It must preserve incomplete ACKs, terminal order and one accounting transfer.
+No reason yet to change wire format, negative horizon, full fanout or CC.
+
 **Discriminator outcome01:47:** feature-only observer builds warning-free1m03,
 is frozen as feedback-encode-20260909, and all69source additions are reversed
 before capture. Current ordinary source remains4c7e232. Independent audit PASS:

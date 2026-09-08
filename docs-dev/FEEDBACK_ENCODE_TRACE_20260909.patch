@@ -1,0 +1,92 @@
+diff --git a/src/lab_diagnostics.rs b/src/lab_diagnostics.rs
+index 4551942..5f2073c 100644
+--- a/src/lab_diagnostics.rs
++++ b/src/lab_diagnostics.rs
+@@ -4,6 +4,73 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Mutex, OnceLock};
+ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
++/// Temporary observer: validated frame encodings, not successful wire writes.
++/// Later batch failure, cancelled handoff and native retransmission are outside
++/// this boundary. Fixed-size counters do not retain frame contents or identities.
++pub(crate) fn lab_frame_encode_totals(frame: &crate::protocol::Frame, kind: u8, bytes: usize) {
++    if !lab_diagnostic_event_enabled("frame_encode_totals") {
++        return;
++    }
++    #[derive(Clone, Copy, Default)]
++    struct Counts {
++        frames: u64,
++        bytes: u64,
++        max_bytes: usize,
++        ack_ranges: u64,
++        ack_max_ranges: usize,
++        ack_complete: u64,
++        ack_sparse: u64,
++        ack_range_bins: [u64; 5],
++    }
++    struct State {
++        next_report: Instant,
++        counts: [Counts; 256],
++    }
++    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
++    let mut state = STATE
++        .get_or_init(|| Mutex::new(State {
++            next_report: Instant::now() + Duration::from_secs(1),
++            counts: [Counts::default(); 256],
++        }))
++        .lock()
++        .expect("lab frame encode totals lock");
++    let count = &mut state.counts[usize::from(kind)];
++    count.frames += 1;
++    count.bytes += bytes as u64;
++    count.max_bytes = count.max_bytes.max(bytes);
++    if let crate::protocol::Frame::StreamAck { ranges, complete, .. } = frame {
++        count.ack_ranges += ranges.len() as u64;
++        count.ack_max_ranges = count.ack_max_ranges.max(ranges.len());
++        count.ack_complete += u64::from(*complete);
++        count.ack_sparse += u64::from(ranges.len() > 1);
++        let bin = match ranges.len() {
++            0..=1 => 0,
++            2..=8 => 1,
++            9..=32 => 2,
++            33..=128 => 3,
++            _ => 4,
++        };
++        count.ack_range_bins[bin] += 1;
++    }
++    let now = Instant::now();
++    if now < state.next_report {
++        return;
++    }
++    state.next_report = now + Duration::from_secs(1);
++    for (kind, counts) in state.counts.iter().enumerate().filter(|(_, c)| c.frames != 0) {
++        lab_diagnostic(
++            "frame_encode_totals",
++            format_args!(
++                "kind={} frames={} bytes={} max_bytes={} ack_ranges={} ack_max_ranges={} ack_complete={} ack_sparse={} ack_bins_1_8_32_128_more={},{},{},{},{}",
++                kind, counts.frames, counts.bytes, counts.max_bytes,
++                counts.ack_ranges, counts.ack_max_ranges, counts.ack_complete,
++                counts.ack_sparse, counts.ack_range_bins[0], counts.ack_range_bins[1],
++                counts.ack_range_bins[2], counts.ack_range_bins[3], counts.ack_range_bins[4],
++            ),
++        );
++    }
++}
++
+ pub(crate) fn lab_diagnostic(event: &str, fields: fmt::Arguments<'_>) {
+     if !lab_diagnostic_event_enabled(event) {
+         return;
+diff --git a/src/protocol/codec.rs b/src/protocol/codec.rs
+index fc5a650..a60eb9d 100644
+--- a/src/protocol/codec.rs
++++ b/src/protocol/codec.rs
+@@ -113,6 +113,8 @@ pub fn encode_frame_into(
+     out[frame_start + 4] = VERSION;
+     out[frame_start + 5] = kind as u8;
+     out[frame_start + 6..frame_start + 10].copy_from_slice(&(payload_len as u32).to_be_bytes());
++    #[cfg(feature = "lab-diagnostics")]
++    crate::lab_diagnostics::lab_frame_encode_totals(frame, kind as u8, frame_len);
+     Ok(())
+ }
+ 
+

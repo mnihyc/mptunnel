@@ -86,6 +86,15 @@ Checkpoint test-only RED, then implement only the reviewed extraction and
 boundary ordering. Keep old whole-map extraction when every key is eligible;
 this exact predicate avoids removal overhead for full-horizon ACKs.
 
+**GREEN18:35:** one production function changed: exact eligible-prefix
+extraction plus preserved H-bucket order. Independent whole-function review
+passes; warning-free test rebuild1m08s,546focused checks pass1.28s including
+both new work/metadata tests and existing epoch/copy/EOF/TCP/QUIC controls.
+The real suffix-fragmentation cases now each process2records; observed RED
+was3versus66. No rate/deadline/ACK/evidence policy changed. Checkpoint runtime,
+then one ordinary optimized build and fixed paired candidate. Component
+GREEN is not performance acceptance. Reply-chain evidence committed bd3b810.
+
 ## Completed discriminator: already-read response service residence
 
 **Observed failure / exact question:** terminal capture on unchanged b783cd6

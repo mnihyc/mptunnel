@@ -279,10 +279,32 @@ impl RequestFlightLedger {
             return Vec::new();
         }
 
-        let original_flights = std::mem::take(&mut self.flights)
-            .into_iter()
-            .flat_map(|(start, flights)| flights.into_iter().map(move |flight| (start, flight)))
-            .collect::<Vec<_>>();
+        // No flight starting at/after the largest normalized ACK end can
+        // cover an acknowledged byte or affect its pre-release ambiguity.
+        // Keep crossing flights in the snapshot, but leave the other suffix
+        // keys untouched. A full-horizon ACK retains the linear map drain.
+        let ack_end = ranges.last().expect("nonempty normalized ACK").end;
+        let original_flights = if self
+            .flights
+            .last_key_value()
+            .is_some_and(|(start, _)| *start < ack_end)
+        {
+            std::mem::take(&mut self.flights)
+                .into_iter()
+                .flat_map(|(start, flights)| flights.into_iter().map(move |flight| (start, flight)))
+                .collect::<Vec<_>>()
+        } else {
+            let mut prefix = Vec::new();
+            while self
+                .flights
+                .first_key_value()
+                .is_some_and(|(start, _)| *start < ack_end)
+            {
+                let (start, flights) = self.flights.pop_first().expect("observed first flight");
+                prefix.extend(flights.into_iter().map(|flight| (start, flight)));
+            }
+            prefix
+        };
         #[cfg(test)]
         ACK_RELEASE_FLIGHT_VISITS.with(|work| work.set(work.get() + original_flights.len()));
         let ambiguous_intervals = ambiguous_flight_intervals(
@@ -292,6 +314,7 @@ impl RequestFlightLedger {
         );
         let now = Instant::now();
         let mut released = Vec::new();
+        let mut existing_boundary = None;
         for (start, flight) in original_flights.iter().copied() {
             let split = split_flight_interval_by_ack(start, flight.end, ranges);
             for (acked_start, acked_end, is_ambiguous) in split
@@ -360,6 +383,12 @@ impl RequestFlightLedger {
                 if bytes == 0 {
                     continue;
                 }
+                // A crossing survivor can meet the untouched bucket at H.
+                // Earlier-key survivors preceded that bucket in the old full
+                // rebuild; preserve this order without rebuilding the suffix.
+                if retained_start == ack_end && existing_boundary.is_none() {
+                    existing_boundary = Some(self.flights.remove(&ack_end).unwrap_or_default());
+                }
                 self.flights
                     .entry(retained_start)
                     .or_default()
@@ -375,6 +404,12 @@ impl RequestFlightLedger {
                         ..flight
                     });
             }
+        }
+        if let Some(existing_boundary) = existing_boundary {
+            self.flights
+                .entry(ack_end)
+                .or_default()
+                .extend(existing_boundary);
         }
         released
     }

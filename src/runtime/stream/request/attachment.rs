@@ -622,16 +622,64 @@ pub(in crate::runtime) enum ReliableRelayAttachOutcome {
 /// Exact path removal does not discard frames already admitted into this queue.
 pub(in crate::runtime) struct ReliableRelayRemoteInput {
     frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
+    /// First ordering boundary encountered by a ready-only credit fold.
+    pending_frame: Option<ReliableRelayRemoteFrame>,
 }
 
 impl ReliableRelayRemoteInput {
     pub(in crate::runtime) async fn recv_frame(
         &mut self,
     ) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
-        self.frames_rx
-            .recv()
-            .await
-            .ok_or(RuntimeError::ReliablePathSessionClosed)
+        let first = match self.pending_frame.take() {
+            Some(frame) => frame,
+            None => self
+                .frames_rx
+                .recv()
+                .await
+                .ok_or(RuntimeError::ReliablePathSessionClosed)?,
+        };
+        Ok(self.fold_ready_max_data(first))
+    }
+
+    /// MAX_DATA is a shared monotonic grant, not byte receipt or path proof.
+    /// Fold only already-ready consecutive grants: intermediate values need
+    /// no separate relay preparation, while isolated credit never waits.
+    fn fold_ready_max_data(
+        &mut self,
+        mut greatest: ReliableRelayRemoteFrame,
+    ) -> ReliableRelayRemoteFrame {
+        let (stream_id, mut max_offset) = match &greatest.frame {
+            Ok(Frame::StreamMaxData {
+                stream_id,
+                max_offset,
+            }) => (*stream_id, *max_offset),
+            _ => return greatest,
+        };
+        // Snapshot work before draining: concurrent producers cannot extend
+        // this turn. The first nonmatching item remains an exact boundary.
+        let ready = self.frames_rx.len();
+        for _ in 0..ready {
+            let Ok(next) = self.frames_rx.try_recv() else {
+                break;
+            };
+            match &next.frame {
+                Ok(Frame::StreamMaxData {
+                    stream_id: next_stream_id,
+                    max_offset: next_max,
+                }) if *next_stream_id == stream_id => {
+                    if *next_max > max_offset {
+                        max_offset = *next_max;
+                        greatest = next;
+                    }
+                }
+                _ => {
+                    debug_assert!(self.pending_frame.is_none());
+                    self.pending_frame = Some(next);
+                    break;
+                }
+            }
+        }
+        greatest
     }
 
     /// Returns the relay-input backlog visible at this instant.
@@ -639,17 +687,23 @@ impl ReliableRelayRemoteInput {
     /// Ready-only receive batching snapshots this value before trying frames so
     /// producers cannot extend one actor turn indefinitely.
     pub(in crate::runtime) fn ready_frame_count(&self) -> usize {
-        self.frames_rx.len()
+        self.frames_rx
+            .len()
+            .saturating_add(usize::from(self.pending_frame.is_some()))
     }
 
     /// Takes one already-queued frame without waiting.
     pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<ReliableRelayRemoteFrame> {
-        self.frames_rx.try_recv().ok()
+        let first = self
+            .pending_frame
+            .take()
+            .or_else(|| self.frames_rx.try_recv().ok())?;
+        Some(self.fold_ready_max_data(first))
     }
 
     #[cfg(test)]
     pub(in crate::runtime) fn has_buffered_frame(&self) -> bool {
-        !self.frames_rx.is_empty()
+        self.pending_frame.is_some() || !self.frames_rx.is_empty()
     }
 }
 
@@ -804,7 +858,13 @@ impl ReliableRelayRemoteSet {
             .attach_opened(opened)
             .expect("a fresh request stream owns attachment incarnation zero");
         debug_assert_eq!(outcome, ReliableRelayAttachOutcome::Attached);
-        (set, ReliableRelayRemoteInput { frames_rx })
+        (
+            set,
+            ReliableRelayRemoteInput {
+                frames_rx,
+                pending_frame: None,
+            },
+        )
     }
 
     pub(in crate::runtime) fn stream_id(&self) -> StreamId {

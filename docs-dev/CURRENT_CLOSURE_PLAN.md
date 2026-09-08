@@ -10,7 +10,83 @@ approaches, remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`.
 Detailed evidence is linked below; shortening obsolete next-action prose does
 not discard findings, adverse results or acceptance gates.
 
-## Active discriminator: already-read response service residence
+## Active transaction: exact ACK-support work exclusion
+
+**Issue / measured motivation:** current reply capture completes387579904B
+in52.491225s, maxconfirmation3.508291s. Winning reply[863,877) has3.247s
+server-read→delivery, including599ms after authenticated decode and1.961027s
+preceding nondata reader-send await inside a1.965s interval. This selects real
+local input backpressure, not an all-Native explanation. Prior unchanged
+flight-release implementation in COPY_DEBT_SERVICE records4786releases taking
+7.808784s within8.160194s ACK-handler elapsed; contained backpressure windows
+include246899us and285275us flight release. New reader counters do not establish
+ACK-only work or the current function's causal share. Existing actual cost
+evidence motivates one work reduction without another aggregate capture.
+
+**Origin / intended invariant:** fd32e60 introduced whole-flight snapshot/
+ambiguity/rebuild to settle exact copies; f4206d0 moved its ownership and
+765683b corrected byte-exact partial-copy attribution. RFC8.3 requires frozen
+pre-release multiplicity on acknowledged bytes, not rebuilding unrelated
+suffix. Current request ledger takes/flattens all retained flights, computes
+global ambiguity and reinserts every survivor for each non-subsumed ACK.
+
+**Model / predicted correction:** for normalized ACK ranges let H=max(end).
+Every released byte u satisfies u<H. A flight starting at or above H neither
+covers u nor contributes ambiguity there. Extract only starts<H in existing
+key/vector order; retain crossing flights intact for split/proof computation;
+leave other keys alone. Preserve all bytes, instances, qualification receipts,
+assignment timestamps, evidence epochs and additive copy debt. Retained crossing
+pieces rekeyed at H must precede the existing H bucket exactly as before; that
+one bucket merge can move its records. No split_off/whole-map append, new
+index/threshold/policy or ACK coalescing. Full-horizon ACK remains proportional
+to all eligible flights. This is a request hot-path implementation correction,
+not an RFC contract change or completed response prepared-source parity.
+
+**Falsifier / smallest action / acceptance:** actual ledger producers plus
+normalized ACK must first prove identical released/remainder/proof/debt while
+irrelevant suffix fragmentation increases current record work. Include partial
+copy, boundary collision/order, disjoint/replayed ACK and exact-instance controls.
+Independent proof/fixture review before intended RED; runtime changes only after
+RED. Then coherent focused GREEN and ordinary parent/candidate unchanged mixed
+upload, full timing/completion/cost. No promotion if adverse/ambiguous, and no
+claim that this explains every prior local or predecode hold. Scope is the
+already-profiled request operation, not another controller or queue redesign.
+
+**Order18:24:** independent exclusion/metadata/order proof passes with the
+explicit boundary-bucket and k≈N cost caveats. Test-only actual producer RED
+preparation delegated; no runtime edit or build. Fresh ordinary frozen b783cd6
+parent runs first (ack-support-control-0908), then candidate only after
+RED/GREEN/audit. No favorable repeat or diagnostic rate substituted as control.
+
+**Parent18:26:** ordinary b783cd6 completes473104384exactB/47.992259s,
+firstconfirmation.368903/max3.060424s, firstwrite.091815/max4.396938s.
+Runner0/48.391215s;48rawbins retained, including buffered confirmation bins
+above500Mbps (not wire capacity). No lab/build now. Test-only fixture pending.
+
+**Practical work support18:30:** replayed already-retained
+prepared-claim-service-0908 exact commit/ACK events without reconstructing
+missing ACK ranges. Keep only committed starts at/above the maximum end of
+every applied ACK so far: none can have been acknowledged. Among6367applied
+ACKs,6343still have such records; their sum is4470499 needless workset visits,
+mean702.136/max2520. This is a conservative suffix-work lower bound, not CPU
+savings or current-run causal attribution. No new capture or policy.
+
+**RED preparation18:30:** root/independent fixture review passes real ledger
+producer tests: same131072B Original plus14600B copy; exact release/proof,
+successor debt and immutable suffix metadata before3versus66work assertion.
+Separate crossing-H control covers receipt clipping, saved boundary order,
+deadlines, replay and full-horizon settlement. No native/actor admission claim.
+One test build now runs with no lab; production algorithm unchanged.
+
+**RED18:32:** warning-free1m12s build; two tests execute in.00s. Boundary/
+receipt/replay/full-horizon control passes. Intended work assertion alone fails
+66versus3 after release/proof/debt/metadata controls. Root and independent
+reviews pass. Independent raw replay reproduces4470499lower-bound visits.
+Checkpoint test-only RED, then implement only the reviewed extraction and
+boundary ordering. Keep old whole-map extraction when every key is eligible;
+this exact predicate avoids removal overhead for full-horizon ACKs.
+
+## Completed discriminator: already-read response service residence
 
 **Observed failure / exact question:** terminal capture on unchanged b783cd6
 completes424017920B/56.939769s but contains a7.996908s confirmation gap.
@@ -57,6 +133,12 @@ preceding nondata send-await time is not packet delay or ACK-only CPU time.
 Sparse exact range coverage, not record counts, will determine winning service.
 REPLY_RESIDENCE_TRACE_20260908.patch archives the whole temporary overlay.
 One diagnostic build is running with no lab; freeze/reverse before capture.
+
+**Capture18:17:** warning-free optimized build3m31s frozen separately as
+reply-residence-20260908. All18runtime-file observer changes reversed and
+source diff verified empty before one unchanged-profile mixed-upload capture.
+No build/lab overlap; source remains b783cd6. target/release is diagnostic,
+not the ordinary comparator. Terminal evidence committed cd97c5d.
 
 ## Completed discriminator: upload terminal service after full target delivery
 

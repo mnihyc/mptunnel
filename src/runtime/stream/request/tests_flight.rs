@@ -97,6 +97,315 @@ fn assert_reinjected_data_totals(
     }
 }
 
+fn ack_support_prefix_with_fragmented_suffix(suffix_records: usize) -> usize {
+    const PREFIX: usize = 65_536;
+    const COPIED: usize = 14_600;
+    let owner = path(UnderlayProtocol::Udp, 0, 71);
+    let successor = path(UnderlayProtocol::Udp, 0, 72);
+    let copy = path(UnderlayProtocol::Tcp, 1, 73);
+    let mut ledger = RequestFlightLedger::default();
+    assert_eq!(
+        ledger.record_original_frame_instance(owner, &data_frame(0, PREFIX)),
+        PREFIX,
+    );
+    assert_eq!(
+        ledger.record_reinjection_frame_instance(copy, &data_frame(0, COPIED)),
+        COPIED,
+    );
+    assert_eq!(PREFIX % suffix_records, 0);
+    let fragment_bytes = PREFIX / suffix_records;
+    for fragment in 0..suffix_records {
+        assert_eq!(
+            ledger.record_original_frame_instance(
+                successor,
+                &data_frame((PREFIX + fragment * fragment_bytes) as u64, fragment_bytes),
+            ),
+            fragment_bytes,
+        );
+    }
+    let suffix_snapshot = |ledger: &RequestFlightLedger| {
+        ledger
+            .flights
+            .range(PREFIX as u64..)
+            .flat_map(|(start, flights)| {
+                flights.iter().map(move |flight| {
+                    (
+                        *start,
+                        flight.instance,
+                        flight.end,
+                        flight.bytes,
+                        flight.sent_at,
+                        flight.kind,
+                        flight.evidence_eligible,
+                        flight.qualification,
+                        flight.reinjection_suppression_deadline,
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let suffix_before = suffix_snapshot(&ledger);
+    let original_sent_at = ledger.flights[&0][0].sent_at;
+    let copy_sent_at = ledger.flights[&0][1].sent_at;
+    assert_original_data_cache(
+        &ledger,
+        (2 * PREFIX) as u64,
+        &[(owner, PREFIX as u64), (successor, PREFIX as u64)],
+    );
+    assert_reinjected_data_totals(&ledger, &[(copy, COPIED)]);
+    let ack = crate::protocol::frame::normalize_offset_ranges(vec![
+        OffsetRange {
+            start: COPIED as u64,
+            end: PREFIX as u64,
+        },
+        OffsetRange {
+            start: 0,
+            end: COPIED as u64,
+        },
+        OffsetRange {
+            start: 0,
+            end: 4096,
+        },
+    ]);
+    assert_eq!(
+        ack,
+        vec![OffsetRange {
+            start: 0,
+            end: PREFIX as u64
+        }]
+    );
+    RequestFlightLedger::take_ack_release_flight_visits_for_test();
+    let released = ledger.release_normalized_acked_ranges(&ack);
+    let visits = RequestFlightLedger::take_ack_release_flight_visits_for_test();
+
+    // These exact release/proof/debt controls precede the work assertion. The
+    // same byte suffix is produced as one or many legal Original records; no
+    // clock, credit, ownership or evidence flag is synthesized for admission.
+    assert_eq!(
+        released
+            .iter()
+            .map(|release| (
+                release.instance,
+                release.range,
+                release.bytes,
+                release.kind,
+                release.path_proving,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                owner,
+                OffsetRange {
+                    start: 0,
+                    end: COPIED as u64
+                },
+                COPIED,
+                CarrierWorkKind::OriginalData,
+                false
+            ),
+            (
+                owner,
+                OffsetRange {
+                    start: COPIED as u64,
+                    end: PREFIX as u64
+                },
+                PREFIX - COPIED,
+                CarrierWorkKind::OriginalData,
+                true
+            ),
+            (
+                copy,
+                OffsetRange {
+                    start: 0,
+                    end: COPIED as u64
+                },
+                COPIED,
+                CarrierWorkKind::ReinjectedData,
+                false
+            ),
+        ],
+    );
+    for release in &released {
+        assert_eq!(release.qualification, None);
+        assert_eq!(
+            release.sent_at,
+            if release.instance == owner {
+                original_sent_at
+            } else {
+                copy_sent_at
+            },
+        );
+    }
+    assert_eq!(suffix_snapshot(&ledger), suffix_before);
+    assert_original_data_cache(
+        &ledger,
+        PREFIX as u64,
+        &[(owner, 0), (successor, PREFIX as u64)],
+    );
+    assert_reinjected_data_totals(&ledger, &[(copy, 0)]);
+    assert_eq!(
+        ledger.latest_unacked_ranges_for_path_instance(successor),
+        vec![OffsetRange {
+            start: PREFIX as u64,
+            end: (2 * PREFIX) as u64
+        }],
+    );
+    visits
+}
+
+#[test]
+fn ack_release_work_excludes_unacknowledged_suffix_fragments() {
+    let coarse = ack_support_prefix_with_fragmented_suffix(1);
+    assert!(
+        coarse >= 2,
+        "the control processes both ACK-support records"
+    );
+    let fragmented = ack_support_prefix_with_fragmented_suffix(64);
+    assert_eq!(
+        fragmented, coarse,
+        "identical ACK support must not process additional unrelated suffix records; counter excludes map comparisons and boundary-bucket merging",
+    );
+}
+
+#[test]
+fn ack_release_support_boundary_precedes_existing_bucket_and_preserves_metadata() {
+    let owner = path(UnderlayProtocol::Udp, 0, 81);
+    let crossing_copy = path(UnderlayProtocol::Tcp, 1, 83);
+    let existing_copy = path(UnderlayProtocol::Tcp, 1, 84);
+    let other_copy = path(UnderlayProtocol::Udp, 0, 82);
+    let mut states = RequestPathStates::default();
+    let receipt = states
+        .tag_admitted_original(owner, 128, 128, OffsetRange { start: 0, end: 128 })
+        .expect("valid actual qualification admission")
+        .expect("full Original receipt");
+    let mut ledger = RequestFlightLedger::default();
+    assert_eq!(
+        ledger.record_original_frame_instance_with_evidence(
+            owner,
+            &data_frame(0, 128),
+            true,
+            Some(receipt),
+        ),
+        128,
+    );
+    for (instance, start, bytes) in [
+        (crossing_copy, 32, 64),
+        (existing_copy, 64, 32),
+        (other_copy, 64, 64),
+    ] {
+        assert_eq!(
+            ledger.record_reinjection_frame_instance(instance, &data_frame(start, bytes)),
+            bytes,
+        );
+    }
+    let original = ledger.flights[&0][0];
+    let crossing = ledger.flights[&32][0];
+    let existing = ledger.flights[&64].clone();
+    let ack = crate::protocol::frame::normalize_offset_ranges(vec![
+        OffsetRange { start: 48, end: 64 },
+        OffsetRange { start: 32, end: 48 },
+    ]);
+    assert_eq!(ack, vec![OffsetRange { start: 32, end: 64 }]);
+    let released = ledger.release_normalized_acked_ranges(&ack);
+    assert_eq!(released.len(), 2);
+    assert_eq!(released[0].instance, owner);
+    assert_eq!(released[1].instance, crossing_copy);
+    assert!(
+        released
+            .iter()
+            .all(|release| release.range == ack[0] && release.bytes == 32 && !release.path_proving)
+    );
+    assert_eq!(released[0].qualification, receipt.intersect(ack[0]));
+    assert_eq!(released[1].qualification, None);
+
+    // Old key/vector order is semantic: crossing pieces rekeyed at H precede
+    // already-retained copies beginning exactly at H. No live record is edited
+    // by the fixture; expected fragments retain the actual producer metadata.
+    let boundary = &ledger.flights[&64];
+    assert_eq!(
+        boundary
+            .iter()
+            .map(|flight| flight.instance)
+            .collect::<Vec<_>>(),
+        vec![owner, crossing_copy, existing_copy, other_copy],
+    );
+    let assert_fragment =
+        |before: &super::RequestFlight, after: &super::RequestFlight, range: OffsetRange| {
+            assert_eq!(after.instance, before.instance);
+            assert_eq!(after.end, range.end);
+            assert_eq!(after.bytes as u64, range.end - range.start);
+            assert_eq!(after.sent_at, before.sent_at);
+            assert_eq!(after.kind, before.kind);
+            assert_eq!(after.evidence_eligible, before.evidence_eligible);
+            assert_eq!(
+                after.qualification,
+                before.qualification.and_then(|q| q.intersect(range))
+            );
+            assert_eq!(
+                after.reinjection_suppression_deadline,
+                before.reinjection_suppression_deadline
+            );
+        };
+    assert_fragment(
+        &original,
+        &ledger.flights[&0][0],
+        OffsetRange { start: 0, end: 32 },
+    );
+    assert_fragment(
+        &original,
+        &boundary[0],
+        OffsetRange {
+            start: 64,
+            end: 128,
+        },
+    );
+    assert_fragment(&crossing, &boundary[1], OffsetRange { start: 64, end: 96 });
+    for (before, after) in existing.iter().zip(&boundary[2..]) {
+        assert_fragment(
+            before,
+            after,
+            OffsetRange {
+                start: 64,
+                end: before.end,
+            },
+        );
+    }
+    assert_original_data_cache(&ledger, 96, &[(owner, 96), (other_copy, 0)]);
+    assert_reinjected_data_totals(
+        &ledger,
+        &[(crossing_copy, 32), (existing_copy, 32), (other_copy, 64)],
+    );
+    assert!(ledger.release_normalized_acked_ranges(&ack).is_empty());
+    assert_eq!(
+        ledger.flights[&64]
+            .iter()
+            .map(|flight| flight.instance)
+            .collect::<Vec<_>>(),
+        vec![owner, crossing_copy, existing_copy, other_copy],
+    );
+
+    // The opposite boundary still processes and settles every retained record
+    // when the normalized ACK actually covers the full flight horizon.
+    let full_ack =
+        crate::protocol::frame::normalize_offset_ranges(vec![OffsetRange { start: 0, end: 128 }]);
+    let tail = ledger.release_normalized_acked_ranges(&full_ack);
+    assert_eq!(tail.iter().map(|release| release.bytes).sum::<usize>(), 224);
+    assert_eq!(
+        tail.iter()
+            .filter(|release| release.path_proving)
+            .map(|release| release.bytes)
+            .sum::<usize>(),
+        32
+    );
+    assert!(ledger.flights.is_empty());
+    assert_original_data_cache(&ledger, 0, &[(owner, 0), (other_copy, 0)]);
+    assert_reinjected_data_totals(
+        &ledger,
+        &[(crossing_copy, 0), (existing_copy, 0), (other_copy, 0)],
+    );
+    assert!(ledger.release_normalized_acked_ranges(&full_ack).is_empty());
+}
+
 #[test]
 fn duplicate_data_ack_releases_original_and_reinjected_flights_without_path_proof() {
     let owner = path(UnderlayProtocol::Tcp, 0, 7);

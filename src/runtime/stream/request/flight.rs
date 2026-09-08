@@ -25,6 +25,11 @@ thread_local! {
     static REINJECTION_DEBT_QUERY_WORK: std::cell::Cell<(usize, usize)> = const {
         std::cell::Cell::new((0, 0))
     };
+    // Records entering the ACK split/evidence workset, excluding ordered-map
+    // lookup comparisons and any retained boundary-bucket merge.
+    static ACK_RELEASE_FLIGHT_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +70,11 @@ impl RequestFlightLedger {
     #[cfg(test)]
     pub(in crate::runtime) fn take_reinjection_debt_query_work_for_test() -> (usize, usize) {
         REINJECTION_DEBT_QUERY_WORK.with(|work| work.replace((0, 0)))
+    }
+
+    #[cfg(test)]
+    fn take_ack_release_flight_visits_for_test() -> usize {
+        ACK_RELEASE_FLIGHT_VISITS.with(|work| work.replace(0))
     }
 
     /// Immutable accepted-copy coverage for one serialized recovery batch.
@@ -273,6 +283,8 @@ impl RequestFlightLedger {
             .into_iter()
             .flat_map(|(start, flights)| flights.into_iter().map(move |flight| (start, flight)))
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        ACK_RELEASE_FLIGHT_VISITS.with(|work| work.set(work.get() + original_flights.len()));
         let ambiguous_intervals = ambiguous_flight_intervals(
             original_flights
                 .iter()

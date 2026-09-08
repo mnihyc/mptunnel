@@ -1,0 +1,1199 @@
+diff --git a/src/runtime/path/quic/client.rs b/src/runtime/path/quic/client.rs
+index eac0c46..903fe1f 100644
+--- a/src/runtime/path/quic/client.rs
++++ b/src/runtime/path/quic/client.rs
+@@ -1700,6 +1700,12 @@ async fn open_client_udp_stream_on_connection(
+                     let _ = frames_tx.send(Ok(frame)).await;
+                     Ok(())
+                 },
++                #[cfg(feature = "lab-diagnostics")]
++                (
++                    true,
++                    stream_runtime.path_index,
++                    carrier.path_instance_id.as_u64(),
++                ),
+             )
+             .await
+         };
+@@ -1818,7 +1824,13 @@ async fn open_client_udp_datagram_stream(
+ ) -> Result<ClientUdpDatagramStream, RuntimeError> {
+     let (mut send, recv) = carrier.connection.open_bi().await?;
+     send.set_traffic_class(TrafficClass::RealtimeDatagram)?;
+-    let frames = spawn_quic_path_reader(recv, runtime.codec_limits, runtime.stream_frame_queue);
++    let frames = spawn_quic_path_reader(
++        recv,
++        runtime.codec_limits,
++        runtime.stream_frame_queue,
++        #[cfg(feature = "lab-diagnostics")]
++        None,
++    );
+     Ok(ClientUdpDatagramStream {
+         send,
+         frames,
+diff --git a/src/runtime/path/quic/client_stream.rs b/src/runtime/path/quic/client_stream.rs
+index c3f23b2..072536e 100644
+--- a/src/runtime/path/quic/client_stream.rs
++++ b/src/runtime/path/quic/client_stream.rs
+@@ -33,7 +33,13 @@ pub(super) async fn run_client_udp_stream(
+     mut commands: ReliablePathCommandReceivers,
+     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
+ ) {
+-    let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
++    let mut carrier_frames = spawn_quic_path_reader(
++        recv,
++        codec_limits,
++        reader_queue_size,
++        #[cfg(feature = "lab-diagnostics")]
++        Some((path_index, path_instance_id.as_u64())),
++    );
+     let mut pending_frames = Vec::<Frame>::new();
+     let mut path_proofs = PathProofTracker::from_limits(mux_limits);
+     let mut deferred_input: Option<Result<Frame, RuntimeError>> = None;
+@@ -290,7 +296,55 @@ async fn handle_client_udp_stream_input(
+         }) if received_stream_id == stream_id => {
+             // Product retirement closes its input before ordered FIN/detach
+             // work drains. Late input must not cancel that independent writer.
+-            let _ = frames.send(Ok(frame)).await;
++            #[cfg(feature = "lab-diagnostics")]
++            let response = match &frame {
++                Frame::StreamData {
++                    stream_id,
++                    offset,
++                    payload,
++                } => Some((*stream_id, *offset, payload.len())),
++                _ => None,
++            };
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some((stream_id, offset, len)) = response {
++                crate::lab_diagnostics::lab_diagnostic(
++                    "response_quic_handoff",
++                    format_args!(
++                        "role=client phase=route_begin mode=actor path_index={} path_instance_id={} request_stream_id={} stream_id={} offset={} end={} len={} mailbox_free={}",
++                        path_index,
++                        path_instance_id.as_u64(),
++                        send.request_stream_id(),
++                        stream_id.0,
++                        offset,
++                        offset.saturating_add(len as u64),
++                        len,
++                        frames.capacity(),
++                    ),
++                );
++            }
++            let _queued = frames.send(Ok(frame)).await.is_ok();
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some((stream_id, offset, len)) = response {
++                crate::lab_diagnostics::lab_diagnostic(
++                    "response_quic_handoff",
++                    format_args!(
++                        "role=client phase=route_end mode=actor path_index={} path_instance_id={} request_stream_id={} stream_id={} offset={} end={} len={} mailbox_free={} result={}",
++                        path_index,
++                        path_instance_id.as_u64(),
++                        send.request_stream_id(),
++                        stream_id.0,
++                        offset,
++                        offset.saturating_add(len as u64),
++                        len,
++                        frames.capacity(),
++                        if _queued {
++                            "queued"
++                        } else {
++                            "recipient_closed"
++                        },
++                    ),
++                );
++            }
+         }
+         Frame::StreamDetach {
+             stream_id: detached_stream_id,
+diff --git a/src/runtime/path/quic/client_writer.rs b/src/runtime/path/quic/client_writer.rs
+index cbc8315..810d62f 100644
+--- a/src/runtime/path/quic/client_writer.rs
++++ b/src/runtime/path/quic/client_writer.rs
+@@ -352,6 +352,8 @@ async fn flush_client_udp_frame_batch(
+         // already-claimed batch must withdraw it before entering native I/O.
+         commands.withdraw_writer_ready();
+     }
++    #[cfg(feature = "lab-diagnostics")]
++    let request_stream_id = send.request_stream_id();
+     let result = if carrier_input_open {
+         flush_udp_frame_batch_with_path_proofs_interlocked(
+             send,
+@@ -360,7 +362,56 @@ async fn flush_client_udp_frame_batch(
+             path_proofs,
+             carrier_frames,
+             deferred_input,
+-            |frame| try_route_client_udp_stream_frame_during_write(frame, stream_id, stream_frames),
++            |frame| {
++                #[cfg(feature = "lab-diagnostics")]
++                let response = match &frame {
++                    Frame::StreamData {
++                        stream_id,
++                        offset,
++                        payload,
++                    } => Some((*stream_id, *offset, payload.len())),
++                    _ => None,
++                };
++                #[cfg(feature = "lab-diagnostics")]
++                if let Some((stream_id, offset, len)) = response {
++                    lab_diagnostic(
++                        "response_quic_handoff",
++                        format_args!(
++                            "role=client phase=route_begin mode=interlocked request_stream_id={} stream_id={} offset={} end={} len={} mailbox_free={}",
++                            request_stream_id,
++                            stream_id.0,
++                            offset,
++                            offset.saturating_add(len as u64),
++                            len,
++                            stream_frames.capacity(),
++                        ),
++                    );
++                }
++                let result =
++                    try_route_client_udp_stream_frame_during_write(frame, stream_id, stream_frames);
++                #[cfg(feature = "lab-diagnostics")]
++                if let Some((stream_id, offset, len)) = response {
++                    lab_diagnostic(
++                        "response_quic_handoff",
++                        format_args!(
++                            "role=client phase=route_result mode=interlocked request_stream_id={} stream_id={} offset={} end={} len={} mailbox_free={} result={}",
++                            request_stream_id,
++                            stream_id.0,
++                            offset,
++                            offset.saturating_add(len as u64),
++                            len,
++                            stream_frames.capacity(),
++                            match &result {
++                                Ok(CarrierInputRoute::Routed) => "queued_or_retired",
++                                Ok(CarrierInputRoute::Mailbox(_)) => "mailbox_full_pending",
++                                Ok(CarrierInputRoute::Barrier(_)) => "barrier",
++                                Err(_) => "error",
++                            },
++                        ),
++                    );
++                }
++                result
++            },
+         )
+         .await
+     } else {
+diff --git a/src/runtime/path/quic/datagram.rs b/src/runtime/path/quic/datagram.rs
+index d364ec2..35e483c 100644
+--- a/src/runtime/path/quic/datagram.rs
++++ b/src/runtime/path/quic/datagram.rs
+@@ -58,6 +58,8 @@ pub(super) async fn handle_server_udp_datagram_stream(
+         recv,
+         context.codec_limits,
+         udp_path_command_queue(context.mux_limits, context.codec_limits),
++        #[cfg(feature = "lab-diagnostics")]
++        None,
+     );
+     let mut flows = Vec::<AcceptedServerDatagramFlow>::new();
+     let mut tombstones = ServerDatagramTombstoneCache::new(context.max_udp_flows_per_session);
+diff --git a/src/runtime/path/quic/io.rs b/src/runtime/path/quic/io.rs
+index da9e216..5b0d569 100644
+--- a/src/runtime/path/quic/io.rs
++++ b/src/runtime/path/quic/io.rs
+@@ -706,9 +706,17 @@ pub(super) fn spawn_quic_path_reader(
+     mut recv: UdpPathRecvStream,
+     codec_limits: CodecLimits,
+     queue_size: usize,
++    #[cfg(feature = "lab-diagnostics")] diagnostic_identity: Option<(usize, u64)>,
+ ) -> mpsc::Receiver<Result<Frame, RuntimeError>> {
+     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
+     tokio::spawn(async move {
++        #[cfg(feature = "lab-diagnostics")]
++        let diagnostic_identity = diagnostic_identity.filter(|_| {
++            crate::lab_diagnostics::lab_diagnostic_event_enabled("response_quic_reader")
++        });
++        #[cfg(feature = "lab-diagnostics")]
++        let (mut preceding_frames, mut preceding_send_us, mut preceding_max_send_us) =
++            (0_u64, 0_u128, 0_u128);
+         loop {
+             let received = tokio::select! {
+                 _ = frames_tx.closed() => return,
+@@ -728,7 +736,67 @@ pub(super) fn spawn_quic_path_reader(
+                 Err(err) => Err(err),
+             };
+             let done = frame.is_err();
+-            if frames_tx.send(frame).await.is_err() || done {
++            #[cfg(feature = "lab-diagnostics")]
++            let response = match (diagnostic_identity, &frame) {
++                (
++                    Some((path_index, path_instance_id)),
++                    Ok(Frame::StreamData {
++                        stream_id,
++                        offset,
++                        payload,
++                    }),
++                ) => {
++                    let end = offset.saturating_add(payload.len() as u64);
++                    crate::lab_diagnostics::lab_diagnostic(
++                        "response_quic_reader",
++                        format_args!(
++                            "phase=decoded path_index={} path_instance_id={} stream_id={} offset={} end={} reader_queue_free={} preceding_frames={} preceding_send_await_us={} preceding_max_send_await_us={}",
++                            path_index,
++                            path_instance_id,
++                            stream_id.0,
++                            offset,
++                            end,
++                            frames_tx.capacity(),
++                            preceding_frames,
++                            preceding_send_us,
++                            preceding_max_send_us,
++                        ),
++                    );
++                    Some((path_index, path_instance_id, stream_id.0, *offset, end))
++                }
++                _ => None,
++            };
++            #[cfg(feature = "lab-diagnostics")]
++            let send_started = diagnostic_identity.map(|_| std::time::Instant::now());
++            let sent = frames_tx.send(frame).await.is_ok();
++            #[cfg(feature = "lab-diagnostics")]
++            if let Some(started) = send_started {
++                let send_us = started.elapsed().as_micros();
++                if let Some((path_index, path_instance_id, stream_id, offset, end)) = response {
++                    crate::lab_diagnostics::lab_diagnostic(
++                        "response_quic_reader",
++                        format_args!(
++                            "phase=mailbox_complete path_index={} path_instance_id={} stream_id={} offset={} end={} send_await_us={} reader_queue_free={} sent={}",
++                            path_index,
++                            path_instance_id,
++                            stream_id,
++                            offset,
++                            end,
++                            send_us,
++                            frames_tx.capacity(),
++                            sent,
++                        ),
++                    );
++                    preceding_frames = 0;
++                    preceding_send_us = 0;
++                    preceding_max_send_us = 0;
++                } else {
++                    preceding_frames = preceding_frames.saturating_add(1);
++                    preceding_send_us = preceding_send_us.saturating_add(send_us);
++                    preceding_max_send_us = preceding_max_send_us.max(send_us);
++                }
++            }
++            if !sent || done {
+                 return;
+             }
+         }
+diff --git a/src/runtime/path/quic/repair.rs b/src/runtime/path/quic/repair.rs
+index 200cdc2..463b93d 100644
+--- a/src/runtime/path/quic/repair.rs
++++ b/src/runtime/path/quic/repair.rs
+@@ -21,12 +21,15 @@ pub(super) async fn run_repair_channel<F, R>(
+     stream_id: StreamId,
+     limits: CodecLimits,
+     route: F,
++    #[cfg(feature = "lab-diagnostics")] diagnostic_identity: (bool, usize, u64),
+ ) -> Result<(), RuntimeError>
+ where
+     F: FnMut(Frame) -> R,
+     R: Future<Output = Result<(), RuntimeError>>,
+ {
+     send.set_repair_priority()?;
++    #[cfg(feature = "lab-diagnostics")]
++    let native_request_stream_id = send.request_stream_id();
+     let write = async {
+         loop {
+             let Some(work) = commands.recv().await? else {
+@@ -35,12 +38,40 @@ where
+                 // The parent owns and cancels this future when that completes.
+                 return std::future::pending::<Result<(), RuntimeError>>().await;
+             };
+-            udp_path_write_frame(&mut send, work.frame(), limits).await?;
++            #[cfg(feature = "lab-diagnostics")]
++            if !diagnostic_identity.0 {
++                observe_repair_response(
++                    "write_begin",
++                    diagnostic_identity,
++                    native_request_stream_id,
++                    work.frame(),
++                    "pending",
++                );
++            }
++            let result = udp_path_write_frame(&mut send, work.frame(), limits).await;
++            #[cfg(feature = "lab-diagnostics")]
++            if !diagnostic_identity.0 {
++                observe_repair_response(
++                    "write_end",
++                    diagnostic_identity,
++                    native_request_stream_id,
++                    work.frame(),
++                    if result.is_ok() { "ok" } else { "error" },
++                );
++            }
++            result?;
+             // `work` releases its exact queue/writer byte charge here, or on
+             // cancellation/error. Native receipt does not settle Product debt.
+         }
+     };
+-    let read = read_repair_channel(recv, stream_id, limits, route);
++    let read = read_repair_channel(
++        recv,
++        stream_id,
++        limits,
++        route,
++        #[cfg(feature = "lab-diagnostics")]
++        Some((diagnostic_identity, native_request_stream_id)),
++    );
+     tokio::try_join!(write, read).map(|_: ((), ())| ())
+ }
+ 
+@@ -49,6 +80,7 @@ pub(super) async fn read_repair_channel<F, R>(
+     stream_id: StreamId,
+     limits: CodecLimits,
+     mut route: F,
++    #[cfg(feature = "lab-diagnostics")] diagnostic_identity: Option<((bool, usize, u64), u64)>,
+ ) -> Result<(), RuntimeError>
+ where
+     F: FnMut(Frame) -> R,
+@@ -76,6 +108,78 @@ where
+                 ));
+             }
+         }
+-        route(frame).await?;
++        #[cfg(feature = "lab-diagnostics")]
++        let response = diagnostic_identity
++            .filter(|(identity, _)| identity.0)
++            .and_then(|(identity, native_id)| {
++                observe_repair_response(
++                    "decoded_route_begin",
++                    identity,
++                    native_id,
++                    &frame,
++                    "pending",
++                );
++                match &frame {
++                    Frame::StreamData {
++                        stream_id,
++                        offset,
++                        payload,
++                    } => Some((identity, native_id, *stream_id, *offset, payload.len())),
++                    _ => None,
++                }
++            });
++        let result = route(frame).await;
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some((identity, native_id, stream_id, offset, len)) = response {
++            crate::lab_diagnostics::lab_diagnostic(
++                "response_quic_handoff",
++                format_args!(
++                    "role=client phase=route_end mode=repair path_index={} path_instance_id={} native_request_stream_id={} stream_id={} offset={} end={} len={} result={}",
++                    identity.1,
++                    identity.2,
++                    native_id,
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(len as u64),
++                    len,
++                    if result.is_ok() { "route_ok" } else { "error" }
++                ),
++            );
++        }
++        result?;
++    }
++}
++
++#[cfg(feature = "lab-diagnostics")]
++fn observe_repair_response(
++    phase: &str,
++    identity: (bool, usize, u64),
++    native_id: u64,
++    frame: &Frame,
++    result: &str,
++) {
++    if let Frame::StreamData {
++        stream_id,
++        offset,
++        payload,
++    } = frame
++    {
++        crate::lab_diagnostics::lab_diagnostic(
++            "response_quic_handoff",
++            format_args!(
++                "role={} phase={} mode=repair path_namespace={} path_index={} path_instance_id={} native_request_stream_id={} stream_id={} offset={} end={} len={} result={}",
++                if identity.0 { "client" } else { "server" },
++                phase,
++                if identity.0 { "runtime" } else { "wire" },
++                identity.1,
++                identity.2,
++                native_id,
++                stream_id.0,
++                offset,
++                offset.saturating_add(payload.len() as u64),
++                payload.len(),
++                result
++            ),
++        );
+     }
+ }
+diff --git a/src/runtime/path/quic/server_stream.rs b/src/runtime/path/quic/server_stream.rs
+index 41b37f7..191b285 100644
+--- a/src/runtime/path/quic/server_stream.rs
++++ b/src/runtime/path/quic/server_stream.rs
+@@ -346,6 +346,12 @@ pub(super) async fn handle_server_udp_reliable_stream(
+                     .reliable_streams
+                     .route_frame(&repair_registration, stream_id, frame)
+             },
++            #[cfg(feature = "lab-diagnostics")]
++            (
++                false,
++                repair_registration.path_id().0 as usize,
++                repair_registration.path_instance_id().as_u64(),
++            ),
+         )
+         .await
+     };
+@@ -401,8 +407,13 @@ async fn run_server_udp_reliable_stream_loop(
+     } = stream_context;
+     let carrier_frame_queue =
+         udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits);
+-    let mut carrier_frames =
+-        spawn_quic_path_reader(recv, context.codec_limits, carrier_frame_queue);
++    let mut carrier_frames = spawn_quic_path_reader(
++        recv,
++        context.codec_limits,
++        carrier_frame_queue,
++        #[cfg(feature = "lab-diagnostics")]
++        None,
++    );
+     let mut pending_frames = Vec::<Frame>::new();
+     let mut deferred_input = None;
+     let mut terminal_drain_deadline = None;
+diff --git a/src/runtime/path/quic/server_writer.rs b/src/runtime/path/quic/server_writer.rs
+index 7c53127..365a69b 100644
+--- a/src/runtime/path/quic/server_writer.rs
++++ b/src/runtime/path/quic/server_writer.rs
+@@ -46,7 +46,39 @@ pub(super) async fn drain_one_server_udp_command_while_input_deferred(
+                     "server QUIC path received an untyped capacity frame",
+                 ));
+             }
++            #[cfg(feature = "lab-diagnostics")]
++            if let Frame::StreamData {
++                stream_id,
++                offset,
++                payload,
++            } = &frame
++            {
++                observe_server_quic_response_write(
++                    "write_begin",
++                    "deferred_direct",
++                    path_registration,
++                    send.request_stream_id(),
++                    (*stream_id, *offset, payload.len()),
++                    "pending",
++                );
++            }
+             let result = udp_path_write_frame(send, &frame, context.codec_limits).await;
++            #[cfg(feature = "lab-diagnostics")]
++            if let Frame::StreamData {
++                stream_id,
++                offset,
++                payload,
++            } = &frame
++            {
++                observe_server_quic_response_write(
++                    "write_end",
++                    "deferred_direct",
++                    path_registration,
++                    send.request_stream_id(),
++                    (*stream_id, *offset, payload.len()),
++                    if result.is_ok() { "ok" } else { "error" },
++                );
++            }
+             commands.release_pending_command_bytes(pending_bytes);
+             result?;
+             path_proofs.record_sent_frame(&frame);
+@@ -426,6 +458,32 @@ async fn flush_server_udp_frame_batch(
+     carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
+     deferred_input: &mut Option<Result<Frame, RuntimeError>>,
+ ) -> Result<(), RuntimeError> {
++    #[cfg(feature = "lab-diagnostics")]
++    let response_ranges: Vec<_> = pending_frames
++        .iter()
++        .filter(|_| crate::lab_diagnostics::lab_diagnostic_event_enabled("response_quic_handoff"))
++        .filter_map(|frame| match frame {
++            Frame::StreamData {
++                stream_id,
++                offset,
++                payload,
++            } => Some((*stream_id, *offset, payload.len())),
++            _ => None,
++        })
++        .collect();
++    #[cfg(feature = "lab-diagnostics")]
++    let native_request_stream_id = send.request_stream_id();
++    #[cfg(feature = "lab-diagnostics")]
++    for range in &response_ranges {
++        observe_server_quic_response_write(
++            "write_begin",
++            "interlocked",
++            path_registration,
++            native_request_stream_id,
++            *range,
++            "pending",
++        );
++    }
+     let result = flush_udp_frame_batch_with_path_proofs_interlocked(
+         send,
+         pending_frames,
+@@ -443,6 +501,17 @@ async fn flush_server_udp_frame_batch(
+         },
+     )
+     .await;
++    #[cfg(feature = "lab-diagnostics")]
++    for range in &response_ranges {
++        observe_server_quic_response_write(
++            "write_end",
++            "interlocked",
++            path_registration,
++            native_request_stream_id,
++            *range,
++            if result.is_ok() { "ok" } else { "error" },
++        );
++    }
+     commands.release_pending_command_bytes(std::mem::take(pending_frame_command_bytes));
+     let _routed_frames = result?;
+     #[cfg(feature = "lab-diagnostics")]
+@@ -461,6 +530,34 @@ async fn flush_server_udp_frame_batch(
+     Ok(())
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn observe_server_quic_response_write(
++    phase: &str,
++    mode: &str,
++    registration: &ServerCarrierPathRegistration,
++    native_request_stream_id: u64,
++    (stream_id, offset, len): (StreamId, u64, usize),
++    result: &str,
++) {
++    lab_diagnostic(
++        "response_quic_handoff",
++        format_args!(
++            "role=server phase={} mode={} session_id={} path_id={} path_instance_id={} native_request_stream_id={} stream_id={} offset={} end={} len={} result={}",
++            phase,
++            mode,
++            registration.session_id().0,
++            registration.path_id().0,
++            registration.path_instance_id().as_u64(),
++            native_request_stream_id,
++            stream_id.0,
++            offset,
++            offset.saturating_add(len as u64),
++            len,
++            result,
++        ),
++    );
++}
++
+ fn try_route_server_udp_stream_frame_during_write(
+     frame: Frame,
+     stream_id: StreamId,
+diff --git a/src/runtime/path/quic/tests_client.rs b/src/runtime/path/quic/tests_client.rs
+index 7548bcc..73e91f2 100644
+--- a/src/runtime/path/quic/tests_client.rs
++++ b/src/runtime/path/quic/tests_client.rs
+@@ -822,9 +822,14 @@ async fn repair_graceful_response_eof_preserves_request_half_and_ordinary_termin
+         // Consume EOF exactly once through the production read-half owner.
+         // Completion of this half must not consume the independent send half
+         // or cancel the parent's ordinary terminal receive/drain transaction.
+-        super::super::repair::read_repair_channel(repair_recv, stream_id, limits, |_| async {
+-            panic!("finished response half cannot deliver another repair frame")
+-        })
++        super::super::repair::read_repair_channel(
++            repair_recv,
++            stream_id,
++            limits,
++            |_| async { panic!("finished response half cannot deliver another repair frame") },
++            #[cfg(feature = "lab-diagnostics")]
++            None,
++        )
+         .await
+         .expect("graceful EOF completes only the repair receive half");
+         let tail = Frame::StreamData {
+diff --git a/src/runtime/path/tcp/client/connection.rs b/src/runtime/path/tcp/client/connection.rs
+index 1686b83..df3ee99 100644
+--- a/src/runtime/path/tcp/client/connection.rs
++++ b/src/runtime/path/tcp/client/connection.rs
+@@ -226,6 +226,27 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
+             reader,
+             reliable_path_writer_frame_queue(mux_limits),
+             move |frame| {
++                #[cfg(feature = "lab-diagnostics")]
++                if let Frame::StreamData {
++                    stream_id,
++                    offset,
++                    payload,
++                } = frame
++                {
++                    crate::lab_diagnostics::lab_diagnostic(
++                        "response_tcp_handoff",
++                        format_args!(
++                            "role=client phase=authenticated_decode session_id={} path_namespace=wire path_id={} remote_port={} stream_id={} offset={} end={} len={}",
++                            session_id.0,
++                            path_id.0,
++                            remote_port,
++                            stream_id.0,
++                            offset,
++                            offset.saturating_add(payload.len() as u64),
++                            payload.len(),
++                        ),
++                    );
++                }
+                 if let Frame::SessionClose { reason } = frame {
+                     observed_lifecycle.retire(*reason);
+                 }
+diff --git a/src/runtime/path/tcp/client/stream.rs b/src/runtime/path/tcp/client/stream.rs
+index 8118f43..6f2cdef 100644
+--- a/src/runtime/path/tcp/client/stream.rs
++++ b/src/runtime/path/tcp/client/stream.rs
+@@ -477,7 +477,23 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
+             offset,
+             payload,
+         } => {
+-            route_client_tcp_stream_frame(
++            #[cfg(feature = "lab-diagnostics")]
++            let response_len = payload.len();
++            #[cfg(feature = "lab-diagnostics")]
++            lab_diagnostic(
++                "response_tcp_handoff",
++                format_args!(
++                    "role=client phase=route_begin mode=actor path_index={} path_instance_id={} stream_id={} offset={} end={} len={} mailbox_free={:?}",
++                    runtime.path_index,
++                    connection.path_instance_id.as_u64(),
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(response_len as u64),
++                    response_len,
++                    streams.get(&stream_id).map(|state| state.frames.capacity()),
++                ),
++            );
++            let result = route_client_tcp_stream_frame(
+                 streams,
+                 closed_streams,
+                 stream_id,
+@@ -487,7 +503,23 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
+                     payload,
+                 },
+             )
+-            .await
++            .await;
++            #[cfg(feature = "lab-diagnostics")]
++            lab_diagnostic(
++                "response_tcp_handoff",
++                format_args!(
++                    "role=client phase=route_end mode=actor path_index={} path_instance_id={} stream_id={} offset={} end={} len={} attachment_present={} result={}",
++                    runtime.path_index,
++                    connection.path_instance_id.as_u64(),
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(response_len as u64),
++                    response_len,
++                    streams.contains_key(&stream_id),
++                    if result.is_ok() { "ok" } else { "error" },
++                ),
++            );
++            result
+         }
+         Frame::StreamAck {
+             stream_id,
+diff --git a/src/runtime/path/tcp/client/writer.rs b/src/runtime/path/tcp/client/writer.rs
+index 825316f..8895ec8 100644
+--- a/src/runtime/path/tcp/client/writer.rs
++++ b/src/runtime/path/tcp/client/writer.rs
+@@ -876,7 +876,54 @@ fn try_route_client_tcp_frame_during_write_for_session(
+             Err(error) => Err(error),
+         };
+     }
+-    try_route_client_tcp_frame_during_write(frame, streams, closed_streams, datagrams)
++    #[cfg(feature = "lab-diagnostics")]
++    let response = match &frame {
++        Frame::StreamData {
++            stream_id,
++            offset,
++            payload,
++        } => {
++            lab_diagnostic(
++                "response_tcp_handoff",
++                format_args!(
++                    "role=client phase=route_begin mode=interlocked path_index={} path_instance_id={} stream_id={} offset={} end={} len={} mailbox_free={:?}",
++                    runtime.path_index,
++                    path_instance_id.as_u64(),
++                    stream_id.0,
++                    offset,
++                    offset.saturating_add(payload.len() as u64),
++                    payload.len(),
++                    streams.get(stream_id).map(|state| state.frames.capacity()),
++                ),
++            );
++            Some((*stream_id, *offset, payload.len()))
++        }
++        _ => None,
++    };
++    let result = try_route_client_tcp_frame_during_write(frame, streams, closed_streams, datagrams);
++    #[cfg(feature = "lab-diagnostics")]
++    if let Some((stream_id, offset, len)) = response {
++        lab_diagnostic(
++            "response_tcp_handoff",
++            format_args!(
++                "role=client phase=route_result mode=interlocked path_index={} path_instance_id={} stream_id={} offset={} end={} len={} attachment_present={} result={}",
++                runtime.path_index,
++                path_instance_id.as_u64(),
++                stream_id.0,
++                offset,
++                offset.saturating_add(len as u64),
++                len,
++                streams.contains_key(&stream_id),
++                match &result {
++                    Ok(ClientTcpWriteFrameRoute::Routed) => "routed_or_retired",
++                    Ok(ClientTcpWriteFrameRoute::Mailbox { .. }) => "mailbox_full_pending",
++                    Ok(ClientTcpWriteFrameRoute::Barrier(_)) => "barrier",
++                    Err(_) => "error",
++                },
++            ),
++        );
++    }
++    result
+ }
+ 
+ fn try_route_client_tcp_frame_during_write(
+diff --git a/src/runtime/path/tcp/server/session.rs b/src/runtime/path/tcp/server/session.rs
+index b336420..7c86e40 100644
+--- a/src/runtime/path/tcp/server/session.rs
++++ b/src/runtime/path/tcp/server/session.rs
+@@ -782,6 +782,28 @@ impl ServerTcpPathSession {
+                     ));
+                 }
+                 ReliablePathCommand::SendFrame(frame) => {
++                    #[cfg(feature = "lab-diagnostics")]
++                    if let Frame::StreamData {
++                        stream_id,
++                        offset,
++                        payload,
++                    } = &frame
++                    {
++                        lab_diagnostic(
++                            "response_tcp_handoff",
++                            format_args!(
++                                "role=server phase=command_stage session_id={} path_namespace=wire path_id={} path_instance_id={} stream_id={} offset={} end={} len={} writer_pending_bytes={}",
++                                self.path_registration.session_id().0,
++                                self.path_id.0,
++                                self.path_registration.path_instance_id().as_u64(),
++                                stream_id.0,
++                                offset,
++                                offset.saturating_add(payload.len() as u64),
++                                payload.len(),
++                                writer_pending_bytes,
++                            ),
++                        );
++                    }
+                     writer_pending_bytes = writer_pending_bytes.checked_add(pending_bytes).ok_or(
+                         RuntimeError::Protocol("server TCP writer transaction byte overflow"),
+                     )?;
+@@ -950,7 +972,18 @@ impl ServerTcpPathSession {
+                 .commit_transaction_interlocked(writer_pending_bytes)
+                 .await;
+         }
+-        let wrote = self.writer.commit_transaction(&mut self.evidence).await?;
++        let wrote = self
++            .writer
++            .commit_transaction(
++                &mut self.evidence,
++                #[cfg(feature = "lab-diagnostics")]
++                (
++                    self.path_registration.session_id().0,
++                    self.path_id.0 as usize,
++                    self.path_registration.path_instance_id().as_u64(),
++                ),
++            )
++            .await?;
+         if wrote && *writer_pending_bytes > 0 {
+             self.evidence
+                 .observe_after_write(&self.context, &self.path_registration, self.path_id);
+@@ -974,7 +1007,15 @@ impl ServerTcpPathSession {
+         let mut routed_frames = 0usize;
+         let mut mailbox: Option<PendingMailboxFrame> = None;
+         let write_result = {
+-            let write = self.writer.commit_transaction(&mut self.evidence);
++            let write = self.writer.commit_transaction(
++                &mut self.evidence,
++                #[cfg(feature = "lab-diagnostics")]
++                (
++                    self.path_registration.session_id().0,
++                    self.path_id.0 as usize,
++                    self.path_registration.path_instance_id().as_u64(),
++                ),
++            );
+             tokio::pin!(write);
+             loop {
+                 tokio::select! {
+diff --git a/src/runtime/path/tcp/server/writer.rs b/src/runtime/path/tcp/server/writer.rs
+index 0ccb601..7798e3b 100644
+--- a/src/runtime/path/tcp/server/writer.rs
++++ b/src/runtime/path/tcp/server/writer.rs
+@@ -53,15 +53,24 @@ impl ServerTcpWriter {
+     pub(in crate::runtime::path::tcp) async fn commit_transaction(
+         &mut self,
+         evidence: &mut ServerTcpEvidenceState,
++        #[cfg(feature = "lab-diagnostics")] diagnostic_identity: (u64, usize, u64),
+     ) -> Result<bool, RuntimeError> {
+         if self.pending_frames.is_empty() {
+             return Ok(true);
+         }
++        #[cfg(feature = "lab-diagnostics")]
++        self.observe_response_transaction("write_begin", diagnostic_identity, "pending");
+         let commit = async {
+             self.framed.write_frames(&self.pending_frames).await?;
+             self.framed.flush().await
+         }
+         .await;
++        #[cfg(feature = "lab-diagnostics")]
++        self.observe_response_transaction(
++            "flush_end",
++            diagnostic_identity,
++            if commit.is_ok() { "ok" } else { "error" },
++        );
+         match commit {
+             Ok(()) => {
+                 for frame in &self.pending_frames {
+@@ -75,6 +84,39 @@ impl ServerTcpWriter {
+         }
+     }
+ 
++    #[cfg(feature = "lab-diagnostics")]
++    fn observe_response_transaction(
++        &self,
++        phase: &str,
++        (session_id, path_index, path_instance_id): (u64, usize, u64),
++        result: &str,
++    ) {
++        for frame in &self.pending_frames {
++            if let Frame::StreamData {
++                stream_id,
++                offset,
++                payload,
++            } = frame
++            {
++                crate::lab_diagnostics::lab_diagnostic(
++                    "response_tcp_handoff",
++                    format_args!(
++                        "role=server phase={} session_id={} path_namespace=wire path_id={} path_instance_id={} stream_id={} offset={} end={} len={} result={}",
++                        phase,
++                        session_id,
++                        path_index,
++                        path_instance_id,
++                        stream_id.0,
++                        offset,
++                        offset.saturating_add(payload.len() as u64),
++                        payload.len(),
++                        result,
++                    ),
++                );
++            }
++        }
++    }
++
+     pub(in crate::runtime::path::tcp) async fn write_frame(
+         &mut self,
+         frame: &Frame,
+diff --git a/src/runtime/relay/client.rs b/src/runtime/relay/client.rs
+index 23783ec..16d9df2 100644
+--- a/src/runtime/relay/client.rs
++++ b/src/runtime/relay/client.rs
+@@ -344,6 +344,22 @@ pub(super) fn apply_client_stream_data_state(
+     {
+         let frontier_after = recv_stream.next_offset();
+         let reorder_bytes = recv_stream.reorder_bytes();
++        lab_diagnostic(
++            "response_handoff_mux_apply",
++            format_args!(
++                "stream_id={} source_underlay={:?} source_path_index={} path_instance_id={} attachment_id={} offset={} end={} frontier_before={} frontier_after={} reorder_bytes={}",
++                stream_id.0,
++                path_key.underlay,
++                path_key.index,
++                instance.path_instance_id.as_u64(),
++                instance.attachment_id,
++                offset,
++                offset.saturating_add(payload_len as u64),
++                frontier_before,
++                frontier_after,
++                reorder_bytes,
++            ),
++        );
+         if reorder_before > 0 && frontier_after > frontier_before {
+             let released_bytes = outcome
+                 .delivered
+diff --git a/src/runtime/relay/control.rs b/src/runtime/relay/control.rs
+index e24293e..a8a67f3 100644
+--- a/src/runtime/relay/control.rs
++++ b/src/runtime/relay/control.rs
+@@ -3410,8 +3410,19 @@ where
+                                     .min(recv_stream.published_max_offset());
+                                 let payload_limit = reliable_relay_buffer_len(context.mux_limits)
+                                     .min({
++                                        #[cfg(feature = "lab-diagnostics")]
++                                        let owner_started = Instant::now();
+                                         let product = request_product.lock();
+-                                        product.remotes.max_frame_payload_bytes(context.mux_limits)
++                                        #[cfg(feature = "lab-diagnostics")]
++                                        let acquired_us = owner_started.elapsed().as_micros();
++                                        let limit = product.remotes.max_frame_payload_bytes(context.mux_limits);
++                                        drop(product);
++                                        #[cfg(feature = "lab-diagnostics")]
++                                        lab_diagnostic("response_owner_service", format_args!(
++                                            "stage=batch_bound stream_id={} offset={} acquire_elapsed_us={} section_elapsed_us={}",
++                                            stream_id.0, offset, acquired_us, owner_started.elapsed().as_micros(),
++                                        ));
++                                        limit
+                                     })
+                                     .max(1);
+                                 let first = ReliableRelayRemoteFrame {
+@@ -3494,8 +3505,14 @@ where
+                                     unreachable!("a deferred apply error must surface after its valid prefix write");
+                                 }
+ 
++                                #[cfg(feature = "lab-diagnostics")]
++                                let response_owner_started = Instant::now();
++                                #[cfg(feature = "lab-diagnostics")]
++                                let response_owner_acquired_us;
+                                 {
+                                 let mut product_guard = request_product.lock();
++                                #[cfg(feature = "lab-diagnostics")]
++                                { response_owner_acquired_us = response_owner_started.elapsed().as_micros(); }
+                                 let product = &mut *product_guard;
+                                 let (sender, remotes) = (&mut product.sender, &mut product.remotes);
+                                 let prewrite_response_path_snapshot = remotes.lowest_eta_path_snapshot(
+@@ -3537,6 +3554,11 @@ where
+ 
+                                 }
+                                 let mut pending_write_path_opens = VecDeque::new();
++                                #[cfg(feature = "lab-diagnostics")]
++                                lab_diagnostic("response_owner_service", format_args!(
++                                    "stage=receive_feedback stream_id={} offset={} receive_frontier={} acquire_elapsed_us={} section_elapsed_us={}",
++                                    stream_id.0, offset, recv_stream.next_offset(), response_owner_acquired_us, response_owner_started.elapsed().as_micros(),
++                                ));
+                                 let write = {
+                                     let write = write_applied_ready_stream_data_batch(
+                                         &mut local,
+@@ -3545,8 +3567,14 @@ where
+                                     );
+                                     tokio::pin!(write);
+                                     loop {
++                                        #[cfg(feature = "lab-diagnostics")]
++                                        let response_owner_started = Instant::now();
++                                        #[cfg(feature = "lab-diagnostics")]
++                                        let response_owner_acquired_us;
+                                         let (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, mut prepared_work_wait) = {
+                                         let mut product_guard = request_product.lock();
++                                        #[cfg(feature = "lab-diagnostics")]
++                                        { response_owner_acquired_us = response_owner_started.elapsed().as_micros(); }
+                                         if let Some(error) = product_guard.prepared.pending_error.take() {
+                                             break Err(error);
+                                         }
+@@ -3615,6 +3643,11 @@ where
+                                         prepared_work_wait.as_mut().enable();
+                                         (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, prepared_work_wait)
+                                         };
++                                        #[cfg(feature = "lab-diagnostics")]
++                                        lab_diagnostic("response_owner_service", format_args!(
++                                            "stage=write_poll_setup stream_id={} offset={} receive_frontier={} acquire_elapsed_us={} section_elapsed_us={}",
++                                            stream_id.0, offset, recv_stream.next_offset(), response_owner_acquired_us, response_owner_started.elapsed().as_micros(),
++                                        ));
+                                         tokio::select! {
+                                             biased;
+                                             result = &mut write => break result,
+@@ -3714,6 +3747,15 @@ where
+                                         }
+                                     }
+                                 };
++                                #[cfg(feature = "lab-diagnostics")]
++                                if let Ok(bytes) = &write {
++                                    if *bytes > 0 {
++                                        lab_diagnostic("terminal_service", format_args!(
++                                            "stage=reply_delivered role=client stream_id={} bytes={} receive_frontier={} request_open={} fin_sent={}",
++                                            stream_id.0, bytes, recv_stream.next_offset(), state.endpoint.local_open, state.endpoint.local_fin_sent,
++                                        ));
++                                    }
++                                }
+                                 if let Err(err) = write {
+                                     break Err(err);
+                                 }
+diff --git a/src/runtime/relay/server.rs b/src/runtime/relay/server.rs
+index e70c981..ae606cd 100644
+--- a/src/runtime/relay/server.rs
++++ b/src/runtime/relay/server.rs
+@@ -3850,6 +3850,11 @@ where
+             let (read, permit) = read;
+             let (read, payload) = read?;
+             permit.retain(&mut send_buffer_reservation, read);
++            #[cfg(feature = "lab-diagnostics")]
++            lab_diagnostic("terminal_service", format_args!(
++                "stage=target_reply_read role=server session_id={} stream_id={} bytes={} request_open={} response_claimed_end={} response_queued_bytes={} opportunistic=false",
++                session_id.0, stream_id.0, read, remote_open, send_stream.next_offset(), response_sender.data_bytes(),
++            ));
+             if read == 0 {
+                 pending_local_fin = true;
+                 local_open = false;
+@@ -3921,6 +3926,11 @@ where
+                     let (read, permit) = read;
+                     let (read, payload) = read?;
+                     permit.retain(&mut send_buffer_reservation, read);
++                    #[cfg(feature = "lab-diagnostics")]
++                    lab_diagnostic("terminal_service", format_args!(
++                        "stage=target_reply_read role=server session_id={} stream_id={} bytes={} request_open={} response_claimed_end={} response_queued_bytes={} opportunistic=true",
++                        session_id.0, stream_id.0, read, remote_open, send_stream.next_offset(), response_sender.data_bytes(),
++                    ));
+                     if read == 0 {
+                         pending_local_fin = true;
+                         local_open = false;
+diff --git a/src/runtime/stream/request/attachment.rs b/src/runtime/stream/request/attachment.rs
+index fb13eba..319e669 100644
+--- a/src/runtime/stream/request/attachment.rs
++++ b/src/runtime/stream/request/attachment.rs
+@@ -478,6 +478,51 @@ impl Drop for ReliableRelayInputForwarder {
+     }
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn lab_response_handoff_data(frame: &Result<Frame, RuntimeError>) -> Option<(StreamId, u64, u64)> {
++    match frame {
++        Ok(Frame::StreamData {
++            stream_id,
++            offset,
++            payload,
++        }) => Some((
++            *stream_id,
++            *offset,
++            offset.saturating_add(payload.len() as u64),
++        )),
++        _ => None,
++    }
++}
++
++#[cfg(feature = "lab-diagnostics")]
++fn lab_response_handoff(
++    phase: &str,
++    instance: RelayPathInstance,
++    data: Option<(StreamId, u64, u64)>,
++    queue_observation: &str,
++    queue_items: usize,
++) {
++    let Some((stream_id, offset, end)) = data else {
++        return;
++    };
++    crate::lab_diagnostics::lab_diagnostic(
++        "response_handoff",
++        format_args!(
++            "phase={} stream_id={} path_underlay={:?} path_index={} path_instance_id={} attachment_id={} offset={} end={} queue_observation={} queue_items={}",
++            phase,
++            stream_id.0,
++            instance.key.underlay,
++            instance.key.index,
++            instance.path_instance_id.as_u64(),
++            instance.attachment_id,
++            offset,
++            end,
++            queue_observation,
++            queue_items,
++        ),
++    );
++}
++
+ async fn forward_reliable_relay_attachment_frame(
+     frames_tx: &mpsc::Sender<ReliableRelayRemoteFrame>,
+     instance: RelayPathInstance,
+@@ -489,11 +534,39 @@ async fn forward_reliable_relay_attachment_frame(
+         Ok(Frame::StreamFin { .. } | Frame::StreamReset { .. })
+     );
+     let carrier_terminal = frame.is_err();
+-    frames_tx
++    #[cfg(feature = "lab-diagnostics")]
++    let observed_data = lab_response_handoff_data(&frame);
++    #[cfg(feature = "lab-diagnostics")]
++    lab_response_handoff(
++        "shared_send_begin",
++        instance,
++        observed_data,
++        "used_slots",
++        frames_tx
++            .max_capacity()
++            .saturating_sub(frames_tx.capacity()),
++    );
++    let sent = frames_tx
+         .send(ReliableRelayRemoteFrame { instance, frame })
+         .await
+-        .is_ok()
+-        && !carrier_terminal
++        .is_ok();
++    #[cfg(feature = "lab-diagnostics")]
++    // Completion is not the channel linearization instant: another worker may
++    // log dequeue first. Used slots also include reservations, not just frames.
++    lab_response_handoff(
++        if sent {
++            "shared_send_complete"
++        } else {
++            "shared_send_failed"
++        },
++        instance,
++        observed_data,
++        "used_slots",
++        frames_tx
++            .max_capacity()
++            .saturating_sub(frames_tx.capacity()),
++    );
++    sent && !carrier_terminal
+ }
+ 
+ async fn drain_reliable_relay_attachment_after_terminal(
+@@ -628,10 +701,22 @@ impl ReliableRelayRemoteInput {
+     pub(in crate::runtime) async fn recv_frame(
+         &mut self,
+     ) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
+-        self.frames_rx
++        let received = self
++            .frames_rx
+             .recv()
+             .await
+-            .ok_or(RuntimeError::ReliablePathSessionClosed)
++            .ok_or(RuntimeError::ReliablePathSessionClosed);
++        #[cfg(feature = "lab-diagnostics")]
++        if let Ok(frame) = &received {
++            lab_response_handoff(
++                "shared_dequeue_async",
++                frame.instance,
++                lab_response_handoff_data(&frame.frame),
++                "remaining_frames",
++                self.frames_rx.len(),
++            );
++        }
++        received
+     }
+ 
+     /// Returns the relay-input backlog visible at this instant.
+@@ -644,7 +729,18 @@ impl ReliableRelayRemoteInput {
+ 
+     /// Takes one already-queued frame without waiting.
+     pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<ReliableRelayRemoteFrame> {
+-        self.frames_rx.try_recv().ok()
++        let received = self.frames_rx.try_recv().ok();
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some(frame) = &received {
++            lab_response_handoff(
++                "shared_dequeue_ready",
++                frame.instance,
++                lab_response_handoff_data(&frame.frame),
++                "remaining_frames",
++                self.frames_rx.len(),
++            );
++        }
++        received
+     }
+ 
+     #[cfg(test)]
+

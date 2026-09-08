@@ -1,0 +1,711 @@
+diff --git a/src/runtime/path/prepared.rs b/src/runtime/path/prepared.rs
+index 928d71f..115a293 100644
+--- a/src/runtime/path/prepared.rs
++++ b/src/runtime/path/prepared.rs
+@@ -127,6 +127,13 @@ impl PreparedOriginalWork {
+         self.lane
+     }
+ 
++    #[cfg(test)]
++    pub(in crate::runtime) fn product_for_test(
++        &self,
++    ) -> Option<crate::runtime::sender::SharedRequestProduct> {
++        self.registration.upgrade()?.product.upgrade()
++    }
++
+     pub(in crate::runtime) fn try_claim(
+         &self,
+         ready: &ReliableWriterReadyGuard,
+diff --git a/src/runtime/path/tcp/server/tests_session.rs b/src/runtime/path/tcp/server/tests_session.rs
+index c22da86..1e0f283 100644
+--- a/src/runtime/path/tcp/server/tests_session.rs
++++ b/src/runtime/path/tcp/server/tests_session.rs
+@@ -284,13 +284,15 @@ async fn server_tcp_test_session(
+     mpsc::Sender<Result<Frame, EncryptedFramedTransportError>>,
+     crate::runtime::relay::ServerReliableRelayService,
+ ) {
+-    server_tcp_test_session_with_mode(session_id, path_id, crate::config::ForwardingMode::L4).await
++    server_tcp_test_session_with_mode(session_id, path_id, crate::config::ForwardingMode::L4, None)
++        .await
+ }
+ 
+ async fn server_tcp_test_session_with_mode(
+     session_id: SessionId,
+     path_id: PathId,
+     forwarding_mode: crate::config::ForwardingMode,
++    command_capacity: Option<usize>,
+ ) -> (
+     ServerTcpPathSession,
+     EncryptedFramedStream<TcpStream>,
+@@ -365,7 +367,7 @@ async fn server_tcp_test_session_with_mode(
+         path_id,
+         ServerLocalPathProperties::default(),
+     );
+-    let (commands_tx, commands_rx) = reliable_path_command_channels(8);
++    let (commands_tx, commands_rx) = reliable_path_command_channels(command_capacity.unwrap_or(8));
+     let commands = commands_tx.clone();
+     let (path_frames_tx, path_frames) = mpsc::channel(1);
+     let evidence = ServerTcpEvidenceState::new(None, None, context.mux_limits);
+@@ -774,6 +776,7 @@ async fn server_tcp_l3_mode_rejects_l4_forwarding_opens() {
+             SessionId(207),
+             PathId(0),
+             crate::config::ForwardingMode::L3,
++            None,
+         )
+         .await;
+     let stream_id = StreamId(1);
+@@ -1978,3 +1981,212 @@ async fn server_tcp_path_close_is_the_aggregate_responder_suffix() {
+         "measurement work is canceled and PATH_CLOSE is serialized last"
+     );
+ }
++
++// Prospective response late-placement model, not a violation of the current
++// queue-publication contract or a wall-clock performance claim. Both carriers
++// use the existing protected TCP writer; only their test-driven service order
++// differs. No rate, Native credit, resource limit, or flight state is injected.
++async fn response_pre_native_alternate_case(start_a_writer: bool) {
++    use crate::model::capacity::{
++        adaptive_reliable_relay_chunk_bytes_with_frame_limit,
++        reliable_path_startup_sample_limit_bytes,
++    };
++    use crate::model::path::CarrierPathKey;
++    use crate::mux::{MuxLimits, stream::ReliableSendStream};
++    use crate::runtime::path::commands::reliable_path_command_queue;
++    use crate::runtime::sender::ServerResponseSenderService;
++    use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
++    use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
++
++    let limits = MuxLimits::default();
++    let lane = TrafficClass::Throughput;
++    let session_id = SessionId(320);
++    let stream_id = StreamId(320);
++    let q = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
++        None,
++        lane,
++        limits,
++        limits.max_payload_bytes,
++    )
++    .min(usize::try_from(reliable_path_startup_sample_limit_bytes(limits)).unwrap());
++    assert!(q > 0);
++    let capacity = reliable_path_command_queue(limits);
++    let (mut a, mut a_peer, a_commands, _a_input, _a_relay) = server_tcp_test_session_with_mode(
++        session_id,
++        PathId(0),
++        crate::config::ForwardingMode::L4,
++        Some(capacity),
++    )
++    .await;
++    let (mut b, mut b_peer, b_commands, _b_input, _b_relay) = server_tcp_test_session_with_mode(
++        session_id,
++        PathId(1),
++        crate::config::ForwardingMode::L4,
++        Some(capacity),
++    )
++    .await;
++    let a_key = CarrierPathKey {
++        underlay: UnderlayProtocol::Tcp,
++        path_id: PathId(0),
++    };
++    let b_key = CarrierPathKey {
++        underlay: UnderlayProtocol::Tcp,
++        path_id: PathId(1),
++    };
++    let binding = ResponseStreamBinding::new_with_limits(
++        session_id,
++        a_key.underlay,
++        a_key.path_id,
++        a_commands.clone(),
++        lane,
++        limits,
++    );
++    // A is a legal sole Backup. Later B's Regular preference makes its actual
++    // admission deterministic without manufacturing completion estimates.
++    let a_target = binding.sender_path_targets(lane, q).remove(0);
++    assert!(binding.update_peer_path_usage_for_test(
++        a_key,
++        a_target.observation.path_instance_id,
++        1,
++        PathUsage::Backup,
++    ));
++    let (_frames_tx, frames) = mpsc::channel(1);
++    let path_stream = ReliablePathStream {
++        stream_id,
++        max_offset: u64::MAX,
++        lane,
++        underlay: UnderlayProtocol::Tcp,
++        max_frame_payload_bytes: limits.max_payload_bytes,
++        output: ReliablePathStreamOutput::Switchable(binding.clone()),
++        frames: frames.into(),
++    };
++    let mut sender = ServerResponseSenderService::new(session_id, stream_id);
++    let mut send_stream = ReliableSendStream::new(stream_id, limits);
++    let payload = Bytes::from(vec![0x5a; q]);
++    for offset in [0, q] {
++        sender.enqueue_data_for_lane(payload.clone(), lane);
++        sender
++            .dispatch_next(&path_stream, &mut send_stream, lane, limits)
++            .expect("publish real response source while A is the sole output");
++        if start_a_writer {
++            let command = try_recv_reliable_path_command(&mut a.commands_rx)
++                .expect("A has its published response command");
++            assert!(matches!(
++                a.drain_commands(command).await.unwrap(),
++                ServerTcpSessionDisposition::Continue
++            ));
++            assert_eq!(
++                a_peer.read_frame().await.unwrap(),
++                Frame::StreamData {
++                    stream_id,
++                    offset: offset as u64,
++                    payload: payload.clone(),
++                }
++            );
++        }
++    }
++    let claimed_before_b = send_stream.next_offset();
++    assert_eq!(
++        sender.data_bytes() as u64 + claimed_before_b,
++        (2 * q) as u64
++    );
++    assert_eq!(send_stream.reinjection_bytes() as u64, claimed_before_b);
++    assert_eq!(a_commands.writer_pending_bytes(), 0);
++
++    assert_eq!(
++        binding.attach(b_key.underlay, b_key.path_id, b_commands.clone(), lane),
++        ResponseStreamAttachOutcome::Attached
++    );
++    let b_target = binding
++        .sender_path_targets(lane, q)
++        .into_iter()
++        .find(|target| target.observation.key == b_key)
++        .unwrap();
++    assert!(b_target.product_admission_active);
++    assert!(!b_target.observation.stale_for_original_data);
++    assert!(b_target.can_enqueue_stream_data(lane));
++    // This same-binding control reaches the real Additional admission check,
++    // command publication, protected write/flush and peer receipt before the
++    // prospective ownership assertion. B is not merely a scored candidate.
++    sender.enqueue_data_for_lane(payload.clone(), lane);
++    let dispatch = sender
++        .dispatch_next(&path_stream, &mut send_stream, lane, limits)
++        .expect("new Regular B has actual Original authority beside A's lower ranges");
++    assert_eq!(dispatch.selected_path, Some(b_key));
++    let command = try_recv_reliable_path_command(&mut b.commands_rx)
++        .expect("B receives its actually admitted Original command");
++    assert!(matches!(
++        b.drain_commands(command).await.unwrap(),
++        ServerTcpSessionDisposition::Continue
++    ));
++    let Frame::StreamData {
++        stream_id: received_stream,
++        offset: b_offset,
++        payload: received,
++    } = b_peer.read_frame().await.unwrap()
++    else {
++        panic!("B must receive response Data")
++    };
++    assert_eq!(received_stream, stream_id);
++    assert_eq!(received, payload);
++    assert_eq!(b_commands.pending_bytes(), 0);
++    assert_eq!(b_commands.writer_pending_bytes(), 0);
++    assert_eq!(
++        sender.data_bytes() as u64 + send_stream.next_offset(),
++        (3 * q) as u64
++    );
++    assert_eq!(
++        send_stream.reinjection_bytes() as u64,
++        send_stream.next_offset()
++    );
++    let targets = binding.sender_path_targets(lane, q);
++    let a_original = targets
++        .iter()
++        .find(|target| target.observation.key == a_key)
++        .unwrap()
++        .observation
++        .original_data_in_flight_bytes;
++    let b_original = targets
++        .iter()
++        .find(|target| target.observation.key == b_key)
++        .unwrap()
++        .observation
++        .original_data_in_flight_bytes;
++    assert_eq!(b_original, q as u64);
++    assert_eq!(a_original + b_original, send_stream.next_offset());
++    if start_a_writer {
++        assert_eq!(claimed_before_b, (2 * q) as u64);
++        assert_eq!(
++            a_original,
++            (2 * q) as u64,
++            "positive native writes remain A's Original ownership until Product ACK"
++        );
++        assert_eq!(b_offset, (2 * q) as u64);
++        assert_eq!(a_commands.pending_bytes(), 0);
++    } else {
++        // A's receiver was never polled. B has already proved real protected
++        // service, so queueing alone must not irrevocably own the lower source.
++        assert_eq!(
++            a_original, 0,
++            "prospective late-placement RED: unconsumed A commands must not own Original bytes while B can write"
++        );
++        assert_eq!(
++            claimed_before_b, 0,
++            "source C must not advance merely to prepare a future A writer command"
++        );
++        assert_eq!(
++            b_offset, 0,
++            "ready B must be able to claim the lowest shared prefix"
++        );
++    }
++}
++
++#[tokio::test]
++async fn response_pre_native_unconsumed_original_remains_available_to_ready_alternate() {
++    response_pre_native_alternate_case(false).await;
++}
++
++#[tokio::test]
++async fn response_pre_native_started_original_retains_its_exact_owner() {
++    response_pre_native_alternate_case(true).await;
++}
+diff --git a/src/runtime/relay/tests_control.rs b/src/runtime/relay/tests_control.rs
+index 05736ec..7e46025 100644
+--- a/src/runtime/relay/tests_control.rs
++++ b/src/runtime/relay/tests_control.rs
+@@ -2259,3 +2259,366 @@ async fn bulk_request_staging_uses_resource_ceiling_and_bounded_ready_work() {
+         "cancelling a not-ready opportunistic source read releases its reservation"
+     );
+ }
++
++// This is a structural isolation contract, not a simulated planning-cost or
++// wall-clock performance assertion. The held scope belongs to an actual
++// prepared Original claimant, never to a test-created Product lock holder.
++async fn received_response_during_request_planning_case(pause_plan: bool) -> bool {
++    use crate::model::path::RelayPathInstance;
++    use crate::runtime::path::commands::{
++        reliable_path_command_pending_bytes, reliable_path_command_queue,
++    };
++    use crate::runtime::path::prepared::PreparedOriginalWork;
++    use crate::runtime::sender::RequestPreparedClaim;
++
++    const TEST_GUARD: Duration = Duration::from_secs(5);
++    const HELD_SERVICE_GUARD: Duration = Duration::from_secs(1);
++    const RESPONSE: &[u8] = b"already authenticated reply";
++
++    #[derive(Default)]
++    struct ResponseWriter {
++        bytes: Mutex<Vec<u8>>,
++        flushed: AtomicBool,
++        flush_notify: Notify,
++    }
++
++    struct PreparedSourceAndReadyWriter {
++        source: Bytes,
++        writer: Arc<ResponseWriter>,
++    }
++
++    impl AsyncRead for PreparedSourceAndReadyWriter {
++        fn poll_read(
++            mut self: Pin<&mut Self>,
++            _cx: &mut TaskContext<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<std::io::Result<()>> {
++            if buf.remaining() == 0 {
++                return Poll::Ready(Ok(()));
++            }
++            if self.source.is_empty() {
++                // Keep the request open: FIN and target EOF are not prerequisites
++                // of this independent, already-produced response.
++                return Poll::Pending;
++            }
++            let count = buf.remaining().min(self.source.len());
++            buf.put_slice(&self.source.split_to(count));
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    impl AsyncWrite for PreparedSourceAndReadyWriter {
++        fn poll_write(
++            self: Pin<&mut Self>,
++            _cx: &mut TaskContext<'_>,
++            buf: &[u8],
++        ) -> Poll<std::io::Result<usize>> {
++            self.writer.bytes.lock().unwrap().extend_from_slice(buf);
++            Poll::Ready(Ok(buf.len()))
++        }
++
++        fn poll_flush(
++            self: Pin<&mut Self>,
++            _cx: &mut TaskContext<'_>,
++        ) -> Poll<std::io::Result<()>> {
++            self.writer.flushed.store(true, Ordering::Release);
++            self.writer.flush_notify.notify_one();
++            Poll::Ready(Ok(()))
++        }
++
++        fn poll_shutdown(
++            self: Pin<&mut Self>,
++            _cx: &mut TaskContext<'_>,
++        ) -> Poll<std::io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    type ClaimedWriter = (
++        ReliablePathCommandReceivers,
++        PreparedOriginalWork,
++        Frame,
++        usize,
++    );
++    struct Cleanup {
++        release_plan: Option<std::sync::mpsc::Sender<()>>,
++        cancel_claim: Option<tokio::sync::oneshot::Sender<()>>,
++        claimant: Option<std::thread::JoinHandle<Option<ClaimedWriter>>>,
++        relay: Option<tokio::task::JoinHandle<Result<PathDeliveryStats, RuntimeError>>>,
++    }
++    impl Drop for Cleanup {
++        fn drop(&mut self) {
++            // Release first, including every setup/error assertion. Cancellation
++            // also interrupts a receiver-deferred Busy/Blocked retry. Every OS
++            // claimant is joined even when the final structural assertion REDs.
++            if let Some(release) = self.release_plan.take() {
++                let _ = release.send(());
++            }
++            if let Some(cancel) = self.cancel_claim.take() {
++                let _ = cancel.send(());
++            }
++            if let Some(claimant) = self.claimant.take() {
++                let _ = claimant.join();
++            }
++            if let Some(relay) = self.relay.take() {
++                relay.abort();
++            }
++        }
++    }
++
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("reserve fixture endpoint");
++    let endpoint = listener.local_addr().unwrap();
++    let context = ClientPathContext::new(
++        vec![format!("tcp://{endpoint}").parse().unwrap()],
++        test_security(),
++        ResourceLimits::default(),
++    )
++    .unwrap();
++    let limits = context.mux_limits;
++    let quantum = adaptive_reliable_relay_chunk_bytes(None, TrafficClass::Latency, limits);
++    let source = Bytes::from(vec![0x6d; quantum]);
++    let stream_id = StreamId(if pause_plan { 731 } else { 730 });
++    let (commands, mut receivers) =
++        reliable_path_command_channels(reliable_path_command_queue(limits));
++    let (frames_tx, frames_rx) = mpsc::channel(8);
++    let opened = test_opened_remote_stream(stream_id, 0, commands.clone(), frames_rx);
++    let instance = RelayPathInstance {
++        key: RelayPathKey {
++            underlay: UnderlayProtocol::Tcp,
++            index: 0,
++        },
++        path_instance_id: opened.path_instance_id(),
++        attachment_id: 0,
++    };
++    context.install_relay_path_instance_for_test(instance);
++    let writer = Arc::new(ResponseWriter::default());
++    let local = PreparedSourceAndReadyWriter {
++        source: source.clone(),
++        writer: writer.clone(),
++    };
++    let relay_context = context.clone();
++    let relay = tokio::spawn(async move {
++        relay_migrating_tcp_stream(
++            local,
++            &relay_context,
++            MppPerformanceConfig::default(),
++            ReliableRelayOpenSpec::new(TargetAddr::Ip(endpoint), TrafficClass::Latency),
++            opened,
++            None,
++        )
++        .await
++    });
++    let mut cleanup = Cleanup {
++        release_plan: None,
++        cancel_claim: None,
++        claimant: None,
++        relay: Some(relay),
++    };
++    let work = tokio::time::timeout(TEST_GUARD, async {
++        loop {
++            let command = recv_reliable_path_command(&mut receivers)
++                .await
++                .expect("actual relay keeps its attachment live");
++            receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
++            match command {
++                ReliablePathCommand::PreparedOriginal(work) => break work,
++                ReliablePathCommand::SendFrame(Frame::StreamData { .. }) => {
++                    panic!("relay source must remain unbound until its writer claims it");
++                }
++                ReliablePathCommand::SendFrame(_) => {}
++                _ => panic!("unexpected lifecycle before prepared source"),
++            }
++        }
++    })
++    .await
++    .expect("the actual actor admits source and publishes its weak writer notice");
++    let product = work.product_for_test().expect("actual relay Product owner");
++    tokio::time::timeout(TEST_GUARD, async {
++        while product.lock().sender_queue.data_bytes() != quantum {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("the normal source reader stages this one admitted quantum");
++    let snapshot = |state: &RequestProductState| {
++        (
++            state.send_stream.next_offset(),
++            state.send_stream.reinjection_bytes(),
++            state.sender_queue.data_bytes(),
++            state.send_stream.data_ack_frontier(),
++            state
++                .sender
++                .unacked_original_paths_before(&state.remotes, u64::MAX),
++            state.prepared.last_claimed_at,
++        )
++    };
++    let before = snapshot(&product.lock());
++    assert_eq!((before.0, before.1, before.2, before.3), (0, 0, quantum, 0));
++    assert!(before.4.is_empty());
++    assert_eq!(before.5, None);
++    assert_eq!(work.instance(), instance);
++    assert!(commands.writer_boundary().snapshot().is_none());
++    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
++    let (release_tx, release_rx) = std::sync::mpsc::channel();
++    cleanup.release_plan = Some(release_tx);
++    product.before_prepared_original_plan_once_for_test(move |state| {
++        let _ = entered_tx.send(snapshot(state));
++        if pause_plan {
++            let _ = release_rx.recv();
++        }
++    });
++    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
++    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
++    cleanup.cancel_claim = Some(cancel_tx);
++    let runtime = tokio::runtime::Handle::current();
++    cleanup.claimant = Some(std::thread::spawn(move || {
++        let result = runtime.block_on(async move {
++            let mut work = work;
++            loop {
++                let ready = receivers
++                    .writer_ready_boundary(instance.path_instance_id)
++                    .expect("real receiver's exact idle epoch");
++                match work.try_claim(ready) {
++                    RequestPreparedClaim::Claimed(frame) => {
++                        let charge = receivers.register_claimed_writer_frame(&frame);
++                        return Some((receivers, work, frame, charge));
++                    }
++                    RequestPreparedClaim::Busy(wait) => receivers.defer_prepared_work(work, wait),
++                    RequestPreparedClaim::Blocked(wait) => {
++                        receivers.defer_prepared_work(work, wait)
++                    }
++                    RequestPreparedClaim::Empty => return None,
++                }
++                work = loop {
++                    let command = tokio::select! {
++                        biased;
++                        _ = &mut cancel_rx => return None,
++                        command = recv_reliable_path_command(&mut receivers) => command?,
++                    };
++                    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(
++                        &command,
++                    ));
++                    match command {
++                        ReliablePathCommand::PreparedOriginal(work) => break work,
++                        ReliablePathCommand::SendFrame(Frame::StreamData { .. }) => {
++                            panic!(
++                                "no queued Original may substitute for actual prepared claiming"
++                            );
++                        }
++                        ReliablePathCommand::SendFrame(_) => receivers.withdraw_writer_ready(),
++                        _ => return None,
++                    }
++                };
++            }
++        });
++        let _ = done_tx.send(());
++        result
++    }));
++    let held = tokio::time::timeout(TEST_GUARD, entered_rx)
++        .await
++        .expect("actual claimant reaches its Original planning scope")
++        .expect("planning snapshot");
++    assert_eq!(
++        held, before,
++        "planning has not assigned or consumed any source"
++    );
++    assert!(!writer.flushed.load(Ordering::Acquire));
++
++    // The existing OpenedRemoteStream fixture is the authenticated native
++    // decoder boundary. This is not a physical socket/encode performance test.
++    frames_tx
++        .send(Ok(Frame::StreamData {
++            stream_id,
++            offset: 0,
++            payload: Bytes::from_static(RESPONSE),
++        }))
++        .await
++        .expect("already authenticated contiguous response");
++    let delivered_while_planning =
++        tokio::time::timeout(HELD_SERVICE_GUARD, writer.flush_notify.notified())
++            .await
++            .is_ok();
++
++    cleanup.release_plan.take().unwrap().send(()).ok();
++    tokio::time::timeout(TEST_GUARD, done_rx)
++        .await
++        .expect("the same actual claimant completes after release")
++        .expect("claimant completion signal");
++    let (mut receivers, work, frame, charge) = cleanup
++        .claimant
++        .take()
++        .unwrap()
++        .join()
++        .expect("claimant thread")
++        .expect("same admitted source obtains an actual native claim");
++    if !writer.flushed.load(Ordering::Acquire) {
++        tokio::time::timeout(TEST_GUARD, writer.flush_notify.notified())
++            .await
++            .expect("the identical response progresses after unrelated planning is released");
++    }
++    assert_eq!(writer.bytes.lock().unwrap().as_slice(), RESPONSE);
++    let Frame::StreamData {
++        stream_id: actual,
++        offset,
++        payload,
++    } = &frame
++    else {
++        panic!("successful Original claim must return StreamData");
++    };
++    assert_eq!((*actual, *offset, payload), (stream_id, 0, &source));
++    let after = snapshot(&product.lock());
++    assert_eq!(
++        (after.0, after.1, after.2, after.3),
++        (quantum as u64, quantum, 0, 0)
++    );
++    assert_eq!(after.4.as_slice(), &[instance]);
++    assert!(after.5.is_some());
++    assert!(commands.writer_boundary().snapshot().is_none());
++    assert!(commands.writer_pending_bytes() >= charge as u64);
++    receivers.release_pending_command_bytes(charge);
++    let mut response_ack = false;
++    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
++        if let ReliablePathCommand::SendFrame(Frame::StreamAck {
++            stream_id: actual,
++            ranges,
++            ..
++        }) = &command
++        {
++            response_ack |= *actual == stream_id
++                && ranges
++                    .iter()
++                    .any(|range| range.start == 0 && range.end == RESPONSE.len() as u64);
++        }
++        assert!(!matches!(
++            &command,
++            ReliablePathCommand::SendFrame(Frame::StreamData { .. })
++        ));
++        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
++    }
++    assert!(
++        response_ack,
++        "actual response progress keeps its ACK publication"
++    );
++    assert_eq!(commands.writer_pending_bytes(), 0);
++    let relay = cleanup.relay.take().unwrap();
++    relay.abort();
++    assert!(relay.await.unwrap_err().is_cancelled());
++    assert!(!product.lock().prepared.claims_active);
++    drop(work);
++    delivered_while_planning
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn received_response_service_uncontended_request_planning_control() {
++    assert!(received_response_during_request_planning_case(false).await);
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn received_response_service_does_not_wait_for_opposite_request_planning() {
++    assert!(
++        received_response_during_request_planning_case(true).await,
++        "structural isolation contract: ready response service must not depend on releasing an unrelated actual Original planner; the guard duration is not a measured runtime stall",
++    );
++}
+diff --git a/src/runtime/sender/request/owner.rs b/src/runtime/sender/request/owner.rs
+index c179864..a824194 100644
+--- a/src/runtime/sender/request/owner.rs
++++ b/src/runtime/sender/request/owner.rs
+@@ -14,6 +14,8 @@ struct SharedRequestProductInner {
+     unlocked: Arc<Notify>,
+     #[cfg(test)]
+     before_prepared_native_resolve: Mutex<Option<Box<dyn FnOnce() + Send>>>,
++    #[cfg(test)]
++    before_prepared_original_plan: Mutex<Option<Box<dyn FnOnce(&RequestProductState) + Send>>>,
+ }
+ 
+ #[derive(Clone)]
+@@ -56,6 +58,8 @@ impl SharedRequestProduct {
+                 unlocked: Arc::new(Notify::new()),
+                 #[cfg(test)]
+                 before_prepared_native_resolve: Mutex::new(None),
++                #[cfg(test)]
++                before_prepared_original_plan: Mutex::new(None),
+             }),
+         }
+     }
+@@ -89,6 +93,35 @@ impl SharedRequestProduct {
+         }
+     }
+ 
++    #[cfg(test)]
++    pub(in crate::runtime) fn before_prepared_original_plan_once_for_test(
++        &self,
++        hook: impl FnOnce(&RequestProductState) + Send + 'static,
++    ) {
++        let previous = self
++            .inner
++            .before_prepared_original_plan
++            .lock()
++            .expect("prepared Original plan test hook lock")
++            .replace(Box::new(hook));
++        assert!(previous.is_none(), "one unconsumed plan hook per owner");
++    }
++
++    #[cfg(test)]
++    pub(super) fn run_before_prepared_original_plan_for_test(&self, state: &RequestProductState) {
++        let hook = self
++            .inner
++            .before_prepared_original_plan
++            .lock()
++            .expect("prepared Original plan test hook lock")
++            .take();
++        // The real claimant owns Product here; the hook mutex is not retained.
++        // This seam proves an execution dependency, not a planning duration.
++        if let Some(hook) = hook {
++            hook(state);
++        }
++    }
++
+     /// Actor-side synchronous ownership. No guard may cross an actual await.
+     /// Native writer claims use arm_claim/try_lock, including advisory reads.
+     pub(in crate::runtime) fn lock(&self) -> RequestProductGuard<'_> {
+diff --git a/src/runtime/sender/request/prepared.rs b/src/runtime/sender/request/prepared.rs
+index 47c7b54..78a3bfb 100644
+--- a/src/runtime/sender/request/prepared.rs
++++ b/src/runtime/sender/request/prepared.rs
+@@ -281,6 +281,8 @@ pub(in crate::runtime) fn claim_prepared_request_data(
+         None
+     };
+     let ready_instances = current_ready_instances(&state);
++    #[cfg(test)]
++    owner.run_before_prepared_original_plan_for_test(&state);
+     let plan = match state.sender.multipath.plan_original_claim_from_observation(
+         context,
+         &observation,

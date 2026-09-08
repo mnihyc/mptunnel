@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 20:21 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 21:06 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,134 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Current decision21:06:** the two frozen captures are complete. UP's current
+useful replies have1.112s already-decoded residence and a6.403s frontier hold
+overlapping substantial reader handoff awaits. Those predecessors are untyped;
+neither ACK-handler dominance nor a three-owner-lock cause is established.
+All915 measured owner sections peak at13.405ms, and all101 useful mux advances
+reach local delivery within13ms. Do not implement the paused-planner separation
+as a seconds fix. Preserve the receive-service boundary as unresolved.
+
+DOWN supplies a separate material sequence: at Unix1788871829040,128 TCP
+Originals cover an exact7,714,742B lower prefix, all published but not yet
+writer-started. QUIC then positively writes57,120,620B of later Originals.
+The receiver takes9.486s to finish that lower prefix and releases a60MB suffix.
+This demonstrates premature private-writer assignment beside real alternate
+service. The largest individual3.589s hold was already native-accepted; neither
+that hold nor the losing9.850s TCP queue residence is the promised gain.
+
+**Replacement / prospective benefit / falsifier:** pursue response Original
+claiming at the actual writer boundary, sharing the existing request ownership
+contract, not a new ranking formula or live-copy fanout. Until an imminent writer
+claims them, lower source bytes remain shared U; C/cache/exact Original ownership
+commit together. Earlier QUIC opportunities can then carry lower bytes rather
+than a stranded-prefix suffix. The practical forecast is fewer multi-second
+ordering sequences and less useless reassembly, not a precise Mbps or9.486s
+saving. Physical loss, already-native queues and feedback changes can leave
+the gain zero; an adverse or ambiguous ordinary pair stops promotion.
+Preserve full configured high-BDP authority, native controllers, source/ACK/FIN
+conservation, qualification/startup, chosen-instance fences, weak cancellation
+and current request semantics. No shrinking queue/window to force this result.
+Independent reviews agree the source/cache owner and writer consumers must
+migrate together; merely marking a fixed-target command prepared is invalid.
+
+**Evidence hygiene:** all five prospective structural test/seam files are
+archived in MIXED_SERVICE_STRUCTURAL_RED_20260908.patch and reversed; its clean
+apply check passes. Their two intentional REDs are not left in CI. Runtime is
+again unchanged d999fea, all observer hooks reversed. Raw result/build/test/run
+files are being preserved in MIXED_RESPONSE_PLACEMENT_SERVICE_20260908.raw.tar.gz.
+No build or lab is active. Source implementation requires the reviewed atomic
+claim contract and one coherent integration; no implementation is accepted yet.
+
+**Implementation transaction21:16:** the reviewed response claim migration is
+now in progress, split by ownership: response source/claim/binding, server actor
+integration, generic weak notices/native writers, and independent real protected
+writer controls. No candidate build or lab yet. Preserve the full membership
+when selecting Ready candidates: an occupied fresh loser must not mask a stale
+Ready survivor. This carries the already-proved request fallback rule into the
+new response prepared entry; simply replacing queue eligibility with Ready while
+retaining that mask would revive the b783cd6 liveness counterexample. Legacy
+non-prepared callers retain their policy. No new rate or score tuning.
+All16 raw archive members pass gzip integrity and byte-for-byte comparison;
+the report's100 timing bins and29 successful echo latencies match probe files.
+
+**User direction20:33:** the all-baselines-poor combined profile is diagnostic,
+not a final performance claim or a100Mbps objective. Keep the stall and default
+mixed-mode defects as the priority; prove the replacement rather than optimize
+an arbitrary aggregate in this harsh environment. Final performance needs
+healthy/high-capacity and restored heterogeneous paths as well.
+
+**Current transaction / forecast:** two bounded structural controls are being
+prepared independently: real prepared-claim versus ready response delivery,
+and real response publication to an unconsumed writer versus a newly usable
+writer. Root first checks whether current d999fea captures retain material
+already-received return-byte residence; historical2.226s is an opportunity,
+not a current gain forecast. The controls prove dependency/ownership, not
+seconds saved. Current small replies have2–4ms publication-to-write residence,
+so response parity is not automatically the first performance change.
+
+**Decision / falsifier / verification:** a present multi-second useful-byte
+hold caused by opposite planning selects directional receive/commit ownership
+separation. Prompt local service rejects that causal attribution for the
+interval and selects the existing ordered-prefix/recovery question instead.
+No arbitrary paused mutex becomes a practical performance proof. Before any
+candidate, require exact earlier legal service and preserve ACK/credit,
+attachment/terminal, source/copy and chosen-native fences. Then one attributable
+implementation, focused actual-producer controls, and ordinary current/candidate
+timing plus healthy high-BDP service; no congestion/threshold changes. Root
+owns builds/labs; agents own disjoint proposed test files only after confirmation.
+
+**Current discriminator20:40:** existing d999fea native/forward captures lack
+return decode/mux/write events;91/80 reverse ACK rows supply no hidden positive
+client-receive-before-write bound either. Reuse the reviewed18-file reply
+observer, adding only acquisition and section elapsed at the three response
+Product-owner cuts, logged after guards release. Timings include descheduling,
+not exclusive mutex/CPU time; early terminal exits may leave a section censored.
+One frozen d999fea diagnostic mixed upload on the unchanged harsh profile
+asks whether current useful replies spend material time at those local cuts,
+earlier ingress service, or before receipt. This determines whether the
+direction-isolation implementation is the material first change. A tiny
+measured acquisition/section rejects that attribution for the captured hold;
+do not promote a model-only barrier RED into a performance claim. Archive and
+reverse the observer after its build, before capture. No protocol, rate, queue,
+controller or task-ownership change in this observer; no final Mbps claim.
+
+**Structural controls executed20:46:** both intended model-contract assertions
+fail after their real-producer and cleanup/accounting prerequisites pass.
+Response: healthy B admits/writes/receives its actual source, but unconsumed A
+still owns131072B; A-already-written opposite passes. Receive: actual prepared
+claimant's paused planning prevents otherwise-ready response delivery;
+uncontended opposite passes, with eventual delivery/ACK/conservation verified
+before the intended assertion. These are two prospective contract REDs, not
+current seconds or ordinary throughput proof. Five test/seam files only,
+all new runtime seams cfg(test). No production model change yet.
+
+**Capture execution:**18-file reply+three-owner-timer overlay built warning-free
+in1m31s, frozen as receive-owner-service-20260908, archived separately and fully
+reversed before1m37s default-feature test build. Both2-test filters each give
+1pass/1intendedfailure. One unchanged mixed-upload diagnostic is now running;
+no build overlaps it. Current source contains only the proposed test controls.
+
+**Current owner result20:49:** capture completes397344768B/59.830669s,
+maximum confirmation gap6.403523s. All915completedowner records (305percut)
+bound acquisition/whole section at13.040/13.042ms batch-bound,
+13.393/13.405ms receive-feedback, and0.486/0.489ms write-poll setup.
+This rejects the three owner-acquisition cuts as a multi-second cause in this
+capture. The structural dependency RED is not promoted to a practical fix.
+Exact useful return arrival/routing joins are being completed; no new lock
+mechanism is justified by the failed aggregate alone.
+
+**Next existing mixed boundary / information forecast:** reuse the same frozen
+reply observer in one mixed download (no new build/hooks) on the unchanged
+diagnostic profile. The ordinary mixed-down7.418s gap/64MiB separation lacks
+exact Original publication, protected writer, decode and ordered-prefix joins.
+The existing observer provides those response-direction cuts. A useful prefix
+held before writer acceptance beside earlier real alternate service selects
+late response placement; prompt publication/write excludes it. Already-native
+or already-decoded waits select their respective existing boundaries. No
+inference from A's synthetic pause duration, no harsh-profile speed target,
+and no candidate until the material removable interval is identified.
 
 **2026-09-08 19:52 +08:00 — scope:** the user explicitly asks why mixed-mode
 still fails and requests a careful comprehensive redesign. This supersedes

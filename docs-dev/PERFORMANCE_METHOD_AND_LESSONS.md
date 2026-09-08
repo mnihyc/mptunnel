@@ -61,6 +61,16 @@ Both raw result directories are under
 
 ## Primary objective and proof boundary
 
+User clarification2026-09-08: the severe combined impairment where all
+baselines perform poorly is a **diagnostic stress case**, not the final
+performance environment or a throughput target. Crossing100Mbps there has
+no special value. Preserve its stalls/failures for attribution, but do not
+optimize its aggregate alone or publish it as general competitiveness.
+Final evidence must include serviceable high-capacity links, healthy/restored
+phases, heterogeneous mixed paths and independent aggregation with matched
+baselines and timing/experience. Do not erase the harsh case; give each case
+its declared purpose before testing.
+
 Optimize receiver-confirmed, ordered user service over time: short-object
 completion, sustained useful bytes, read/confirmation gaps, loaded latency,
 restart-free recovery, finite resource ownership and wire/CPU/memory cost.

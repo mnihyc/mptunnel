@@ -666,3 +666,12 @@ and complete thread cleanup.1pass/3fail in1.00s; no fixture/admission failure.
 Independent review confirms the current proof/source/Ready provenance and
 that no extra validation unlock masks the tested notification. This establishes
 the actual native claim's blocking mechanism, not its share of ordinary gaps.
+
+Executed15:34: only the two advisory acquisitions now use freshly prearmed
+try-lock/Busy; final Native fencing and scheduling are unchanged. Warning-free
+GREEN rebuild1m12s;542 focused controls pass1.28s, including actual contention,
+unlock-before-first-poll, same-source retry/cancellation, prior all-refused
+idle recurrence, selected withdrawal, half-close and actual TCP/QUIC EOF.
+Two independent source/fixture reviews pass. The ordinary optimized candidate
+build and unchanged-profile pair follow; this checkpoint is not performance
+acceptance and does not supersede the control's5.052667s maximum gap.

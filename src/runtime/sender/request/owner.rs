@@ -90,7 +90,7 @@ impl SharedRequestProduct {
     }
 
     /// Actor-side synchronous ownership. No guard may cross an actual await.
-    /// This blocking acquisition must never be called from a Native fence.
+    /// Native writer claims use arm_claim/try_lock, including advisory reads.
     pub(in crate::runtime) fn lock(&self) -> RequestProductGuard<'_> {
         RequestProductGuard {
             state: Some(
@@ -103,7 +103,8 @@ impl SharedRequestProduct {
         }
     }
 
-    /// Register before entering Native. A failed try-lock then retains the
+    /// Register before each writer attempt (before entering a Native fence,
+    /// if any). A failed try-lock then retains the
     /// exact notification, including an unlock before its first future poll.
     pub(in crate::runtime) fn arm_claim(&self) -> RequestProductClaimAttempt<'_> {
         let mut unlocked = Box::pin(self.inner.unlocked.clone().notified_owned());
@@ -130,8 +131,9 @@ impl Drop for RequestProductActorLifetime {
     }
 }
 
-/// One nonblocking Native -> Product attempt, not a payload reservation or a
-/// policy generation. On Busy, leave Native before awaiting the returned wake.
+/// One nonblocking writer -> Product attempt, not a payload reservation or a
+/// policy generation. On Busy, leave any Native fence and defer the notice;
+/// do not wait inline on the native writer's service path.
 pub(in crate::runtime) struct RequestProductClaimAttempt<'a> {
     owner: &'a SharedRequestProduct,
     unlocked: RequestProductLockWait,

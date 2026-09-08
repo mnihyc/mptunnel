@@ -61,6 +61,11 @@ only the two existing prearmed try-lock acquisitions now. Fresh ordinary
 parent completes355532800B/44.964483s, maxconfirmation5.052667s; this variation
 is retained alongside the earlier11s gap rather than called acceptance.
 
+**GREEN15:34:** two advisory acquisitions changed, final fence unchanged;
+542checks pass1.28s after warning-free1m12s rebuild. Independent model and
+consumer/fixture reviews pass. Ordinary optimized candidate build next,
+no lab overlap. No practical promotion from this checkpoint.
+
 ## Completed discriminator: remaining winning-reply service hold
 
 **Executed15:00:** warning-free diagnostic build3m33s; all observer hooks

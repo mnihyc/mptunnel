@@ -171,9 +171,9 @@ fn current_ready_instances(state: &RequestProductState) -> Vec<RelayPathInstance
         .collect()
 }
 
-/// No await or Native read occurs between the final nonblocking owner lock and
-/// Product commit. All still-prepared source remains shared if any receipt is
-/// stale or another writer wins the current ordinary selection.
+/// Every owner acquisition is nonblocking so contention cannot park the native
+/// writer's input service. No await or Native read occurs between the final
+/// owner lock and Product commit. Refused source remains shared and unclaimed.
 pub(in crate::runtime) fn claim_prepared_request_data(
     owner: &SharedRequestProduct,
     context: &ClientPathContext,
@@ -184,7 +184,10 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     if ready.receipt().instance() != instance.path_instance_id {
         return RequestPreparedClaim::Empty;
     }
-    let mut state = owner.lock();
+    let mut state = match owner.arm_claim().try_lock() {
+        Ok(state) => state,
+        Err(wait) => return RequestPreparedClaim::Busy(wait),
+    };
     if !registration_is_current(&state, instance, registration) {
         return RequestPreparedClaim::Empty;
     }
@@ -231,7 +234,12 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     #[cfg(test)]
     owner.run_before_prepared_native_resolve_for_test();
     let inputs = capture.resolve();
-    let mut state = owner.lock();
+    // Arm anew after our earlier unlock; it is not a release credit for a
+    // competing holder. Busy discards this advisory capture and retries fresh.
+    let mut state = match owner.arm_claim().try_lock() {
+        Ok(state) => state,
+        Err(wait) => return RequestPreparedClaim::Busy(wait),
+    };
     if !registration_is_current(&state, instance, registration) {
         return RequestPreparedClaim::Empty;
     }

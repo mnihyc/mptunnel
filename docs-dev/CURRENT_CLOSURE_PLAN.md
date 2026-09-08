@@ -433,15 +433,25 @@ a continuously blocked local-response-write loop as the entire explanation.
 Locate exact response frontier267 through receive/decode/handoff and service;
 do not assume response parity or queue-size changes solve it.
 
-Source review additionally finds an actual native-loop recurrence candidate:
+Source review additionally finds an actual native-loop recurrence:
 when all writer claims refuse unchanged admission, each publish/drop of Ready
 wakes the other's deferred token. OUTSTANDING coalesces tokens, not retries.
 The earlier valid-winner race test does not cover all-refused service. Next
-construct real prepared source + actual admission withdrawal, singleton park
-control and two real receiver/deferred-loop RED before any fix. This is a
-bounded candidate CPU-churn defect, NOT yet the75s ordinary root cause. Do not
+real prepared source + actual admission withdrawal now executes its intended
+RED: singleton parks, but two receiver/deferred loops regenerate[2,2] retries
+versus[0,0] across two finite rounds with U/C/policy/model generation unchanged.
+All initial idle appearances occur before wait arming, so the assertion does
+not outlaw a legitimate newly ready sibling. Build1m12s, one control PASS and
+one intended assertion FAIL. This is a bounded candidate CPU-churn defect,
+NOT yet attribution of the75s ordinary hold. Do not
 invent zero receiver credit with impossible prepared U; retain actual producer
 and conservation premises. No timer/rate/queue tweak or ordinary repeat.
+The model review selects one persistent Ready capability inside the existing
+exclusive physical command receiver, borrowed by synchronous claims. Refusal
+does not occupy the writer or create a new epoch. Consume on successful claim;
+explicitly withdraw before real write/input-route/drain. No sticky source grant
+or separate eligibility flag. Current native loops/tests must migrate to that
+one owner; guard borrowing cannot span receiver I/O. Implementation is next.
 
 Normal build also exposed an obsolete Original dispatcher kept alive only by
 tests. Its deletion is code/test reachability cleanup, not a performance fix:

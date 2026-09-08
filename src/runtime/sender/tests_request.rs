@@ -4788,3 +4788,200 @@ async fn prepared_request_ready_claim_new_regular_displaces_backup() {
         prepared_competing_writer_claim_case(PreparedWriterClaimCase::RegularBecomesReady);
     assert_eq!(claimed, quantum as u64);
 }
+
+fn prepared_blocked_writer_idle_retry_case(path_count: usize) -> [usize; 2] {
+    use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
+
+    let endpoints = ["tcp://127.0.0.1:10724", "tcp://127.0.0.1:10725"];
+    let context = client_test_context_with_paths(&endpoints[..path_count]);
+    let stream_id = StreamId(722);
+    let limits = context.mux_limits;
+    let capacity = crate::runtime::path::commands::reliable_path_command_queue(limits);
+    let mut writers = Vec::new();
+    let mut opened = Vec::new();
+    let mut input_guards = Vec::new();
+    for index in 0..path_count {
+        let (commands, receivers) = reliable_path_command_channels(capacity);
+        let (path, input) =
+            opened_request_stream_with_retained_input(stream_id, index, commands.clone());
+        opened.push(path);
+        input_guards.push(input);
+        writers.push((commands, receivers));
+    }
+    let mut opened = opened.into_iter();
+    let (mut remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened.next().unwrap(), capacity);
+    for path in opened {
+        assert_eq!(remotes.attach(path), ReliableRelayAttachOutcome::Attached);
+    }
+    let instances = remotes.path_instances();
+    assert_eq!(instances.len(), path_count);
+    for (instance, (_, receivers)) in instances.iter().zip(&mut writers) {
+        consume_client_path_proof_for_test(receivers);
+        context.install_relay_path_instance_for_test(*instance);
+    }
+    let sender = RequestSenderService::new(stream_id);
+    let admission = sender.reliable_stream_source_admission(
+        &context,
+        &remotes,
+        TrafficClass::Throughput,
+        reliable_relay_buffer_len(limits),
+    );
+    assert!(admission.selected_path.is_some());
+    let quantum = crate::model::capacity::adaptive_reliable_relay_chunk_bytes(
+        admission.selected_path,
+        TrafficClass::Throughput,
+        limits,
+    );
+    assert!(quantum > 0 && quantum <= admission.window_bytes);
+    let source = Bytes::from(vec![0x7c; quantum]);
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(source.clone());
+    let shared = SharedRequestProduct::new(RequestProductState {
+        sender,
+        sender_queue: queue,
+        send_stream: ReliableSendStream::new(stream_id, limits),
+        last_send_ack: Default::default(),
+        remotes,
+        prepared: RequestPreparedSource::new(TrafficClass::Throughput, quantum),
+    });
+    let _actor_lifetime = shared.actor_lifetime();
+    {
+        let mut state = shared.lock();
+        crate::runtime::relay::control::publish_prepared_request_work(
+            &mut state,
+            &shared,
+            &context,
+            TrafficClass::Throughput,
+            quantum,
+            true,
+        );
+    }
+    // The source was admitted while paths were usable. A real non-draining
+    // management transition now refuses new Original admission. This is not
+    // an impossible fixture with U inserted behind zero initial mux credit.
+    // Settle the only policy change before any claim's waits are armed.
+    for index in 0..path_count {
+        context.set_tcp_endpoint_control(index, ClientTcpEndpointControlState::Failed);
+    }
+    let assert_retained_refusal = || {
+        let state = shared.lock();
+        assert_eq!(state.send_stream.next_offset(), 0);
+        assert_eq!(state.send_stream.reinjection_bytes(), 0);
+        assert_eq!(state.sender_queue.data_bytes(), quantum);
+        assert!(
+            matches!(state.sender_queue.front().map(|(_, queued)| &queued.kind),
+            Some(ReliableRelayQueuedWorkKind::Data(payload)) if payload == &source)
+        );
+        assert_eq!(state.prepared.last_claimed_at, None);
+        assert_eq!(state.remotes.path_instances(), instances);
+        for path in &state.remotes.paths {
+            assert!(
+                path.stream.product_admission_active(),
+                "physical writer remains live"
+            );
+            let snapshot = context
+                .reliable_path_snapshot_for_instance(path.instance())
+                .unwrap();
+            assert!(!crate::scheduler::path_is_schedulable(
+                snapshot,
+                TrafficClass::Throughput
+            ));
+            assert!(
+                state
+                    .sender
+                    .multipath
+                    .latest_unacked_ranges_for_path_instance(path.instance())
+                    .is_empty()
+            );
+        }
+    };
+    assert_retained_refusal();
+
+    // Establish every real initial idle opportunity before arming any claim
+    // wait. Otherwise the first sibling appearance is a legitimate wake and
+    // must not be mistaken for refusal-generated recurrence.
+    let mut parked_ready: Vec<_> = writers
+        .iter()
+        .zip(&instances)
+        .map(|((_, receivers), instance)| {
+            Some(
+                receivers
+                    .writer_ready_boundary(instance.path_instance_id)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    for index in 0..path_count {
+        let (_, receivers) = &mut writers[index];
+        let ReliablePathCommand::PreparedOriginal(work) =
+            try_recv_request_command_after_path_proofs_for_test(receivers)
+                .expect("the producer's initial weak notice")
+        else {
+            panic!("no source payload may precede the actual claim");
+        };
+        let ready = parked_ready[index]
+            .take()
+            .expect("established initial idle epoch");
+        let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
+            panic!("current policy refusal must park this otherwise live physical writer");
+        };
+        receivers.defer_prepared_work(work, wait);
+        // Current native loops publish their outer idle epoch after a refused
+        // metadata attempt. No source or Native work occurred in that attempt.
+        parked_ready[index] = receivers.writer_ready_boundary(instances[index].path_instance_id);
+        assert!(parked_ready[index].is_some());
+    }
+    assert_retained_refusal();
+    let stable_model = context.path_model_generation();
+    let mut retries = [0; 2];
+    for retry_count in &mut retries {
+        for index in 0..path_count {
+            let (_, receivers) = &mut writers[index];
+            let Some(command) = try_recv_request_command_after_path_proofs_for_test(receivers)
+            else {
+                continue;
+            };
+            let ReliablePathCommand::PreparedOriginal(work) = command else {
+                panic!("only a receiver-deferred weak retry can recur here");
+            };
+            *retry_count += 1;
+            // Mirror the current native selected-command path: withdraw the
+            // outer idle guard, run one synchronous weak-notice claim, then
+            // return idle after refusal. This is the lifecycle under test,
+            // not an externally imposed genuine I/O transition to suppress.
+            drop(parked_ready[index].take());
+            let ready = receivers
+                .writer_ready_boundary(instances[index].path_instance_id)
+                .unwrap();
+            let RequestPreparedClaim::Blocked(wait) = work.try_claim(ready) else {
+                panic!("unchanged policy cannot authorize a claim during the retry cycle");
+            };
+            receivers.defer_prepared_work(work, wait);
+            parked_ready[index] =
+                receivers.writer_ready_boundary(instances[index].path_instance_id);
+            assert!(parked_ready[index].is_some());
+        }
+        assert_retained_refusal();
+        assert_eq!(context.path_model_generation(), stable_model);
+        for (commands, _) in &writers {
+            assert_eq!(commands.pending_bytes(), 0);
+            assert_eq!(commands.writer_pending_bytes(), 0);
+        }
+    }
+    retries
+}
+
+#[tokio::test]
+async fn prepared_blocked_single_writer_parks_without_idle_retry() {
+    assert_eq!(prepared_blocked_writer_idle_retry_case(1), [0, 0]);
+}
+
+#[tokio::test]
+async fn prepared_blocked_writers_do_not_regenerate_idle_retries() {
+    assert_eq!(
+        prepared_blocked_writer_idle_retry_case(2),
+        [0, 0],
+        "refused metadata attempts must not regenerate sibling retries in successive idle cycles without source, policy, Native or admission progress",
+    );
+}

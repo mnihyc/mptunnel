@@ -528,3 +528,62 @@ than separately interleaved. Neither correction changes an existing claimed
 assignment/copy deadline, renews evidence, or proves ordinary performance.
 Request-only intermediate checkpoint is eligible; optimized ordinary timing,
 response parity and the direction-neutral RFC amendment remain pending.
+
+## Adverse composition and refused-claim readiness lifetime
+
+2026-09-08 13:32 +08:00. Ordinary9720e4b fails settlement despite better early
+forward delivery. PREPARED_ORIGINAL_ORDINARY_20260908 records the75s return
+hold,69s target plateau and barely consumed client TCP receive backlog. No
+practical promotion; do not treat the earlier component GREEN as this gate.
+
+A second, distinct recurrence survives the valid-winner correction above:
+when all current writer attempts refuse admission, A's Ready publish/drop
+wakes deferred B, whose attempt wakes A. Actual receiver-owned deferred work
+requeues the same weak token. Coalescing bounds token ownership, not frequency;
+cooperative per-turn budgets do not eliminate recurrence. The proposed legal
+counterexample prepares source first, then withdraws actual endpoint admission
+without draining the writer. It does not assume impossible U under zero source
+credit. Real singleton-park/two-receiver RED is the next required discriminator;
+this source argument alone does not attribute the75s hold.
+
+Independent pre-code review conditionally approves a simpler ownership rule:
+Ready names physical idleness, not one metadata attempt. For R=Idle(epoch),
+a refused/Busy/Empty metadata claim leaves R unchanged. Actual admitted data
+consumes the exact epoch; control/data writes, awaited input routing, heartbeat
+and drain withdraw it before occupation. An idle physical owner retains the
+SAME guard across deferred source waits, irrespective of a logical stream's
+cancellation. The claim borrows that guard; no Product/source ownership or
+payload reservation is retained with it. A consumed guard is not current
+merely because an Option contains it.
+
+After genuine state changes settle, all-refused claims then change neither
+R, U, C nor admission, so sibling-boundary notifications cannot perpetuate
+themselves. Genuine return-to-idle changes still notify. This proves removal
+of that recurrence, not arbitrary starvation freedom. Multiple streams share
+the existing physical arbiter, not separate readiness flags per subscription.
+QUIC successor claims remain within its existing bounded no-await imminent
+batch; any live refusal guard must withdraw before flushing already-claimed
+frames. TCP still protects one transaction. No timer, queue limit, controller
+or policy preference is part of this proposed correction. Real RED/control
+and used native-loop integration must precede an implementation/acceptance claim.
+
+Executed13:37: the real producer/Failed-policy/weak-receiver case preserves
+U, C0, cache/flight0, exact live attachments, model generation and zero native
+charges. Singleton parks; two writers regenerate[2,2] retries against[0,0] over
+two finite rounds. Initial idle opportunities are all published BEFORE waits,
+excluding legitimate sibling appearance as the asserted defect. This is
+current native lifecycle composition, not a full socket-loop or75s-stall proof.
+The initial test build missed a namespace qualification; its old-binary zero-
+match invocation is not verification. The completed1m12s rebuild executes both
+tests and reaches only the intended pair assertion. Process success and a
+nonzero matching test count must precede interpreting future verification.
+
+Receiver-owned representation is independently preferred: one existing
+exclusive ReliablePathCommandReceivers owns Option<ReadyGuard>. Reuse the
+same current same-instance capability, refresh consumed/stale epochs only at
+an actual next idle/imminent action, and withdraw before occupied operations.
+This avoids passing an Option through every native helper without creating
+another admission flag. A synchronous claim borrows the guard; that borrow
+ends before receiver mutation or await. Receiver destruction invalidates its
+receipt; claiming after destroying the physical owner is no longer a reachable
+borrow-safe operation, not a regression case to preserve artificially.

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 01:13 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 01:41 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,90 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Next discriminator01:41:** one temporary feature-only codec observer counts
+successful per-frame encodings by wire kind, exact encoded frame bytes, and ACK
+range/count/complete distributions. Report cumulative counters at one-second
+observation intervals; retain every summary, no per-frame flood. These are
+encoded attempts, not transmitted bytes: later batch validation, cancellation,
+native handoff or retransmission can differ. No transport/control policy change.
+
+Competing causes are MPP cumulative ACK vectors, MAX publication, source/repair
+traffic, native ACKs/retransmissions and unrelated control. Source inspection
+shows changed sparse receive evidence is repeated cumulatively on each accepting
+attachment; unchanged generations are already suppressed. That is a candidate,
+not attribution of the120.6MB ordinary return total. Forecast is information,
+not speed: classify the dominant serialized return owner during one identical
+mixed asymmetric15–25s feedback restriction. Small ACK contribution falsifies
+that candidate. Large contribution selects its exact publication semantics for
+a counterexample/proof before any fix. Preserve immediate positive release,
+complete/partial gap authority, exact per-attachment progress and terminal order;
+no rate cap, cadence tweak or restored stateful ACK dictionary is justified.
+
+**Profile correction / decisive asymmetric failure01:32:** the completed
+panel's actual mirrored shaping limits the client→server/feedback direction,
+NOT server-egress as mistakenly forecast below. All four saved class snapshots
+show DOWN500Mbps throughout; UP10Mbps in rows16–25, restored500 atrow26.
+Keep this as an asymmetric return-service experiment; do not label it a
+download-cap recovery proof, hide the setup mistake, or rerun until favorable.
+
+In that phase Q-only440.691Mbps, raw475.851, H2470.379 remain fluent;
+mixed falls124.563Mbps with one actual echo timeout15.988→18.990s.
+The42later unavailable-after-disconnect records are probe-owned censoring,
+not independent sends or proof that MPP cannot reopen. Mixed bulk maxgap
+1.246742s occurs19.675833→20.922575. Restored25–40means are Q428.610,
+mixed429.321, raw462.514,H2467.072 with no zero bins. Bulk restoration is
+useful, but mixed usability under asymmetric feedback is plainly not accepted.
+All other modes retain80/80echoes and30/30in restored phase. Configured random
+loss is0, but mixed UP queue overflow drops8508packets; other modes drop0.
+
+This is the highest-impact existing mixed/stall owner: determine which native
+or MPP feedback work fills the return queue and creates the critical stall.
+Healthy mixed already spends much more return wire bytes than Q-only/raw/H2;
+wire totals alone do not identify ACK/MAX/copies or forbid legitimate feedback.
+Do not weaken ACK validity, merge authoritative snapshots by analogy to MAX,
+restore rejected ACK dictionaries, invent a feedback cap or blame a10Mbps
+environment in which the baselines sustain~470Mbps downloads. Next minimal
+discriminator is actual per-kind serialized feedback volume plus existing
+critical-frontier/path/wire observations. Hold low-volume membership policy
+implementation until this larger demonstrated failure is attributed.
+
+**Echo outcome / recovery gate01:29:** all80echoes/5120uniqueB succeed in
+the selected diagnostic. All81winning fragments are TCP Originals; eight
+late duplicate fragments add448B and win nothing. Source→claim max7ms,
+claim→positivewrite max1ms, decode→localdelivery max2ms. Largest post-write
+interval461ms; the slowest762ms echo additionally has280ms between target
+local-write and response read. Do not call post-write residence network-only.
+
+Actual echo membership is only two TCP attachments despite one stable active
+session QUIC carrier. RFC8.1 startup h58400 is never reached by5120B; ordinary
+rebalance is Throughput-only since282b8e1, making control's nonbulk branch
+unreachable. That branch also requests BulkStriping, so simply ungating it is
+not a coherent latency fix. count>1 only preserves the set on first stall;
+9ab3cbcb's persistent-stall and receive-hole opens bypass that condition.
+Thus this is no ongoing low-volume membership reconsideration, NOT a proved
+recovery deadlock or rejection of an eligible QUIC writer. Attachment alone
+may save none of the delay because QUIC shares the loaded network queue.
+ECHO_OWNER_SERVICE_20260909 retains the joins, ordinary/diagnostic distinction,
+observer patch and raw evidence. No latency policy change is accepted.
+
+**Next immediate experiment:** close the latest-credit model's existing
+high-capacity recovery gate before another latency implementation. One fixed
+ordinary DOWN panel: MPP QUIC, mixed, raw TCP and Hysteria2; existing healthy
+500Mbps/100ms asymmetric-delay shared cut, except the already available
+10Mbps server-egress epoch15–25s, restored500Mbps25–40s. Keep loss/jitter/
+blackhole disabled, every timing bin/echo/failure/cost, unchanged40s workload
+and H2's explicit500Mbps prior. No compiler overlap. The10Mbps phase is a
+diagnostic perturbation, never a performance claim or target.
+
+Information forecast: determine whether multi-second stalls/poor restored
+service survive the current ordinary state model when real capacity returns,
+and distinguish mixed-only from Q-only/baseline recovery. Compare observed
+restored histories and completion/echo gaps, not whole-run Mbps. A material
+MPP-only collapse selects this existing stall owner ahead of low-volume
+membership work. If recovery is useful, retain that conditional proof, then
+construct the minimal membership counterexample/proposal separately. This
+does not waive changing-loss/blackhole/independent-aggregation/Cloudflare gates.
 
 **Echo discriminator01:13:** preserve the completed twelve-cell comparison in
 HIGH_CAPACITY_REFERENCE_20260909 (407 available bins,445 attempts,64-member

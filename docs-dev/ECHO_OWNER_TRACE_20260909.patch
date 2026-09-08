@@ -1,0 +1,733 @@
+diff --git a/src/lab_diagnostics.rs b/src/lab_diagnostics.rs
+index 4551942..bef8851 100644
+--- a/src/lab_diagnostics.rs
++++ b/src/lab_diagnostics.rs
+@@ -8,6 +8,22 @@ pub(crate) fn lab_diagnostic(event: &str, fields: fmt::Arguments<'_>) {
+     if !lab_diagnostic_event_enabled(event) {
+         return;
+     }
++    // Temporary echo-only observer. This is selected by the real target-aware
++    // opening, never a telemetry display ID or a Product routing policy.
++    let fields = fields.to_string();
++    let Some((selected_session, selected_stream)) = LAB_ECHO_STREAM.get() else {
++        return;
++    };
++    let field = |name: &str| {
++        fields.split_whitespace().find_map(|part| {
++            part.strip_prefix(name).and_then(|value| value.parse::<u64>().ok())
++        })
++    };
++    if field("stream_id=") != Some(*selected_stream)
++        || field("session_id=").is_some_and(|id| id != *selected_session)
++    {
++        return;
++    }
+     let stamp = lab_stamp();
+     eprintln!(
+         "mptunnel_lab_diag ts_unix_ms={} t_mono_ms={} seq={} pid={} role={} event={event} {fields}",
+@@ -19,6 +35,23 @@ pub(crate) fn lab_diagnostic(event: &str, fields: fmt::Arguments<'_>) {
+     );
+ }
+ 
++static LAB_ECHO_STREAM: OnceLock<(u64, u64)> = OnceLock::new();
++
++pub(crate) fn lab_select_echo_stream(session_id: u64, stream_id: u64, port: u16) {
++    // The existing finite diagnostic workload has one persistent echo target.
++    // The complete temporary patch is removed before any ordinary build.
++    if port == 10022 && lab_diagnostics_requested() {
++        let _ = LAB_ECHO_STREAM.set((session_id, stream_id));
++        lab_diagnostic("echo_stream_selected", format_args!(
++            "session_id={} stream_id={} target_port={}", session_id, stream_id, port,
++        ));
++    }
++}
++
++pub(crate) fn lab_echo_stream_selected(session_id: u64, stream_id: u64) -> bool {
++    LAB_ECHO_STREAM.get() == Some(&(session_id, stream_id))
++}
++
+ pub(crate) fn lab_diagnostic_event_enabled(event: &str) -> bool {
+     if !lab_diagnostics_requested() {
+         return false;
+diff --git a/src/runtime/path/quic/io.rs b/src/runtime/path/quic/io.rs
+index da9e216..1d8b6ea 100644
+--- a/src/runtime/path/quic/io.rs
++++ b/src/runtime/path/quic/io.rs
+@@ -383,7 +383,17 @@ pub(in crate::runtime) async fn udp_path_read_frame(
+     recv: &mut UdpPathRecvStream,
+     codec_limits: CodecLimits,
+ ) -> Result<Frame, RuntimeError> {
+-    Ok(quic_transport::read_frame(&mut recv.stream, codec_limits).await?)
++    let frame = quic_transport::read_frame(&mut recv.stream, codec_limits).await?;
++    #[cfg(feature = "lab-diagnostics")]
++    if let Frame::StreamData { stream_id, offset, payload }
++        | Frame::StreamRequalifyData { stream_id, offset, payload, .. } = &frame
++    {
++        crate::lab_diagnostics::lab_diagnostic("echo_quic_decode", format_args!(
++            "stream_id={} offset={} end={} len={}",
++            stream_id.0, offset, offset.saturating_add(payload.len() as u64), payload.len(),
++        ));
++    }
++    Ok(frame)
+ }
+ 
+ pub(in crate::runtime) async fn udp_path_write_frame(
+@@ -392,7 +402,25 @@ pub(in crate::runtime) async fn udp_path_write_frame(
+     codec_limits: CodecLimits,
+ ) -> Result<(), RuntimeError> {
+     ensure_quic_data_plane_frames(std::slice::from_ref(frame))?;
++    #[cfg(feature = "lab-diagnostics")]
++    if let Frame::StreamData { stream_id, offset, payload }
++        | Frame::StreamRequalifyData { stream_id, offset, payload, .. } = frame
++    {
++        crate::lab_diagnostics::lab_diagnostic("echo_quic_direct_write", format_args!(
++            "phase=begin stream_id={} native_request_stream_id={} offset={} end={} len={}",
++            stream_id.0, send.request_stream_id(), offset, offset.saturating_add(payload.len() as u64), payload.len(),
++        ));
++    }
+     quic_transport::write_frame(&mut send.stream, frame, codec_limits).await?;
++    #[cfg(feature = "lab-diagnostics")]
++    if let Frame::StreamData { stream_id, offset, payload }
++        | Frame::StreamRequalifyData { stream_id, offset, payload, .. } = frame
++    {
++        crate::lab_diagnostics::lab_diagnostic("echo_quic_direct_write", format_args!(
++            "phase=end stream_id={} native_request_stream_id={} offset={} end={} len={}",
++            stream_id.0, send.request_stream_id(), offset, offset.saturating_add(payload.len() as u64), payload.len(),
++        ));
++    }
+     Ok(())
+ }
+ 
+diff --git a/src/runtime/path/quic/server_writer.rs b/src/runtime/path/quic/server_writer.rs
+index 3ac4ab3..9db054c 100644
+--- a/src/runtime/path/quic/server_writer.rs
++++ b/src/runtime/path/quic/server_writer.rs
+@@ -477,6 +477,32 @@ async fn flush_server_udp_frame_batch(
+     if !pending_frames.is_empty() {
+         commands.withdraw_writer_ready();
+     }
++    #[cfg(feature = "lab-diagnostics")]
++    let response_ranges: Vec<_> = pending_frames
++        .iter()
++        .filter(|_| crate::lab_diagnostics::lab_diagnostic_event_enabled("response_quic_handoff"))
++        .filter_map(|frame| match frame {
++            Frame::StreamData {
++                stream_id,
++                offset,
++                payload,
++            } => Some((*stream_id, *offset, payload.len())),
++            _ => None,
++        })
++        .collect();
++    #[cfg(feature = "lab-diagnostics")]
++    let native_request_stream_id = send.request_stream_id();
++    #[cfg(feature = "lab-diagnostics")]
++    for range in &response_ranges {
++        observe_server_quic_response_write(
++            "write_begin",
++            "interlocked",
++            path_registration,
++            native_request_stream_id,
++            *range,
++            "pending",
++        );
++    }
+     let result = flush_udp_frame_batch_with_path_proofs_interlocked(
+         send,
+         pending_frames,
+@@ -494,6 +520,17 @@ async fn flush_server_udp_frame_batch(
+         },
+     )
+     .await;
++    #[cfg(feature = "lab-diagnostics")]
++    for range in &response_ranges {
++        observe_server_quic_response_write(
++            "write_end",
++            "interlocked",
++            path_registration,
++            native_request_stream_id,
++            *range,
++            if result.is_ok() { "ok" } else { "error" },
++        );
++    }
+     commands.release_pending_command_bytes(std::mem::take(pending_frame_command_bytes));
+     let _routed_frames = result?;
+     #[cfg(feature = "lab-diagnostics")]
+@@ -512,6 +549,34 @@ async fn flush_server_udp_frame_batch(
+     Ok(())
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++fn observe_server_quic_response_write(
++    phase: &str,
++    mode: &str,
++    registration: &ServerCarrierPathRegistration,
++    native_request_stream_id: u64,
++    (stream_id, offset, len): (StreamId, u64, usize),
++    result: &str,
++) {
++    lab_diagnostic(
++        "response_quic_handoff",
++        format_args!(
++            "role=server phase={} mode={} session_id={} path_id={} path_instance_id={} native_request_stream_id={} stream_id={} offset={} end={} len={} result={}",
++            phase,
++            mode,
++            registration.session_id().0,
++            registration.path_id().0,
++            registration.path_instance_id().as_u64(),
++            native_request_stream_id,
++            stream_id.0,
++            offset,
++            offset.saturating_add(len as u64),
++            len,
++            result,
++        ),
++    );
++}
++
+ fn try_route_server_udp_stream_frame_during_write(
+     frame: Frame,
+     stream_id: StreamId,
+diff --git a/src/runtime/path/tcp/client/connection.rs b/src/runtime/path/tcp/client/connection.rs
+index 1686b83..df3ee99 100644
+--- a/src/runtime/path/tcp/client/connection.rs
++++ b/src/runtime/path/tcp/client/connection.rs
+@@ -226,6 +226,27 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
+             reader,
+             reliable_path_writer_frame_queue(mux_limits),
+             move |frame| {
++                #[cfg(feature = "lab-diagnostics")]
++                if let Frame::StreamData {
++                    stream_id,
++                    offset,
++                    payload,
++                } = frame
++                {
++                    crate::lab_diagnostics::lab_diagnostic(
++                        "response_tcp_handoff",
++                        format_args!(
++                            "role=client phase=authenticated_decode session_id={} path_namespace=wire path_id={} remote_port={} stream_id={} offset={} end={} len={}",
++                            session_id.0,
++                            path_id.0,
++                            remote_port,
++                            stream_id.0,
++                            offset,
++                            offset.saturating_add(payload.len() as u64),
++                            payload.len(),
++                        ),
++                    );
++                }
+                 if let Frame::SessionClose { reason } = frame {
+                     observed_lifecycle.retire(*reason);
+                 }
+diff --git a/src/runtime/path/tcp/server/session.rs b/src/runtime/path/tcp/server/session.rs
+index b0a597a..f09937f 100644
+--- a/src/runtime/path/tcp/server/session.rs
++++ b/src/runtime/path/tcp/server/session.rs
+@@ -1018,7 +1018,18 @@ impl ServerTcpPathSession {
+                 .commit_transaction_interlocked(writer_pending_bytes)
+                 .await;
+         }
+-        let wrote = self.writer.commit_transaction(&mut self.evidence).await?;
++        let wrote = self
++            .writer
++            .commit_transaction(
++                &mut self.evidence,
++                #[cfg(feature = "lab-diagnostics")]
++                (
++                    self.path_registration.session_id().0,
++                    self.path_id.0 as usize,
++                    self.path_registration.path_instance_id().as_u64(),
++                ),
++            )
++            .await?;
+         if wrote && *writer_pending_bytes > 0 {
+             self.evidence
+                 .observe_after_write(&self.context, &self.path_registration, self.path_id);
+@@ -1042,7 +1053,15 @@ impl ServerTcpPathSession {
+         let mut routed_frames = 0usize;
+         let mut mailbox: Option<PendingMailboxFrame> = None;
+         let write_result = {
+-            let write = self.writer.commit_transaction(&mut self.evidence);
++            let write = self.writer.commit_transaction(
++                &mut self.evidence,
++                #[cfg(feature = "lab-diagnostics")]
++                (
++                    self.path_registration.session_id().0,
++                    self.path_id.0 as usize,
++                    self.path_registration.path_instance_id().as_u64(),
++                ),
++            );
+             tokio::pin!(write);
+             loop {
+                 tokio::select! {
+diff --git a/src/runtime/path/tcp/server/writer.rs b/src/runtime/path/tcp/server/writer.rs
+index 0ccb601..7798e3b 100644
+--- a/src/runtime/path/tcp/server/writer.rs
++++ b/src/runtime/path/tcp/server/writer.rs
+@@ -53,15 +53,24 @@ impl ServerTcpWriter {
+     pub(in crate::runtime::path::tcp) async fn commit_transaction(
+         &mut self,
+         evidence: &mut ServerTcpEvidenceState,
++        #[cfg(feature = "lab-diagnostics")] diagnostic_identity: (u64, usize, u64),
+     ) -> Result<bool, RuntimeError> {
+         if self.pending_frames.is_empty() {
+             return Ok(true);
+         }
++        #[cfg(feature = "lab-diagnostics")]
++        self.observe_response_transaction("write_begin", diagnostic_identity, "pending");
+         let commit = async {
+             self.framed.write_frames(&self.pending_frames).await?;
+             self.framed.flush().await
+         }
+         .await;
++        #[cfg(feature = "lab-diagnostics")]
++        self.observe_response_transaction(
++            "flush_end",
++            diagnostic_identity,
++            if commit.is_ok() { "ok" } else { "error" },
++        );
+         match commit {
+             Ok(()) => {
+                 for frame in &self.pending_frames {
+@@ -75,6 +84,39 @@ impl ServerTcpWriter {
+         }
+     }
+ 
++    #[cfg(feature = "lab-diagnostics")]
++    fn observe_response_transaction(
++        &self,
++        phase: &str,
++        (session_id, path_index, path_instance_id): (u64, usize, u64),
++        result: &str,
++    ) {
++        for frame in &self.pending_frames {
++            if let Frame::StreamData {
++                stream_id,
++                offset,
++                payload,
++            } = frame
++            {
++                crate::lab_diagnostics::lab_diagnostic(
++                    "response_tcp_handoff",
++                    format_args!(
++                        "role=server phase={} session_id={} path_namespace=wire path_id={} path_instance_id={} stream_id={} offset={} end={} len={} result={}",
++                        phase,
++                        session_id,
++                        path_index,
++                        path_instance_id,
++                        stream_id.0,
++                        offset,
++                        offset.saturating_add(payload.len() as u64),
++                        payload.len(),
++                        result,
++                    ),
++                );
++            }
++        }
++    }
++
+     pub(in crate::runtime::path::tcp) async fn write_frame(
+         &mut self,
+         frame: &Frame,
+diff --git a/src/runtime/relay/client.rs b/src/runtime/relay/client.rs
+index 23783ec..16d9df2 100644
+--- a/src/runtime/relay/client.rs
++++ b/src/runtime/relay/client.rs
+@@ -344,6 +344,22 @@ pub(super) fn apply_client_stream_data_state(
+     {
+         let frontier_after = recv_stream.next_offset();
+         let reorder_bytes = recv_stream.reorder_bytes();
++        lab_diagnostic(
++            "response_handoff_mux_apply",
++            format_args!(
++                "stream_id={} source_underlay={:?} source_path_index={} path_instance_id={} attachment_id={} offset={} end={} frontier_before={} frontier_after={} reorder_bytes={}",
++                stream_id.0,
++                path_key.underlay,
++                path_key.index,
++                instance.path_instance_id.as_u64(),
++                instance.attachment_id,
++                offset,
++                offset.saturating_add(payload_len as u64),
++                frontier_before,
++                frontier_after,
++                reorder_bytes,
++            ),
++        );
+         if reorder_before > 0 && frontier_after > frontier_before {
+             let released_bytes = outcome
+                 .delivered
+diff --git a/src/runtime/relay/control.rs b/src/runtime/relay/control.rs
+index 6a1a850..f3b6e7a 100644
+--- a/src/runtime/relay/control.rs
++++ b/src/runtime/relay/control.rs
+@@ -2967,6 +2967,11 @@ where
+                     .await;
+                     #[cfg(feature = "lab-diagnostics")]
+                     if let Ok((read, _)) = &result {
++                        if *read > 0 {
++                            lab_diagnostic("echo_request_read", format_args!(
++                                "session_id={} stream_id={} bytes={} opportunistic=false", context.session_id.0, stream_id.0, read,
++                            ));
++                        }
+                         lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
+                     }
+                     (result, permit)
+@@ -3225,6 +3230,14 @@ where
+                                     let result = read_reliable_relay_payload(
+                                         &mut local, &mut buf, permit.bytes(),
+                                     ).await;
++                                    #[cfg(feature = "lab-diagnostics")]
++                                    if let Ok((read, _)) = &result {
++                                        if *read > 0 {
++                                            lab_diagnostic("echo_request_read", format_args!(
++                                                "session_id={} stream_id={} bytes={} opportunistic=true", context.session_id.0, stream_id.0, read,
++                                            ));
++                                        }
++                                    }
+                                     (result, permit)
+                                 }).await;
+                                 let Some((read, permit)) = read else {
+@@ -3715,6 +3728,15 @@ where
+                                         }
+                                     }
+                                 };
++                                #[cfg(feature = "lab-diagnostics")]
++                                if let Ok(bytes) = &write {
++                                    if *bytes > 0 {
++                                        lab_diagnostic("terminal_service", format_args!(
++                                            "stage=reply_delivered role=client stream_id={} bytes={} receive_frontier={} request_open={} fin_sent={}",
++                                            stream_id.0, bytes, recv_stream.next_offset(), state.endpoint.local_open, state.endpoint.local_fin_sent,
++                                        ));
++                                    }
++                                }
+                                 if let Err(err) = write {
+                                     break Err(err);
+                                 }
+diff --git a/src/runtime/relay/server.rs b/src/runtime/relay/server.rs
+index 60d4436..1862b88 100644
+--- a/src/runtime/relay/server.rs
++++ b/src/runtime/relay/server.rs
+@@ -3480,6 +3480,10 @@ where
+                         },
+                     )
+                     .await?;
++                    #[cfg(feature = "lab-diagnostics")]
++                    lab_diagnostic("echo_target_write", format_args!(
++                        "session_id={} stream_id={} frontier={}", session_id.0, stream_id.0, recv_stream.next_offset(),
++                    ));
+                     if enqueue_tcp_recv_progress(
+                         path_stream,
+                         &mut recv_stream,
+@@ -4046,6 +4050,15 @@ where
+             let result =
+                 read_reliable_relay_payload(&mut local, &mut buf, reserved_read_budget).await;
+             #[cfg(feature = "lab-diagnostics")]
++            if let Ok((read, _)) = &result {
++                if *read > 0 {
++                    lab_diagnostic("terminal_service", format_args!(
++                        "stage=target_reply_read role=server session_id={} stream_id={} bytes={} read_await_us={} opportunistic=false",
++                        session_id.0, stream_id.0, read, read_started.elapsed().as_micros(),
++                    ));
++                }
++            }
++            #[cfg(feature = "lab-diagnostics")]
+             if let Ok((read, _)) = &result {
+                 lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
+             }
+@@ -4062,8 +4075,19 @@ where
+             } else {
+                 {
+                     let mut product = response_product.lock();
++                    #[cfg(feature = "lab-diagnostics")]
++                    let (claimed_end, source_before) =
++                        (product.send_stream.next_offset(), product.sender.data_bytes());
+                     let payload = payload.expect("positive read returns payload");
+                     let enqueue_id = product.sender.enqueue_data_for_lane(payload, response_lane);
++                    #[cfg(feature = "lab-diagnostics")]
++                    lab_diagnostic("terminal_service", format_args!(
++                        "stage=response_source_enqueue role=server session_id={} stream_id={} enqueue_id={} bytes={} claimed_end={} source_before={} source_after={} offset={} end={} opportunistic=false",
++                        session_id.0, stream_id.0, enqueue_id, read, claimed_end,
++                        source_before, product.sender.data_bytes(),
++                        claimed_end.saturating_add(source_before as u64),
++                        claimed_end.saturating_add(source_before as u64).saturating_add(read as u64),
++                    ));
+                     #[cfg(not(feature = "lab-diagnostics"))]
+                     let _ = enqueue_id;
+                     #[cfg(feature = "lab-diagnostics")]
+@@ -4114,9 +4138,20 @@ where
+                             let permit = session_send_buffer
+                                 .reserve(&mut send_buffer_updates, next_read_budget)
+                                 .await;
++                            #[cfg(feature = "lab-diagnostics")]
++                            let read_started = Instant::now();
+                             let result = read_reliable_relay_payload(
+                                 &mut local, &mut buf, permit.bytes(),
+                             ).await;
++                            #[cfg(feature = "lab-diagnostics")]
++                            if let Ok((read, _)) = &result {
++                                if *read > 0 {
++                                    lab_diagnostic("terminal_service", format_args!(
++                                        "stage=target_reply_read role=server session_id={} stream_id={} bytes={} read_await_us={} opportunistic=true",
++                                        session_id.0, stream_id.0, read, read_started.elapsed().as_micros(),
++                                    ));
++                                }
++                            }
+                             (result, permit)
+                         } => read,
+                         _ = std::future::ready(()) => break,
+@@ -4132,8 +4167,19 @@ where
+                     }
+                     {
+                         let mut product = response_product.lock();
++                        #[cfg(feature = "lab-diagnostics")]
++                        let (claimed_end, source_before) =
++                            (product.send_stream.next_offset(), product.sender.data_bytes());
+                         let payload = payload.expect("positive read returns payload");
+                         let enqueue_id = product.sender.enqueue_data_for_lane(payload, response_lane);
++                        #[cfg(feature = "lab-diagnostics")]
++                        lab_diagnostic("terminal_service", format_args!(
++                            "stage=response_source_enqueue role=server session_id={} stream_id={} enqueue_id={} bytes={} claimed_end={} source_before={} source_after={} offset={} end={} opportunistic=true",
++                            session_id.0, stream_id.0, enqueue_id, read, claimed_end,
++                            source_before, product.sender.data_bytes(),
++                            claimed_end.saturating_add(source_before as u64),
++                            claimed_end.saturating_add(source_before as u64).saturating_add(read as u64),
++                        ));
+                         #[cfg(not(feature = "lab-diagnostics"))]
+                         let _ = enqueue_id;
+                         #[cfg(feature = "lab-diagnostics")]
+diff --git a/src/runtime/sender/response/prepared.rs b/src/runtime/sender/response/prepared.rs
+index 4bddf94..466ca69 100644
+--- a/src/runtime/sender/response/prepared.rs
++++ b/src/runtime/sender/response/prepared.rs
+@@ -1,5 +1,7 @@
+ //! Response bytes receive their first DSN and path owner at native claim.
+ 
++#[cfg(feature = "lab-diagnostics")]
++use super::scheduling::ResponseDataPathSelection;
+ use super::scheduling::select_prepared_response_data_path;
+ use super::service::response_data_dispatch_lane;
+ use super::{ServerResponseSenderService, SharedResponseProduct};
+@@ -210,6 +212,108 @@ fn source_error(state: &mut ResponseProductState, error: RuntimeError) {
+     state.prepared.work_changed.notify_waiters();
+ }
+ 
++#[cfg(feature = "lab-diagnostics")]
++#[allow(clippy::too_many_arguments)]
++fn observe_echo_selection(
++    phase: &'static str,
++    state: &ResponseProductState,
++    attempting: ResponseAcquisitionOutputId,
++    offset: u64,
++    payload_bytes: usize,
++    model_generation: u64,
++    targets: &[crate::runtime::stream::response::ResponseSenderPathTarget],
++    ready: &[ResponseAcquisitionOutputId],
++    selection: Option<&ResponseDataPathSelection>,
++) {
++    use crate::lab_diagnostics::{lab_diagnostic, lab_echo_stream_selected};
++    let session_id = state.sender.session_id.0;
++    let stream_id = state.sender.stream_id.0;
++    if !lab_echo_stream_selected(session_id, stream_id) {
++        return;
++    }
++    // One first-attempt view per source frontier, not an all-retry trace.
++    // Successful final commits each advance C and are recorded separately.
++    if phase == "initial" {
++        static LAST_INITIAL: std::sync::Mutex<Option<(u64, u64, u64)>> =
++            std::sync::Mutex::new(None);
++        let mut previous = LAST_INITIAL.lock().expect("echo selection diagnostic lock");
++        let key = (session_id, stream_id, offset);
++        if *previous == Some(key) {
++            return;
++        }
++        *previous = Some(key);
++    }
++    let selected = selection.map(|selection| ResponseAcquisitionOutputId::from(&selection.target));
++    lab_diagnostic(
++        "response_echo_selection",
++        format_args!(
++            "phase={} kind=summary session_id={} stream_id={} offset={} end={} lane={:?} claimed_end={} source_bytes={} model_generation={} attempting_underlay={:?} attempting_path_id={} attempting_instance={} attempting_attachment={} candidate_count={} ready_count={} selected_underlay={:?} selected_path_id={:?} selected_instance={:?} selected_attachment={:?} selected_payload_bytes={:?} position={:?}",
++            phase,
++            session_id,
++            stream_id,
++            offset,
++            offset.saturating_add(payload_bytes as u64),
++            state.prepared.response_lane,
++            state.send_stream.next_offset(),
++            state.sender.data_bytes(),
++            model_generation,
++            attempting.key.underlay,
++            attempting.key.path_id.0,
++            attempting.path_instance_id.as_u64(),
++            attempting.incarnation,
++            targets.len(),
++            ready.len(),
++            selected.map(|id| id.key.underlay),
++            selected.map(|id| id.key.path_id.0),
++            selected.map(|id| id.path_instance_id.as_u64()),
++            selected.map(|id| id.incarnation),
++            selection.map(|selection| selection.payload_bytes),
++            selection.map(|selection| selection.position),
++        ),
++    );
++    for target in targets {
++        let observation = target.observation;
++        let snapshot = observation.snapshot;
++        let id = ResponseAcquisitionOutputId::from(target);
++        lab_diagnostic(
++            "response_echo_selection",
++            format_args!(
++                "phase={} kind=candidate session_id={} stream_id={} offset={} model_generation={} path_namespace=wire underlay={:?} path_id={} path_instance_id={} attachment={} ready={} selected={} product_admission_active={} state={:?} stale={} product_qualified={} bulk_rate_evidence={} policy_backup={} peer_usage={:?} probe_only={} bulk_allowed={} original_flight={} product_limit={} native_drain_observed={} native_queue={} snapshot_queue={} native_flight={} carrier_limit={} srtt_ms={:.3} delivery_bps={:.3} native_authority_present={}",
++                phase,
++                session_id,
++                stream_id,
++                offset,
++                model_generation,
++                id.key.underlay,
++                id.key.path_id.0,
++                id.path_instance_id.as_u64(),
++                id.incarnation,
++                ready.contains(&id),
++                selected == Some(id),
++                target.product_admission_active,
++                snapshot.state,
++                observation.stale_for_original_data,
++                observation.product_assignment_qualified,
++                observation.has_bulk_rate_evidence,
++                snapshot.policy.backup,
++                snapshot.peer_usage,
++                snapshot.policy.probe_only,
++                snapshot.policy.bulk_allowed,
++                observation.original_data_in_flight_bytes,
++                snapshot.data_level_limit_bytes,
++                observation.native_drain_observed,
++                observation.native_queue_bytes,
++                snapshot.queue_bytes,
++                snapshot.bytes_in_flight,
++                snapshot.carrier_inflight_limit_bytes,
++                snapshot.srtt_ms,
++                snapshot.delivery_rate_bps,
++                target.native_authority_stamp.is_some(),
++            ),
++        );
++    }
++}
++
+ pub(in crate::runtime) enum ResponsePreparedCommitError {
+     Blocked,
+     Source(RuntimeError),
+@@ -321,7 +425,8 @@ pub(in crate::runtime) fn claim_prepared_response_data(
+     else {
+         return PreparedOriginalClaim::Blocked(wake);
+     };
+-    let Some(selection) = select_prepared_response_data_path(
++    let observed_ready;
++    let selection = select_prepared_response_data_path(
+         &observation.targets,
+         lane,
+         source.len(),
+@@ -329,8 +434,24 @@ pub(in crate::runtime) fn claim_prepared_response_data(
+         &observation.lower_flights,
+         state.send_stream.reinjection_bytes(),
+         frontier(&state),
+-        &ready_outputs(&outputs),
+-    ) else {
++        {
++            observed_ready = ready_outputs(&outputs);
++            &observed_ready
++        },
++    );
++    #[cfg(feature = "lab-diagnostics")]
++    observe_echo_selection(
++        "initial",
++        &state,
++        identity,
++        offset,
++        source.len(),
++        observation.model_generation,
++        &observation.targets,
++        &observed_ready,
++        selection.as_ref(),
++    );
++    let Some(selection) = selection else {
+         return PreparedOriginalClaim::Blocked(wake);
+     };
+     let selected_identity = ResponseAcquisitionOutputId::from(&selection.target);
+@@ -398,6 +519,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
+         let observation = owner
+             .binding()
+             .observe_prepared_original(&inputs, lane, offset)?;
++        let current_ready;
+         let current_plan = select_prepared_response_data_path(
+             &observation.targets,
+             lane,
+@@ -406,7 +528,10 @@ pub(in crate::runtime) fn claim_prepared_response_data(
+             &observation.lower_flights,
+             state.send_stream.reinjection_bytes(),
+             frontier(&state),
+-            &ready_outputs(&outputs),
++            {
++                current_ready = ready_outputs(&outputs);
++                &current_ready
++            },
+         )?;
+         let selected = ResponseAcquisitionOutputId::from(&current_plan.target);
+         if selected != identity {
+@@ -458,7 +583,41 @@ pub(in crate::runtime) fn claim_prepared_response_data(
+                         *offset,
+                         payload.len(),
+                     );
++                    if crate::lab_diagnostics::lab_echo_stream_selected(
++                        state.sender.session_id.0,
++                        state.sender.stream_id.0,
++                    ) {
++                        crate::lab_diagnostics::lab_diagnostic(
++                            "response_original_claim",
++                            format_args!(
++                                "session_id={} stream_id={} kind=Original path_namespace=wire underlay={:?} path_id={} path_instance_id={} attachment={} offset={} end={} len={} claimed_end={} source_bytes={}",
++                                state.sender.session_id.0,
++                                state.sender.stream_id.0,
++                                identity.key.underlay,
++                                identity.key.path_id.0,
++                                identity.path_instance_id.as_u64(),
++                                identity.incarnation,
++                                offset,
++                                offset.saturating_add(payload.len() as u64),
++                                payload.len(),
++                                state.send_stream.next_offset(),
++                                state.sender.data_bytes(),
++                            ),
++                        );
++                    }
+                 }
++                #[cfg(feature = "lab-diagnostics")]
++                observe_echo_selection(
++                    "committed",
++                    &state,
++                    identity,
++                    offset,
++                    current_plan.payload_bytes,
++                    observation.model_generation,
++                    &observation.targets,
++                    &current_ready,
++                    Some(&current_plan),
++                );
+                 Some(PreparedOriginalClaim::Claimed(frame.clone()))
+             }
+             Err(ResponsePreparedCommitError::Blocked) => None,
+diff --git a/src/runtime/telemetry.rs b/src/runtime/telemetry.rs
+index 7f73507..72c38b8 100644
+--- a/src/runtime/telemetry.rs
++++ b/src/runtime/telemetry.rs
+@@ -508,6 +508,10 @@ impl RuntimeTelemetry {
+         stream_id: StreamId,
+         target: TargetAddr,
+     ) -> ProductFlowLease {
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some(session_id) = session_id {
++            crate::lab_diagnostics::lab_select_echo_stream(session_id.0, stream_id.0, target.port());
++        }
+         self.open_flow(session_id, ProductFlowId::Reliable(stream_id), Some(target))
+     }
+ 

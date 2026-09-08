@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 09:00 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 09:45 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
@@ -12,7 +12,7 @@ Shortening this ledger discards neither failures nor gates.
 
 ## Current source and disposition
 
-Current runtime candidate: globally ordered direct request structural recovery,
+Current runtime checkpoint **1436ff4**: globally ordered direct request structural recovery,
 483 current focused checks plus independent review; ordinary comparison is
 phase-mixed and not performance-accepted. Its frozen comparator **445011f**
 remains available. Earlier89a1a63 retains that comparator's own mixed/adverse
@@ -28,7 +28,7 @@ LIVE_OWNER_FRONTIER_WORK_BOUND.md addition remains untouched.
 | Unique ACK atoms,765683b |66checks; Original65536/copy14600 retains50936 unique proving bytes | Mixed63.923->26.050Mbps, adverse; no practical promotion |
 | Response retained assignment recovery,953a54f |333checks; no-ACK/H<F and immutable head deadline, preserved active/final admission |35.608->43.611Mbps but maxgap4.799931->6.080193s; no practical promotion |
 | Ranked-prefix query,445011f |321checks; equal exact output, fewer irrelevant visits |36.394->71.344Mbps but maxgap4.260012->4.627694s; no practical promotion |
-| Ordered direct request structural recovery,current |Three publication-order REDs, actual overlap-count RED;483current GREEN/audit |75.320->76.112Mbps and lower maxgap, but severe adverse early delivery; no promotion |
+| Ordered direct request structural recovery,1436ff4 |Three publication-order REDs, actual overlap-count RED;483current GREEN/audit |75.320->76.112Mbps and lower maxgap, but severe adverse early delivery; no promotion |
 | Shelved paired-clock request sampler |Actual pipelined[2,2,2]->[2,3,4];23checks |TCP incomplete/adverse, not stacked into runtime |
 
 Random realizations and unequal accepted work prevent a simple causal
@@ -98,7 +98,7 @@ controller, queue, persistent cache or RFC policy changed. Two independent
 proof/diff reviews passed. Work reduction is demonstrated; the whole3.14s
 helper budget is not promised savings or user-latency reduction.
 
-## Latest ordinary comparison — promotion stopped
+## Earlier ordinary comparison — promotion stopped
 
 Exact cells:
 `./.tmp/reflection/results/mixed-combined-up-frontier-scope-{control,candidate}-0908/`.
@@ -125,13 +125,14 @@ CPU is lifetime ps%, not interval CPU; unequal work prevents normalized cost
 claims. Confirmation bins above500Mbps are buffered ACK-observation releases,
 not physical wire-rate claims. No further ordinary run seeks a passing number.
 
-## Completed discriminator and active transaction: recovery service ordering
+## Completed discriminator and correction: recovery service ordering
 
 One joint publication/writer/server/native diagnostic on445011f completed:
 310640640 exact bytes/52.591374s, maxconfirmation10.010333s. Build2m14s;
 hooks archived and reversed before the run. REQUEST_PREFIX_SERVICE_20260908.md,
 its TRACE patch and3.6MiB raw archive retain full53bins, stage joins and costs.
-No new performance candidate, no third ordinary run, no runtime correction.
+At that diagnostic checkpoint there was no new runtime correction or third
+ordinary run; the later ordering transaction below followed its evidence.
 
 Two exact server frontier waits:
 - F206843545: QUIC Original local H3 acceptance1788823302404; first decoder
@@ -235,18 +236,51 @@ attribute it to the new structural branch or initial QUIC readiness from
 aggregate snapshots. Historical initial-attachment evidence already refutes
 the claim that an attached QUIC was ignored during the first TCP burst.
 
-**Existing evidence:** REQUEST_COHORT_ORDINARY records14.6KiB ACK-clocked
-winning live-frontier chains at.768/.511Mbps during10Mbps QoS; their target
-selection L was positive, but this does not establish500Mbps spare service.
-It also records an earlier hedge losing to its Original. No unconditional
-larger-copy cursor/quantum or artificial owner staleness follows from either.
+**Existing evidence:** reuse completed; REQUEST_PREFIX_SERVICE now records
+pre-QoS winning adjacent pairs at13.658/13.843s on765683b and4.837/4.958s
+on445011f. Actual TCP Original progress surrounds both; copies beat their
+covering Original and advance peer F within54--85ms. The older pair's second
+publication exactly coincides with the first positive frontier ACK, despite
+positive L and QUIC accepting new high-offset Originals. Earlier QoS pairs and
+an Original-wins contrary case remain recorded. No spare500Mbps or exact
+current-candidate early-hold attribution is claimed.
 
-**Smallest next action:** reread that exact chain and current live-owner
-recovery model/history. Determine whether existing capture answers the new
-ordinary early-phase question; if not, declare one low-volume stage/range
-discriminator before running it. No runtime edit or another ordinary pass now.
-Preserve symbols: ordered prefix arrival, exact range identities and copy
-commit time, native service versus retained resource permission, causal wakes.
+**Model review disposition:** repeated independently ranked Q still fills K
+with speculative duplicates; both audits reject that as a sufficient model.
+Strict substitution cannot serve the window-blocked case without new ahead-
+copy authority. Keep T06's real112.6x unranked-suffix correction and declare
+its bounded-hedge limitation, not an implementation mismatch.
+
+**New stage discrimination from the same capture:**445011f assigned192 initial
+TCP Originals/12517323B in23ms. At first actual QUIC Original Apply+117ms,
+8585216B/131 commands had not begun TCP writing. One later frame waited6.598s
+before writer entry. This is exact pre-native local queueing, not inferred
+socket occupancy. Already-begun writes stay protected. Full joins are in
+REQUEST_PREFIX_SERVICE; no new capture/build was needed.
+
+**Ownership alternatives:** published commands have no retraction ticket.
+Adding one requires transfer of more than flight bytes; writer-initiated transfer
+also needs extra target authority while its suffix stays charged, and a blocking
+Product-actor roundtrip can deadlock native service. Do not implement that as a
+small cancellation patch or revive the rejected writer-idle gate.
+
+**Smallest coherent model candidate:** PREPARED_ORIGINAL_OWNERSHIP_MODEL.md
+separates unnumbered prepared source end A from native-claimed wire/cache end C.
+PreparedU=A−C remains shared by the stream direction; synchronous pre-encode
+claim convertsU→exactO_i without copying or increasing shared B. Current P/E/q,
+native fences, protected writes and existing recovery remain. Claimed bytes
+never return to preparation. First-owner classification usesΣO_i=0, ACKs stop
+at C, and FIN waits forU=0. Both independent reviews find the bounded separation
+coherent, not proof of overall speed or a ready implementation.
+
+**Next concrete action:** map REQUEST source/cache/ACK/qualification/membership
+into its smallest shared claim owner and establish actual native-fence/lock
+order, writer-boundary readiness/arbitration and lost-wake-free registrations.
+Preserve full preparation capacity and immediate singleton native feeding;
+no lock across await, actor roundtrip, queue shrink, executor-luck policy or
+private prefetch. Once those source boundaries are closed, real producer
+RED/control precedes migration; no unused model code or ordinary rerun now.
+Response parity and all existing global gates remain pending, not waived.
 
 **Falsifier/stop:** if head work was already promptly published, pursue its
 actual downstream service owner instead of changing repair permission. If
@@ -304,15 +338,18 @@ aggregate300/200 defaults as200each. Do not tune this profile to pass.
   preserve small evidence before scoped cache cleanup. No deletion this turn.
   User seven-line edit must remain outside commits.
 - Telegram milestone authorization: no more often than hourly. Last sent about
-  2026-09-08 00:11UTC; next nonurgent not before2026-09-08 01:11UTC. Respect advisory;
+  2026-09-08 01:18UTC; next nonurgent not before2026-09-08 02:18UTC. Respect advisory;
   ordinary gaps remain open, so do not send a completion claim.
 - Reflection: local work proof was useful and enabled a deletion, but did not
   predict every network interval. The ordinary pair moved the worst observed
   holding stage; this is why total Mbps and isolated GREEN cannot close the
   loop. Follow the exact stage, without bundling unrelated fixes or discarding
-  adverse evidence. The joint trace isolates publication/native/input stages;
-  historical per-owner allocation is now the bounded RED/control question,
-  not proof that one new correction will explain every captured pause.
+  adverse evidence. Historical per-owner ordering and repeated overlap work
+  now have real RED/GREEN, but the ordinary early forward prefix remains slow.
+  Existing live-prefix geometry and substantial unstarted TCP assignment are
+  now joined without another lab. Reject bulk repair, writer-idle and blocking
+  transfer shortcuts; define shared prepared ownership before implementation. Do not
+  assume the structural fix caused the ordinary span or its maxgap closes it.
 - Universal clairvoyant optimality under arbitrary future outages is impossible;
   that does not waive avoidable delays or any practical gate. Never label
   unfinished work ideal or promise cost-free capacity discovery.

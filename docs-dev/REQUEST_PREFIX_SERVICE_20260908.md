@@ -732,3 +732,166 @@ service evidence prevents earlier recovery? Read existing live-prefix capture
 and model first; it already proves14.6KiB ACK-clocked winning chains during
 10Mbps QoS, not during500Mbps spare service. No new parameter or implementation
 is authorized until that evidence gap is resolved.
+
+## Reused pre-QoS evidence — live-prefix service, not native inactivity
+
+Recorded 2026-09-08 09:25 +08:00. Category: existing-capture discriminator;
+no new experiment, runtime edit, or practical acceptance. Independent audit
+and root checked exact publications, receiver advances and competing Originals.
+Use Unix timestamps and event/range identity below: concurrent log sequence
+numbers are not physical line numbers or a global execution order.
+
+The older765683b capture in ACK_ATOMS_SERVICE_DIAGNOSTIC_20260908.raw.tar.gz
+already contains this pair before the15s QoS transition. Its client zero is
+1788808128204ms. Both successful causes are persistent ACK-gap repair;
+concurrent retained-frontier selection is eligibility evidence, not proof that
+the retained-only producer committed these copies.
+
+| Exact half-open range | QUIC Apply / writer, Unix ms | Actual receiver F reaches end, Unix ms | Relevant feedback |
+| --- | --- | --- | --- |
+| `[8912684,8927284)` |1788808141862 /1862 |1788808141947 |Client F reaches8927284 at1788808142047 |
+| `[8927284,8941884)` |1788808142047 /2047 |1788808142107 |Later ACK also includes winning Original bytes; do not isolate a second-copy ACK delay |
+
+The second publication occurs in the same logged millisecond as the first
+copy's positive frontier ACK. Each extent is14600B; selected L is3342336 /
+3306336B. The only covering Original is TCP0/client physical instance2,
+attachment0, `[8912684,8978220)`, published1788808128219 and received only at
+1788808142162, after both copies. No competing TCP repair supplies either
+advance. Surrounding actual TCP Original receives advance the frontier through
+8912684 before the pair and past8941884 afterwards: the owner progresses.
+The capture does not expose its exact qualifying-ACK epoch; native ACK or
+released debt alone must not be substituted for that proof.
+
+At these copies' Apply, previous queued/accepted repair debt is0. QUIC
+Original debt is65536/44136B, native flight47502/16434B, native limit
+4275882/4265193B, Product limit67108864B. The logged14600B queue includes the
+current reservation. These distinguish resource eligibility and prompt small
+copy service, not spare500Mbps capacity. Copies reach the receiver in85/60ms;
+the first waits another100ms for client ACK application. In between, QUIC
+continues accepting new OriginalData above75MB while the missing prefix is
+below9MB. Neither native inactivity nor a delayed repair writer explains this
+specific chain.
+
+The newer445011f capture in REQUEST_PREFIX_SERVICE_20260908.raw.tar.gz supplies
+an independent earlier pair at4.837/4.958s (zero1788823273955ms):
+
+| Exact half-open range | Apply / writer, Unix ms | Actual receiver F reaches end, Unix ms |
+| --- | --- | --- |
+| `[4259787,4274387)` |1788823278792 /8793 |1788823278866 |
+| `[4274387,4288987)` |1788823278913 /8913 |1788823278967 |
+
+Both are persistent ACK-gap copies on QUIC0/client instance1/attachment2,
+native repair stream8. TCP0/client instance4/attachment0's covering Original
+`[4259787,4325323)` was published1788823273967, written1788823275620, and
+decoded only1788823279027; it loses both prefixes. TCP Original arrivals at
+1788823278430--8433/8628/8681/8762 advance surrounding lower bytes. QUIC
+decoder-to-mux is at most1ms, with no preceding non-data or reader-send wait
+at the copies. This newer capture lacks exact client post-ACK F and selected
+L hooks, so it does not independently prove the second publication's ACK
+trigger. Both captures finish these pairs before configured QoS begins.
+
+### Model question and proof boundary
+
+For a long missing span, if Original arrivals do not cover its next quantum,
+only one repair quantum Q may be outstanding at the sender's cumulative F,
+and the feedback cycle is tau, repair-only ordered service cannot exceed
+approximately8Q/tau. With Q14600B and tau100ms this is1.168Mbps; this is a
+conditional countermodel, not a measured global tunnel ceiling. T06 explicitly
+defines a bounded live-owner latency hedge, not sustained migration. The
+serialization therefore does not by itself violate its implementation contract.
+
+The useful intention must survive: T06 stopped one14600B ranking from exposing
+10667416B of unranked service and reduced measured repair amplification.
+Neither enlarging Q, declaring a progressing owner stale, nor repeatedly
+appending independently checked quanta proves that cumulative service is safe.
+Current K/native enqueue readiness is permission, not spare service or a
+physical completion prediction. A speculative continuation can lose to an
+Original and delay new work at a shared bottleneck.
+
+Next bounded decision: can existing exact range ownership and native service
+boundaries define ordered allocation between due lower repair and new suffix
+without an ACK-per-quantum bottleneck or the prior suffix-amplification defect?
+Independent model review must supply a concrete counterexample, conditional
+benefit and adverse case before any RED or implementation. If that requires
+unavailable comparable native predecessor work, reject that claimed guarantee
+instead of fabricating capacity. These captures answer reachability/geometry;
+they do not attribute1436ff4's exact ordinary early hold or prove a pipeline's
+counterfactual benefit. No additional capture is required merely to repeat
+this already demonstrated geometry.
+
+### Independent disposition: reject a superficially bounded repair loop
+
+Both independent reviews reject proceeding with repeated independently ranked
+Q-byte live repairs until K is full. Each decision would preserve T06's local
+score/Apply extent but the loop could recreate its harmful bulk duplicate load.
+Strict substitution for an otherwise-admissible new Original is narrower,
+yet cannot serve a receive-window-blocked stream with no such Original action.
+Calling a free writer slot an opportunity does not remove that distinction.
+
+The adverse worlds are indistinguishable until new feedback: in one, the old
+TCP prefix remains slow and ahead copies help; in another, its Original has
+already arrived or arrives first and its ACK is delayed. Copies then displace
+unique work. For illustration,1.8MB ahead of useful work consumes1.44s on a
+shared10Mbps cut. This is a serialization calculation, not a new limit. The
+recorded Original-winning hedge and target-complete/unreleased-Product-debt
+case support the adverse premises. No implementation or tuning follows.
+
+### More precise existing-stage evidence: initial pre-native commitment
+
+Recorded 2026-09-08 09:30 +08:00. The same445011f capture distinguishes work
+still waiting in MPP from work already inside an irreversible native write.
+These counts/times belong to this capture, not the older765683b187-frame,
+91ms-attachment capture. This capture has no attachment hook; actual QUIC
+publication/write/receipt establishes readiness without guessing its start.
+
+All192 initial TCP0/client-instance4 Originals,12517323B, were published
+within23ms of zero1788823273955. First QUIC0/client-instance1/attachment2
+Original `[12517323,12582859)` commits at1788823274072 (+117ms), starts H3
+ordinary stream4 writing then, and completes its local write at4073. Its first
+fragment is decoded/routed by the server at4173,101ms after publication.
+At the first QUIC publication the exact initial TCP partition is:
+
+| Stage | Half-open range | Bytes |
+| --- | --- | ---: |
+| Local write/flush completed | `[0,3866571)` |3866571 |
+| Protected native transaction already begun | `[3866571,3932107)` |65536 |
+| No writer-begin event yet,131 commands | `[3932107,12517323)` |8585216 |
+
+No boundary depends on ambiguous same-millisecond event ordering. The begun
+frame starts1788823273967 and flushes only1788823275619. Its successor
+`[3932107,3997643)` was published3967 but cannot begin until5619:1.652s before
+writer entry. The previously joined `[4259787,4325323)` waits similarly.
+A later Original `[8257483,8323019)` is published1788823273972 (+17ms), begins
+and completes local writing1788823280570 (+6.615s), and reaches the server at
+1788823287378 (+13.423s). Its6.598s pre-writer delay is distinct from subsequent
+native/transport delay. At4/10/15s, initial commands still without writer begin
+contain5898240/1966080/458752B respectively.
+
+The observer is immediately before `writer.write_frames` and after successful
+flush in the archived TRACE patch. Therefore unstarted commands have not
+entered that protected encode/write transaction. Once it begins, even a pending
+future may have partially advanced encoding or the socket: it is not revocable
+from a missing completion event. Flush completion means local acceptance,
+never wire transmission or remote receipt.
+
+This proves material pre-native queuing, not safe cancellation in current code.
+Current SendFrame has no exact claim/revocation ticket. Product assignment,
+qualification and debt are recorded before MPSC publication, and ordinary
+writer commands retain that path choice until service or terminal cleanup.
+The queue was deliberately enlarged for high-BDP and concurrent-actor
+pipelining; its existence is not a bug. T03_ADVISORY_SCORE and T04a already
+reject shrinking it or inserting a one-action writer-idle gate. A proposed
+single writer-ready offer would restore that rejected gate and is not pursued.
+
+The narrower next model question is whether an **unstarted queued Original**
+can change exact ownership without a second physical copy: retain full queues
+and protected writes, but require an atomic writer-claim versus actor-revocation
+boundary before encoding. A transfer must have a valid alternate reservation
+and move exact Original ownership, not release shared O, mint receive credit,
+reset remaining-byte ages, erase earlier-copy ambiguity, or borrow another
+incarnation's qualification. Claimed/writing work remains unchanged. This is
+a candidate ownership-contract revision, not an implemented fix or a promise
+that a different native path will finish earlier. Independent review must
+resolve ACK/copy races, cancellation, close/FIN, refund and wake ownership
+before any producer RED or implementation. No new queue limit, timer, controller
+or protocol preference is authorized.

@@ -1,9 +1,39 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-08 14:31 +08:00. Authoritative source is `./`.
+Updated: 2026-09-08 14:51 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 ## Active transaction — 2026-09-08 14:31 +08:00
+
+**Next bounded transaction14:51:** the ordinary pair is complete; no promotion.
+Candidate has10.001s sampled Rc433 hold alongside continuing forward/response
+production and9s separate target hold. Parent has66.001s Rc/60s T holds and
+incomplete guard termination. Candidate first3s T is worse, peak RSS is higher;
+completion improves, not every phase/cost. COPY_DEBT_SERVICE records full data.
+
+**Question / alternatives:** where is the actual winning missing reply during
+the candidate's remaining long gap—before native decode, between decode and
+Product input, or after mux delivery? Existing ordinary telemetry cannot
+answer; the previous diagnostic is a different version/realization. Native
+congestion/backpressure, local routing/executor service, costly preparation,
+and local delivery remain competing causes; no further model change now.
+
+**Smallest experiment / falsifier:** reuse the archived sparse reply-stage and
+aggregate-cost observer on9ea25e2, adding nested synchronous scopes for recovery
+range preparation, target selection, Native resolution, Product projection,
+queued-copy debt, repair Apply and its fenced bookkeeping. No per-attempt logs,
+new harness/profile, selected-target cache or policy change. Exact winning
+reply joins must precede cost attribution. Prompt decode/mux rejects that local
+stage as the cause; prepublication gaps remain distinct. No new long gap means
+that capture does not reproduce the ordinary failure. Do not report diagnostic
+Mbps as acceptance. Archive/reverse hooks before capture, record nested elapsed
+as such (not CPU or additive independent totals), retain contrary cases.
+
+**Latest practical result14:45:** normal9ea25e2 build3m29s; candidate completes
+254083072 exact bytes in48.973579s,41.505Mbps, runner0, but still has11.042148s
+confirmation gaps. First confirmation.397566s, max local-write gap1.011139s.
+The planned ordinary b3dfef1 parent cell is running; no other runtime correction
+or experiment is authorized by this throughput number. No practical promotion.
 
 **Issue / evidence:** the completed sparse capture locates a winning reply's
 2.226s decode-to-mux delay beside expensive structural recovery dispatch.

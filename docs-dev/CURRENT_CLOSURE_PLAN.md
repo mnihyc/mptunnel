@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 00:10 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 00:40 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,40 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Ablation outcome / next evidence 00:44:** ordinary mixed DOWN403.212112Mbps
+recovers part of the repeated384–387Mbps cost but remains below both413Mbps
+fcc controls. Its maxread .323468s and80/80 echoes (p50 .334069s, p95 .501201s,
+max .561082s) are retained, not selected as universal improvements. UP settles
+2131230720B/41.0558s=415.285Mbps, preserving the state-model throughput gain;
+maxconfirmation .789938s and maxwrite .630792s are adverse versus83734b2's
+.697809/.540541s, while confirmation is better than fcc1.192361s. Removing
+the redundant helper boundary has supported practical benefit within this pair,
+not proof that nested charging was the sole DOWN cause. No further code change
+is selected from the remaining10Mbps or subsecond extrema without attribution.
+
+Next is the overdue matched **high-capacity reference panel**, not another
+micro-adjustment: use this frozen ordinary variant for the remaining TCP/QUIC
+UP and DOWN cells, plus raw TCP, Xray VMess/TCP and Hysteria2 in both directions.
+Reuse its just-completed mixed cells. Same healthy500Mbps shared cut,100ms RTT
+(UP70/DOWN30), no configured jitter/loss/QoS/outage, same40s probes, CPU allocation
+and wire/resource/management sampling; no compiler overlap. Hysteria2 retains
+its existing explicit500Mbps up/down prior, MPP dynamic discovery stays unchanged.
+This conditional panel measures full user service against matched baselines,
+including startup, gaps, echoes, completion and costs; it is not a real-Internet
+or mixed-impairment victory. A major collapse or failed completion halts widening
+and selects its existing owner. Otherwise preserve the complete comparison,
+then the already-required high-capacity QoS/outage recovery and heterogeneous
+path gates. No poor-link100Mbps target, release or global acceptance claim.
+
+**Ablation execution 00:40:** exact removal-only diff is independently reviewed
+and archived as LATEST_CREDIT_ACTOR_YIELD_ABLATION_20260909.patch. Ten focused
+latest-state/whole-actor cooperation checks and773 affected checks pass; default
+test build55.88s, default ordinary build1m04s, warning-free. The frozen ordinary
+latest-credit-actor-yield-20260909 runs mixed DOWN then UP, same healthy shape.
+No compiler overlaps either lab. Root HEAD e27e4f9 retains all ten preceding
+ordinary cells;83734b2 is the state-model intermediary, not acceptance.
+Telegram practical/attribution update sent16:39UTC; next nonurgent>=17:40UTC.
 
 **Reverse pair / one ablation 00:35:** DOWN throughput deficit recurs: latest
 state384.475560Mbps versus retained413.225355. Across both orders the candidate
@@ -1067,8 +1101,8 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram last attribution/comparison report:15:38UTC; next nonurgent not
-  before16:39UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram last attribution/comparison report:16:39UTC; next nonurgent not
+  before17:40UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

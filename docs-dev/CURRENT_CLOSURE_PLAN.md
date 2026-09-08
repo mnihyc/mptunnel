@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-08 17:03 +08:00. Authoritative source is `./`.
+Updated:2026-09-08 17:41 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each
@@ -10,7 +10,57 @@ approaches, remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`.
 Detailed evidence is linked below; shortening obsolete next-action prose does
 not discard findings, adverse results or acceptance gates.
 
-## Active transaction: one owner for prepared stale-path preference
+## Active discriminator: upload terminal service after full target delivery
+
+**Observed failure / current owner:** ordinary b783cd6 completes326041600B
+in52.965807s, with6.082958s maximum confirmation gap. Candidate service rows
+48–53 already have full target T326041600, while server-read/client-delivered
+reply Rs=Rc1142 are unchanged. Only final row54 observes13new server-read
+reply bytes. Local TCP receive queues are zero through this tail, but client
+native TCP Send-Q drains8.70→2.69MB. Those queues are not exact Product debt.
+This is the existing completion-service timing owner, not a new bug inventory.
+
+**Competing causes / exact question:** determine where the request EOF/FIN
+and terminal response spend that tail: source EOF recognition, pending FIN
+publication/admission, selected native ordered service, server FIN/mux-ready
+handling, target write-half-close, sink natural EOF/final reply production,
+or response delivery. lab/tcp_sink.py checks its .2s ACK cadence only after
+recv(data); it does not produce an idle periodic ACK. Final OK is generated
+only after natural EOF. Thirteen bytes are consistent with the final OK line,
+not a direct content observation. Full T and flat Rs do not establish a
+6s already-produced reply stall, nor a6s missing forward payload.
+
+**Existing evidence / smallest action:** PREPARED_STALE_SERVICE_20260908
+retains the ordinary pair. Inspect current terminal origin/RFC and existing
+diagnostic seams first, then add only missing EOF/FIN/half-close timestamps
+to one temporary diagnostic. Preserve actual admission, ordering, wakes and
+all policy. No native controller change or larger packet-tracing framework.
+Archive/reverse hooks before one unchanged-profile capture; a different or
+absent tail is non-reproduction, not a performance win.
+
+**Falsifier / acceptance / stop:** prompt source FIN publication followed by
+held decode excludes source publication; prompt server FIN-ready/shutdown
+excludes that stage. Observe producer timestamp before attributing response
+transport. Exact same-flow/stage joins precede a real-producer RED/control
+and any coherent fix. The earlier already-written QUIC predecode payload
+stalls remain distinct and unresolved. No policy tuning or favorable rerun.
+Native receipt/hole/timer source preflight is retained only as an alternative
+if later evidence selects it; no Native observer or correction implemented.
+
+## Completed transaction: one owner for prepared stale-path preference
+
+**Ordinary pair17:36 — no performance promotion:** control389218304B/47.562042s
+versus candidate326041600B/52.965807s, exact complete accounting in both.
+First confirmation.641281→.448263s; maximum confirmation4.845539→6.082958s.
+First write.131315→.104305s; maximum write3.553143→2.223001s.65.467→49.246Mbps
+does not pass the timing/throughput gate. Candidate early target delivery is
+better at10s but worse at15s; peak client RSS775264→832336KiB with unequal
+work. Independent full-phase/cost analysis distinguishes its terminal hold
+from middle incomplete-target and early already-produced-reply holds. No
+favorable third run or causal rate ratio from these random unequal workloads.
+Runtime b783cd6 remains a mechanism-correct intermediate checkpoint, not
+accepted performance. No rollback to the proven duplicate gate merely from
+one average, and no assertion it fixed the largest captured stalls.
 
 **Observed failure / exact cause boundary:** latest capture completes484507648B
 in44.176499s but maxconfirmation4.478852s/maxwrite8.647851s remain. Longest
@@ -88,6 +138,16 @@ component tests, not a falsely claimed facade exhaustion test. Implementing
 that additional real-claim setup is unnecessary to change this policy mask.
 Checkpoint the isolated correction, then one ordinary optimized candidate
 build and the already-fixed paired comparison. No performance promotion yet.
+
+**Ordinary17:35:** runtime checkpoint b783cd6; warning-free optimized build
+3m29s, frozen as prepared-stale-20260908. Source is clean except user's
+unrelated seven-line document edit. One unchanged-profile candidate running,
+no compilation. Independent baseline review finds existing matched mirrored
+raw/Xray/H2 controls in review-mirrored-0906: raw completes4.279Mbps with
+1.610879s maximum confirmation gap; Xray/H2 are incomplete. Their router
+epochs match, but they are historical unequal-work random realizations and
+cannot attribute current gaps to Native or Product. Nonmirrored raw274.677Mbps
+must not be substituted. No redundant baseline rerun merely to obtain wins.
 
 ## Completed discriminator: available request source is not claimed
 
@@ -380,9 +440,11 @@ a different stage, follow it rather than force the recovery-cost hypothesis.
 
 ## Current source and latest practical disposition
 
-Runtime checkpoint **e476308** adds the two nonblocking advisory acquisitions
-above; RED checkpoint584b748. Its ordinary result is mixed/adverse in timing
-and not promoted. Parent **9ea25e2** maintains exact additive accepted-copy debt
+Runtime checkpoint **b783cd6** separates prepared stale preference; actual RED
+checkpoint f1b0900. Its ordinary pair above is mixed/adverse and not promoted.
+Parent **e476308** adds the two nonblocking advisory acquisitions above; RED
+checkpoint584b748. Its ordinary result also remains mixed/adverse in timing.
+Earlier **9ea25e2** maintains exact additive accepted-copy debt
 by attachment; RED checkpoint **3396087**, evidence checkpoint **ebad57f**.
 No shelved sampler, new Native observation policy or congestion tuning is active.
 The user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md edit is untouched and
@@ -440,6 +502,7 @@ Do not silently package it as source cleanup.
 | Persistent idle readinessb3dfef1 |Real all-refused two-writer retry recurrence removed;535checks/audit. Ordinary long return/target holds remain |
 | Exact copy-debt index9ea25e2 |Work and conservation proved; ordinary settlement improves,11s gaps remain |
 | Native advisory owner admissione476308 |Actual two-cut contention RED/GREEN; no blocking native Product acquisition. Ordinary completion with worse gaps; no practical promotion |
+| Single prepared stale preferenceb783cd6 |Actual sole-Ready stale claim0→64KiB with fresh-Ready opposite and unchanged qualification;544 focused checks. Ordinary slower completion/larger confirmation gap; no promotion |
 | Shelved paired-clock request sampler |Actual[2,2,2]→[2,3,4] sampling correction; ordinary incomplete/adverse, not stacked into runtime |
 
 Preserve prepared-source conservation and exact chosen readiness epochs:
@@ -485,14 +548,15 @@ above500Mbps can be buffered observation, not wire capacity.
 
 - Owned Docker only; no sudo, host shaping, outside-repo work or build/lab
   overlap. Products/probes stopped; no build/lab. Origins retained.
-- Normal frozen candidate:`./.tmp/reflection/bin/advisory-owner-20260908/mptunnel`.
-  Normal parent:`./.tmp/reflection/bin/copy-debt-20260908/mptunnel`.
+- Normal frozen candidate:`./.tmp/reflection/bin/prepared-stale-20260908/mptunnel`.
+  Normal parent:`./.tmp/reflection/bin/advisory-owner-20260908/mptunnel`.
   Current diagnostic:`./.tmp/reflection/bin/prepared-claim-service-20260908/mptunnel`.
-  target/release is that temporary diagnostic, not the ordinary executable.
+  target/release is ordinary b783cd6 after the latest optimized build.
 - Exact intermediate commits only. Preserve raw evidence before scoped cleanup.
   No deletion this turn; ample root space. User7lines must stay unstaged.
-- Telegram last meaningful report2026-09-08 08:30:59UTC; next nonurgent
-  not before09:31UTC. Respect hourly minimum and soft-frequency advisory.
+- Telegram latest ordinary adverse-pair report sent during09:38UTC; next
+  nonurgent not before10:42UTC (conservative hourly boundary). Respect the
+  hourly minimum and soft-frequency advisory.
   No component-only success notification or unfinished completion claim.
 - Reflection: exact symbolic conservation enabled one justified work deletion,
   but did not predict every timing phase. The ordinary pair supplies real

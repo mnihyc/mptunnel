@@ -216,3 +216,147 @@ mixed-feedback owner. The exact publication correction and attainable user
 benefit remain unproved. This diagnostic does not allocate all physical queue
 cost to ACKs, identify every critical range, permit weakened acknowledgement
 authority or establish ordinary performance acceptance.
+
+## Follow-up: queued feedback opportunity, not an implemented correction
+
+The completed `feedback-queue-0909` mixed diagnostic asks how much older feedback
+is still at MPP's cancellable queue boundary when newer same-kind work is pending.
+Runtime remains `4c7e232`; the frozen executable is
+`./.tmp/reflection/bin/feedback-queue-20260909/mptunnel`. The warning-free optimized
+build took 1m03s. The exact three-file
+[FEEDBACK_QUEUE_TRACE_20260909.patch](FEEDBACK_QUEUE_TRACE_20260909.patch) extends
+the encoder observer above with queue bookkeeping; all additions were reversed
+before capture. No command is replaced, dropped or reprioritized by this observer.
+
+Sources are `./.tmp/reflection/results/mixed-combined-down-feedback-queue-0909/`,
+with `feedback-queue-diagnostic-build-0909.log` and `feedback-queue-0909-run.log`
+under `./.tmp/reflection/`. The separate
+[queue raw archive](FEEDBACK_QUEUE_SERVICE_20260909.raw.tar.gz) contains exactly
+the five result files, those two logs and the three-file patch: eight members,
+1923330B uncompressed, 197582B archived. Gzip integrity, exact ordered manifest
+and byte-for-byte tar comparison against all eight originals pass. No hashes
+are needed. Every summary, all 40 body bins and all 71 echo outcome records
+remain in the archive; `probe.err` is empty. The prior two-cell archive is unchanged.
+
+### Boundary and conservation
+
+The shadow observes permitted queue admission immediately before infallible send,
+then command ownership transfer at `QueuedReliablePathCommand::into_parts`, or
+token drop. A group is keyed by actual queue identity, logical stream, command
+lane, same-stream barrier epoch and feedback kind. It retains admission ordinals,
+not payloads or Product publication generations. At take, an older item is flagged
+only if a newer ordinal remains pending in that group. `into_parts` is neither
+native write nor encoder completion. The observed queue may not represent every
+direct prepared-source or retirement path.
+
+Data/FIN/reset/detach/close and incomplete ACKs delimit the shadow's same-stream
+epochs. These are conservative observation cuts, not a proof that every such cut
+is required by the Product model. Semantic substitution, missed generations,
+negative horizon, attachment lifetime and terminal ordering remain obligations.
+Global pending peaks below are not per-path queue capacities. The diagnostic
+mutex/bookkeeping also adds cost; this run is not an ordinary performance trial.
+
+All 225 queue rows (114 client, 111 server) satisfy
+`accepted = taken + dropped + pending`; range accounting also reconciles when
+pending is zero. Cumulative counts are monotonic, flagged counts stay within taken
+counts, incomplete ACK counts are zero, and observed command drops are zero.
+This does not imply zero physical queue drops. Last client rows C632–634 are at
+Unix 1788890599597ms, mono 39450ms, PID 342558:
+
+| Kind | Accepted / taken / pending | Takes with newer pending | Flagged / taken range entries | Global peak pending |
+|---|---:|---:|---:|---:|
+| Complete ACK | 313270 /313269 /1 | 82354 (26.2886%) | 2007621 /8595870 (23.3556%) | 206 |
+| MAX | 172949 /172949 /0 | 50181 (29.0149%) | 0 /0 | 161 |
+
+The one pending ACK contains four range entries; accepted range count is 8595874.
+There are 14 observed barriers and one live group at that snapshot. Last server
+rows S396–398 at Unix 1788890599961ms have 74 ACKs/74 ranges and 78 MAX frames,
+all taken, with no newer-pending flags or drops and peak pending 2. The opportunity is
+concentrated in client feedback here, not a universal property of every sender.
+
+An inner constrained interval, Unix 1788890576154→1788890583309ms (7155ms), uses
+C252→364 for complete ACK and C254→366 for MAX. It contains 23406 ACK takes,
+7265 flagged (31.0390%), with 549099/1831318 range entries flagged (29.9838%);
+MAX has 4663/14982 flagged takes (31.1240%). These are exact same-kind deltas,
+not a reconstructed nominal 15–25s cohort. Management snapshots can be cached
+and have different peer timestamps; the selected interval lies inside the
+observed restriction, without claiming millisecond-exact shaping transition time.
+
+### Offered serialization pressure remains material
+
+The last encoder snapshot C639–640 is 13ms later than the client queue snapshot,
+Unix 1788890599610ms: ACK 313438 frames/57600896B/8596546 range entries, maximum
+127 ranges/760B; MAX 173124 frames/4501224B. All ACKs are complete, 306178 sparse.
+The five range-count bins are 7260/69841/150529/85808/0 and sum to 313438.
+Do not force equality with differently timed queue counters. Neither observer
+has a final flush; these are last reported values, not exact terminal totals.
+
+| Same-kind encoder delta | Lines | Unix-ms endpoints | Bytes / ms | Encoded-attempt Mbps |
+|---|---|---|---:|---:|
+| ACK, constrained peak | C291→307 | 1788890578246→1788890579249 | 4163302 /1003 | 33.206796 |
+| MAX, own matching interval | C292→308 | 1788890578246→1788890579249 | 140244 /1003 | 1.118596 |
+
+These attempts exceed the 10Mbps UP cut before native overhead, but are not
+proof that those bytes were accepted or transmitted in that same interval.
+Flagged frame/range percentages do not measure exact encoded-byte savings.
+An altered dequeue schedule would also alter future pending opportunities.
+
+### Full outcome, phases and costs
+
+The runner exits 0 after 40.609988635s, but combined probe status is `loss` because
+one actual echo times out. The bulk read itself is HTTP200/`ok`: 1636396402B in
+40.000631392s, 327.274114Mbps, one deliberately partial 8GiB body and zero completed
+bodies. First body is .584531609s; maximum read gap is 3.642142994s at
+22.008806591→25.650949585s, bytes 850259186→850324722. Body-bin means are
+436.0829/103.4389/419.2668Mbps in 5–15/15–25/25–40s. This again shows substantial
+restriction-phase collapse and resumed high delivery, not a queue-fix comparison.
+
+Echo accounting is 34 successes, one actual timeout and 36 unattempted
+`unavailable_after_disconnect` slots—not 37 failed network sends. The probe sends
+2240 request bytes and receives 2176; it never reconnects. Success-only p50/p95/max
+are 319.481224/654.477967/2089.395541ms; maximum completed-success gap is 2.089409171s
+and excludes the censored tail. Attempt 32 succeeds at 16.307313544→18.396709085s;
+attempt 34 starts 19.351599528s and returns `io_error: timed out` at 22.354722836s
+(3003.123308ms). Start-time phases 0–15/15–25/25–40 contain 30 successes;
+4 successes +1 timeout +6 unattempted; and 30 unattempted respectively.
+Restored echo service was therefore not tested after the probe disconnected.
+
+All 40 service rows preserve actual DOWN eth0 at 500Mbps and UP eth1 at 10Mbps in
+L16–25, restored 500Mbps at L26. Mirrored 30ms DOWN/70ms UP, zero jitter/configured
+loss, no blackhole and netem 8192 are unchanged. The intended DOWN-cap experiment
+was not run. Sample times are .000060601→39.609852255s; final samples precede
+body completion. UP has 4570 physical queue drops; DOWN has 0.
+
+| Sampled metric | Client / server or DOWN / UP |
+|---|---:|
+| Stable process PID | 342558 /348068 |
+| RSS peak / last, KiB (client; server) | 105868 /92264; 309724 /295528 |
+| ps %CPU maximum / last (client; server) | 101 /86.9; 174 /164 |
+| HTB class bytes Δ, DOWN / UP | 1908913293 /102183622 |
+| HTB class packets Δ, DOWN / UP | 1367304 /463380 |
+| Maximum class backlog B, DOWN / UP | 27935828 /5959967 |
+
+ps percentages are process-lifetime averages, not exclusive feedback CPU. RSS
+is not settled memory or leak evidence. Physical first→last class counters use
+a different window from encoder/queue reports; do not add parent HTB and child
+netem totals, subtract an exact native remainder or infer per-byte queue delay.
+
+All 40 untrimmed body bins, Mbps, indices 0–39 (above 500 can be buffered delivery):
+```text
+2.597, 99.799, 261.191, 641.286, 401.981, 505.465, 276.108, 555.118, 442.654, 437.719
+376.880, 334.774, 565.531, 453.780, 412.800, 424.680, 193.285, 2.538, 155.075, 35.271
+51.929, 158.984, 12.627, 0.000, 0.000, 3.737, 423.417, 653.728, 457.298, 439.856
+428.342, 230.138, 635.941, 447.334, 403.333, 480.912, 280.658, 584.749, 462.917, 356.642
+```
+
+Disposition: queue-latest has a real, bounded replacement opportunity and may
+have correctness or partial performance value, but implementation is deferred.
+The observed roughly 26% ACK frames/23% range support (roughly 30% inside the cut)
+does not establish a whole cure for the measured 33.207Mbps ACK pressure plus MAX
+against 10Mbps. It neither promises all flagged bytes are saved nor disproves
+useful partial savings. The next proof concerns repeated full cumulative history,
+`O(A × Σ R_g)` across accepting attachments and generations, and truthful
+incremental feedback/checkpoint semantics. It must preserve positive receipt,
+complete/partial omission authority, missed-generation catch-up and exact
+publication/terminal ownership. No wire change, rate cap, queue implementation
+or ordinary performance promotion is justified by this diagnostic alone.

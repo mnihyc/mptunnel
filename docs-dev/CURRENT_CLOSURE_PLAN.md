@@ -13,6 +13,40 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
+**Queue result / bounded redesign decision02:09:** exact three-file observer
+is archived FEEDBACK_QUEUE_TRACE_20260909.patch; warning-free1m03build frozen
+feedback-queue-20260909, then ALL source additions reversed. Both audits pass
+counter conservation and cancellation; no ordinary runtime changes. One mixed
+capture again fails materially:436.083→103.439→419.267Mbps phases,3.642143s
+body gap22.008807→25.650950s;34echo successes, one actual3s timeout and36
+unattempted-after-disconnect slots. Retain failure and observer cost honestly.
+
+Queued replacement opportunity is real but limited:313269ACKtakes,82354with
+newer same-kind work pending(26.29%); associated range support23.36%. MAX29.01%.
+Inside restriction roughly31%ACK/MAXtakes and30%range support are flagged.
+All225summaries conserve accepted=taken+dropped+pending. These are generous
+schedule-dependent opportunities, not exact safe substitutions or saved bytes;
+queue-admission ordinals are not producer generations. Native-started work is
+outside the scope. ACK encoding still peaks33.207Mbps plusMAX1.119Mbps.
+
+Decision: DEFER standalone queue-latest implementation, not call its real
+opportunity a fake defect. The observed~30%scope does not credibly remove the
+>3×offered-feedback mismatch, and would add exact-owner/terminal machinery
+without a convincing full-defect gain forecast. This discriminator avoided
+an unproven implementation and its test/cleanup loop. Keep the proof for later
+if useful, but do not optimize small remnants before the structural owner.
+
+Next existing mixed/stall model question: repeated full cumulative receive
+history costs O(A×sum R_g) across accepting attachments and generations.
+Establish explicit incremental feedback facts/checkpoint semantics using the
+single Product positive ledger and existing per-attachment publication fences.
+An ordered carrier's prior accepted feedback may justify a delta, but only if
+negative horizon/checkpoint completeness and replacement/cancellation/chunk
+ordering are proven. A fresh or missed-generation attachment needs truthful
+cumulative catch-up. No hidden mutable codec dictionary, timer/rate cap, false
+complete delta or shortened gap authority. Source/model audits proceed first;
+no wire/runtime change until a bounded proof and magnitude forecast exist.
+
 **Queue-opportunity discriminator01:54:** same-observer Q control sustains
 438.794Mbps during restriction and442.089after,80/80echoes,max301ms. Last
 reported ACK is134221frames/3606579B, every frame single-range, versus mixed

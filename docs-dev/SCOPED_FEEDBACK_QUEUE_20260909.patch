@@ -1,0 +1,501 @@
+diff --git a/src/lab_diagnostics.rs b/src/lab_diagnostics.rs
+index 4551942..24ba72f 100644
+--- a/src/lab_diagnostics.rs
++++ b/src/lab_diagnostics.rs
+@@ -1,9 +1,273 @@
+-use std::collections::{BTreeMap, HashMap, HashSet};
++use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+ use std::fmt;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Mutex, OnceLock};
+ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
++/// Temporary observer: validated encodings, not successful wire writes.
++/// Later batch failure, cancelled handoff and native retransmission are outside
++/// this boundary. Fixed-size counters retain no frame contents or identities.
++pub(crate) fn lab_frame_encode_totals(frame: &crate::protocol::Frame, kind: u8, bytes: usize) {
++    if !lab_diagnostic_event_enabled("frame_encode_totals") {
++        return;
++    }
++    #[derive(Clone, Copy, Default)]
++    struct Counts {
++        frames: u64,
++        bytes: u64,
++        max_bytes: usize,
++        ack_ranges: u64,
++        ack_max_ranges: usize,
++        ack_scope_present: u64,
++        ack_scope_absent: u64,
++        ack_sparse: u64,
++        ack_range_bins: [u64; 5],
++    }
++    struct State {
++        next_report: Instant,
++        counts: [Counts; 256],
++    }
++    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
++    let mut state = STATE
++        .get_or_init(|| {
++            Mutex::new(State {
++                next_report: Instant::now() + Duration::from_secs(1),
++                counts: [Counts::default(); 256],
++            })
++        })
++        .lock()
++        .expect("lab frame encode totals lock");
++    let count = &mut state.counts[usize::from(kind)];
++    count.frames += 1;
++    count.bytes += bytes as u64;
++    count.max_bytes = count.max_bytes.max(bytes);
++    if let crate::protocol::Frame::StreamAck {
++        ranges,
++        scope_start,
++        ..
++    } = frame
++    {
++        count.ack_ranges += ranges.len() as u64;
++        count.ack_max_ranges = count.ack_max_ranges.max(ranges.len());
++        count.ack_scope_present += u64::from(scope_start.is_some());
++        count.ack_scope_absent += u64::from(scope_start.is_none());
++        count.ack_sparse += u64::from(ranges.len() > 1);
++        let bin = match ranges.len() {
++            0..=1 => 0,
++            2..=8 => 1,
++            9..=32 => 2,
++            33..=128 => 3,
++            _ => 4,
++        };
++        count.ack_range_bins[bin] += 1;
++    }
++    let now = Instant::now();
++    if now < state.next_report {
++        return;
++    }
++    state.next_report = now + Duration::from_secs(1);
++    for (kind, counts) in state
++        .counts
++        .iter()
++        .enumerate()
++        .filter(|(_, c)| c.frames != 0)
++    {
++        lab_diagnostic(
++            "frame_encode_totals",
++            format_args!(
++                "kind={} frames={} bytes={} max_bytes={} ack_ranges={} ack_max_ranges={} ack_scope_present={} ack_scope_absent={} ack_sparse={} ack_bins_1_8_32_128_more={},{},{},{},{}",
++                kind,
++                counts.frames,
++                counts.bytes,
++                counts.max_bytes,
++                counts.ack_ranges,
++                counts.ack_max_ranges,
++                counts.ack_scope_present,
++                counts.ack_scope_absent,
++                counts.ack_sparse,
++                counts.ack_range_bins[0],
++                counts.ack_range_bins[1],
++                counts.ack_range_bins[2],
++                counts.ack_range_bins[3],
++                counts.ack_range_bins[4],
++            ),
++        );
++    }
++}
++
++type FeedbackQueueKey = (usize, u64, &'static str);
++type FeedbackGroupKey = (FeedbackQueueKey, u64, usize);
++
++// Temporary shadow of accepted MPSC work, never retained frames or a policy.
++pub(crate) struct LabFeedbackQueueToken {
++    group: FeedbackGroupKey,
++    ordinal: u64,
++    ranges: u64,
++}
++
++#[derive(Clone, Copy, Default)]
++struct FeedbackQueueCounts {
++    accepted: u64,
++    accepted_ranges: u64,
++    accepted_with_pending: u64,
++    taken: u64,
++    taken_ranges: u64,
++    taken_with_newer: u64,
++    taken_with_newer_ranges: u64,
++    dropped: u64,
++    dropped_ranges: u64,
++    pending: u64,
++    peak_pending: u64,
++}
++
++struct FeedbackQueueShadow {
++    ordinal: u64,
++    // Epoch and outstanding token count; erased when the last token leaves.
++    streams: HashMap<(usize, u64), (u64, u64)>,
++    groups: HashMap<FeedbackGroupKey, BTreeSet<u64>>,
++    counts: [FeedbackQueueCounts; 2],
++    barriers: u64,
++    next_report: Instant,
++}
++
++static FEEDBACK_QUEUE_SHADOW: OnceLock<Mutex<FeedbackQueueShadow>> = OnceLock::new();
++
++fn feedback_queue_shadow() -> &'static Mutex<FeedbackQueueShadow> {
++    FEEDBACK_QUEUE_SHADOW.get_or_init(|| {
++        Mutex::new(FeedbackQueueShadow {
++            ordinal: 0,
++            streams: HashMap::new(),
++            groups: HashMap::new(),
++            counts: [FeedbackQueueCounts::default(); 2],
++            barriers: 0,
++            next_report: Instant::now() + Duration::from_secs(1),
++        })
++    })
++}
++
++/// Kind 0 = every StreamAck, kind 1 = MAX; None is a same-stream barrier.
++/// Called after obtaining a permit, immediately before its infallible send.
++/// Newer same-kind work is only a generous opportunity count: independent
++/// ACK deltas/scopes need not subsume each other and are never replaced here.
++pub(crate) fn lab_feedback_queue_enqueue(
++    queue_id: usize,
++    queue: &'static str,
++    stream_id: u64,
++    kind: Option<usize>,
++    ranges: usize,
++) -> Option<LabFeedbackQueueToken> {
++    if !lab_diagnostic_event_enabled("feedback_queue_totals") {
++        return None;
++    }
++    let mut state = feedback_queue_shadow()
++        .lock()
++        .expect("lab feedback queue shadow");
++    let key = (queue_id, stream_id, queue);
++    let stream_key = (queue_id, stream_id);
++    if kind.is_none() {
++        state.barriers += 1;
++        if let Some((epoch, _)) = state.streams.get_mut(&stream_key) {
++            *epoch += 1;
++        }
++        state.report();
++        return None;
++    }
++    let kind = kind.expect("feedback kind checked");
++    state.ordinal += 1;
++    let ordinal = state.ordinal;
++    let stream = state.streams.entry(stream_key).or_default();
++    stream.1 += 1;
++    let group = (key, stream.0, kind);
++    let queued = state.groups.entry(group).or_default();
++    let had_pending = !queued.is_empty();
++    queued.insert(ordinal);
++    let count = &mut state.counts[kind];
++    count.accepted += 1;
++    count.accepted_ranges += ranges as u64;
++    count.accepted_with_pending += u64::from(had_pending);
++    count.pending += 1;
++    count.peak_pending = count.peak_pending.max(count.pending);
++    state.report();
++    Some(LabFeedbackQueueToken {
++        group,
++        ordinal,
++        ranges: ranges as u64,
++    })
++}
++
++pub(crate) fn lab_feedback_queue_finish(token: LabFeedbackQueueToken, taken: bool) {
++    let mut state = feedback_queue_shadow()
++        .lock()
++        .expect("lab feedback queue shadow");
++    let queued = state
++        .groups
++        .get_mut(&token.group)
++        .expect("queued lab token group");
++    let newer = queued
++        .last()
++        .is_some_and(|ordinal| *ordinal > token.ordinal);
++    assert!(
++        queued.remove(&token.ordinal),
++        "lab token leaves exactly once"
++    );
++    if queued.is_empty() {
++        state.groups.remove(&token.group);
++    }
++    let stream_key = (token.group.0.0, token.group.0.1);
++    let stream = state
++        .streams
++        .get_mut(&stream_key)
++        .expect("queued lab token stream");
++    stream.1 -= 1;
++    if stream.1 == 0 {
++        state.streams.remove(&stream_key);
++    }
++    let count = &mut state.counts[token.group.2];
++    count.pending -= 1;
++    if taken {
++        count.taken += 1;
++        count.taken_ranges += token.ranges;
++        count.taken_with_newer += u64::from(newer);
++        count.taken_with_newer_ranges += if newer { token.ranges } else { 0 };
++    } else {
++        count.dropped += 1;
++        count.dropped_ranges += token.ranges;
++    }
++    state.report();
++}
++
++impl FeedbackQueueShadow {
++    fn report(&mut self) {
++        let now = Instant::now();
++        if now < self.next_report {
++            return;
++        }
++        self.next_report = now + Duration::from_secs(1);
++        for (kind, count) in ["ack", "max_data"].into_iter().zip(self.counts) {
++            lab_diagnostic(
++                "feedback_queue_totals",
++                format_args!(
++                    "kind={kind} accepted={} accepted_ranges={} accepted_with_pending={} taken={} taken_ranges={} taken_with_newer={} taken_with_newer_ranges={} dropped={} dropped_ranges={} pending={} peak_pending={} barriers={} live_stream_keys={} live_groups={} opportunity_only=true",
++                    count.accepted,
++                    count.accepted_ranges,
++                    count.accepted_with_pending,
++                    count.taken,
++                    count.taken_ranges,
++                    count.taken_with_newer,
++                    count.taken_with_newer_ranges,
++                    count.dropped,
++                    count.dropped_ranges,
++                    count.pending,
++                    count.peak_pending,
++                    self.barriers,
++                    self.streams.len(),
++                    self.groups.len(),
++                ),
++            );
++        }
++    }
++}
++
+ pub(crate) fn lab_diagnostic(event: &str, fields: fmt::Arguments<'_>) {
+     if !lab_diagnostic_event_enabled(event) {
+         return;
+diff --git a/src/protocol/codec.rs b/src/protocol/codec.rs
+index a4dc155..a924aaf 100644
+--- a/src/protocol/codec.rs
++++ b/src/protocol/codec.rs
+@@ -113,6 +113,8 @@ pub fn encode_frame_into(
+     out[frame_start + 4] = VERSION;
+     out[frame_start + 5] = kind as u8;
+     out[frame_start + 6..frame_start + 10].copy_from_slice(&(payload_len as u32).to_be_bytes());
++    #[cfg(feature = "lab-diagnostics")]
++    crate::lab_diagnostics::lab_frame_encode_totals(frame, kind as u8, frame_len);
+     Ok(())
+ }
+ 
+diff --git a/src/runtime/path/queue.rs b/src/runtime/path/queue.rs
+index 5397651..e2e3d01 100644
+--- a/src/runtime/path/queue.rs
++++ b/src/runtime/path/queue.rs
+@@ -275,19 +275,21 @@ impl ReliablePathFrameReservation<'_> {
+             .accounted_bytes
+             .take()
+             .expect("reserved reliable path byte ownership");
+-        self.permit
++        let permit = self
++            .permit
+             .take()
+-            .expect("reserved reliable path queue permit")
+-            .send(
+-                QueuedReliablePathCommand::new(
+-                    ReliablePathCommand::SendFrame(
+-                        self.frame.take().expect("reserved reliable path frame"),
+-                    ),
+-                    accounted_bytes,
+-                    self.metrics.clone(),
+-                )
+-                .with_datagram_retirement(self.datagram_retirement.take()),
+-            );
++            .expect("reserved reliable path queue permit");
++        let queued = QueuedReliablePathCommand::new(
++            ReliablePathCommand::SendFrame(
++                self.frame.take().expect("reserved reliable path frame"),
++            ),
++            accounted_bytes,
++            self.metrics.clone(),
++        )
++        .with_datagram_retirement(self.datagram_retirement.take());
++        #[cfg(feature = "lab-diagnostics")]
++        let queued = queued.observe_feedback_enqueue(self.queue_name);
++        permit.send(queued);
+         #[cfg(feature = "lab-diagnostics")]
+         lab_diagnostic(
+             "path_command_queue_send",
+@@ -564,6 +566,8 @@ struct QueuedReliablePathCommand {
+     accounted_bytes: usize,
+     metrics: Arc<ReliablePathCommandQueueMetrics>,
+     datagram_retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
++    #[cfg(feature = "lab-diagnostics")]
++    feedback_token: Option<crate::lab_diagnostics::LabFeedbackQueueToken>,
+ }
+ 
+ impl QueuedReliablePathCommand {
+@@ -577,6 +581,8 @@ impl QueuedReliablePathCommand {
+             accounted_bytes,
+             metrics,
+             datagram_retirement: None,
++            #[cfg(feature = "lab-diagnostics")]
++            feedback_token: None,
+         }
+     }
+ 
+@@ -594,7 +600,45 @@ impl QueuedReliablePathCommand {
+             .is_some_and(|retirement| retirement.retired.load(Ordering::Acquire))
+     }
+ 
++    #[cfg(feature = "lab-diagnostics")]
++    fn observe_feedback_enqueue(mut self, queue: &'static str) -> Self {
++        let observation = match self.command() {
++            ReliablePathCommand::SendFrame(Frame::StreamAck {
++                stream_id, ranges, ..
++            }) => Some((*stream_id, Some(0), ranges.len())),
++            ReliablePathCommand::SendFrame(Frame::StreamMaxData { stream_id, .. }) => {
++                Some((*stream_id, Some(1), 0))
++            }
++            ReliablePathCommand::SendFrame(
++                Frame::StreamData { stream_id, .. }
++                | Frame::StreamRequalifyData { stream_id, .. }
++                | Frame::StreamFin { stream_id, .. }
++                | Frame::StreamReset { stream_id, .. }
++                | Frame::StreamDetach { stream_id },
++            )
++            | ReliablePathCommand::CloseStream(stream_id)
++            | ReliablePathCommand::ResetAndCloseStream { stream_id, .. } => {
++                Some((*stream_id, None, 0))
++            }
++            _ => None,
++        };
++        if let Some((stream_id, kind, ranges)) = observation {
++            self.feedback_token = crate::lab_diagnostics::lab_feedback_queue_enqueue(
++                Arc::as_ptr(&self.metrics) as usize,
++                queue,
++                stream_id.0,
++                kind,
++                ranges,
++            );
++        }
++        self
++    }
++
+     fn into_parts(mut self) -> (ReliablePathCommand, usize) {
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some(token) = self.feedback_token.take() {
++            crate::lab_diagnostics::lab_feedback_queue_finish(token, true);
++        }
+         // Dequeue transfers the byte charge to the receiver. It remains visible
+         // until the writer hands the command to carrier/product accounting.
+         let accounted_bytes = self.accounted_bytes;
+@@ -621,6 +665,10 @@ impl QueuedReliablePathCommand {
+ 
+ impl Drop for QueuedReliablePathCommand {
+     fn drop(&mut self) {
++        #[cfg(feature = "lab-diagnostics")]
++        if let Some(token) = self.feedback_token.take() {
++            crate::lab_diagnostics::lab_feedback_queue_finish(token, false);
++        }
+         if self.accounted_bytes > 0 {
+             self.metrics
+                 .release_accounted_bytes(self.accounted_bytes as u64);
+@@ -899,6 +947,20 @@ impl ReliablePathCommandReceivers {
+     /// it through `release_pending_command_bytes` after the writer transaction.
+     /// Receiver drop reconciles a cancelled or failed transaction's remainder.
+     pub(in crate::runtime) fn register_claimed_writer_frame(&self, frame: &Frame) -> usize {
++        #[cfg(feature = "lab-diagnostics")]
++        if matches!(
++            frame,
++            Frame::StreamData { .. } | Frame::StreamRequalifyData { .. }
++        ) && let Some(stream_id) = reliable_path_frame_stream_id(frame)
++        {
++            let _ = crate::lab_diagnostics::lab_feedback_queue_enqueue(
++                Arc::as_ptr(&self.metrics) as usize,
++                "writer",
++                stream_id.0,
++                None,
++                0,
++            );
++        }
+         let bytes = reliable_path_frame_pacing_bytes(frame);
+         self.metrics.add_pending_bytes(bytes);
+         self.register_writer_pending_bytes(bytes);
+@@ -1263,11 +1325,23 @@ impl ReliablePathCommandSender {
+         stream_id: StreamId,
+     ) -> Result<(), RuntimeError> {
+         self.ensure_new_command_admitted(false)?;
+-        self.retirement
++        let result = self
++            .retirement
+             .send(ReliablePathRetirementCommand::RetireAcceptedStream(
+                 stream_id,
+             ))
+-            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
++            .map_err(|_| RuntimeError::ReliablePathSessionClosed);
++        #[cfg(feature = "lab-diagnostics")]
++        if result.is_ok() {
++            let _ = crate::lab_diagnostics::lab_feedback_queue_enqueue(
++                Arc::as_ptr(&self.metrics) as usize,
++                "retirement",
++                stream_id.0,
++                None,
++                0,
++            );
++        }
++        result
+     }
+ 
+     /// Transfers an accepted stream's terminal reset to the carrier-owned
+@@ -1278,9 +1352,21 @@ impl ReliablePathCommandSender {
+         reason: ResetReason,
+     ) -> Result<(), RuntimeError> {
+         self.ensure_new_command_admitted(false)?;
+-        self.retirement
++        let result = self
++            .retirement
+             .send(ReliablePathRetirementCommand::ResetAcceptedStream { stream_id, reason })
+-            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
++            .map_err(|_| RuntimeError::ReliablePathSessionClosed);
++        #[cfg(feature = "lab-diagnostics")]
++        if result.is_ok() {
++            let _ = crate::lab_diagnostics::lab_feedback_queue_enqueue(
++                Arc::as_ptr(&self.metrics) as usize,
++                "retirement",
++                stream_id.0,
++                None,
++                0,
++            );
++        }
++        result
+     }
+ 
+     pub(in crate::runtime) fn retire_datagram_attachment(
+@@ -1330,11 +1416,10 @@ impl ReliablePathCommandSender {
+             .await
+         {
+             Some(permit) => {
+-                permit.send(QueuedReliablePathCommand::new(
+-                    command,
+-                    0,
+-                    self.metrics.clone(),
+-                ));
++                let queued = QueuedReliablePathCommand::new(command, 0, self.metrics.clone());
++                #[cfg(feature = "lab-diagnostics")]
++                let queued = queued.observe_feedback_enqueue("control");
++                permit.send(queued);
+                 #[cfg(test)]
+                 if let Some(stream_id) = accepted_open_stream {
+                     self.metrics
+@@ -1449,6 +1534,8 @@ impl ReliablePathCommandSender {
+             .await
+         {
+             Some(permit) => {
++                #[cfg(feature = "lab-diagnostics")]
++                let queued = queued.observe_feedback_enqueue("data");
+                 permit.send(queued);
+                 Ok(())
+             }

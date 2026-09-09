@@ -158,3 +158,106 @@ benefit, with lower restored service and higher observed costs. Its performance
 promotion remains held. The proof above preserves the pre-change forecast and
 its assumptions; it is not a substitute for practical closure. RFC8.3 now
 describes the same independently scoped authority model.
+
+## Publication alternatives reviewed — 2026-09-09 12:03 +08:00
+
+The scoped representation remains the current runtime. This section is a
+source/model review, not an accepted extension. Receipt batching was tested
+and rejected after both healthy test orders worsened latency. The subsequent
+queue observation finds newer work at only about20% of restricted-phase takes;
+that is neither safe scoped-fact substitution nor a wire-saving estimate.
+
+### Independent deferred publication: possible, but not latency-neutral
+
+The earlier all-TCP-feedback withholding ablation removes a material cost:
+restricted mixed service266→399Mbps and worst restricted echo2.405s→274ms.
+It deliberately abandons the independent return protection introduced by
+5e1ace67 after actual7–14s blackhole stalls. It cannot be a shipped policy.
+
+A coherent prompt-ingress/deferred-sibling model would need one retained
+current receipt/grant state plus an exact-incarnation obligation per attachment:
+last covered generation/grant, a nonrenewing pending deadline, and at most one
+finite in-progress publication job. New facts must not restart that job's
+chunk cursor or postpone its outstanding deadline. Accepted queue work is not
+proof that the peer received it. ACK catch-up and repeated publication are
+different operations; current retry_cumulative returns immediately for an
+already-covered generation. Pinning a coherent multi-chunk job adds bounded
+snapshot retention; it is not a free cursor-only extension.
+
+For a healthy sibling b, a conditional feedback bound would be
+`D_b <= interval_b + residual_job_service + next_job_service + native_return`.
+The terms require executor, queue-capacity and native progress. With roughly
+constant interval Delta, ordinary sibling jobs can be bounded by approximately
+`1 + T/Delta`; sparse cumulative jobs still have multiple chunks and may be
+expensive. Neither formula proves that a given asymmetric return cut suffices.
+
+The decisive counterexample is an ingress whose reverse direction blackholes
+while another return path works. Immediate fanout can deliver after T_b;
+deferring b adds its eligibility interval and service. No reduction of unknown
+return-path copies can universally preserve the earliest available feedback
+time. At500Mbps,100ms extra feedback delay requires about6.25MB additional
+pipeline authority; enlarging windows to conceal that cost is not a fix.
+This model is therefore not selected as a latency-neutral optimization. No
+new timer, PTO multiplier, threshold, native policy or RFC rule is installed.
+
+Actual integration constraints, not speculative new release obligations:
+
+- Server routing knows exact ingress but enqueues Frame without that identity;
+  its shared ingress hint can be overwritten by the next queued arrival before
+  the first is applied. A prompt-ingress policy cannot use that hint as proof.
+- Global last-feedback timestamps can be renewed by primary activity and
+  cannot own independent sibling deadlines.
+- Current cumulative cursor resets on every new generation. A one-slot
+  attachment facing continuous generations can restart a multi-chunk job.
+  Existing immediate fanout must not be silently replaced with that deferred
+  service pattern and then patched with another timeout.
+- Client retains one application-write future while servicing some controls;
+  server awaits write before ACK/MAX. Neither branch already implements the
+  complete proposed per-attachment deadline/credit service contract.
+- New attachment, partial catch-up, duplicate receipt, FIN, RESET and ordered
+  exact-incarnation detach need explicit obligations. No obligation creates
+  received bytes or grants capacity before application consumption.
+
+These are source-audited prerequisites for that alternative, not attribution
+of all current stalls or independent implementation tasks. It remains deferred.
+
+### Same-publication ACK/credit pairing: insufficient reachability evidence
+
+Server enqueue_tcp_recv_progress can produce ACK and MAX after one receive/
+write boundary. Dominant client download deliberately emits ACK before local
+write and MAX afterward. Those are not one publication event. Combining them
+would require delaying the ACK or advertising unconsumed capacity; neither is
+authorized by a packet-count argument. The eligible same-call fraction is not
+measured, so total ACK/MAX counts do not forecast a material gain here.
+
+One protected record also does not imply atomic Product application. Received
+MAX bypasses the ACK FIFO through the latest-credit ingress introduced by
+83734b2. A composite must not restore that old coupling or discard newer credit
+because its ACK is already subsumed. Conversely, extracting MAX before ACK
+assigned-extent validation is not an atomic combined transaction. Same-event
+pairing is distinct from both rejected receipt batching and writer-ready
+packetization, but that distinction is not enough to select it. No wire or
+command variant is added.
+
+### Next discriminator: separate ACK fanout from credit fanout
+
+The combined ablation cannot identify whether repeated receipt copies, repeated
+credit copies, or their interaction dominates the observed collapse. This
+question can change the owner/model decision without implementing either
+alternative above. Reuse its feature-only local intervention with separate
+ACK and MAX selectors, retaining all data paths and normal server behavior.
+Compare one env-unset control, TCP-MAX withheld only, and TCP-ACK withheld only
+using the same frozen binary and unchanged40s500/10 return-restriction profile.
+Withholding either kind is deliberately unsafe under failure of the chosen
+return path and is diagnostic only. Do not treat these as candidate policies.
+
+Information forecast: a large benefit from MAX suppression alone focuses the
+next proof on shared-credit publication, not ACK timing. A benefit from ACK
+suppression alone focuses receipt publication. Similar gains from either or
+poor individual gains leave interaction/saturation rather than a unique owner;
+retain that uncertainty instead of declaring one cause. Lower return bytes
+without better gaps/loaded latency is not a useful performance result. Keep
+all phases, failed/censored work and CPU/RSS/queue cost. Existing total fanout
+result is context, not a fourth matched cell. No guessed numerical pass gate,
+new controller or repeat-until-green. Freeze and reverse the observer source
+before runs; ordinary runtime and all prior independent recovery remain intact.

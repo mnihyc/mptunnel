@@ -277,3 +277,107 @@ These observations do not justify simple batching or undoing independent
 publication: that publication fixed actual selected-wire-blackhole stalls.
 Any next service-model change must preserve that availability invariant and
 address the observed cost without promoting either diagnostic to acceptance.
+
+## Diagnostic follow-up: current scoped feedback queue ownership
+
+Recorded: 2026-09-09. `mixed-combined-down-scoped-feedback-queue-0909`
+observes restored ordinary `b2aa215`, **not** the rejected ready-receipt
+candidate. The three-file feature observer was frozen as
+`.tmp/reflection/bin/scoped-feedback-queue-20260909/mptunnel`, then its source
+was reversed before this run. The [exact patch](SCOPED_FEEDBACK_QUEUE_20260909.patch)
+and [raw archive](SCOPED_FEEDBACK_QUEUE_20260909.raw.tar.gz) retain classification,
+all records, 40 body bins, echo attempts, service samples and reproduction logs.
+The unchanged profile is DOWN 500, UP 500→10→500 Mbps during 15–25 s, 30/70 ms delay,
+zero configured jitter/loss, no blackhole, with the same burst/queue bounds.
+
+Question: after scoped encoding, how much feedback still has newer same-kind
+work pending at the cancellable MPP queue boundary, rather than already being
+taken by a native writer? Earlier pre-scoped overlap percentages cannot answer
+this. All StreamAck frames share one observed kind regardless of scope presence;
+MAX is separate. Same-stream Data/lifecycle boundaries separate observation
+groups. Admission ordinals are not receive/publication generations. An older
+independently meaningful scoped ACK may contain facts absent from a newer one.
+
+All **160 queue summaries** (80 per role) satisfy
+`accepted = taken + dropped + pending`. Cumulative counters are monotonic;
+newer counts/support stay within taken counts/support. Every observed ACK has
+one range, so accepted/taken/dropped/newer range totals equal their frame
+totals, and the residual accepted−taken−dropped range count equals pending.
+MAX has zero range support. Every encoded ACK's scope-present plus scope-absent
+counts and range-bin sum equal its frame count; zero multi-range ACKs occur.
+
+| Last queue summary | Accepted | Taken | Taken with newer | Dropped | Pending / peak |
+|---|---:|---:|---:|---:|---:|
+| Client ACK | 395,277 | 395,272 | 101,756 (25.743%) | 5 | 0 / 121 |
+| Client MAX | 283,701 | 283,699 | 82,153 (28.958%) | 2 | 0 / 112 |
+| Server ACK | 155 | 155 | 0 | 0 | 0 / 2 |
+| Server MAX | 159 | 159 | 0 | 0 | 0 / 2 |
+
+Client last queue sequences 593/594 are at Unix 1788924688478; server 357/358
+at 1788924688161. Both report zero live stream keys/groups. These are last
+event-driven reports, not an independent shutdown flush. Take means leaving
+the observed MPSC boundary through `into_parts`, not a successful or irreversible
+native send. Pre-take cancellation is dropped; later writer queuing/cancellation
+is outside this shadow. Unflagged work cannot all be labeled native-owned.
+
+Actual UP 10 Mbps snapshots are rows 16–25, Unix 1788924662982→1788924671982 using
+the conservative endpoint timestamp bounds; the next snapshot is UP 500 Mbps at
+1788924672981/2982. Strictly interior client same-kind deltas span
+**1788924663162→1788924671337**, 8,175 ms:
+
+| Counter interval | Delta taken / encoded frames | Delta newer / encoded bytes | Opportunity / rate |
+|---|---:|---:|---:|
+| Queue ACK, sequences 218→338 | 58,064 | 11,365 newer | 19.573% |
+| Queue MAX, sequences 219→339 | 44,437 | 9,157 newer | 20.607% |
+| Encoded ACK, sequences 224→344 | 58,064 | 1,604,668 B | 1.570317 Mbps |
+| Encoded MAX, sequences 225→345 | 44,436 | 1,155,336 B | 1.130604 Mbps |
+
+ACK newer range-support share is likewise 19.573%, not the old pre-scoped
+~30% restricted share. Server queue sequences 132→204 / 133→205, Unix
+1788924663128→1788924671135, take 28 ACKs and 28 MAX records with zero newer
+opportunities. Its codec intervals at 1788924663235→1788924671246 encode
+26 ACKs/624 B and 26 MAX records/676 B. Do not combine unlike timestamps or
+expect queue-take and codec counts to agree at every snapshot.
+
+Last client codec sequences 599/600 at 1788924688478 count 395,272 ACKs /
+10,930,139 B (maximum 34 B, 11,316 scope-present and 383,956 scope-absent)
+and 283,705 MAX records / 7,376,330 B (maximum 26 B). Last server codec
+sequences 352/353 at 1788924687258 count 151 ACKs/3,619 B, all scope-absent,
+and 159 MAX records/4,134 B. Scope presence is evidence geometry, **not** the
+former complete/incomplete replacement authority. Codec and queue boundaries
+are different; their totals must not be forced into false equality. Encodings
+are not successful wire writes, omit native ACKs/retransmission/transport
+overhead, and can precede cancellation or failure. Client global same-kind ACK
+peak is 3.514896 Mbps at 1788924686341→1788924687341, after restoration; MAX
+peak 2.920112 Mbps is at 1788924681339→1788924682339, also after restoration.
+
+Preserved diagnostic service: 1,731,074,820 body bytes / 40.002060415 s =
+346.197131 Mbps; raw 5–15/15–25/25–40 s means 436.312/202.112/396.835 Mbps.
+First body 0.595011184 s; maximum gap 0.779959798 s at
+16.890748491→17.670708289, bytes 815,621,448→815,633,448. All 76 attempted
+echoes succeed, p50/p95/max 303.244/742.800/995.736 ms; worst attempt 41 is
+21.419820918→22.415557398 s. One duration-partial HTTP 200, zero completed
+8 GiB bodies, no disconnection; exit 0 and empty probe stderr. This is not an
+ordinary performance comparison, despite exposing a continued service deficit.
+
+Telemetry has 41 rows, elapsed 0.000054160→40.005504289 s. DOWN class deltas
+are 2,118,091,892 B / 1,556,263 packets; UP 72,565,559 B / 640,364 packets;
+zero drops both ways. Peak DOWN/UP backlog is 22,681,132/946,665 B. Restricted
+row 16→25 drains 10,890,673 UP bytes / 9.000961404 s = 9.679564 Mbps, with
+205,511–946,665 B sampled backlog. Same-epoch restricted native ACKed deltas
+are server TCP 138,846,446 B / QUIC 141,161,991 B and client TCP 3,664,452 B /
+QUIC 1,238,771 B; all four carriers remain active. Client RSS peak/last is
+89,624/86,900 KiB; server 416,244/377,524 KiB; peak/last lifetime CPU 101/191%.
+Prior sequential-window, native-byte, offload and CPU/RSS caveats still apply.
+
+Information outcome: the current cancellable overlap is real but only roughly
+20% during restriction, versus about 26–29% over the full observed run. It is
+a generous schedule-dependent opportunity, **not** safe substitution count,
+byte savings, attainable wire reduction or predicted throughput gain. It is
+not an upper bound for every later ownership stage. Combining
+scoped facts could retain all older support and save less; already-taken work
+cannot be erased by later queue replacement. The observer itself adds locking,
+bookkeeping and logging overhead. These counters answer the ownership-boundary
+question without accepting a queue-latest policy or reopening rejected receipt
+batching. Any next model needs its own fact/ownership proof and material gain
+forecast; the global ledger owns that decision. No release promotion follows.

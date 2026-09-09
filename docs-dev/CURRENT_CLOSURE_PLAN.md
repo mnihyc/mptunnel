@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 11:15 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 12:03 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,91 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Model review / next discriminator12:03:** the scoped queue result and source
+audits are retained in SCOPED_ACK_SERVICE_MODEL's publication-alternatives
+section. Deferred independent feedback necessarily adds latency under unknown
+asymmetric failure, needs finite jobs/nonrenewing per-incarnation service, and
+is not selected as a free optimization. Same-event ACK/MAX pairing also is not
+selected: dominant client ACK is prewrite and MAX postwrite, while received
+MAX intentionally bypasses ACK FIFO. No runtime/RFC change follows either.
+
+The next small causal question separates the already-proven combined fanout
+cost: same feature binary, env-unset control, TCP-MAX withheld only, TCP-ACK
+withheld only. Reuse the existing one-file ablation with independent selectors;
+preserve all data carriers, server behavior, generation state, profile and
+receiver probes. Freeze and reverse before running. Information forecast and
+falsifiers are in the model: a large one-kind benefit focuses that owner;
+nonseparable/weak/adverse results do not justify a policy. These are unsafe
+diagnostic interventions, never ordinary candidates. Root alone builds/runs.
+No batching/timer/controller changes or public performance claims.
+
+**Scoped queue result11:39:** feature observer builds cleanly in2m04, frozen
+and fully reversed before one mixed capture. Ordinary runtime remainsb2aa215.
+All160client/server queue summaries conserve counts; captured ACK range weights
+and scope/bin counts reconcile. During strict8.175s actualUP10 interior, newer
+same-kind work is pending at19.573%of ACKtakes and20.607%of MAXtakes, below
+the old pre-scoped~31% assumption. Whole25.743%/28.958% is not the restricted
+answer. All capturedACKs have one range; ACK/MAX encoding1.570/1.131Mbps.
+Diagnostic phases436.312→202.112→396.835Mbps; .779960s bodygap,76/76echoes,
+p95/max742.800/995.736ms. UP still9.680Mbps with205511–946665B queued,
+zero drops. Timing is observer-affected and not an ordinary candidate result.
+
+Qualification: take is into_parts, not successful native writing. The unflagged
+remainder is not proved irreversibly native-owned; newer ordinals are neither
+fact subsumption nor saved-wire estimates. Current measurements justify no
+blanket last-ACK-wins map and no throughput forecast from20% alone. Standalone
+queue replacement stays DEFERRED: it does not address most per-receipt fanout,
+safe removable facts are unmeasured, and receipt batching's ordinary latency
+failure forbids assuming all coalescing is harmless. Do not implement it as a
+small apparently safe patch or compensate with estimator parameters.
+
+Next bounded work is a publication MODEL, not runtime: separate prompt current
+receipt feedback from independent per-attachment recovery obligations without
+renewable deadlines or abandoning5e1ace67's blackhole protection. Reuse existing
+native timing/eligibility, no protocol preference or new guessed constant.
+Before selecting an implementation, explicitly cover exact server ingress,
+both-direction blocked local I/O, per-incarnation pending scope/generation,
+partial catch-up that cannot restart forever, new/terminal attachments and
+unknown/asymmetric/failing return paths. Compute conditional traffic and delay
+bounds and identify an actual consumer/caller counterexample for any necessary
+change. Earlier ingress-prompt/deferred-backup concerns are prerequisites for
+this model, not a new issue inventory. A model that needs a timing tradeoff
+must state it; receipt equality alone is no longer a latency forecast.
+The causal all-fanout ablation supports potentially material benefit, not this
+model's safety. No RFC/runtime edits, new frames, timers or controller settings
+are authorized until the full bounded obligation model and falsifiers are read.
+
+**Next bounded discriminator11:22 — current queued feedback ownership:**
+receipt candidate is rejected and archived at89911ab; ordinary source remains
+b2aa215, with no new receiver policy. Existing scoped ordinary/header captures
+still establish material mixed return cost; the unsafe fanout ablation gives a
+causal benefit but cannot replace independent-path recovery protection.
+Question: after scoped encoding, how much ACK/MAX work still sits at a
+cancellable MPP queue boundary with newer same-kind work pending, versus being
+already irreversibly owned by a native writer? Old26–31%queue overlap predates
+scoped ACKs and cannot answer this. Current old-frame encoding and native/header
+cost compete with cancellable duplication; no queue-latest implementation yet.
+
+Reuse the exact existing three-file queue/codec observer, adapting classification
+to wire14 ACKs (all independently meaningful), never treating scope=None/Some
+as the old complete/incomplete replacement authority. Count queued/taken/drop/
+pending conservation and newer same-kind work between unchanged per-stream
+barriers. Keep MAX separate; ACK counts are only a generous opportunity bound,
+not proof of subsumption or saved bytes. New scoped ACKs can omit older facts.
+No payload retention, Product decisions, timers, wire format or limits change.
+Freeze the feature build, preserve exact patch, then reverse all observer source
+before one identical mixed return-restriction diagnostic run. Diagnostic timing
+is not an ordinary comparison. Root alone builds/runs; no compile/load overlap.
+
+Information forecast/falsifier: small current overlap defers queue replacement
+without spending a model/implementation loop; material overlap permits only a
+scoped-fact/ownership proof and quantitative cost forecast, not acceptance or a
+promised speedup. Observer overhead, invalid conservation or scope ambiguity
+limits that inference. No extra repeat, controller tuning or replay of rejected
+ready-feedback/receipt batching follows merely from a high counter. Preserve
+the diagnostic full timing/failures/cost alongside the counters. This remains
+the same existing mixed feedback/stall issue, not a new SEEN/UNSEEN inventory.
 
 **Receipt correction REJECTED11:15:** reversed-order healthy control→candidate
 406.710→412.076Mbps does not justify bodygap.273264→.385985s, p95echo
@@ -1685,13 +1770,13 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
   Frozen diagnostic:
   `./.tmp/reflection/bin/feedback-fanout-20260909/mptunnel`; its env-set wrapper
   is an intentionally unsafe causal intervention, never an ordinary candidate.
-  target/release currently contains the rejected receipt candidate. Do not use
+  target/release currently contains the scoped queue diagnostic. Do not use
   it as the restored ordinary comparator; use the frozen scoped-ack binary.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram last causal-result report:2026-09-09 02:47:33UTC; next nonurgent not
-  before03:48UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram rejection/queue-result report sent:2026-09-09 03:58UTC; next nonurgent
+  not before04:59UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

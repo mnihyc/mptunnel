@@ -584,6 +584,237 @@ fn retained_ack_retry_resumes_at_the_first_unaccepted_cumulative_chunk() {
 }
 
 #[test]
+fn retained_response_ack_catchup_services_newer_max_data_under_generation_churn() {
+    use crate::mux::stream::{ReliableRecvStream, ReliableSendStream, validate_stream_ack};
+    use crate::protocol::codec::{CodecLimits, decode_frame_bytes, encode_frame};
+    use crate::runtime::path::commands::{
+        ReliablePathCommandReceivers, reliable_path_command_pending_bytes,
+    };
+    use crate::runtime::stream::feedback::ReliableRecvProgress;
+    use bytes::Bytes;
+
+    fn take_frame(receivers: &mut ReliablePathCommandReceivers) -> Frame {
+        let command = try_recv_reliable_path_priority_command(receivers)
+            .expect("one actually admitted priority frame");
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        let ReliablePathCommand::SendFrame(frame) = command else {
+            panic!("expected an ordinary priority frame");
+        };
+        let encoded = encode_frame(&frame, CodecLimits::default()).expect("encode actual feedback");
+        let decoded = decode_frame_bytes(Bytes::from(encoded), CodecLimits::default())
+            .expect("decode actual feedback");
+        assert_eq!(decoded, frame);
+        decoded
+    }
+
+    fn apply_feedback(frame: &Frame, peer: &mut ReliableSendStream, truthful_acks: &[Frame]) {
+        match frame {
+            Frame::StreamAck {
+                stream_id,
+                scope_start,
+                ranges,
+            } => {
+                assert_eq!(*stream_id, peer.stream_id());
+                assert!(
+                    truthful_acks.contains(frame),
+                    "an immutable old tail must remain an exact producer-generated frame"
+                );
+                let ack = validate_stream_ack(*scope_start, ranges.clone(), peer.next_offset())
+                    .expect("feedback cannot exceed the actually assigned extent");
+                peer.apply_validated_ack(&ack).expect("apply real ACK");
+            }
+            Frame::StreamMaxData {
+                stream_id,
+                max_offset,
+            } => {
+                assert_eq!(*stream_id, peer.stream_id());
+                peer.update_max_offset(*max_offset);
+            }
+            _ => panic!("unexpected feedback frame: {frame:?}"),
+        }
+    }
+
+    let limits = MuxLimits::default();
+    assert_eq!(limits.max_ack_ranges, 256);
+    let stream_id = StreamId(7);
+    let (binding, a_key, mut a_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let b_key = alternate_key(UnderlayProtocol::Tcp);
+    let (b_commands, mut b_receivers) = reliable_path_command_channels(1);
+    assert_eq!(
+        binding.attach(
+            b_key.underlay,
+            b_key.path_id,
+            b_commands.clone(),
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    let a_instance = with_output_entry_for_key(&binding, a_key, |entry| entry.path_instance_id);
+    let b_instance = with_output_entry_for_key(&binding, b_key, |entry| entry.path_instance_id);
+    let mut received = ReliableRecvStream::new_with_initial_max_offset(stream_id, limits, 0);
+    let mut peer = ReliableSendStream::new_with_initial_max_offset(stream_id, limits, 0);
+    let mut progress = ReliableRecvProgress::default();
+    let mut truthful_acks = Vec::new();
+
+    // Both real outputs first advertise the window. No receipt or future input
+    // in this fixture relies on manufactured/unlimited sole-path credit.
+    let initial_max = limits.max_stream_window_bytes;
+    let initial = binding.publish_max_data(stream_id, initial_max);
+    assert_eq!(initial.published_offset, Some(initial_max));
+    assert!(!initial.pending);
+    received.commit_max_data(initial_max);
+    for receivers in [&mut a_receivers, &mut b_receivers] {
+        let frame = take_frame(receivers);
+        assert!(
+            matches!(frame, Frame::StreamMaxData { max_offset, .. } if max_offset == initial_max)
+        );
+        apply_feedback(&frame, &mut peer, &truthful_acks);
+    }
+
+    // Two two-chunk catch-up jobs plus a credit opportunity each: six actual
+    // queue slots, not a new runtime timeout or a throughput threshold.
+    let opportunities = 2 * (2 + 1);
+    let assigned_bytes = 2 * (limits.max_ack_ranges + 2 + opportunities);
+    peer.send_data(Bytes::from(vec![b'x'; assigned_bytes]))
+        .expect("assign every tested byte under the published shared window");
+    for index in 0..limits.max_ack_ranges {
+        received
+            .receive_data((2 * index) as u64, Bytes::from_static(b"x"))
+            .expect("receive a distinct baseline island");
+    }
+    assert_eq!(received.next_offset(), 1);
+    assert!(progress.should_send_ack(&received, None, TrafficClass::Throughput, limits, true));
+    let baseline = received.ack_frames();
+    assert_eq!(baseline.len(), 1);
+    truthful_acks.extend(baseline.clone());
+    let update = received.take_ack_update();
+    truthful_acks.extend(update.clone());
+    let first = binding.publish_ack(progress.ack_generation(), &update, &baseline);
+    assert!(first.published && !first.pending);
+    for receivers in [&mut a_receivers, &mut b_receivers] {
+        apply_feedback(&take_frame(receivers), &mut peer, &truthful_acks);
+    }
+    let baseline_max = received.max_data_offset();
+    let first_credit = binding.publish_max_data(stream_id, baseline_max);
+    assert_eq!(first_credit.published_offset, Some(baseline_max));
+    assert!(!first_credit.pending);
+    received.commit_max_data(baseline_max);
+    for receivers in [&mut a_receivers, &mut b_receivers] {
+        apply_feedback(&take_frame(receivers), &mut peer, &truthful_acks);
+    }
+    b_commands
+        .try_enqueue_admitted_frame(Frame::Ping { nonce: 91 }, TrafficClass::Control)
+        .expect("temporarily occupy B's one real priority slot");
+
+    let old_higher = OffsetRange {
+        start: (2 * (limits.max_ack_ranges + 1)) as u64,
+        end: (2 * (limits.max_ack_ranges + 1) + 1) as u64,
+    };
+    let mut old_higher_seen = false;
+    let mut b_max_seen = baseline_max;
+    let mut b_trace = Vec::new();
+    for turn in 0..=opportunities {
+        // Closing one low hole frees consumed prefix credit. Adding a high
+        // island preserves two cumulative chunks throughout generation churn.
+        let low = received.next_offset();
+        let consumed = received
+            .receive_data(low, Bytes::from_static(b"x"))
+            .expect("consume the next missing prefix byte");
+        assert_eq!(
+            consumed
+                .delivered
+                .iter()
+                .map(|chunk| chunk.len())
+                .sum::<usize>(),
+            2
+        );
+        let high = 2 * (limits.max_ack_ranges + turn);
+        received
+            .receive_data(high as u64, Bytes::from_static(b"x"))
+            .expect("receive the newly assigned high island");
+        if turn == 0 {
+            received
+                .receive_data(old_higher.start, Bytes::from_static(b"x"))
+                .expect("create the old second-chunk receipt before B has capacity");
+        } else {
+            received
+                .receive_data((high + 2) as u64, Bytes::from_static(b"x"))
+                .expect("replace the merged range with one new high island");
+        }
+        assert!(progress.should_send_ack(&received, None, TrafficClass::Throughput, limits, true));
+        let generation = progress.ack_generation();
+        let cumulative = received.ack_frames();
+        assert_eq!(cumulative.len(), 2);
+        let update = received.take_ack_update();
+        assert_eq!(
+            update.len(),
+            1,
+            "A can remain caught up using one-frame deltas"
+        );
+        truthful_acks.extend(cumulative.clone());
+        truthful_acks.extend(update.clone());
+
+        // Match the real publisher and reconciliation order: ACK, then MAX.
+        let ack = binding.publish_ack(generation, &update, &cumulative);
+        assert!(
+            ack.published,
+            "unconstrained A publishes the current generation"
+        );
+        let desired_max = received.max_data_offset();
+        let credit = binding.publish_max_data(stream_id, desired_max);
+        assert_eq!(credit.published_offset, Some(desired_max));
+        received.commit_max_data(desired_max);
+        binding.retry_pending_ack(generation, &cumulative);
+        binding.retry_pending_max_data(stream_id);
+        for _ in 0..2 {
+            apply_feedback(&take_frame(&mut a_receivers), &mut peer, &truthful_acks);
+        }
+        assert!(try_recv_reliable_path_priority_command(&mut a_receivers).is_none());
+        assert_eq!(
+            peer.send_credit_bytes(),
+            desired_max as usize - assigned_bytes
+        );
+
+        let frame = take_frame(&mut b_receivers);
+        if turn == 0 {
+            assert_eq!(frame, Frame::Ping { nonce: 91 });
+            assert!(
+                ack.pending && credit.pending,
+                "B retains both unsent obligations"
+            );
+        } else {
+            match &frame {
+                Frame::StreamAck { ranges, .. } => {
+                    old_higher_seen |= ranges.iter().any(|range| {
+                        range.start <= old_higher.start && range.end >= old_higher.end
+                    });
+                }
+                Frame::StreamMaxData { max_offset, .. } => b_max_seen = b_max_seen.max(*max_offset),
+                _ => panic!("unexpected B feedback: {frame:?}"),
+            }
+            apply_feedback(&frame, &mut peer, &truthful_acks);
+            b_trace.push(frame);
+        }
+        assert!(try_recv_reliable_path_priority_command(&mut b_receivers).is_none());
+        assert_eq!(
+            with_output_entry_for_key(&binding, a_key, |entry| entry.path_instance_id),
+            a_instance
+        );
+        assert_eq!(
+            with_output_entry_for_key(&binding, b_key, |entry| entry.path_instance_id),
+            b_instance
+        );
+        assert!(binding.has_live_output());
+    }
+
+    assert_eq!(
+        (old_higher_seen, b_max_seen > baseline_max),
+        (true, true),
+        "one-slot B must serve both its old higher ACK receipt and newer shared credit; trace={b_trace:?}"
+    );
+}
+
+#[test]
 fn retained_ack_publication_status_excludes_a_detached_fence() {
     let stream_id = StreamId(7);
     let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);

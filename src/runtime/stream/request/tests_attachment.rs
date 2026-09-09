@@ -32,8 +32,20 @@ fn opened_stream_at(
     mpsc::Sender<Result<Frame, RuntimeError>>,
     ReliablePathCommandReceivers,
 ) {
+    opened_stream_at_with_command_capacity(stream_id, path_index, 4)
+}
+
+fn opened_stream_at_with_command_capacity(
+    stream_id: StreamId,
+    path_index: usize,
+    command_capacity: usize,
+) -> (
+    OpenedRemoteStream,
+    mpsc::Sender<Result<Frame, RuntimeError>>,
+    ReliablePathCommandReceivers,
+) {
     let limits = MuxLimits::default();
-    let (commands, receivers) = reliable_path_command_channels(4);
+    let (commands, receivers) = reliable_path_command_channels(command_capacity);
     let (frames_tx, frames_rx) = mpsc::channel(4);
     let stream = ReliablePathStream {
         stream_id,
@@ -54,6 +66,235 @@ fn opened_stream_at(
         frames_tx,
         receivers,
     )
+}
+
+#[tokio::test]
+async fn skipped_ack_backup_completes_old_sparse_facts_under_generation_churn() {
+    use crate::mux::stream::{ReliableRecvStream, ReliableSendStream, validate_stream_ack};
+    use crate::protocol::codec::{CodecLimits, decode_frame_bytes, encode_frame};
+    use crate::protocol::frame::offset_ranges_not_covered;
+    use crate::runtime::stream::feedback::ReliableRecvProgress;
+
+    fn take_frame(receivers: &mut ReliablePathCommandReceivers) -> Frame {
+        let command = try_recv_reliable_path_command(receivers).expect("one real queued frame");
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        let ReliablePathCommand::SendFrame(frame) = command else {
+            panic!("expected an ordinary frame command");
+        };
+        let encoded = encode_frame(&frame, CodecLimits::default()).expect("default codec limits");
+        let decoded = decode_frame_bytes(Bytes::from(encoded), CodecLimits::default())
+            .expect("decode the actually published frame");
+        assert_eq!(decoded, frame);
+        assert!(
+            try_recv_reliable_path_command(receivers).is_none(),
+            "the one-slot queue admitted exactly one frame"
+        );
+        decoded
+    }
+
+    fn apply_truthful_ack(
+        frame: &Frame,
+        received: &ReliableRecvStream,
+        peer: &mut ReliableSendStream,
+    ) {
+        let Frame::StreamAck {
+            stream_id,
+            scope_start,
+            ranges,
+        } = frame
+        else {
+            panic!("expected actual ACK publication");
+        };
+        assert_eq!(*stream_id, peer.stream_id());
+        let positives = received.ack_ranges();
+        assert!(offset_ranges_not_covered(ranges, &positives).is_empty());
+        if let Some(start) = scope_start {
+            let end = ranges.last().expect("nonempty scoped ACK").end;
+            let received_in_scope = positives
+                .iter()
+                .filter_map(|range| {
+                    let start = range.start.max(*start);
+                    let end = range.end.min(end);
+                    (start < end).then_some(OffsetRange { start, end })
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                offset_ranges_not_covered(&received_in_scope, ranges).is_empty(),
+                "a scoped omission must not deny any actually received byte"
+            );
+        }
+        let ack = validate_stream_ack(*scope_start, ranges.clone(), peer.next_offset())
+            .expect("ACK is valid against the real assigned extent");
+        peer.apply_validated_ack(&ack)
+            .expect("release only positively acknowledged Product bytes");
+    }
+
+    let limits = MuxLimits::default();
+    assert_eq!(limits.max_ack_ranges, 256);
+    let baseline_ranges = limits.max_ack_ranges;
+    let missed_generations = 2;
+    let fallback_generations = 3;
+    let total_ranges = baseline_ranges + missed_generations + fallback_generations;
+    let old_missing = OffsetRange {
+        start: (2 * baseline_ranges) as u64,
+        end: (2 * baseline_ranges + 1) as u64,
+    };
+
+    // The unchanged always-fanout control must pass before the selective-lag
+    // assertion. Selection itself is not implemented by this fixture.
+    for skip_backup in [false, true] {
+        let stream_id = StreamId(if skip_backup { 818 } else { 817 });
+        let (a, _a_input, mut a_commands) = opened_stream_at_with_command_capacity(stream_id, 0, 1);
+        let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(a, 4);
+        let (b, _b_input, mut b_commands) = opened_stream_at_with_command_capacity(stream_id, 1, 1);
+        assert_eq!(
+            remotes.attach_candidate(b),
+            ReliableRelayAttachOutcome::Attached
+        );
+        for commands in [&mut a_commands, &mut b_commands] {
+            assert!(matches!(take_frame(commands), Frame::PathProofData { .. }));
+        }
+        let a_instance = remotes.paths[0].instance();
+        let b_instance = remotes.paths[1].instance();
+        let mut received = ReliableRecvStream::new(stream_id, limits);
+        let mut progress = ReliableRecvProgress::default();
+        let mut a_peer = ReliableSendStream::new(stream_id, limits);
+        a_peer
+            .send_data(Bytes::from(vec![b'x'; total_ranges * 2]))
+            .expect("real assigned bytes contain every sparse receipt");
+        let mut b_peer = a_peer.clone();
+        for index in 0..baseline_ranges {
+            received
+                .receive_data((2 * index) as u64, Bytes::from_static(b"x"))
+                .expect("admit a distinct baseline island");
+        }
+        assert_eq!(received.ack_range_summary().count, baseline_ranges);
+        assert!(progress.should_send_ack(&received, None, TrafficClass::Throughput, limits, true));
+        assert_eq!(progress.ack_generation(), 1);
+        let baseline = received.ack_frames();
+        assert_eq!(baseline.len(), 1);
+        let publication =
+            remotes.publish_stream_ack(1, received.take_ack_update(), baseline.clone());
+        assert!(publication.published && !publication.pending);
+        for (commands, peer) in [
+            (&mut a_commands, &mut a_peer),
+            (&mut b_commands, &mut b_peer),
+        ] {
+            let frame = take_frame(commands);
+            assert_eq!(frame, baseline[0]);
+            apply_truthful_ack(&frame, &received, peer);
+        }
+        assert!(!remotes.paths[1].stream_ack_publication.is_pending(1));
+
+        // Hold the same path object outside this test's publication enumeration,
+        // not an actual detach/replacement: its exact incarnation and accepted
+        // baseline cursor survive. This simulates only the proposed suppression.
+        let skipped = skip_backup.then(|| remotes.paths.remove(1));
+        for index in baseline_ranges..baseline_ranges + missed_generations {
+            received
+                .receive_data((2 * index) as u64, Bytes::from_static(b"x"))
+                .unwrap();
+            assert!(progress.should_send_ack(
+                &received,
+                None,
+                TrafficClass::Throughput,
+                limits,
+                true
+            ));
+            let update = received.take_ack_update();
+            assert_eq!(update.len(), 1, "one incremental frame per sparse receipt");
+            assert_eq!(
+                received.ack_frames().len(),
+                2,
+                "catch-up exceeds one queue slot"
+            );
+            let publication = remotes.publish_stream_ack(
+                progress.ack_generation(),
+                update.clone(),
+                received.ack_frames(),
+            );
+            assert!(publication.published && !publication.pending);
+            let frame = take_frame(&mut a_commands);
+            assert_eq!(frame, update[0]);
+            apply_truthful_ack(&frame, &received, &mut a_peer);
+            if skip_backup {
+                assert!(try_recv_reliable_path_command(&mut b_commands).is_none());
+            } else {
+                let frame = take_frame(&mut b_commands);
+                assert_eq!(frame, update[0]);
+                apply_truthful_ack(&frame, &received, &mut b_peer);
+            }
+        }
+        if let Some(skipped) = skipped {
+            assert_eq!(skipped.instance(), b_instance);
+            assert!(!skipped.stream_ack_publication.is_pending(1));
+            remotes.paths.push(skipped);
+        }
+        assert_eq!(
+            b_peer.has_unacknowledged_ranges(&[old_missing]),
+            skip_backup
+        );
+        drop(
+            remotes
+                .remove_path_instance(a_instance)
+                .expect("A becomes unavailable"),
+        );
+        assert_eq!(remotes.path_instances(), vec![b_instance]);
+
+        let mut fallback_trace = Vec::new();
+        for index in baseline_ranges + missed_generations..total_ranges {
+            received
+                .receive_data((2 * index) as u64, Bytes::from_static(b"x"))
+                .unwrap();
+            assert!(progress.should_send_ack(
+                &received,
+                None,
+                TrafficClass::Throughput,
+                limits,
+                true
+            ));
+            let update = received.take_ack_update();
+            assert_eq!(update.len(), 1);
+            assert_eq!(received.ack_frames().len(), 2);
+            let publication = remotes.publish_stream_ack(
+                progress.ack_generation(),
+                update,
+                received.ack_frames(),
+            );
+            assert!(
+                publication.accepted,
+                "B admits real work on every generation"
+            );
+            let frame = take_frame(&mut b_commands);
+            apply_truthful_ack(&frame, &received, &mut b_peer);
+            let Frame::StreamAck {
+                scope_start,
+                ranges,
+                ..
+            } = frame
+            else {
+                unreachable!("truth check requires an ACK");
+            };
+            fallback_trace.push((
+                scope_start,
+                ranges.len(),
+                ranges.first().map(|range| range.start),
+                ranges.last().map(|range| range.end),
+            ));
+            // A new sparse generation arrives before the next available slot.
+            // There is no extra same-generation service between these calls.
+        }
+        assert_eq!(progress.ack_generation(), 6);
+        assert_eq!(fallback_trace.len(), fallback_generations);
+        assert!(
+            !b_peer.has_unacknowledged_ranges(&[old_missing]),
+            "skip_backup={skip_backup}: three one-slot services must finish the older two-chunk catch-up; (scope, range_count, first_start, last_end): {fallback_trace:?}"
+        );
+        if !skip_backup {
+            assert!(!b_peer.has_unacknowledged_ranges(&received.ack_ranges()));
+            assert!(!remotes.has_pending_stream_ack_publication());
+        }
+    }
 }
 
 // The receive boundary starts at actually published/decoded Product frames;

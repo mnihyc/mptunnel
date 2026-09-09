@@ -604,3 +604,126 @@ claimed from the ordinary snapshots. All trial source/RFC/tests are reversed;
 no reduced quantum, PTO adjustment or estimator change rescues this candidate.
 The scoped-ACK comparator is restored. Continue the existing architectural
 owner, not this rejected cadence branch or a new list of hypothetical defects.
+
+## Confirmed return service candidate — 2026-09-10 00:27 +08:00
+
+This is a model gate, not runtime acceptance. Same-build suppression already
+establishes a material redundant publication cost; no new baseline calibration
+is needed. The prior checkpoint/replay sketch is NOT selected: losing its
+confirmation could leave newer facts on the failed primary forever, and an
+old receipt could not cancel newer snapshot coverage. The smaller model below
+never reclaims receipt facts based on its service confirmation.
+
+Default state is the existing independent full fanout. A receipt from an exact
+live stream owner, after preceding ACK/MAX transactions on that same ordinary
+FIFO, can establish a return output for immediate subsequent publication.
+Per-output complete cumulative baseline and subsequent-delta ancestry remain
+real admission facts; another output's generation is never borrowed. Selection
+uses the probed feedback output, not the opposite path carrying the receipt.
+First and terminal feedback retain prompt full fanout. Ordinary ACK timing,
+scoped truths, MAX-after-consumption and native controllers are unchanged.
+
+Each current output-validation attempt captures its exact incarnation, token,
+ACK generation and MAX offset separately, and a deadline frozen when feedback
+first needs proof, even if marker admission is blocked. More DATA/MAX, changed
+RTT and retries cannot extend it. Expiry is processed before a simultaneously
+late receipt. Missing proof, closed admission or detach restores full fanout
+and wakes retained latest ACK/MAX retries immediately. Every subsequent fact
+continues to fan out while proof is missing. Old tokens cannot renew selection.
+New proof is needed only when newer feedback exists; quiescence is not a new
+periodic heartbeat requirement. Feedback never waits for proof to be applied.
+
+The marker must share ACK/MAX's ordinary priority-frame FIFO/native stream,
+not a higher-priority lane or QUIC repair stream. A logical actor replies after
+preceding transactions, including valid already-subsumed ACKs. A marker is an
+ordered feedback-batch boundary. Raw path Ping/Pong/PathProof is insufficient:
+registry routing can report success after dropping an unknown/closed stream.
+Aggregate/platform-optional TCP ACK counters and local QUIC write completion
+are likewise not exact logical receipts. Two explicit stream-scoped wire kinds
+may be required; do not repurpose requalification or native sampling evidence.
+Replies do not elicit replies. Retain bounded pending response service when
+its output queue is full; losing a reply must cause only baseline duplication,
+never lost credit, stopped newer feedback or an ACK loop.
+
+Conditional failure cost is the frozen native proof interval plus actual
+alternate publication/queue/transport service. Silent loss and delayed service
+are indistinguishable before evidence, so reduced healthy duplication cannot
+preserve literal zero-added-alternate-send delay. This is a deliberate policy
+tradeoff to test against the real selected-return-blackhole regression, not a
+promise that all apparent delay is unavoidable. No PTO multiplier, congestion
+gain, static protocol preference or fixed bottleneck group is introduced.
+
+### Necessary finite catch-up service
+
+Independent audit finds a new-mode counterexample in the current cursor:
+initially caught-up B is skipped, then A fails; B needs two cumulative chunks.
+One slot per new sparse generation repeatedly admits chunk zero because each
+generation resets next_cumulative_frame. Higher old facts can starve although
+the always-fanout control could have kept B current with one-frame deltas.
+This must be reproduced before implementation; remaining in full-fanout mode
+is not by itself a proof of equivalent recovery after deliberately creating lag.
+
+Proposed bounded correction: retain only the unsent immutable tail and target
+generation of one current job per exact attachment. Successfully admitted
+prefix chunks immediately leave that job. A new desired generation cannot
+reset it; finish it, then bridge to latest desired state using complete
+cumulative evidence if intervening generations were missed. A partially sent
+incremental update may retain its own immutable tail only with its proven prior
+baseline. Every frame remains independently truthful under existing scoped ACK.
+Finite existing frame count, not a moving live-ledger horizon, bounds each job.
+No per-generation journal or whole-history reference may survive job completion.
+
+This is an explicit memory/service tradeoff: at default65,536retained ranges
+and256per frame, a job has at most256chunks and roughly1MiB range payload;
+four distinct blocked jobs can retain4MiB,64can retain64MiB per direction/stream.
+The common one-frame immediate case retains nothing additional. Sharing a
+snapshot does not guarantee sharing when outputs lag at different generations.
+These bounds exclude allocator/queued-frame overhead and are NOT a global RAM
+bound. Measure actual retained tails and ordinary RSS/cleanup; do not disguise
+cost with a new limit or call it negligible. Completion must leave independent
+MAX service possible; ACK job service cannot endlessly consume every freed slot.
+
+### Smallest transaction and falsifiers
+
+The two real REDs now reproduce both partial-ACK restart and per-output MAX
+starvation (00:52 +08, log in CURRENT_CLOSURE_PLAN). A finite ACK job alone is
+insufficient: another unconstrained output can keep granting shared credit
+while the constrained output spends every freed slot on ACKs. This is not an
+infinite-data claim about an isolated zero-credit sender.
+
+Use a shared latest ACK/MAX owner and one fair service operation. Server ACK
+cumulative ownership moves from the actor to output state rather than being
+copied. With both kinds pending, alternate successful ACK-chunk and latest-MAX
+admissions per exact output; unsuccessful queue admission advances neither.
+Finite ACK tails therefore finish under repeated successful opportunities and
+newer credit receives service within two such opportunities. This is not a
+wall-clock network bound. Preserve immediate borrowed-frame fast path and
+drop each admitted tail frame's range storage. Continue while admission is
+ready, avoiding a lost-ready continuation. Every entrypoint returns both ACK
+status and newly admitted MAX offset. Callers commit actual receiver credit
+and refresh generation/terminal fences regardless of which kind triggered
+service. Otherwise this refactoring itself creates false flow-control errors
+or a stale terminal wait. Exact replacement/drop removes pending tail state.
+
+First real publisher/queue RED: initial baseline, selective lag, changed sparse
+generations, one-slot healthy alternate; verify higher positive receipt as well
+as exact frame truth and unchanged immediate-fanout control. Then complete the
+bounded-tail model and integration audit. Required opposite controls include
+partial delta, duplicate/new generations, no-capacity retries, new incarnation,
+subsumed ACK with new MAX, terminal/reset and retained-state teardown.
+
+The tail correction alone has no predicted gain in the captured one-range
+steady case. It prevents a concrete regression in the proposed publication
+policy. Combined gain remains unknown; unsafe withholding's266→399Mbps and
+2405→274ms restricted echo are opportunity evidence, not a promised result.
+After actual FIFO/proof/deadline/blocked-I/O controls, one ordinary asymmetric
+pair decides promotion. Only useful full timing/completion/cost results permit
+the existing selected-return-blackhole, healthy mixed and mirrored upload
+comparisons. No throughput-only promotion, quantum rescue or resource waiver.
+
+Standards context, not a proof of this MPP policy: RFC8684 §3.3.2 distinguishes
+connection Data ACK from native subflow ACK and permits reducing redundant
+Data ACK signaling; RFC9000 §13.2.3–4 discusses ACK-range retention and obtaining
+ACK receipt evidence. MPP still needs its own exact logical-owner contract.
+Sources: https://www.rfc-editor.org/rfc/rfc8684.html#section-3.3.2 and
+https://www.rfc-editor.org/rfc/rfc9000.html#section-13.2.3.

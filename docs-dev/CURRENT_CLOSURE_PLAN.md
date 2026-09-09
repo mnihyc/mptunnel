@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 23:55 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 00:52 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,73 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+### Selected next model gate — confirmed return service with baseline fallback
+
+00:52 prerequisite outcome: both real producer/queue tests fail at their
+intended assertions before runtime changes. The request backup repeats chunk
+zero three times, never acknowledges old [512,513); the response alternate
+receives old ACK evidence but no newer MAX in six service opportunities.
+The always-fanout request control passes first. Build103s, tests0.01s; evidence
+`./.tmp/reflection/return-service-prerequisites-red-0910.log`. An earlier
+fixture compile error named PathProof rather than actual PathProofData; it was
+corrected by tracing enrollment and is not counted as Product RED.
+
+Implement one joint feedback-service owner, not ACK-first retries plus a
+separate credit loop. Move the existing server cumulative ACK vector to the
+output owner beside latest MAX (no second copy). Each output retains only its
+unfinished ACK tail and alternates successful ACK-chunk/latest-MAX admissions
+when both need service. Failed admission does not advance the turn. Continue
+while capacity accepts work; no voluntary yield followed solely by a capacity
+wait. Every publication/retry returns BOTH effects: admitted MAX must commit
+receiver credit even from ACK retry, and ACK completion must refresh terminal
+fences even from MAX retry. Root/shared helper and disjoint direction adapters
+are one coherent prerequisite transaction. No runtime speed claim or native
+controller/cadence/pool change. Confirmed-return routing follows only after
+this mechanism and retained-state cost pass focused review.
+
+The matched Q/raw/H2 evidence and same-build feedback withholding already
+identify material redundant return publication; another baseline calibration
+would not change the decision. No new run was needed. Do not tune controllers,
+pool size, ACK cadence or packing. Root reversal checkpoint is5d2af0c.
+
+Evaluate the smaller confirmed-return contract appended to SCOPED_ACK_SERVICE_MODEL:
+feedback itself remains immediate and pipelined; a valid exact stream-owner
+probe receipt can select one return output. A nonrenewing missing-proof deadline
+restores ordinary full fanout for current AND all future ACK/MAX facts. Receipt
+loss cannot make new facts wait behind an old checkpoint. First/terminal fanout
+remains prompt. No confirmation-based data release, credit, estimator update,
+per-generation journal or frozen logical checkpoint is proposed. This revises
+the zero-added-alternate-delay policy explicitly; it is not equivalent cleanup.
+
+Independent review found a necessary prerequisite: a skipped backup may need
+multiple cumulative chunks, but the existing cursor restarts at chunk zero on
+every new generation. One slot per new sparse update can therefore starve old
+higher facts. This lag is deliberately induced by selective publication; merely
+calling old full fanout on expiry is insufficient. Prove this through the real
+producer/queue before any selected-return integration. The proposed correction
+retains only the unsent immutable tail of one in-progress job per attachment,
+finishes it despite newer generations, then serves the current desired state.
+Do not retain a separate frame history per generation or add timeout knobs.
+
+Cost is explicit, not free: worst-case retained range payload is roughly1MiB
+per blocked attachment under the65,536-range default, up to4MiB for four
+attachments or64MiB at64slots per directional stream, excluding overhead.
+Accepted prefixes leave the job; no snapshot is retained when immediate
+publication completes. Previously this cost was a reason not to call per-path
+snapshots negligible, not proof that a bounded tail is forbidden. Count actual
+retention and teardown in focused controls and ordinary RSS. Do not claim a
+whole-process memory bound from the per-stream bound. No resource limit is
+changed or silently borrowed. Further integration needs an explicit cost review.
+
+Forecast: the cursor correction alone is not expected to improve the captured
+one-range steady case. Its purpose is preventing a concrete recovery regression
+in the return-service trial. That combined trial could remove material fanout
+cost (diagnostic restricted266→399Mbps, worst echo2405→274ms), but neither that
+gain nor latency parity is promised. Falsifiers: unproven logical receipt, lost
+sparse facts, renewable deadline, stalled newer credit, unbounded retention or
+ordinary adverse timing. First action is one real-cursor/producer RED plus
+opposite controls, then model review; no broad benchmark or runtime stack.
 
 ### Current decision — reject logical ACK cadence; continue the existing owner
 

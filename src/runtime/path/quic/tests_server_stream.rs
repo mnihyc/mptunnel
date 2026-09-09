@@ -1058,7 +1058,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
             client_send,
             &Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: vec![fresh_range],
             },
             fixture.context.codec_limits,
@@ -1408,7 +1408,7 @@ async fn client_quic_closed_product_recipient_preserves_ordered_terminal_writer(
             &mut server_send,
             &Frame::StreamAck {
                 stream_id,
-                complete: true,
+                scope_start: None,
                 ranges: Vec::new(),
             },
             limits,
@@ -1517,7 +1517,7 @@ async fn client_quic_terminal_input_keeps_feedback_writer_until_owner_close() {
     commands_tx
         .send_control(ReliablePathCommand::SendFrame(Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: None,
             ranges: Vec::new(),
         }))
         .await
@@ -1526,7 +1526,7 @@ async fn client_quic_terminal_input_keeps_feedback_writer_until_owner_close() {
         udp_path_read_frame(&mut server_recv, codec_limits).await,
         Ok(Frame::StreamAck {
             stream_id: ack_stream_id,
-            complete: true,
+            scope_start: None,
             ..
         }) if ack_stream_id == stream_id
     ));
@@ -2065,7 +2065,7 @@ async fn server_quic_restart_reset_preserves_fresh_sibling_on_same_carrier() {
         {}
         let ack = Frame::StreamAck {
             stream_id: fresh_id,
-            complete: false,
+            scope_start: None,
             ranges: vec![
                 OffsetRange::new(0, payload.len() as u64).expect("fresh sibling payload range"),
             ],
@@ -3082,7 +3082,7 @@ async fn server_quic_ordered_close_drains_peer_until_stream_detach() {
         client_send,
         &Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: None,
             ranges: Vec::new(),
         },
         fixture.context.codec_limits,
@@ -3093,7 +3093,7 @@ async fn server_quic_ordered_close_drains_peer_until_stream_detach() {
         tokio::time::timeout(Duration::from_secs(5), product_stream.recv_frame()).await,
         Ok(Ok(Frame::StreamAck {
             stream_id: ack_stream_id,
-            complete: true,
+            scope_start: None,
             ..
         })) if ack_stream_id == stream_id
     ));

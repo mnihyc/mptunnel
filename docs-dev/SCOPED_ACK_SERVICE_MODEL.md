@@ -152,6 +152,9 @@ do not claim identical sample counts or estimator history from set equivalence.
 6. Retained-owner recovery above/outside observed scope stays available; ACK
    gaps, staleness and prepared-source synchronization consume explicit G.
 
-Disposition: symbolically selected subject to bounded source integration and
-these controls. No implementation or ordinary performance result is asserted
-by this document. Public RFC changes must describe the same authority model.
+Disposition09:54: the coherent wire-v14 model and affected1241checks now pass;
+the [first ordinary pair](SCOPED_ACK_ORDINARY_20260909.md) shows only partial
+benefit, with lower restored service and higher observed costs. Its performance
+promotion remains held. The proof above preserves the pre-change forecast and
+its assumptions; it is not a substitute for practical closure. RFC8.3 now
+describes the same independently scoped authority model.

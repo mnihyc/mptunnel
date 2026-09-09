@@ -8,7 +8,7 @@ use super::flow::{
     ReliableRelayFlowDecision, ReliableRelayFlowDemandTracker, ReliableRelayFlowPathEvidence,
     ReliableRelayFlowSignals,
 };
-use super::io::normalized_stream_ack_first_gap;
+use super::io::first_proven_ack_gap;
 use super::io::{
     AuthoritativeStreamAckSnapshot, ReadyStreamDataBatchBounds, ReadyStreamDataDirection,
     ReliableAckGapReinjectionProgress, ReliablePathStalenessObservation,
@@ -59,11 +59,9 @@ use crate::performance::MppPerformanceConfig;
 use crate::product::InboundId;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
+use crate::protocol::frame::reliable_stream_frame_extent;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::stream_ack_contiguous_frontier;
-use crate::protocol::frame::{
-    normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_extent,
-};
 use crate::protocol::{Frame, OffsetRange, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::error::reliable_path_error_is_migratable;
@@ -398,7 +396,7 @@ fn reliable_relay_current_data_ack_outstanding_bytes(
     _ack_frontier: u64,
 ) -> usize {
     // The retained send cache is the exact unique Product debt after all
-    // complete and incomplete DataACK releases. It applies in every lane.
+    // scoped and positive-only DataACK releases. It applies in every lane.
     send_stream.reinjection_bytes()
 }
 
@@ -593,7 +591,15 @@ impl ServerReceiveHoleDiagnostics {
         let now = Instant::now();
         let reorder_bytes = recv_stream.reorder_bytes();
         let ranges = recv_stream.ack_ranges();
-        let first_gap = normalized_stream_ack_first_gap(&ranges);
+        let first_gap = ranges
+            .first()
+            .filter(|range| range.start > 0)
+            .map(|range| (0, range.start))
+            .or_else(|| {
+                ranges.windows(2).find_map(|pair| {
+                    (pair[0].end < pair[1].start).then_some((pair[0].end, pair[1].start))
+                })
+            });
         if reorder_bytes > 0 && self.opened_at.is_none() {
             self.opened_at = Some(now);
             lab_diagnostic(
@@ -650,37 +656,6 @@ impl ServerReceiveHoleDiagnostics {
     }
 }
 
-// Server sparse ACK state
-// Sparse history belongs only to server-side request feedback. Keeping it out
-// of shared receive progress leaves the cloned response hot path cumulative.
-#[derive(Debug, Default)]
-struct RequestTcpSparseAckProgress {
-    acknowledged_ranges: Vec<OffsetRange>,
-}
-
-// Server receive-progress emission
-impl RequestTcpSparseAckProgress {
-    pub(in crate::runtime) fn ack_frames(
-        &mut self,
-        recv_stream: &ReliableRecvStream,
-        sparse_delta: bool,
-    ) -> Vec<Frame> {
-        let current_ranges = recv_stream.ack_ranges();
-        if !sparse_delta {
-            self.acknowledged_ranges = current_ranges;
-            return recv_stream.ack_frames();
-        }
-        let delta = offset_ranges_not_covered(&current_ranges, &self.acknowledged_ranges);
-        if delta.is_empty() {
-            return Vec::new();
-        }
-        let mut acknowledged = std::mem::take(&mut self.acknowledged_ranges);
-        acknowledged.extend(delta.iter().copied());
-        self.acknowledged_ranges = normalize_offset_ranges(acknowledged);
-        recv_stream.ack_delta_frames(&delta)
-    }
-}
-
 #[derive(Debug, Default)]
 struct ServerAckPublicationState {
     generation: u64,
@@ -717,7 +692,6 @@ fn enqueue_tcp_recv_progress(
     path_stream: &ReliablePathStream,
     recv_stream: &mut ReliableRecvStream,
     progress: &mut ReliableRecvProgress,
-    sparse_ack_progress: &mut RequestTcpSparseAckProgress,
     ack_publication: &mut ServerAckPublicationState,
     path: Option<PathSnapshot>,
     lane: TrafficClass,
@@ -727,11 +701,6 @@ fn enqueue_tcp_recv_progress(
     force_max_data: bool,
 ) -> bool {
     let mut sent_any = false;
-    let sparse_delta = !force_ack
-        && progress.has_sent_ack()
-        && lane.is_bulk()
-        && path.is_some_and(|snapshot| snapshot.underlay == UnderlayProtocol::Tcp)
-        && recv_stream.reorder_bytes() > 0;
     let previous_ack_generation = progress.ack_generation();
     if progress.should_send_ack(recv_stream, path, lane, mux_limits, force_ack) {
         let generation = progress.ack_generation();
@@ -746,31 +715,18 @@ fn enqueue_tcp_recv_progress(
         } else {
             #[cfg(feature = "lab-diagnostics")]
             let ack_started = Instant::now();
-            let mut ack_frames = sparse_ack_progress.ack_frames(recv_stream, sparse_delta);
-            // A sparse update can be empty when newly contiguous coverage was
-            // already represented by older positive ranges. Publish a cumulative
-            // snapshot for that generation so gap authority still advances.
-            let sparse_update_available = sparse_delta && !ack_frames.is_empty();
-            if !sparse_update_available {
-                ack_frames = recv_stream.ack_frames();
-            }
-            let cumulative_ack_frames = sparse_update_available.then(|| recv_stream.ack_frames());
+            let cumulative_ack_frames = recv_stream.ack_frames();
+            let ack_frames = recv_stream.take_ack_update();
             #[cfg(feature = "lab-diagnostics")]
-            let cumulative_ack_frame_count = cumulative_ack_frames
-                .as_ref()
-                .map_or(ack_frames.len(), Vec::len);
+            let cumulative_ack_frame_count = cumulative_ack_frames.len();
             #[cfg(feature = "lab-diagnostics")]
             lab_perf_record(
                 "mux.ack_frames",
                 ack_started.elapsed(),
                 cumulative_ack_frame_count,
             );
-            let publication = path_stream.publish_ack(
-                generation,
-                &ack_frames,
-                cumulative_ack_frames.as_deref().unwrap_or(&ack_frames),
-            );
-            let cumulative_ack_frames = cumulative_ack_frames.unwrap_or(ack_frames);
+            let publication =
+                path_stream.publish_ack(generation, &ack_frames, &cumulative_ack_frames);
             ack_publication.record_generation(
                 generation,
                 publication.published,
@@ -880,16 +836,15 @@ fn reliable_failed_original_tail_reinjection_ready(
 fn has_distinct_response_reinjection_alternative(
     path_stream: &ReliablePathStream,
     send_stream: &ReliableSendStream,
-    complete: bool,
-    ranges: &[OffsetRange],
+    gaps: &[OffsetRange],
     ack_frontier: u64,
 ) -> bool {
-    let preview = if stream_ack_ranges_expose_authoritative_gap(complete, ranges) {
+    let preview = if !gaps.is_empty() {
         send_stream
-            .retransmission_frames_for_normalized_ack_gaps(ranges, 1)
+            .retransmission_frames_for_ranges(gaps, 1)
             .into_iter()
             .next()
-    } else if complete && ack_frontier < send_stream.next_offset() {
+    } else if ack_frontier < send_stream.next_offset() {
         send_stream
             .retransmission_frames_for_ranges(
                 &[OffsetRange {
@@ -1466,16 +1421,14 @@ fn evaluate_server_data_ack_reinjection(
     mux_limits: MuxLimits,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))] stream_id: StreamId,
 ) -> ServerDataAckReinjectionOutcome {
-    let complete = authoritative_ack.complete();
-    let ranges = authoritative_ack.ranges();
+    let ranges = authoritative_ack.gaps();
     let base_limit =
         adaptive_reliable_relay_reinjection_bytes(send_path_snapshot, relay_lane, mux_limits);
-    let exposes_gap = stream_ack_ranges_expose_authoritative_gap(complete, ranges);
+    let exposes_gap = stream_ack_ranges_expose_authoritative_gap(ranges);
     let has_multipath_alternative = exposes_gap
         && has_distinct_response_reinjection_alternative(
             path_stream,
             send_stream,
-            complete,
             ranges,
             ack_frontier,
         );
@@ -1495,9 +1448,9 @@ fn evaluate_server_data_ack_reinjection(
             tail_recovery_deadline: None,
         };
     }
-    let original_flight = exposes_gap
-        .then(|| path_stream.data_ack_recovery_candidate(ack_frontier))
-        .flatten();
+    let original_flight = authoritative_ack
+        .first_gap()
+        .and_then(|gap| path_stream.data_ack_recovery_candidate(gap.start));
     let observation = (exposes_gap && has_multipath_alternative)
         .then(|| {
             response_sender.ack_gap_reinjection_path_snapshot(
@@ -1515,7 +1468,7 @@ fn evaluate_server_data_ack_reinjection(
     let target_reinjection_quantum = target.map_or(base_limit, |target| {
         adaptive_reliable_relay_reinjection_bytes(Some(target.snapshot), relay_lane, mux_limits)
     });
-    let frontier_extent = normalized_stream_ack_first_gap(ranges)
+    let frontier_extent = first_proven_ack_gap(ranges)
         .map_or(0, |(start, end)| flight_interval_bytes(start, end))
         .min(
             observation
@@ -1570,7 +1523,6 @@ fn evaluate_server_data_ack_reinjection(
     let recovery_deadline =
         observation.map(|observation| observation.owner_recovery_timing.fallback_at);
     let candidate_gap_deadline = progress.observe_recovery_timing(
-        complete,
         ranges,
         has_multipath_alternative,
         observed_gap_timing,
@@ -1580,7 +1532,7 @@ fn evaluate_server_data_ack_reinjection(
     );
     let measured_ready = candidate_gap_deadline.is_some_and(|deadline| observed_at >= deadline);
     let persistent_ready =
-        progress.reinjection_ready(complete, ranges, has_multipath_alternative, measured_ready)
+        progress.reinjection_ready(ranges, has_multipath_alternative, measured_ready)
             && target.is_some();
     let Some(target) = target.filter(|_| persistent_ready) else {
         return ServerDataAckReinjectionOutcome {
@@ -1598,7 +1550,7 @@ fn evaluate_server_data_ack_reinjection(
         };
     };
 
-    // A complete persistent gap proves missing Product order, not failure of
+    // An explicitly proven persistent gap establishes missing Product order, not failure of
     // the live native-reliable owner. The selected target's Product service
     // window is only a capacity ceiling; the ranked frontier below is the
     // publication authority. Stable-slot, retained-range, queue, and native
@@ -1620,7 +1572,7 @@ fn evaluate_server_data_ack_reinjection(
         frontier_limit,
         persistent_ready,
     );
-    let frames = normalized_stream_ack_first_gap(ranges)
+    let frames = first_proven_ack_gap(ranges)
         .and_then(|(frontier, _)| {
             let applied_extent = service_limit.min(
                 observation
@@ -1766,15 +1718,13 @@ impl TailReinjectionEnqueueOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enqueue_reliable_tail_reinjection_with_ack_horizon(
+fn enqueue_reliable_tail_reinjection_with_ack_gaps(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
     failed_original_ranges: &[OffsetRange],
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))] stream_id: StreamId,
     send_stream: &ReliableSendStream,
     last_send_ack_ranges: &[OffsetRange],
-    last_send_ack_complete: bool,
-    last_send_ack_horizon: Option<u64>,
     tail_reinjection_path_snapshot: Option<PathSnapshot>,
     relay_lane: TrafficClass,
     mux_limits: MuxLimits,
@@ -1837,21 +1787,12 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
             reinjection_cause = RelaySendCause::PathFailureReinjection;
         }
     }
-    let no_ack_frontier_failed_original_tail = last_send_ack_ranges.is_empty()
-        && last_send_ack_frontier == 0
-        && send_stream.next_offset() > 0;
-    if reinjection_frames.is_empty()
-        && (last_send_ack_complete || no_ack_frontier_failed_original_tail)
-    {
+    if reinjection_frames.is_empty() && !last_send_ack_ranges.is_empty() {
         if live_ack_gap_owner_recovery_ready
-            && stream_ack_ranges_expose_authoritative_gap(
-                last_send_ack_complete,
-                last_send_ack_ranges,
-            )
+            && stream_ack_ranges_expose_authoritative_gap(last_send_ack_ranges)
             && has_distinct_response_reinjection_alternative(
                 path_stream,
                 send_stream,
-                last_send_ack_complete,
                 last_send_ack_ranges,
                 last_send_ack_frontier,
             )
@@ -1861,7 +1802,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
             // evidence and a measured target, so this generic clock cannot
             // inherit that target's larger service window. Both observations
             // contribute to the sender's shared successor observation below.
-            let frontier_extent = normalized_stream_ack_first_gap(last_send_ack_ranges)
+            let frontier_extent = first_proven_ack_gap(last_send_ack_ranges)
                 .map_or(0, |(start, end)| flight_interval_bytes(start, end));
             let frontier_limit = reliable_live_frontier_reinjection_limit_bytes(
                 base_reinjection_limit,
@@ -1879,7 +1820,6 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 send_stream,
                 last_send_ack_ranges,
                 gap_limit,
-                true,
                 true,
                 true,
             );
@@ -1900,24 +1840,14 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 blocked_frontier_offset = gap_blocked_offset;
             }
         }
-        if reinjection_frames.is_empty()
-            && last_send_ack_complete
-            && last_send_ack_horizon.is_some_and(|horizon| last_send_ack_frontier < horizon)
-        {
-            let last_send_ack_horizon =
-                last_send_ack_horizon.expect("complete ACK tail requires a snapshot horizon");
+        if reinjection_frames.is_empty() {
             let tail_limit = reliable_critical_tail_reinjection_limit_bytes(
                 base_reinjection_limit,
                 send_stream.reinjection_bytes(),
                 mux_limits,
             );
-            let tail_source_frames = send_stream.retransmission_frames_for_ranges(
-                &[OffsetRange {
-                    start: last_send_ack_frontier,
-                    end: last_send_ack_horizon,
-                }],
-                tail_limit,
-            );
+            let tail_source_frames =
+                send_stream.retransmission_frames_for_ranges(last_send_ack_ranges, tail_limit);
             let (unknown_owner_frames, unknown_owner_blocked_offset) =
                 prefix_reinjection_frames_with_unknown_owner_output(
                     path_stream,
@@ -2034,7 +1964,6 @@ fn enqueue_reliable_tail_reinjection(
     stream_id: StreamId,
     send_stream: &ReliableSendStream,
     last_send_ack_ranges: &[OffsetRange],
-    last_send_ack_complete: bool,
     tail_reinjection_path_snapshot: Option<PathSnapshot>,
     relay_lane: TrafficClass,
     mux_limits: MuxLimits,
@@ -2043,15 +1972,13 @@ fn enqueue_reliable_tail_reinjection(
     last_send_ack_frontier: u64,
 ) -> TailReinjectionEnqueueOutcome {
     let failed_original_recovery = path_stream.failed_original_recovery_state();
-    enqueue_reliable_tail_reinjection_with_ack_horizon(
+    enqueue_reliable_tail_reinjection_with_ack_gaps(
         response_sender,
         path_stream,
         &failed_original_recovery.uncovered_ranges,
         stream_id,
         send_stream,
         last_send_ack_ranges,
-        last_send_ack_complete,
-        last_send_ack_complete.then_some(send_stream.next_offset()),
         tail_reinjection_path_snapshot,
         relay_lane,
         mux_limits,
@@ -2064,12 +1991,12 @@ fn enqueue_reliable_tail_reinjection(
 
 fn server_data_ack_frontier_state(
     last_send_ack: &AuthoritativeStreamAckSnapshot,
+    send_stream: &ReliableSendStream,
 ) -> ReliableDataAckFrontierState {
     ReliableDataAckFrontierState::from_authoritative_gap(
-        stream_ack_ranges_expose_authoritative_gap(
-            last_send_ack.complete(),
-            last_send_ack.ranges(),
-        ),
+        last_send_ack
+            .gap_at(send_stream.data_ack_frontier())
+            .is_some(),
     )
 }
 
@@ -2229,7 +2156,7 @@ fn drain_shared_server_response_sender_ready(
         sender,
         path_stream,
         outstanding,
-        server_data_ack_frontier_state(last_send_ack),
+        server_data_ack_frontier_state(last_send_ack, send_stream),
         send_stream,
         relay_lane,
         mux_limits,
@@ -2377,7 +2304,6 @@ where
     let mut pending_local_fin = false;
     let mut pending_remote_fin_offset = None;
     let mut recv_progress = ReliableRecvProgress::default();
-    let mut request_sparse_ack_progress = RequestTcpSparseAckProgress::default();
     let mut request_ack_publication = ServerAckPublicationState::default();
     let mut request_ack_capacity_wait = None;
     let mut request_ack_capacity_wait_generation = 0_u64;
@@ -2592,10 +2518,8 @@ where
                 .next_deadline()
                 .is_some_and(|deadline| deadline <= Instant::now());
             if response_path_staleness_dirty || response_path_staleness_due {
-                let response_path_staleness_candidates = path_stream.data_ack_recovery_candidates(
-                    last_send_ack.horizon().unwrap_or(0),
-                    response_lane,
-                );
+                let response_path_staleness_candidates =
+                    path_stream.data_ack_recovery_candidates(last_send_ack.gaps(), response_lane);
                 if mark_response_path_staleness(
                     &mut response_path_staleness,
                     path_stream,
@@ -2679,16 +2603,13 @@ where
             if output_membership_changed {
                 observed_output_membership_generation = output_membership_generation;
             }
-            let authoritative_data_ack_gap = stream_ack_ranges_expose_authoritative_gap(
-                last_send_ack.complete(),
-                last_send_ack.ranges(),
-            );
+            let authoritative_data_ack_gap =
+                stream_ack_ranges_expose_authoritative_gap(last_send_ack.gaps());
             let has_distinct_ack_gap_reinjection_alternative = authoritative_data_ack_gap
                 && has_distinct_response_reinjection_alternative(
                     path_stream,
                     send_stream,
-                    last_send_ack.complete(),
-                    last_send_ack.ranges(),
+                    last_send_ack.gaps(),
                     last_send_ack_frontier,
                 );
             let ack_gap_capacity_wait_arm_active = server_ack_gap_capacity_wait_arm_active(
@@ -2919,8 +2840,7 @@ where
             let has_tail_reinjection_alternative = has_distinct_response_reinjection_alternative(
                 path_stream,
                 send_stream,
-                last_send_ack.complete(),
-                last_send_ack.ranges(),
+                last_send_ack.gaps(),
                 last_send_ack_frontier,
             );
             let failed_original_recovery = path_stream.failed_original_recovery_state();
@@ -2968,11 +2888,8 @@ where
             response_state_capacity_blocked |=
                 retained_frontier_outcome.blocked_for_carrier_capacity;
             let tail_reinjection_candidate = has_tail_reinjection_alternative
-                && last_send_ack.has_unacknowledged_extent(last_send_ack_frontier)
-                && stream_ack_ranges_expose_authoritative_gap(
-                    last_send_ack.complete(),
-                    last_send_ack.ranges(),
-                );
+                && last_send_ack.has_gaps()
+                && stream_ack_ranges_expose_authoritative_gap(last_send_ack.gaps());
             let tail_timer_active = reliable_relay_tail_reinjection_timer_active(
                 send_stream.reinjection_bytes(),
                 tail_reinjection_candidate,
@@ -2999,10 +2916,7 @@ where
                 failed_original_tail_reinjection_ready,
             );
             let ack_gap_candidate_deadline = (has_tail_reinjection_alternative
-                && stream_ack_ranges_expose_authoritative_gap(
-                    last_send_ack.complete(),
-                    last_send_ack.ranges(),
-                ))
+                && stream_ack_ranges_expose_authoritative_gap(last_send_ack.gaps()))
             .then(|| ack_gap_reinjection.next_reinjection_deadline())
             .flatten();
             let live_owner_epoch_deadline = response_sender.live_owner_frontier_floor_deadline();
@@ -3038,15 +2952,13 @@ where
                 || failed_tail_deadline.is_some()
                 || accepted_copy_deadline.is_some();
             if tail_copy_due || live_tail_wake.due {
-                let outcome = enqueue_reliable_tail_reinjection_with_ack_horizon(
+                let outcome = enqueue_reliable_tail_reinjection_with_ack_gaps(
                     response_sender,
                     path_stream,
                     &failed_original_recovery.uncovered_ranges,
                     stream_id,
                     send_stream,
-                    last_send_ack.ranges(),
-                    last_send_ack.complete(),
-                    last_send_ack.horizon(),
+                    last_send_ack.gaps(),
                     tail_reinjection_path_snapshot,
                     response_lane,
                     mux_limits,
@@ -3150,7 +3062,7 @@ where
                     response_lane,
                     mux_limits,
                     data_ack_outstanding_bytes,
-                    server_data_ack_frontier_state(last_send_ack),
+                    server_data_ack_frontier_state(last_send_ack, send_stream),
                 );
             let sender_wait = response_sender_wait_state(
                 response_sender_queue_nonempty,
@@ -3332,15 +3244,13 @@ where
                 None,
                 now.into_std(),
             );
-            enqueue_reliable_tail_reinjection_with_ack_horizon(
+            enqueue_reliable_tail_reinjection_with_ack_gaps(
                 response_sender,
                 path_stream,
                 &failed_original_recovery.uncovered_ranges,
                 stream_id,
                 send_stream,
-                last_send_ack.ranges(),
-                last_send_ack.complete(),
-                last_send_ack.horizon(),
+                last_send_ack.gaps(),
                 tail_reinjection_path_snapshot,
                 response_lane,
                 mux_limits,
@@ -3484,7 +3394,6 @@ where
                         path_stream,
                         &mut recv_stream,
                         &mut recv_progress,
-                        &mut request_sparse_ack_progress,
                         &mut request_ack_publication,
                         request_feedback_path_snapshot,
                         request_lane,
@@ -3502,7 +3411,6 @@ where
                             path_stream,
                             &mut recv_stream,
                             &mut recv_progress,
-                            &mut request_sparse_ack_progress,
                             &mut request_ack_publication,
                             request_feedback_path_snapshot,
                             request_lane,
@@ -3521,7 +3429,7 @@ where
                 }
                 Frame::StreamAck {
                     stream_id: ack_stream_id,
-                    complete,
+                    scope_start,
                     ranges,
                 } if ack_stream_id == stream_id => {
                     let released_bytes = {
@@ -3533,11 +3441,11 @@ where
                     // original range before any cache, flight, queue,
                     // reservation, or recovery-evidence mutation.
                     let validated_ack =
-                        match begin_reliable_stream_ack(send_stream, complete, ranges) {
+                        match begin_reliable_stream_ack(send_stream, scope_start, ranges) {
                             Ok(ack) => ack,
                             Err(err) => break Err(err.into()),
                         };
-                    if last_send_ack.subsumes(&validated_ack) {
+                    if last_send_ack.subsumes(&validated_ack, send_stream) {
                         continue;
                     }
                     let normalized_ranges = validated_ack.ranges();
@@ -3574,11 +3482,11 @@ where
                     update_reinjection_authoritative_ack_snapshot(
                         last_send_ack,
                         &validated_ack,
+                        send_stream,
                     );
-                    // Positive ACK chunks release bytes even when their range
-                    // list is incomplete. Only the complete snapshot above may
-                    // authorize gap inference; flow control follows the exact
-                    // lowest outstanding Data Sequence offset.
+                    // Positive coverage always releases bytes; only explicitly
+                    // scoped omissions update gap authority. Flow control follows
+                    // the exact lowest outstanding Data Sequence offset.
                     last_send_ack_frontier = send_stream.data_ack_frontier();
                     let ack_made_progress = last_send_ack_frontier > previous_ack_frontier;
                     if ack_made_progress {
@@ -3663,9 +3571,9 @@ where
                     lab_diagnostic(
                         "stream_ack_received",
                         format_args!(
-                            "stream_id={} complete={} ranges={} incoming_frontier={} stored_frontier={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={} base_reinjection_limit={} reinjection_limit={} optional_reinjection_budget_percent={}",
+                            "stream_id={} scope_start={:?} ranges={} incoming_frontier={} stored_frontier={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={} base_reinjection_limit={} reinjection_limit={} optional_reinjection_budget_percent={}",
                             stream_id.0,
-                            complete,
+                            scope_start,
                             normalized_ranges.len(),
                             incoming_ack_frontier,
                             last_send_ack_frontier,
@@ -3732,7 +3640,6 @@ where
                             path_stream,
                             &mut recv_stream,
                             &mut recv_progress,
-                            &mut request_sparse_ack_progress,
                             &mut request_ack_publication,
                             request_feedback_path_snapshot,
                             request_lane,
@@ -3765,7 +3672,6 @@ where
                         path_stream,
                         &mut recv_stream,
                         &mut recv_progress,
-                        &mut request_sparse_ack_progress,
                         &mut request_ack_publication,
                         request_feedback_path_snapshot,
                         request_lane,
@@ -3852,7 +3758,7 @@ where
                     close.sent,
                     pending_local_fin,
                     send_stream.reinjection_bytes(),
-                    last_send_ack.ranges().len(),
+                    last_send_ack.gaps().len(),
                     last_send_ack_frontier,
                     send_stream.next_offset(),
                     response_sender.bytes(),
@@ -3974,7 +3880,6 @@ where
                 path_stream,
                 &mut recv_stream,
                 &mut recv_progress,
-                &mut request_sparse_ack_progress,
                 &mut request_ack_publication,
                 request_feedback_path_snapshot,
                 request_lane,
@@ -4273,7 +4178,7 @@ where
                     close.lane,
                     mux_limits,
                     outstanding,
-                    server_data_ack_frontier_state(last_send_ack),
+                    server_data_ack_frontier_state(last_send_ack, send_stream),
                 )
             };
             match dispatched {

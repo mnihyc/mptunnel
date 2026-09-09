@@ -176,17 +176,17 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 #[cfg(feature = "lab-diagnostics")]
                 if let Frame::StreamAck {
                     stream_id,
-                    complete,
+                    scope_start,
                     ranges,
                 } = &frame
                 {
                     lab_diagnostic(
                         "client_tcp_stream_ack_dequeue",
                         format_args!(
-                            "stream_id={} path_index={} complete={} ranges={} frontier={} largest_end={} pending_bytes_after={}",
+                            "stream_id={} path_index={} scope_start={:?} ranges={} frontier={} largest_end={} pending_bytes_after={}",
                             stream_id.0,
                             runtime.path_index,
-                            complete,
+                            scope_start,
                             ranges.len(),
                             stream_ack_contiguous_frontier(ranges),
                             ranges.last().map_or(0, |range| range.end),
@@ -636,17 +636,17 @@ fn publish_client_tcp_frame_transaction(
     for frame in frames.iter() {
         if let Frame::StreamAck {
             stream_id,
-            complete,
+            scope_start,
             ranges,
         } = frame
         {
             lab_diagnostic(
                 "client_tcp_stream_ack_write_complete",
                 format_args!(
-                    "stream_id={} path_index={} complete={} ranges={} frontier={} largest_end={}",
+                    "stream_id={} path_index={} scope_start={:?} ranges={} frontier={} largest_end={}",
                     stream_id.0,
                     runtime.path_index,
-                    complete,
+                    scope_start,
                     ranges.len(),
                     stream_ack_contiguous_frontier(ranges),
                     ranges.last().map_or(0, |range| range.end),

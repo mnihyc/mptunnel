@@ -222,7 +222,7 @@ async fn quic_write_wait_routes_stream_feedback_before_an_ordering_barrier() {
     input_tx
         .send(Ok(Frame::StreamAck {
             stream_id: StreamId(8),
-            complete: false,
+            scope_start: None,
             ranges: Vec::new(),
         }))
         .await

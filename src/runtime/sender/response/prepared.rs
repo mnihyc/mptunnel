@@ -11,9 +11,7 @@ use crate::runtime::path::prepared::{
     PreparedOriginalClaim, PreparedOriginalRegistration, PreparedOriginalWait,
 };
 use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
-use crate::runtime::relay::io::{
-    AuthoritativeStreamAckSnapshot, stream_ack_ranges_expose_authoritative_gap,
-};
+use crate::runtime::relay::io::AuthoritativeStreamAckSnapshot;
 use crate::runtime::sender::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
 use crate::runtime::stream::response::{
     ResponseAcquisitionOutputId, ResponseDispatchTarget, ResponsePreparedNativeInputs,
@@ -139,10 +137,10 @@ fn current(
 
 fn frontier(state: &ResponseProductState) -> ReliableDataAckFrontierState {
     ReliableDataAckFrontierState::from_authoritative_gap(
-        stream_ack_ranges_expose_authoritative_gap(
-            state.last_send_ack.complete(),
-            state.last_send_ack.ranges(),
-        ),
+        state
+            .last_send_ack
+            .gap_at(state.send_stream.data_ack_frontier())
+            .is_some(),
     )
 }
 

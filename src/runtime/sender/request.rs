@@ -52,8 +52,8 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::relay::io::{
-    AuthoritativeStreamAckSnapshot, exact_contiguous_retransmission_frames,
-    normalized_stream_ack_first_gap, preserve_reinjection_frontier_quantum,
+    AuthoritativeStreamAckSnapshot, exact_contiguous_retransmission_frames, first_proven_ack_gap,
+    preserve_reinjection_frontier_quantum,
 };
 #[cfg(test)]
 use crate::runtime::stream::ReliablePathStreamHandle;
@@ -650,13 +650,13 @@ impl RequestSenderService {
         )
     }
 
-    pub(in crate::runtime) fn unacked_original_paths_before(
+    pub(in crate::runtime) fn unacked_original_paths_for_gaps(
         &self,
         remotes: &ReliableRelayRemoteSet,
-        authoritative_horizon: u64,
+        gaps: &[OffsetRange],
     ) -> smallvec::SmallVec<[RelayPathInstance; 4]> {
         self.multipath
-            .unacked_original_paths_before(remotes, authoritative_horizon)
+            .unacked_original_paths_for_gaps(remotes, gaps)
     }
 
     pub(in crate::runtime) fn request_path_has_reinjection_path(
@@ -716,7 +716,7 @@ impl RequestSenderService {
         preview_limit: usize,
         lane: TrafficClass,
     ) -> RequestDataAckGapObservation {
-        let Some((frontier, horizon)) = normalized_stream_ack_first_gap(normalized_ranges) else {
+        let Some((frontier, horizon)) = first_proven_ack_gap(normalized_ranges) else {
             return RequestDataAckGapObservation::default();
         };
         let live_instances = self
@@ -1470,16 +1470,19 @@ impl RequestSenderService {
                 #[cfg(feature = "lab-diagnostics")]
                 let ack_started = Instant::now();
                 let ack_frames = recv_stream.ack_frames();
+                let update_frames = recv_stream.take_ack_update();
                 #[cfg(feature = "lab-diagnostics")]
                 {
                     lab_perf_record("mux.ack_frames", ack_started.elapsed(), ack_frames.len());
                     if let Some(ack_frame) = ack_frames.last() {
-                        let (ack_complete, ack_ranges, ack_frontier, ack_largest_end) =
+                        let (ack_scope_start, ack_ranges, ack_frontier, ack_largest_end) =
                             match ack_frame {
                                 Frame::StreamAck {
-                                    complete, ranges, ..
+                                    scope_start,
+                                    ranges,
+                                    ..
                                 } => (
-                                    *complete,
+                                    *scope_start,
                                     ranges.len(),
                                     stream_ack_contiguous_frontier(ranges),
                                     ranges.last().map_or(0, |range| range.end),
@@ -1489,9 +1492,9 @@ impl RequestSenderService {
                         lab_diagnostic(
                             "recv_progress_ack_state",
                             format_args!(
-                                "stream_id={} complete={} ranges={} frontier={} largest_end={} recv_next_offset={} recv_reorder_bytes={} generation={}",
+                                "stream_id={} scope_start={:?} ranges={} frontier={} largest_end={} recv_next_offset={} recv_reorder_bytes={} generation={}",
                                 self.multipath.stream_id().0,
-                                ack_complete,
+                                ack_scope_start,
                                 ack_ranges,
                                 ack_frontier,
                                 ack_largest_end,
@@ -1502,7 +1505,7 @@ impl RequestSenderService {
                         );
                     }
                 }
-                remotes.publish_stream_ack(generation, ack_frames)
+                remotes.publish_stream_ack(generation, update_frames, ack_frames)
             };
             sent_any |= publication.published;
             #[cfg(feature = "lab-diagnostics")]

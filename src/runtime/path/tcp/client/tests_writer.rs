@@ -84,7 +84,7 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
     let mut datagrams = ClientTcpDatagramState::new(4, 4);
     let ack = Frame::StreamAck {
         stream_id,
-        complete: false,
+        scope_start: None,
         ranges: vec![OffsetRange { start: 0, end: 64 }],
     };
 

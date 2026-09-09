@@ -335,7 +335,9 @@ pub enum Frame {
     },
     StreamAck {
         stream_id: StreamId,
-        complete: bool,
+        /// Omissions are evidence only in [scope_start, greatest range end).
+        /// None reports positive receipt without negative gap authority.
+        scope_start: Option<u64>,
         ranges: Vec<OffsetRange>,
     },
     /// Bounded non-delivering duplicate used to requalify one exact stream

@@ -6040,34 +6040,38 @@ async fn retained_completion_tail_after_positive_ack(aligned_horizon: bool) {
         } else {
             let (start, end, _) =
                 reliable_stream_frame_extent(original).expect("new positive receipt extent");
-            receiver.ack_delta_frames(&[OffsetRange { start, end }])
+            vec![Frame::StreamAck {
+                stream_id,
+                scope_start: None,
+                ranges: vec![OffsetRange { start, end }],
+            }]
         };
         assert_eq!(frames.len(), 1);
         let Frame::StreamAck {
-            complete, ranges, ..
+            scope_start,
+            ranges,
+            ..
         } = frames.into_iter().next().expect("one ACK publication")
         else {
             panic!("expected receiver-produced ACK");
         };
-        assert_eq!(complete, index == 0 || aligned_horizon);
-        let ack = begin_reliable_stream_ack(&send_stream, complete, ranges)
+        assert_eq!(
+            scope_start, None,
+            "a received contiguous prefix carries no omission"
+        );
+        let ack = begin_reliable_stream_ack(&send_stream, scope_start, ranges)
             .expect("receiver ACK validates against actual assigned extent");
         let applied = sender
             .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
             .expect("positive ACK releases exact cache and original ownership");
         assert_eq!(applied.mux.released_bytes, unit);
-        update_reinjection_authoritative_ack_snapshot(&mut snapshot, &ack);
+        update_reinjection_authoritative_ack_snapshot(&mut snapshot, &ack, &send_stream);
     }
     let frontier = send_stream.data_ack_frontier();
-    let horizon = (if aligned_horizon { 2 * unit } else { unit }) as u64;
     assert_eq!(frontier, (2 * unit) as u64);
-    assert_eq!(snapshot.horizon(), Some(horizon));
-    assert_eq!(
-        snapshot.ranges(),
-        &[OffsetRange {
-            start: 0,
-            end: horizon
-        }]
+    assert!(
+        snapshot.gaps().is_empty(),
+        "neither cumulative prefixes nor positive deltas prove the unobserved tail missing"
     );
     assert_eq!(send_stream.reinjection_bytes(), unit);
     assert_eq!(
@@ -6147,7 +6151,7 @@ async fn retained_completion_tail_after_positive_ack(aligned_horizon: bool) {
     );
     assert!(
         outcome.queued,
-        "retained ownership after positive ACK progress must survive H/F divergence: aligned={aligned_horizon} H={horizon} F={frontier} N={} outcome={outcome:?}",
+        "retained ownership survives positive-only ACK progress: cumulative={aligned_horizon} F={frontier} N={} outcome={outcome:?}",
         send_stream.next_offset(),
     );
     let (_, queued) = queue.pop_front().expect("exact retained-tail repair");
@@ -6159,9 +6163,8 @@ async fn retained_completion_tail_after_positive_ack(aligned_horizon: bool) {
         } if offset == frontier && payload.len() == unit && identity.instance == target
     ));
     assert!(queue.is_empty());
-    assert_eq!(
-        snapshot.horizon(),
-        Some(horizon),
+    assert!(
+        snapshot.gaps().is_empty(),
         "recovery must not invent negative ACK authority"
     );
 }
@@ -6236,29 +6239,35 @@ async fn active_request_retained_hole_recovers_after_partial_ack_beyond_horizon(
         let frames = if index == 0 {
             receiver.ack_frames()
         } else {
-            receiver.ack_delta_frames(&[OffsetRange {
-                start: *offset,
-                end: *offset + payload.len() as u64,
-            }])
+            vec![Frame::StreamAck {
+                stream_id,
+                scope_start: None,
+                ranges: vec![OffsetRange {
+                    start: *offset,
+                    end: *offset + payload.len() as u64,
+                }],
+            }]
         };
         assert_eq!(frames.len(), 1);
         let Frame::StreamAck {
-            complete, ranges, ..
+            scope_start,
+            ranges,
+            ..
         } = frames.into_iter().next().expect("receiver-produced ACK")
         else {
             panic!("StreamAck");
         };
-        assert_eq!(complete, index == 0);
-        let ack = begin_reliable_stream_ack(&send_stream, complete, ranges)
+        assert_eq!(scope_start, None);
+        let ack = begin_reliable_stream_ack(&send_stream, scope_start, ranges)
             .expect("ACK validates against committed source extent");
         let applied = sender
             .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
             .expect("positive receipt releases exact Product ownership");
         assert_eq!(applied.mux.released_bytes, unit);
-        update_reinjection_authoritative_ack_snapshot(&mut snapshot, &ack);
+        update_reinjection_authoritative_ack_snapshot(&mut snapshot, &ack, &send_stream);
     }
     let frontier = (2 * unit) as u64;
-    assert_eq!(snapshot.horizon(), Some(unit as u64));
+    assert!(snapshot.gaps().is_empty());
     assert_eq!(send_stream.data_ack_frontier(), frontier);
     assert_eq!(send_stream.next_offset(), (4 * unit) as u64);
     assert_eq!(send_stream.reinjection_bytes(), unit);
@@ -6382,7 +6391,7 @@ async fn active_request_retained_hole_recovers_after_partial_ack_beyond_horizon(
         unit,
         "no queued copy or ACKed suffix duplication"
     );
-    assert_eq!(snapshot.horizon(), Some(unit as u64));
+    assert!(snapshot.gaps().is_empty());
 
     let Frame::StreamData {
         offset, payload, ..
@@ -6393,20 +6402,26 @@ async fn active_request_retained_hole_recovers_after_partial_ack_beyond_horizon(
     receiver
         .receive_data(*offset, payload.clone())
         .expect("original or copy closes the hole");
-    let frames = receiver.ack_delta_frames(&[OffsetRange {
-        start: *offset,
-        end: *offset + payload.len() as u64,
-    }]);
+    let frames = vec![Frame::StreamAck {
+        stream_id,
+        scope_start: None,
+        ranges: vec![OffsetRange {
+            start: *offset,
+            end: *offset + payload.len() as u64,
+        }],
+    }];
     assert_eq!(frames.len(), 1);
     let Frame::StreamAck {
-        complete, ranges, ..
+        scope_start,
+        ranges,
+        ..
     } = frames.into_iter().next().expect("hole ACK")
     else {
         panic!("StreamAck");
     };
-    assert!(!complete);
+    assert_eq!(scope_start, None);
     let ack =
-        begin_reliable_stream_ack(&send_stream, complete, ranges).expect("hole ACK validates");
+        begin_reliable_stream_ack(&send_stream, scope_start, ranges).expect("hole ACK validates");
     let applied = sender
         .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
         .expect("hole receipt releases final retained ownership");
@@ -6415,13 +6430,12 @@ async fn active_request_retained_hole_recovers_after_partial_ack_beyond_horizon(
         queue.release_normalized_acked_reinjections(ack.ranges()),
         unit
     );
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &ack);
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &ack, &send_stream);
     assert_eq!(send_stream.data_ack_frontier(), send_stream.next_offset());
     assert_eq!(send_stream.reinjection_bytes(), 0);
-    assert_eq!(
-        snapshot.horizon(),
-        Some(unit as u64),
-        "partial receipts never widen H"
+    assert!(
+        snapshot.gaps().is_empty(),
+        "positive-only receipts do not create negative authority"
     );
     assert!(!request_retained_frontier_candidate(&send_stream, &remotes));
     let resolved = sender.enqueue_retained_frontier_reinjection(

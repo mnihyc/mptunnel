@@ -4,7 +4,9 @@ use crate::mux::stream::{
     ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError, ValidatedStreamAck,
     validate_stream_ack,
 };
-use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_extent};
+use crate::protocol::frame::{
+    normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_extent,
+};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
@@ -22,64 +24,55 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Both client and server actors call this before touching any ACK-owned state.
 pub(in crate::runtime) fn begin_reliable_stream_ack(
     send_stream: &ReliableSendStream,
-    complete: bool,
+    scope_start: Option<u64>,
     ranges: Vec<OffsetRange>,
 ) -> Result<ValidatedStreamAck, StreamError> {
-    validate_stream_ack(complete, ranges, send_stream.next_offset())
+    validate_stream_ack(scope_start, ranges, send_stream.next_offset())
 }
 
 pub(in crate::runtime) fn stream_ack_gap_reinjection_allowed(
-    complete: bool,
     has_multipath_reinjection_alternative: bool,
     ack_gap_reinjection_ready: bool,
 ) -> bool {
-    if !complete {
-        return false;
-    }
     if !has_multipath_reinjection_alternative {
         return false;
     }
     ack_gap_reinjection_ready
 }
 
-pub(in crate::runtime) fn stream_ack_ranges_expose_authoritative_gap(
-    complete: bool,
-    ranges: &[OffsetRange],
-) -> bool {
-    complete
-        && ranges
-            .first()
-            .is_some_and(|first| first.start > 0 || ranges.len() > 1)
+pub(in crate::runtime) fn stream_ack_ranges_expose_authoritative_gap(gaps: &[OffsetRange]) -> bool {
+    !gaps.is_empty()
 }
 
-/// Monotonic negative ACK authority retained by one logical stream.
-///
-/// Positive ACK evidence is applied directly to cache and flight ledgers. This
-/// snapshot is narrower: it authorizes recovery for omissions only through the
-/// receiver-observed DSN horizon carried by a complete ACK transaction. Incomplete
-/// deltas may fill an existing authoritative gap, but cannot extend that
-/// horizon to data assigned after the snapshot.
+/// Explicit, still-unacknowledged negative evidence for one Product direction.
+/// Positive coverage is owned by the send cache's complement, not duplicated
+/// here. Disjoint scopes never authorize the unknown interval between them.
+/// Each surviving gap ends at acknowledged coverage, so within one normalized
+/// retained-cache component it can cover only a suffix. Gap state is therefore
+/// bounded by current cache support, not the number of lifetime ACK reports.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::runtime) struct AuthoritativeStreamAckSnapshot {
-    ranges: Vec<OffsetRange>,
-    horizon: Option<u64>,
+    gaps: Vec<OffsetRange>,
 }
 
 impl AuthoritativeStreamAckSnapshot {
-    pub(in crate::runtime) fn complete(&self) -> bool {
-        self.horizon.is_some()
+    pub(in crate::runtime) fn has_gaps(&self) -> bool {
+        !self.gaps.is_empty()
     }
 
-    pub(in crate::runtime) fn ranges(&self) -> &[OffsetRange] {
-        &self.ranges
+    pub(in crate::runtime) fn gaps(&self) -> &[OffsetRange] {
+        &self.gaps
     }
 
-    pub(in crate::runtime) fn horizon(&self) -> Option<u64> {
-        self.horizon
+    pub(in crate::runtime) fn first_gap(&self) -> Option<OffsetRange> {
+        self.gaps.first().copied()
     }
 
-    pub(in crate::runtime) fn has_unacknowledged_extent(&self, frontier: u64) -> bool {
-        self.horizon.is_some_and(|horizon| frontier < horizon)
+    pub(in crate::runtime) fn gap_at(&self, offset: u64) -> Option<OffsetRange> {
+        self.gaps
+            .iter()
+            .copied()
+            .find(|gap| gap.start <= offset && offset < gap.end)
     }
 
     /// Returns true when this logical stream has already applied every
@@ -88,57 +81,46 @@ impl AuthoritativeStreamAckSnapshot {
     /// Retained ACK state is shared across attachments. Redundant publication
     /// must therefore be idempotent at this owner rather than re-running
     /// cache, flight, and recovery mutations once per carrier.
-    pub(in crate::runtime) fn subsumes(&self, ack: &ValidatedStreamAck) -> bool {
-        let Some(horizon) = self.horizon else {
+    pub(in crate::runtime) fn subsumes(
+        &self,
+        ack: &ValidatedStreamAck,
+        send_stream: &ReliableSendStream,
+    ) -> bool {
+        if send_stream.has_unacknowledged_ranges(ack.ranges()) {
             return false;
+        }
+        let Some(scope) = validated_ack_scope(ack) else {
+            return true;
         };
-        if ack.complete() {
-            let observed_horizon = ack.ranges().last().map_or(0, |range| range.end);
-            if observed_horizon > horizon {
-                return false;
-            }
-        }
-        ack.ranges().iter().all(|range| {
-            range.end <= horizon
-                && self
-                    .ranges
-                    .iter()
-                    .any(|stored| stored.start <= range.start && range.end <= stored.end)
-        })
+        offset_ranges_not_covered(&send_stream.retained_ranges_in_scope(scope), &self.gaps)
+            .is_empty()
     }
 
-    fn update(&mut self, ack: &ValidatedStreamAck) {
-        if !ack.complete() && self.horizon.is_none() {
-            return;
+    fn update(&mut self, ack: &ValidatedStreamAck, send_stream: &ReliableSendStream) -> bool {
+        let mut next = offset_ranges_not_covered(&self.gaps, ack.ranges());
+        if let Some(scope) = validated_ack_scope(ack) {
+            next.extend(send_stream.retained_ranges_in_scope(scope));
         }
-
-        if ack.complete() {
-            let observed_horizon = ack.ranges().last().map_or(0, |range| range.end);
-            self.horizon = Some(
-                self.horizon
-                    .map_or(observed_horizon, |horizon| horizon.max(observed_horizon)),
-            );
-        }
-        let horizon = self
-            .horizon
-            .expect("complete ACK authority must have a receiver-observed horizon");
-        let mut merged = std::mem::take(&mut self.ranges);
-        merged.extend(ack.ranges().iter().filter_map(|range| {
-            let end = range.end.min(horizon);
-            (range.start < end).then_some(OffsetRange {
-                start: range.start,
-                end,
-            })
-        }));
-        self.ranges = normalize_offset_ranges(merged);
+        let next = normalize_offset_ranges(next);
+        let changed = next != self.gaps;
+        self.gaps = next;
+        changed
     }
+}
+
+fn validated_ack_scope(ack: &ValidatedStreamAck) -> Option<OffsetRange> {
+    Some(OffsetRange {
+        start: ack.scope_start()?,
+        end: ack.ranges().last()?.end,
+    })
 }
 
 pub(in crate::runtime) fn update_reinjection_authoritative_ack_snapshot(
     stored: &mut AuthoritativeStreamAckSnapshot,
     ack: &ValidatedStreamAck,
-) {
-    stored.update(ack);
+    send_stream_after_ack: &ReliableSendStream,
+) -> bool {
+    stored.update(ack, send_stream_after_ack)
 }
 
 #[cfg(test)]
@@ -146,18 +128,16 @@ pub(in crate::runtime) fn stream_ack_gap_reinjection_frames(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
     byte_limit: usize,
-    complete: bool,
     has_multipath_reinjection_alternative: bool,
     ack_gap_reinjection_ready: bool,
 ) -> Vec<Frame> {
-    if stream_ack_ranges_expose_authoritative_gap(complete, ranges)
+    if stream_ack_ranges_expose_authoritative_gap(ranges)
         && stream_ack_gap_reinjection_allowed(
-            complete,
             has_multipath_reinjection_alternative,
             ack_gap_reinjection_ready,
         )
     {
-        send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit)
+        send_stream.retransmission_frames_for_ranges(ranges, byte_limit)
     } else {
         Vec::new()
     }
@@ -169,19 +149,17 @@ pub(in crate::runtime) fn stream_ack_gap_reinjection_frames_normalized(
     ranges: &[OffsetRange],
     byte_limit: usize,
     frontier_frame_limit: usize,
-    complete: bool,
     has_multipath_reinjection_alternative: bool,
     ack_gap_reinjection_ready: bool,
 ) -> Vec<Frame> {
-    if stream_ack_ranges_expose_authoritative_gap(complete, ranges)
+    if stream_ack_ranges_expose_authoritative_gap(ranges)
         && stream_ack_gap_reinjection_allowed(
-            complete,
             has_multipath_reinjection_alternative,
             ack_gap_reinjection_ready,
         )
     {
         preserve_reinjection_frontier_quantum(
-            send_stream.retransmission_frames_for_normalized_ack_gaps(ranges, byte_limit),
+            send_stream.retransmission_frames_for_ranges(ranges, byte_limit),
             frontier_frame_limit,
         )
     } else {
@@ -196,20 +174,18 @@ pub(in crate::runtime) fn stream_ack_gap_frontier_reinjection_frames_normalized(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
     byte_limit: usize,
-    complete: bool,
     has_multipath_reinjection_alternative: bool,
     ack_gap_reinjection_ready: bool,
 ) -> Vec<Frame> {
-    if !stream_ack_ranges_expose_authoritative_gap(complete, ranges)
+    if !stream_ack_ranges_expose_authoritative_gap(ranges)
         || !stream_ack_gap_reinjection_allowed(
-            complete,
             has_multipath_reinjection_alternative,
             ack_gap_reinjection_ready,
         )
     {
         return Vec::new();
     }
-    let Some((start, end)) = normalized_stream_ack_first_gap(ranges) else {
+    let Some((start, end)) = first_proven_ack_gap(ranges) else {
         return Vec::new();
     };
     send_stream.retransmission_frames_for_ranges(&[OffsetRange { start, end }], byte_limit)
@@ -484,7 +460,6 @@ impl ReliableAckGapReinjectionProgress {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn observe_recovery_timing(
         &mut self,
-        complete: bool,
         normalized_ranges: &[OffsetRange],
         has_multipath_reinjection_alternative: bool,
         observed_timing: Option<ReliableDataAckGapTiming>,
@@ -492,11 +467,7 @@ impl ReliableAckGapReinjectionProgress {
         owner_completion: Option<Duration>,
         observed_at: Instant,
     ) -> Option<Instant> {
-        if !self.retain_gap_identity(
-            complete,
-            normalized_ranges,
-            has_multipath_reinjection_alternative,
-        ) {
+        if !self.retain_gap_identity(normalized_ranges, has_multipath_reinjection_alternative) {
             self.candidate_deadline = None;
             return None;
         }
@@ -534,13 +505,11 @@ impl ReliableAckGapReinjectionProgress {
 
     pub(in crate::runtime) fn reinjection_ready(
         &mut self,
-        complete: bool,
         normalized_ranges: &[OffsetRange],
         has_multipath_reinjection_alternative: bool,
         measured_reinjection_ready: bool,
     ) -> bool {
         self.reinjection_ready_at(
-            complete,
             normalized_ranges,
             has_multipath_reinjection_alternative,
             measured_reinjection_ready,
@@ -550,17 +519,12 @@ impl ReliableAckGapReinjectionProgress {
 
     fn reinjection_ready_at(
         &mut self,
-        complete: bool,
         normalized_ranges: &[OffsetRange],
         has_multipath_reinjection_alternative: bool,
         measured_reinjection_ready: bool,
         _now: Instant,
     ) -> bool {
-        if !self.retain_gap_identity(
-            complete,
-            normalized_ranges,
-            has_multipath_reinjection_alternative,
-        ) {
+        if !self.retain_gap_identity(normalized_ranges, has_multipath_reinjection_alternative) {
             return false;
         }
         if !measured_reinjection_ready {
@@ -587,15 +551,10 @@ impl ReliableAckGapReinjectionProgress {
 
     fn retain_gap_identity(
         &mut self,
-        complete: bool,
         normalized_ranges: &[OffsetRange],
         has_multipath_reinjection_alternative: bool,
     ) -> bool {
-        if !complete {
-            self.clear();
-            return false;
-        }
-        let Some(first_gap) = normalized_stream_ack_first_gap(normalized_ranges) else {
+        let Some(first_gap) = first_proven_ack_gap(normalized_ranges) else {
             self.clear();
             return false;
         };
@@ -610,28 +569,8 @@ impl ReliableAckGapReinjectionProgress {
     }
 }
 
-pub(in crate::runtime) fn normalized_stream_ack_first_gap(
-    normalized_ranges: &[OffsetRange],
-) -> Option<(u64, u64)> {
-    debug_assert!(
-        normalized_ranges
-            .windows(2)
-            .all(|ranges| ranges[0].end < ranges[1].start)
-    );
-    if normalized_ranges.is_empty() {
-        return None;
-    }
-    let mut cursor = 0_u64;
-    for range in normalized_ranges {
-        if range.end <= cursor {
-            continue;
-        }
-        if range.start > cursor {
-            return Some((cursor, range.start));
-        }
-        cursor = range.end;
-    }
-    None
+pub(in crate::runtime) fn first_proven_ack_gap(gaps: &[OffsetRange]) -> Option<(u64, u64)> {
+    gaps.first().map(|gap| (gap.start, gap.end))
 }
 
 pub(in crate::runtime) fn resize_reliable_relay_buffer(

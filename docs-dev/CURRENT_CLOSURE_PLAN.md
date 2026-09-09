@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 01:41 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 09:54 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,63 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Residual discriminator09:50:** candidate UP remains continuously queued
+throughrestriction,9.782594Mbps sampledphysicalservice versuscontrol9.733527.
+UP bytes fall118.606→81.781MB but packets rise556903→731328, and candidate
+CPU/serverRSS rise. Telemetrywindows differ by~.54s; no exactwireefficiency
+or ACK-only attribution follows. Reuse the existing two-file codec observer,
+only renaming complete counter to scoped: fixedframes/encodedbytes/rangebins
+and same-kind timestamps. One sameprofile mixed capture separates surviving
+cumulative-range repetition/ACKfrequency/MAX from external/nativepacket cost.
+Information forecast: lowACKcost rejects further ACK serialization work;
+dominantACKs select producer/publication service, not controller tuning.
+No new policy/queueimplementation; freeze diagnostic then reverse its source.
+Keep partial ordinary benefit and higher costs, no performance promotion.
+
+**Ordinary outcome09:47 — promotion held:** first candidate completes the
+unchanged40s mixed DOWN cell:336.430Mbps whole;427.275→185.569→385.708Mbps
+in5–15/15–25/25–40windows. Refreshedcontrol327.137whole,
+441.551→104.527→411.605. Max bodygap2.249929→.811220s;76/76candidateechoes
+succeed versus34success/1timeout/35unattemptedcontrol. Candidateecho
+p50/p95/max250/580/1479ms. HTTP200durationpartial, notcomplete8GiB.
+This is partial restrictedservice benefit, NOT declaredstallclosure; restored
+phase worsens~6.3% and baselineQ/raw/H2restrictedservice remains~441–476Mbps.
+Keep the exact model/tests but withhold performance acceptance. Analyze physical
+returnservice/costs, then use the existing codec observer if needed to separate
+residualACK amplification from native/recovery/local service. No favorable
+rerun, parameterchange or queued-latestimplementation stacked. Telegram01:47UTC;
+nexteligible>=02:47UTC.
+
+**Ordinary gate09:45:** all1241affected protocol/mux/path/stream/sender/relay
+checks pass after the independently reviewed fixture repairs. No new runtime
+patch was required by those five failures. Build the default optimized binary,
+freeze scoped-ack-20260909, and run mixed DOWN once using exactly the refreshed
+control profile/tagged scoped-ack-candidate-0909. Acceptance requires actual
+restricted/restored user service and echoes, not merely less encoded feedback.
+If material stalls remain, stop promotion and attribute the residual before
+adding changes. Otherwise check Q-only and healthy mixed plus UP composition.
+No public README or release claim follows a single improved case.
+
+**Focused outcome09:44:** lower-memory test build succeeds in1m35 without
+warnings. Broad scoped-name filter25/25passes (includes unrelated matching
+names, not25newtests). Affected suite1236passes/5fails. Independent review
+attributes allfive to fixture migration: two passed positives where exactG
+was required; one expected a redundant now-omitted scope; two unknown-owner
+fixtures used an old helper that inventedH=assigned4096 from ACK[0,1024).
+Replace those two with genuine scoped positives[0,1024)+[4095,4096), giving
+G[1024,4095); retain survivor/dispatch assertions. Do not widen runtime recovery
+to satisfy that fabricated authority. Retained-owner controls outsideG already
+pass. Rebuild/recheck actual repairedfixtures before ordinary tests.
+
+**Build boundary09:38:** semantic test-call migration is complete and reviewed.
+The third default debuginfo2 test compilation reports no type errors, then
+rustc exits by SIGKILL before producing a test executable. This is not a
+Product test result or proof of a runtime memory leak. Retry once with test
+debuginfo0 and two build jobs to reduce compiler footprint; no Product/profile
+configuration or ordinary release optimization changes. Remove the now-unused
+has_sent_ack accessor left by removal of TCP-only sparse publication. All
+functional checks and the ordinary mixed asymmetry pair remain required.
 
 **Control outcome09:19:** frozenordinary4c7e232 reproduces the existing defect:
 441.551→104.527→411.605Mbps (5–15/15–25/25–40 bins),2.249929s body gap

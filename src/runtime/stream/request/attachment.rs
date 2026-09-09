@@ -1250,18 +1250,36 @@ impl ReliableRelayRemoteSet {
     pub(in crate::runtime) fn publish_stream_ack(
         &mut self,
         generation: u64,
+        update_frames: Vec<Frame>,
         cumulative_frames: Vec<Frame>,
     ) -> StreamAckPublication {
         debug_assert!(generation != 0);
+        debug_assert!(!update_frames.is_empty());
         debug_assert!(!cumulative_frames.is_empty());
         debug_assert!(
-            cumulative_frames
+            update_frames
                 .iter()
-                .all(|frame| matches!(frame, Frame::StreamAck { .. }))
+                .chain(&cumulative_frames)
+                .all(|frame| matches!(frame, Frame::StreamAck { stream_id, .. } if *stream_id == self.stream_id))
         );
         self.desired_stream_ack_generation = generation;
         self.desired_stream_ack_frames = cumulative_frames;
-        self.retry_pending_stream_ack()
+        let mut publication = StreamAckPublication::default();
+        for path in &mut self.paths {
+            if path.stream.request_control_frame_admission_is_closed() {
+                continue;
+            }
+            let attachment = path.stream_ack_publication.publish_update(
+                generation,
+                &update_frames,
+                &self.desired_stream_ack_frames,
+                |frame| path.stream.try_enqueue_request_control_frame(frame).is_ok(),
+            );
+            publication.accepted |= attachment.accepted;
+            publication.published |= attachment.published;
+        }
+        publication.pending = self.has_pending_stream_ack_publication();
+        publication
     }
 
     pub(in crate::runtime) fn stream_ack_generation(&self) -> u64 {

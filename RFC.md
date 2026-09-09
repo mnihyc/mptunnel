@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 13
+# MPTunnel Multipath Proxy Protocol (MPP) Version 14
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 13: its wire format, carrier profiles,
+This document specifies MPP version 14: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,7 +21,7 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 13 is identified by the frame header in Section 12. A peer MUST
+Wire version 14 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
@@ -1415,28 +1415,32 @@ envelope.
 
 ### 8.3 MPP Data ACK
 
-`STREAM_ACK(stream_id, complete, ranges)` carries a bounded list of
-half-open Product ranges in one directional MPP stream offset space. Every
-listed range is non-empty; the list itself MAY be empty.
+`STREAM_ACK(stream_id, scope_start?, ranges)` carries a bounded list of
+half-open positive Product ranges in one directional MPP stream offset space.
+Every listed range is non-empty; the list itself MAY be empty. All listed
+bytes have been received, regardless of scope.
 
-When `complete` is true, the list is an authoritative snapshot of the
-receiver's retained received ranges and can establish an omitted gap. When
-false, the ranges report partial positive progress and omission does not imply
-a gap. `complete` does not mean end of stream.
+When `scope_start=L` is present, the list is an authoritative description only
+within `[L,H)`, where H is the greatest end of its listed ranges. The list MUST
+be nonempty and L MUST be less than H. Omissions inside that interval establish
+gap evidence; omission outside it is unknown. Without a scope, the frame
+reports positive receipt only. No ACK field means end of stream.
 
-Negative authority from a complete snapshot extends only through the greatest
-range end carried by that snapshot. The sender's current assigned offset is not
-receiver evidence and MUST NOT be used as the snapshot horizon. A complete
-contiguous prefix therefore proves its positive range but does not declare a
-later assigned tail missing; an empty complete snapshot establishes no negative
-extent. An incomplete update can fill an already authoritative gap but cannot
-extend its horizon.
+The sender MUST retain explicit proven missing intervals, not replace the
+union of separate scopes with their convex hull or greatest end. Previously
+acknowledged bytes always override a delayed omission. Let U be the exact
+retained unacknowledged Product coverage after applying the incoming positives,
+G the previous proven missing set, R the incoming positive union and S its
+scope (empty when absent). The new missing set is `(G union (S minus R))
+intersection U`. A positive-only report can therefore fill a known gap but
+cannot create one. A scope spanning only a contiguous received prefix proves
+no missing tail. The sender's assigned offset is not receiver omission evidence.
 
-That horizon limits negative range inference; it does not erase the sender's
+These scoped facts limit negative range inference; they do not erase the sender's
 positive local fact that current-epoch OriginalData remains retained and
 unacknowledged on an exact attachment incarnation. Retained Product ownership
-above the horizon remains authoritative for exact Product ACK release and
-Product recovery. It MUST NOT by itself extend the Data ACK horizon, establish
+outside those scopes remains authoritative for exact Product ACK release and
+Product recovery. It MUST NOT by itself extend Data ACK scope, establish
 a Data ACK gap, or declare native transport loss.
 
 Before mutation, the endpoint MUST structurally validate the complete frame and
@@ -1468,12 +1472,12 @@ or ACK coalescing alone MUST NOT change the attributable byte union. These
 partitions release the same total original/copy debt and do not create extra
 independent rate observations or confidence samples within an ACK transaction.
 
-Processing newly received unique Product bytes marks the cumulative Data ACK
-state pending and advances one local publication generation. Before the
+Processing newly received unique Product bytes marks Data ACK state pending.
+Materializing the next publication advances one local generation. Before the
 serialized receive actor parks or yields its bounded cooperative turn, it MUST
 offer the latest pending generation independently to every currently live
 exact attachment. Several frames processed in that turn coalesce into the
-latest cumulative state; ACK publication never waits for an application read
+latest receive evidence; ACK publication never waits for an application read
 or another Product frame.
 
 Forced publication of unchanged state reuses the current generation. Queue
@@ -1485,14 +1489,36 @@ chunk cursor keep pending publication bounded. This rule adds no receive
 window, congestion signal, stop-and-wait dependency, or carrier-delivery
 attribution.
 
-When the cumulative range set fits one frame, that frame MAY be complete. When
-it requires multiple frames, every chunk MUST be incomplete positive evidence,
-and an attachment advances its generation fence only after every chunk was
-accepted. Received positive ranges are monotonic for the stream lifetime, so a
-newer cumulative generation MAY supersede the unqueued tail of an older
-generation; already accepted older chunks remain valid and idempotent. The
-logical receive range ledger remains the sole range owner. Each attachment
-retains only its exact-incarnation generation and next-chunk cursor.
+The logical receive range ledger remains the sole cumulative range owner.
+For an incremental publication it MUST retain every newly admitted positive
+fact since the preceding materialization; a truthful positive superset is
+permitted. If H0 was the preceding materialization's highest received offset,
+all received coverage above H0 is new, so an update extending it may describe
+scope `[H0,new_H)`. Non-extending updates report positives only. Duplicate or
+rejected data adds no new fact. Generation fences are publication state, not
+a decoding dependency or proof of remote receipt.
+
+When the positive list covers the entire proposed scope, that scope adds no
+negative fact and SHOULD be omitted. This preserves the same evidence without
+extra scope bytes for ordinary contiguous progress.
+
+Sorted cumulative catch-up chunks carry scopes starting at zero for the first
+chunk and at the preceding chunk's greatest end thereafter. Incremental chunks
+ending at or below H0 have no scope; each later chunk starts its scope at the
+previously covered high-water. Each frame MUST be truthful independently, even
+when preceding or succeeding chunks never arrive. Disjoint scopes MUST NOT be
+merged across an unknown interval. Ready-only coalescing preserves the union
+of positive coverage and of actual scoped omission evidence.
+
+An exact attachment that accepted the immediately preceding generation may
+receive the incremental update. A new, replaced, missed-generation or partially
+published attachment receives cumulative catch-up. It advances its generation
+fence only after all required chunks are accepted. A newer generation MAY
+supersede the unqueued tail of an older generation; already accepted frames
+remain independently valid and idempotent. Each attachment retains only its
+exact-incarnation generation and next-chunk cursor. This reduces repeated
+history without delaying feedback, selecting a preferred ACK carrier, or
+depending on a mutable cross-frame compression dictionary.
 
 ### 8.4 Shared flow control
 
@@ -1614,7 +1640,7 @@ original retention deadline.
 Lack of Product progress while attachments remain live is stream-local
 recovery evidence, not carrier failure. The sender first evaluates retained
 ranges and the currently attached outputs. That first recovery cycle MUST NOT
-infer loss beyond the receiver's authoritative complete-ACK horizon. If no
+infer omitted data outside the receiver's explicitly proven missing set. If no
 Product progress follows that bounded cycle, recovery MAY extend through the
 current retained send extent and MAY attach the same logical stream to one
 additional authenticated configured carrier that is not already attached. A
@@ -2464,7 +2490,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        13
+4      version        14
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -2487,7 +2513,7 @@ frames.
 | 4 | `PATH_JOIN` | `session_id:u64, credential_id, path_id:u16, configured_member_slot:u16, underlay:u8, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
 | 7 | `OPEN_STREAM` | `stream_id:u64, target, demand:u8, trigger_bytes:u64, candidate_total:u8, candidate_tier:u8, phase:u8, candidate_ordinal:u8` |
 | 8 | `STREAM_DATA` | `stream_id:u64, offset:u64, length:u32, bytes` |
-| 9 | `STREAM_ACK` | `stream_id:u64, flags:u8, range_count:u16, ranges[range_count]` |
+| 9 | `STREAM_ACK` | `stream_id:u64, flags:u8, range_count:u16, scope_start?:varuint64, ranges[range_count]` |
 | 10 | `STREAM_MAX_DATA` | `stream_id:u64, max_offset:u64` |
 | 11 | `STREAM_RESET` | `stream_id:u64, reason:u8` |
 | 12 | `OPEN_DGRAM_FLOW` | `flow_id:u64, target` |
@@ -2530,7 +2556,7 @@ server-to-client only and requires a matching `PATH_DRAIN`.
 
 Kind50 is QUIC-only and client-to-server, valid only as the first frame of the
 companion request defined in Section6.2. It carries neither a destination nor
-Product admission authority. Unsupported versions are rejected; wire13 does
+Product admission authority. Unsupported versions are rejected; wire14 does
 not silently fall back to the wire11 single-ordering-stream mapping.
 
 Kinds 38 through 41 are valid only when the endpoint has enabled the IP packet
@@ -2558,14 +2584,16 @@ a different duplicate is a protocol violation.
 Each fixed `ranges[range_count]` entry is `start:u64, end:u64` and represents
 `[start, end)`. `start` MUST be less than `end`.
 
-For `STREAM_ACK`, flags bit0 is `complete`; bit1 selects packed ranges.
+For `STREAM_ACK`, flags bit0 indicates the presence of `scope_start`; bit1
+selects packed ranges. When present, the scope offset follows `range_count`
+using the minimal `varuint64` encoding below, before the range entries.
 All other bits MUST be zero.
 Fixed independent ranges retain arbitrary order and overlap for
 subsequent Product validation and normalization. In packed form each entry is
 `gap:varuint64, length:varuint64`: `start = previous_end + gap`,
 `end = start + length`, with initial `previous_end = 0`. Length MUST be nonzero;
 both additions MUST fit u64. This representation preserves the exact decoded
-range list and complete bit; it does not change Section8.3 ACK authority.
+range list and scope; it does not change Section8.3 ACK authority.
 
 `varuint64` is minimal unsigned base128, least-significant seven bits first;
 bit7 indicates another byte. At most ten bytes are permitted, with the tenth
@@ -2573,7 +2601,7 @@ byte at most1. A multi-byte representation ending in zero, integer overflow,
 or truncation MUST be rejected. Senders SHOULD select packed form only when
 the entire range vector is ordered/nonoverlapping and its packed byte length
 is less than16 times the range count. Otherwise use fixed form. The two forms
-have the same header size and range-count limit. Packing itself uses no state
+have the same optional-scope header size and range-count limit. Packing itself uses no state
 from another frame.
 
 A target begins with a type:
@@ -2773,13 +2801,13 @@ has durable, unambiguous Data ACK coverage for original transmissions, it may
 own at most one bounded startup flight. Native TCP ACK or QUIC packet-ACK
 evidence alone does not unlock mature additional-output placement.
 
-That live-contiguous treatment applies only while no retained complete Data ACK
-proves the lowest outstanding range missing. When a complete Data ACK omits
+That live-contiguous treatment applies only while no retained scoped Data ACK
+proves the lowest outstanding range missing. When a scoped Data ACK omits
 that range, the frontier becomes an authoritative-gap frontier. Its exact owner
 remains the ordering, hysteresis, and recovery reference, but fresh originals
 on that owner use the additional-output Product and reorder position until Data
 ACK progress advances or resolves the gap. Other eligible outputs are not
-globally paused. An incomplete positive ACK cannot create this state, and this
+globally paused. A positive-only ACK cannot create this state, and this
 rule changes neither configured reorder resources nor native recovery.
 
 An output does not become the contiguous-frontier owner merely because it is
@@ -3175,8 +3203,8 @@ Exact carrier-instance failure permits immediate bounded reinjection on an
 eligible live alternative. A measured survivor is preferred, but liveness is
 sufficient when no measured survivor remains.
 
-A complete Data ACK snapshot may establish omitted ranges. Later positive
-partial ranges extend known progress but do not establish omissions alone.
+A scoped Data ACK may establish omitted ranges only inside its own scope.
+Later positive-only ranges extend known progress but establish no omissions.
 
 The MPP recovery interval uses the original carrier's underlay and latest
 snapshot. When that snapshot contains an observation, let `srtt` and `jitter`
@@ -3193,8 +3221,8 @@ be its nonnegative directional smoothed-RTT and jitter durations:
 These are MPP estimates. They do not read, reset, or replace a native TCP RTO
 or QUIC PTO.
 
-After a Data ACK transaction in either direction leaves a retained complete
-snapshot with an omitted range, define two absolute clocks for every exact
+After a Data ACK transaction in either direction leaves a retained proven
+missing interval, define two absolute clocks for every exact
 OriginalData assignment span participating in the candidate extent:
 `loss_at_j` is that span's immutable assignment epoch plus the local MPP
 Data-ACK threshold, and `fallback_at_j` is that epoch plus the MPP recovery
@@ -3344,11 +3372,11 @@ directional Product recovery-work accounting.
 Retained-frontier fallback applies during active sending as well as final
 drain. Its frontier is the sender's current positive Data-ACK/cache frontier,
 refined to exact cached OriginalData ownership and the ranked prefix above.
-Source EOF, empty source staging and completeness of a historical ACK snapshot
+Source EOF, empty source staging and scope of historical ACK evidence
 are not prerequisites. Suffix receipt or source activity MUST NOT postpone the
 original owner's immutable fallback deadline. This local retained obligation
-does not extend the negative ACK horizon or declare omitted/native data lost;
-speculative authoritative-gap recovery retains its separate complete-horizon
+does not extend negative ACK scope or declare omitted/native data lost;
+speculative authoritative-gap recovery retains its separate proven-omission
 requirement. Existing accepted-copy suppression and exact target/native service
 admission apply before another copy, including a copy to a third carrier.
 
@@ -3401,10 +3429,10 @@ authority: the selected TCP or QUIC sender remains the final enqueue, pacing,
 congestion, and recovery authority. These ratios are local approximations
 inspired by transport time-threshold loss detection; the TCP ratio is not RFC
 8985 RACK and the QUIC ratio is not QUIC's native RFC 9002 loss decision. A
-multi-frame cumulative publication consists only of positive, incomplete
-frames and cannot establish an omission. Later incomplete updates may fill a
-gap already established below a retained complete snapshot's horizon, but
-cannot extend that horizon or create negative evidence. Both directions use
+multi-frame cumulative publication carries independently valid scoped frames;
+absence of another chunk cannot establish an omission outside a received
+chunk's scope. Positive-only updates may fill existing gaps but cannot create
+negative evidence. Both directions use
 the immutable epochs of every exact OriginalData assignment span in the
 candidate extent. For the same exact gap and assignment spans, later owner
 observations may move a threshold-derived deadline earlier but MUST NOT restart
@@ -3681,7 +3709,7 @@ The probe carries its stream ID, a nonzero
 monotonically allocated probe ID, the copied range offset, and the bytes. It is
 data-bearing for reachability, native service, queue admission, and extra-traffic
 accounting, but it does not own or deliver that Product range: it is not
-inserted in the receive map, does not advance a Data ACK horizon, and does not
+inserted in the receive map, does not extend Data ACK scope, and does not
 enter Product flight or delivery evidence. OriginalData therefore remains the
 only Product owner, and a lost or reordered probe cannot create Product
 head-of-line blocking or make its OriginalData owner's ACK ambiguous.
@@ -3780,12 +3808,12 @@ probe loss, at most one quantum per stale interval over time, excluding frame
 headers. Later optional reinjection authority remains reduced by that debt.
 
 The placement-persistence clock is independent for every exact attachment
-incarnation that owns evidence-eligible OriginalData omitted below a complete
-authoritative Data ACK horizon. Positive ACK ranges are
-released before this decision, so a retained flight below that horizon is an
-authoritative omission. An incomplete ACK may fill an omission below an
-existing retained horizon, but cannot extend the horizon or create one. A
-successful OriginalData commitment, ACK silence above the horizon, and retained
+incarnation that owns evidence-eligible OriginalData intersecting explicitly
+proven Data ACK gaps. Positive ACK ranges are released before this decision;
+neither an unknown interval between scopes nor its retained flights are
+authoritative omissions. A positive-only ACK may fill an omission but cannot
+create one. A successful OriginalData commitment, ACK silence outside the
+proven missing set, and retained
 work not covered by such an omission MUST NOT arm placement withdrawal.
 
 When the distinct-alternative predicate holds, the first stream-owner
@@ -3813,11 +3841,11 @@ ACKs, `PATH_METRICS`, requalification ACKs, and polling MUST NOT replace or
 restart it. Progress or gap repair elsewhere and movement of the lowest missing
 frontier MUST NOT restart it.
 
-Every transition that can change the predicate -- authoritative ACK horizon,
+Every transition that can change the predicate -- authoritative ACK gap set,
 effective directional lane, exact attachment membership or incarnation,
 readiness, accepted directional usage, local health or policy, drain,
 retirement, or failure -- MUST trigger stream-owner reconciliation.
-While any horizon-bounded request candidate exists, the client stream owner
+While any proven-gap request candidate exists, the client stream owner
 MUST arm path-model publication from a generation captured before observing
 the predicate. A generation change is reconciliation work even when no
 alternate and therefore no placement-persistence clock existed previously; an
@@ -3931,9 +3959,9 @@ A conforming implementation preserves all of the following:
     preserves inner-flow affinity until an exact failure or a transport-derived
     flowlet boundary permits safe reselection.
 31. Negative Data ACK inference and placement-persistence candidates remain
-    complete-snapshot-horizon bounded. A frozen per-owner deadline may be armed
-    only for current-epoch OriginalData authoritatively omitted below that
-    horizon; only newly acknowledged unique Data ACK progress unambiguously
+    explicitly scoped. A frozen per-owner deadline may be armed only for
+    current-epoch OriginalData intersecting a proven missing interval;
+    only newly acknowledged unique Data ACK progress unambiguously
     attributable to that exact owner may replace it.
 32. Every authenticated, ready, admission-active, non-stale output owns its
     configured bounded unqualified Product authority without a capacity proof.
@@ -3997,7 +4025,7 @@ A conforming implementation preserves all of the following:
     ordinals, atomically withdraws omitted enrolled outputs before removing the
     ceiling, and is absorbing and idempotent only for an equal repetition.
 42. Kinds 44 through 48 are reserved and MUST be rejected as unknown under
-    version 13.
+    version 14.
 43. Stale requalification uses one finite cyclic exact-incarnation cursor and
     at most one pending proof and one stream-owned ACK publication per
     direction. The ACK carrier is authenticated return service only; the exact
@@ -4005,7 +4033,7 @@ A conforming implementation preserves all of the following:
     may publish one identical ACK on each currently attached accepting output
     and makes no finite delivery claim when every reverse writer stalls.
 44. STREAM_REQUALIFY_DATA is Product-neutral and cannot advance a receive map,
-    Data ACK horizon, Product flight, or delivery evidence.
+    Data ACK scope, Product flight, or delivery evidence.
     STREAM_REQUALIFY_ACK activates only its exact still-pending target's
     already-advanced output epoch with Product qualification reset.
 45. Exact carrier, attachment, output-admission, writer-capacity, proof,
@@ -4046,7 +4074,7 @@ server `PATH_CLOSE`.
 MPP follows those principles but is not MPTCP-conformant. Its offset space is
 per direction of each MPP stream rather than one connection-level DSN space
 per direction.
-`STREAM_ACK` uses range snapshots and positive partial ranges rather than a
+`STREAM_ACK` uses independently scoped ranges and positive-only updates rather than a
 cumulative DSS Data ACK. MPP carriers are not MPTCP subflows.
 
 RFC 6356 documents why independently controlled subflows sharing a bottleneck

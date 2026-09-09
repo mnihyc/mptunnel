@@ -1,7 +1,8 @@
 use super::{
     FixedNativeRateEpoch, FixedProductRateEpoch, FixedReliablePathOutput, ReliablePathStream,
     ReliablePathStreamHandle, ReliablePathStreamInput, ReliablePathStreamOutput,
-    RequalificationAttempt, ServerReliableStreamEvent, TargetCarrierCapacityWait,
+    RequalificationAttempt, ServerFeedbackBatch, ServerReliableStreamEvent,
+    TargetCarrierCapacityWait,
 };
 use crate::model::capacity::{
     MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
@@ -12,6 +13,7 @@ use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::service_rate::{DirectionalServiceRate, DirectionalServiceRateScope};
 use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
+use crate::mux::stream::ReliableSendStream;
 use crate::protocol::PathMetricDirection;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, PathId, ResetReason, StreamId, UnderlayProtocol};
@@ -1377,7 +1379,7 @@ async fn server_input_coalesces_only_the_contiguous_feedback_backlog() {
     for event in [
         ServerReliableStreamEvent::Frame(Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: Some(0),
             ranges: vec![
                 OffsetRange { start: 0, end: 100 },
                 OffsetRange {
@@ -1394,12 +1396,12 @@ async fn server_input_coalesces_only_the_contiguous_feedback_backlog() {
         // coverage is monotonic, so the actor must union rather than replace.
         ServerReliableStreamEvent::Frame(Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: Some(0),
             ranges: vec![OffsetRange { start: 0, end: 80 }],
         }),
         ServerReliableStreamEvent::Frame(Frame::StreamAck {
             stream_id,
-            complete: false,
+            scope_start: None,
             ranges: vec![OffsetRange {
                 start: 100,
                 end: 120,
@@ -1423,28 +1425,14 @@ async fn server_input_coalesces_only_the_contiguous_feedback_backlog() {
 
     let mut stream = server_stream_with_events(events_rx);
     assert_eq!(
-        stream.recv_frame().await.expect("merged ACK delta"),
+        stream
+            .recv_frame()
+            .await
+            .expect("all merged positive ACK coverage"),
         Frame::StreamAck {
             stream_id,
-            complete: false,
-            ranges: vec![OffsetRange {
-                start: 100,
-                end: 120,
-            }],
-        }
-    );
-    assert_eq!(
-        stream.recv_frame().await.expect("merged complete ACK"),
-        Frame::StreamAck {
-            stream_id,
-            complete: true,
-            ranges: vec![
-                OffsetRange { start: 0, end: 100 },
-                OffsetRange {
-                    start: 120,
-                    end: 130,
-                },
-            ],
+            scope_start: None,
+            ranges: vec![OffsetRange { start: 0, end: 130 }],
         }
     );
     assert_eq!(
@@ -1467,25 +1455,133 @@ async fn server_input_coalesces_only_the_contiguous_feedback_backlog() {
 }
 
 #[tokio::test]
-async fn server_input_retains_an_empty_complete_ack_snapshot() {
+async fn server_input_retains_an_empty_positive_only_ack_snapshot() {
     let stream_id = StreamId(7);
     let (events, events_rx) = mpsc::channel(2);
     events
         .try_send(ServerReliableStreamEvent::Frame(Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: None,
             ranges: Vec::new(),
         }))
         .expect("queue empty ACK snapshot");
 
     let mut stream = server_stream_with_events(events_rx);
     assert_eq!(
-        stream.recv_frame().await.expect("empty complete ACK"),
+        stream.recv_frame().await.expect("empty positive-only ACK"),
         Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: None,
             ranges: Vec::new(),
         }
+    );
+}
+
+#[test]
+fn server_feedback_batch_preserves_disconnected_negative_scopes() {
+    use crate::runtime::relay::io::{
+        AuthoritativeStreamAckSnapshot, begin_reliable_stream_ack,
+        update_reinjection_authoritative_ack_snapshot,
+    };
+    let stream_id = StreamId(7);
+    let mut batch = ServerFeedbackBatch::default();
+    for (scope_start, start, end) in [(Some(100), 140, 160), (Some(200), 240, 260), (None, 80, 90)]
+    {
+        batch.push(Frame::StreamAck {
+            stream_id,
+            scope_start,
+            ranges: vec![OffsetRange { start, end }],
+        });
+    }
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream
+        .send_data(Bytes::from(vec![1; 300]))
+        .expect("assigned Product coverage");
+    let mut evidence = AuthoritativeStreamAckSnapshot::default();
+    let frames = batch.into_frames();
+    assert_eq!(frames.len(), 3);
+    for frame in frames {
+        let Frame::StreamAck {
+            scope_start,
+            ranges,
+            ..
+        } = frame
+        else {
+            panic!("ACK batch");
+        };
+        let ack = begin_reliable_stream_ack(&send_stream, scope_start, ranges)
+            .expect("valid independent evidence");
+        send_stream
+            .apply_validated_ack(&ack)
+            .expect("positive release");
+        update_reinjection_authoritative_ack_snapshot(&mut evidence, &ack, &send_stream);
+    }
+    assert_eq!(
+        evidence.gaps(),
+        &[
+            OffsetRange {
+                start: 100,
+                end: 140
+            },
+            OffsetRange {
+                start: 200,
+                end: 240
+            },
+        ]
+    );
+    assert!(
+        evidence.gap_at(170).is_none(),
+        "batching must not fill the unknown region between scopes"
+    );
+    assert_eq!(send_stream.reinjection_bytes(), 250);
+}
+
+#[test]
+fn server_feedback_batch_validates_all_original_positive_endpoints_before_release() {
+    use crate::runtime::relay::io::begin_reliable_stream_ack;
+    let stream_id = StreamId(7);
+    let mut batch = ServerFeedbackBatch::default();
+    let original = Frame::StreamAck {
+        stream_id,
+        scope_start: Some(5),
+        ranges: vec![
+            OffsetRange { start: 0, end: 1 },
+            OffsetRange { start: 9, end: 11 },
+        ],
+    };
+    assert!(ServerFeedbackBatch::accepts(&original));
+    batch.push(original);
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream
+        .send_data(Bytes::from_static(b"0123456789"))
+        .expect("assigned ten bytes");
+    let before = send_stream.clone();
+    let Frame::StreamAck {
+        scope_start,
+        ranges,
+        ..
+    } = batch
+        .into_frames()
+        .pop_front()
+        .expect("first ACK transaction")
+    else {
+        panic!("ACK transaction");
+    };
+    assert!(
+        begin_reliable_stream_ack(&send_stream, scope_start, ranges).is_err(),
+        "the first transaction must include endpoint 11; it cannot release byte zero first"
+    );
+    assert_eq!(send_stream, before);
+    assert!(
+        !ServerFeedbackBatch::accepts(&Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: vec![
+                OffsetRange { start: 0, end: 1 },
+                OffsetRange { start: 9, end: 8 }
+            ],
+        }),
+        "malformed original ranges remain intact for rejection, not normalized away"
     );
 }
 
@@ -1495,12 +1591,12 @@ async fn server_input_does_not_coalesce_feedback_across_path_detach() {
     let (events, events_rx) = mpsc::channel(4);
     let first_ack = Frame::StreamAck {
         stream_id,
-        complete: true,
+        scope_start: Some(0),
         ranges: vec![OffsetRange { start: 0, end: 64 }],
     };
     let second_ack = Frame::StreamAck {
         stream_id,
-        complete: true,
+        scope_start: Some(0),
         ranges: vec![OffsetRange { start: 0, end: 128 }],
     };
     for event in [
@@ -1521,11 +1617,19 @@ async fn server_input_does_not_coalesce_feedback_across_path_detach() {
     let mut stream = server_stream_with_events(events_rx);
     assert_eq!(
         stream.recv_frame().await.expect("ACK before detach"),
-        first_ack
+        Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: vec![OffsetRange { start: 0, end: 64 }]
+        }
     );
     assert_eq!(
         stream.recv_frame().await.expect("ACK after detach"),
-        second_ack
+        Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: vec![OffsetRange { start: 0, end: 128 }]
+        }
     );
 }
 

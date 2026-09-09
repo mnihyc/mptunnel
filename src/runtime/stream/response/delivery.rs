@@ -308,12 +308,12 @@ impl ResponseStreamBinding {
     /// recovery work, not another staleness observation.
     pub(in crate::runtime) fn data_ack_recovery_candidates(
         &self,
-        authoritative_horizon: u64,
+        gaps: &[OffsetRange],
         lane: TrafficClass,
     ) -> SmallVec<[ResponseDataAckRecoveryCandidate; 4]> {
-        if authoritative_horizon == 0 {
+        let Some(last_gap) = gaps.last() else {
             return SmallVec::new();
-        }
+        };
         let outputs = self
             .outputs
             .lock()
@@ -340,7 +340,7 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream flight lock");
         let mut candidates = SmallVec::<[ResponseDataAckRecoveryCandidate; 4]>::new();
-        'flights: for (start, path_flights) in flights.range(..authoritative_horizon) {
+        'flights: for (start, path_flights) in flights.range(..last_gap.end) {
             for flight in path_flights {
                 if flight.end <= *start
                     || !flight.kind.is_original_transmission()
@@ -348,6 +348,10 @@ impl ResponseStreamBinding {
                 {
                     continue;
                 }
+                let first_gap = gaps.partition_point(|gap| gap.end <= *start);
+                let Some(gap) = gaps.get(first_gap).filter(|gap| gap.start < flight.end) else {
+                    continue;
+                };
                 let identity = (flight.key, flight.output_incarnation);
                 let Some((_, observed)) = live_outputs
                     .iter_mut()
@@ -360,8 +364,8 @@ impl ResponseStreamBinding {
                 }
                 *observed = true;
                 candidates.push(ResponseDataAckRecoveryCandidate {
-                    start: *start,
-                    end: flight.end,
+                    start: (*start).max(gap.start),
+                    end: flight.end.min(gap.end),
                     key: flight.key,
                     output_incarnation: flight.output_incarnation,
                     sent_at: flight.sent_at,

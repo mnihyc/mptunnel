@@ -1084,6 +1084,26 @@ fn data_ack_recovery_candidate_uses_the_blocking_original_flight_identity() {
 }
 
 #[test]
+fn scoped_response_gap_does_not_withdraw_an_earlier_unknown_owner() {
+    let (binding, unknown_owner, _owner_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let gap_owner = key(UnderlayProtocol::Udp, 1);
+    let (commands, _gap_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        gap_owner.underlay,
+        gap_owner.path_id,
+        commands,
+        TrafficClass::Throughput,
+    );
+    binding.record_original_flight(unknown_owner, &stream_data_frame_at(0, 4096));
+    binding.record_original_flight(gap_owner, &stream_data_frame_at(4096, 4096));
+    let candidates =
+        binding.data_ack_recovery_candidates(&[range(5000, 6000)], TrafficClass::Throughput);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].key, gap_owner);
+    assert_eq!((candidates[0].start, candidates[0].end), (5000, 6000));
+}
+
+#[test]
 fn ambiguous_prefix_ack_cannot_make_a_fresh_tail_a_staleness_candidate() {
     let (binding, owner, _owner_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let duplicate = key(UnderlayProtocol::Udp, 1);
@@ -1140,11 +1160,12 @@ fn ambiguous_prefix_ack_cannot_make_a_fresh_tail_a_staleness_candidate() {
     }
     assert!(
         binding
-            .data_ack_recovery_candidates(4096, TrafficClass::Throughput)
+            .data_ack_recovery_candidates(&[range(0, 4096)], TrafficClass::Throughput)
             .is_empty(),
         "a fresh tail beginning at the complete ACK horizon is not an authoritative omission",
     );
-    let candidates = binding.data_ack_recovery_candidates(8192, TrafficClass::Throughput);
+    let candidates =
+        binding.data_ack_recovery_candidates(&[range(4096, 8192)], TrafficClass::Throughput);
     assert_eq!(
         candidates
             .iter()
@@ -1211,7 +1232,7 @@ fn data_ack_recovery_candidates_exclude_nonlive_and_stale_output_incarnations() 
 
     drop(replaced_receivers);
     let closed_candidates =
-        binding.data_ack_recovery_candidates(u64::MAX, TrafficClass::Throughput);
+        binding.data_ack_recovery_candidates(&[range(0, u64::MAX)], TrafficClass::Throughput);
     assert_eq!(closed_candidates.len(), 1);
     assert_eq!(closed_candidates[0].key, live);
 
@@ -1225,7 +1246,8 @@ fn data_ack_recovery_candidates_exclude_nonlive_and_stale_output_incarnations() 
         ),
         super::super::attachment::ResponseStreamAttachOutcome::ReplacedClosedOutput
     );
-    let candidates = binding.data_ack_recovery_candidates(u64::MAX, TrafficClass::Throughput);
+    let candidates =
+        binding.data_ack_recovery_candidates(&[range(0, u64::MAX)], TrafficClass::Throughput);
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].key, live);
 }

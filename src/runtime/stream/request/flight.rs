@@ -827,18 +827,27 @@ impl RequestFlightLedger {
     }
 
     /// Exact current-epoch attachment owners with retained unacknowledged
-    /// OriginalData below a complete authoritative Data ACK horizon. The
+    /// OriginalData intersecting explicit authoritative ACK gaps. The
     /// caller filters current attachment liveness.
-    pub(in crate::runtime) fn unacked_original_paths_before(
+    pub(in crate::runtime) fn unacked_original_paths_for_gaps(
         &self,
-        authoritative_horizon: u64,
+        gaps: &[OffsetRange],
     ) -> SmallVec<[RelayPathInstance; 4]> {
         let mut paths = SmallVec::new();
-        for (_, flights) in self.flights.range(..authoritative_horizon) {
+        let Some(last_gap) = gaps.last() else {
+            return paths;
+        };
+        for (start, flights) in self.flights.range(..last_gap.end) {
             let Some(original) = latest_original_transmission(flights) else {
                 continue;
             };
-            if original.evidence_eligible && !paths.contains(&original.instance) {
+            let first_gap = gaps.partition_point(|gap| gap.end <= *start);
+            if original.evidence_eligible
+                && gaps
+                    .get(first_gap)
+                    .is_some_and(|gap| gap.start < original.end)
+                && !paths.contains(&original.instance)
+            {
                 paths.push(original.instance);
             }
         }

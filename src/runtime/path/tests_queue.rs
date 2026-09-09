@@ -200,7 +200,7 @@ async fn path_drain_closes_admission_and_waits_for_preexisting_reservations() {
         .try_enqueue_admitted_frame(
             Frame::StreamAck {
                 stream_id: StreamId(1),
-                complete: false,
+                scope_start: None,
                 ranges: Vec::new(),
             },
             TrafficClass::Control,
@@ -454,7 +454,7 @@ fn control_and_ack_frames_never_use_throughput_lane() {
         (
             Frame::StreamAck {
                 stream_id: StreamId(1),
-                complete: false,
+                scope_start: None,
                 ranges: vec![],
             },
             TrafficClass::Control,

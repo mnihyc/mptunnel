@@ -166,12 +166,12 @@ pub(crate) fn bulk_original_data_assignment_authority(
 /// still owns a live contiguous frontier.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReliableDataAckFrontierState {
-    /// No complete sparse Data ACK proves that the lowest outstanding range is
+    /// No scoped Data ACK proves that the lowest outstanding range is
     /// missing. The owner remains work-conserving while both Product and
     /// native admission authorities have headroom.
     #[default]
     Live,
-    /// A complete retained Data ACK omits the lowest outstanding range. Exact
+    /// Retained scoped Data ACK evidence omits the lowest outstanding range. Exact
     /// ownership remains authoritative for ordering and recovery, but fresh
     /// originals must use the ordinary Product service window.
     AuthoritativeGap,

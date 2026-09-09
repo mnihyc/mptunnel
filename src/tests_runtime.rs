@@ -18,6 +18,10 @@ use crate::runtime::path::{
     ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerLocalPath,
     ServerLocalPathProperties, ServerStreamOpenRequest, ServerStreamPathAttachment,
 };
+use crate::runtime::relay::io::{
+    AuthoritativeStreamAckSnapshot, begin_reliable_stream_ack,
+    update_reinjection_authoritative_ack_snapshot,
+};
 use crate::runtime::relay::lifecycle::{
     reliable_relay_receive_hole_reinjection_active,
     reliable_relay_receive_hole_reinjection_deadline, reliable_relay_response_stall_watch_bytes,
@@ -3748,7 +3752,7 @@ fn path_writer_budget_counts_encoded_payload_and_variable_control_frames() {
     }
     let ack = Frame::StreamAck {
         stream_id: StreamId(1),
-        complete: false,
+        scope_start: None,
         ranges: (0..MuxLimits::default().max_ack_ranges)
             .map(|index| OffsetRange {
                 start: (index as u64) * 2,
@@ -4241,28 +4245,47 @@ fn stream_ack_gap_reinjection_waits_for_persistent_gap_on_reliable_carriers() {
     send_stream
         .send_data(Bytes::from_static(b"cccc"))
         .expect("later chunk");
-    let ranges = [
+    let ranges = vec![
         OffsetRange { start: 0, end: 4 },
         OffsetRange { start: 8, end: 12 },
     ];
+    let mut evidence = AuthoritativeStreamAckSnapshot::default();
+    let positive_only = begin_reliable_stream_ack(&send_stream, None, ranges.clone())
+        .expect("positive ranges fit assigned data");
+    send_stream
+        .apply_validated_ack(&positive_only)
+        .expect("apply positive evidence first");
+    update_reinjection_authoritative_ack_snapshot(&mut evidence, &positive_only, &send_stream);
+    assert!(
+        stream_ack_gap_reinjection_frames(&send_stream, evidence.gaps(), usize::MAX, true, true,)
+            .is_empty(),
+        "positive-only ACKs cannot infer holes even when an alternate and its timing are ready",
+    );
+    let scoped = begin_reliable_stream_ack(&send_stream, Some(0), ranges)
+        .expect("scope establishes the missing middle range");
+    send_stream
+        .apply_validated_ack(&scoped)
+        .expect("repeated positives remain idempotent");
+    update_reinjection_authoritative_ack_snapshot(&mut evidence, &scoped, &send_stream);
+    assert_eq!(evidence.gaps(), &[OffsetRange { start: 4, end: 8 }]);
 
     assert!(
-        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, false, false,)
+        stream_ack_gap_reinjection_frames(&send_stream, evidence.gaps(), usize::MAX, false, false,)
             .is_empty(),
         "a single reliable carrier must not replay product bytes over itself"
     );
     assert!(
-        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, false, true,)
+        stream_ack_gap_reinjection_frames(&send_stream, evidence.gaps(), usize::MAX, false, true,)
             .is_empty(),
         "a single reliable carrier owns ordinary packet-loss recovery"
     );
     assert!(
-        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, true, false,)
+        stream_ack_gap_reinjection_frames(&send_stream, evidence.gaps(), usize::MAX, true, false,)
             .is_empty(),
         "fresh multipath ACK gaps wait for persistent product-hole evidence"
     );
     let persistent_gap_reinjections =
-        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, true, true);
+        stream_ack_gap_reinjection_frames(&send_stream, evidence.gaps(), usize::MAX, true, true);
     assert_eq!(
         persistent_gap_reinjections.len(),
         1,
@@ -4276,11 +4299,6 @@ fn stream_ack_gap_reinjection_waits_for_persistent_gap_on_reliable_carriers() {
             ..
         } if payload.as_ref() == b"bbbb"
     ));
-    assert!(
-        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, false, false, false,)
-            .is_empty(),
-        "non-authoritative ACK snapshots must not infer missing holes"
-    );
 }
 
 #[test]
@@ -4297,10 +4315,20 @@ fn ack_gap_reinjection_prefers_authoritative_gap_before_frontier_tail() {
         .send_data(Bytes::from_static(b"cccc"))
         .expect("third chunk");
 
-    let ranges = [OffsetRange { start: 4, end: 12 }];
-    let _ = send_stream.apply_ack(&ranges);
+    let mut evidence = AuthoritativeStreamAckSnapshot::default();
+    let ack = begin_reliable_stream_ack(
+        &send_stream,
+        Some(0),
+        vec![OffsetRange { start: 4, end: 12 }],
+    )
+    .expect("scoped ACK proves the missing prefix");
+    send_stream
+        .apply_validated_ack(&ack)
+        .expect("release received suffix");
+    update_reinjection_authoritative_ack_snapshot(&mut evidence, &ack, &send_stream);
+    assert_eq!(evidence.gaps(), &[OffsetRange { start: 0, end: 4 }]);
     let reinjections =
-        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, true, true);
+        stream_ack_gap_reinjection_frames(&send_stream, evidence.gaps(), usize::MAX, true, true);
 
     assert_eq!(reinjections.len(), 1);
     assert!(matches!(
@@ -4327,10 +4355,21 @@ fn ack_gap_reinjection_ignores_contiguous_unacked_original_tail() {
         .send_data(Bytes::from_static(b"cccc"))
         .expect("third chunk");
 
-    let ranges = [OffsetRange { start: 0, end: 4 }];
-    let _ = send_stream.apply_ack(&ranges);
+    let mut evidence = AuthoritativeStreamAckSnapshot::default();
+    let ack = begin_reliable_stream_ack(
+        &send_stream,
+        Some(0),
+        vec![OffsetRange { start: 0, end: 4 }],
+    )
+    .expect("ACK scope stops before the retained tail");
+    send_stream
+        .apply_validated_ack(&ack)
+        .expect("release received prefix");
+    update_reinjection_authoritative_ack_snapshot(&mut evidence, &ack, &send_stream);
+    assert!(!evidence.has_gaps());
+    assert_eq!(send_stream.reinjection_bytes(), 8);
     let reinjections =
-        stream_ack_gap_reinjection_frames(&send_stream, &ranges, 6, true, true, true);
+        stream_ack_gap_reinjection_frames(&send_stream, evidence.gaps(), 6, true, true);
 
     assert!(
         reinjections.is_empty(),

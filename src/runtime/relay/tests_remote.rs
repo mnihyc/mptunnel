@@ -86,7 +86,7 @@ async fn failed_path_proof_enqueue_retries_without_sticky_state() {
             .stream()
             .try_enqueue_request_control_frame(Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: Vec::new(),
             })
             .expect("fill priority queue");

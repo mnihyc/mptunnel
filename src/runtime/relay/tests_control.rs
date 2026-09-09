@@ -1172,7 +1172,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
             relay_lane: TrafficClass::Throughput,
         },
         stream_id,
-        true,
+        Some(0),
         vec![OffsetRange { start: 4, end: 9 }],
     );
 
@@ -1206,13 +1206,13 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
             relay_lane: TrafficClass::Throughput,
         },
         stream_id,
-        true,
+        Some(0),
         vec![OffsetRange { start: 0, end: 8 }],
     )
     .expect("exact assigned ACK commits");
     assert_eq!(released, 8);
     assert!(sender_queue.is_empty());
-    assert_eq!(last_send_ack.horizon(), Some(8));
+    assert!(last_send_ack.gaps().is_empty());
 }
 
 async fn closed_output_relay(
@@ -1303,7 +1303,7 @@ async fn blocked_feedback_relay(
         .try_enqueue_admitted_frame(
             Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: Vec::new(),
             },
             TrafficClass::Control,
@@ -1517,7 +1517,12 @@ async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted(
         1,
         vec![Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: None,
+            ranges: Vec::new(),
+        }],
+        vec![Frame::StreamAck {
+            stream_id,
+            scope_start: None,
             ranges: Vec::new(),
         }],
     );
@@ -1594,7 +1599,12 @@ async fn client_completion_retains_ack_until_every_live_attachment_accepts_it() 
         1,
         vec![Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: None,
+            ranges: Vec::new(),
+        }],
+        vec![Frame::StreamAck {
+            stream_id,
+            scope_start: None,
             ranges: Vec::new(),
         }],
     );
@@ -1729,7 +1739,7 @@ async fn final_feedback_backpressure_keeps_fin_pending_until_ack_is_queued() {
                 &frame,
                 Frame::StreamAck {
                     stream_id: ack_stream_id,
-                    complete: true,
+                    scope_start: None,
                     ..
                 } if *ack_stream_id == stream_id
             ),
@@ -1960,7 +1970,7 @@ async fn prepared_request_actor_keeps_eof_source_claimable_until_final_offset() 
     frames_tx
         .send(Ok(Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: Some(0),
             ranges: vec![OffsetRange {
                 start: 0,
                 end: final_offset,

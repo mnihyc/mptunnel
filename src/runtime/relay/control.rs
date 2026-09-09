@@ -50,7 +50,7 @@ use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::performance::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
-use crate::protocol::{Frame, PathUsage, ResetReason};
+use crate::protocol::{Frame, OffsetRange, PathUsage, ResetReason};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::commands::reliable_stream_frame_queue;
 use crate::runtime::path::prepared::PreparedOriginalRegistration;
@@ -248,11 +248,11 @@ pub(super) fn arm_request_path_staleness_model_publication(
     context: &ClientPathContext,
     sender: &RequestSenderService,
     remotes: &ReliableRelayRemoteSet,
-    authoritative_horizon: u64,
+    gaps: &[OffsetRange],
     observed_generation: u64,
 ) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
     (!sender
-        .unacked_original_paths_before(remotes, authoritative_horizon)
+        .unacked_original_paths_for_gaps(remotes, gaps)
         .is_empty())
     .then(|| context.arm_path_model_publication(observed_generation))
 }
@@ -1214,7 +1214,7 @@ where
                     context,
                     sender,
                     remotes,
-                    last_send_ack.horizon().unwrap_or(0),
+                    last_send_ack.gaps(),
                     path_model_generation_before_recovery_observation,
                 );
             let request_path_staleness_model_wait_active =
@@ -1771,10 +1771,8 @@ where
                 if data_ack_timer_due {
                     state.progress.data_ack_reinjection_at = None;
                 }
-                let authoritative_data_ack_gap = stream_ack_ranges_expose_authoritative_gap(
-                    last_send_ack.complete(),
-                    last_send_ack.ranges(),
-                );
+                let authoritative_data_ack_gap =
+                    stream_ack_ranges_expose_authoritative_gap(last_send_ack.gaps());
                 let data_ack_capacity_wait_arm_active =
                     reliable_relay_client_ack_gap_capacity_wait_arm_active(
                         authoritative_data_ack_gap,
@@ -3872,7 +3870,7 @@ where
                             }
                             Frame::StreamAck {
                                 stream_id: ack_stream_id,
-                                complete,
+                                scope_start,
                                 ranges,
                             } if ack_stream_id == stream_id => {
                                 let pending_attach = {
@@ -3883,7 +3881,7 @@ where
                                     &mut product.last_send_ack, &mut product.remotes,
                                 );
                                 let mut pending_attach = None;
-                                let previous_ack_horizon = last_send_ack.horizon();
+                                let previous_had_ack_gaps = last_send_ack.has_gaps();
                                 let previous_ack_frontier = send_stream.data_ack_frontier();
                                 let previous_queue_bytes = sender_queue.bytes();
                                 let released_bytes = match apply_client_stream_ack(
@@ -3899,7 +3897,7 @@ where
                                         relay_lane: request_lane,
                                     },
                                     stream_id,
-                                    complete,
+                                    scope_start,
                                     ranges,
                                 ) {
                                     Ok(released_bytes) => released_bytes,
@@ -3908,7 +3906,7 @@ where
                                 send_buffer_reservation.release(released_bytes);
                                 request_recovery_dirty = true;
                                 let claim_inputs_changed = released_bytes > 0
-                                    || previous_ack_horizon != last_send_ack.horizon()
+                                    || previous_had_ack_gaps != last_send_ack.has_gaps()
                                     || previous_ack_frontier != send_stream.data_ack_frontier()
                                     || previous_queue_bytes != sender_queue.bytes();
                                 publish_prepared_request_work(

@@ -117,7 +117,7 @@ fn stream_frames_round_trip() {
     });
     round_trip(Frame::StreamAck {
         stream_id: StreamId(7),
-        complete: true,
+        scope_start: Some(0),
         ranges: vec![
             OffsetRange::new(0, 5).expect("range"),
             OffsetRange::new(10, 12).expect("range"),
@@ -145,7 +145,7 @@ fn stream_frames_round_trip() {
 }
 
 #[test]
-fn open_stream_v13_canonically_carries_return_plan() {
+fn open_stream_v14_canonically_carries_return_plan() {
     let frame = Frame::OpenStream {
         stream_id: StreamId(0x0102_0304_0506_0708),
         target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
@@ -163,7 +163,7 @@ fn open_stream_v13_canonically_carries_return_plan() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 13, 7, 0, 0, 0, 28, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            b'M', b'P', b'T', b'F', 14, 7, 0, 0, 0, 28, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
             187, 2, 0, 0, 0, 0, 0, 0, 228, 32, 4, 0, 0, 2,
         ]
     );
@@ -202,7 +202,7 @@ fn open_stream_creation_and_enrollment_have_distinct_wire_authority() {
 }
 
 #[test]
-fn stream_return_plan_final_v13_has_canonical_kind_and_count() {
+fn stream_return_plan_final_v14_has_canonical_kind_and_count() {
     let frame = Frame::StreamReturnPlanFinal {
         stream_id: StreamId(0x0102_0304_0506_0708),
         retained_ordinals: vec![0, 2, 7],
@@ -211,7 +211,7 @@ fn stream_return_plan_final_v13_has_canonical_kind_and_count() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 13, 49, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 3, 0, 2, 7,
+            b'M', b'P', b'T', b'F', 14, 49, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 3, 0, 2, 7,
         ]
     );
     assert_eq!(
@@ -348,8 +348,8 @@ fn decoder_rejects_unknown_path_usage() {
 }
 
 #[test]
-fn decoder_rejects_old_frames_after_v13_wire_cut() {
-    for version in [9, 10, 11, 12] {
+fn decoder_rejects_old_frames_after_v14_wire_cut() {
+    for version in [9, 10, 11, 12, 13] {
         let mut encoded =
             encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
         encoded[4] = version;
@@ -1109,7 +1109,7 @@ fn codec_rejects_oversize_payloads_and_ack_ranges() {
 
     let too_many_ranges = Frame::StreamAck {
         stream_id: StreamId(1),
-        complete: true,
+        scope_start: Some(0),
         ranges: vec![
             OffsetRange::new(0, 1).expect("range"),
             OffsetRange::new(2, 3).expect("range"),

@@ -168,10 +168,6 @@ pub(in crate::runtime) struct ReliableRecvProgress {
 }
 
 impl ReliableRecvProgress {
-    pub(in crate::runtime) fn has_sent_ack(&self) -> bool {
-        self.last_ack_at.is_some()
-    }
-
     pub(in crate::runtime) fn ack_generation(&self) -> u64 {
         self.ack_generation
     }

@@ -1256,6 +1256,10 @@ async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent()
 
 #[tokio::test]
 async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output() {
+    use crate::runtime::relay::io::{
+        AuthoritativeStreamAckSnapshot, begin_reliable_stream_ack,
+        update_reinjection_authoritative_ack_snapshot,
+    };
     let stream_id = StreamId(90);
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10260?initial-srtt-s=0.5&initial-rate-mbps=400",
@@ -1320,10 +1324,25 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
     let mut sender = RequestSenderService::new(stream_id);
     let sender_queue = ReliableRelaySenderQueue::default();
     sender.record_original_frame_for_test(tcp, &blocked);
-    let ranges = [OffsetRange {
+    let positive_ranges = vec![OffsetRange {
         start: 4096,
         end: 8192,
     }];
+    let ack = begin_reliable_stream_ack(&send_stream, Some(0), positive_ranges)
+        .expect("later positive receipt validates against committed source");
+    sender
+        .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
+        .expect("positive receipt releases the actual cache");
+    let mut evidence = AuthoritativeStreamAckSnapshot::default();
+    update_reinjection_authoritative_ack_snapshot(&mut evidence, &ack, &send_stream);
+    let ranges = evidence.gaps();
+    assert_eq!(
+        ranges,
+        &[OffsetRange {
+            start: 0,
+            end: 4096
+        }]
+    );
 
     // Match the relay actor's race-free ordering: generation precedes every
     // model read that can conclude there is no measured alternate.
@@ -1333,7 +1352,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         &remotes,
         &send_stream,
         &sender_queue,
-        &ranges,
+        ranges,
         64 * 1024,
         TrafficClass::Throughput,
     );
@@ -1363,7 +1382,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         &remotes,
         &send_stream,
         &sender_queue,
-        &ranges,
+        ranges,
         64 * 1024,
         TrafficClass::Throughput,
     );
@@ -3319,7 +3338,7 @@ async fn request_product_ack_preserves_exact_data_ack_progress_path() {
     sender.record_original_frame_for_test(owner, &frame);
 
     let ack = crate::mux::stream::validate_stream_ack(
-        true,
+        None,
         vec![OffsetRange {
             start: 0,
             end: 4096,
@@ -3490,7 +3509,7 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
         .try_enqueue_admitted_frame(
             Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: Vec::new(),
             },
             TrafficClass::Control,
@@ -3549,7 +3568,7 @@ async fn client_stream_ack_publication_resumes_at_the_exact_cumulative_chunk() {
         .try_enqueue_admitted_frame(
             Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: Vec::new(),
             },
             TrafficClass::Control,
@@ -3560,17 +3579,17 @@ async fn client_stream_ack_publication_resumes_at_the_exact_cumulative_chunk() {
     let chunks = vec![
         Frame::StreamAck {
             stream_id,
-            complete: false,
+            scope_start: Some(0),
             ranges: vec![OffsetRange { start: 0, end: 4 }],
         },
         Frame::StreamAck {
             stream_id,
-            complete: false,
+            scope_start: Some(4),
             ranges: vec![OffsetRange { start: 8, end: 12 }],
         },
     ];
 
-    let blocked = remotes.publish_stream_ack(1, chunks);
+    let blocked = remotes.publish_stream_ack(1, chunks.clone(), chunks);
     assert!(!blocked.published);
     assert!(blocked.pending);
     assert!(matches!(
@@ -3607,6 +3626,165 @@ async fn client_stream_ack_publication_resumes_at_the_exact_cumulative_chunk() {
 }
 
 #[tokio::test]
+async fn scoped_ack_actual_two_attachment_publication_preserves_catchup_and_replacement() {
+    fn take_ack(
+        receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers,
+    ) -> Frame {
+        match try_recv_reliable_path_priority_command(receivers) {
+            Some(ReliablePathCommand::SendFrame(frame @ Frame::StreamAck { .. })) => frame,
+            _ => panic!("expected immediately queued ACK"),
+        }
+    }
+
+    let stream_id = StreamId(921);
+    let context = client_test_context();
+    let (blocked_commands, mut blocked_rx) = reliable_path_command_channels(1);
+    blocked_commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamAck {
+                stream_id,
+                scope_start: None,
+                ranges: vec![],
+            },
+            TrafficClass::Control,
+        )
+        .expect("prefill one attachment without blocking the other");
+    let (available_commands, mut available_rx) = reliable_path_command_channels(8);
+    let (mut remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, blocked_commands), 4);
+    remotes.attach(opened_test_relay_stream(stream_id, 1, available_commands));
+    consume_client_path_proof_for_test(&mut available_rx);
+    let mut mux_limits = MuxLimits::default();
+    mux_limits.max_ack_ranges = 1;
+    let mut recv_stream = ReliableRecvStream::new(stream_id, mux_limits);
+    let mut progress = ReliableRecvProgress::default();
+    let mut sender = RequestSenderService::new(stream_id);
+    for offset in [0, 10, 20] {
+        recv_stream
+            .receive_data(offset, Bytes::from_static(b"x"))
+            .unwrap();
+    }
+    assert!(
+        sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &mut recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::ack_only(None, TrafficClass::Throughput),
+            )
+            .unwrap()
+    );
+    assert_eq!(progress.ack_generation(), 1);
+    for expected in recv_stream.ack_frames() {
+        assert_eq!(take_ack(&mut available_rx), expected);
+    }
+    assert!(remotes.has_pending_stream_ack_publication());
+    assert!(try_recv_reliable_path_priority_command(&mut available_rx).is_none());
+
+    for offset in [30, 40] {
+        recv_stream
+            .receive_data(offset, Bytes::from_static(b"x"))
+            .unwrap();
+    }
+    assert!(
+        sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &mut recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::ack_only(None, TrafficClass::Throughput),
+            )
+            .unwrap()
+    );
+    assert_eq!(progress.ack_generation(), 2);
+    for (start, scope) in [(30, 21), (40, 31)] {
+        assert_eq!(
+            take_ack(&mut available_rx),
+            Frame::StreamAck {
+                stream_id,
+                scope_start: Some(scope),
+                ranges: vec![OffsetRange {
+                    start,
+                    end: start + 1
+                }],
+            }
+        );
+    }
+    assert!(
+        try_recv_reliable_path_priority_command(&mut available_rx).is_none(),
+        "the current attachment receives only new positive support"
+    );
+
+    assert_eq!(
+        take_ack(&mut blocked_rx),
+        Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: vec![],
+        }
+    );
+    let partial = remotes.retry_pending_stream_ack();
+    assert!(partial.accepted && partial.pending);
+    assert_eq!(take_ack(&mut blocked_rx), recv_stream.ack_frames()[0]);
+
+    // A newer generation supersedes a partially queued catch-up. The partial
+    // predecessor is already immutable; the successor must restart its full
+    // truthful catch-up, rather than assuming that all older chunks arrived.
+    recv_stream
+        .receive_data(50, Bytes::from_static(b"x"))
+        .unwrap();
+    assert!(
+        sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &mut recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::ack_only(None, TrafficClass::Throughput),
+            )
+            .unwrap()
+    );
+    assert_eq!(progress.ack_generation(), 3);
+    assert_eq!(
+        take_ack(&mut available_rx),
+        Frame::StreamAck {
+            stream_id,
+            scope_start: Some(41),
+            ranges: vec![OffsetRange { start: 50, end: 51 }],
+        }
+    );
+    let cumulative = recv_stream.ack_frames();
+    assert_eq!(take_ack(&mut blocked_rx), cumulative[0]);
+    for expected in cumulative.iter().skip(1) {
+        let retry = remotes.retry_pending_stream_ack();
+        assert!(retry.accepted);
+        assert_eq!(&take_ack(&mut blocked_rx), expected);
+        assert!(try_recv_reliable_path_priority_command(&mut available_rx).is_none());
+    }
+    assert!(!remotes.has_pending_stream_ack_publication());
+
+    let previous_instance = remotes.paths[1].instance();
+    drop(remotes.remove_path_instance(previous_instance));
+    let (replacement_commands, mut replacement_rx) = reliable_path_command_channels(8);
+    remotes.attach(opened_test_relay_stream(stream_id, 1, replacement_commands));
+    consume_client_path_proof_for_test(&mut replacement_rx);
+    let replacement = remotes.retry_pending_stream_ack();
+    assert!(replacement.published && !replacement.pending);
+    for expected in cumulative {
+        assert_eq!(take_ack(&mut replacement_rx), expected);
+    }
+    assert!(try_recv_reliable_path_priority_command(&mut blocked_rx).is_none());
+    assert!(try_recv_reliable_path_priority_command(&mut replacement_rx).is_none());
+    assert!(
+        matches!(recv_stream.take_ack_update().as_slice(),
+        [Frame::StreamAck { scope_start: None, ranges, .. }] if ranges.is_empty()),
+        "retry/replacement did not create or consume another receive generation"
+    );
+}
+
+#[tokio::test]
 async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
     let stream_id = StreamId(97);
     let context = client_test_context();
@@ -3615,7 +3793,7 @@ async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
         .try_enqueue_admitted_frame(
             Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: Vec::new(),
             },
             TrafficClass::Control,
@@ -3689,7 +3867,7 @@ async fn client_max_data_retries_only_the_blocked_attachment() {
         .try_enqueue_admitted_frame(
             Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: Vec::new(),
             },
             TrafficClass::Control,
@@ -3784,7 +3962,7 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
         .try_enqueue_admitted_frame(
             Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: Vec::new(),
             },
             TrafficClass::Control,

@@ -242,7 +242,7 @@ async fn latest_max_data_crosses_ack_case(asynchronous: bool) {
     let [_, b_latest] = fixture.publish(greatest);
     let ack = Frame::StreamAck {
         stream_id,
-        complete: false,
+        scope_start: None,
         ranges: vec![OffsetRange { start: 0, end: 1 }],
     };
     let data = Frame::StreamData {
@@ -327,7 +327,7 @@ async fn latest_max_data_preserves_fifo_identity_and_reset_fence() {
         let boundaries = [
             Some(Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: vec![OffsetRange { start: 0, end: 1 }],
             }),
             Some(Frame::StreamData {
@@ -531,7 +531,7 @@ async fn latest_max_data_and_ready_fifo_have_fair_service() {
         let expected = vec![
             Frame::StreamAck {
                 stream_id,
-                complete: false,
+                scope_start: None,
                 ranges: vec![
                     OffsetRange { start: 0, end: 3 },
                     OffsetRange { start: 4, end: 7 },
@@ -544,7 +544,7 @@ async fn latest_max_data_and_ready_fifo_have_fair_service() {
             },
             Frame::StreamAck {
                 stream_id,
-                complete: true,
+                scope_start: Some(0),
                 ranges: vec![OffsetRange { start: 0, end: 7 }],
             },
         ];

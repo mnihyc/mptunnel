@@ -56,7 +56,7 @@ fn validated_stream_ack_accepts_the_exact_assigned_extent() {
     let assigned_end = stream.next_offset();
 
     let ack = validate_stream_ack(
-        true,
+        Some(0),
         vec![OffsetRange {
             start: 0,
             end: assigned_end,
@@ -65,7 +65,7 @@ fn validated_stream_ack_accepts_the_exact_assigned_extent() {
     )
     .expect("exact assigned extent is valid");
 
-    assert!(ack.complete());
+    assert_eq!(ack.scope_start(), Some(0));
     assert_eq!(ack.assigned_end(), 8);
     assert_eq!(ack.ranges(), &[OffsetRange { start: 0, end: 8 }]);
     assert_eq!(
@@ -87,7 +87,7 @@ fn validated_stream_ack_rejects_beyond_and_crossing_ranges_without_mutation() {
     let assigned_end = stream.next_offset();
 
     assert_eq!(
-        validate_stream_ack(false, vec![OffsetRange { start: 9, end: 10 }], assigned_end,),
+        validate_stream_ack(None, vec![OffsetRange { start: 9, end: 10 }], assigned_end,),
         Err(StreamError::AckRangeBeyondAssigned {
             start: 9,
             end: 10,
@@ -97,7 +97,11 @@ fn validated_stream_ack_rejects_beyond_and_crossing_ranges_without_mutation() {
     assert_eq!(stream, before);
 
     assert_eq!(
-        validate_stream_ack(true, vec![OffsetRange { start: 4, end: 9 }], assigned_end,),
+        validate_stream_ack(
+            Some(0),
+            vec![OffsetRange { start: 4, end: 9 }],
+            assigned_end,
+        ),
         Err(StreamError::AckRangeBeyondAssigned {
             start: 4,
             end: 9,
@@ -116,9 +120,9 @@ fn validated_stream_ack_handles_empty_snapshot_and_rejects_empty_original_range(
     let before = stream.clone();
     let assigned_end = stream.next_offset();
 
-    let empty = validate_stream_ack(true, Vec::new(), assigned_end)
-        .expect("an empty complete snapshot is valid evidence");
-    assert!(empty.complete());
+    let empty = validate_stream_ack(None, Vec::new(), assigned_end)
+        .expect("an empty positive report is valid and has no negative authority");
+    assert_eq!(empty.scope_start(), None);
     assert!(empty.ranges().is_empty());
     assert_eq!(empty.assigned_end(), assigned_end);
     assert_eq!(
@@ -131,10 +135,39 @@ fn validated_stream_ack_handles_empty_snapshot_and_rejects_empty_original_range(
     assert_eq!(stream, before);
 
     assert_eq!(
-        validate_stream_ack(false, vec![OffsetRange { start: 4, end: 4 }], assigned_end,),
+        validate_stream_ack(None, vec![OffsetRange { start: 4, end: 4 }], assigned_end,),
         Err(StreamError::InvalidAckRange { start: 4, end: 4 })
     );
     assert_eq!(stream, before);
+}
+
+#[test]
+fn validated_stream_ack_rejects_scope_without_a_positive_end_before_mutation() {
+    let mut stream = ReliableSendStream::new(StreamId(104), limits());
+    stream.send_data(Bytes::from_static(b"abcdefgh")).unwrap();
+    let before = stream.clone();
+    for (scope_start, ranges) in [
+        (0, vec![]),
+        (8, vec![OffsetRange { start: 4, end: 8 }]),
+        (9, vec![OffsetRange { start: 4, end: 8 }]),
+    ] {
+        assert!(validate_stream_ack(Some(scope_start), ranges, stream.next_offset()).is_err());
+        assert_eq!(stream, before);
+    }
+    let scoped = validate_stream_ack(
+        Some(6),
+        vec![
+            OffsetRange { start: 0, end: 2 },
+            OffsetRange { start: 7, end: 8 },
+        ],
+        stream.next_offset(),
+    )
+    .unwrap();
+    assert_eq!(scoped.scope_start(), Some(6));
+    assert_eq!(
+        stream.apply_validated_ack(&scoped).unwrap().released_bytes,
+        3
+    );
 }
 
 #[test]
@@ -318,12 +351,18 @@ fn first_retransmission_frame_matches_existing_cache_slices_without_mutation() {
         assert!(
             stream
                 .first_retransmission_frame_for_range(
-                    OffsetRange { start: u64::MAX - 1, end: u64::MAX },
+                    OffsetRange {
+                        start: u64::MAX - 1,
+                        end: u64::MAX
+                    },
                     usize::MAX,
                 )
                 .is_none()
         );
-        assert_eq!(stream, before, "view cannot change credit, offsets or cache");
+        assert_eq!(
+            stream, before,
+            "view cannot change credit, offsets or cache"
+        );
     }
 }
 
@@ -441,7 +480,7 @@ fn recv_stream_reassembles_out_of_order_data_and_builds_ack_ranges() {
         stream.ack_frame(),
         Frame::StreamAck {
             stream_id: StreamId(7),
-            complete: true,
+            scope_start: None,
             ranges: vec![OffsetRange::new(0, 11).expect("range")]
         }
     );
@@ -488,7 +527,7 @@ fn recv_stream_limits_encoded_ack_ranges_without_rejecting_reordering() {
         stream.ack_frame(),
         Frame::StreamAck {
             stream_id: StreamId(7),
-            complete: false,
+            scope_start: Some(0),
             ranges: vec![
                 OffsetRange::new(0, 1).expect("contiguous range"),
                 OffsetRange::new(10, 11).expect("first reinjection-adjacent range"),
@@ -496,19 +535,6 @@ fn recv_stream_limits_encoded_ack_ranges_without_rejecting_reordering() {
                 OffsetRange::new(30, 31).expect("fourth range"),
             ]
         }
-    );
-    let delta_ranges = [
-        OffsetRange::new(20, 21).expect("middle delta"),
-        OffsetRange::new(50, 51).expect("tail delta"),
-    ];
-    assert_eq!(
-        stream.ack_delta_frames(&delta_ranges),
-        vec![Frame::StreamAck {
-            stream_id: StreamId(7),
-            complete: false,
-            ranges: delta_ranges.to_vec(),
-        }],
-        "a delta ACK must preserve exact new coverage without claiming a full snapshot"
     );
 }
 
@@ -529,7 +555,7 @@ fn recv_stream_splits_large_ack_sets_into_bounded_frames() {
         vec![
             Frame::StreamAck {
                 stream_id: StreamId(7),
-                complete: false,
+                scope_start: Some(0),
                 ranges: vec![
                     OffsetRange::new(0, 1).expect("first"),
                     OffsetRange::new(10, 11).expect("second"),
@@ -537,7 +563,7 @@ fn recv_stream_splits_large_ack_sets_into_bounded_frames() {
             },
             Frame::StreamAck {
                 stream_id: StreamId(7),
-                complete: false,
+                scope_start: Some(11),
                 ranges: vec![
                     OffsetRange::new(20, 21).expect("third"),
                     OffsetRange::new(30, 31).expect("fourth"),
@@ -545,11 +571,214 @@ fn recv_stream_splits_large_ack_sets_into_bounded_frames() {
             },
             Frame::StreamAck {
                 stream_id: StreamId(7),
-                complete: false,
+                scope_start: Some(31),
                 ranges: vec![OffsetRange::new(40, 41).expect("fifth")],
             },
         ]
     );
+}
+
+#[test]
+fn scoped_ack_update_preserves_batched_merges_without_repeating_unchanged_islands() {
+    let stream_id = StreamId(70);
+    let mut limit = limits();
+    limit.max_ack_ranges = 1;
+    let mut stream = ReliableRecvStream::new(stream_id, limit);
+    for offset in [10, 30] {
+        stream
+            .receive_data(offset, Bytes::from_static(b"0123456789"))
+            .expect("admit initial islands");
+    }
+    assert_eq!(
+        stream.take_ack_update(),
+        vec![
+            Frame::StreamAck {
+                stream_id,
+                scope_start: Some(0),
+                ranges: vec![OffsetRange { start: 10, end: 20 }],
+            },
+            Frame::StreamAck {
+                stream_id,
+                scope_start: Some(20),
+                ranges: vec![OffsetRange { start: 30, end: 40 }],
+            },
+        ]
+    );
+
+    // One receive-publication boundary covers all three novel receives, not
+    // just the latest DATA. The middle receive merges with a clean old node.
+    stream
+        .receive_data(0, Bytes::from_static(b"first"))
+        .unwrap();
+    stream
+        .receive_data(15, Bytes::from_static(b"0123456789"))
+        .unwrap();
+    stream
+        .receive_data(45, Bytes::from_static(b"later"))
+        .unwrap();
+    assert_eq!(
+        stream.receive_data(30, Bytes::from_static(b"0123456789")),
+        Ok(ReceiveOutcome::default()),
+        "a duplicate must not dirty the unchanged island",
+    );
+    let before_rejected = stream.clone();
+    assert!(
+        stream
+            .receive_data(limit.max_stream_window_bytes, Bytes::from_static(b"x"))
+            .is_err()
+    );
+    assert_eq!(
+        stream, before_rejected,
+        "rejected bytes cannot alter feedback evidence"
+    );
+
+    let update = stream.take_ack_update();
+    assert_eq!(
+        update,
+        vec![
+            Frame::StreamAck {
+                stream_id,
+                scope_start: None,
+                ranges: vec![OffsetRange { start: 0, end: 5 }],
+            },
+            Frame::StreamAck {
+                stream_id,
+                scope_start: None,
+                ranges: vec![OffsetRange { start: 10, end: 25 }],
+            },
+            Frame::StreamAck {
+                stream_id,
+                scope_start: Some(40),
+                ranges: vec![OffsetRange { start: 45, end: 50 }],
+            },
+        ]
+    );
+    // Each record is truthful by itself; dropping preceding chunks does not
+    // turn the unchanged received island [30,40) into a claimed missing gap.
+    let truth = stream.ack_ranges();
+    for frame in update.iter().rev().chain(update.iter()) {
+        let Frame::StreamAck {
+            scope_start,
+            ranges,
+            ..
+        } = frame
+        else {
+            unreachable!();
+        };
+        for range in ranges {
+            assert!(
+                truth
+                    .iter()
+                    .any(|known| known.start <= range.start && known.end >= range.end)
+            );
+        }
+        if let Some(start) = scope_start {
+            for offset in *start..ranges.last().unwrap().end {
+                let covered = |ranges: &[OffsetRange]| {
+                    ranges
+                        .iter()
+                        .any(|range| range.start <= offset && offset < range.end)
+                };
+                assert_eq!(covered(ranges), covered(&truth));
+            }
+        }
+    }
+    assert_eq!(
+        stream.take_ack_update(),
+        vec![Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: vec![]
+        }],
+        "publication consumes only the dirty markers, not cumulative catch-up coverage",
+    );
+    assert_eq!(stream.ack_ranges(), truth);
+}
+
+#[test]
+fn scoped_ack_updates_reduce_repeated_support_and_omit_empty_negative_scopes() {
+    use crate::protocol::codec::{CodecLimits, encode_frame};
+
+    let mut limit = limits();
+    limit.max_ack_ranges = 256;
+    let mut stream = ReliableRecvStream::new(StreamId(71), limit);
+    let mut update_ranges = 0;
+    let mut cumulative_ranges = 0;
+    let mut update_bytes = 0;
+    let mut cumulative_bytes = 0;
+    for index in 0..128 {
+        stream
+            .receive_data(index * 20, Bytes::from_static(b"x"))
+            .unwrap();
+        let cumulative = stream.ack_frames();
+        let update = stream.take_ack_update();
+        assert_eq!(cumulative.len(), 1);
+        assert_eq!(update.len(), 1);
+        let count_ranges = |frame: &Frame| match frame {
+            Frame::StreamAck { ranges, .. } => ranges.len(),
+            _ => unreachable!(),
+        };
+        cumulative_ranges += count_ranges(&cumulative[0]);
+        update_ranges += count_ranges(&update[0]);
+        cumulative_bytes += encode_frame(&cumulative[0], CodecLimits::default())
+            .unwrap()
+            .len();
+        update_bytes += encode_frame(&update[0], CodecLimits::default())
+            .unwrap()
+            .len();
+    }
+    assert_eq!(cumulative_ranges, 128 * 129 / 2);
+    assert_eq!(
+        update_ranges, 128,
+        "one new island contributes one normalized node, not its whole history"
+    );
+    assert!(
+        update_bytes < cumulative_bytes,
+        "actual independently encoded records must remove repeated range cost: {update_bytes} versus {cumulative_bytes}"
+    );
+
+    let mut contiguous = ReliableRecvStream::new(StreamId(72), limits());
+    for offset in [0, 10] {
+        contiguous
+            .receive_data(offset, Bytes::from_static(b"0123456789"))
+            .unwrap();
+        let update = contiguous.take_ack_update();
+        let [
+            Frame::StreamAck {
+                scope_start,
+                ranges,
+                ..
+            },
+        ] = update.as_slice()
+        else {
+            panic!("contiguous receive has one normalized positive range");
+        };
+        assert_eq!(
+            *scope_start, None,
+            "a fully positive scope proves no omissions"
+        );
+        assert_eq!(
+            ranges,
+            &[OffsetRange {
+                start: 0,
+                end: offset + 10
+            }]
+        );
+        let redundant_scope = Frame::StreamAck {
+            stream_id: StreamId(72),
+            scope_start: Some(offset),
+            ranges: ranges.clone(),
+        };
+        assert!(
+            encode_frame(&update[0], CodecLimits::default())
+                .unwrap()
+                .len()
+                < encode_frame(&redundant_scope, CodecLimits::default())
+                    .unwrap()
+                    .len()
+        );
+        assert_eq!(contiguous.ack_frames(), update);
+    }
 }
 
 #[test]

@@ -7,7 +7,7 @@
 use super::io::{
     AuthoritativeStreamAckSnapshot, ReliableAckGapReinjectionProgress,
     ReliablePathStalenessObservation, ReliableRequestPathStaleness, begin_reliable_stream_ack,
-    exact_contiguous_retransmission_frames, normalized_stream_ack_first_gap,
+    exact_contiguous_retransmission_frames, first_proven_ack_gap,
     preserve_reinjection_frontier_quantum, stream_ack_ranges_expose_authoritative_gap,
     update_reinjection_authoritative_ack_snapshot,
 };
@@ -433,8 +433,8 @@ pub(super) struct ClientStreamAckContext<'a> {
     pub(super) relay_lane: TrafficClass,
 }
 
-/// Runs exact-attachment stale-path decisions for OriginalData omitted below a
-/// complete authoritative Data ACK horizon. TCP and QUIC continue to own
+/// Runs exact-attachment stale-path decisions for OriginalData intersecting
+/// explicitly proven Data ACK gaps. TCP and QUIC continue to own
 /// recovery of their already-emitted flights.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_request_path_staleness(
@@ -447,8 +447,7 @@ pub(super) fn update_request_path_staleness(
     lane: TrafficClass,
     stream_id: StreamId,
 ) -> bool {
-    let authoritative_horizon = last_send_ack.horizon().unwrap_or(0);
-    let candidates = sender.unacked_original_paths_before(remotes, authoritative_horizon);
+    let candidates = sender.unacked_original_paths_for_gaps(remotes, last_send_ack.gaps());
     let observations = candidates
         .iter()
         .copied()
@@ -533,15 +532,11 @@ pub(super) fn evaluate_client_data_ack_reinjection(
 ) -> ClientDataAckReinjectionOutcome {
     let has_multipath_reinjection_alternative =
         sender.has_multipath_reinjection_alternative(context, remotes, relay_lane);
-    let authoritative_ack_complete = last_send_ack.complete();
-    let authoritative_ack_ranges = last_send_ack.ranges();
-    if !stream_ack_ranges_expose_authoritative_gap(
-        authoritative_ack_complete,
-        authoritative_ack_ranges,
-    ) || !has_multipath_reinjection_alternative
+    let authoritative_ack_ranges = last_send_ack.gaps();
+    if !stream_ack_ranges_expose_authoritative_gap(authoritative_ack_ranges)
+        || !has_multipath_reinjection_alternative
     {
         state.progress.ack_gap_reinjection.observe_recovery_timing(
-            authoritative_ack_complete,
             authoritative_ack_ranges,
             has_multipath_reinjection_alternative,
             None,
@@ -587,7 +582,7 @@ pub(super) fn evaluate_client_data_ack_reinjection(
                 context.mux_limits,
             )
         });
-    let frontier_extent = normalized_stream_ack_first_gap(authoritative_ack_ranges)
+    let frontier_extent = first_proven_ack_gap(authoritative_ack_ranges)
         .map_or(0, |(start, end)| flight_interval_bytes(start, end))
         .min(reinjection.uniform_frontier_extent_bytes);
     let frontier_limit = reliable_live_frontier_reinjection_limit_bytes(
@@ -613,7 +608,6 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         .then_some(reinjection.owner_recovery_timing)
         .flatten();
     let candidate_gap_deadline = state.progress.ack_gap_reinjection.observe_recovery_timing(
-        authoritative_ack_complete,
         authoritative_ack_ranges,
         has_multipath_reinjection_alternative,
         observed_gap_timing,
@@ -624,14 +618,13 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     let measured_reinjection_ready =
         candidate_gap_deadline.is_some_and(|deadline| observed_at >= deadline);
     let ack_gap_reinjection_ready = state.progress.ack_gap_reinjection.reinjection_ready(
-        authoritative_ack_complete,
         authoritative_ack_ranges,
         has_multipath_reinjection_alternative,
         measured_reinjection_ready,
     );
     let persistent_ack_gap_reinjection_ready =
         ack_gap_reinjection_ready && reinjection_target.is_some();
-    // A complete persistent gap proves missing Product order. Its immutable
+    // An explicitly proven persistent gap establishes missing Product order. Its immutable
     // cause clock and exact current ownership decide recovery readiness; the
     // selected target's Product headroom bounds the admitted extent.
     let owner_recovery_deadline = state
@@ -672,7 +665,7 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     } else {
         RelaySendCause::AckGapReinjection
     };
-    let reinjection_frames = normalized_stream_ack_first_gap(authoritative_ack_ranges)
+    let reinjection_frames = first_proven_ack_gap(authoritative_ack_ranges)
         .and_then(|(frontier, _)| {
             let applied_extent = reinjection_limit.min(reinjection.uniform_frontier_extent_bytes);
             exact_contiguous_retransmission_frames(
@@ -736,10 +729,8 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             sender.record_live_owner_frontier_floor_attempt(accepted_at, reinjection_retry_after);
         }
     }
-    let timer_active = stream_ack_ranges_expose_authoritative_gap(
-        authoritative_ack_complete,
-        authoritative_ack_ranges,
-    ) && has_multipath_reinjection_alternative
+    let timer_active = stream_ack_ranges_expose_authoritative_gap(authoritative_ack_ranges)
+        && has_multipath_reinjection_alternative
         && state
             .progress
             .ack_gap_reinjection
@@ -779,13 +770,16 @@ pub(super) fn evaluate_client_data_ack_reinjection(
 pub(super) fn apply_client_stream_ack(
     ack_context: ClientStreamAckContext<'_>,
     stream_id: StreamId,
-    complete: bool,
+    scope_start: Option<u64>,
     ranges: Vec<OffsetRange>,
 ) -> Result<usize, StreamError> {
     // Capture one immutable send-assignment extent before touching any ACK-owned
     // cache, flight, queue, reservation, or recovery evidence.
-    let validated_ack = begin_reliable_stream_ack(ack_context.send_stream, complete, ranges)?;
-    if ack_context.last_send_ack.subsumes(&validated_ack) {
+    let validated_ack = begin_reliable_stream_ack(ack_context.send_stream, scope_start, ranges)?;
+    if ack_context
+        .last_send_ack
+        .subsumes(&validated_ack, ack_context.send_stream)
+    {
         ack_context.state.progress.last_stream_at = Instant::now();
         return Ok(0);
     }
@@ -811,7 +805,7 @@ pub(super) fn apply_client_stream_ack(
         remotes.depublish_path_instance_load(instance);
     }
     let previous_ack_frontier = state.progress.last_send_ack_frontier;
-    update_reinjection_authoritative_ack_snapshot(last_send_ack, &validated_ack);
+    update_reinjection_authoritative_ack_snapshot(last_send_ack, &validated_ack, send_stream);
     state.progress.last_send_ack_frontier = send_stream.data_ack_frontier();
     if state.progress.last_send_ack_frontier > previous_ack_frontier {
         sender.record_live_owner_data_ack_frontier_progress(Instant::now());
@@ -847,9 +841,9 @@ pub(super) fn apply_client_stream_ack(
     lab_diagnostic(
         "stream_ack_received",
         format_args!(
-            "stream_id={} complete={} ranges={} largest_end={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={}",
+            "stream_id={} scope_start={:?} ranges={} largest_end={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={}",
             stream_id.0,
-            complete,
+            scope_start,
             normalized_ranges.len(),
             normalized_ranges
                 .iter()

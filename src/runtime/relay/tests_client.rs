@@ -250,7 +250,7 @@ async fn request_ack_releases_load_only_after_final_original_flight() {
         &mut sender_queue,
         &mut remotes,
         &mut send_stream,
-        false,
+        None,
         vec![OffsetRange { start: 0, end: 2 }],
     )
     .expect("partial ACK");
@@ -267,7 +267,7 @@ async fn request_ack_releases_load_only_after_final_original_flight() {
             &mut sender_queue,
             &mut remotes,
             &mut send_stream,
-            false,
+            None,
             vec![OffsetRange { start: 0, end: 2 }],
         )
         .expect("replayed ACK"),
@@ -281,7 +281,7 @@ async fn request_ack_releases_load_only_after_final_original_flight() {
         &mut sender_queue,
         &mut remotes,
         &mut send_stream,
-        false,
+        None,
         vec![OffsetRange {
             start: 0,
             end: first_end,
@@ -296,7 +296,7 @@ async fn request_ack_releases_load_only_after_final_original_flight() {
         &mut sender_queue,
         &mut remotes,
         &mut send_stream,
-        true,
+        Some(0),
         vec![OffsetRange {
             start: 0,
             end: final_end,
@@ -411,16 +411,15 @@ async fn ambiguous_prefix_ack_cannot_withdraw_a_fresh_request_tail_beyond_the_ho
                 relay_lane: TrafficClass::Throughput,
             },
             stream_id,
-            true,
+            Some(0),
             vec![OffsetRange::new(0, horizon).expect("prefix ACK range")],
         )
         .expect("apply prefix ACK"),
         horizon as usize,
     );
-    assert_eq!(
-        last_send_ack.horizon(),
-        Some(horizon),
-        "the complete prefix ACK establishes exactly the prefix horizon",
+    assert!(
+        last_send_ack.gaps().is_empty(),
+        "a received prefix has no proven omission"
     );
     assert_eq!(
         state.progress.request_path_staleness.next_deadline(),
@@ -430,7 +429,7 @@ async fn ambiguous_prefix_ack_cannot_withdraw_a_fresh_request_tail_beyond_the_ho
     assert!(!sender.request_path_is_stale(quic));
     assert!(
         sender
-            .unacked_original_paths_before(&remotes, horizon)
+            .unacked_original_paths_for_gaps(&remotes, last_send_ack.gaps())
             .is_empty(),
         "the fresh tail is retained for exact ACK and failure recovery but is not an authoritative omission",
     );
@@ -439,7 +438,7 @@ async fn ambiguous_prefix_ack_cannot_withdraw_a_fresh_request_tail_beyond_the_ho
             &context,
             &sender,
             &remotes,
-            horizon,
+            last_send_ack.gaps(),
             context.path_model_generation(),
         )
         .is_none(),
@@ -529,14 +528,20 @@ async fn request_staleness_reconciles_when_first_alternate_becomes_schedulable()
             relay_lane: TrafficClass::Throughput,
         },
         stream_id,
-        true,
+        Some(0),
         vec![OffsetRange::new(marker_start, marker_end).expect("marker ACK range")],
     )
     .expect("apply complete marker ACK");
-    assert_eq!(last_send_ack.horizon(), Some(marker_end));
+    assert_eq!(
+        last_send_ack.gaps(),
+        &[OffsetRange {
+            start: 0,
+            end: marker_start
+        }]
+    );
     assert_eq!(
         sender
-            .unacked_original_paths_before(&remotes, marker_end)
+            .unacked_original_paths_for_gaps(&remotes, last_send_ack.gaps())
             .as_slice(),
         &[owner],
         "the omitted owner is authoritative below the complete horizon",
@@ -553,7 +558,7 @@ async fn request_staleness_reconciles_when_first_alternate_becomes_schedulable()
         &context,
         &sender,
         &remotes,
-        marker_end,
+        last_send_ack.gaps(),
         observed_model_generation,
     )
     .expect("one authoritative owner must arm the model publication");
@@ -573,7 +578,13 @@ async fn request_staleness_reconciles_when_first_alternate_becomes_schedulable()
         .await
         .expect("the unavailable-to-available model transition must wake reconciliation");
     assert_eq!(remotes.membership_generation(), membership_generation);
-    assert_eq!(last_send_ack.horizon(), Some(marker_end));
+    assert_eq!(
+        last_send_ack.gaps(),
+        &[OffsetRange {
+            start: 0,
+            end: marker_start
+        }]
+    );
     assert!(sender.request_path_has_reinjection_path(
         &context,
         &remotes,
@@ -609,7 +620,7 @@ async fn request_staleness_reconciles_when_first_alternate_becomes_schedulable()
         &context,
         &sender,
         &remotes,
-        marker_end,
+        last_send_ack.gaps(),
         current_generation,
     )
     .expect("the authoritative owner remains observable while its clock runs");
@@ -767,15 +778,15 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
             end: (quantum * 5) as u64,
         },
     ];
-    let validated_ack = validate_stream_ack(true, ack_ranges, send_stream.next_offset())
+    let validated_ack = validate_stream_ack(Some(0), ack_ranges, send_stream.next_offset())
         .expect("valid sparse request ACK");
     let _ = send_stream.apply_validated_ack(&validated_ack);
     let mut state = ClientRelayState::new();
     let mut last_send_ack = AuthoritativeStreamAckSnapshot::default();
-    update_reinjection_authoritative_ack_snapshot(&mut last_send_ack, &validated_ack);
+    update_reinjection_authoritative_ack_snapshot(&mut last_send_ack, &validated_ack, &send_stream);
     state.progress.last_send_ack_frontier = quantum as u64;
 
-    let authoritative_ranges = last_send_ack.ranges().to_vec();
+    let authoritative_ranges = last_send_ack.gaps().to_vec();
     let scored_path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 1_500_000.0);
     let scored_frontier_bytes = adaptive_reliable_relay_reinjection_bytes(
         Some(scored_path),
@@ -818,7 +829,11 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
     let mut predeadline_queue = ReliableRelaySenderQueue::default();
     let mut predeadline_state = ClientRelayState::new();
     let mut predeadline_ack = AuthoritativeStreamAckSnapshot::default();
-    update_reinjection_authoritative_ack_snapshot(&mut predeadline_ack, &validated_ack);
+    update_reinjection_authoritative_ack_snapshot(
+        &mut predeadline_ack,
+        &validated_ack,
+        &send_stream,
+    );
     predeadline_state.progress.last_send_ack_frontier = quantum as u64;
     let predeadline_observed_at = Instant::now();
     let predeadline = evaluate_client_data_ack_reinjection(
@@ -879,7 +894,7 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
     let mut zero_queue = ReliableRelaySenderQueue::default();
     let mut zero_state = ClientRelayState::new();
     let mut zero_ack = AuthoritativeStreamAckSnapshot::default();
-    update_reinjection_authoritative_ack_snapshot(&mut zero_ack, &validated_ack);
+    update_reinjection_authoritative_ack_snapshot(&mut zero_ack, &validated_ack, &send_stream);
     zero_state.progress.last_send_ack_frontier = quantum as u64;
     let zero = evaluate_client_data_ack_reinjection(
         &mut zero_state,
@@ -925,7 +940,7 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
     let mut early_queue = ReliableRelaySenderQueue::default();
     let mut early_state = ClientRelayState::new();
     let mut early_ack = AuthoritativeStreamAckSnapshot::default();
-    update_reinjection_authoritative_ack_snapshot(&mut early_ack, &validated_ack);
+    update_reinjection_authoritative_ack_snapshot(&mut early_ack, &validated_ack, &send_stream);
     early_state.progress.last_send_ack_frontier = quantum as u64;
     let early_observation = early_sender.data_ack_gap_reinjection_model(
         &context,
@@ -961,7 +976,6 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
         .progress
         .ack_gap_reinjection
         .observe_recovery_timing(
-            true,
             &authoritative_ranges,
             true,
             Some(ReliableDataAckGapTiming {
@@ -1027,7 +1041,6 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
         .progress
         .ack_gap_reinjection
         .observe_recovery_timing(
-            true,
             &authoritative_ranges,
             true,
             Some(ReliableDataAckGapTiming {
@@ -1099,7 +1112,6 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
             .progress
             .ack_gap_reinjection
             .observe_recovery_timing(
-                true,
                 &authoritative_ranges,
                 true,
                 Some(ReliableDataAckGapTiming {
@@ -1115,7 +1127,7 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
     );
 
     let frontier_frame = send_stream
-        .retransmission_frames_for_normalized_ack_gaps(&authoritative_ranges, scored_frontier_bytes)
+        .retransmission_frames_for_ranges(&authoritative_ranges, scored_frontier_bytes)
         .into_iter()
         .next()
         .expect("request frontier repair frame");
@@ -1153,7 +1165,6 @@ async fn persistent_request_ack_gap_commits_only_the_ranked_frontier_quantum() {
         &authoritative_ranges,
         quantum.saturating_mul(2),
         scored_frontier_bytes,
-        true,
         true,
         true,
     );

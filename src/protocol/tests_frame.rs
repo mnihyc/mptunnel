@@ -167,7 +167,7 @@ fn frame_accounting_and_pacing_cover_each_semantic_row() {
             "stream ack",
             Frame::StreamAck {
                 stream_id,
-                complete: true,
+                scope_start: Some(0),
                 ranges: vec![OffsetRange { start: 0, end: 4 }],
             },
             1,

@@ -1750,14 +1750,14 @@ impl RequestMultipathController {
             .latest_unacked_ranges_for_path_instance(instance)
     }
 
-    pub(super) fn unacked_original_paths_before(
+    pub(super) fn unacked_original_paths_for_gaps(
         &self,
         remotes: &ReliableRelayRemoteSet,
-        authoritative_horizon: u64,
+        gaps: &[OffsetRange],
     ) -> smallvec::SmallVec<[RelayPathInstance; 4]> {
         self.request
             .flights
-            .unacked_original_paths_before(authoritative_horizon)
+            .unacked_original_paths_for_gaps(gaps)
             .into_iter()
             .filter(|instance| remotes.contains_path_instance(*instance))
             .filter(|instance| {

@@ -127,7 +127,7 @@ pub(crate) fn reliable_path_frame_pacing_bytes(frame: &Frame) -> usize {
 
 /// Returns the explicitly proven zero-based prefix of an ordered range set.
 ///
-/// ACK completeness controls what omitted higher ranges imply, not the prefix
+/// ACK scope controls which omissions are proven, not the positive prefix
 /// stated by ranges that are present, so it is deliberately not an input here.
 #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
 pub(crate) fn stream_ack_contiguous_frontier(ranges: &[OffsetRange]) -> u64 {

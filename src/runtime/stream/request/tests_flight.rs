@@ -528,7 +528,7 @@ fn partial_copy_ack_proving_bytes(split_ack: bool, invalidate_epoch: bool) -> us
     };
     assert_eq!(
         ledger
-            .unacked_original_paths_before(retained.end)
+            .unacked_original_paths_for_gaps(&[retained])
             .as_slice(),
         expected_candidates.as_slice(),
         "the omitted owner remains a stale-clock candidate only in its eligible epoch",
@@ -950,7 +950,7 @@ fn ambiguous_prefix_ack_cannot_make_a_fresh_tail_a_staleness_candidate() {
     ledger.record_original_frame_instance(owner, &data_frame(4096, 4096));
 
     assert!(
-        ledger.unacked_original_paths_before(0).is_empty(),
+        ledger.unacked_original_paths_for_gaps(&[]).is_empty(),
         "retained work without a complete ACK horizon cannot arm withdrawal",
     );
 
@@ -963,13 +963,42 @@ fn ambiguous_prefix_ack_cannot_make_a_fresh_tail_a_staleness_candidate() {
         "delivery of an overlapping original and reinjection has no exact owner attribution",
     );
     assert!(
-        ledger.unacked_original_paths_before(4096).is_empty(),
+        ledger
+            .unacked_original_paths_for_gaps(&[OffsetRange {
+                start: 0,
+                end: 4096
+            }])
+            .is_empty(),
         "a fresh tail beginning at the complete ACK horizon is not an authoritative omission",
     );
     assert_eq!(
-        ledger.unacked_original_paths_before(8192).as_slice(),
+        ledger
+            .unacked_original_paths_for_gaps(&[OffsetRange {
+                start: 4096,
+                end: 8192
+            }])
+            .as_slice(),
         &[owner],
         "the same retained tail becomes eligible only when a later complete horizon covers it",
+    );
+}
+
+#[test]
+fn scoped_request_gap_does_not_withdraw_an_earlier_unknown_owner() {
+    let unknown_owner = path(UnderlayProtocol::Tcp, 0, 3);
+    let gap_owner = path(UnderlayProtocol::Udp, 1, 5);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(unknown_owner, &data_frame(0, 4096));
+    ledger.record_original_frame_instance(gap_owner, &data_frame(4096, 4096));
+    assert_eq!(
+        ledger
+            .unacked_original_paths_for_gaps(&[OffsetRange {
+                start: 5000,
+                end: 6000
+            }])
+            .as_slice(),
+        &[gap_owner],
+        "a later scoped omission does not authorize negative evidence for the earlier retained owner",
     );
 }
 

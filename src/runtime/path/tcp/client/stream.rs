@@ -491,7 +491,7 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
         }
         Frame::StreamAck {
             stream_id,
-            complete,
+            scope_start,
             ranges,
         } => {
             route_client_tcp_stream_frame(
@@ -500,7 +500,7 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
                 stream_id,
                 Frame::StreamAck {
                     stream_id,
-                    complete,
+                    scope_start,
                     ranges,
                 },
             )

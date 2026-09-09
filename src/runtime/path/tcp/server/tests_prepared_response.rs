@@ -260,7 +260,7 @@ impl PreparedResponseFixture {
                 stream_id,
                 Frame::StreamAck {
                     stream_id,
-                    complete: true,
+                    scope_start: Some(0),
                     ranges: vec![crate::protocol::OffsetRange { start: 0, end }],
                 },
             )
@@ -268,7 +268,7 @@ impl PreparedResponseFixture {
             .expect("route received ACK through the actual attachment");
         let Frame::StreamAck {
             stream_id: received,
-            complete,
+            scope_start,
             ranges,
         } = self
             .path_stream
@@ -282,8 +282,8 @@ impl PreparedResponseFixture {
         // Exercise the production validator and paired cache/flight releases.
         // This writer fixture does not claim to execute the whole relay actor.
         let mut state = self.owner.lock();
-        let ack = begin_reliable_stream_ack(&state.send_stream, complete, ranges).unwrap();
-        if !state.last_send_ack.subsumes(&ack) {
+        let ack = begin_reliable_stream_ack(&state.send_stream, scope_start, ranges).unwrap();
+        if !state.last_send_ack.subsumes(&ack, &state.send_stream) {
             let applied = state.send_stream.apply_validated_ack(&ack).unwrap();
             state.sender.record_delivered_data(applied.released_bytes);
             self.owner
@@ -292,7 +292,12 @@ impl PreparedResponseFixture {
             state
                 .sender
                 .release_normalized_acked_reinjections(ack.ranges());
-            update_reinjection_authoritative_ack_snapshot(&mut state.last_send_ack, &ack);
+            let ResponseProductState {
+                last_send_ack,
+                send_stream,
+                ..
+            } = &mut *state;
+            update_reinjection_authoritative_ack_snapshot(last_send_ack, &ack, send_stream);
             publish_prepared_response_work(
                 &mut state,
                 &self.owner,

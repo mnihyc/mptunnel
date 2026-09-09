@@ -80,12 +80,12 @@ fn frame_subject(frame: &Frame) -> String {
         ),
         Frame::StreamAck {
             stream_id,
-            complete,
+            scope_start,
             ranges,
         } => format!(
-            "stream_id={} complete={} ranges={}",
+            "stream_id={} scope_start={:?} ranges={}",
             stream_id.0,
-            complete,
+            scope_start,
             ranges.len()
         ),
         Frame::StreamRequalifyData {

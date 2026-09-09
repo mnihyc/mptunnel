@@ -153,7 +153,7 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
         stream_id,
         Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: None,
             ranges: Vec::new(),
         },
     )

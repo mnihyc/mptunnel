@@ -42,9 +42,7 @@ use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_f
 use crate::protocol::{Frame, OffsetRange, SessionId, StreamId};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::reliable_path_effective_frame_lane;
-use crate::runtime::relay::io::{
-    exact_contiguous_retransmission_frames, normalized_stream_ack_first_gap,
-};
+use crate::runtime::relay::io::{exact_contiguous_retransmission_frames, first_proven_ack_gap};
 use crate::runtime::sender::{
     CarrierEmitMode, RelaySendCause, ReliableRelayQueuedWork, ReliableRelayQueuedWorkKind,
     ReliableRelaySenderQueue, ServerReinjectionOutputIdentity,
@@ -350,7 +348,7 @@ impl ServerResponseSenderService {
         normalized_ranges: &[OffsetRange],
         preview_limit: usize,
     ) -> Option<ServerAckGapReinjectionObservation> {
-        let (frontier, horizon) = normalized_stream_ack_first_gap(normalized_ranges)?;
+        let (frontier, horizon) = first_proven_ack_gap(normalized_ranges)?;
         let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
             return None;
         };

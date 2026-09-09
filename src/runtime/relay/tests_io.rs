@@ -13,7 +13,6 @@ use crate::model::work::{
     reliable_reinjection_service_limit_bytes,
 };
 use crate::mux::MuxLimits;
-use crate::mux::stream::validate_stream_ack;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use crate::runtime::stream::reliable_stream_recv_progress_interval;
@@ -590,54 +589,28 @@ fn duplicate_stream_data_below_final_frontier_is_already_delivered() {
 
 #[test]
 fn ack_gap_reinjection_requires_multipath_alternative_and_persistent_gap() {
-    assert!(!stream_ack_gap_reinjection_allowed(true, false, true));
-    assert!(!stream_ack_gap_reinjection_allowed(true, true, false));
-    assert!(stream_ack_gap_reinjection_allowed(true, true, true));
-    assert!(!stream_ack_gap_reinjection_allowed(false, true, true));
+    assert!(!stream_ack_gap_reinjection_allowed(false, true));
+    assert!(!stream_ack_gap_reinjection_allowed(true, false));
+    assert!(stream_ack_gap_reinjection_allowed(true, true));
 }
 
 #[test]
-fn ack_gap_reinjection_requires_authoritative_ack_gap_shape() {
-    assert!(!stream_ack_ranges_expose_authoritative_gap(
-        false,
-        &[
-            OffsetRange {
-                start: 0,
-                end: 1024,
-            },
-            OffsetRange {
-                start: 2048,
-                end: 4096,
-            },
-        ],
-    ));
-    assert!(!stream_ack_ranges_expose_authoritative_gap(
-        true,
-        &[OffsetRange {
-            start: 0,
-            end: 1024,
-        }],
-    ));
-    assert!(stream_ack_ranges_expose_authoritative_gap(
-        true,
-        &[OffsetRange {
+fn ack_gap_reinjection_requires_explicit_negative_evidence() {
+    assert!(!stream_ack_ranges_expose_authoritative_gap(&[]));
+    assert!(stream_ack_ranges_expose_authoritative_gap(&[OffsetRange {
+        start: 1024,
+        end: 2048,
+    }],));
+    assert!(stream_ack_ranges_expose_authoritative_gap(&[
+        OffsetRange {
             start: 1024,
+            end: 2048,
+        },
+        OffsetRange {
+            start: 3072,
             end: 4096,
-        }],
-    ));
-    assert!(stream_ack_ranges_expose_authoritative_gap(
-        true,
-        &[
-            OffsetRange {
-                start: 0,
-                end: 1024,
-            },
-            OffsetRange {
-                start: 2048,
-                end: 4096,
-            },
-        ],
-    ));
+        },
+    ],));
 }
 
 #[test]
@@ -706,8 +679,11 @@ fn shared_relay_ack_transaction_rejects_extent_before_stream_mutation() {
         .expect("send assigned relay bytes");
     let before = send_stream.clone();
 
-    let rejected =
-        begin_reliable_stream_ack(&send_stream, true, vec![OffsetRange { start: 4, end: 9 }]);
+    let rejected = begin_reliable_stream_ack(
+        &send_stream,
+        Some(0),
+        vec![OffsetRange { start: 4, end: 9 }],
+    );
 
     assert!(matches!(
         rejected,
@@ -720,11 +696,36 @@ fn shared_relay_ack_transaction_rejects_extent_before_stream_mutation() {
     assert_eq!(send_stream, before);
 }
 
+fn scoped_ack_test_sender(bytes: usize) -> ReliableSendStream {
+    let mut send_stream = ReliableSendStream::new(StreamId(778), MuxLimits::default());
+    send_stream
+        .send_data(Bytes::from(vec![0x61; bytes]))
+        .expect("assign real retained Product bytes");
+    send_stream
+}
+
+fn apply_scoped_ack_for_test(
+    send_stream: &mut ReliableSendStream,
+    evidence: &mut AuthoritativeStreamAckSnapshot,
+    scope_start: Option<u64>,
+    ranges: Vec<OffsetRange>,
+) {
+    let ack = begin_reliable_stream_ack(send_stream, scope_start, ranges)
+        .expect("ACK fits the real assigned extent");
+    send_stream
+        .apply_validated_ack(&ack)
+        .expect("apply positive evidence before negative evidence");
+    update_reinjection_authoritative_ack_snapshot(evidence, &ack, send_stream);
+}
+
 #[test]
-fn authoritative_ack_snapshot_merges_positive_incomplete_delta_without_regressing() {
+fn scoped_ack_positive_delta_closes_gap_without_inventing_tail_authority() {
+    let mut send_stream = scoped_ack_test_sender(256);
     let mut snapshot = AuthoritativeStreamAckSnapshot::default();
-    let complete = validate_stream_ack(
-        true,
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        Some(0),
         vec![
             OffsetRange { start: 0, end: 64 },
             OffsetRange {
@@ -732,36 +733,46 @@ fn authoritative_ack_snapshot_merges_positive_incomplete_delta_without_regressin
                 end: 128,
             },
         ],
-        256,
-    )
-    .expect("complete ACK is within its assigned horizon");
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &complete);
-    let filled_gap = validate_stream_ack(false, vec![OffsetRange { start: 64, end: 96 }], 256)
-        .expect("positive delta is within the later assigned extent");
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &filled_gap);
-    let after_snapshot = validate_stream_ack(
-        false,
+    );
+    assert_eq!(snapshot.gaps(), &[OffsetRange { start: 64, end: 96 }]);
+
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        None,
+        vec![OffsetRange { start: 64, end: 96 }],
+    );
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        None,
         vec![OffsetRange {
             start: 192,
             end: 256,
         }],
-        256,
-    )
-    .expect("positive delta is within the later assigned extent");
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &after_snapshot);
+    );
 
-    assert_eq!(snapshot.ranges(), &[OffsetRange { start: 0, end: 128 }]);
-    assert!(snapshot.complete());
-    assert_eq!(snapshot.horizon(), Some(128));
-    assert!(snapshot.has_unacknowledged_extent(64));
-    assert!(!snapshot.has_unacknowledged_extent(128));
+    assert!(!snapshot.has_gaps());
+    assert_eq!(snapshot.first_gap(), None);
+    assert_eq!(send_stream.data_ack_frontier(), 128);
+    assert_eq!(send_stream.reinjection_bytes(), 64);
+    assert_eq!(
+        send_stream.retained_ranges_in_scope(OffsetRange { start: 0, end: 256 }),
+        vec![OffsetRange {
+            start: 128,
+            end: 192
+        }],
+        "unknown retained tail remains recoverable by its owner, not ACK-gap authority",
+    );
 }
 
 #[test]
 fn retained_authoritative_ack_state_subsumes_redundant_publication() {
+    let mut send_stream = scoped_ack_test_sender(256);
     let mut snapshot = AuthoritativeStreamAckSnapshot::default();
-    let initial = validate_stream_ack(
-        true,
+    let initial = begin_reliable_stream_ack(
+        &send_stream,
+        Some(0),
         vec![
             OffsetRange { start: 0, end: 64 },
             OffsetRange {
@@ -769,135 +780,306 @@ fn retained_authoritative_ack_state_subsumes_redundant_publication() {
                 end: 128,
             },
         ],
-        256,
     )
     .expect("initial ACK is valid");
-    assert!(!snapshot.subsumes(&initial));
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &initial);
+    assert!(!snapshot.subsumes(&initial, &send_stream));
+    send_stream
+        .apply_validated_ack(&initial)
+        .expect("release received bytes");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &initial, &send_stream);
 
-    let duplicate = validate_stream_ack(true, initial.ranges().to_vec(), 256)
-        .expect("redundant cumulative ACK is valid");
-    let covered_delta = validate_stream_ack(false, vec![OffsetRange { start: 16, end: 48 }], 256)
-        .expect("covered positive update is valid");
-    let new_positive = validate_stream_ack(
-        false,
+    let duplicate = begin_reliable_stream_ack(&send_stream, Some(0), initial.ranges().to_vec())
+        .expect("redundant scoped ACK is valid");
+    let covered_delta =
+        begin_reliable_stream_ack(&send_stream, None, vec![OffsetRange { start: 16, end: 48 }])
+            .expect("covered positive update is valid");
+    let new_positive = begin_reliable_stream_ack(
+        &send_stream,
+        None,
         vec![OffsetRange {
             start: 128,
             end: 160,
         }],
-        256,
     )
     .expect("new positive update is valid");
-    let newer_snapshot = validate_stream_ack(true, vec![OffsetRange { start: 0, end: 160 }], 256)
-        .expect("newer cumulative ACK is valid");
+    let newer_snapshot = begin_reliable_stream_ack(
+        &send_stream,
+        Some(0),
+        vec![OffsetRange { start: 0, end: 160 }],
+    )
+    .expect("newer scoped ACK is valid");
 
-    assert!(snapshot.subsumes(&duplicate));
-    assert!(snapshot.subsumes(&covered_delta));
-    assert!(!snapshot.subsumes(&new_positive));
-    assert!(!snapshot.subsumes(&newer_snapshot));
+    assert!(snapshot.subsumes(&duplicate, &send_stream));
+    assert!(snapshot.subsumes(&covered_delta, &send_stream));
+    assert!(!snapshot.subsumes(&new_positive, &send_stream));
+    assert!(!snapshot.subsumes(&newer_snapshot, &send_stream));
 }
 
 #[test]
-fn incomplete_ack_cannot_establish_gap_authority() {
+fn positive_only_ack_cannot_establish_gap_authority() {
+    let mut send_stream = scoped_ack_test_sender(256);
     let mut snapshot = AuthoritativeStreamAckSnapshot::default();
-    let incomplete = validate_stream_ack(
-        false,
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        None,
         vec![OffsetRange {
             start: 192,
             end: 256,
         }],
-        256,
-    )
-    .expect("positive ACK is within assigned data");
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &incomplete);
+    );
 
-    assert!(snapshot.ranges().is_empty());
-    assert!(!snapshot.complete());
-    assert_eq!(snapshot.horizon(), None);
+    assert!(!snapshot.has_gaps());
+    assert_eq!(snapshot.first_gap(), None);
+    assert_eq!(send_stream.reinjection_bytes(), 192);
 }
 
 #[test]
-fn complete_ack_negative_authority_never_infers_an_unobserved_assignment_tail() {
+fn scoped_ack_never_infers_an_unobserved_assignment_tail() {
+    let mut send_stream = scoped_ack_test_sender(128);
     let mut snapshot = AuthoritativeStreamAckSnapshot::default();
-    let empty =
-        validate_stream_ack(true, Vec::new(), 128).expect("empty complete ACK is well formed");
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &empty);
+    apply_scoped_ack_for_test(&mut send_stream, &mut snapshot, None, Vec::new());
+    assert!(!snapshot.has_gaps());
 
-    assert!(snapshot.complete());
-    assert!(snapshot.ranges().is_empty());
-    assert_eq!(snapshot.horizon(), Some(0));
-    assert!(!snapshot.has_unacknowledged_extent(0));
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        Some(0),
+        vec![OffsetRange { start: 0, end: 64 }],
+    );
+    assert!(!snapshot.has_gaps());
+    assert_eq!(send_stream.data_ack_frontier(), 64);
 
-    let contiguous_prefix = validate_stream_ack(true, vec![OffsetRange { start: 0, end: 64 }], 128)
-        .expect("delayed complete prefix is within assigned data");
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &contiguous_prefix);
-    assert_eq!(snapshot.horizon(), Some(64));
-    assert!(!snapshot.has_unacknowledged_extent(64));
-
-    let later_positive = validate_stream_ack(
-        false,
+    send_stream
+        .send_data(Bytes::from(vec![0x62; 128]))
+        .expect("assign later tail");
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        None,
         vec![OffsetRange {
             start: 128,
             end: 256,
         }],
-        256,
-    )
-    .expect("later positive ACK stays within newly assigned data");
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &later_positive);
-    assert_eq!(snapshot.horizon(), Some(64));
-    assert_eq!(snapshot.ranges(), &[OffsetRange { start: 0, end: 64 }]);
+    );
+    assert!(!snapshot.has_gaps());
+    assert_eq!(send_stream.reinjection_bytes(), 64);
 }
 
 #[test]
-fn authoritative_gap_persistence_ignores_an_older_complete_snapshot() {
+fn delayed_scoped_ack_cannot_resurrect_a_newer_positive_fill() {
+    let mut send_stream = scoped_ack_test_sender(512);
     let mut snapshot = AuthoritativeStreamAckSnapshot::default();
-    let current = [
-        OffsetRange {
-            start: 0,
-            end: 4096,
-        },
-        OffsetRange {
-            start: 8192,
-            end: 16_384,
-        },
-    ];
-    let stale = [
-        OffsetRange {
-            start: 0,
-            end: 2048,
-        },
-        OffsetRange {
-            start: 8192,
-            end: 12_288,
-        },
-    ];
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        None,
+        vec![OffsetRange {
+            start: 300,
+            end: 400,
+        }],
+    );
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        Some(300),
+        vec![OffsetRange {
+            start: 400,
+            end: 500,
+        }],
+    );
+
+    assert!(
+        !snapshot.has_gaps(),
+        "older negative evidence cannot resurrect released bytes"
+    );
+    assert_eq!(send_stream.reinjection_bytes(), 312);
+    assert_eq!(
+        send_stream.retained_ranges_in_scope(OffsetRange { start: 0, end: 512 }),
+        vec![
+            OffsetRange { start: 0, end: 300 },
+            OffsetRange {
+                start: 500,
+                end: 512
+            }
+        ],
+    );
+}
+
+#[test]
+fn disconnected_ack_scopes_do_not_authorize_the_unknown_interval() {
+    let mut send_stream = scoped_ack_test_sender(512);
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    // Deliberately deliver the later scope first, as can happen across carriers.
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        Some(300),
+        vec![OffsetRange {
+            start: 400,
+            end: 500,
+        }],
+    );
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        Some(0),
+        vec![OffsetRange {
+            start: 64,
+            end: 128,
+        }],
+    );
+
+    assert_eq!(
+        snapshot.gaps(),
+        &[
+            OffsetRange { start: 0, end: 64 },
+            OffsetRange {
+                start: 300,
+                end: 400
+            },
+        ]
+    );
+    assert_eq!(snapshot.gap_at(128), None);
+    assert_eq!(snapshot.gap_at(299), None);
+    assert_eq!(snapshot.gap_at(500), None);
+    assert_eq!(send_stream.reinjection_bytes(), 348);
+}
+
+#[test]
+fn already_known_positive_can_carry_new_gap_authority() {
+    let mut send_stream = scoped_ack_test_sender(256);
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    let positives = vec![OffsetRange {
+        start: 192,
+        end: 256,
+    }];
+    apply_scoped_ack_for_test(&mut send_stream, &mut snapshot, None, positives.clone());
+    let gap_only = begin_reliable_stream_ack(&send_stream, Some(160), positives)
+        .expect("existing positive with new scope is valid");
+
+    assert!(!snapshot.subsumes(&gap_only, &send_stream));
+    let outcome = send_stream
+        .apply_validated_ack(&gap_only)
+        .expect("duplicate positive is valid");
+    assert_eq!(outcome.released_bytes, 0);
+    assert!(update_reinjection_authoritative_ack_snapshot(
+        &mut snapshot,
+        &gap_only,
+        &send_stream
+    ));
+    assert_eq!(
+        snapshot.gaps(),
+        &[OffsetRange {
+            start: 160,
+            end: 192
+        }]
+    );
+    assert!(snapshot.subsumes(&gap_only, &send_stream));
+    assert_eq!(
+        send_stream
+            .apply_validated_ack(&gap_only)
+            .expect("replayed positive is idempotent")
+            .released_bytes,
+        0,
+    );
+    assert!(!update_reinjection_authoritative_ack_snapshot(
+        &mut snapshot,
+        &gap_only,
+        &send_stream
+    ));
+}
+
+#[test]
+fn malformed_scoped_ack_leaves_send_cache_and_gap_authority_unchanged() {
+    let mut send_stream = scoped_ack_test_sender(256);
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        Some(0),
+        vec![OffsetRange {
+            start: 64,
+            end: 128,
+        }],
+    );
+    let before_send = send_stream.clone();
+    let before_snapshot = snapshot.clone();
+    for (scope_start, ranges) in [
+        (
+            Some(192),
+            vec![OffsetRange {
+                start: 128,
+                end: 192,
+            }],
+        ),
+        (Some(0), Vec::new()),
+        (None, vec![OffsetRange { start: 32, end: 16 }]),
+        (
+            Some(0),
+            vec![
+                OffsetRange { start: 0, end: 32 },
+                OffsetRange {
+                    start: 255,
+                    end: 257,
+                },
+            ],
+        ),
+    ] {
+        assert!(begin_reliable_stream_ack(&send_stream, scope_start, ranges).is_err());
+        assert_eq!(send_stream, before_send);
+        assert_eq!(snapshot, before_snapshot);
+    }
+}
+
+#[test]
+fn authoritative_gap_persistence_ignores_an_older_scoped_snapshot() {
+    let mut send_stream = scoped_ack_test_sender(16_384);
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
     let now = Instant::now();
     let persistence = Duration::from_millis(300);
     let mut progress = ReliableAckGapReinjectionProgress::default();
 
-    let current_ack = validate_stream_ack(true, current.to_vec(), 16_384)
-        .expect("current ACK fits assigned extent");
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &current_ack);
-    assert!(!progress.reinjection_ready_at(
-        snapshot.complete(),
-        snapshot.ranges(),
-        true,
-        false,
-        now,
-    ));
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        Some(0),
+        vec![
+            OffsetRange {
+                start: 0,
+                end: 4096,
+            },
+            OffsetRange {
+                start: 8192,
+                end: 16_384,
+            },
+        ],
+    );
+    assert!(!progress.reinjection_ready_at(snapshot.gaps(), true, false, now));
 
-    let stale_ack =
-        validate_stream_ack(true, stale.to_vec(), 12_288).expect("stale ACK fits its old horizon");
-    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &stale_ack);
-    assert_eq!(snapshot.ranges(), current.as_slice());
-    assert_eq!(snapshot.horizon(), Some(16_384));
-    assert!(progress.reinjection_ready_at(
-        snapshot.complete(),
-        snapshot.ranges(),
-        true,
-        true,
-        now + persistence,
-    ));
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        Some(0),
+        vec![
+            OffsetRange {
+                start: 0,
+                end: 2048,
+            },
+            OffsetRange {
+                start: 8192,
+                end: 12_288,
+            },
+        ],
+    );
+    assert_eq!(
+        snapshot.gaps(),
+        &[OffsetRange {
+            start: 4096,
+            end: 8192
+        }]
+    );
+    assert!(progress.reinjection_ready_at(snapshot.gaps(), true, true, now + persistence));
 }
 
 #[test]
@@ -1284,10 +1466,12 @@ fn ack_gap_reinjection_still_reinjections_authoritative_ack_gap() {
     send_stream
         .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
-
-    let reinjection_frames = stream_ack_gap_reinjection_frames(
-        &send_stream,
-        &[
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    apply_scoped_ack_for_test(
+        &mut send_stream,
+        &mut snapshot,
+        Some(0),
+        vec![
             OffsetRange {
                 start: 0,
                 end: 1024,
@@ -1297,11 +1481,10 @@ fn ack_gap_reinjection_still_reinjections_authoritative_ack_gap() {
                 end: 4096,
             },
         ],
-        4096,
-        true,
-        true,
-        true,
     );
+
+    let reinjection_frames =
+        stream_ack_gap_reinjection_frames(&send_stream, snapshot.gaps(), 4096, true, true);
 
     assert_eq!(reinjection_frames.len(), 1);
     assert_eq!(
@@ -1408,26 +1591,20 @@ fn final_offset_tail_reinjection_waits_for_persistent_stall_evidence() {
 }
 
 #[test]
-fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
+fn ack_gap_reinjection_progress_keeps_frontier_identity_when_later_gaps_arrive() {
     let mut progress = ReliableAckGapReinjectionProgress::default();
-    let first = [
-        OffsetRange {
-            start: 0,
-            end: 110_098,
-        },
-        OffsetRange {
-            start: 112_318,
-            end: 114_538,
-        },
-    ];
+    let first = [OffsetRange {
+        start: 110_098,
+        end: 112_318,
+    }];
     let grown = [
         OffsetRange {
-            start: 0,
-            end: 110_098,
+            start: 110_098,
+            end: 112_318,
         },
         OffsetRange {
-            start: 113_428,
-            end: 116_758,
+            start: 114_538,
+            end: 115_648,
         },
     ];
     let now = Instant::now();
@@ -1435,14 +1612,13 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
     let reinjection_delay =
         reliable_data_retransmission_interval(Some(UnderlayProtocol::Udp), None);
 
-    assert!(!progress.reinjection_ready_at(true, &first, true, false, now,));
-    assert!(!progress.reinjection_ready_at(true, &grown, true, false, now + interval,));
+    assert!(!progress.reinjection_ready_at(&first, true, false, now,));
+    assert!(!progress.reinjection_ready_at(&grown, true, false, now + interval,));
     assert!(
-        progress.reinjection_ready_at(true, &grown, true, true, now + reinjection_delay,),
-        "a growing ACK horizon with the same missing frontier is one persistent gap"
+        progress.reinjection_ready_at(&grown, true, true, now + reinjection_delay,),
+        "additional authoritative gaps cannot restart the unchanged first gap's identity"
     );
     assert!(progress.reinjection_ready_at(
-        true,
         &grown,
         true,
         true,
@@ -1450,7 +1626,6 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
     ));
     assert!(
         progress.reinjection_ready_at(
-            true,
             &grown,
             true,
             true,
@@ -1463,34 +1638,21 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
 #[test]
 fn ack_gap_reinjection_progress_accepts_an_advanced_frontier() {
     let mut progress = ReliableAckGapReinjectionProgress::default();
-    let first = [
-        OffsetRange {
-            start: 0,
-            end: 1024,
-        },
-        OffsetRange {
-            start: 4096,
-            end: 8192,
-        },
-    ];
-    let advanced = [
-        OffsetRange {
-            start: 0,
-            end: 2048,
-        },
-        OffsetRange {
-            start: 4096,
-            end: 8192,
-        },
-    ];
+    let first = [OffsetRange {
+        start: 1024,
+        end: 4096,
+    }];
+    let advanced = [OffsetRange {
+        start: 2048,
+        end: 4096,
+    }];
     let now = Instant::now();
     let reinjection_delay =
         reliable_data_retransmission_interval(Some(UnderlayProtocol::Udp), None);
 
-    assert!(!progress.reinjection_ready_at(true, &first, true, false, now,));
-    assert!(progress.reinjection_ready_at(true, &first, true, true, now + reinjection_delay,));
+    assert!(!progress.reinjection_ready_at(&first, true, false, now,));
+    assert!(progress.reinjection_ready_at(&first, true, true, now + reinjection_delay,));
     assert!(progress.reinjection_ready_at(
-        true,
         &advanced,
         true,
         true,
@@ -1501,26 +1663,14 @@ fn ack_gap_reinjection_progress_accepts_an_advanced_frontier() {
 #[test]
 fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
     let mut progress = ReliableAckGapReinjectionProgress::default();
-    let first = [
-        OffsetRange {
-            start: 0,
-            end: 1024,
-        },
-        OffsetRange {
-            start: 4096,
-            end: 8192,
-        },
-    ];
-    let advanced = [
-        OffsetRange {
-            start: 0,
-            end: 2048,
-        },
-        OffsetRange {
-            start: 4096,
-            end: 8192,
-        },
-    ];
+    let first = [OffsetRange {
+        start: 1024,
+        end: 4096,
+    }];
+    let advanced = [OffsetRange {
+        start: 2048,
+        end: 4096,
+    }];
     let now = Instant::now();
     let assignment_at = now;
     let timing = crate::model::timing::ReliableDataAckGapTiming {
@@ -1536,7 +1686,6 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
 
     assert_eq!(
         progress.observe_recovery_timing(
-            true,
             &first,
             true,
             Some(timing),
@@ -1547,7 +1696,7 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
         timing.loss_at,
     );
     assert_eq!(
-        progress.observe_recovery_timing(true, &first, false, None, None, None, now),
+        progress.observe_recovery_timing(&first, false, None, None, None, now),
         None,
         "temporary absence of an alternate cannot authorize repair",
     );
@@ -1558,7 +1707,6 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
     );
     assert_eq!(
         progress.observe_recovery_timing(
-            true,
             &first,
             true,
             Some(later_observation),
@@ -1571,7 +1719,6 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
     );
     assert_eq!(
         progress.observe_recovery_timing(
-            true,
             &first,
             true,
             Some(later_observation),
@@ -1583,7 +1730,7 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
         "a slower replacement target must not inherit an earlier target's deadline",
     );
     assert_eq!(
-        progress.observe_recovery_timing(true, &first, true, Some(timing), None, None, now,),
+        progress.observe_recovery_timing(&first, true, Some(timing), None, None, now,),
         None,
         "without a current target there is no target-bound repair deadline",
     );
@@ -1594,7 +1741,6 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
     };
     assert_eq!(
         progress.observe_recovery_timing(
-            true,
             &advanced,
             true,
             Some(advanced_timing),
@@ -1609,22 +1755,16 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
 
 #[test]
 fn ack_gap_reinjection_requires_measured_loss_but_does_not_own_copy_lifetime() {
-    let ranges = [
-        OffsetRange {
-            start: 0,
-            end: 64 * 1024,
-        },
-        OffsetRange {
-            start: 128 * 1024,
-            end: 192 * 1024,
-        },
-    ];
+    let gaps = [OffsetRange {
+        start: 64 * 1024,
+        end: 128 * 1024,
+    }];
     let now = Instant::now();
     let mut progress = ReliableAckGapReinjectionProgress::default();
-    assert!(!progress.reinjection_ready_at(true, &ranges, true, false, now,));
-    assert!(progress.reinjection_ready_at(true, &ranges, true, true, now,));
+    assert!(!progress.reinjection_ready_at(&gaps, true, false, now,));
+    assert!(progress.reinjection_ready_at(&gaps, true, true, now,));
     assert!(
-        progress.reinjection_ready_at(true, &ranges, true, true, now + Duration::from_millis(1),),
+        progress.reinjection_ready_at(&gaps, true, true, now + Duration::from_millis(1),),
         "queued overlap owns pre-commit suppression and the exact flight ledger owns post-commit suppression"
     );
 }

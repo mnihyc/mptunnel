@@ -36,7 +36,7 @@ fn quic_write_interlock_still_routes_nonterminal_stream_feedback() {
     let (frames_tx, mut frames_rx) = mpsc::channel(1);
     let feedback = Frame::StreamAck {
         stream_id,
-        complete: false,
+        scope_start: None,
         ranges: Vec::new(),
     };
 
@@ -49,7 +49,7 @@ fn quic_write_interlock_still_routes_nonterminal_stream_feedback() {
         frames_rx.try_recv(),
         Ok(Ok(Frame::StreamAck {
             stream_id: received_stream_id,
-            complete: false,
+            scope_start: None,
             ranges,
         })) if received_stream_id == stream_id && ranges.is_empty()
     ));
@@ -64,7 +64,7 @@ fn quic_write_interlock_closed_product_recipient_is_retired_input() {
         try_route_client_udp_stream_frame_during_write(
             Frame::StreamAck {
                 stream_id,
-                complete: true,
+                scope_start: None,
                 ranges: Vec::new(),
             },
             stream_id,
@@ -82,7 +82,7 @@ async fn quic_write_interlock_pending_product_recipient_retires_without_error() 
     let route = try_route_client_udp_stream_frame_during_write(
         Frame::StreamAck {
             stream_id,
-            complete: true,
+            scope_start: None,
             ranges: Vec::new(),
         },
         stream_id,
@@ -107,7 +107,7 @@ async fn quic_write_wait_retries_full_product_mailbox_before_write_completion() 
     };
     let feedback = Frame::StreamAck {
         stream_id,
-        complete: false,
+        scope_start: None,
         ranges: Vec::new(),
     };
     stream_frames_tx
@@ -182,7 +182,7 @@ async fn quic_write_wins_before_mailbox_capacity_preserves_exact_input() {
         .unwrap();
     let feedback = Frame::StreamAck {
         stream_id,
-        complete: false,
+        scope_start: None,
         ranges: Vec::new(),
     };
     let (release_write, write_released) = oneshot::channel::<()>();

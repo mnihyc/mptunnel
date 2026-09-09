@@ -118,41 +118,55 @@ impl ReliablePathStreamInput {
 
 /// Coalesces only state-like feedback before the next data or lifecycle event.
 ///
-/// Complete Data ACK snapshots can arrive out of order on different paths, so
-/// their monotonic received ranges are unioned instead of choosing by arrival
-/// order. Deltas remain explicitly incomplete. MAX_DATA is monotonic, so only
-/// its greatest advertised offset needs to reach the actor.
+/// Positive coverage and explicit negative scopes each form a union. A scope
+/// union is not its convex hull: unknown intervals between reports remain
+/// unknown. MAX_DATA is independently monotonic.
 #[derive(Debug, Default)]
 struct ServerFeedbackBatch {
-    complete_stream_id: Option<StreamId>,
-    complete_ranges: Vec<OffsetRange>,
-    delta_stream_id: Option<StreamId>,
-    delta_ranges: Vec<OffsetRange>,
+    ack_stream_id: Option<StreamId>,
+    positive_ranges: Vec<OffsetRange>,
+    scopes: Vec<OffsetRange>,
     max_data: Option<(StreamId, u64)>,
 }
 
 impl ServerFeedbackBatch {
     fn accepts(frame: &Frame) -> bool {
-        matches!(frame, Frame::StreamAck { .. } | Frame::StreamMaxData { .. })
+        match frame {
+            Frame::StreamMaxData { .. } => true,
+            Frame::StreamAck {
+                scope_start,
+                ranges,
+                ..
+            } => {
+                // Never let normalization erase malformed original evidence.
+                // Such a frame remains an ordered boundary and reaches the
+                // Product transaction's full assigned-extent validation intact.
+                ranges.iter().all(|range| range.start < range.end)
+                    && scope_start.is_none_or(|start| ranges.iter().any(|range| start < range.end))
+            }
+            _ => false,
+        }
     }
 
     fn push(&mut self, frame: Frame) {
         match frame {
             Frame::StreamAck {
                 stream_id,
-                complete: true,
+                scope_start,
                 ranges,
             } => {
-                self.complete_stream_id.get_or_insert(stream_id);
-                self.complete_ranges.extend(ranges);
-            }
-            Frame::StreamAck {
-                stream_id,
-                complete: false,
-                ranges,
-            } => {
-                self.delta_stream_id.get_or_insert(stream_id);
-                self.delta_ranges.extend(ranges);
+                self.ack_stream_id.get_or_insert(stream_id);
+                if let Some(start) = scope_start {
+                    self.scopes.push(OffsetRange {
+                        start,
+                        end: ranges
+                            .iter()
+                            .map(|range| range.end)
+                            .max()
+                            .expect("validated nonempty scope"),
+                    });
+                }
+                self.positive_ranges.extend(ranges);
             }
             Frame::StreamMaxData {
                 stream_id,
@@ -170,22 +184,41 @@ impl ServerFeedbackBatch {
     }
 
     fn into_frames(self) -> VecDeque<Frame> {
-        let mut frames = VecDeque::with_capacity(3);
-        // Positive delta coverage is released before the complete union drives
-        // gap inference, so one batch cannot infer against bytes it also ACKs.
-        if let Some(stream_id) = self.delta_stream_id {
+        let mut frames = VecDeque::new();
+        if let Some(stream_id) = self.ack_stream_id {
+            let positives = normalize_offset_ranges(self.positive_ranges);
+            let scopes = normalize_offset_ranges(self.scopes);
+            // The first Product transaction validates every original positive
+            // endpoint before releasing any byte. Splitting a not-yet-validated
+            // ACK into valid early coverage and an invalid later scope would
+            // otherwise hide a partial mutation before rejection.
             frames.push_back(Frame::StreamAck {
                 stream_id,
-                complete: false,
-                ranges: normalize_offset_ranges(self.delta_ranges),
+                scope_start: None,
+                ranges: positives.clone(),
             });
-        }
-        if let Some(stream_id) = self.complete_stream_id {
-            frames.push_back(Frame::StreamAck {
-                stream_id,
-                complete: true,
-                ranges: normalize_offset_ranges(self.complete_ranges),
-            });
+            for scope in scopes {
+                let first = positives.partition_point(|range| range.end <= scope.start);
+                if positives
+                    .get(first)
+                    .is_some_and(|range| range.start <= scope.start && scope.end <= range.end)
+                {
+                    continue;
+                }
+                let ranges = positives[first..]
+                    .iter()
+                    .take_while(|range| range.start < scope.end)
+                    .map(|range| OffsetRange {
+                        start: range.start.max(scope.start),
+                        end: range.end.min(scope.end),
+                    })
+                    .collect();
+                frames.push_back(Frame::StreamAck {
+                    stream_id,
+                    scope_start: Some(scope.start),
+                    ranges,
+                });
+            }
         }
         if let Some((stream_id, max_offset)) = self.max_data {
             frames.push_back(Frame::StreamMaxData {
@@ -410,11 +443,10 @@ impl ReliablePathStream {
 
     pub(in crate::runtime) fn data_ack_recovery_candidates(
         &self,
-        authoritative_horizon: u64,
+        gaps: &[OffsetRange],
         lane: TrafficClass,
     ) -> SmallVec<[ResponseDataAckRecoveryCandidate; 4]> {
-        self.output
-            .data_ack_recovery_candidates(authoritative_horizon, lane)
+        self.output.data_ack_recovery_candidates(gaps, lane)
     }
 
     pub(in crate::runtime) fn response_output_snapshot(
@@ -1990,14 +2022,12 @@ impl ReliablePathStreamOutput {
 
     pub(in crate::runtime) fn data_ack_recovery_candidates(
         &self,
-        authoritative_horizon: u64,
+        gaps: &[OffsetRange],
         lane: TrafficClass,
     ) -> SmallVec<[ResponseDataAckRecoveryCandidate; 4]> {
         match self {
             Self::Fixed(_) => SmallVec::new(),
-            Self::Switchable(binding) => {
-                binding.data_ack_recovery_candidates(authoritative_horizon, lane)
-            }
+            Self::Switchable(binding) => binding.data_ack_recovery_candidates(gaps, lane),
         }
     }
 

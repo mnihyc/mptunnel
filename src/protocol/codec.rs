@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 13;
+const VERSION: u8 = 14;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 116;
@@ -129,7 +129,7 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
         Frame::PathProofData { payload, .. } | Frame::PathCapacityData { payload, .. } => {
             payload.len().saturating_add(16)
         }
-        Frame::StreamAck { ranges, .. } => 16usize.saturating_add(ranges.len().saturating_mul(16)),
+        Frame::StreamAck { ranges, .. } => 21usize.saturating_add(ranges.len().saturating_mul(16)),
         Frame::PeerStatusResponse { paths, .. } => PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN
             .saturating_add(paths.len().saturating_mul(PEER_PATH_STATUS_ENCODED_LEN)),
         Frame::IpTunnelReady { addresses, .. } => {
@@ -400,7 +400,7 @@ fn encode_payload(
         }
         Frame::StreamAck {
             stream_id,
-            complete,
+            scope_start,
             ranges,
         } => {
             if ranges.len() > limits.max_ack_ranges {
@@ -412,10 +412,17 @@ fn encode_payload(
             if ranges.len() > u16::MAX as usize {
                 return Err(CodecError::LengthOverflow);
             }
+            validate_ack_scope(*scope_start, ranges)?;
             put_u64(out, stream_id.0);
             let packed = packed_ack_ranges_len(ranges).is_some_and(|len| len < ranges.len() * 16);
-            put_u8(out, u8::from(*complete) | (u8::from(packed) << 1));
+            put_u8(
+                out,
+                u8::from(scope_start.is_some()) | (u8::from(packed) << 1),
+            );
             put_u16(out, ranges.len() as u16);
+            if let Some(scope_start) = scope_start {
+                put_ack_varint(out, *scope_start);
+            }
             let mut previous_end = 0;
             for range in ranges {
                 if range.is_empty() {
@@ -916,7 +923,7 @@ fn encode_target(
 fn decode_ack_payload(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<Frame, CodecError> {
     let stream_id = StreamId(reader.get_u64()?);
     let flags = reader.get_u8()?;
-    let complete = flags & 1 != 0;
+    let scoped = flags & 1 != 0;
     if flags & !3 != 0 {
         return Err(CodecError::InvalidEnum);
     }
@@ -928,6 +935,11 @@ fn decode_ack_payload(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<Fr
             limit: limits.max_ack_ranges,
         });
     }
+    let scope_start = if scoped {
+        Some(reader.get_ack_varint()?)
+    } else {
+        None
+    };
     let mut ranges = Vec::with_capacity(range_count);
     let mut previous_end: u64 = 0;
     for _ in 0..range_count {
@@ -948,11 +960,21 @@ fn decode_ack_payload(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<Fr
         ranges.push(range);
         previous_end = end;
     }
+    validate_ack_scope(scope_start, &ranges)?;
     Ok(Frame::StreamAck {
         stream_id,
-        complete,
+        scope_start,
         ranges,
     })
+}
+
+fn validate_ack_scope(scope_start: Option<u64>, ranges: &[OffsetRange]) -> Result<(), CodecError> {
+    if let Some(start) = scope_start
+        && !ranges.iter().any(|range| start < range.end)
+    {
+        return Err(CodecError::InvalidRange);
+    }
+    Ok(())
 }
 
 fn decode_target(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<TargetAddr, CodecError> {
@@ -1320,7 +1342,7 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-// Per-frame compression only: retain the exact range vector and complete bit,
+// Per-frame compression only: retain the exact range vector and optional scope,
 // without attachment history or changing Product ACK/gap authority.
 fn packed_ack_ranges_len(ranges: &[OffsetRange]) -> Option<usize> {
     let mut previous_end = 0;

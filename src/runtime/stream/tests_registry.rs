@@ -1839,7 +1839,7 @@ async fn repeated_same_key_reconnect_does_not_wait_for_predecessor_cleanup() {
     for offset in 0..10_000u64 {
         let frame = Frame::StreamAck {
             stream_id,
-            complete: false,
+            scope_start: None,
             ranges: vec![OffsetRange {
                 start: offset,
                 end: offset + 1,
@@ -3121,7 +3121,7 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
     let mut stream = accepted.take_stream();
     let first = Frame::StreamAck {
         stream_id,
-        complete: false,
+        scope_start: None,
         ranges: vec![OffsetRange { start: 0, end: 1 }],
     };
     assert!(matches!(
@@ -3134,7 +3134,7 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
     for offset in 1..10_000u64 {
         let frame = Frame::StreamAck {
             stream_id,
-            complete: false,
+            scope_start: None,
             ranges: vec![OffsetRange {
                 start: offset,
                 end: offset + 1,
@@ -3553,7 +3553,7 @@ async fn routed_request_data_updates_feedback_ingress_on_the_same_stream_event_s
 
     let ack = Frame::StreamAck {
         stream_id,
-        complete: false,
+        scope_start: None,
         ranges: vec![OffsetRange { start: 0, end: 1 }],
     };
     port.route_frame(&tcp, stream_id, ack.clone())
@@ -3625,7 +3625,7 @@ fn full_actor_queue_keeps_detach_fifo_without_runtime_context() {
     let output_incarnation = target.observation.incarnation;
     let ack = Frame::StreamAck {
         stream_id,
-        complete: true,
+        scope_start: Some(0),
         ranges: vec![OffsetRange { start: 0, end: 1 }],
     };
     let (events, mut actor_input) = mpsc::channel(1);
@@ -3723,7 +3723,7 @@ async fn queued_ack_precedes_following_path_detach_at_stream_actor() {
     };
     let ack = Frame::StreamAck {
         stream_id,
-        complete: true,
+        scope_start: Some(0),
         ranges: vec![OffsetRange {
             start: 0,
             end: 32_971,
@@ -3740,7 +3740,19 @@ async fn queued_ack_precedes_following_path_detach_at_stream_actor() {
         "detaching output must stop accepting new sends immediately"
     );
     assert!(stream.has_output_incarnation(key, output_incarnation));
-    assert_eq!(stream.recv_frame().await.expect("receive ACK"), ack);
+    assert_eq!(
+        stream.recv_frame().await.expect("receive ACK"),
+        Frame::StreamAck {
+            stream_id,
+            // The queued ACK covers its whole proposed scope, so batching
+            // preserves its positives without an empty negative-authority field.
+            scope_start: None,
+            ranges: vec![OffsetRange {
+                start: 0,
+                end: 32_971,
+            }],
+        },
+    );
     assert!(
         stream.has_output_incarnation(key, output_incarnation),
         "the following detach must not overtake ACK handling"

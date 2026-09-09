@@ -458,7 +458,7 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
     let (binding, _initial, mut initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let initial_snapshot = vec![Frame::StreamAck {
         stream_id,
-        complete: true,
+        scope_start: Some(0),
         ranges: vec![OffsetRange { start: 0, end: 8 }],
     }];
     let first = binding.publish_ack(1, &initial_snapshot, &initial_snapshot);
@@ -467,7 +467,7 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut initial_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
-            complete: true,
+            scope_start: Some(0),
             ranges,
             ..
         })) if ranges == vec![OffsetRange { start: 0, end: 8 }]
@@ -486,12 +486,12 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
     );
     let update = vec![Frame::StreamAck {
         stream_id,
-        complete: false,
+        scope_start: None,
         ranges: vec![OffsetRange { start: 16, end: 24 }],
     }];
     let cumulative = vec![Frame::StreamAck {
         stream_id,
-        complete: true,
+        scope_start: Some(0),
         ranges: vec![
             OffsetRange { start: 0, end: 8 },
             OffsetRange { start: 16, end: 24 },
@@ -503,7 +503,7 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut initial_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
-            complete: false,
+            scope_start: None,
             ranges,
             ..
         })) if ranges == vec![OffsetRange { start: 16, end: 24 }]
@@ -511,7 +511,7 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut alternate_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
-            complete: true,
+            scope_start: Some(0),
             ranges,
             ..
         })) if ranges == vec![
@@ -534,12 +534,12 @@ fn retained_ack_retry_resumes_at_the_first_unaccepted_cumulative_chunk() {
     let cumulative = vec![
         Frame::StreamAck {
             stream_id,
-            complete: false,
+            scope_start: None,
             ranges: vec![OffsetRange { start: 0, end: 8 }],
         },
         Frame::StreamAck {
             stream_id,
-            complete: false,
+            scope_start: None,
             ranges: vec![OffsetRange { start: 16, end: 24 }],
         },
     ];
@@ -589,7 +589,7 @@ fn retained_ack_publication_status_excludes_a_detached_fence() {
     let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let cumulative = vec![Frame::StreamAck {
         stream_id,
-        complete: true,
+        scope_start: Some(0),
         ranges: vec![OffsetRange { start: 0, end: 8 }],
     }];
     assert!(binding.publish_ack(1, &cumulative, &cumulative).published);

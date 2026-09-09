@@ -107,16 +107,18 @@ impl ServerTcpStreamState {
         let _ = path_id;
         #[cfg(feature = "lab-diagnostics")]
         if let Frame::StreamAck {
-            complete, ranges, ..
+            scope_start,
+            ranges,
+            ..
         } = &frame
         {
             lab_diagnostic(
                 "server_tcp_stream_ack_ingress",
                 format_args!(
-                    "stream_id={} path_id={} complete={} ranges={} frontier={} largest_end={}",
+                    "stream_id={} path_id={} scope_start={:?} ranges={} frontier={} largest_end={}",
                     stream_id.0,
                     path_id.0,
-                    complete,
+                    scope_start,
                     ranges.len(),
                     stream_ack_contiguous_frontier(ranges),
                     ranges.last().map_or(0, |range| range.end),
@@ -142,16 +144,18 @@ impl ServerTcpStreamState {
         let _ = path_id;
         #[cfg(feature = "lab-diagnostics")]
         if let Frame::StreamAck {
-            complete, ranges, ..
+            scope_start,
+            ranges,
+            ..
         } = &frame
         {
             lab_diagnostic(
                 "server_tcp_stream_ack_ingress",
                 format_args!(
-                    "stream_id={} path_id={} complete={} ranges={} frontier={} largest_end={}",
+                    "stream_id={} path_id={} scope_start={:?} ranges={} frontier={} largest_end={}",
                     stream_id.0,
                     path_id.0,
-                    complete,
+                    scope_start,
                     ranges.len(),
                     stream_ack_contiguous_frontier(ranges),
                     ranges.last().map_or(0, |range| range.end),

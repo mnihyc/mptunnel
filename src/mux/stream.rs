@@ -67,13 +67,49 @@ impl ReliableSendStream {
 
     /// Lowest Data Sequence offset not yet acknowledged by the peer.
     ///
-    /// Incomplete STREAM_ACK chunks are still affirmative delivery evidence.
+    /// Positive-only STREAM_ACK chunks are still affirmative delivery evidence.
     /// Deriving this frontier from the remaining send cache lets those chunks
-    /// release connection credit without treating them as complete gap reports.
+    /// release connection credit without granting unreported gap authority.
     pub(crate) fn data_ack_frontier(&self) -> u64 {
         self.reinjection_cache
             .first_key_value()
             .map_or(self.next_offset, |(offset, _)| *offset)
+    }
+
+    /// Exact retained, unacknowledged coverage inside a validated ACK scope.
+    /// Assigned bytes absent from this cache have already received positive
+    /// acknowledgment; a delayed negative proof must never resurrect them.
+    pub(crate) fn retained_ranges_in_scope(&self, scope: OffsetRange) -> Vec<OffsetRange> {
+        let mut retained: Vec<OffsetRange> = Vec::new();
+        let Some(first) =
+            first_overlapping_reinjection_chunk(&self.reinjection_cache, scope.start, scope.end)
+        else {
+            return retained;
+        };
+        for (&start, chunk) in self.reinjection_cache.range(first..scope.end) {
+            let end = start
+                .saturating_add(chunk.payload.len() as u64)
+                .min(scope.end);
+            let start = start.max(scope.start);
+            if start >= end {
+                continue;
+            }
+            if let Some(previous) = retained.last_mut()
+                && previous.end == start
+            {
+                previous.end = end;
+            } else {
+                retained.push(OffsetRange { start, end });
+            }
+        }
+        retained
+    }
+
+    pub(crate) fn has_unacknowledged_ranges(&self, ranges: &[OffsetRange]) -> bool {
+        ranges.iter().any(|range| {
+            first_overlapping_reinjection_chunk(&self.reinjection_cache, range.start, range.end)
+                .is_some()
+        })
     }
 
     pub fn update_max_offset(&mut self, max_offset: u64) {
@@ -225,7 +261,7 @@ impl ReliableSendStream {
     }
 
     pub fn apply_ack(&mut self, ranges: &[OffsetRange]) -> Result<AckOutcome, StreamError> {
-        let ack = validate_stream_ack(false, ranges.to_vec(), self.next_offset)?;
+        let ack = validate_stream_ack(None, ranges.to_vec(), self.next_offset)?;
         self.apply_validated_ack(&ack)
     }
 
@@ -626,14 +662,14 @@ pub struct AckOutcome {
 /// invalid crossing range into otherwise valid evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedStreamAck {
-    complete: bool,
+    scope_start: Option<u64>,
     ranges: Vec<OffsetRange>,
     assigned_end: u64,
 }
 
 impl ValidatedStreamAck {
-    pub(crate) fn complete(&self) -> bool {
-        self.complete
+    pub(crate) fn scope_start(&self) -> Option<u64> {
+        self.scope_start
     }
 
     pub(crate) fn ranges(&self) -> &[OffsetRange] {
@@ -653,7 +689,7 @@ impl ValidatedStreamAck {
 /// `ReliableSendStream::next_offset()` before changing cache, flight, queue,
 /// reservation, or recovery evidence.
 pub(crate) fn validate_stream_ack(
-    complete: bool,
+    scope_start: Option<u64>,
     ranges: Vec<OffsetRange>,
     assigned_end: u64,
 ) -> Result<ValidatedStreamAck, StreamError> {
@@ -672,8 +708,16 @@ pub(crate) fn validate_stream_ack(
             });
         }
     }
+    if let Some(start) = scope_start
+        && !ranges.iter().any(|range| start < range.end)
+    {
+        return Err(StreamError::InvalidAckRange {
+            start,
+            end: ranges.iter().map(|range| range.end).max().unwrap_or(0),
+        });
+    }
     Ok(ValidatedStreamAck {
-        complete,
+        scope_start,
         ranges: normalize_offset_ranges(ranges),
         assigned_end,
     })
@@ -687,6 +731,7 @@ pub struct ReliableRecvStream {
     reorder_bytes: usize,
     buffered: BTreeMap<u64, RecvChunk>,
     received_ranges: RangeSet,
+    ack_high_water: u64,
     limits: MuxLimits,
 }
 
@@ -716,6 +761,7 @@ impl ReliableRecvStream {
             reorder_bytes: 0,
             buffered: BTreeMap::new(),
             received_ranges: RangeSet::default(),
+            ack_high_water: 0,
             limits,
         }
     }
@@ -909,63 +955,60 @@ impl ReliableRecvStream {
         self.received_ranges.ranges_limited(limit)
     }
 
-    /// Build a single ACK frame for callers that cannot batch control frames.
-    ///
-    /// A single ACK frame is only a complete description when all received
-    /// ranges fit in `max_ack_ranges`. If the range set has to be truncated we
-    /// must mark the frame `complete=false`; otherwise the sender interprets
-    /// omitted higher ranges as real holes and starts product reinjection. That was
-    /// catastrophic for multipath/QUIC because ordinary reordering produced
-    /// reinjection storms, extra traffic, and application stalls.
+    /// A bounded prefix of cumulative evidence. Omission authority stops at
+    /// this frame's own highest positive end, never at an omitted later chunk.
     pub fn ack_frame(&self) -> Frame {
-        let all_ranges = self.ack_ranges();
-        let range_limit = self.limits.max_ack_ranges.max(1);
-        let complete = all_ranges.len() <= range_limit;
-        let ranges = all_ranges.into_iter().take(range_limit).collect();
+        let ranges = self.ack_ranges_limited(self.limits.max_ack_ranges.max(1));
         Frame::StreamAck {
             stream_id: self.stream_id,
-            complete,
+            scope_start: ranges
+                .last()
+                .is_some_and(|range| range.start > 0)
+                .then_some(0),
             ranges,
         }
     }
 
-    /// Encode newly received ranges without claiming a complete snapshot.
-    /// Reliable-carrier sparse ACK deltas release exact new bytes immediately;
-    /// periodic `ack_frames` snapshots retain cumulative recovery authority.
-    pub fn ack_delta_frames(&self, ranges: &[OffsetRange]) -> Vec<Frame> {
-        let chunk_size = self.limits.max_ack_ranges.max(1);
-        ranges
-            .chunks(chunk_size)
-            .map(|chunk| Frame::StreamAck {
-                stream_id: self.stream_id,
-                complete: false,
-                ranges: chunk.to_vec(),
-            })
-            .collect()
+    /// Independently truthful cumulative chunks cover adjacent scopes. Neither
+    /// decoding nor gap authority depends on another chunk arriving first.
+    pub fn ack_frames(&self) -> Vec<Frame> {
+        self.scoped_ack_frames(self.ack_ranges(), 0)
     }
 
-    /// Build every ACK chunk needed to describe the current receive ranges.
-    ///
-    /// When multiple frames are needed each chunk is explicitly incomplete.
-    /// The sender may use incomplete ACK chunks for flight release, but it must
-    /// not infer stream gaps from omitted chunks.
-    pub fn ack_frames(&self) -> Vec<Frame> {
-        let ranges = self.ack_ranges();
+    /// Materialize one Product publication boundary, not one receive call.
+    /// Merged dirty nodes are truthful positive supersets of every new byte
+    /// since the previous boundary; unchanged islands need not be repeated.
+    pub(crate) fn take_ack_update(&mut self) -> Vec<Frame> {
+        let ranges = self.received_ranges.take_changed_ranges();
+        let frames = self.scoped_ack_frames(ranges, self.ack_high_water);
+        self.ack_high_water = self.ack_range_summary().largest_end;
+        frames
+    }
+
+    fn scoped_ack_frames(&self, ranges: Vec<OffsetRange>, mut high_water: u64) -> Vec<Frame> {
         let chunk_size = self.limits.max_ack_ranges.max(1);
         if ranges.is_empty() {
             return vec![Frame::StreamAck {
                 stream_id: self.stream_id,
-                complete: true,
+                scope_start: None,
                 ranges,
             }];
         }
-        let complete = ranges.len() <= chunk_size;
         ranges
             .chunks(chunk_size)
-            .map(|chunk| Frame::StreamAck {
-                stream_id: self.stream_id,
-                complete,
-                ranges: chunk.to_vec(),
+            .map(|chunk| {
+                let last_range = chunk.last().expect("nonempty ACK chunk");
+                let end = last_range.end;
+                // If this last positive covers the whole proposed scope,
+                // there are no omission facts to encode. Positive release is
+                // identical and needs no empty negative-authority header.
+                let scope_start = (last_range.start > high_water).then_some(high_water);
+                high_water = high_water.max(end);
+                Frame::StreamAck {
+                    stream_id: self.stream_id,
+                    scope_start,
+                    ranges: chunk.to_vec(),
+                }
             })
             .collect()
     }
@@ -1008,7 +1051,13 @@ pub struct AckRangeSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct RangeSet {
-    ranges: BTreeMap<u64, u64>,
+    ranges: BTreeMap<u64, ReceivedRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReceivedRange {
+    end: u64,
+    dirty: bool,
 }
 
 impl RangeSet {
@@ -1027,21 +1076,19 @@ impl RangeSet {
         let mut merged_end = end;
         let mut removed = 0usize;
         let mut lower_bound = std::ops::Bound::Included(start);
-        if let Some((&previous_start, &previous_end)) = self.ranges.range(..=start).next_back()
-            && previous_end >= start
+        if let Some((&previous_start, previous)) = self.ranges.range(..=start).next_back()
+            && previous.end >= start
         {
-            merged_end = merged_end.max(previous_end);
+            merged_end = merged_end.max(previous.end);
             removed = 1;
             lower_bound = std::ops::Bound::Excluded(previous_start);
         }
-        for (&range_start, &range_end) in
-            self.ranges.range((lower_bound, std::ops::Bound::Unbounded))
-        {
+        for (&range_start, range) in self.ranges.range((lower_bound, std::ops::Bound::Unbounded)) {
             if range_start > merged_end {
                 break;
             }
             removed = removed.saturating_add(1);
-            merged_end = merged_end.max(range_end);
+            merged_end = merged_end.max(range.end);
         }
 
         self.ranges.len().saturating_sub(removed).saturating_add(1)
@@ -1055,11 +1102,11 @@ impl RangeSet {
         let mut merged_start = start;
         let mut merged_end = end;
 
-        if let Some((&prev_start, &prev_end)) = self.ranges.range(..=start).next_back()
-            && prev_end >= start
+        if let Some((&prev_start, previous)) = self.ranges.range(..=start).next_back()
+            && previous.end >= start
         {
             merged_start = prev_start;
-            merged_end = merged_end.max(prev_end);
+            merged_end = merged_end.max(previous.end);
             self.ranges.remove(&prev_start);
         }
 
@@ -1068,7 +1115,7 @@ impl RangeSet {
                 .ranges
                 .range(start..=merged_end)
                 .next()
-                .map(|(&range_start, &range_end)| (range_start, range_end));
+                .map(|(&range_start, range)| (range_start, range.end));
             let Some((range_start, range_end)) = next else {
                 break;
             };
@@ -1076,14 +1123,20 @@ impl RangeSet {
             self.ranges.remove(&range_start);
         }
 
-        self.ranges.insert(merged_start, merged_end);
+        self.ranges.insert(
+            merged_start,
+            ReceivedRange {
+                end: merged_end,
+                dirty: true,
+            },
+        );
     }
 
     fn covers(&self, start: u64, end: u64) -> bool {
         self.ranges
             .range(..=start)
             .next_back()
-            .is_some_and(|(_, range_end)| *range_end >= end)
+            .is_some_and(|(_, range)| range.end >= end)
     }
 
     fn uncovered_ranges(&self, start: u64, end: u64) -> Vec<OffsetRange> {
@@ -1092,12 +1145,12 @@ impl RangeSet {
         }
         let mut cursor = start;
         let mut ranges = Vec::new();
-        if let Some((_, range_end)) = self.ranges.range(..=start).next_back()
-            && *range_end > cursor
+        if let Some((_, range)) = self.ranges.range(..=start).next_back()
+            && range.end > cursor
         {
-            cursor = (*range_end).min(end);
+            cursor = range.end.min(end);
         }
-        for (&range_start, &range_end) in self.ranges.range(start..) {
+        for (&range_start, range) in self.ranges.range(start..) {
             if cursor >= end || range_start >= end {
                 break;
             }
@@ -1106,7 +1159,7 @@ impl RangeSet {
             {
                 ranges.push(range);
             }
-            cursor = cursor.max(range_end.min(end));
+            cursor = cursor.max(range.end.min(end));
         }
         if cursor < end
             && let Some(range) = OffsetRange::new(cursor, end)
@@ -1124,14 +1177,29 @@ impl RangeSet {
         self.ranges
             .iter()
             .take(limit)
-            .filter_map(|(&start, &end)| OffsetRange::new(start, end))
+            .filter_map(|(&start, range)| OffsetRange::new(start, range.end))
+            .collect()
+    }
+
+    fn take_changed_ranges(&mut self) -> Vec<OffsetRange> {
+        self.ranges
+            .iter_mut()
+            .filter_map(|(&start, range)| {
+                std::mem::take(&mut range.dirty).then_some(OffsetRange {
+                    start,
+                    end: range.end,
+                })
+            })
             .collect()
     }
 
     fn summary(&self) -> AckRangeSummary {
         AckRangeSummary {
             count: self.ranges.len(),
-            largest_end: self.ranges.last_key_value().map_or(0, |(_, &end)| end),
+            largest_end: self
+                .ranges
+                .last_key_value()
+                .map_or(0, |(_, range)| range.end),
         }
     }
 }

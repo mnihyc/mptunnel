@@ -13,7 +13,6 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::prepared::{PreparedOriginalClaim, PreparedOriginalRegistration};
 use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
-use crate::runtime::relay::io::stream_ack_ranges_expose_authoritative_gap;
 use crate::runtime::sender::queue::ReliableRelayQueuedWorkKind;
 use crate::runtime::sender::work::RelaySendCause;
 use crate::runtime::stream::ReliablePathStreamOutput;
@@ -75,10 +74,10 @@ fn registration_is_current(
 
 fn frontier(state: &RequestProductState) -> ReliableDataAckFrontierState {
     ReliableDataAckFrontierState::from_authoritative_gap(
-        stream_ack_ranges_expose_authoritative_gap(
-            state.last_send_ack.complete(),
-            state.last_send_ack.ranges(),
-        ),
+        state
+            .last_send_ack
+            .gap_at(state.send_stream.data_ack_frontier())
+            .is_some(),
     )
 }
 

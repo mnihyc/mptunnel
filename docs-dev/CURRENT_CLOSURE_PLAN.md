@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 10:34 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 11:15 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,121 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Receipt correction REJECTED11:15:** reversed-order healthy control→candidate
+406.710→412.076Mbps does not justify bodygap.273264→.385985s, p95echo
+466.176→567.908ms, maximum523.741→842.107ms (80→79successful exchanges).
+Both healthy pairs worsen these tails despite different execution order.
+All four receipt helper/actor/test diffs and nine RFC lines are now reversed;
+`git diff b2aa215 -- src RFC.md Cargo.toml Cargo.lock` is empty. The exact
+candidate patch/binary, original RED,1244checks and all8ordinary runs remain
+evidence, not an implicit dependency. UP was not started; no release/README.
+
+Why the forecast failed: removing publication work did reduce whole UP bytes
+and improved restricted service, but byte-coverage/FIFO equivalence did not
+prove equivalent ACK timing, sender observation or placement. Healthy queues
+and repeated tails become worse, so this is not an acceptable latency tradeoff.
+Reverse candidate's late echo sample has a request not yet at the real target;
+first pair had a reply already echoed but not delivered. A single downstream
+queue explanation is insufficient. Exact causal chain for the extra tail is
+not proved; do not disguise it as a confidence/BBR or physical-loss defect.
+Source audit identifies actual ACK-transaction-dependent delivery sample counts
+and first-clock seeding, but neither establishes this interval's active cause.
+No compensating sampler/threshold adjustment is authorized.
+
+Current ordinary runtime is scoped ACK checkpointb2aa215. Preserve this result
+as a rejected bounded approach; next question remains material feedback cost
+and mixed timing, not a new lifecycle inventory. The old queue-overlap fraction
+cannot be imported into the scoped model. Any renewed queue-latest proposal
+requires current cancellable-work evidence and exact scoped-fact ownership.
+Restored ordinary test build and1241affected checks pass. All8runs,61raw files,
+exact rejected patch and RED/GREEN/rollback logs are archived in
+READY_RECEIPT_ORDINARY_20260909.raw.tar.gz; gzip integrity and byte comparison
+pass. No diagnostic source or receipt candidate remains in runtime.
+
+**Healthy attribution/repeat11:10:** sampled candidate DOWN queue32.138→
+27.390MB brackets the worst echo; all four native RTTs rise from about300 to
+500ms while ACKs progress. UP queue remains49–140KB/500Mbps, no drops. At
+the late sample the server has echoed1728B but the client has only1664B; at
+least the late hold is downstream of the real echo target. Control's worst
+echo accompanies smaller13.821→8.796MB DOWN queues. Whole-queue Q/C is not
+the exact echo delay and these snapshots cannot attribute the queue to the
+receipt correction rather than the pre-existing mixed allocator/native state.
+
+One predeclared reversed-order healthy pair (candidate then control) answers
+that variability question; preserve BOTH pairs, not replace the adverse one.
+No source, profile, queue, load or benchmark changes. Forecast is information:
+repeatable candidate tail/queue worsening supports rejection of this correction;
+changed ordering/sign with queue episodes in both builds weakens that causal
+claim but does not prove global non-regression. This repeat is finite, not
+rerun-until-green; inconclusive evidence retains the hold and selects exact
+critical-event evidence rather than more repetitions. UP remains deferred.
+The queue-latest shadow remains deferred meanwhile: its old26–31% overlap
+cannot be reused after scoped ACK/receipt changes, and newer scoped ACKs are
+not necessarily supersets. No queue replacement code is authorized.
+
+**Healthy mixed stop11:07:** control→candidate whole393.331→392.565Mbps,
+bodygap.310480→.331440s; echo p50/p95/max280.491/492.308/817.280→
+286.590/528.341/1042.248ms. Both79/79 actual successes. Candidate's worst
+echo is13.035326→14.077574s, not startup; no configured impairment exists.
+This is an adverse/ambiguous affected result. Stop promotion, and defer the
+planned UP pair until one causal attribution question is answered. Do not
+replace this pair, waive the tail, or stack the deferred queue-latest design.
+First reuse ordinary native/queue/timing samples around the two slow echoes:
+does a newly dominant sampled queue accompany the candidate hold, or is the
+existing mixed placement/tail behavior unchanged? These samples cannot prove
+the exact blocking byte's location; acknowledge that limit before adding any
+observer. Component correctness and return-QoS improvement remain evidence,
+not practical acceptance or a reason to silently retain a latency tradeoff.
+
+**Q-only affected control11:03:** candidate-first then fixed control under
+the same return restriction. Control→candidate whole428.634→431.675Mbps,
+restricted441.383→443.261; restored438.912→438.317. Both80/80echoes; p95
+160.788→168.332ms, max318.800→287.649ms; bodygap100.443→106.381ms, firstbody
+408.391→407.006ms. Small contrary extremes remain in raw evidence; no material
+Q-only service loss appears in this pair. Proceed with the predeclared healthy
+mixed DOWN pair, not a repeat of the favorable restricted mixed result.
+
+**Receipt ordinary outcome11:01:** fixed control versus default corrected
+build gives restricted235.091→299.175Mbps; healthy433.747→433.185 and restored
+367.121→370.929Mbps. Whole344.436→360.721Mbps. Echo p95/max746.712/969.400
+→541.200/706.855ms,75→79successes with no actual failures. Firstbody.587367
+→.581723s; longest read gap worsens.581397→.622215s (candidate21.863670→
+22.485885). Preserve the41ms adverse extreme; do not infer non-regression or
+stall closure from one pair. No new threshold or favorable replacement control.
+
+Continue only the predeclared affected controls: Q-only DOWN with identical
+return restriction (candidate then control), healthy mixed DOWN and healthy
+mixed UP (control then candidate). No source/profile edits between each pair.
+These test unintended Q-only receipt cost, ordinary mixed service, and the
+server-side receive/error composition and upload settlement respectively.
+Forecast is neutral or useful service, not a required speedup in every case;
+materially worse completion/gaps/loaded latency stops promotion and selects one
+causal question before further cases. The current modest worst-gap increase
+stays visible in the final pair report; it is neither proof of regression nor
+waived by better means. Raw queues/resources still require the same-window join.
+
+**Receipt verification10:57:** the corrected ordinary test build passes1244
+affected protocol/mux/relay/stream/sender/path checks, including the original
+four-ready-record RED and real later-range rejection. Independent final review
+finds no concrete regression in either caller, prefix error handling, FIFO
+metadata, duplicate/hole/FIN semantics, or unchanged all-attachment feedback.
+This establishes the receipt mechanism, not practical performance. Default
+release compilation now precedes one identical-profile candidate comparison
+against the fixed control below; no compiler overlaps a lab. Runtime scope
+remains four receipt helper/actor/test files plus the RFC clarification.
+
+**Comparator outcome10:48:** ordinary b2aa215 completes40.000098s,
+1722184258body bytes/344.436Mbps. Phases433.747→235.091→367.121Mbps;
+firstbody.587367s, maxgap.581397s at16.788212→17.369609s;75/75actualechoes,
+p50/p95/max254.092/746.712/969.400ms. This comparator is fixed for the
+ready-receipt correction; do not substitute an earlier slower control.
+
+**Ordinary comparator10:46:** while the focused fixture additions finish, run
+frozen ordinary b2aa215 once under the unchanged mixed return-restriction
+profile, tag ready-receipt-control-0909. No compiler overlaps. This supplies
+the declared correction's ordinary comparator; the earlier same-feature
+ablation pair remains diagnostic evidence, not its acceptance control.
 
 **Receipt RED10:40:** the actual collector/receive/two-attachment test runs
 one test and fails exactly at batch length1 versus4 on unchanged runtime.
@@ -1366,9 +1481,9 @@ list and byte-for-byte source comparison pass. No build or lab remains active;
 target/release is diagnostic, not ordinary d999fea. Exact causal joins and the
 next discriminator remain root-owned.
 
-## Comparator source and retained ordinary disposition
+## Earlier comparators and retained ordinary dispositions
 
-Comparator runtime **d999fea** restricts request ACK-release work to exact support;
+Historical comparator **d999fea** restricts request ACK-release work to exact support;
 RED **0683286**,546focused checks. Parent **b783cd6** separates prepared stale
 preference; RED **f1b0900**,544checks. Earlier **e476308** makes the two advisory
 native-writer Product acquisitions nonblocking; RED **584b748**,542checks.
@@ -1557,24 +1672,26 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 
 ## Execution, evidence and continuity
 
-- Root owns builds/labs. Response claim comparisons and the subsequent MAX-fold
-  mechanism/ordinary UP pair are complete; all adverse outcomes remain visible.
-  The current replacement candidate is shared latest-credit input state; its
-  predecessor is fcc0b22's finite ready-MAX fold. The completed healthy observer
-  selected this bounded transaction; do not repeat that capture without cause.
+- Root owns builds/labs. The ready-receipt correction is REJECTED and fully
+  reversed as recorded at the top. Scoped ACK is checkpoint b2aa215 with
+  partial ordinary benefit, not acceptance. Feedback fanout's causal ablation
+  is evidence only; its unsafe source has been fully reversed. The earlier
+  MAX/claim/work comparisons above are historical, not parallel open tasks.
   Owned Docker only: no sudo, host shaping, outside-repo work or build/lab overlap.
-- Ordinary candidate:`./.tmp/reflection/bin/ready-credit-20260908/mptunnel`.
-  Ordinary comparator:`./.tmp/reflection/bin/response-claim-20260908/mptunnel`.
-  Earlier comparator:`./.tmp/reflection/bin/ack-support-20260908/mptunnel`.
-  Current diagnostic:`./.tmp/reflection/bin/ready-credit-return-20260908/mptunnel`.
-  Previous forward diagnostic:`./.tmp/reflection/bin/post-ack-forward-20260908/mptunnel`.
-  Previous reply diagnostic:`./.tmp/reflection/bin/reply-residence-20260908/mptunnel`.
-  Do not use diagnostic target/release as an ordinary comparator.
+- Next ordinary comparator:
+  `./.tmp/reflection/bin/scoped-ack-20260909/mptunnel` (b2aa215).
+  Previous pre-scoped comparator:
+  `./.tmp/reflection/bin/latest-credit-actor-yield-20260909/mptunnel` (4c7e232).
+  Frozen diagnostic:
+  `./.tmp/reflection/bin/feedback-fanout-20260909/mptunnel`; its env-set wrapper
+  is an intentionally unsafe causal intervention, never an ordinary candidate.
+  target/release currently contains the rejected receipt candidate. Do not use
+  it as the restored ordinary comparator; use the frozen scoped-ack binary.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram last attribution/comparison report:16:39UTC; next nonurgent not
-  before17:40UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram last causal-result report:2026-09-09 02:47:33UTC; next nonurgent not
+  before03:48UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

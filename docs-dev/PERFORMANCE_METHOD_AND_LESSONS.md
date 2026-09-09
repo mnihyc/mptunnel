@@ -248,6 +248,16 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- Receipt-set equivalence is not feedback-clock equivalence. The09-09 ready
+  receipt candidate passed1244 checks and improved restricted mixed goodput
+  235→299Mbps, but both healthy execution-order pairs worsened echo/body tails;
+  the candidate was fully reversed. Fewer/larger ACK transactions can change
+  clock seeding, sample counts, confidence, intermediate gap exposure and the
+  release/assignment schedule despite identical final receipt coverage. Audit
+  those temporal consumers before predicting a latency-neutral work reduction.
+  Their existence is not proof that an estimator caused a measured interval;
+  native-authority QUIC and Product-rate TCP paths must not be conflated. Keep
+  adverse ordinary timing; do not compensate with sampler/threshold tweaks.
 - No component-green => fluent tunnel inference; no finite-bound => latency
   non-regression inference; no unchanged memory ceiling => unchanged queuing.
 - No throughput-only, success-only latency, hidden failed transfers or averaging

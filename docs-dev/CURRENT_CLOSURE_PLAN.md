@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 14:41 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 15:27 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,48 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — mixed Original placement discriminator, not a fix.**
+**Current next action — ordinary mixed copy-cause/receipt discriminator.**
+The placement diagnostic is closed without promotion: TCP bulk Originals fall
+42.16%→1.20%, useful service393.901→275.892Mbps, winning QUIC residence
+179→192ms median. No missing-service recovery even at lower useful load.
+Independent source conservation proves at least313432617B TCP recovery payload
+in that intervention, but the same conservative bound is zero in the ordinary
+control. BULK_ORIGINAL_PLACEMENT_20260909 retains all80 body bins,160echoes,
+82profiles, unequal realized echo membership, costs and the verified raw archive.
+The protocol-specific non-work-conserving filter is fully removed, never a fix.
+
+Question: in ordinary mixed policy, which existing successful repair cause
+produces material copy work, and how much incoming TCP/QUIC data is new versus
+duplicate? Existing bulk logs cannot answer this; echo-copy volume cannot be
+extrapolated. Competing explanations are useful recovery, premature/repeated
+copy work, or mostly non-copy native/shared-queue service. A cause label alone
+is not a defect and an accepted copy is not necessarily a winning arrival.
+
+Smallest action: one frozen feature-only observer build, no echo membership or
+placement intervention. Reuse periodic perf counters for successful Original
+payload, accepted copies by six existing cause groups×actual underlay, separate
+requalification, and client receive new/duplicate/ordered-release bytes by exact
+ingress. Receipt conservation is delta(frontier+buffered bytes); release is
+triggered by this ingress, not proof it carried the unlocked suffix. Use checked
+wide arithmetic and no added payload/range retention or batching changes.
+No per-frame bulk logging or sampling;1us perf timing floors are not service.
+Freeze/reverse before one existing healthy40s mixed DOWN diagnostic; enable
+periodic counters on both ends and retain full service/profile/CPU/RSS history.
+This is ordinary policy with observation cost, not ordinary performance proof.
+
+Information forecast: substantial accepted tail copies with largely duplicate
+arrival support inspecting their assignment-to-native-service timing; different
+dominant causes select their existing owner instead. Small copy volume falsifies
+copy service as the principal explanation. A conservative useful-copy bound
+requires complete covering Original counters; no unflushed-tail assumption.
+Wire carries no cause identity, so exact winning cause requires a subsequent
+bounded exact-range join ONLY if aggregate results leave that decisive ambiguity.
+No recovery suppression, controller/timer/threshold changes or model acceptance
+from byte ratios. Expected gain is unknown; this cheap classification must choose
+a material mechanism or stop it. Preserve old stall/restart/ownership fixes.
+
+### Completed Original-placement discriminator (predeclared contract)
+
 The same-build QUIC-only cell completes at428.149Mbps, echo median/p95/max
 106.536/159.800/274.824ms and bodygap.104166s. All80 responses win on QUIC;
 postwrite residence31/89/177ms versus mixed QUIC228/327/426ms. Stable exact
@@ -1995,8 +2036,8 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram ordinary trial rejection report sent:2026-09-09 06:05UTC; next nonurgent
-  not before07:06UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram mixed-context attribution report sent:2026-09-09 07:07UTC; next nonurgent
+  not before08:08UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

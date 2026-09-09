@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 09:54 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 10:34 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,138 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Attribution10:03:** interim model checkpointb2aa215 committed with1241checks
+**Receipt RED10:40:** the actual collector/receive/two-attachment test runs
+one test and fails exactly at batch length1 versus4 on unchanged runtime.
+The earlier compile command selected zero tests because of an unqualified
+exact filter; that log proves compilation only, not GREEN. The corrected
+execution is retained in ready-receipt-red-test-0909.log. Implementation is
+now authorized only within the four receipt-helper/actor/test files.
+
+Receipt proof: let R_i be admitted coverage after original FIFO input i and
+d_i its contiguous delivered frontier. The existing atomic receive operation
+validates before mutation, monotonically extends R_i, and returns only the
+new contiguous prefix [d_(i-1),d_i), never duplicate bytes. Inductively, applying
+a finite ready batch and concatenating its returned chunks equals sequential
+application of the same accepted inputs. On the first rejection, retain that
+accepted prefix and the original error; later inputs have no surviving Product
+obligation after terminal failure. A single scoped ACK formed from final R_i
+preserves all new positive and truthful negative facts; the existing independent
+per-attachment publication/catch-up rules remain unchanged. Local delivery may
+release old reorder storage in addition to new input, so its byte envelope is
+prior retained payload plus the unchanged bounded input, not input bytes alone.
+ACK transaction granularity and observation timing can change; neither identical
+rate samples nor a throughput gain follows solely from this equivalence proof.
+
+**Selected bounded correction10:34 — ready receipt, not delayed fanout:**
+the same-feature ablation identifies materialreturnfeedbackcost (below), but
+its unsafe single-return path is not a fix. Source/origin review exposes an
+older, narrower constraint:3353d7d introduced contiguous-only ready batching
+for vectored application delivery. Both roles disable batching if any reorder
+data exists; even with no priorbuffer, firstoffset mustequalreceivefrontier.
+This is not required for safely applying FIFO inputs to the real receive map.
+
+Existing mixed receive-owner trace0908 seq152–175 contains FOUR alreadyqueued
+12000B QUICframes behind a TCPgap, each followed by separate feedback/write
+setup; all48000B fit the unchanged default512KiB receipt-turn payload bound.
+23540async dequeues also see queueditems+priorreorder, but those older diagnostic
+counts are only opportunity observations (controls may interrupt readyqueues),
+not predicted batch counts or Mbps. The actual scopedproducer retains every
+new fact across one materialization, including merged earlypositives.
+
+Model: collect already-ready same-stream Data in existing FIFO/item-snapshot/
+aggregate-input-byte bounds regardless of its offset relative to the delivered
+frontier. Retain geometry/credit/FIN/error/control boundaries and exact ingress;
+apply every real frame through ReliableRecvStream, never pre-sort or bypass
+validation. Application output is still only the receiver's contiguous prefix.
+No new wait, timer, resource size, ACK cadence/fanout or native/ranking change.
+Client keeps pre-application ACK and one retained partial-write future. A later
+apply failure becomes reachable: publish accepted prefix facts, deliver that
+prefix once, preserve I/O-error precedence, then surface the deferred error.
+Server retains its existing publication/I/O ordering; do not stack a different
+server interlock/cadence policy into this receive-eligibility correction.
+
+Forecast: the concrete4frame opportunity reduces4publication turns to1 while
+retaining all four feedback recipients; larger gains require actual readywork.
+Given the proven TCPfeedback burden and ample captured readywork this can be
+material, but nativequeues/placement may still dominate and no Mbps value is
+promised. Zero benefit or worse first/recovered/loaded timing rejects performance
+promotion. Tests must first RED on the actual collector/receive/publication
+path, then cover sparse/duplicate/hole-fill, size/item/control/FIN boundaries,
+later resource rejection, prefix ACK/write, partial I/O and chunk release.
+Build/run only one coherent implementation; ordinary paired mixed returnQoS,
+then Q-only/healthy mixed and opposite-direction controls if useful. No README
+or release acceptance. Preserve full series/failures/costs, not mean alone.
+
+**Causal outcome10:31:** same-feature/env-unsetcontrol versus clientTCPACK/MAX
+withholding: restricted266.246→399.106Mbps; bodygap1.242532s→.390762s(startup);
+worstecho2.405033→.803287s(startup), restrictedecho max273.765ms;71→80successes.
+Returnclass75.293→26.278MB,16508→0drops. Interiorreturnservice9.602→5.395Mbps.
+TCPData remains productive (servernativeTCP ACKeddelta132.402→275.034MBinside
+restriction); only clientTCPreturnfeedbackfalls4.285MB→2016B. Restored mean
+387.452→390.184 does NOT fix all performance. BothpartialHTTP200bodies.
+This proves a materialcontributor, NOT safetyofselectedQUICfeedback or identical
+placement histories. Temporary30add6del diff is frozenandfullyreversed; working
+runtime stillb2aa215. Do not implement deferred-backup machinery at this point.
+
+**Next causal ablation10:19:** zero-drop header evidence attributes76.81% of
+restricted observedIP bytes toTCP carrying payload,20.95%UDP,2.24%TCPnondata.
+History5e1ace67 proves that selecting one locally-accepting feedback path once
+caused7–14s blackhole stalls; no rollback of that protection is selected.
+Before implementing a replacement publication model, one feature-only diagnostic
+will withhold client ACK/MAX fanout from TCP while keeping all threeTCP+oneQUIC
+data attachments and the identical500/10/500return profile. All QUIC feedback
+generations/catch-up remain unchanged. This is an intentionally unsafe causal
+ablation, NOT a proposed single-path policy or release candidate. No blackhole
+is introduced in this cell; no inference of recovery safety is permitted.
+
+Question: does removing the redundant small TCPfeedback copies materially
+restore restricted ordered service/latency, or do native/local/forward queues
+still dominate? Conditional information forecast: if those copies dominate,
+restrictedservice should move toward existingQ/raw/H2~440–476Mbps andreturn
+queue/drop burden shrink; unchanged stalls reject fanout as a sufficient fix.
+Removingobservedcost cannot be converted into an exact gain forecast because
+forward work andnativepacket rates change. Preserve every timingbin, failure,
+first/restored phase andCPU/RSS; ordinaryacceptance remains held regardless.
+Use one small feature/env-gated source diff, freeze executable, reverse all
+source before running. No change to thresholds, data placement, CC or profile.
+Run one same-feature/env-unset control immediately before the env-set ablation
+to separate compiled diagnostic cost from the intended intervention. Existing
+ordinary/encoder/header runs remain context, not substituted matched controls.
+
+A possible ingress-prompt/deferred-independent-backup model is NOT selected:
+independent audits expose server loss of exact ingress metadata, globally renewed
+timers, blocked-write wake requirements and partial cumulative catch-up restart.
+Do not implement those lifecycle pieces until causal gain justifies their scope.
+Any eventual model must retain coverage, terminal/new-attachment service and
+blackhole-safe independent delivery; a deadline alone proves none of these.
+
+**Header outcome10:16:** same ordinarycandidate with externalobserver gives
+345.206Mbps whole,235.631restricted,391.113restored; .989s bodygap and2.496s
+worstecho,70/70actualsuccesses. Interior8.006s capture hasnoobserverdrops:
+TCPdata6.880MB, TCPnondata.200MB, UDP1.877MB. MostTCPdatarecordsare96/97B.
+OffloadedSKBs reach14548B; totalsareobservedIPrecords, notphysicalwirepackets.
+All1501observerdrops crossrestoration, excludedfrominteriorattribution.
+ActualUPclass has9987drops and1.480MBpeakbacklog. Pre-restriction1.410s echo
+and34.310MBDOWNbacklog showreturncostdoesnotexplainalllatencyspikes.
+Report/rawarchive retain both outcomes; no batching revival or acceptedfix.
+
+**Header discriminator10:06:** same persistentTCPtuples show ordinaryUP
+25.409MB/532015datasegments (~47.76B each), versus56095nondata segments;
+restricted8.1Kdata versus1.14Knondata segments/s. This rules out pureTCPACKs
+as the solecost, but doesnotmeasureUDPcontribution or justifyrejectedbatching.
+Run one ordinarycandidate identicalprofile with header-only AF_PACKET observer
+atservereth0 ingress AFTERroutershaping. Count exact observedIPv4 lengths by
+TCPdata/nondata/UDP, timestamps andobserverkerneldrops; no packetcontents.
+Interface/source/targetports restrict toownedlabcarriertraffic. Capture keeps
+offloadunchanged, so countersdescribeobservedIPSKBs, not claimedphysicalwire
+segments.45s capture spansunchanged40sload; no Productthreshold/configchanges.
+Forecastinformation: whichtransportdominatesremainingreturnbytes/packets,
+andwhethermanytinydata-bearingrecordsarethematerialowner. Observerdrops or
+unaccountableoffload weakenexactclaims; lowTCPshare rejectsTCP-onlyfixes.
+Rawcapture socket is availablewithoutnewprivileges; tcpdump absent, use small
+stdlibheadercounter, notnewlabframework. No runtimefixselected.
+
+**Attribution10:00:** interim model checkpointb2aa215 committed with1241checks
 andfullordinarypair, not acceptedperformance. The reused69lineobserver is
 againfullyremovedafterfreezing. DiagnosticACK344391frames/9646477B, everyACK
 onerange(max34B);MAX191677/4983602B. InsideactualUP10, same-kind8.006s

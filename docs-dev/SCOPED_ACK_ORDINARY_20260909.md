@@ -15,8 +15,9 @@ cursors retain cumulative catch-up for blocked, missed or replaced outputs.
 Positive ACK release precedes gap intersection with the real send cache. Empty
 negative scopes are omitted algebraically, not by a traffic threshold.
 
-Control is ordinary runtime `4c7e232`; candidate is the uncommitted wire-v14
-model frozen as `.tmp/reflection/bin/scoped-ack-20260909/mptunnel`. Both are
+Control is ordinary runtime `4c7e232`; candidate is the wire-v14 model frozen
+as `.tmp/reflection/bin/scoped-ack-20260909/mptunnel`, uncommitted at capture
+and now retained in checkpoint `b2aa215`, not accepted for release. Both are
 default optimized builds without the codec observer. No controller parameters,
 clock thresholds, feedback fanout, queue replacement or link-profile change is
 stacked here; changed ACK granularity can still change observed timing history.
@@ -207,3 +208,72 @@ ordinary candidate's 185.569 Mbps, 0.811 s body gap or 1.479 s echo. The residua
 needs attribution among record/packet frequency, native/recovery cost and local
 service before another policy change. Further range-history compression or
 threshold adjustment is not justified by these counters. Promotion remains held.
+
+## Diagnostic follow-up: return traffic composition and remaining stalls
+
+Recorded: 2026-09-09. The `scoped-ack-headers-0909` capture uses the same model
+and link profile with an external receive-side header observer, without the
+codec observer. Its [raw archive](SCOPED_ACK_HEADERS_20260909.raw.tar.gz)
+retains the result, observer records and reproduction material. All 40 raw
+body bins and 70 echo attempts remain in `probe.json`. This is a separate
+diagnostic run, not a matched intervention or an ordinary acceptance result.
+
+The observer origin differs from the workload origin. Actual UP10 service
+snapshots are rows 16–25, Unix 1788919640999→1788919649999; the next snapshot,
+Unix 1788919650999, has UP500. Entirely interior capture intervals span
+1788919641095→1788919649101, 8.006 s, with zero capture drops:
+
+| Captured category | Numeric IPv4-length sum, B | Share | Mbps |
+|---|---:|---:|---:|
+| TCP with transport payload | 6,879,514 | 76.81% | 6.874358 |
+| TCP without transport payload | 200,416 | 2.24% | 0.200266 |
+| UDP | 1,876,570 | 20.95% | 1.875164 |
+| Total | 8,956,500 | 100% | 8.949788 |
+
+TCP-data transport payload totals 4,036,458 B; the IPv4/TCP header-length
+difference is 2,843,056 B (2.840925 Mbps). Of 54,673 TCP-data records,
+45,562 (83.34%) have IPv4 lengths 96 or 97 B. Pure TCP nondata traffic is
+not the dominant observed return cost. These are received records, **not
+physical packets**: unchanged GRO produces lengths up to 14,548 B. No invalid
+lengths were reported. The only 1,501 capture-socket drops occur in the interval
+ending Unix 1788919651102, crossing restoration; that interval is excluded.
+Capture loss is distinct from the router's 9,987 actual UP class drops below.
+
+| Outcome | Ordinary candidate | Codec diagnostic | Header diagnostic |
+|---|---:|---:|---:|
+| Whole-run Mbps | 336.430 | 370.792 | 345.206 |
+| Raw 5–15 s Mbps | 427.275 | 441.096 | 433.894 |
+| Restricted 15–25 s Mbps | 185.569 | 293.066 | 235.631 |
+| Restored 25–40 s Mbps | 385.708 | 408.973 | 391.113 |
+| Longest body gap, s | 0.811220 | 0.320592 | 0.989289 |
+| Echo maximum, ms | 1479.040 | 838.076 | 2495.677 |
+
+Header-run body is 1,726,035,164 B / 40.000167025 s; first body 0.578959832 s.
+One duration-partial HTTP 200 response, zero completed 8 GiB bodies; all 70
+attempted echoes succeed, p50/p95 310.411/821.642 ms. Worst echo is attempt 34,
+19.978996652→22.474674008 s; longest body gap is
+21.322361338→22.311650562 s, bytes 919,066,416→919,131,952. A separate
+1.409978503 s echo at 13.526404814→14.936383317 occurs **before restriction**,
+near the sampled DOWN backlog peak of 34,310,079 B at ~14.002 s. Not every
+latency spike is attributable to restricted return service. After 25 s the
+largest observed echo is 648.215 ms; no echo disconnection occurs.
+
+Service telemetry spans 41 rows, elapsed 0.000044930→40.004694485 s. DOWN
+class deltas are 2,155,078,701 B / 1,588,811 packets, zero drops; UP deltas
+76,208,183 B / 648,939 packets, 9,987 drops. Restricted rows 16→25 drain
+11,069,873 UP bytes / 9.001216109 s = 9.838558 Mbps; sampled backlog stays
+positive, 175,225–1,480,102 B. Drop increments 2,523/2,623/4,841 end at
+approximately 17/19/20 s; the UP backlog peak near 20 s precedes the worst
+echo/body gap. Client RSS peak/last is 81,800/81,800 KiB; server
+371,384/359,816 KiB. Peak/last lifetime `ps %CPU` is 97.5/181 respectively.
+The prior sequential-sampling, offload and lifetime-CPU caveats still apply.
+
+Disposition: remaining return pressure and small TCP-data record cost are
+directly observed. Encrypted payload cannot identify MPP ACK/MAX contents or
+separate repeated native transmission from new feedback; this run has no codec
+counters to join, and unlike runs/windows cannot yield exact overhead by
+subtraction. The unfavorable latency and restored-rate results remain visible.
+These observations do not justify simple batching or undoing independent
+publication: that publication fixed actual selected-wire-blackhole stalls.
+Any next service-model change must preserve that availability invariant and
+address the observed cost without promoting either diagnostic to acceptance.

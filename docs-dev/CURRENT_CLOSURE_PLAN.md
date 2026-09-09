@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 14:03 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 14:41 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,82 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — existing short-flow membership contract, model first.**
+**Current next action — mixed Original placement discriminator, not a fix.**
+The same-build QUIC-only cell completes at428.149Mbps, echo median/p95/max
+106.536/159.800/274.824ms and bodygap.104166s. All80 responses win on QUIC;
+postwrite residence31/89/177ms versus mixed QUIC228/327/426ms. Stable exact
+carrier/epoch; more useful load, not a low-load latency comparison. Q RTT
+median101ms versus mixed293ms; physical DOWN backlog peak8.19 versus25.77MB.
+Mixed context materially contributes. Membership alone does not remedy it.
+
+Next question: does stopping new TCP bulk Original placement after a usable
+QUIC attachment exists recover service while retaining mixed membership and
+all ordinary feedback/repair machinery? Same frozen observer plus a feature/
+env-only final-choice filter; same-build echo-injected control then echo-injected
+placement intervention, unchanged healthy40s profile. This is deliberately
+non-work-conserving and protocol-specific DIAGNOSTIC behavior, never a candidate
+policy or RFC change. No config provides this isolated change: backup/bulk flags
+also alter startup/ranking/repair. Root builds once, freezes/reverses, then runs.
+
+Two source reviews establish the precise boundary: preserve the entire target
+set through live counts, lead/FirstPath/AdditionalPath and resource admission;
+filter TCP only from the final admitted choices, and only for Throughput when
+current exact Regular QUIC is Active, nonstale, admission-active and normally
+schedulable. Do not require Ready or a historical-use latch. Both preselection
+and final fenced re-selection run the same rule. Existing source/binding/native/
+writer/ACK waits remain; preserve pre-FINAL ceiling, old TCP debt, every repair,
+feedback and echo Latency choice. Missing native shape is not usable QUIC.
+
+Information/benefit envelope: roughly200ms median response residence separates
+mixed from QUIC-only at comparable useful service. The diagnostic may remove
+none or a material part, not guarantee200ms or a throughput multiplier. Lower
+useful load, prolonged Q-only waiting, replacement or absent effective
+intervention prevents a favorable inference. Normal ACK/MAX policy is unchanged,
+but realized timing/volume can change as an effect of placement. Preserve those
+costs. If new bulk Originals actually use QUIC at comparable load while latency
+stays high, do not blame TCP Original allocation. If latency/service recover,
+that supports a general allocation-model proof, not shipping this preference.
+Actual per-underlay Original counts/bytes and exact echo ranges must verify
+the mechanism, with no per-frame bulk log flood. No new threshold/controller.
+The reused periodic perf recorder is explicitly enabled at the server in BOTH
+cells (it was off in the preceding echo captures); sample-by-sample logging
+stays off. Its new Original components count real commits/bytes only: their
+1us zero-duration floor is not CPU or service evidence. Process-wide per-lane
+counts may have an unflushed final tail; reconcile recorded intervals and keep
+that scope. This observation cost is common to the new pair, not permission to
+compare its Mbps as an ordinary gain or reuse the earlier binary as control.
+
+### Completed membership and carrier-context discriminator
+
+The actual echo-membership counterfactual completes: extra QUIC attaches104ms
+after injection and wins45/80 responses. Winning postwrite→decode remains
+QUIC median/p95/max228/327/426ms, versus TCP223/382/677ms in that run;
+control TCP234/416/483ms. Source/claim/write/postdecode waits are small.
+Whole echo median306→312ms does not improve; bodygap.305→.402s worsens.
+Membership is not sufficient/dominant here; do not implement its forced QUIC
+choice, ungate bulk rebalance or add a priority knob. Full pair and costs are
+in ECHO_MEMBERSHIP_COUNTERFACTUAL_20260909. Ordinary source remainsb2aa215.
+
+Next discriminator is one QUIC-only healthy40s cell using the SAME frozen
+feature binary and existing client-quic.toml, flag unset; server,500/500Mbps,
+30/70ms, queues, observer and body/echo workload unchanged. Reuse both mixed
+cells above, no favorable rerun. Question: is winning QUIC postwrite residence
+high generally in this implementation, or specifically when mixed TCP work
+and its feedback share the service path? Historical ordinary QUIC103/191ms
+echo median/p95 is context, not this same-build comparison.
+
+Information forecast: if QUIC-only restores roughly configured-RTT echo and
+roughly30ms response residence at comparable useful load, mixed context is
+material; compare native flight/RTT, exact delivery and physical/service cost
+before selecting an allocation/queue model. This removal changes TCP data,
+control and membership together: it cannot isolate their separate effects or
+justify assuming all paths share one bottleneck. If residence remains similarly
+high, stop the mixed-specific inference and examine the common native service
+owner. Failed/ambiguous joins or lower useful load remain explicit. No new
+code, controller, parameter, queue size, runtime fix or public claim follows
+this diagnostic alone. Independent source review confirms QUIC priority already
+works before packetization and cannot overtake emitted shared-queue packets.
+
 Joint ACK/MAX publication is REJECTED. Restricted163→238Mbps and27%less
 return traffic did not satisfy timing: healthy reverse-order pair gives
 413.444→402.332Mbps, echo p95/max467.854/606.069→561.990/813.918ms.

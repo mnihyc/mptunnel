@@ -7,6 +7,67 @@ individually. The slowest whole echo also contains a separate pre-read interval.
 
 ## Question, identity and evidence
 
+### Completed bounded counterfactual,2026-09-09 14:15 +08:00
+
+Outcome is recorded in [the same-build comparison](ECHO_MEMBERSHIP_COUNTERFACTUAL_20260909.md):
+QUIC truly wins45 responses but median postwrite residence remains228ms;
+membership alone is not the dominant remedy. The following text preserves
+the pre-run forecast, not an instruction to repeat it. CURRENT_CLOSURE_PLAN
+records the next same-build QUIC-only context discriminator.
+
+The later joint-publication trial is rejected at4d11ef8: measurable return-work
+savings did not preserve healthy echo tails. This resumes the existing
+membership owner; ordinary runtime isb2aa215 and the captured guard/startup
+contract is unchanged. No production membership policy has been selected.
+
+Source/origin review confirms282b8e1 extended bulk-promotion service to recurring
+bulk rebalance, not interactive membership refresh. Its Throughput predicate
+makes the current nonbulk BulkStriping branch unreachable; merely ungating it
+would use bulk geometry and may await opening inline. The9ab3cbcb persistent
+stall/receive-hole paths still open beyond two members, so no count deadlock
+is claimed. Startup h does not forbid an earlier justified exact ordinal open;
+begin_candidate_for_open permits it. FINAL/same-slot successors retain ordinary
+enrollment and late-STARTUP refusal. Client C→S scores cannot establish S→C
+capacity or promise a faster return attachment.
+
+Information question: does giving only the measured small echo stream an
+additional live QUIC attachment let the existing sender select materially
+faster response service, or does shared queueing/selection still dominate?
+Reuse the full existing echo observer on current source and one feature-only,
+explicitly enabled intervention. Same binary/observer control runs flag-unset,
+then flag-set, with the unchanged healthy500/500Mbps/100ms40s mixed workload.
+No controller, feedback recipient rule, byte threshold, classifier, bulk policy,
+queue or native parameter is changed. This forced protocol choice is diagnostic
+only and cannot be shipped as a policy or a favorable performance claim.
+
+The intervention waits for the actual echo's continuing response and observed
+two-TCP membership before injecting one async logical QUIC open job. This avoids
+preempting the originally observed two-TCP state. A feature-only consumed flag
+prevents repeated injection; require an existing active exact QUIC incarnation,
+respect pending claims/suppression, classify its normal STARTUP/ORDINARY phase,
+and use modeAny (not Recovery's reinjection side effects). Preserve all ordinary
+completion, FIN, reset, cancellation and orphan cleanup. Internal QUIC open
+retries remain existing lifecycle behavior; one job is not one wire attempt.
+If membership/state never qualifies, record no intervention, not a negative
+performance verdict. Carrier replacement invalidates the strict same-carrier
+counterfactual. Natural future TCP recovery can change as an effect; no explicit
+retirement or initial membership rewrite is authorized.
+
+Forecast is information, not Mbps: the captured461ms response residence offers
+at most~431ms removable delay if an alternative traverses the30ms return leg
+without other debt. It cannot remove the separate280ms pre-read or request-side
+wait. Echo payload is only5120B/40s, so no meaningful direct bulk gain is expected.
+Opening/fanout and changed latency-load accounting can alter shared allocation;
+retain those costs and every early/late echo, body bin, gap and failure.
+
+Accepted membership without actual QUIC selection is inconclusive, not evidence
+to force selection. Selected QUIC with comparable residence/echo tails rejects
+membership as the dominant cause here. Material sustained residence/tail benefit
+without adverse useful-bulk/stability/cost permits only the next sender-neutral
+opportunity-policy proof. Unknown joins or failed/replaced enrollment stop the
+discriminator. No favorable rerun, timer/preference tuning or new issue scope.
+Root alone builds, freezes/reverses the complete patch, then runs the pair.
+
 The [matched ordinary panel](HIGH_CAPACITY_REFERENCE_20260909.md) exposed mixed
 echo p95 501ms versus raw/Xray/H2 126/127/114ms under healthy bulk load.
 The declared discriminator asked whether slow echoes wait before response source,

@@ -248,6 +248,21 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- An absent candidate is not automatically the dominant delay. The09-09
+  echo intervention adds a real accepted QUIC member and it wins45 responses,
+  yet winning postwrite residence remains228ms median and whole echo median
+  stays~312ms. The same-build QUIC-only ablation gives31ms residence and107ms
+  whole median with more useful load. Keep eligibility, actual winner and
+  post-handoff service separate; do not ship a protocol preference from an
+  omission alone. Removing a carrier changes its data/control/membership
+  together, so that ablation identifies context, not one packet category.
+- Diagnostic final-choice suppression must not rewrite admission geometry.
+  In the mixed-placement review, deleting TCP from full targets would change
+  sole-path admission; filtering before lead selection also changes FirstPath
+  versus AdditionalPath. Preserve those calculations when the question is
+  placement alone, and deliberately suppress only final admitted choices.
+  A resulting wait or reduced offered load belongs to the intervention's
+  known non-work-conserving behavior, not a newly discovered Product defect.
 - Same-publication pairing is not automatically timing-neutral either. The
  09-09 typed ACK/MAX trial preserved each ACK generation and passed1267checks;
   it cut return bytes27% and improved restricted163→238Mbps. Yet a healthy

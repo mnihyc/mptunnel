@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 16:42 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 17:11 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,57 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — one causal live-hedge-service ablation, never a fix.**
+**Current next action — resolve the existing repair/evidence/allocation coupling.**
+
+The predeclared same-build ablation completes. Control→suppressed useful
+420.434→450.065Mbps; echo p50/p95/max434.334/603.703/841.278→
+289.985/422.512/760.980ms; bodygap.537601→.413086s. All77/80attempts succeed.
+All82 profiles remain500/500Mbps,30/70ms, no jitter/loss/QoS/blackhole/drop.
+Accepted repair100017667B→0 with no structural substitution; duplicate receipt
+93702451B→0. Actual Original payload rises2120982771→2275304730B, while TCP
+share36.1309%→55.6274%. This supports live hedge service and its mediated effects
+as a contributor, without lowering useful load; it does not isolate wire cost.
+Echo completion spacing worsens.885998→1.017568s, CPU/UP bytes rise, and server
+QUIC median RTT remains249ms despite falling from452ms. Full157attempts,80bins,
+costs and conservation are retained in LIVE_HEDGE_SERVICE_ABLATION_20260909 and
+its verified518654B raw archive. Six-file overlay removed before traffic;
+ordinaryb2aa215 source/RFC and executable restored/cmp verified. No suppression
+or pipeline policy is retained. No failure/recovery acceptance follows this run.
+
+Next exact source question is already in the split/unaccepted `a4679b5` scope:
+can repair ambiguity withhold numeric TCP Product-rate evidence used by the
+response allocator even while the dashboard publishes fresh Linux native rates?
+Independent review confirms the mechanism is possible: ambiguous releases do
+not supply path-proving samples, TCP scalar selection excludes kernel/peer
+rates, and a numeric Product epoch can expire back to the startup prior. This
+does NOT revoke established tagged qualification. Dashboard native confidence
+and rate are not the per-flow completion input. The current capture lacks those
+actual inputs, so it does not prove this sequence caused its changed allocation.
+Only~13% copied payload relative to TCP Originals bounds a simple proportional
+explanation; a much larger effect needs concentrated ambiguity or epoch loss.
+
+`a4679b5` repaired proven configured-prior provenance but bundled rate demotion;
+RECENT_SEEN_CHANGE_REFLECTION already separates their verdicts. `b7961f3`
+retained that policy while isolating the unfinished typed sidecar. Preserve the
+startup correction, durable qualification and native authority. Do not restore
+kernel values as typed C, erase ambiguity or call native feedback proof of
+Product receipt. First finish independent consumption/origin review: could a
+qualified local native advisory affect more than ranking through current rate
+consumers? No such restoration is selected merely because RFC17.1 permits a
+legacy advisory. This is the existing mixed allocation issue, not a new inventory.
+
+Before another policy or lab, choose the smallest observation of actual per-flow
+TCP Product epoch/rank alongside exact native shape and copy overlap during the
+same healthy workload. Continuously fresh qualified Product C throughout the
+allocation change falsifies the proposed evidence-collapse mechanism and leaves
+native/shared service as the stronger interpretation. Native management rows
+alone cannot settle it. Information forecast is choosing that material owner,
+not promising a Mbps gain from the already-measured copy ratio. No new timer,
+threshold, controller, permanent hedge suppression or scope expansion. Global
+single/mixed, bidirectional, dynamic impairment, baseline, browser and lifecycle
+acceptance gates remain unchanged; README/release remain held.
+
+### Completed live-hedge-service ablation (predeclared contract)
 
 The actual admission/native-drain/receiver-ACK characterization passes with a
 live distinct TCP alternate: final-drain repair has spare successor service but

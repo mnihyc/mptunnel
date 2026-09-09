@@ -13,6 +13,47 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
+**Control outcome09:19:** frozenordinary4c7e232 reproduces the existing defect:
+441.551→104.527→411.605Mbps (5–15/15–25/25–40 bins),2.249929s body gap
+22.724777→24.974706s,34echo successes plus one actual3s timeout19.954177→
+22.954310s and35unattemptedafterdisconnect. ActualUP10Mbps/DOWN500 during
+restriction confirmed; all40rawbins retained. Thus the new candidate still
+has a material ordinary comparator, not just a diagnosticcounterfactual.
+No compilation overlapped. Same-directory rawresults remain forpairedarchive.
+
+**Matched-control09:18:** while source integration continues, run one frozen
+ordinary4c7e232 mixed control under the identical asymmetric500Mbps DOWN,
+500→10→500Mbps UP profile, RTT100ms split30/70, no jitter/configuredloss/outage.
+No build overlaps this41s run. This refreshes the comparator after the elapsed
+host/session interruption; it is not a favorable rerun or a candidate test.
+Question: does the documented feedback collapse still reproduce on the current
+idle host before attribution to the candidate? Retain all bodybins/echoattempts,
+actualshape snapshots/costs and any contraryresult. Failure to reproduce weakens
+immediatepaircausality and forbids promoting merelydifferentaverages. Tag
+scoped-ack-control-0909; use existingrunnerunchanged and ordinaryfrozenbinary.
+
+**Execution09:19:** resume the same scoped-ACK implementation after an agent
+usage interruption; three bounded assignments now finish producer, consumer
+and semantic tests. No ordinary build/lab has run on the partial tree, and
+README remains unchanged. User explicitly defers README/baseline publication
+until the model is practically proven immediately before release. Keep all
+high-capacity timing/recovery gates; no poor-baseline100Mbps objective.
+One algebraic simplification omits an optional scope when its omission set is
+empty, avoiding extra wire bytes for contiguous Q updates. This changes no
+facts, cadence, controller or limit. Runtime candidate remains unaccepted.
+
+**Selected proof02:27:** SCOPED_ACK_SERVICE_MODEL.md replaces the proposed
+base-generation seal with independently scoped positive/negative evidence.
+Every frame is meaningful alone; negative authority is only its explicit
+interval, never a guessed global horizon. Previously acknowledged bytes cannot
+be resurrected by stale negative evidence: intersect with the exact remaining
+send cache. Full catch-up chunks each describe their own disjoint scope.
+Keep existing publication cadence/fanout/cursors, no timer/rate/CC change.
+The fixed-count~71%ACK-byte forecast is conditional; Q-only header cost and
+increased feedback under restored forward service are explicit non-regression
+risks. Source integration must consume explicit gaps everywhere before tests
+or practical promotion. Ordinary source still4c7e232; no release acceptance.
+
 **Queue result / bounded redesign decision02:09:** exact three-file observer
 is archived FEEDBACK_QUEUE_TRACE_20260909.patch; warning-free1m03build frozen
 feedback-queue-20260909, then ALL source additions reversed. Both audits pass

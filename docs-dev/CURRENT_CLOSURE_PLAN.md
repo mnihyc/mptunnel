@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 12:23 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 13:18 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,36 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Current next action — conditional joint-publication candidate, RED first.**
+The unchanged first-poll capture completes:73,914 nonempty ReadyOk,3 Pending
+(42.845MB),1 closure error;42,638 empty calls excluded. ReadyOk99.9946% of calls
+but97.7146% of offered bytes; mean34.329us/max16.195ms. Strict return-restricted
+interior12,150 ReadyOk,mean34.732us/max5.856ms. Opportunity is common, not
+uniformly negligible or proof of readiness at an earlier pre-ACK position.
+
+WRITE_FIRST_POLL_20260909 retains all130 conserving perf summaries,40 bins,
+69/69echoes with p95/max.989/2.046s, .722s body gap and11,576 return drops.
+Diagnostic phase rates436.937→283.432→418.362Mbps are NOT an ordinary gain.
+Feature build3m34, frozen77-line observer fully reversed before traffic; archive
+integrity and byte comparisons pass. Production source stillb2aa215.
+
+The final SCOPED_ACK_SERVICE_MODEL section predeclares the candidate forecast,
+timing changes, protected444fb38 startup/blocked-I/O behavior, typed pair API,
+independent fences/standalone retries, pressure2 and full writer ownership.
+At most one record/associated packet can be saved per eligible ACK/MAX pair;
+no Mbps promise follows from readiness or unsafe suppression. Current material
+return pressure justifies one bounded prototype/ordinary comparison, not a new
+timer/controller/fanout policy. Weak/adverse composition stops promotion.
+
+First, the real publisher fixture validates ACK/MAX facts, grants, generation,
+pressure and retry deduplication before expecting one envelope rather than two.
+Root caught and corrected an invalid fixture assumption about already-published
+ACK retries before running it; that was not a Product failure. Focused RED build
+now active, no production implementation yet. No traffic overlaps compilation.
+Then coherent pair integration, targeted controls/audit, same ordinary return
+restriction; healthy mixed/QUIC and UP only if materially supported. All global
+experience/recovery/aggregation/baseline gates below remain unchanged.
 
 **Proof outcome, after kind separation:** no replacement implementation is
 selected. Finite-horizon live-ledger scanning has sound positive/scope semantics
@@ -1818,13 +1848,13 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
   Frozen diagnostic:
   `./.tmp/reflection/bin/feedback-fanout-20260909/mptunnel`; its env-set wrapper
   is an intentionally unsafe causal intervention, never an ordinary candidate.
-  target/release currently contains the feedback-kind diagnostic. Do not use
+  target/release currently contains the first-poll diagnostic. Do not use
   it as the restored ordinary comparator; use the frozen scoped-ack binary.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram rejection/queue-result report sent:2026-09-09 03:58UTC; next nonurgent
-  not before04:59UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram kind-separation result report sent:2026-09-09 05:03UTC; next nonurgent
+  not before06:04UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

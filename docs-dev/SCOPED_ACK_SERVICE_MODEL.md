@@ -21,7 +21,7 @@ local service and source allocation. The observed repeated range support is a
 real dominant serialization cost; reducing it does not prove all stalls vanish.
 The original model deliberately offered full receive state independently to
 every attachment (5e1ace67), preserving delivery when one carrier was blocked;
-pre-local-write feedback (6e2504b) deliberately avoided application backpressure.
+pre-local-write feedback (444fb38) deliberately avoided application backpressure.
 Both intentions remain. The defective premise is that every new fact needs
 the full cumulative range history to carry truthful omission evidence.
 
@@ -354,3 +354,119 @@ implementation is selected. The next model decision must jointly resolve
 independent return recovery, retained/sent fact cost, bounded work/memory,
 first/sparse service and explicit asymmetric-failure timing. Preserve the
 existing scoped encoding and independently published protection meanwhile.
+
+## Conditional immediate-write pairing: bounded discriminator, not code selection
+
+Origin correction:444fb38 introduced pre-write ACK/startup service after a real
+one-byte-then-Pending sink prevented ACK, OPEN and FINAL progress. 6e2504b
+introduced the ACK-only timer API; moved-line blame at59fbd22 was not the origin.
+The existing blocked-delivery regression remains mandatory, not a removable
+piece of performance overhead.
+
+A narrower alternative may avoid delayed sibling timers and repeated sparse
+catch-up: poll the same retained application write/flush future once without
+waiting. Ready success makes both receipt and consumed-capacity facts available
+in one turn; Pending preserves the original ACK/startup-before-yield path and
+the same partial-write future; Ready error requires receipt ACK before cleanup
+and no MAX. No extra Product input or ACK generations are merged. Known prepared
+errors and existing nonblocking startup/capacity/FIN work must not be bypassed.
+
+Ready-success publication needs force_ack=true, publish_max_data=true,
+force_max_data=false. Existing new(false)/new(true) are not equivalent. A typed
+internal pair could carry at most one original ACK and one independently due
+MAX through existing transport write_frames, with no wire/receiver change.
+ACK-only, MAX-only, partial ACK catch-up and failed admission remain independently
+retryable. Pair acceptance certifies its chunk and grant, not an incomplete
+whole ACK generation. Preserve two logical frames and two pressure units;
+one queue envelope instead of two is an explicit admission-granularity change.
+Terminal filtering, all TCP/QUIC writers including deferred-input QUIC drain,
+partial native failure and successful sent accounting need the same ownership.
+Do not use a new aggregate codec bound to reject two individually valid frames.
+
+This is approximately15 production-file integration, not a tiny helper tweak.
+One poll also is not one syscall: gap filling can release a large retained
+receive span, and the current helper loops through writes and flush. Therefore
+ACK timing can shift even without awaiting a Pending future. Concrete sinks
+are accepted Tokio TcpStream for ordinary proxy/forwarding,64KiB DuplexStream
+for routed DNS, and netstack-smoltcp's stream for TUN. Telemetry/activity wrappers
+delegate polls. An arbitrary slow always-ready mock is an API counterexample,
+not a proven production defect; a large gap-fill is real, but its first-poll
+work and latency still need observation.
+
+Next information-only action: observe the FIRST poll of the existing complete
+write/flush future without moving its invocation or ACK publication. For nonempty
+delivered batches, aggregate Ready-success, Ready-error and Pending counts,
+offered bytes and first-poll duration using existing feature perf summaries.
+Keep empty delivery separate so out-of-order receipt/flush-only turns cannot
+inflate apparent pairing opportunities. No per-frame logging, data decisions,
+extra polling, timer, threshold or frame/queue change. Root freezes and reverses
+the observer before one unchanged mixed return-restriction run.
+
+Information forecast: a high actual Ready-success fraction with small observed
+first-poll work would justify only the next coherent candidate/RED decision;
+rare ready completion or material synchronous work can defer it without a
+15-file patch. Observation occurs at the OLD post-ACK invocation and is not
+proof that an earlier pre-ACK poll has identical readiness. It is neither a
+speed forecast nor candidate acceptance. Existing MAX-withheld170→243Mbps is
+only a material-cost reference, not an upper bound or promised gain from
+pairing. Any selected candidate still needs the original blocked-write/FIN/
+partial-error controls and ordinary timing comparisons, not sample-count proof.
+
+### Measured opportunity and next bounded optimization transaction
+
+2026-09-09 13:10 +08:00. One unchanged mixed capture is complete; the feature
+observer is fully removed. Client nonempty first polls:73,914 Ready-success,
+3 Pending,1 Ready-error at shutdown. Ready-success covers99.9946% of calls
+but97.7146% of offered bytes; Pending contains42.845MB of large gap-filled
+batches. Mean Ready-success poll is34.329us, maximum16.195ms, including existing
+feature instrumentation and possible descheduling. Empty42,638 successes are
+excluded. This supports a common opportunity, not universally cheap writes.
+Full counts/timing/profile/cost are retained in WRITE_FIRST_POLL_20260909.
+
+Select a bounded conditional-publication CANDIDATE transaction, not acceptance.
+Issue: mixed feedback saturates the restricted return cut and harms ordered
+delivery/echo tails. Competing residual causes include native packet ACKs,
+same-cut data contention and allocation/recovery timing. Current suppression
+cells prove both Product feedback kinds matter; they do not predict a safe
+pair's gain. This candidate retains every existing ACK generation, independent
+grant and return attachment while removing one separate queue/native record
+transaction when the exact ACK and due MAX are already jointly publishable.
+
+Benefit forecast: at most one separate record and associated packet overhead
+can be removed per eligible pair; QUIC's existing batching and native socket
+packetization can reduce this saving to zero. The measured ready fraction is
+not the exact paired-frame fraction and is not a Mbps forecast. Cost reference
+is the observed170→243Mbps credit-withholding restriction result, not a bound
+or promised gain. Material current feedback pressure justifies one coherent
+prototype plus affected ordinary comparison; no gain/regression remains a
+credible outcome. Do not enlarge pairing, defer sparse feedback or add a knob
+if its ordinary timing result is weak/adverse.
+
+Smallest next action: existing real receive-progress publisher/queue regression
+must first establish that an eligible ACK and due MAX become separate commands,
+after validating both original frame contents and exact pressure. This is an
+optimization work-bound RED, not a claimed corruption or sufficient speed proof.
+Then implement the typed same-publication pair through all consumers, retaining
+standalone cases, pressure2, exact terminal/drop/native commit ownership and
+unchanged wire decoding/latest-credit ingress. No generic ready-head batching.
+
+Actor sequencing: preserving every prior relative order is impossible because
+the candidate moves current ACK behind one local poll. Keep the existing
+nonblocking startup/prepared-error/notices/capacity prelude before that poll.
+On a prelude error offer receipt ACK before returning, without local I/O.
+Cache the first result; Ready-success permits independently due MAX, Pending
+grants no new credit and re-arms newly pending ACK capacity before parking,
+Ready-error preserves ACK then error cleanup. Never repoll a Ready future.
+Previous feedback/startup can therefore precede the current ACK; record and
+test this temporal change rather than pretending the event trace is identical.
+Final ACK admission still precedes shutdown.
+
+Gates: existing blocked-write/startup, partial-write/error, FIN, independent
+ACK/MAX catch-up/new attachment/backpressure, all writer and queue/drop checks;
+independent source audit; then ordinary control/candidate on the same return
+restriction with full phases/body gaps/echo failures and CPU/RSS/traffic costs.
+Only a material composed benefit permits healthy mixed and QUIC controls plus
+UP. Any adverse/ambiguous timing stops promotion for one attribution decision;
+no favorable-average acceptance or compensating threshold/controller changes.
+Global asymmetric failure/recovery, aggregation, browser and baseline gates
+remain unchanged. No release/README follows this local candidate selection.

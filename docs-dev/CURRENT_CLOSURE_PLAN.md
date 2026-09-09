@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 18:07 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 18:45 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,117 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — reuse exact winning-byte handoff/service evidence.**
+**Current next action — return to the proven asymmetric feedback-service stall.**
+
+Both context discriminators are complete. One versus three independently
+progressing raw TCP bodies gives450.855→452.044Mbps, but sparse echo median
+103.221→214.376ms and p95125.942→235.202ms. All160echoes succeed; all four
+bodies have intentional40s partial service, no failed request. The same
+500/500Mbps,30/70ms profile has no configured loss, jitter, QoS or outage.
+Native competition therefore reproduces substantial common delay without MPP;
+this is not all mixed attribution, unavoidable-queue proof or acceptance.
+Full histories/costs and exact raw archives are in DIRECT_ECHO_CONTEXT_20260909
+and RAW_CONTROLLER_CONTEXT_20260909. No runtime correction follows these cells.
+
+Priority returns to the already demonstrated return500→10→500Mbps stall,
+not another healthy ranking/priority experiment. Ordinary scoped ACK retains
+185.569Mbps during restriction and an.811220s body gap; the unsafe full TCP
+feedback-withholding pair independently removes multi-second restricted echoes
+while TCP data still progresses. Matched QUIC/raw/H2 context sustains~441–476Mbps.
+The healthy native-count finding does not excuse this separate feedback cost.
+
+Independent source/model review confirms no missing backup retry: each live
+exact output immediately receives latest ACK/MAX offers with capacity wakes.
+Deferred full ACK fanout still has incomplete catch-up under generation churn;
+MAX-only deferral has a tractable scalar but adds alternate-return delay and
+can hurt small-window service. Neither is selected. Preserve the independent
+publication that repaired selected-return blackholes; no new timer or window.
+
+Next bounded source-only question: do already superseded, not-yet-written
+MAX grants consume immutable output queue/service, or is latest-value
+supersession already owned there? This is distinct from the accepted incoming
+logical MAX fold and rejected ACK batching/pairing. Check exact writer ownership,
+partial writes, close/replacement and independent readiness before any proposal.
+Information forecast: an actual redundant queued obligation could justify one
+reachable counterexample; existing supersession or work already beyond the
+irreversible boundary ends this branch. No new build or speed gain is forecast
+from reading. Removing records is not proof of better timing. Do not implement
+unless the resulting contract preserves prompt per-output service without a
+timer, ACK clock change or unbounded state. Existing scope/gates remain intact.
+
+### Completed native-count discriminator (predeclared contract)
+
+The direct companion pair completes: mixed397.858Mbps, MPP echo median/p95
+268.501/443.952ms; QUIC-only424.411Mbps,106.692/159.501ms. All160 foreground
+and200 direct attempts succeed. Actual loaded direct median/p95 is
+250.033/404.408ms mixed versus101.300/164.717ms QUIC-only; unloaded~100ms.
+The early429ms QUIC-only direct setup spike is retained outside foreground load.
+Thus a material penalty also reaches independent traffic bypassing MPP, and
+MPP-only framing/reader service cannot explain the whole mixed delay. Exact
+shared-network versus host attribution remains bounded. No runtime change.
+
+Next existing composition question: is the native controller multiplicity
+alone sufficient to create the common penalty, or does MPP's specific wire
+work/assignment pattern remain necessary? Existing raw reference has one bulk
+TCP loop, not mixed's three TCP plus QUIC. Reuse the canonical bulk_worker and
+interactive_tcp_worker for one versus three simultaneous direct raw bodies,
+one sparse echo and one shared40s clock. Same500/500Mbps30/70ms profile, body,
+target, chunk size and host allocations; no Product or controller adjustment.
+One independent result per body, full echo attempts, aligned raw bins and common
+elapsed denominator. Observe actual simultaneously progressing ESTABLISHED8080
+sockets/controller identity; echo10022 separate, not old7443 telemetry filter.
+Early EOF/reopen, missing counters, failed workers or serialized target service
+invalidate a clean controller-count comparison. Preserve all adverse evidence.
+
+Information forecast: substantial common delay under three raw bodies supports
+native contention as a material context; prompt raw service rejects count alone
+and returns focus to MPP's work/assignment pattern. Neither proves a numeric BBR
+version, universal inevitability or a safe coupling/queue policy. This is a
+two-cell baseline ablation, not new performance requirements or favorable reruns.
+No build, controller replacement, bandwidth hint or limit change. Expected
+information is material because current mixed loaded bypass adds~150ms median
+while body throughput remains below the prompt single-native baselines. No
+speed improvement is forecast from measuring it. Stop after1/3 cells and record
+full timing, aggregate/per-flow distinction, queue/wire/CPU/RSS and identity.
+
+### Completed direct-echo discriminator (predeclared contract)
+
+Source/capture reuse completes before this selection. Two independent audits
+confirm exact H3 request-stream priority is applied, latency/repair1 versus
+bulk0, native fairness stays enabled, and writes are per-request rather than
+one shared bulk writer. TCP flush and QUIC send_data are native acceptance,
+not emission. Earlier-frame actor service may precede the TCP reader's next
+decode, so near-zero postdecode time cannot exclude pre-read task delay.
+No missing-priority or shared-QUIC-writer defect is established.
+
+Independent reuse finds mixed/QUIC-only steady DOWN backlog medians14.605/1.869MB,
+whose difference at500Mbps is203.8ms; server QUIC RTT differs200.3ms and winning
+handoff→decode medians differ197ms. This is scale agreement, not per-byte cause.
+HTB/netem report the same queue and must not be added. All three kernel TCP
+sockets report`bbr`; its numeric version is not established by ss. Three TCP
+controllers plus QUIC differ from the single-controller raw baseline.
+
+Smallest discriminator: reuse interactive_tcp_worker in direct mode with a
+persistent64B request every500ms beside one existing40s mixed workload, then
+one QUIC-only context. Fifty-second companion includes unloaded margins;3s
+timeout preserves the existing observation convention, not a Product limit.
+Use the already frozen echo-membership build with intervention flag UNSET in
+both cells, existing exact echo trace, and unchanged500/500Mbps30/70ms healthy
+profile. No compile, new runtime observer, priority, queue or controller change.
+The thin companion imports the existing worker, preserves every actual attempt
+and records its own monotonic/Unix anchor; it is not a new probe implementation.
+Root alone runs cells sequentially with no build or other lab overlap.
+
+Information forecast: elevated bypass latency during mixed load supports common
+cut/host service; bypass near unloaded latency while MPP replies remain delayed
+favors tunnel-native/reader service. A different route/class, weak reproduction
+or inconsistent timing leaves attribution unresolved. The companion's~128B/s
+per direction is negligible compared with bulk, but its independent TCP packet
+schedule and shared target host remain confounders. Do not subtract unpaired
+medians as an exclusive delay component. Compare full phase/attempt histories,
+same-cell body service, queue/native/CPU costs and exact recorded echo joins.
+No speed gain is forecast from observation. Stop after the declared two cells;
+no favorable repeat, policy promotion or new inventory follows automatically.
 
 The predeclared native-rank pair completes and is REJECTED for promotion.
 Control→advised useful396.378→419.059Mbps; echo p50/p95 worsens
@@ -2353,8 +2463,8 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram live-hedge attribution report sent:2026-09-09 09:26UTC; next nonurgent
-  not before10:27UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram common-latency attribution report sent:2026-09-09 10:29:48UTC; next nonurgent
+  not before11:30UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

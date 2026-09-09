@@ -261,3 +261,96 @@ all phases, failed/censored work and CPU/RSS/queue cost. Existing total fanout
 result is context, not a fourth matched cell. No guessed numerical pass gate,
 new controller or repeat-until-green. Freeze and reverse the observer source
 before runs; ordinary runtime and all prior independent recovery remain intact.
+
+## Independent-service proof outcome — 2026-09-09
+
+The [three-kind experiment](FEEDBACK_KIND_ABLATION_20260909.md) gives restricted
+169.929Mbps control,243.267Mbps without TCP MAX copies and296.144Mbps without
+TCP ACK copies. Both kinds contribute. This supports publication-service work,
+not a one-kind-only cure or immediate implementation of deferred copies.
+
+### Finite-horizon cursor: truthful, but insufficient service bound
+
+For a proposed job `(goal_generation,H,c)`, freeze H at its start and read the
+monotone current receive coverage intersecting `[c,H)`. Include any predecessor
+range that has since merged across c. Choose a bounded prefix of those ranges,
+clip at H, and include every currently received byte inside the emitted scope
+`[c,last_end)`. Advance c only when the exact attachment queue accepts it.
+New global generations do not reset c or extend H. Since receive coverage only
+adds/merges, induction over admitted cursor intervals covers every job-start
+positive by c=H. The byte before nonzero H remains received, so a noncompleted
+job cannot legitimately reach an empty terminal suffix. Newly received fills
+behind c belong to a later generation; finishing the old job cannot cover them.
+
+This avoids an incorrect merge lookup: publishing[0,10), then merging into
+[0,30), must still find the overlap when resuming at10. Ignoring that predecessor
+could produce false negative evidence. Temporary work can be bounded per step
+by the existing256-range frame and an indexed lookup, with scalar retained
+state per attachment. These are useful truth/ownership facts, not a wall-clock
+service guarantee.
+
+Counterexample to the stronger work claim: start with K small one-byte islands
+and a distant positive ending at H. After each accepted chunk, merge already
+published islands into a prefix and add K islands just ahead of c. Current
+node count stays O(K), but the distant original positive can require O(H/K)
+chunks. The actual65,536-range ceiling therefore does not imply the frozen
+snapshot's256-frame job bound. With K=256 and a64MiB unconsumed span, only a
+much looser roughly131,000-full-chunk byte-span bound follows. The sequence is
+legal under the receive model; it is not an invented malformed-input test.
+No useful worst-case recovery-latency claim follows from that bound.
+
+### The alternatives have explicit costs
+
+A frozen full snapshot has at most65,536 ranges in256 frames, about1MiB of
+range payload. Distinct retained jobs on64 attachment slots can add about64MiB
+per logical stream; the shipped four-path case can add4MiB, excluding frame/
+allocation overhead and already-queued copies. Sharing an Arc only helps when
+jobs actually pin the same version; staggered or blocked jobs need not do so.
+Do not call this negligible or silently add it to a sustainability-sensitive
+runtime. These are verified configured/default bounds, not new limits.
+
+Periodically skipping current publication generations also falls back to
+cumulative catch-up under the existing cursor. Repeating full sparse history
+could restore the cost the scoped model removed. A traffic forecast must count
+those catch-up ranges, not merely jobs per second or the current one-range lab
+trace. This source consequence needs resolution before a delayed-fanout model
+can be selected as a general Internet fix.
+
+ACK/MAX fairness is independent: always ACK-first can hold credit behind a
+long catch-up; always latest-MAX-first can starve ACK under continuous grants.
+Persistent alternation when both are eligible is a possible admission rule,
+advancing only on success, not a selected implementation. Freezing credit to
+an entire ACK job instead explicitly delays newer independent credit.
+
+There is also no automatic joint rate/delay bound for successor jobs. Keeping
+all newer facts on an expired predecessor deadline permits continuous jobs;
+resetting the deadline delays previously uncovered facts. Thus one cannot
+claim both `jobs <= 1+T/Delta` and an oldest-fact latency bound from a single
+last-publication timestamp. Exact semantics must precede implementation.
+
+### Actual integration scope, if a replacement is later selected
+
+Server Frame events must preserve authenticated ingress through the existing
+FIFO and mailbox continuation. PendingMailboxFrame currently accepts a function
+pointer wrapper; a captured Send wrapper can preserve identity without a new
+channel. The client already has exact ingress per item. Record every successfully
+applied ingress, including valid duplicates, in the unchanged bounded batch;
+retain it through the same write future for later credit publication. A last
+frame or mutable global hint is insufficient.
+
+Existing attachment entries can own eligible ACK/MAX obligations. Capacity
+retry must honor eligibility rather than immediately bypass any deferred
+service. Client retained-write service needs the relevant deadline/MAX wakes;
+server must separate its existing synchronous apply and pinned write helpers,
+without advancing credit before consumption. Shutdown eligibility/state commit
+must surround the same retained shutdown future. No partial write is replayed.
+Preserving input FIFO also means queued data/reset/detach cannot all be claimed
+universally prompt during application blockage; that broader claim is excluded.
+
+Disposition: this second proof pass rules out promoting the scalar cursor as
+a bounded-latency fix or snapshot retention as a free cleanup. No timer,
+snapshot/job framework, per-attachment delta ledger, RFC change or runtime
+implementation is selected. The next model decision must jointly resolve
+independent return recovery, retained/sent fact cost, bounded work/memory,
+first/sparse service and explicit asymmetric-failure timing. Preserve the
+existing scoped encoding and independently published protection meanwhile.

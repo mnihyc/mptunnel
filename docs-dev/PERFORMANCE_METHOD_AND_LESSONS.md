@@ -248,6 +248,13 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- A finite cursor is not necessarily a practically bounded publication job.
+  The09-09 live-ledger/horizon proof preserves receipt truth, but continuous
+  legal insertion/merging can require roughly131k full chunks despite a
+  65,536-node cap; a frozen snapshot would need at most256 frames but can add
+  MiB per attachment. Deferred generations can also restore full-history
+  traffic removed by scoped encoding. Check complete service, retention and
+  successor-deadline costs before converting a local proof into runtime.
 - Receipt-set equivalence is not feedback-clock equivalence. The09-09 ready
   receipt candidate passed1244 checks and improved restricted mixed goodput
   235→299Mbps, but both healthy execution-order pairs worsened echo/body tails;

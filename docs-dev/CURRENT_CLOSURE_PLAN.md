@@ -13,6 +13,26 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
+**Proof outcome, after kind separation:** no replacement implementation is
+selected. Finite-horizon live-ledger scanning has sound positive/scope semantics
+with predecessor lookup and exact acceptance cursor, but legal moving islands
+defeat the snapshot's256-frame work bound; a64MiB span permits roughly131k
+full chunks. Frozen snapshots instead can retain1MiB per attachment,4MiB for
+the shipped set/64MiB at configured slot maximum, before overhead. Deferred
+generations also trigger current full sparse catch-up, potentially restoring
+already-removed history cost. ACK/MAX fairness and successor deadlines cannot
+be inferred from one last-publication timestamp. Full proof/counterexample and
+minimal actual caller plumbing are in SCOPED_ACK_SERVICE_MODEL's final section.
+No added timer/snapshot/delta framework, numeric knob, RFC or runtime change.
+
+The deterministic next decision is joint publication service, not implementation
+of the failed stronger proof: retain independent return recovery while reducing
+sent facts/copies with a credible sparse-state, memory/work and failure-delay
+bound. First/sparse feedback must remain prompt. A concrete safe model must
+resolve these constraints before RED/candidate comparison; do not turn each
+constraint into a separate fix inventory. Current ordinary source isb2aa215;
+all diagnostic policies and rejected batching are absent. Public promotion held.
+
 **Kind separation complete12:23:** same-feature control/MAX-withheld/ACK-withheld
 gives restricted169.929/243.267/296.144Mbps. All79/79/80echoes succeed, but
 restricted echo maxima are1246.461/1175.848/470.844ms; neither is a safe policy.

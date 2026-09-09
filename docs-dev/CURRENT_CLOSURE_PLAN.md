@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 17:11 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 17:46 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,52 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — resolve the existing repair/evidence/allocation coupling.**
+**Current next action — isolate the existing Original ranking rate domain.**
+
+Actual TCP prepared-input observation completes:398.006Mbps,80/80echoes,
+p95/max408.021/639.834ms, bodygap.273840s. All41 profiles unchanged.131events
+cover509539 prepared observations, three exact epoch1 TCP outputs, no revoke.
+Only TCP2 falls back after startup:29.751–30.130s and37.598–38.783s in the
+server diagnostic clock; native advisory remains38.446 and22.463→17.551Mbps.
+Its ambiguity totals are flat during both. Eligible Original service and
+admission already decline before expiry, with Original debt reaching0 while
+native work remains. Thus numeric fallback is reachable, but immediate repair-
+ambiguity poisoning and an arithmetic sampler bug are NOT established. Native
+socket service includes copies/other traffic; Product rate measures this flow's
+eligible Original service. Full evidence: TCP_PRODUCT_EVIDENCE_20260909.
+
+Next bounded diagnostic question: does using that per-flow rate to rank
+carrier work materially worsen healthy mixed Original placement, or does the
+native/shared service dominate even with another available advisory? Independent
+source review permits a score-only intervention: in the two Throughput Original
+ETA evaluations, score a temporary copy with the existing qualified local TCP
+carrier rate and PathCapacity scope when available. Keep the original snapshot
+in every target/admission tuple. Leave Latency lanes (including echo), QUIC,
+typed authority, Product qualification, feedback, recovery and shared snapshot
+helpers unchanged. The incumbent hysteresis consumes supplied ETAs plus queue/
+jitter and does not secretly recompute rates. FirstPath identity can change
+because placement changes; unchanged resource rules may then apply elsewhere.
+
+This is a diagnostic rate-source substitution, not a production recommendation.
+No multiplier, guessed rate, timer or threshold. Use one frozen feature build
+with the same observers in both cells; startup-fixed flag unset control first,
+set server-only second. Verify activation and actual finite qualified source
+use, retain all native/copy/useful timing and costs, and remove source before
+traffic. Same healthy500/500Mbps30/70ms profile, no loss/jitter/QoS/blackhole.
+The observer still reports the ordinary prepared snapshot, not the substituted
+rank scalar; that distinction must be explicit. No full candidate log flood.
+
+Information forecast: native advisories differ severalfold in observed late
+TCP inputs, so their ranking effect could be material; the echo median~294ms
+versus earlier QUIC-only~107ms is a comparison envelope, not a removable-delay
+estimate. Better sustained timing at comparable useful load and real changed
+allocation supports the ranking coupling. No allocation change or adverse/
+ambiguous timing stops promotion and requires attribution, not another gain or
+favorable rerun. Native advisory can overpredict unique service and increase
+queueing; zero gain or regression is plausible. Keep every adverse phase.
+No change is accepted without subsequent coherent model/ordinary checks.
+
+### Completed TCP evidence discriminator and preceding repair attribution
 
 The predeclared same-build ablation completes. Control→suppressed useful
 420.434→450.065Mbps; echo p50/p95/max434.334/603.703/841.278→
@@ -47,21 +92,49 @@ RECENT_SEEN_CHANGE_REFLECTION already separates their verdicts. `b7961f3`
 retained that policy while isolating the unfinished typed sidecar. Preserve the
 startup correction, durable qualification and native authority. Do not restore
 kernel values as typed C, erase ambiguity or call native feedback proof of
-Product receipt. First finish independent consumption/origin review: could a
-qualified local native advisory affect more than ranking through current rate
-consumers? No such restoration is selected merely because RFC17.1 permits a
-legacy advisory. This is the existing mixed allocation issue, not a new inventory.
+Product receipt. Independent consumption review finds this shared scalar also
+changes request ACK byte batching through the feedback snapshot, so restoring
+it is not strictly rank-only. An initially proposed1.26s feedback starvation
+claim was FALSE: every DATA call independently checks elapsed time since ACK;
+MAX cannot defeat that predicate. No timer defect/fix follows. This correction
+records complete consumer composition, not another issue. No native restoration
+is selected merely because RFC17.1 permits a legacy advisory. This remains the
+existing mixed allocation issue, not a new inventory.
 
-Before another policy or lab, choose the smallest observation of actual per-flow
-TCP Product epoch/rank alongside exact native shape and copy overlap during the
-same healthy workload. Continuously fresh qualified Product C throughout the
-allocation change falsifies the proposed evidence-collapse mechanism and leaves
-native/shared service as the stronger interpretation. Native management rows
-alone cannot settle it. Information forecast is choosing that material owner,
-not promising a Mbps gain from the already-measured copy ratio. No new timer,
-threshold, controller, permanent hedge suppression or scope expansion. Global
-single/mixed, bidirectional, dynamic impairment, baseline, browser and lifecycle
-acceptance gates remain unchanged; README/release remain held.
+Next one ordinary healthy40s mixed capture observes the actual per-flow TCP
+completion snapshots consumed by prepared selection, not management rows or a
+second model. Reuse existing computed snapshot and observation time under its
+output lock. Fixed stream1, per-output bounded lifetime; initial/structural
+source, freshness and qualification transitions plus periodic numeric min/max/
+last over every observation. Include raw Product epoch, effective rate and
+native advisory separately, and already-computed eligible/ambiguity-excluded
+Original ACK accounting without new range scans. Both advisory and fenced
+prepared calls are covered; these snapshots are not claims or admitted choices.
+Periodic output does not sample the accumulated observations; final unflushed
+tail must be emitted or explicitly censored. Reuse the four-file cause/receipt
+observer and existing runner, no new harness. Independent audit, one feature
+build, freeze/reverse before traffic, restore ordinary executable afterward.
+
+Information forecast: continuously fresh qualified Product rates through actual
+prepared observations falsify the proposed collapse mechanism. Expiry or rate
+erosion with ambiguity growth makes that owner worth causal review, but low C
+alone can reflect reduced allocation rather than cause it. Do not promise a
+Mbps gain or immediately restore native rates. Keep500/500Mbps,30/70ms and zero
+loss/jitter/QoS/outage unchanged; full useful bins, echo attempts/gaps, native/
+class and CPU/RSS costs accompany this diagnostic. If it cannot distinguish
+the sources or logging materially distorts service, stop attribution rather
+than tune a policy to its numbers. No new timer, threshold, controller, permanent
+hedge suppression or scope expansion. Global gates unchanged; no README/release.
+
+Observer review before capture: root and independent consumer audit pass.
+Exact released Original segments form eligible/ambiguity/other partitions;
+observer-lifetime counters are separate from the existing qualification-floor
+counter that resets on same-incarnation revocation. Closed in-place replacement
+resets observer state; observation itself reads no new clock or native handle.
+Periodic counts weight actual prepared observations, not time or selected bytes.
+No ordinary mechanism/test requirement is added by this diagnostic. Ten-file
+overlay includes four reused cause/receipt files, initializer/cfg plumbing and
+the small per-output observer; its build/patch are under tcp-product-evidence.
 
 ### Completed live-hedge-service ablation (predeclared contract)
 
@@ -2240,8 +2313,8 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram mixed-context attribution report sent:2026-09-09 07:07UTC; next nonurgent
-  not before08:08UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram live-hedge attribution report sent:2026-09-09 09:26UTC; next nonurgent
+  not before10:27UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

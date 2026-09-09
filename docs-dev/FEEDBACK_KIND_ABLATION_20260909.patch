@@ -1,0 +1,100 @@
+diff --git a/src/runtime/stream/request/attachment.rs b/src/runtime/stream/request/attachment.rs
+index fdd5669..1f0304e 100644
+--- a/src/runtime/stream/request/attachment.rs
++++ b/src/runtime/stream/request/attachment.rs
+@@ -430,6 +430,25 @@ pub(in crate::runtime) struct ReliableRelayRemotePath {
+ }
+ 
+ impl ReliableRelayRemotePath {
++    // Causally unsafe diagnostic ablations, never candidate feedback policies.
++    fn receives_feedback_for_ablation(&self, withheld_kind: &str) -> bool {
++        #[cfg(feature = "lab-diagnostics")]
++        {
++            static SELECTION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
++            let selection = SELECTION
++                .get_or_init(|| std::env::var("MPTUNNEL_LAB_FEEDBACK_ABLATION").ok())
++                .as_deref();
++            if self.stream.underlay == UnderlayProtocol::Tcp
++                && (selection == Some("quic-only") || selection == Some(withheld_kind))
++            {
++                return false;
++            }
++        }
++        #[cfg(not(feature = "lab-diagnostics"))]
++        let _ = withheld_kind;
++        true
++    }
++
+     pub(in crate::runtime) fn key(&self) -> RelayPathKey {
+         RelayPathKey {
+             underlay: self.stream.underlay,
+@@ -1203,7 +1222,8 @@ impl ReliableRelayRemoteSet {
+         let desired = self.desired_max_data_offset;
+         let mut publication = StreamMaxDataPublication::default();
+         for path in &mut self.paths {
+-            if path.stream.request_control_frame_admission_is_closed()
++            if !path.receives_feedback_for_ablation("tcp-max-withheld")
++                || path.stream.request_control_frame_admission_is_closed()
+                 || path.published_max_data_offset >= desired
+             {
+                 continue;
+@@ -1226,7 +1246,8 @@ impl ReliableRelayRemoteSet {
+ 
+     pub(in crate::runtime) fn has_pending_max_data_publication(&self) -> bool {
+         self.paths.iter().any(|path| {
+-            !path.stream.request_control_frame_admission_is_closed()
++            path.receives_feedback_for_ablation("tcp-max-withheld")
++                && !path.stream.request_control_frame_admission_is_closed()
+                 && path.published_max_data_offset < self.desired_max_data_offset
+         })
+     }
+@@ -1237,7 +1258,8 @@ impl ReliableRelayRemoteSet {
+         self.paths
+             .iter()
+             .filter(|path| {
+-                path.published_max_data_offset < self.desired_max_data_offset
++                path.receives_feedback_for_ablation("tcp-max-withheld")
++                    && path.published_max_data_offset < self.desired_max_data_offset
+                     && !path.stream.request_control_frame_admission_is_closed()
+             })
+             .filter_map(|path| path.stream.request_control_capacity_notify())
+@@ -1266,7 +1288,9 @@ impl ReliableRelayRemoteSet {
+         self.desired_stream_ack_frames = cumulative_frames;
+         let mut publication = StreamAckPublication::default();
+         for path in &mut self.paths {
+-            if path.stream.request_control_frame_admission_is_closed() {
++            if !path.receives_feedback_for_ablation("tcp-ack-withheld")
++                || path.stream.request_control_frame_admission_is_closed()
++            {
+                 continue;
+             }
+             let attachment = path.stream_ack_publication.publish_update(
+@@ -1296,7 +1320,9 @@ impl ReliableRelayRemoteSet {
+         let frames = &self.desired_stream_ack_frames;
+         let mut publication = StreamAckPublication::default();
+         for path in &mut self.paths {
+-            if path.stream.request_control_frame_admission_is_closed() {
++            if !path.receives_feedback_for_ablation("tcp-ack-withheld")
++                || path.stream.request_control_frame_admission_is_closed()
++            {
+                 continue;
+             }
+             let attachment = path.stream_ack_publication.retry_cumulative(
+@@ -1320,7 +1346,8 @@ impl ReliableRelayRemoteSet {
+         let generation = self.desired_stream_ack_generation;
+         generation != 0
+             && self.paths.iter().any(|path| {
+-                !path.stream.request_control_frame_admission_is_closed()
++                path.receives_feedback_for_ablation("tcp-ack-withheld")
++                    && !path.stream.request_control_frame_admission_is_closed()
+                     && path.stream_ack_publication.is_pending(generation)
+             })
+     }
+@@ -1333,6 +1360,7 @@ impl ReliableRelayRemoteSet {
+             .iter()
+             .filter(|path| {
+                 generation != 0
++                    && path.receives_feedback_for_ablation("tcp-ack-withheld")
+                     && path.stream_ack_publication.is_pending(generation)
+                     && !path.stream.request_control_frame_admission_is_closed()
+             })

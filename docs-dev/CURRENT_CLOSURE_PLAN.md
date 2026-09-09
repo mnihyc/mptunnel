@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 12:03 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 12:23 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,34 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+**Kind separation complete12:23:** same-feature control/MAX-withheld/ACK-withheld
+gives restricted169.929/243.267/296.144Mbps. All79/79/80echoes succeed, but
+restricted echo maxima are1246.461/1175.848/470.844ms; neither is a safe policy.
+UP remains9.6–9.8Mbps with queue pressure and zero drops in all three cells.
+Whole UP bytes fall19.8%/23.2%; MAX restored mean is7.1% lower and ACK healthy
+mean4.2% lower. Both kinds contribute; no exclusive owner or additive effect
+follows. Every TCP data carrier still progresses. FEEDBACK_KIND_ABLATION_20260909
+retains all120 bins and exact123 effective profile samples, costs and failures.
+Independent audit passes; build3m34, frozen and source fully reversed before
+traffic. Raw archive integrity/byte comparisons pass. Ordinary source isb2aa215.
+
+Next is a finite publication-service proof, NOT implementation: immediate
+feedback at exact receipt ingresses with independently serviced sibling
+obligations; first/new/terminal and already-overdue after-idle service stays
+immediate. Evaluate existing per-path PTO/2 timing with nonrenewing deadlines;
+no new parameter or protocol preference. This can reduce busy duplicate work,
+but a reverse-only failure can add a backup eligibility interval. Do not hide
+that cost, promise all-condition improvement, or enlarge windows to absorb it.
+The old obligation model covers the needed caller boundaries. Current proof
+asks whether a frozen generation/high-water plus byte cursor can use monotone
+current receive coverage without per-attachment snapshot copies or starvation.
+Source audit must cover exact multi-ingress batches, retained partial writes,
+ACK/MAX fairness and terminal membership; no independent issue expansion.
+Information forecast: a valid bounded model with explicit failure cost permits
+only a candidate decision and affected RED/recovery/timing controls. A coverage,
+memory/work, wake or first/sparse-service counterexample rejects it before code.
+No runtime/RFC edit, lab or further suppression policy is selected by this proof.
 
 **Model review / next discriminator12:03:** the scoped queue result and source
 audits are retained in SCOPED_ACK_SERVICE_MODEL's publication-alternatives
@@ -1770,7 +1798,7 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
   Frozen diagnostic:
   `./.tmp/reflection/bin/feedback-fanout-20260909/mptunnel`; its env-set wrapper
   is an intentionally unsafe causal intervention, never an ordinary candidate.
-  target/release currently contains the scoped queue diagnostic. Do not use
+  target/release currently contains the feedback-kind diagnostic. Do not use
   it as the restored ordinary comparator; use the frozen scoped-ack binary.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line

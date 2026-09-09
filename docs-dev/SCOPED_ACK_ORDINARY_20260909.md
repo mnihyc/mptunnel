@@ -137,3 +137,73 @@ Freeze the observer build and reverse its source before capture. Low encoded
 ACK cost rejects further ACK-serialization work; dominant encoded ACK cost
 selects producer/publication service investigation, not congestion thresholds.
 README/PERFORMANCE and release claims remain deferred pending practical proof.
+
+## Diagnostic follow-up: encoded range repetition is removed
+
+Recorded: 2026-09-09 09:58 +08:00. The single `scoped-ack-encode-0909`
+capture uses the same model/profile plus only the archived 69-line codec
+observer. Its [eight-file archive](SCOPED_ACK_ENCODE_SERVICE_20260909.raw.tar.gz)
+retains all five result files, run/build logs and exact observer patch. The
+observer source was reversed after freezing the diagnostic binary. This is
+attribution evidence, **not a replacement ordinary performance result**.
+
+Last client counters at client-log lines C520/C521 (sequences519/520),
+Unix1788918830090:
+
+| Encoded kind | Frames | Bytes | Range support |
+|---|---:|---:|---|
+| STREAM_ACK | 344,391 | 9,646,477 | Exactly one range per frame; maximum 34 B |
+| STREAM_MAX_DATA | 191,677 | 4,983,602 | Maximum 26 B |
+
+ACK has 344,391 total ranges, zero multi-range frames and 14,076 scoped frames;
+the other positive records need no negative scope. All client kinds total
+14,640,646 encoded bytes. Last server-log counters S274/S275, Unix1788918829178,
+contain 159 ACKs / 3,811 B and 167 MAX records / 4,342 B. These event-driven
+counters are censored at their last report, not final flush totals.
+
+Use successive records of the **same kind**, not cohorts assembled by equal
+printed milliseconds. C194→C298 (ACK) spans Unix 1788918805013→1788918813019:
+1,576,108 B / 55,884 ranges in 8,006 ms = 1.574927 Mbps. C195→C299 (MAX)
+has those same bounds: 760,136 B / 29,236 frames = 0.759566 Mbps. This entire
+window lies inside the actual UP10 snapshots: service row 16 Unix 1788918804835
+through row 25 Unix 1788918813836; DOWN remains 500 Mbps. The next snapshot,
+row 26 Unix 1788918814836, has restored UP500.
+
+| Same-kind counter interval | Unix ms bounds | ΔB / elapsed ms | Mbps |
+|---|---|---:|---:|
+| Restricted ACK C194→207 | 1788918805013→1788918806014 | 249,256 / 1,001 | 1.992056 |
+| Restricted ACK C207→220 | 1788918806014→1788918807014 | 138,463 / 1,000 | 1.107704 |
+| Restricted MAX C286→299 | 1788918812018→1788918813019 | 64,948 / 1,001 | 0.519065 |
+| Global ACK peak C428→441, restored | 1788918823025→1788918824025 | 377,951 / 1,000 | 3.023608 |
+
+The previous multi-range support repetition is absent in this capture. This
+does not mean catch-up is disabled: a cumulative contiguous prefix also has one
+range. Encoding is not a positive native-write receipt, excludes native ACKs,
+retransmission/transport overhead, and can precede later cancellation/failure.
+Do not subtract these totals from unlike router windows to manufacture an exact
+native-overhead amount. The former repeated-range cost no longer explains the
+remaining ~10 Mbps physical return service by itself.
+
+Preserved diagnostic outcomes: 1,853,968,314 body bytes / 40.000138335 s =
+370.792380 Mbps; raw 5–15 / 15–25 / 25–40 s means 441.096 / 293.066 / 408.973
+Mbps. First body is 0.579338865 s. Longest read gap is 0.320592015 s at
+22.333535079→22.654127094, bytes 1,002,415,436→1,002,423,528. All 79 attempted
+echoes succeed, p50/p95/max 291.551/546.237/838.076 ms; the worst is attempt 27
+at 13.692929572→14.531005317 s. There is one duration-partial HTTP 200 body,
+zero completed 8 GiB bodies. All 40 bins and 79 individual attempts are retained.
+
+Telemetry has 41 rows, elapsed 0.000049890→40.004818836 s. DOWN class deltas
+are 2,238,257,794 B / 1,608,709 packets; UP 62,080,524 B / 569,711 packets;
+zero drops both ways. Peak DOWN/UP backlog is 17,754,774/452,046 B. Restricted
+row 16→25 drains 10,965,211 UP bytes / 9.001208513 s = 9.745546 Mbps, with
+positive sampled backlog throughout (110,708–452,046 B). Client RSS peak/last
+is 94,648/83,556 KiB, server 318,420/297,100 KiB; peak/last lifetime `ps %CPU`
+is 92.7 for client and 188 for server. The same telemetry-window, offload and
+lifetime-CPU caveats above apply; this is not a memory-leak or CPU-cause proof.
+
+Disposition: the model's range-serialization mechanism has direct supporting
+evidence, but the better diagnostic restricted goodput must not replace the
+ordinary candidate's 185.569 Mbps, 0.811 s body gap or 1.479 s echo. The residual
+needs attribution among record/packet frequency, native/recovery cost and local
+service before another policy change. Further range-history compression or
+threshold adjustment is not justified by these counters. Promotion remains held.

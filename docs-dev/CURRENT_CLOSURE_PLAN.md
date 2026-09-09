@@ -13,6 +13,23 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
+**Attribution10:03:** interim model checkpointb2aa215 committed with1241checks
+andfullordinarypair, not acceptedperformance. The reused69lineobserver is
+againfullyremovedafterfreezing. DiagnosticACK344391frames/9646477B, everyACK
+onerange(max34B);MAX191677/4983602B. InsideactualUP10, same-kind8.006s
+countersgiveACK1.574927Mbps+MAX.759566Mbps. Prior sparsehistorycost is gone;
+furtherhistorycompression is not the nextfix. PhysicalUPremainsqueued~9.75Mbps.
+Diagnostic293Mbpsrestricted/.321sbodygap/79echoes(max.838s) is NOT a replacement
+forordinary186Mbps/.811s/max1.479s. Preserveboth observercostandrunvariability.
+
+ExistingTCPsocketrow20 shows~2.3MBpayload/~47–49kdatasegments percarrier,
+mean~47–49B; nativepacketization contributes beyondencodedMPPbytes. Read
+FEEDBACK_PACKETIZATION_MODEL completely before anyrenewedproposal: its earlier
+ready-feedback batching failedpairedtimingrepeat(292→302Mbps,worsegap), so do
+notreviveit merelyfromsmallrecords. Nextreadonly nativecounterjoin andexisting
+writerboundary distinguishpureNativeACKs, tinycontrolsegments andQUICresidual.
+No newcontroller,fanout,cadence,queuepolicy orpacketizationfixselectedyet.
+
 **Residual discriminator09:50:** candidate UP remains continuously queued
 throughrestriction,9.782594Mbps sampledphysicalservice versuscontrol9.733527.
 UP bytes fall118.606→81.781MB but packets rise556903→731328, and candidate

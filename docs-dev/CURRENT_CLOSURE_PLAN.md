@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 16:29 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 16:42 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,61 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — prove the existing live-owner repair service boundary.**
+**Current next action — one causal live-hedge-service ablation, never a fix.**
+
+The actual admission/native-drain/receiver-ACK characterization passes with a
+live distinct TCP alternate: final-drain repair has spare successor service but
+waits for positive ACK of its head. The first fixture failed before that check
+because its QUIC queue lacked mandatory native authority; a future observation
+epoch was a separate chronology error. Corrected real-clock fixture passes1/1
+after28.91s build; source is restored and its patch/logs are archived, not made
+an unselected service-model requirement. This is final-drain characterization,
+not measured attribution of persistent-gap or request-side network performance.
+
+No pipeline candidate is selected. Sender states can be identical when an
+Original is stuck and when it already arrived with ACK still in return transit.
+An accepted-copy coverage cursor could help the former but amplify late copies
+in the latter; per-transaction ranking alone does not bound that competing cost.
+The cited7–14s blackhole incident was an older, separately fixed single-attachment
+feedback defect, not evidence of this limit. September exact stalls instead
+show already-admitted repairs, stale/no-target decisions and native/shared queued
+service; none establishes repeated q-to-ACK serialization as its dominant cause.
+LIVE_REPAIR_SUCCESSOR_20260909 records the distinction. Do not repair a hypothesis.
+
+Existing impact/question: healthy mixed has~337ms median echo and~322ms median
+server QUIC RTT, versus same-build earlier QUIC-only107/101ms. Does actual live
+hedge service materially contribute, or does native mixed/shared service remain
+slow without it? Cause/window traces establish material ordinary copies and
+late local winners but not counterfactual effect. Next one frozen feature build
+reuses periodic Original/copy-cause/unique-receipt accounting, then runs same-
+build control followed by an unsafe live-hedge-suppressed healthy40s mixed cell.
+Both keep500/500Mbps,30/70ms, no loss/jitter/QoS/blackhole, full bins/echoes,
+native/class/CPU/RSS observations and unmodified source workload. No new harness,
+controller, limit or protocol preference. Feature flag fixed at process start.
+
+Suppress only server live persistent-gap, active/final retained-frontier and
+generic live ACK-gap producers, before enqueue; exclude their nonexistent
+recovery-only wait. Preserve real alternative facts, Original placement,
+already-accepted debt, ACK/MAX, native writes, stale/failed/unknown-owner recovery,
+requalification and cleanup. Do not gate dispatch or disable failure timers.
+Source inspection must prove no expired-deadline busy loop or substitution via
+the generic live branch. Client behavior stays unchanged. Both captures enable
+the same periodic observer and disable per-frame logs; actual cause counters
+must verify what disappears and what substitutes. Freeze/reverse before traffic.
+
+Information forecast: equal useful load with much lower echo/native RTT supports
+live-hedge service as a material contributor, not a safe suppression policy or
+proof of one wire/CPU substage. Persistent delay despite eliminated hedges moves
+attribution away from that category. Lower latency only with reduced useful load
+is mediation by offered service, not a performance correction. Stale/failure
+substitution makes a narrower causal comparison and must stay visible. The
+ordinary196–318MB accepted copies are~39–64Mbps/40s of payload-service equivalent,
+not promised removable bandwidth. The~230ms mixed/QUIC median difference is a
+comparison envelope, not a measured removable critical interval. Zero benefit
+and worse ordered stalls remain plausible. No favorable rerun or release claim
+from this deliberately weaker recovery; restore ordinary binary after the pair.
+
+### Completed live-owner service characterization (predeclared contract)
 
 The fixed-window transaction completes; REPAIR_WINDOW_20260909 and its verified
 307265B raw archive retain the result. Ordinary-policy observation408.341Mbps,

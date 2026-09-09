@@ -263,8 +263,10 @@ It does not establish that an earlier deadline was wrong, that server feedback
 was late, or that deleting these copies preserves blackhole recovery. Source
 admission timestamps do not localize native write service.
 
-Useful-copy evidence in other intervals and the existing7–14s selected-path
-blackhole failures remain constraints. No window extrapolation, blanket repair
+Useful-copy evidence in other intervals remains a constraint. The cited7–14s
+selected-path blackhole incident belongs to the earlier single-attachment
+feedback defect, already corrected; it is not current T06 stall attribution.
+No window extrapolation, blanket repair
 suppression, parameter tuning, public performance claim or release follows.
 The next model decision must explain this observed timing and retain required
 failure recovery; broad competitiveness remains unaccepted.

@@ -442,6 +442,16 @@ prototype plus affected ordinary comparison; no gain/regression remains a
 credible outcome. Do not enlarge pairing, defer sparse feedback or add a knob
 if its ordinary timing result is weak/adverse.
 
+The current private TCP transport adds a2-byte record length and16-byte tag.
+For illustration only, pairing every observed73,914 ready success on all three
+TCP attachments could remove at most3,991,356 such record bytes over40s, about
+0.798Mbps of return service. This assumes every call has a due grant, all three
+attachments, and an otherwise separate record; actual opportunity can be lower.
+Saved TCP/IP packets, syscalls and arbitration may matter more, but existing
+offload/packetization does not justify assigning them a fixed per-pair saving.
+Thus record bytes alone do not predict recovery of the whole throughput gap;
+the ordinary comparison must establish the composed gain and latency cost.
+
 Smallest next action: existing real receive-progress publisher/queue regression
 must first establish that an eligible ACK and due MAX become separate commands,
 after validating both original frame contents and exact pressure. This is an
@@ -461,6 +471,23 @@ Previous feedback/startup can therefore precede the current ACK; record and
 test this temporal change rather than pretending the event trace is identical.
 Final ACK admission still precedes shutdown.
 
+The first-poll wrapper must itself return Ready(inner_poll) on the same outer
+poll. A select-based helper with a ready branch is insufficient as a proof:
+[Tokio's select expansion](https://github.com/tokio-rs/tokio/blob/master/tokio/src/macros/select.rs)
+checks cooperative budget before polling branches. The candidate therefore
+uses an explicit standard poll_fn around the same borrowed pinned future;
+inner Pending still permits synchronous receipt publication before parking.
+This changes no existing cooperative policy or opportunistic-read helper and
+does not classify that helper's other uses as shipped defects.
+
+Candidate cross-review caught an ordering dependency at a newly freed queue:
+the first-write prelude must not retry the previous desired ACK generation
+before offering the newly received facts. Otherwise old G1 can occupy the
+last slot intended for G2's joint publication. Guard that retry with
+receipt_offered; preserve pre-poll notification arming and the first-Pending
+continuation so newly blocked G2 is retried without a lost wake. This restores
+latest-fact priority within the trial, not a new deployed defect or timer.
+
 Gates: existing blocked-write/startup, partial-write/error, FIN, independent
 ACK/MAX catch-up/new attachment/backpressure, all writer and queue/drop checks;
 independent source audit; then ordinary control/candidate on the same return
@@ -470,3 +497,21 @@ UP. Any adverse/ambiguous timing stops promotion for one attribution decision;
 no favorable-average acceptance or compensating threshold/controller changes.
 Global asymmetric failure/recovery, aggregation, browser and baseline gates
 remain unchanged. No release/README follows this local candidate selection.
+
+### Ordinary disposition: REJECTED,2026-09-09 14:03 +08:00
+
+Both1267-check batches pass, including original blocked startup, pair/credit
+fences and encrypted transport. The first ordinary restriction pair improves
+162.871→237.654Mbps and echo p95/max582/1283→398/614ms, with26.98%less
+UP class bytes, but median echo and maximum body gap worsen. Promotion stops.
+One predeclared healthy candidate→control discriminator retains the cost
+reduction yet produces413.444→402.332Mbps and echo p95/max468/606→562/814ms.
+Median324→291ms and bodygap.390→.331s improve; the adverse tails still reject
+the trial. All four histories/costs and limitations are in JOINT_FEEDBACK_20260909.
+
+The mechanism forecast held at the return-work boundary, but failed to establish
+overall timing improvement. Shared queue/allocation and moved feedback timing
+remain competing causes; measured queues do not identify the individual echo's
+blocking byte. No controller tweak or broader batch is justified. Exact trial
+source/RFC is fully reversed; typed pair, actor move and associated tests are
+not retained obligations. The original ordinary scoped implementation remains.

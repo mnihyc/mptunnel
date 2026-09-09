@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-09 11:22 +08:00. Category: requested global retrospective and
+Updated: 2026-09-09 14:05 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -248,6 +248,15 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- Same-publication pairing is not automatically timing-neutral either. The
+ 09-09 typed ACK/MAX trial preserved each ACK generation and passed1267checks;
+  it cut return bytes27% and improved restricted163→238Mbps. Yet a healthy
+  reverse-order discriminator gave413→402Mbps and echo p95/max468/606→562/814ms.
+  Median latency and body gap improved, so this is an adverse tail tradeoff,
+  not universal slowdown or proof of a particular internal cause. The trial
+  was fully removed. Once real record/queue savings repeatedly fail composed
+  service, do not infer the next packaging variant from byte counts alone;
+  return to the existing exact winning-path/membership or queue owner evidence.
 - A finite cursor is not necessarily a practically bounded publication job.
   The09-09 live-ledger/horizon proof preserves receipt truth, but continuous
   legal insertion/merging can require roughly131k full chunks despite a

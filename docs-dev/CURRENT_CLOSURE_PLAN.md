@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 13:18 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 14:03 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,59 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — conditional joint-publication candidate, RED first.**
+**Current next action — existing short-flow membership contract, model first.**
+Joint ACK/MAX publication is REJECTED. Restricted163→238Mbps and27%less
+return traffic did not satisfy timing: healthy reverse-order pair gives
+413.444→402.332Mbps, echo p95/max467.854/606.069→561.990/813.918ms.
+Median323.976→291.257ms and bodygap.390→.331s improve; these positives do
+not erase the adverse tails. All160bins/four runs and costs are in
+JOINT_FEEDBACK_20260909. No next QUIC/UP promotion run for this rejected trial.
+The exact24-file source/RFC trial was frozen and fully reversed; restored1260
+affected checks pass in3.33s after a warning-free1m27s build. The raw archive
+passes integrity and byte comparisons. Current
+ordinary implementation is againb2aa215. No controller/timer compensation.
+
+Next question returns to the already-recorded ECHO_OWNER_SERVICE finding,
+not another packetization attempt or new issue inventory. Its81winning echo
+fragments use onlyTCP despite an active session QUIC carrier. Source→claim
+max7ms, claim→write max1ms, postdecode delivery max2ms; postwrite→decode
+median210/p95329/max461ms. A5120B stream never reaches startup h58400;
+recurring rebalance is Throughput-only. This excludes an eligible-QUIC writer
+rejection: QUIC was not a flow member. It does not prove QUIC would be faster.
+
+Model transaction: inspect282b8e1's bulk-service intention,9ab3cbcb's preserved
+stall recovery, and exact direction/membership/lifecycle ownership. Determine
+whether ordinary low-volume service has a coherent opportunity-refresh
+contract without BulkStriping misuse, inline open stalls, byte-volume gates
+or protocol preference. Existing capture suffices for current reachability;
+no new diagnostic build or policy edit before this contract is established.
+Competing explanation: all carriers share loaded native/network queues, so
+membership correction can save nothing. The461ms response interval is only
+an upper removable envelope if a better eligible service really exists;
+request-side and separate280ms pre-read waits cannot be claimed as its gain.
+Hundreds of milliseconds per common echo justify this review; no Mbps promise.
+Falsifier: no reachable membership omission or no better completion opportunity
+defers a fix. A proved omission permits one real-model RED and a bounded
+candidate, with sparse/bidirectional/startup/retirement controls and ordinary
+timing. No universal clairvoyant ranking, new numeric knob, or release waiver.
+
+### Completed joint-publication trial chronology (not current instructions)
+
+Ordinary first pair completes13:53:restricted162.871→237.654Mbps, whole
+321.300→348.730; echo p95/max582/1283→398/614ms,77→80successful/no failures.
+Whole UP bytes fall26.98%, but longest body gap.580→.658s and median echo
+268→307ms worsen. Healthy/restored echo medians and tails also rise. This
+is mixed evidence; promotion stops, not a successful speed milestone.
+
+Next one discriminator uses the already-planned healthy mixed pair, now
+candidate→control order, same frozen binaries and40s workload; only NO_QOS=1.
+Question: does timing cost recur without the return transition, or is it
+confined to the transition/changed queue history? Profiles/counter scope and
+all timing stay visible. Information forecast: recurring adverse healthy tails
+reject this trial; a neutral result only narrows the cause, not acceptance of
+the original gap. No favorable reruns, thresholds or controller compensation.
+Independent audit agrees on this bounded question. No new issue scope.
+
 The unchanged first-poll capture completes:73,914 nonempty ReadyOk,3 Pending
 (42.845MB),1 closure error;42,638 empty calls excluded. ReadyOk99.9946% of calls
 but97.7146% of offered bytes; mean34.329us/max16.195ms. Strict return-restricted
@@ -34,12 +86,27 @@ no Mbps promise follows from readiness or unsafe suppression. Current material
 return pressure justifies one bounded prototype/ordinary comparison, not a new
 timer/controller/fanout policy. Weak/adverse composition stops promotion.
 
-First, the real publisher fixture validates ACK/MAX facts, grants, generation,
-pressure and retry deduplication before expecting one envelope rather than two.
+The real publisher RED is confirmed after all ACK/MAX facts, grants, generation,
+pressure and retry-deduplication checks:two envelopes instead of one. Build35.17s,
+test ends at the exact final work assertion, not a semantic/setup failure.
 Root caught and corrected an invalid fixture assumption about already-published
-ACK retries before running it; that was not a Product failure. Focused RED build
-now active, no production implementation yet. No traffic overlaps compilation.
-Then coherent pair integration, targeted controls/audit, same ordinary return
+ACK retries before running it; that was not a Product failure. Evidence remains
+JOINT_FEEDBACK_20260909.red.patch and the focused test log. Coherent prototype
+implementation is complete in three disjoint owners:typed path command/writers,
+symmetric publication/fences, and retained-write actor sequencing. Independent
+publisher/actor/all-writer accounting reviews are complete. Review caught a
+candidate-only stale retry: before current receipt is offered, retrying the
+previous ACK generation could spend the only newly freed queue slot. The
+prelude now retries only after receipt_offered; first-Pending rearm and the
+existing startup/error service are preserved. This is not a shipped defect.
+Both focused runs pass1267 checks, including encrypted transport and original
+blocked startup. The first build's missing test import was fixture integration,
+not Product RED. Two obsolete response publication wrappers were removed;
+their four controls now exercise the actual production API. Ordinary release
+build is active. Its remaining request publication wrapper is test-only and
+semantically redundant; remove it if this trial is retained, rather than
+rebuilding an otherwise identical comparator before the practical decision.
+Next the same ordinary return
 restriction; healthy mixed/QUIC and UP only if materially supported. All global
 experience/recovery/aggregation/baseline gates below remain unchanged.
 
@@ -1835,7 +1902,7 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
 
 ## Execution, evidence and continuity
 
-- Root owns builds/labs. The ready-receipt correction is REJECTED and fully
+- Root owns builds/labs. Joint-publication and ready-receipt trials are REJECTED and fully
   reversed as recorded at the top. Scoped ACK is checkpoint b2aa215 with
   partial ordinary benefit, not acceptance. Feedback fanout's causal ablation
   is evidence only; its unsafe source has been fully reversed. The earlier
@@ -1848,13 +1915,13 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
   Frozen diagnostic:
   `./.tmp/reflection/bin/feedback-fanout-20260909/mptunnel`; its env-set wrapper
   is an intentionally unsafe causal intervention, never an ordinary candidate.
-  target/release currently contains the first-poll diagnostic. Do not use
-  it as the restored ordinary comparator; use the frozen scoped-ack binary.
+  target/release has been restored by copying the frozen scoped-ack ordinary
+  binary; the rejected trial remains only in its named frozen directory.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram kind-separation result report sent:2026-09-09 05:03UTC; next nonurgent
-  not before06:04UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram ordinary trial rejection report sent:2026-09-09 06:05UTC; next nonurgent
+  not before07:06UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

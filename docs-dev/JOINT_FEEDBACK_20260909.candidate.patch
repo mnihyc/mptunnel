@@ -1,0 +1,2189 @@
+diff --git a/RFC.md b/RFC.md
+index 3fcd712..07df1cb 100644
+--- a/RFC.md
++++ b/RFC.md
+@@ -1564,6 +1564,21 @@ and credit can advance only when receive-buffer capacity is actually freed.
+ capacity and native congestion state are additional local constraints, not
+ alternate MPP receive windows.
+ 
++Jointly available Data ACK and credit MAY share one bounded publication and
++protected transport write. They remain two independently meaningful wire
++frames; sharing a record creates no decoding dependency or combined receipt/
++credit authority. Neither kind may wait for the other to become available.
++In particular, a non-blocking local delivery attempt may make credit available
++alongside receipt, but pending or failed delivery MUST NOT postpone receipt
++publication or required startup/lifecycle service. A partial write is retained,
++not replayed, and does not authorize unconsumed credit. Successful queue
++admission advances only the exact ACK chunk and grant it accepted; completing
++an ACK generation still requires all of its chunks. An already-covered ACK
++or blocked catch-up MUST NOT prevent independent credit publication and retry.
++The two frames retain their full accounting and terminal ownership through
++native write/flush completion or cleanup. This adds no feedback timer, batching
++threshold, larger receive window, or preferred return carrier.
++
+ ### 8.5 Completion, detach, and reset
+ 
+ `STREAM_FIN(stream_id, final_offset)` declares the final offset and may travel
+diff --git a/src/runtime/path/commands.rs b/src/runtime/path/commands.rs
+index bbb27e5..b9c2c1b 100644
+--- a/src/runtime/path/commands.rs
++++ b/src/runtime/path/commands.rs
+@@ -218,6 +218,44 @@ impl Drop for TcpCapacityProbeCommand {
+     }
+ }
+ 
++/// One receipt publication whose ACK and independently due receive grant are
++/// already available together. This is one carrier transaction, not a new wire
++/// frame or permission to combine different ACK generations.
++#[derive(Debug)]
++pub(in crate::runtime) struct ReliableStreamFeedbackPair {
++    frames: [Frame; 2],
++}
++
++impl ReliableStreamFeedbackPair {
++    pub(in crate::runtime) fn new(ack: Frame, max_offset: u64) -> Result<Self, RuntimeError> {
++        let Frame::StreamAck { stream_id, .. } = &ack else {
++            return Err(RuntimeError::Protocol("feedback pair requires STREAM_ACK"));
++        };
++        let max_data = Frame::StreamMaxData {
++            stream_id: *stream_id,
++            max_offset,
++        };
++        Ok(Self {
++            frames: [ack, max_data],
++        })
++    }
++
++    pub(in crate::runtime) fn frames(&self) -> &[Frame; 2] {
++        &self.frames
++    }
++
++    pub(in crate::runtime) fn into_frames(self) -> [Frame; 2] {
++        self.frames
++    }
++
++    pub(in crate::runtime) fn stream_id(&self) -> StreamId {
++        let Frame::StreamAck { stream_id, .. } = &self.frames[0] else {
++            unreachable!("private feedback pair starts with STREAM_ACK");
++        };
++        *stream_id
++    }
++}
++
+ pub(in crate::runtime) enum ReliablePathCommand {
+     PreparedOriginal(super::prepared::PreparedOriginalWork),
+     PrepareConnection {
+@@ -268,6 +306,7 @@ pub(in crate::runtime) enum ReliablePathCommand {
+         response: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+     },
+     SendFrame(Frame),
++    SendFeedbackPair(ReliableStreamFeedbackPair),
+     #[cfg(test)]
+     SendTcpCapacityProbe(TcpCapacityProbeCommand),
+     ResetAndCloseStream {
+diff --git a/src/runtime/path/queue.rs b/src/runtime/path/queue.rs
+index 5397651..94445b3 100644
+--- a/src/runtime/path/queue.rs
++++ b/src/runtime/path/queue.rs
+@@ -1,5 +1,5 @@
+ use super::authority::NativeCarrierRateAuthorityHandle;
+-use super::commands::ReliablePathCommand;
++use super::commands::{ReliablePathCommand, ReliableStreamFeedbackPair};
+ #[cfg(test)]
+ use super::commands::{RequestTcpCapacityProbeRequest, TcpCapacityProbeCommand};
+ use super::prepared::{PreparedOriginalWait, PreparedOriginalWork};
+@@ -1634,6 +1634,38 @@ impl ReliablePathCommandSender {
+         )
+     }
+ 
++    /// Both facts retain independent Product publication fences. One existing
++    /// priority permit accepts the whole typed transaction or neither frame;
++    /// failed pairing does not prevent the caller from retrying either singleton.
++    pub(in crate::runtime) fn try_enqueue_stream_feedback_pair(
++        &self,
++        ack: Frame,
++        max_offset: u64,
++    ) -> Result<(), RuntimeError> {
++        let pair = ReliableStreamFeedbackPair::new(ack, max_offset)?;
++        let command = ReliablePathCommand::SendFeedbackPair(pair);
++        let permit = self.priority.try_reserve().map_err(|error| match error {
++            mpsc::error::TrySendError::Full(_)
++                if self.metrics.lifecycle.admits_new_command(false) =>
++            {
++                RuntimeError::SenderServiceBlocked
++            }
++            _ => RuntimeError::ReliablePathSessionClosed,
++        })?;
++        // ACK and MAX both remain admissible while Product data drains.
++        if !self.metrics.lifecycle.admits_new_command(false) {
++            return Err(RuntimeError::ReliablePathSessionClosed);
++        }
++        let bytes = reliable_path_command_pending_bytes(&command);
++        self.metrics.add_pending_bytes(bytes);
++        permit.send(QueuedReliablePathCommand::new(
++            command,
++            bytes,
++            self.metrics.clone(),
++        ));
++        Ok(())
++    }
++
+     /// Reserves carrier work for a repeated Data Sequence range. Reinjection is
+     /// drained after latency/control traffic but before fresh bulk data.
+     pub(in crate::runtime) fn try_reserve_reinjection_frame(
+@@ -1933,6 +1965,7 @@ fn reliable_path_command_requires_product_admission(command: &ReliablePathComman
+             reliable_path_frame_requires_product_admission(frame)
+         }
+         ReliablePathCommand::CancelTcpOpen { .. }
++        | ReliablePathCommand::SendFeedbackPair(_)
+         | ReliablePathCommand::CloseDatagramAttachment { .. }
+         | ReliablePathCommand::ResetAndCloseStream { .. }
+         | ReliablePathCommand::CloseStream(_) => false,
+@@ -2418,6 +2451,11 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
+         | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
+             reliable_path_frame_pacing_bytes(frame)
+         }
++        ReliablePathCommand::SendFeedbackPair(pair) => pair
++            .frames()
++            .iter()
++            .map(reliable_path_frame_pacing_bytes)
++            .sum(),
+         #[cfg(test)]
+         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
+             usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
+@@ -2447,6 +2485,11 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
+         | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
+             crate::protocol::codec::encoded_frame_capacity_hint(frame).max(1)
+         }
++        ReliablePathCommand::SendFeedbackPair(pair) => pair
++            .frames()
++            .iter()
++            .map(crate::protocol::codec::encoded_frame_capacity_hint)
++            .fold(0usize, usize::saturating_add),
+         #[cfg(test)]
+         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
+             usize::try_from(probe.train_payload_bytes)
+@@ -2474,6 +2517,7 @@ fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> Option<Stre
+     match command {
+         ReliablePathCommand::PreparedOriginal(work) => Some(work.stream_id()),
+         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_stream_id(frame),
++        ReliablePathCommand::SendFeedbackPair(pair) => Some(pair.stream_id()),
+         ReliablePathCommand::SendDatagramFrame { .. }
+         | ReliablePathCommand::OpenDatagramAttachment { .. }
+         | ReliablePathCommand::OpenDatagramFlow { .. }
+@@ -2516,6 +2560,7 @@ fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
+         ReliablePathCommand::SendDatagramFrame { frame, .. } => reliable_path_frame_kind(frame),
+         ReliablePathCommand::CloseDatagramAttachment { .. } => "close_datagram_attachment",
+         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),
++        ReliablePathCommand::SendFeedbackPair(_) => "stream_feedback_pair",
+         #[cfg(test)]
+         ReliablePathCommand::SendTcpCapacityProbe(_) => "tcp_capacity_probe",
+         ReliablePathCommand::ResetAndCloseStream { .. } => "reset_and_close_stream",
+diff --git a/src/runtime/path/quic/client_writer.rs b/src/runtime/path/quic/client_writer.rs
+index eea14ed..690446a 100644
+--- a/src/runtime/path/quic/client_writer.rs
++++ b/src/runtime/path/quic/client_writer.rs
+@@ -156,12 +156,29 @@ pub(super) async fn drain_client_udp_stream_commands(
+                     "client QUIC path received an untyped capacity frame",
+                 ));
+             }
+-            ReliablePathCommand::SendFrame(frame) => {
+-                pending_frames.push(frame);
++            command @ (ReliablePathCommand::SendFrame(_)
++            | ReliablePathCommand::SendFeedbackPair(_)) => {
++                let frame_count = match command {
++                    ReliablePathCommand::SendFrame(frame) => {
++                        pending_frames.push(frame);
++                        1
++                    }
++                    ReliablePathCommand::SendFeedbackPair(pair) => {
++                        if pair.stream_id() != stream_id {
++                            commands.release_pending_command_bytes(pending_bytes);
++                            return Err(RuntimeError::Protocol(
++                                "client QUIC feedback pair stream does not match writer",
++                            ));
++                        }
++                        pending_frames.extend(pair.into_frames());
++                        2
++                    }
++                    _ => unreachable!("only typed frame transactions enter this branch"),
++                };
+                 pending_frame_command_bytes =
+                     pending_frame_command_bytes.saturating_add(pending_bytes);
+                 sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
+-                sent_items = sent_items.saturating_add(1);
++                sent_items = sent_items.saturating_add(frame_count);
+                 if sent_bytes >= byte_budget || sent_items >= item_budget {
+                     flush_client_udp_frame_batch(
+                         send,
+diff --git a/src/runtime/path/quic/datagram.rs b/src/runtime/path/quic/datagram.rs
+index d364ec2..11fb981 100644
+--- a/src/runtime/path/quic/datagram.rs
++++ b/src/runtime/path/quic/datagram.rs
+@@ -343,6 +343,12 @@ async fn drain_server_udp_datagram_commands(
+                 }
+                 continue;
+             }
++            ReliablePathCommand::SendFeedbackPair(_) => {
++                commands.release_pending_command_bytes(pending_bytes);
++                return Err(RuntimeError::Protocol(
++                    "server QUIC datagram writer received reliable feedback pair",
++                ));
++            }
+             #[cfg(test)]
+             ReliablePathCommand::SendTcpCapacityProbe(_) => {
+                 commands.release_pending_command_bytes(pending_bytes);
+diff --git a/src/runtime/path/quic/io.rs b/src/runtime/path/quic/io.rs
+index da9e216..4863e7f 100644
+--- a/src/runtime/path/quic/io.rs
++++ b/src/runtime/path/quic/io.rs
+@@ -424,7 +424,7 @@ pub(super) fn udp_path_retain_datagram_denial(
+     Ok(())
+ }
+ 
+-async fn udp_path_write_frames(
++pub(super) async fn udp_path_write_frames(
+     send: &mut UdpPathSendStream,
+     frames: &[Frame],
+     codec_limits: CodecLimits,
+diff --git a/src/runtime/path/quic/server_writer.rs b/src/runtime/path/quic/server_writer.rs
+index 3ac4ab3..af11e60 100644
+--- a/src/runtime/path/quic/server_writer.rs
++++ b/src/runtime/path/quic/server_writer.rs
+@@ -2,7 +2,7 @@
+ 
+ use super::io::{
+     UdpPathSendStream, flush_udp_frame_batch_with_path_proofs_interlocked, udp_path_finish_stream,
+-    udp_path_write_frame,
++    udp_path_write_frame, udp_path_write_frames,
+ };
+ #[cfg(feature = "lab-diagnostics")]
+ use crate::lab_diagnostics::lab_diagnostic;
+@@ -64,6 +64,21 @@ pub(super) async fn drain_one_server_udp_command_while_input_deferred(
+             path_proofs.record_sent_frame(&frame);
+             Ok(false)
+         }
++        ReliablePathCommand::SendFeedbackPair(pair) => {
++            if pair.stream_id() != stream_id {
++                commands.release_pending_command_bytes(pending_bytes);
++                return Err(RuntimeError::Protocol(
++                    "server QUIC feedback pair stream does not match writer",
++                ));
++            }
++            let result = udp_path_write_frames(send, pair.frames(), context.codec_limits).await;
++            commands.release_pending_command_bytes(pending_bytes);
++            result?;
++            for frame in pair.frames() {
++                path_proofs.record_sent_frame(frame);
++            }
++            Ok(false)
++        }
+         #[cfg(test)]
+         ReliablePathCommand::SendTcpCapacityProbe(_) => {
+             commands.release_pending_command_bytes(pending_bytes);
+@@ -253,12 +268,29 @@ pub(super) async fn drain_server_udp_reliable_commands(
+                     "server QUIC path received an untyped capacity frame",
+                 ));
+             }
+-            ReliablePathCommand::SendFrame(frame) => {
+-                pending_frames.push(frame);
++            command @ (ReliablePathCommand::SendFrame(_)
++            | ReliablePathCommand::SendFeedbackPair(_)) => {
++                let frame_count = match command {
++                    ReliablePathCommand::SendFrame(frame) => {
++                        pending_frames.push(frame);
++                        1
++                    }
++                    ReliablePathCommand::SendFeedbackPair(pair) => {
++                        if pair.stream_id() != stream_id {
++                            commands.release_pending_command_bytes(pending_bytes);
++                            return Err(RuntimeError::Protocol(
++                                "server QUIC feedback pair stream does not match writer",
++                            ));
++                        }
++                        pending_frames.extend(pair.into_frames());
++                        2
++                    }
++                    _ => unreachable!("only typed frame transactions enter this branch"),
++                };
+                 pending_frame_command_bytes =
+                     pending_frame_command_bytes.saturating_add(pending_bytes);
+                 sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
+-                sent_items = sent_items.saturating_add(1);
++                sent_items = sent_items.saturating_add(frame_count);
+                 if sent_bytes >= byte_budget || sent_items >= item_budget {
+                     flush_server_udp_frame_batch(
+                         send,
+diff --git a/src/runtime/path/quic/tests_server_stream.rs b/src/runtime/path/quic/tests_server_stream.rs
+index ad07aae..d97c502 100644
+--- a/src/runtime/path/quic/tests_server_stream.rs
++++ b/src/runtime/path/quic/tests_server_stream.rs
+@@ -910,6 +910,63 @@ async fn server_quic_drains_exact_ack_without_consuming_deferred_probe_slot() {
+         .expect("read exact requalification ACK"),
+         ack
+     );
++
++    let ack = Frame::StreamAck {
++        stream_id,
++        scope_start: Some(4),
++        ranges: vec![OffsetRange { start: 8, end: 16 }],
++    };
++    for input_deferred in [true, false] {
++        fixture
++            .commands_tx
++            .try_enqueue_stream_feedback_pair(ack.clone(), 64)
++            .unwrap();
++        let pair = recv_reliable_path_command(fixture.commands_rx.as_mut().unwrap())
++            .await
++            .unwrap();
++        assert_eq!(fixture.commands_tx.writer_pending_bytes(), 2);
++        let closed = if input_deferred {
++            drain_one_server_udp_command_while_input_deferred(
++                pair,
++                fixture.commands_rx.as_mut().unwrap(),
++                fixture.server_send.as_mut().unwrap(),
++                &fixture.context,
++                stream_id,
++                &fixture._path_registration,
++                &mut path_proofs,
++            )
++            .await
++            .unwrap()
++        } else {
++            fixture.drain_normal_command(pair).await.unwrap()
++        };
++        assert!(!closed);
++        for expected in [
++            ack.clone(),
++            Frame::StreamMaxData {
++                stream_id,
++                max_offset: 64,
++            },
++        ] {
++            assert_eq!(
++                udp_path_read_frame(
++                    fixture.client_recv.as_mut().unwrap(),
++                    fixture.context.codec_limits,
++                )
++                .await
++                .unwrap(),
++                expected
++            );
++        }
++        assert_eq!(fixture.commands_tx.pending_bytes(), 0);
++        assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);
++    }
++    assert!(matches!(
++        deferred_input,
++        Some(Ok(Frame::StreamRequalifyData { probe_id: 24, .. }))
++    ));
++    assert_eq!(fixture.commands_tx.pending_bytes(), 0);
++    assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);
+ }
+ 
+ #[tokio::test]
+diff --git a/src/runtime/path/tcp/client/session.rs b/src/runtime/path/tcp/client/session.rs
+index 2945be4..7afe12e 100644
+--- a/src/runtime/path/tcp/client/session.rs
++++ b/src/runtime/path/tcp/client/session.rs
+@@ -1100,6 +1100,7 @@ fn reject_client_tcp_command_for_path_drain(command: ReliablePathCommand) {
+         ReliablePathCommand::CancelTcpOpen { .. }
+         | ReliablePathCommand::PreparedOriginal(_)
+         | ReliablePathCommand::SendFrame(_)
++        | ReliablePathCommand::SendFeedbackPair(_)
+         | ReliablePathCommand::ResetAndCloseStream { .. }
+         | ReliablePathCommand::CloseStream(_) => {}
+     }
+@@ -1359,6 +1360,7 @@ async fn handle_disconnected_client_tcp_command(
+         ReliablePathCommand::CancelTcpOpen { .. }
+         | ReliablePathCommand::PreparedOriginal(_)
+         | ReliablePathCommand::SendFrame(_)
++        | ReliablePathCommand::SendFeedbackPair(_)
+         | ReliablePathCommand::ResetAndCloseStream { .. }
+         | ReliablePathCommand::CloseStream(_) => {}
+     }
+diff --git a/src/runtime/path/tcp/client/writer.rs b/src/runtime/path/tcp/client/writer.rs
+index 3af5c7a..089b4ca 100644
+--- a/src/runtime/path/tcp/client/writer.rs
++++ b/src/runtime/path/tcp/client/writer.rs
+@@ -219,6 +219,32 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
+                 // to the actor so all lanes arbitrate the next command head.
+                 break;
+             }
++            ReliablePathCommand::SendFeedbackPair(pair) => {
++                writer_pending_bytes = writer_pending_bytes.checked_add(pending_bytes).ok_or(
++                    RuntimeError::Protocol("client TCP writer transaction byte overflow"),
++                )?;
++                pending_frames.extend(pair.into_frames());
++                #[cfg(feature = "lab-diagnostics")]
++                {
++                    sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
++                    sent_items = sent_items.saturating_add(2);
++                }
++                commit_client_tcp_command_frame_transaction(
++                    connection,
++                    pending_frames,
++                    streams,
++                    closed_streams,
++                    datagrams,
++                    runtime,
++                    commands,
++                    &mut writer_pending_bytes,
++                    &mut deferred_frame,
++                )
++                .await?;
++                // The typed same-publication pair is one transaction; another
++                // command still returns through normal lane arbitration.
++                break;
++            }
+             #[cfg(test)]
+             ReliablePathCommand::SendTcpCapacityProbe(probe) => {
+                 let stream_id = probe.stream_id;
+@@ -1146,6 +1172,19 @@ async fn handle_connected_client_tcp_command(
+             connection.record_outbound_activity();
+             Ok(())
+         }
++        ReliablePathCommand::SendFeedbackPair(pair) => {
++            connection
++                .carrier
++                .writer
++                .write_frames(pair.frames())
++                .await?;
++            connection.carrier.writer.flush().await?;
++            for frame in pair.frames() {
++                connection.path_proofs.record_sent_frame(frame);
++            }
++            connection.record_outbound_activity();
++            Ok(())
++        }
+         #[cfg(test)]
+         ReliablePathCommand::SendTcpCapacityProbe(_) => Err(RuntimeError::Protocol(
+             "client TCP path received server capacity command",
+diff --git a/src/runtime/path/tcp/server/session.rs b/src/runtime/path/tcp/server/session.rs
+index b0a597a..e885b05 100644
+--- a/src/runtime/path/tcp/server/session.rs
++++ b/src/runtime/path/tcp/server/session.rs
+@@ -874,6 +874,27 @@ impl ServerTcpPathSession {
+                     // next head after the exact commit boundary.
+                     break;
+                 }
++                ReliablePathCommand::SendFeedbackPair(pair) => {
++                    writer_pending_bytes = writer_pending_bytes.checked_add(pending_bytes).ok_or(
++                        RuntimeError::Protocol("server TCP writer transaction byte overflow"),
++                    )?;
++                    #[cfg(feature = "lab-diagnostics")]
++                    {
++                        sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
++                        sent_items = sent_items.saturating_add(2);
++                    }
++                    self.writer.stage_feedback_pair(pair)?;
++                    if matches!(
++                        self.commit_transaction_respecting_deferred_input(
++                            &mut writer_pending_bytes,
++                        )
++                        .await?,
++                        ServerTcpSessionDisposition::Stop
++                    ) {
++                        return Ok(ServerTcpSessionDisposition::Stop);
++                    }
++                    break;
++                }
+                 #[cfg(test)]
+                 ReliablePathCommand::SendTcpCapacityProbe(probe) => {
+                     drop(probe);
+diff --git a/src/runtime/path/tcp/server/tests_session.rs b/src/runtime/path/tcp/server/tests_session.rs
+index 1878fcb..898096c 100644
+--- a/src/runtime/path/tcp/server/tests_session.rs
++++ b/src/runtime/path/tcp/server/tests_session.rs
+@@ -1557,6 +1557,39 @@ async fn server_tcp_one_head_transaction_returns_to_priority_arbitration() {
+         try_recv_reliable_path_command(&mut session.commands_rx).is_none(),
+         "each ordinary frame must require its own actor transaction"
+     );
++
++    let ack = Frame::StreamAck {
++        stream_id: StreamId(306),
++        scope_start: Some(4),
++        ranges: vec![crate::protocol::OffsetRange { start: 8, end: 16 }],
++    };
++    commands
++        .try_enqueue_stream_feedback_pair(ack.clone(), 64)
++        .unwrap();
++    let pair = try_recv_reliable_path_command(&mut session.commands_rx).unwrap();
++    assert_eq!(commands.writer_pending_bytes(), 2);
++    commands
++        .try_enqueue_admitted_frame(control.clone(), TrafficClass::Control)
++        .unwrap();
++    assert!(matches!(
++        session.drain_commands(pair).await.unwrap(),
++        ServerTcpSessionDisposition::Continue
++    ));
++    assert_eq!(client.read_frame().await.unwrap(), ack);
++    assert_eq!(
++        client.read_frame().await.unwrap(),
++        Frame::StreamMaxData {
++            stream_id: StreamId(306),
++            max_offset: 64,
++        }
++    );
++    assert_eq!(commands.writer_pending_bytes(), 0);
++    let later = try_recv_reliable_path_command(&mut session.commands_rx)
++        .expect("typed pair must not absorb the next ordinary control head");
++    assert!(matches!(&later, ReliablePathCommand::SendFrame(frame) if frame == &control));
++    session.drain_commands(later).await.unwrap();
++    assert_eq!(client.read_frame().await.unwrap(), control);
++    assert_eq!(commands.pending_bytes(), 0);
+ }
+ 
+ #[tokio::test]
+diff --git a/src/runtime/path/tcp/server/writer.rs b/src/runtime/path/tcp/server/writer.rs
+index 0ccb601..bd36db7 100644
+--- a/src/runtime/path/tcp/server/writer.rs
++++ b/src/runtime/path/tcp/server/writer.rs
+@@ -8,6 +8,7 @@ use super::super::io::{EncryptedTcpWriter, encrypted_framed_peer_closed};
+ use super::evidence::ServerTcpEvidenceState;
+ use crate::protocol::Frame;
+ use crate::runtime::error::RuntimeError;
++use crate::runtime::path::commands::ReliableStreamFeedbackPair;
+ 
+ pub(in crate::runtime::path::tcp) struct ServerTcpWriter {
+     pending_frames: Vec<Frame>,
+@@ -47,6 +48,17 @@ impl ServerTcpWriter {
+         Ok(())
+     }
+ 
++    /// Only the typed ACK plus independently due grant from one publication
++    /// may share this transaction. Ordinary frames retain their single-head guard.
++    pub(in crate::runtime::path::tcp) fn stage_feedback_pair(
++        &mut self,
++        pair: ReliableStreamFeedbackPair,
++    ) -> Result<(), RuntimeError> {
++        self.begin_transaction()?;
++        self.pending_frames.extend(pair.into_frames());
++        Ok(())
++    }
++
+     /// Flushes one structural transaction and only then publishes sent-frame
+     /// evidence. An ambiguous write or flush leaves the ledger intact for the
+     /// terminal actor drop; it must never be retried on this carrier.
+diff --git a/src/runtime/path/tests_queue.rs b/src/runtime/path/tests_queue.rs
+index 94294cc..d15f5d0 100644
+--- a/src/runtime/path/tests_queue.rs
++++ b/src/runtime/path/tests_queue.rs
+@@ -5,7 +5,8 @@ use super::{
+     try_recv_reliable_path_command,
+ };
+ use crate::protocol::{
+-    DatagramFlowId, Frame, PathId, PathUsage, ResetReason, StreamDemandHint, StreamId, TargetAddr,
++    DatagramFlowId, Frame, OffsetRange, PathId, PathUsage, ResetReason, StreamDemandHint, StreamId,
++    TargetAddr,
+ };
+ use crate::scheduler::TrafficClass;
+ use bytes::Bytes;
+@@ -18,6 +19,118 @@ fn stream_data_frame(stream_id: u64, bytes: usize) -> Frame {
+     }
+ }
+ 
++#[test]
++fn feedback_pair_preserves_facts_pressure_and_independent_singleton_admission() {
++    let (commands, mut receivers) = reliable_path_command_channels(1);
++    let ack = Frame::StreamAck {
++        stream_id: StreamId(17),
++        scope_start: Some(2),
++        ranges: vec![OffsetRange { start: 4, end: 8 }],
++    };
++    let max_data = Frame::StreamMaxData {
++        stream_id: StreamId(17),
++        max_offset: 64,
++    };
++    commands
++        .try_enqueue_stream_feedback_pair(ack.clone(), 64)
++        .unwrap();
++    assert_eq!(commands.pending_bytes(), 2);
++    assert!(matches!(
++        commands.try_enqueue_stream_feedback_pair(ack.clone(), 128),
++        Err(crate::runtime::error::RuntimeError::SenderServiceBlocked)
++    ));
++    assert_eq!(
++        commands.pending_bytes(),
++        2,
++        "failed admission owns neither fact"
++    );
++    let command = try_recv_reliable_path_command(&mut receivers).unwrap();
++    assert_eq!(reliable_path_command_pending_bytes(&command), 2);
++    assert_eq!(
++        super::reliable_path_command_writer_run_bytes(&command),
++        crate::protocol::codec::encoded_frame_capacity_hint(&ack)
++            + crate::protocol::codec::encoded_frame_capacity_hint(&max_data)
++    );
++    let ReliablePathCommand::SendFeedbackPair(pair) = command else {
++        panic!("same-publication facts require one typed envelope");
++    };
++    assert_eq!(pair.stream_id(), StreamId(17));
++    assert_eq!(pair.frames(), &[ack.clone(), max_data.clone()]);
++    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
++    assert_eq!(commands.writer_pending_bytes(), 2);
++    receivers.release_pending_command_bytes(2);
++    assert_eq!(commands.pending_bytes(), 0);
++    assert_eq!(commands.writer_pending_bytes(), 0);
++
++    for frame in [ack, max_data] {
++        commands
++            .try_enqueue_stream_ordered_frame(frame.clone(), TrafficClass::Control)
++            .unwrap();
++        let command = try_recv_reliable_path_command(&mut receivers).unwrap();
++        assert!(matches!(&command, ReliablePathCommand::SendFrame(actual) if actual == &frame));
++        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
++    }
++    assert!(
++        commands
++            .try_enqueue_stream_feedback_pair(Frame::Ping { nonce: 1 }, 64)
++            .is_err()
++    );
++    assert_eq!(commands.pending_bytes(), 0);
++}
++
++#[tokio::test]
++async fn feedback_pair_common_stream_terminal_and_receiver_drop_release_both_facts() {
++    let ack = Frame::StreamAck {
++        stream_id: StreamId(18),
++        scope_start: None,
++        ranges: vec![OffsetRange { start: 0, end: 8 }],
++    };
++    let (commands, mut receivers) = reliable_path_command_channels(1);
++    commands
++        .try_enqueue_stream_feedback_pair(ack.clone(), 64)
++        .unwrap();
++    commands
++        .send_control(ReliablePathCommand::CloseStream(StreamId(18)))
++        .await
++        .unwrap();
++    let close = recv_reliable_path_command(&mut receivers).await.unwrap();
++    assert!(matches!(
++        close,
++        ReliablePathCommand::CloseStream(StreamId(18))
++    ));
++    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&close));
++    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
++    assert_eq!(
++        commands.pending_bytes(),
++        0,
++        "close drops both old facts together"
++    );
++
++    for dequeued in [false, true] {
++        let (commands, mut receivers) = reliable_path_command_channels(1);
++        commands.begin_path_drain();
++        commands
++            .try_enqueue_stream_feedback_pair(ack.clone(), 64)
++            .unwrap();
++        if dequeued {
++            assert!(matches!(
++                try_recv_reliable_path_command(&mut receivers),
++                Some(ReliablePathCommand::SendFeedbackPair(_))
++            ));
++            assert_eq!(commands.writer_pending_bytes(), 2);
++        }
++        assert_eq!(commands.pending_bytes(), 2);
++        drop(receivers);
++        assert_eq!(commands.pending_bytes(), 0);
++        assert_eq!(commands.writer_pending_bytes(), 0);
++        assert!(matches!(
++            commands.try_enqueue_stream_feedback_pair(ack.clone(), 64),
++            Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
++        ));
++        assert_eq!(commands.pending_bytes(), 0);
++    }
++}
++
+ #[tokio::test]
+ async fn repair_split_keeps_existing_capacity_and_cancellation_charges() {
+     let (commands, mut ordinary) = reliable_path_command_channels(1);
+diff --git a/src/runtime/relay/control.rs b/src/runtime/relay/control.rs
+index e2e3138..24decc7 100644
+--- a/src/runtime/relay/control.rs
++++ b/src/runtime/relay/control.rs
+@@ -566,6 +566,39 @@ enum PendingLocalWritePathOpen {
+     Deferred(RelayAdditionalPathOpenResult),
+ }
+ 
++/// Receipt is always publishable here; credit is eligible only after the
++/// existing complete local write/flush future returns success.
++fn publish_client_received_progress(
++    product: &mut RequestProductState,
++    context: &ClientPathContext,
++    recv_stream: &mut ReliableRecvStream,
++    state: &mut ClientRelayState,
++    response_lane: TrafficClass,
++    local_write_completed: bool,
++) -> Result<(), RuntimeError> {
++    let (sender, remotes) = (&mut product.sender, &mut product.remotes);
++    let path = remotes.lowest_eta_path_snapshot(context, response_lane, PATH_OPEN_SCORE_BYTES);
++    let request = if local_write_completed {
++        RelayRecvProgressSend::received_and_consumed(path, response_lane)
++    } else {
++        RelayRecvProgressSend::ack_only(path, response_lane)
++    };
++    match sender.send_recv_progress(
++        remotes,
++        context,
++        recv_stream,
++        &mut state.progress.recv_progress,
++        request,
++    ) {
++        Ok(sent) => state.record_recv_progress_sent(sent),
++        Err(err) if reliable_path_error_is_migratable(&err) => {
++            state.progress.sender_retry_at = None;
++        }
++        Err(err) => return Err(err),
++    }
++    Ok(())
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn drive_client_response_startup_control(
+     context: &ClientPathContext,
+@@ -3493,50 +3526,25 @@ where
+                                     unreachable!("a deferred apply error must surface after its valid prefix write");
+                                 }
+ 
+-                                {
+-                                let mut product_guard = request_product.lock();
+-                                let product = &mut *product_guard;
+-                                let (sender, remotes) = (&mut product.sender, &mut product.remotes);
+-                                let prewrite_response_path_snapshot = remotes.lowest_eta_path_snapshot(
+-                                    context,
+-                                    response_lane,
+-                                    PATH_OPEN_SCORE_BYTES,
+-                                );
+-                                match sender
+-                                    .send_recv_progress(
+-                                        remotes,
++                                let startup = {
++                                    let mut product = request_product.lock();
++                                    drive_client_response_startup_control(
+                                         context,
+-                                        &mut recv_stream,
+-                                        &mut state.progress.recv_progress,
+-                                        RelayRecvProgressSend::ack_only(
+-                                            prewrite_response_path_snapshot,
+-                                            response_lane,
+-                                        ),
++                                        &spec,
++                                        &mut return_plan,
++                                        request_lane,
++                                        stream_id,
++                                        recv_stream.next_offset(),
++                                        &mut product.remotes,
++                                        &mut state,
++                                        &additional_path_open_tx,
+                                     )
+-                                {
+-                                    Ok(sent) => state.record_recv_progress_sent(sent),
+-                                    Err(err) if reliable_path_error_is_migratable(&err) => {
+-                                        state.progress.sender_retry_at = None;
+-                                    }
+-                                    Err(err) => break Err(err),
+-                                }
+-                                if let Err(err) = drive_client_response_startup_control(
+-                                    context,
+-                                    &spec,
+-                                    &mut return_plan,
+-                                    request_lane,
+-                                    stream_id,
+-                                    recv_stream.next_offset(),
+-                                    remotes,
+-                                    &mut state,
+-                                    &additional_path_open_tx,
+-                                ) {
+-                                    break Err(err);
+-                                }
+-
+-                                }
++                                };
++                                let mut receipt_offered = false;
+                                 let mut pending_write_path_opens = VecDeque::new();
+-                                let write = {
++                                let write = match startup {
++                                    Err(error) => Err(error),
++                                    Ok(()) => {
+                                     let write = write_applied_ready_stream_data_batch(
+                                         &mut local,
+                                         &mut ready_remote_data,
+@@ -3581,7 +3589,7 @@ where
+                                                 )
+                                             })
+                                             .flatten();
+-                                        if stream_ack_pending {
++                                        if stream_ack_pending && receipt_offered {
+                                             let publication = remotes.retry_pending_stream_ack();
+                                             state.record_recv_progress_sent(publication.published);
+                                         }
+@@ -3614,6 +3622,34 @@ where
+                                         prepared_work_wait.as_mut().enable();
+                                         (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, prepared_work_wait)
+                                         };
++                                        if !receipt_offered {
++                                            // One real-waker poll, never a wait for local
++                                            // consumption. Keep this exact future/cursor if
++                                            // it is Pending, and never repoll a Ready future.
++                                            let first_write = std::future::poll_fn(|cx| {
++                                                std::task::Poll::Ready(write.as_mut().poll(cx))
++                                            }).await;
++                                            receipt_offered = true;
++                                            let mut product = request_product.lock();
++                                            if let Err(error) = publish_client_received_progress(
++                                                &mut product,
++                                                context,
++                                                &mut recv_stream,
++                                                &mut state,
++                                                response_lane,
++                                                matches!(&first_write, std::task::Poll::Ready(Ok(_))),
++                                            ) {
++                                                break Err(error);
++                                            }
++                                            drop(product);
++                                            if let std::task::Poll::Ready(result) = first_write {
++                                                break result;
++                                            }
++                                            // Publication may have created a new blocked
++                                            // ACK obligation. Re-arm before retry/parking;
++                                            // the pre-poll capacity snapshot is insufficient.
++                                            continue;
++                                        }
+                                         tokio::select! {
+                                             biased;
+                                             result = &mut write => break result,
+@@ -3712,7 +3748,24 @@ where
+                                             }
+                                         }
+                                     }
++                                    }
+                                 };
++                                if !receipt_offered {
++                                    // A nonblocking startup/prepared error can precede
++                                    // the first write poll. Its accepted receive facts
++                                    // still reach publication before error cleanup.
++                                    let mut product = request_product.lock();
++                                    if let Err(error) = publish_client_received_progress(
++                                        &mut product,
++                                        context,
++                                        &mut recv_stream,
++                                        &mut state,
++                                        response_lane,
++                                        false,
++                                    ) {
++                                        break Err(error);
++                                    }
++                                }
+                                 if let Err(err) = write {
+                                     break Err(err);
+                                 }
+diff --git a/src/runtime/relay/server.rs b/src/runtime/relay/server.rs
+index ae2155b..27ab08a 100644
+--- a/src/runtime/relay/server.rs
++++ b/src/runtime/relay/server.rs
+@@ -701,6 +701,13 @@ fn enqueue_tcp_recv_progress(
+     force_max_data: bool,
+ ) -> bool {
+     let mut sent_any = false;
++    let max_offset = (publish_max_data
++        && progress.should_send_max_data(recv_stream, path, lane, mux_limits, force_max_data))
++    .then(|| {
++        let window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
++        recv_stream.max_data_offset_with_window(window)
++    });
++    let mut max_publication = None;
+     let previous_ack_generation = progress.ack_generation();
+     if progress.should_send_ack(recv_stream, path, lane, mux_limits, force_ack) {
+         let generation = progress.ack_generation();
+@@ -708,8 +715,12 @@ fn enqueue_tcp_recv_progress(
+             && generation == ack_publication.generation
+             && !ack_publication.cumulative_frames.is_empty()
+         {
+-            let publication =
+-                path_stream.retry_pending_ack(generation, &ack_publication.cumulative_frames);
++            let (publication, max_data) = path_stream.retry_pending_ack_with_max_data(
++                generation,
++                &ack_publication.cumulative_frames,
++                max_offset,
++            );
++            max_publication = Some(max_data);
+             ack_publication.record_status(generation, publication.published, publication.pending);
+             sent_any |= publication.published;
+         } else {
+@@ -725,8 +736,13 @@ fn enqueue_tcp_recv_progress(
+                 ack_started.elapsed(),
+                 cumulative_ack_frame_count,
+             );
+-            let publication =
+-                path_stream.publish_ack(generation, &ack_frames, &cumulative_ack_frames);
++            let (publication, max_data) = path_stream.publish_ack_with_max_data(
++                generation,
++                &ack_frames,
++                &cumulative_ack_frames,
++                max_offset,
++            );
++            max_publication = Some(max_data);
+             ack_publication.record_generation(
+                 generation,
+                 publication.published,
+@@ -736,12 +752,9 @@ fn enqueue_tcp_recv_progress(
+             sent_any |= publication.published;
+         }
+     }
+-    if publish_max_data
+-        && progress.should_send_max_data(recv_stream, path, lane, mux_limits, force_max_data)
+-    {
+-        let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
+-        let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
+-        let publication = path_stream.publish_max_data(max_offset);
++    if let Some(max_offset) = max_offset {
++        let publication =
++            max_publication.unwrap_or_else(|| path_stream.publish_max_data(max_offset));
+         if let Some(published_offset) = publication.published_offset {
+             recv_stream.commit_max_data(published_offset);
+             sent_any = true;
+diff --git a/src/runtime/relay/tests_control.rs b/src/runtime/relay/tests_control.rs
+index 802895a..75d0981 100644
+--- a/src/runtime/relay/tests_control.rs
++++ b/src/runtime/relay/tests_control.rs
+@@ -10,8 +10,8 @@ use crate::protocol::{
+ };
+ use crate::runtime::path::commands::{
+     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
+-    reliable_path_command_channels, try_recv_reliable_path_command,
+-    try_recv_reliable_path_priority_command,
++    reliable_path_command_channels, reliable_path_command_pending_bytes,
++    try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
+ };
+ use crate::runtime::stream::{
+     ReliablePathStream, ReliablePathStreamOutput, ReliableRelayRemoteInput,
+@@ -120,14 +120,27 @@ impl BlockedLocalDeliveryControl {
+ 
+ struct BlockedLocalDelivery {
+     state: Arc<BlockedLocalDeliveryState>,
++    mode: LocalDeliveryMode,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum LocalDeliveryMode {
++    PartialWrite,
++    Ready,
++    PendingFlush,
+ }
+ 
+ impl BlockedLocalDelivery {
+     fn new() -> (Self, BlockedLocalDeliveryControl) {
++        Self::with_mode(LocalDeliveryMode::PartialWrite)
++    }
++
++    fn with_mode(mode: LocalDeliveryMode) -> (Self, BlockedLocalDeliveryControl) {
+         let state = Arc::new(BlockedLocalDeliveryState::default());
+         (
+             Self {
+                 state: state.clone(),
++                mode,
+             },
+             BlockedLocalDeliveryControl { state },
+         )
+@@ -155,6 +168,10 @@ impl AsyncWrite for BlockedLocalDelivery {
+         }
+         let state = &self.state;
+         let mut accepted = state.accepted.lock().expect("blocked local delivery bytes");
++        if self.mode != LocalDeliveryMode::PartialWrite {
++            accepted.extend_from_slice(buf);
++            return Poll::Ready(Ok(buf.len()));
++        }
+         if accepted.is_empty() {
+             accepted.push(buf[0]);
+             return Poll::Ready(Ok(1));
+@@ -176,7 +193,18 @@ impl AsyncWrite for BlockedLocalDelivery {
+         Poll::Pending
+     }
+ 
+-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
++    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
++        if self.mode == LocalDeliveryMode::PendingFlush
++            && !self.state.released.load(Ordering::Acquire)
++        {
++            self.state.blocked.store(true, Ordering::Release);
++            self.state.blocked_notify.notify_waiters();
++            *self.state.write_waker.lock().expect("blocked flush waker") = Some(cx.waker().clone());
++            if self.state.released.load(Ordering::Acquire) {
++                cx.waker().wake_by_ref();
++            }
++            return Poll::Pending;
++        }
+         Poll::Ready(Ok(()))
+     }
+ 
+@@ -195,9 +223,18 @@ struct ResponseStartupProgressObservation {
+ 
+ impl ResponseStartupProgressObservation {
+     fn observe_command(&mut self, command: ReliablePathCommand, stream_id: StreamId) {
+-        let ReliablePathCommand::SendFrame(frame) = command else {
+-            return;
+-        };
++        match command {
++            ReliablePathCommand::SendFrame(frame) => self.observe_frame(frame, stream_id),
++            ReliablePathCommand::SendFeedbackPair(pair) => {
++                for frame in pair.into_frames() {
++                    self.observe_frame(frame, stream_id);
++                }
++            }
++            _ => {}
++        }
++    }
++
++    fn observe_frame(&mut self, frame: Frame, stream_id: StreamId) {
+         match frame {
+             Frame::StreamAck {
+                 stream_id: ack_stream_id,
+@@ -409,6 +446,125 @@ async fn restart_reset_during_blocked_product_write(obsolete_generation: bool) {
+     assert_eq!(control.accepted_bytes(), b"b");
+ }
+ 
++#[tokio::test]
++async fn first_local_poll_pairs_only_completed_write_and_flush() {
++    for mode in [LocalDeliveryMode::Ready, LocalDeliveryMode::PendingFlush] {
++        let stream_id = StreamId(622);
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let endpoint = listener.local_addr().unwrap();
++        let context = ClientPathContext::new(
++            vec![format!("tcp://{endpoint}").parse::<PathSpec>().unwrap()],
++            test_security(),
++            ResourceLimits::default(),
++        )
++        .unwrap();
++        let initial_window = reliable_stream_initial_advertised_window_bytes(
++            UnderlayProtocol::Tcp,
++            TrafficClass::Latency,
++            context.mux_limits,
++        );
++        let (commands, mut receivers) = reliable_path_command_channels(8);
++        let (frames_tx, frames_rx) = mpsc::channel(2);
++        let opened = test_opened_remote_stream(stream_id, 0, commands.clone(), frames_rx);
++        let (local, control) = BlockedLocalDelivery::with_mode(mode);
++        let relay = tokio::spawn(async move {
++            relay_migrating_tcp_stream(
++                local,
++                &context,
++                MppPerformanceConfig::default(),
++                ReliableRelayOpenSpec::new(TargetAddr::Ip(endpoint), TrafficClass::Latency),
++                opened,
++                None,
++            )
++            .await
++        });
++        tokio::time::timeout(Duration::from_secs(1), async {
++            loop {
++                let command = recv_reliable_path_command(&mut receivers).await.unwrap();
++                let initialized = matches!(
++                    &command,
++                    ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
++                );
++                receivers
++                    .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
++                if initialized {
++                    break;
++                }
++            }
++        })
++        .await
++        .expect("actor initialized");
++        while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
++            receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
++        }
++
++        frames_tx
++            .send(Ok(Frame::StreamData {
++                stream_id,
++                offset: 0,
++                payload: Bytes::from_static(b"reply"),
++            }))
++            .await
++            .unwrap();
++        if mode == LocalDeliveryMode::PendingFlush {
++            control.wait_blocked().await;
++        }
++        let mut observation = ResponseStartupProgressObservation::default();
++        let mut paired = false;
++        tokio::time::timeout(Duration::from_secs(1), async {
++            while observation.ack_frontier != 5 {
++                let command = recv_reliable_path_command(&mut receivers).await.unwrap();
++                paired |= matches!(&command, ReliablePathCommand::SendFeedbackPair(_));
++                receivers
++                    .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
++                observation.observe_command(command, stream_id);
++            }
++        })
++        .await
++        .expect("receipt feedback cannot wait for a pending flush");
++        assert_eq!(control.accepted_bytes(), b"reply");
++        if mode == LocalDeliveryMode::Ready {
++            assert!(paired, "ready write and flush publish one ACK/MAX pair");
++            assert_eq!(observation.maximum_data_offset, Some(initial_window + 5));
++        } else {
++            assert!(!paired, "pending flush authorizes receipt, not new credit");
++            while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
++                receivers
++                    .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
++                observation.observe_command(command, stream_id);
++            }
++            assert!(
++                observation
++                    .maximum_data_offset
++                    .is_none_or(|grant| grant <= initial_window)
++            );
++            control.release();
++            tokio::time::timeout(Duration::from_secs(1), async {
++                while observation.maximum_data_offset != Some(initial_window + 5) {
++                    let command = recv_reliable_path_command(&mut receivers).await.unwrap();
++                    assert!(
++                        !matches!(&command, ReliablePathCommand::SendFeedbackPair(_)),
++                        "completed pending flush publishes independent credit"
++                    );
++                    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(
++                        &command,
++                    ));
++                    observation.observe_command(command, stream_id);
++                }
++            })
++            .await
++            .expect("ordinary post-write credit remains serviced");
++            assert_eq!(
++                control.accepted_bytes(),
++                b"reply",
++                "retained flush never restarts writes"
++            );
++        }
++        relay.abort();
++        let _ = relay.await;
++    }
++}
++
+ #[tokio::test]
+ async fn response_startup_ack_open_and_final_progress_during_blocked_local_delivery() {
+     const STARTUP_TRIGGER_BYTES: usize = 58_400;
+diff --git a/src/runtime/relay/tests_io.rs b/src/runtime/relay/tests_io.rs
+index 35c4459..31a528e 100644
+--- a/src/runtime/relay/tests_io.rs
++++ b/src/runtime/relay/tests_io.rs
+@@ -32,6 +32,8 @@ struct VectoredWriteProbe {
+     max_write_bytes: Option<usize>,
+     yield_between_writes: bool,
+     yield_next: bool,
++    fail_write: bool,
++    fail_flush: bool,
+ }
+ 
+ impl AsyncWrite for VectoredWriteProbe {
+@@ -47,6 +49,9 @@ impl AsyncWrite for VectoredWriteProbe {
+         }
+         self.yield_next = self.yield_between_writes;
+         self.scalar_writes = self.scalar_writes.saturating_add(1);
++        if self.fail_write {
++            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
++        }
+         let written = self.max_write_bytes.unwrap_or(buf.len()).min(buf.len());
+         self.bytes.extend_from_slice(&buf[..written]);
+         Poll::Ready(Ok(written))
+@@ -54,7 +59,11 @@ impl AsyncWrite for VectoredWriteProbe {
+ 
+     fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+         self.flushes = self.flushes.saturating_add(1);
+-        Poll::Ready(Ok(()))
++        if self.fail_flush {
++            Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
++        } else {
++            Poll::Ready(Ok(()))
++        }
+     }
+ 
+     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+@@ -73,6 +82,9 @@ impl AsyncWrite for VectoredWriteProbe {
+         }
+         self.yield_next = self.yield_between_writes;
+         self.vectored_writes = self.vectored_writes.saturating_add(1);
++        if self.fail_write {
++            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
++        }
+         let total: usize = bufs.iter().map(|slice| slice.len()).sum();
+         let written = self.max_write_bytes.unwrap_or(total).min(total);
+         let mut remaining = written;
+@@ -89,6 +101,51 @@ impl AsyncWrite for VectoredWriteProbe {
+     }
+ }
+ 
++#[tokio::test]
++async fn first_write_poll_includes_flush_failure_without_restarting_delivery() {
++    use std::future::Future;
++
++    for fail_write in [true, false] {
++        let mut recv_stream = ReliableRecvStream::new(StreamId(702), MuxLimits::default());
++        let mut batch = ReadyStreamDataBatch::new();
++        batch.items.push(());
++        batch.payload_bytes = 5;
++        let applied = apply_ready_stream_data_batch(
++            &mut recv_stream,
++            &mut batch,
++            ReadyStreamDataDirection::ClientDownload,
++            true,
++            |recv_stream, ()| Ok(recv_stream.receive_data(0, Bytes::from_static(b"reply"))?),
++        );
++        let mut writer = VectoredWriteProbe {
++            fail_write,
++            fail_flush: !fail_write,
++            ..VectoredWriteProbe::default()
++        };
++        let result = {
++            let write = write_applied_ready_stream_data_batch(&mut writer, &mut batch, applied);
++            tokio::pin!(write);
++            std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await
++        };
++        assert!(matches!(result,
++            Poll::Ready(Err(RuntimeError::Io(error)))
++                if error.kind() == std::io::ErrorKind::BrokenPipe));
++        assert_eq!(writer.scalar_writes, 1);
++        assert_eq!(writer.flushes, usize::from(!fail_write));
++        assert_eq!(
++            writer.bytes.as_slice(),
++            if fail_write { &b""[..] } else { &b"reply"[..] }
++        );
++        assert!(batch.delivered.is_empty());
++        assert_eq!(batch.payload_bytes, 0);
++        assert_eq!(
++            recv_stream.next_offset(),
++            5,
++            "local errors do not revoke receipt facts"
++        );
++    }
++}
++
+ #[tokio::test]
+ async fn delivered_payload_write_preserves_partial_cursor_across_pending() {
+     for chunks in [
+diff --git a/src/runtime/sender/request.rs b/src/runtime/sender/request.rs
+index 6d09a8a..ebf79b0 100644
+--- a/src/runtime/sender/request.rs
++++ b/src/runtime/sender/request.rs
+@@ -346,6 +346,19 @@ impl RelayRecvProgressSend {
+             force_max_data: false,
+         }
+     }
++
++    pub(in crate::runtime) fn received_and_consumed(
++        path: Option<PathSnapshot>,
++        lane: TrafficClass,
++    ) -> Self {
++        Self {
++            path,
++            lane,
++            force_ack: true,
++            publish_max_data: true,
++            force_max_data: false,
++        }
++    }
+ }
+ 
+ impl RequestSenderService {
+@@ -1455,6 +1468,23 @@ impl RequestSenderService {
+         }
+ 
+         let mut sent_any = false;
++        let max_offset = (request.publish_max_data
++            && progress.should_send_max_data(
++                recv_stream,
++                request.path,
++                request.lane,
++                context.mux_limits,
++                request.force_max_data,
++            ))
++        .then(|| {
++            let window = reliable_stream_advertised_window_bytes(
++                request.path,
++                request.lane,
++                context.mux_limits,
++            );
++            recv_stream.max_data_offset_with_window(window)
++        });
++        let mut max_publication = None;
+         let ack_generation_before = progress.ack_generation();
+         if progress.should_send_ack(
+             recv_stream,
+@@ -1464,8 +1494,8 @@ impl RequestSenderService {
+             request.force_ack,
+         ) {
+             let generation = progress.ack_generation();
+-            let publication = if generation == ack_generation_before {
+-                remotes.retry_pending_stream_ack()
++            let (publication, max_data) = if generation == ack_generation_before {
++                remotes.retry_pending_stream_ack_with_max_data(max_offset)
+             } else {
+                 #[cfg(feature = "lab-diagnostics")]
+                 let ack_started = Instant::now();
+@@ -1505,8 +1535,14 @@ impl RequestSenderService {
+                         );
+                     }
+                 }
+-                remotes.publish_stream_ack(generation, update_frames, ack_frames)
++                remotes.publish_stream_ack_with_max_data(
++                    generation,
++                    update_frames,
++                    ack_frames,
++                    max_offset,
++                )
+             };
++            max_publication = Some(max_data);
+             sent_any |= publication.published;
+             #[cfg(feature = "lab-diagnostics")]
+             lab_diagnostic(
+@@ -1522,22 +1558,9 @@ impl RequestSenderService {
+                 ),
+             );
+         }
+-        if request.publish_max_data
+-            && progress.should_send_max_data(
+-                recv_stream,
+-                request.path,
+-                request.lane,
+-                context.mux_limits,
+-                request.force_max_data,
+-            )
+-        {
+-            let advertised_window = reliable_stream_advertised_window_bytes(
+-                request.path,
+-                request.lane,
+-                context.mux_limits,
+-            );
+-            let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
+-            let publication = remotes.publish_max_data(max_offset);
++        if let Some(max_offset) = max_offset {
++            let publication =
++                max_publication.unwrap_or_else(|| remotes.publish_max_data(max_offset));
+             if let Some(published_offset) = publication.published_offset {
+                 recv_stream.commit_max_data(published_offset);
+                 sent_any = true;
+diff --git a/src/runtime/sender/tests_request.rs b/src/runtime/sender/tests_request.rs
+index d90628d..2e83b07 100644
+--- a/src/runtime/sender/tests_request.rs
++++ b/src/runtime/sender/tests_request.rs
+@@ -3500,6 +3500,180 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
+     );
+ }
+ 
++#[tokio::test]
++async fn client_recv_progress_joint_publication_preserves_facts_in_one_envelope() {
++    let stream_id = StreamId(923);
++    let context = client_test_context();
++    let (commands, mut receivers) = reliable_path_command_channels(4);
++    let (mut remotes, _remote_input) =
++        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands.clone()), 4);
++    consume_client_path_proof_for_test(&mut receivers);
++    assert_eq!(commands.pending_bytes(), 0);
++    let window =
++        reliable_stream_advertised_window_bytes(None, TrafficClass::Throughput, context.mux_limits);
++    let mut recv_stream =
++        ReliableRecvStream::new_with_initial_max_offset(stream_id, context.mux_limits, window);
++    let payload = Bytes::from_static(b"reply");
++    let outcome = recv_stream.receive_data(0, payload.clone()).unwrap();
++    assert_eq!(outcome.delivered.as_slice(), &[payload.clone()]);
++    drop(outcome);
++    let frontier = payload.len() as u64;
++    let expected_grant = window + frontier;
++    let mut progress = ReliableRecvProgress::default();
++    let mut sender = RequestSenderService::new(stream_id);
++
++    assert!(
++        sender
++            .send_recv_progress(
++                &mut remotes,
++                &context,
++                &mut recv_stream,
++                &mut progress,
++                RelayRecvProgressSend::received_and_consumed(None, TrafficClass::Throughput),
++            )
++            .unwrap()
++    );
++    assert_eq!(progress.ack_generation(), 1);
++    assert_eq!(recv_stream.published_max_offset(), expected_grant);
++    assert!(!remotes.has_pending_stream_ack_publication());
++    assert!(!remotes.has_pending_max_data_publication());
++    assert_eq!(commands.pending_bytes(), 2, "two independent control units");
++
++    let mut envelopes = 0;
++    let mut frames = Vec::new();
++    while let Some(command) = try_recv_reliable_path_priority_command(&mut receivers) {
++        envelopes += 1;
++        let charge = reliable_path_command_pending_bytes(&command);
++        match command {
++            ReliablePathCommand::SendFrame(frame) => frames.push(frame),
++            ReliablePathCommand::SendFeedbackPair(pair) => frames.extend(pair.into_frames()),
++            _ => panic!("receive-progress publication contains only feedback"),
++        }
++        receivers.release_pending_command_bytes(charge);
++    }
++    assert_eq!(
++        frames,
++        vec![
++            Frame::StreamAck {
++                stream_id,
++                scope_start: None,
++                ranges: vec![OffsetRange {
++                    start: 0,
++                    end: frontier
++                }],
++            },
++            Frame::StreamMaxData {
++                stream_id,
++                max_offset: expected_grant
++            },
++        ]
++    );
++    assert_eq!(commands.pending_bytes(), 0);
++    let ack_retry = remotes.retry_pending_stream_ack();
++    assert!(!ack_retry.accepted && ack_retry.published && !ack_retry.pending);
++    let max_retry = remotes.retry_pending_max_data();
++    assert_eq!(max_retry.published_offset, None);
++    assert!(!max_retry.pending);
++    assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
++
++    // Optimization-work RED: all receipt/credit semantics above already pass.
++    // This bound alone proves neither corruption nor a throughput improvement.
++    assert_eq!(
++        envelopes, 1,
++        "jointly available feedback needs one envelope"
++    );
++}
++
++#[tokio::test]
++async fn client_joint_feedback_fences_partial_ack_and_independent_credit() {
++    let stream_id = StreamId(924);
++    let (commands, mut receivers) = reliable_path_command_channels(1);
++    let (mut remotes, _input) =
++        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands.clone()), 4);
++    consume_client_path_proof_for_test(&mut receivers);
++    let grant = remotes.paths[0].published_max_data_offset + 32;
++    let chunks = vec![
++        Frame::StreamAck {
++            stream_id,
++            scope_start: None,
++            ranges: vec![OffsetRange { start: 0, end: 8 }],
++        },
++        Frame::StreamAck {
++            stream_id,
++            scope_start: Some(8),
++            ranges: vec![OffsetRange { start: 16, end: 24 }],
++        },
++    ];
++    commands
++        .try_enqueue_admitted_frame(Frame::Ping { nonce: 1 }, TrafficClass::Control)
++        .unwrap();
++    let (ack, max) =
++        remotes.publish_stream_ack_with_max_data(1, chunks.clone(), chunks.clone(), Some(grant));
++    assert!(!ack.accepted && !ack.published && ack.pending);
++    assert_eq!(max.published_offset, None);
++    assert!(max.pending);
++    let held = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
++    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&held));
++    assert!(matches!(
++        held,
++        ReliablePathCommand::SendFrame(Frame::Ping { nonce: 1 })
++    ));
++
++    let (ack, max) = remotes.retry_pending_stream_ack_with_max_data(Some(grant));
++    assert!(ack.accepted && !ack.published && ack.pending);
++    assert_eq!(max.published_offset, Some(grant));
++    assert!(
++        !max.pending,
++        "credit does not wait for the complete ACK generation"
++    );
++    let held = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
++    assert_eq!(reliable_path_command_pending_bytes(&held), 2);
++    receivers.release_pending_command_bytes(2);
++    match held {
++        ReliablePathCommand::SendFeedbackPair(pair) => assert_eq!(
++            pair.into_frames(),
++            [
++                chunks[0].clone(),
++                Frame::StreamMaxData {
++                    stream_id,
++                    max_offset: grant
++                }
++            ]
++        ),
++        _ => panic!("first accepted chunk carries the independent grant"),
++    }
++    assert!(remotes.retry_pending_stream_ack().published);
++    let held = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
++    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&held));
++    assert!(matches!(held, ReliablePathCommand::SendFrame(frame) if frame == chunks[1]));
++
++    let (ack, max) = remotes.retry_pending_stream_ack_with_max_data(Some(grant + 1));
++    assert!(!ack.accepted && ack.published && !ack.pending);
++    assert_eq!(max.published_offset, Some(grant + 1));
++    assert!(!max.pending);
++    let held = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
++    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&held));
++    assert!(
++        matches!(held, ReliablePathCommand::SendFrame(Frame::StreamMaxData { max_offset, .. }) if max_offset == grant + 1)
++    );
++    assert_eq!(commands.pending_bytes(), 0);
++
++    let (replacement_commands, mut replacement_rx) = reliable_path_command_channels(4);
++    remotes.attach(opened_test_relay_stream(stream_id, 1, replacement_commands));
++    consume_client_path_proof_for_test(&mut replacement_rx);
++    let (ack, max) = remotes.retry_pending_stream_ack_with_max_data(Some(grant + 1));
++    assert!(ack.accepted && ack.published && !ack.pending);
++    assert_eq!(max.published_offset, Some(grant + 1));
++    assert!(!max.pending);
++    let held = try_recv_reliable_path_priority_command(&mut replacement_rx).unwrap();
++    replacement_rx.release_pending_command_bytes(reliable_path_command_pending_bytes(&held));
++    assert!(matches!(held, ReliablePathCommand::SendFeedbackPair(_)));
++    let held = try_recv_reliable_path_priority_command(&mut replacement_rx).unwrap();
++    replacement_rx.release_pending_command_bytes(reliable_path_command_pending_bytes(&held));
++    assert!(matches!(held, ReliablePathCommand::SendFrame(frame) if frame == chunks[1]));
++    assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
++}
++
+ #[tokio::test]
+ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
+     let stream_id = StreamId(92);
+@@ -3995,10 +4169,18 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
+         try_recv_reliable_path_priority_command(&mut first_rx),
+         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+     ));
+-    assert!(matches!(
+-        try_recv_reliable_path_priority_command(&mut second_rx),
+-        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+-    ));
++    let Some(ReliablePathCommand::SendFeedbackPair(pair)) =
++        try_recv_reliable_path_priority_command(&mut second_rx)
++    else {
++        panic!("available sibling accepts both current receipt and credit");
++    };
++    let [ack, max] = pair.into_frames();
++    assert!(matches!(ack, Frame::StreamAck { stream_id: id, ranges, .. }
++        if id == stream_id && ranges == vec![OffsetRange { start: 0, end: 5 }]));
++    assert!(
++        matches!(max, Frame::StreamMaxData { stream_id: id, max_offset }
++        if id == stream_id && max_offset == recv_stream.published_max_offset())
++    );
+ }
+ 
+ #[tokio::test]
+diff --git a/src/runtime/stream/handle.rs b/src/runtime/stream/handle.rs
+index dd45725..777dbc7 100644
+--- a/src/runtime/stream/handle.rs
++++ b/src/runtime/stream/handle.rs
+@@ -499,30 +499,53 @@ impl ReliablePathStream {
+         }
+     }
+ 
+-    pub(in crate::runtime) fn publish_ack(
++    pub(in crate::runtime) fn retry_pending_ack(
+         &self,
+         generation: u64,
+-        update_frames: &[Frame],
+         cumulative_frames: &[Frame],
+     ) -> StreamAckPublication {
+         match &self.output {
+             ReliablePathStreamOutput::Switchable(binding) => {
+-                binding.publish_ack(generation, update_frames, cumulative_frames)
++                binding.retry_pending_ack(generation, cumulative_frames)
+             }
+             ReliablePathStreamOutput::Fixed(_) => StreamAckPublication::default(),
+         }
+     }
+ 
+-    pub(in crate::runtime) fn retry_pending_ack(
++    pub(in crate::runtime) fn publish_ack_with_max_data(
+         &self,
+         generation: u64,
++        update_frames: &[Frame],
+         cumulative_frames: &[Frame],
+-    ) -> StreamAckPublication {
++        max_offset: Option<u64>,
++    ) -> (StreamAckPublication, StreamMaxDataPublication) {
+         match &self.output {
+-            ReliablePathStreamOutput::Switchable(binding) => {
+-                binding.retry_pending_ack(generation, cumulative_frames)
+-            }
+-            ReliablePathStreamOutput::Fixed(_) => StreamAckPublication::default(),
++            ReliablePathStreamOutput::Switchable(binding) => binding.publish_ack_with_max_data(
++                self.stream_id,
++                generation,
++                update_frames,
++                cumulative_frames,
++                max_offset,
++            ),
++            ReliablePathStreamOutput::Fixed(_) => Default::default(),
++        }
++    }
++
++    pub(in crate::runtime) fn retry_pending_ack_with_max_data(
++        &self,
++        generation: u64,
++        cumulative_frames: &[Frame],
++        max_offset: Option<u64>,
++    ) -> (StreamAckPublication, StreamMaxDataPublication) {
++        match &self.output {
++            ReliablePathStreamOutput::Switchable(binding) => binding
++                .retry_pending_ack_with_max_data(
++                    self.stream_id,
++                    generation,
++                    cumulative_frames,
++                    max_offset,
++                ),
++            ReliablePathStreamOutput::Fixed(_) => Default::default(),
+         }
+     }
+ 
+@@ -758,6 +781,21 @@ pub(in crate::runtime) struct ReliablePathStreamHandle {
+ }
+ 
+ impl ReliablePathStreamHandle {
++    pub(in crate::runtime) fn try_enqueue_stream_feedback_pair(
++        &self,
++        ack: Frame,
++        max_offset: u64,
++    ) -> Result<(), RuntimeError> {
++        match &self.output {
++            ReliablePathStreamOutput::Fixed(fixed) => fixed
++                .commands()
++                .try_enqueue_stream_feedback_pair(ack, max_offset),
++            ReliablePathStreamOutput::Switchable(_) => {
++                Err(RuntimeError::Protocol("request relay path is not fixed"))
++            }
++        }
++    }
++
+     pub(in crate::runtime) fn try_enqueue_request_control_frame(
+         &self,
+         frame: Frame,
+diff --git a/src/runtime/stream/request/attachment.rs b/src/runtime/stream/request/attachment.rs
+index fdd5669..fd01441 100644
+--- a/src/runtime/stream/request/attachment.rs
++++ b/src/runtime/stream/request/attachment.rs
+@@ -429,6 +429,28 @@ pub(in crate::runtime) struct ReliableRelayRemotePath {
+     pub(in crate::runtime) stream: ReliablePathStreamHandle,
+ }
+ 
++fn try_enqueue_ack_with_max_data(
++    stream: &ReliablePathStreamHandle,
++    published_max_offset: &mut u64,
++    desired_max_offset: Option<u64>,
++    frame: Frame,
++) -> bool {
++    if let Some(max_offset) = desired_max_offset
++        && *published_max_offset < max_offset
++    {
++        if stream
++            .try_enqueue_stream_feedback_pair(frame, max_offset)
++            .is_err()
++        {
++            return false;
++        }
++        *published_max_offset = max_offset;
++        true
++    } else {
++        stream.try_enqueue_request_control_frame(frame).is_ok()
++    }
++}
++
+ impl ReliableRelayRemotePath {
+     pub(in crate::runtime) fn key(&self) -> RelayPathKey {
+         RelayPathKey {
+@@ -1253,6 +1275,19 @@ impl ReliableRelayRemoteSet {
+         update_frames: Vec<Frame>,
+         cumulative_frames: Vec<Frame>,
+     ) -> StreamAckPublication {
++        self.publish_stream_ack_with_max_data(generation, update_frames, cumulative_frames, None)
++            .0
++    }
++
++    /// Pairs only one currently offered ACK chunk with an independently due
++    /// grant. Remaining ACK chunks and unpaired credit keep their own retries.
++    pub(in crate::runtime) fn publish_stream_ack_with_max_data(
++        &mut self,
++        generation: u64,
++        update_frames: Vec<Frame>,
++        cumulative_frames: Vec<Frame>,
++        max_offset: Option<u64>,
++    ) -> (StreamAckPublication, StreamMaxDataPublication) {
+         debug_assert!(generation != 0);
+         debug_assert!(!update_frames.is_empty());
+         debug_assert!(!cumulative_frames.is_empty());
+@@ -1264,22 +1299,47 @@ impl ReliableRelayRemoteSet {
+         );
+         self.desired_stream_ack_generation = generation;
+         self.desired_stream_ack_frames = cumulative_frames;
++        let desired_max_offset = max_offset.map(|offset| {
++            self.desired_max_data_offset = self.desired_max_data_offset.max(offset);
++            self.desired_max_data_offset
++        });
+         let mut publication = StreamAckPublication::default();
++        let mut max_publication = StreamMaxDataPublication::default();
+         for path in &mut self.paths {
+             if path.stream.request_control_frame_admission_is_closed() {
+                 continue;
+             }
++            let previous_max_offset = path.published_max_data_offset;
++            let stream = &path.stream;
++            let published_max_offset = &mut path.published_max_data_offset;
+             let attachment = path.stream_ack_publication.publish_update(
+                 generation,
+                 &update_frames,
+                 &self.desired_stream_ack_frames,
+-                |frame| path.stream.try_enqueue_request_control_frame(frame).is_ok(),
++                |frame| {
++                    try_enqueue_ack_with_max_data(
++                        stream,
++                        published_max_offset,
++                        desired_max_offset,
++                        frame,
++                    )
++                },
+             );
++            if path.published_max_data_offset > previous_max_offset {
++                max_publication.published_offset = Some(path.published_max_data_offset);
++            }
+             publication.accepted |= attachment.accepted;
+             publication.published |= attachment.published;
+         }
+         publication.pending = self.has_pending_stream_ack_publication();
+-        publication
++        if max_offset.is_some() {
++            let standalone = self.retry_pending_max_data();
++            max_publication.published_offset = max_publication
++                .published_offset
++                .or(standalone.published_offset);
++            max_publication.pending = standalone.pending;
++        }
++        (publication, max_publication)
+     }
+ 
+     pub(in crate::runtime) fn stream_ack_generation(&self) -> u64 {
+@@ -1287,18 +1347,40 @@ impl ReliableRelayRemoteSet {
+     }
+ 
+     pub(in crate::runtime) fn retry_pending_stream_ack(&mut self) -> StreamAckPublication {
++        self.retry_pending_stream_ack_with_max_data(None).0
++    }
++
++    pub(in crate::runtime) fn retry_pending_stream_ack_with_max_data(
++        &mut self,
++        max_offset: Option<u64>,
++    ) -> (StreamAckPublication, StreamMaxDataPublication) {
++        let desired_max_offset = max_offset.map(|offset| {
++            self.desired_max_data_offset = self.desired_max_data_offset.max(offset);
++            self.desired_max_data_offset
++        });
+         let generation = self.desired_stream_ack_generation;
+         if generation == 0 || self.desired_stream_ack_frames.is_empty() {
+-            return StreamAckPublication::default();
++            return (
++                StreamAckPublication::default(),
++                if max_offset.is_some() {
++                    self.retry_pending_max_data()
++                } else {
++                    StreamMaxDataPublication::default()
++                },
++            );
+         }
+ 
+         let stream_id = self.stream_id;
+         let frames = &self.desired_stream_ack_frames;
+         let mut publication = StreamAckPublication::default();
++        let mut max_publication = StreamMaxDataPublication::default();
+         for path in &mut self.paths {
+             if path.stream.request_control_frame_admission_is_closed() {
+                 continue;
+             }
++            let previous_max_offset = path.published_max_data_offset;
++            let stream = &path.stream;
++            let published_max_offset = &mut path.published_max_data_offset;
+             let attachment = path.stream_ack_publication.retry_cumulative(
+                 generation,
+                 frames,
+@@ -1306,14 +1388,29 @@ impl ReliableRelayRemoteSet {
+                     debug_assert!(
+                         matches!(&frame, Frame::StreamAck { stream_id: id, .. } if *id == stream_id)
+                     );
+-                    path.stream.try_enqueue_request_control_frame(frame).is_ok()
++                    try_enqueue_ack_with_max_data(
++                        stream,
++                        published_max_offset,
++                        desired_max_offset,
++                        frame,
++                    )
+                 },
+             );
++            if path.published_max_data_offset > previous_max_offset {
++                max_publication.published_offset = Some(path.published_max_data_offset);
++            }
+             publication.accepted |= attachment.accepted;
+             publication.published |= attachment.published;
+         }
+         publication.pending = self.has_pending_stream_ack_publication();
+-        publication
++        if max_offset.is_some() {
++            let standalone = self.retry_pending_max_data();
++            max_publication.published_offset = max_publication
++                .published_offset
++                .or(standalone.published_offset);
++            max_publication.pending = standalone.pending;
++        }
++        (publication, max_publication)
+     }
+ 
+     pub(in crate::runtime) fn has_pending_stream_ack_publication(&self) -> bool {
+diff --git a/src/runtime/stream/response/attachment.rs b/src/runtime/stream/response/attachment.rs
+index 79083b1..28aec23 100644
+--- a/src/runtime/stream/response/attachment.rs
++++ b/src/runtime/stream/response/attachment.rs
+@@ -265,23 +265,37 @@ fn publish_ack_update(
+     generation: u64,
+     update_frames: &[Frame],
+     cumulative_frames: &[Frame],
+-) -> StreamAckPublication {
++    max_data: Option<(StreamId, u64)>,
++) -> (StreamAckPublication, StreamMaxDataPublication) {
++    let desired_max_offset = max_data.map(|(_, offset)| {
++        outputs.desired_max_data_offset = outputs.desired_max_data_offset.max(offset);
++        outputs.desired_max_data_offset
++    });
+     let mut publication = StreamAckPublication::default();
++    let mut max_publication = StreamMaxDataPublication::default();
+     for entry in &mut outputs.entries {
+         if entry.commands.control_frame_admission_is_closed() {
+             continue;
+         }
+         let commands = &entry.commands;
++        let previous_max_offset = entry.published_max_data_offset;
++        let published_max_offset = &mut entry.published_max_data_offset;
+         let attachment = entry.ack_publication.publish_update(
+             generation,
+             update_frames,
+             cumulative_frames,
+             |frame| {
+-                commands
+-                    .try_enqueue_admitted_frame(frame, TrafficClass::Control)
+-                    .is_ok()
++                try_enqueue_ack_with_max_data(
++                    commands,
++                    published_max_offset,
++                    desired_max_offset,
++                    frame,
++                )
+             },
+         );
++        if entry.published_max_data_offset > previous_max_offset {
++            max_publication.published_offset = Some(entry.published_max_data_offset);
++        }
+         publication.accepted |= attachment.accepted;
+         publication.published |= attachment.published;
+     }
+@@ -293,15 +307,28 @@ fn publish_ack_update(
+         !entry.commands.control_frame_admission_is_closed()
+             && entry.ack_publication.is_pending(generation)
+     });
+-    publication
++    if let Some((stream_id, _)) = max_data {
++        let standalone = publish_pending_max_data(outputs, stream_id);
++        max_publication.published_offset = max_publication
++            .published_offset
++            .or(standalone.published_offset);
++        max_publication.pending = standalone.pending;
++    }
++    (publication, max_publication)
+ }
+ 
+ fn retry_pending_ack(
+     outputs: &mut ResponseStreamOutputs,
+     generation: u64,
+     cumulative_frames: &[Frame],
+-) -> StreamAckPublication {
++    max_data: Option<(StreamId, u64)>,
++) -> (StreamAckPublication, StreamMaxDataPublication) {
++    let desired_max_offset = max_data.map(|(_, offset)| {
++        outputs.desired_max_data_offset = outputs.desired_max_data_offset.max(offset);
++        outputs.desired_max_data_offset
++    });
+     let mut publication = StreamAckPublication::default();
++    let mut max_publication = StreamMaxDataPublication::default();
+     for entry in &mut outputs.entries {
+         if entry.commands.control_frame_admission_is_closed()
+             || !entry.ack_publication.is_pending(generation)
+@@ -309,14 +336,22 @@ fn retry_pending_ack(
+             continue;
+         }
+         let commands = &entry.commands;
++        let previous_max_offset = entry.published_max_data_offset;
++        let published_max_offset = &mut entry.published_max_data_offset;
+         let attachment =
+             entry
+                 .ack_publication
+                 .retry_cumulative(generation, cumulative_frames, |frame| {
+-                    commands
+-                        .try_enqueue_admitted_frame(frame, TrafficClass::Control)
+-                        .is_ok()
++                    try_enqueue_ack_with_max_data(
++                        commands,
++                        published_max_offset,
++                        desired_max_offset,
++                        frame,
++                    )
+                 });
++        if entry.published_max_data_offset > previous_max_offset {
++            max_publication.published_offset = Some(entry.published_max_data_offset);
++        }
+         publication.accepted |= attachment.accepted;
+         publication.published |= attachment.published;
+     }
+@@ -328,7 +363,38 @@ fn retry_pending_ack(
+         !entry.commands.control_frame_admission_is_closed()
+             && entry.ack_publication.is_pending(generation)
+     });
+-    publication
++    if let Some((stream_id, _)) = max_data {
++        let standalone = publish_pending_max_data(outputs, stream_id);
++        max_publication.published_offset = max_publication
++            .published_offset
++            .or(standalone.published_offset);
++        max_publication.pending = standalone.pending;
++    }
++    (publication, max_publication)
++}
++
++fn try_enqueue_ack_with_max_data(
++    commands: &ReliablePathCommandSender,
++    published_max_offset: &mut u64,
++    desired_max_offset: Option<u64>,
++    frame: Frame,
++) -> bool {
++    if let Some(max_offset) = desired_max_offset
++        && *published_max_offset < max_offset
++    {
++        if commands
++            .try_enqueue_stream_feedback_pair(frame, max_offset)
++            .is_err()
++        {
++            return false;
++        }
++        *published_max_offset = max_offset;
++        true
++    } else {
++        commands
++            .try_enqueue_admitted_frame(frame, TrafficClass::Control)
++            .is_ok()
++    }
+ }
+ 
+ impl ResponseStreamBinding {
+@@ -384,17 +450,25 @@ impl ResponseStreamBinding {
+     /// Publishes one newly observed Data ACK generation on every live output.
+     /// An output exactly caught up to the preceding generation may receive the
+     /// smaller update; a new or blocked output receives cumulative state.
+-    pub(in crate::runtime) fn publish_ack(
++    pub(in crate::runtime) fn publish_ack_with_max_data(
+         &self,
++        stream_id: StreamId,
+         generation: u64,
+         update_frames: &[Frame],
+         cumulative_frames: &[Frame],
+-    ) -> StreamAckPublication {
++        max_offset: Option<u64>,
++    ) -> (StreamAckPublication, StreamMaxDataPublication) {
+         let mut outputs = self
+             .outputs
+             .lock()
+             .expect("server reliable stream binding lock");
+-        publish_ack_update(&mut outputs, generation, update_frames, cumulative_frames)
++        publish_ack_update(
++            &mut outputs,
++            generation,
++            update_frames,
++            cumulative_frames,
++            max_offset.map(|offset| (stream_id, offset)),
++        )
+     }
+ 
+     pub(in crate::runtime) fn retry_pending_ack(
+@@ -406,7 +480,26 @@ impl ResponseStreamBinding {
+             .outputs
+             .lock()
+             .expect("server reliable stream binding lock");
+-        retry_pending_ack(&mut outputs, generation, cumulative_frames)
++        retry_pending_ack(&mut outputs, generation, cumulative_frames, None).0
++    }
++
++    pub(in crate::runtime) fn retry_pending_ack_with_max_data(
++        &self,
++        stream_id: StreamId,
++        generation: u64,
++        cumulative_frames: &[Frame],
++        max_offset: Option<u64>,
++    ) -> (StreamAckPublication, StreamMaxDataPublication) {
++        let mut outputs = self
++            .outputs
++            .lock()
++            .expect("server reliable stream binding lock");
++        retry_pending_ack(
++            &mut outputs,
++            generation,
++            cumulative_frames,
++            max_offset.map(|offset| (stream_id, offset)),
++        )
+     }
+ 
+     pub(in crate::runtime) fn pending_ack_capacity_notifies(
+diff --git a/src/runtime/stream/response/tests_attachment.rs b/src/runtime/stream/response/tests_attachment.rs
+index 2e04680..c333800 100644
+--- a/src/runtime/stream/response/tests_attachment.rs
++++ b/src/runtime/stream/response/tests_attachment.rs
+@@ -13,7 +13,8 @@ use crate::protocol::{
+ };
+ use crate::runtime::RuntimeError;
+ use crate::runtime::path::commands::{
+-    ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_priority_command,
++    ReliablePathCommand, reliable_path_command_channels, reliable_path_command_pending_bytes,
++    try_recv_reliable_path_priority_command,
+ };
+ use crate::runtime::sender::ServerReinjectionOutputIdentity;
+ use crate::scheduler::TrafficClass;
+@@ -461,7 +462,9 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
+         scope_start: Some(0),
+         ranges: vec![OffsetRange { start: 0, end: 8 }],
+     }];
+-    let first = binding.publish_ack(1, &initial_snapshot, &initial_snapshot);
++    let first = binding
++        .publish_ack_with_max_data(stream_id, 1, &initial_snapshot, &initial_snapshot, None)
++        .0;
+     assert!(first.published);
+     assert!(!first.pending);
+     assert!(matches!(
+@@ -497,7 +500,9 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
+             OffsetRange { start: 16, end: 24 },
+         ],
+     }];
+-    let second = binding.publish_ack(2, &update, &cumulative);
++    let second = binding
++        .publish_ack_with_max_data(stream_id, 2, &update, &cumulative, None)
++        .0;
+     assert!(second.published);
+     assert!(!second.pending);
+     assert!(matches!(
+@@ -543,7 +548,9 @@ fn retained_ack_retry_resumes_at_the_first_unaccepted_cumulative_chunk() {
+             ranges: vec![OffsetRange { start: 16, end: 24 }],
+         },
+     ];
+-    let first = binding.publish_ack(1, &cumulative, &cumulative);
++    let first = binding
++        .publish_ack_with_max_data(stream_id, 1, &cumulative, &cumulative, None)
++        .0;
+     assert!(!first.published);
+     assert!(first.pending);
+ 
+@@ -583,6 +590,87 @@ fn retained_ack_retry_resumes_at_the_first_unaccepted_cumulative_chunk() {
+     assert!(!fenced.pending);
+ }
+ 
++#[test]
++fn joint_feedback_acceptance_fences_one_chunk_without_gating_credit() {
++    let stream_id = StreamId(7);
++    let (binding, initial, mut receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
++    let commands = with_output_entry_for_key(&binding, initial, |entry| entry.commands.clone());
++    for nonce in 0..8 {
++        commands
++            .try_enqueue_admitted_frame(Frame::Ping { nonce }, TrafficClass::Control)
++            .unwrap();
++    }
++    let chunks = vec![
++        Frame::StreamAck {
++            stream_id,
++            scope_start: None,
++            ranges: vec![OffsetRange { start: 0, end: 8 }],
++        },
++        Frame::StreamAck {
++            stream_id,
++            scope_start: Some(8),
++            ranges: vec![OffsetRange { start: 16, end: 24 }],
++        },
++    ];
++    let (ack, max) = binding.publish_ack_with_max_data(stream_id, 1, &chunks, &chunks, Some(4096));
++    assert!(!ack.accepted && !ack.published && ack.pending);
++    assert_eq!(max.published_offset, None);
++    assert!(max.pending);
++    assert_eq!(
++        with_output_entry_for_key(&binding, initial, |entry| entry.published_max_data_offset),
++        0
++    );
++    let held = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
++    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&held));
++
++    let (ack, max) = binding.retry_pending_ack_with_max_data(stream_id, 1, &chunks, Some(4096));
++    assert!(ack.accepted && !ack.published && ack.pending);
++    assert_eq!(max.published_offset, Some(4096));
++    assert!(!max.pending);
++    for nonce in 1..8 {
++        let held = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
++        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&held));
++        assert!(
++            matches!(held, ReliablePathCommand::SendFrame(Frame::Ping { nonce: received }) if received == nonce)
++        );
++    }
++    let held = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
++    assert_eq!(reliable_path_command_pending_bytes(&held), 2);
++    receivers.release_pending_command_bytes(2);
++    match held {
++        ReliablePathCommand::SendFeedbackPair(pair) => assert_eq!(
++            pair.into_frames(),
++            [
++                chunks[0].clone(),
++                Frame::StreamMaxData {
++                    stream_id,
++                    max_offset: 4096
++                }
++            ]
++        ),
++        _ => panic!("accepted prefix and grant share one queue transaction"),
++    }
++    assert!(binding.retry_pending_ack(1, &chunks).published);
++    let held = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
++    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&held));
++    assert!(matches!(held, ReliablePathCommand::SendFrame(frame) if frame == chunks[1]));
++
++    let (ack, max) = binding.retry_pending_ack_with_max_data(stream_id, 1, &chunks, Some(4097));
++    assert!(!ack.accepted && ack.published && !ack.pending);
++    assert_eq!(max.published_offset, Some(4097));
++    assert!(!max.pending, "already covered ACK cannot gate newer credit");
++    let held = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
++    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&held));
++    assert!(matches!(
++        held,
++        ReliablePathCommand::SendFrame(Frame::StreamMaxData {
++            max_offset: 4097,
++            ..
++        })
++    ));
++    assert_eq!(commands.pending_bytes(), 0);
++}
++
+ #[test]
+ fn retained_ack_publication_status_excludes_a_detached_fence() {
+     let stream_id = StreamId(7);
+@@ -592,7 +680,12 @@ fn retained_ack_publication_status_excludes_a_detached_fence() {
+         scope_start: Some(0),
+         ranges: vec![OffsetRange { start: 0, end: 8 }],
+     }];
+-    assert!(binding.publish_ack(1, &cumulative, &cumulative).published);
++    assert!(
++        binding
++            .publish_ack_with_max_data(stream_id, 1, &cumulative, &cumulative, None)
++            .0
++            .published
++    );
+ 
+     let alternate = alternate_key(UnderlayProtocol::Udp);
+     let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);

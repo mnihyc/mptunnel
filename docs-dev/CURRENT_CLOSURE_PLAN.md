@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 15:46 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 16:29 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,57 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — exact repair/receipt timing in one bounded byte window.**
+**Current next action — prove the existing live-owner repair service boundary.**
+
+The fixed-window transaction completes; REPAIR_WINDOW_20260909 and its verified
+307265B raw archive retain the result. Ordinary-policy observation408.341Mbps,
+80/80echoes, p95/max445.177/773.080ms and bodygap.338428s is not an improvement
+comparison. All16777216 window bytes arrive as Originals; all28 accepted copies
+(347856 clipped bytes) arrive187–250ms later. All35 queued events are fallback-
+authorized, not an early loss/ETA trigger. Originals precede accepted-copy
+queueing56–72ms, comparable to configured70ms return propagation. Thus sender
+knowledge lag is not proof of faulty ACK publication or a timer correction.
+No window extrapolation or blanket repair suppression is justified. The six-file
+observer is removed, ordinary executable restored; no runtime/RFC change.
+
+Existing issue: mixed-mode stalls and slow takeover while an Original owner is
+still live. Two independent source reviews find that after a head quantum is
+actually accepted on alternate B, the live producer revisits the same Product
+ACK frontier. B's exact copy ownership excludes B there and truncates the
+uniform prefix; no following mature suffix is served before ACK advances it.
+Native queue drain alone does not clear Product debt. This follows current T06,
+not a loop typo. Exact stale/failed recovery has different authority and escapes
+the restriction; this is not a universal stream throughput ceiling.
+
+Question: can actual producer/admission/receipt paths demonstrate this boundary
+with a live Original A, healthy credited B, and two mature quanta, and does it
+warrant a pipelined takeover contract rather than a deliberately bounded hedge?
+Competing cost: continuous repair can amplify the already-observed losing copies
+and worsen healthy latency. First characterize real dispatch, drain native
+pending work without Product ACK, verify B's remaining service and blocked next
+range, then apply actual positive receipt/ACK and verify next-range progress.
+Use one focused test, not another observer build or full lab. A missing native
+credit/invalid owner fixture falsifies the claimed mechanism.
+
+Conditional information/benefit forecast: if only q repair bytes can advance
+per Product-ACK cycle tau while originals do not progress, service is bounded
+by8q/tau. At q14600B and tau100ms this is1.168Mbps despite a500Mbps alternate.
+Actual q is phase/model dependent; structural failure and Original progress
+invalidate that bound. Removing this serialization could materially improve
+known multi-second takeover, but no current timing capture attributes its full
+stall to this limit, and healthy performance may regress. Do not predict a gain
+or select a candidate from the equation alone.
+
+Independent contract review must preserve per-prefix rank=Apply extent,
+immutable assignment clocks, exact range/slot debt, lowest unresolved head
+obligation, sparse work, failed-copy retry and actor work bounds. Copy acceptance
+is not receipt. No G_s hard gate, ACK-renewed fallback or one-copy-per-RTT cap:
+those recreate trickle starvation or add an explicit capacity-independent rate
+ceiling. No runtime/RFC prototype until the actual characterization and coherent
+service proof justify it. Global acceptance gates remain unchanged.
+
+### Completed fixed-window attribution (predeclared contract)
+
 Ordinary-policy cause capture completes:387.730Mbps,78/78echoes with
 median/p95/max296.971/503.781/947.406ms and bodygap.317860s. All41effective
 profiles remain500/500Mbps,30/70ms and zero configured impairments/drops.

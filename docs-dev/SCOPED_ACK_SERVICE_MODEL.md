@@ -515,3 +515,73 @@ remain competing causes; measured queues do not identify the individual echo's
 blocking byte. No controller tweak or broader batch is justified. Exact trial
 source/RFC is fully reversed; typed pair, actor move and associated tests are
 not retained obligations. The original ordinary scoped implementation remains.
+
+## Logical generation cadence candidate — 2026-09-09 22:54 +08:00
+
+This is a new coherent service candidate, not revival of ready-input batching
+or per-sibling deferral. It is still temporal ACK coalescing: previous adverse
+healthy-tail results remain relevant. The unchanged decision observer finds
+68,524/85,674 changed bulk decisions supported only by force (~80%). Actual
+ACK encodings total343,006/9,585,118B; MAX206,903/5,379,478B. Counts describe
+the old clock, not removable-frame percentages or a throughput prediction.
+The observer capture still has a.928s body gap and1.618s worst echo. Ordinary
+scoped ACK remains the control; the candidate is not accepted.
+
+Origin/intention:444fb38 deliberately forced receipt before application I/O
+to repair real ACK/OPEN/FINAL starvation.5e1ace67 deliberately copied feedback
+independently to survive selected-return blackholes. Preserve both service
+properties. The over-strong premise being changed is immediate generation
+per receive callback, rather than receipt-driven service with an independent
+deadline. No native congestion controller, path preference or extra window.
+
+One directional receive ledger owns U=next_offset+reorder_bytes, the exact
+unique received byte count. Gap filling advances ordered delivery by more
+than newly received bytes; duplicates advance neither U nor receipt facts.
+Use the existing bounded-service floor/repair-window geometry,64KiB by default,
+as a receipt-work quantum. Do not newly activate the previously bypassed
+opposite-direction half-BDP rule or pretend that floor measures bandwidth.
+The shared policy applies symmetrically: server upload is explicitly affected.
+
+Pending states are separate: (a) not-yet-materialized logical receipt and (b)
+materialized per-exact-attachment publication debt. For(a), freeze one deadline
+at preceding changed-generation time plus the existing PTO/2 interval when
+new receipt first becomes pending. An already-expired deadline is immediately
+due. Further bytes, duplicates, MAX, unchanged retries, membership or snapshot
+changes never postpone it. First receipt, nonbulk/Latency receipt, terminal
+feedback and important gap appearance/fill/closure remain prompt. Other bulk
+receipt materializes on its unique-byte quantum or that deadline. Sparse
+extension with no contiguous movement must still expire. This is explicitly
+new delay authority: existing geometry is87.5ms at100ms RTT, not zero latency.
+
+Generation materialization clears only(a) and immediately offers independently
+on every live exact output. Existing cursors/capacity wakes retain(b). No
+per-sibling eligibility delay, snapshot ledger or new caught-up guarantee.
+Admission closure cannot discard receipt state. Service due work in the outer
+actor and inside the same retained write/flush future before selecting other
+ready work; a continuously-ready control cannot starve expiry. Do not recreate
+a partially completed application write. Server applies receipt before entering
+this service loop, like client; MAX still follows successful consumption only.
+Terminal/error receipt is published before cleanup, without premature credit.
+
+Conditional proof: once new receipt is observed, its deadline is finite and
+nonrenewing. Under finite executor turns, either byte/urgent service occurs
+earlier or the deadline branch materializes it without needing another DATA
+or application completion. Materialization independently offers every output;
+native/queue failure still prevents unconditional wall-clock delivery bounds.
+Truth follows the unchanged dirty-range/scoped model. Retained state is one
+deadline and scalar receipt baseline, not another range ledger. Existing
+multi-chunk catch-up limits remain unchanged and explicitly unproven under
+arbitrary generation/capacity churn. Do not strengthen that claim here.
+
+Forecast: at smooth500/200Mbps the64KiB quantum arrives in1.05/2.62ms, allowing
+fewer callback-driven generations without a bulk stop-and-wait dependency.
+This is conditional arithmetic, not measured delay. Sparse bulk tails may
+wait longer; sampling/qualification/recovery use ACK event timing and may
+regress even with identical final coverage. MAX/native/shared queues remain.
+Gain size is unknown; material observed return collapse justifies one coherent
+prototype and ordinary affected pair, not a claimed80% saving. First run real
+publisher coalescing RED and subsequent-bulk blocked-write/flush controls;
+check frozen expiry, sparse extension, gap closure, all-output retry, credit
+and terminal boundaries. Independent audit then ordinary asymmetric pair,
+healthy mixed/QUIC/TCP and upload if useful. Any absent material benefit or
+adverse timing stops promotion without another sampler/threshold rescue.

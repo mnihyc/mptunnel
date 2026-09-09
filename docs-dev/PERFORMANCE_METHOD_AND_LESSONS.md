@@ -222,6 +222,10 @@ the claim; a correct local equation is not a sustained allocator.
    defect fixed/composition pending; practically supported within a declared
    envelope; or rejected approach. Commit isolated checkpoints with honest
    status, never equate an intermediate commit with release acceptance.
+   A candidate's stop condition stops that candidate, not the authorized
+   closure task. Continue to the next evidence-backed decision within the
+   existing owner/global plan; do not end execution merely because one
+   hypothesis was rejected. Genuine authority blockers still require user input.
 
 ## Necessary exploration and efficient experiment ordering
 

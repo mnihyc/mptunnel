@@ -13,6 +13,70 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
+### Continuing the loop — logical ACK generation, not per-sibling deferral
+
+22:54 +08 update: discriminator completes with68,524/85,674 bulk changed
+decisions force-only(~80%). Source observer archived/reversed; ordinary binary
+restored, no runtime change. Select one prototype transaction per the complete
+logical-generation contract appended to SCOPED_ACK_SERVICE_MODEL. Existing
+rate-free service quantum, unique-receipt accounting and nonrenewing existing
+PTO/2 deadline replace callback-driven force, preserving prompt urgent work and
+independent fanout. Both client/server retained write service are in scope;
+upload is explicitly affected. Model proof and independent review precede code;
+targeted real-producer RED/blocked controls then one ordinary affected pair.
+This is not performance acceptance; prior batching tail regressions remain
+candidate rejection conditions. Full observer report is ACK_DECISION_TRACE_20260909.
+
+22:58 +08: real publisher work-bound RED reproduced before runtime editing:
+five contiguous1KiB bulk receipts produce generations[1,2,3,4,5]/five ACKs;
+the unforced control confirms no subsequent urgent/byte/deadline predicate.
+Failure is exactly the candidate coalescing assertion, not setup. Build28.88s,
+test0.00s; log .tmp/reflection/ack-cadence-red-0909.log. This is intentional
+current-contract publication work, not corruption. Proceed with the coherent
+candidate and blocked-I/O controls; all promotion gates unchanged.
+
+2026-09-09 22:35 +08:00. User correctly distinguishes an intermediary decision
+from task completion. The rejected direction-input patch closes only that
+branch. Continue the existing mixed return-feedback owner; no new issue scope.
+
+Decision: evaluate one logical pending-receipt/generation service contract,
+while every materialized generation still gets immediate independent fanout.
+This is not ready-receipt batching, first-poll ACK/MAX pairing or selectively
+delayed sibling catch-up. Keep one existing dirty receive ledger, independent
+materialized-output retries, and the same retained application-write future.
+First/Latency/terminal and important gap evidence remain prompt. A deadline
+for pending receipt cannot be renewed by more bytes, MAX, retries or snapshot
+changes, and must be serviced inside blocked write/flush as well as outside.
+RFC8.3 must explicitly change if deferred materialization is selected; no
+runtime cadence or rate estimator is selected yet.
+
+Source review already proves unconditional prewrite forcing; it does not say
+how often first/gap/byte/timer predicates independently require a generation.
+Smallest next discriminator: feature-only bounded cumulative trigger counts
+at the actual should_send_ack decision, separated by bulk/nonbulk, changed
+state and overlapping predicates; observe actual bulk threshold/rate ranges.
+Reuse the existing codec counter and one unchanged500DOWN/return500→10→500
+mixed capture. No per-frame log, payload retention, new harness, clock/policy
+change or compiled observer marketed as ordinary performance. Root alone
+builds/runs; freeze and reverse source before the capture.
+
+Information forecast: substantial changed generations supported only by force
+justify completing a logical-cadence model and a blocked subsequent-bulk RED;
+dominant urgent gap/first work argues against that candidate before runtime
+implementation. Counts are opportunity under the old clock, NOT a prediction
+of a coalesced trace or Mbps. Byte/time/range predicates interact after any
+clock change. Existing ACK withholding169.929→296.144Mbps is cost context,
+not this proposal's promised gain; MAX/native/forward queues remain competing
+causes. Preserve complete timing/failures/costs and stop only this candidate
+if its prospective material benefit is absent, then continue the global plan.
+
+The shared unique-receipt count is next_offset+reorder_bytes; contiguous gap
+release and demand-tracker rates are not new arrival capacity. No receiver
+rate substitution is justified. Existing missed-generation multi-chunk retry
+limits remain explicit; lower generation frequency is not proof of complete
+catch-up under arbitrary capacity service. No extra snapshot framework or
+numeric knob is smuggled into this discriminator.
+
 ### ACK-direction gate complete — rejected as the download-stall fix
 
 Actual publisher characterization passes:351Kbps and500Mbps snapshots select

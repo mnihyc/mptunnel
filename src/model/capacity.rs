@@ -194,14 +194,14 @@ pub(crate) fn reliable_stream_ack_batch_limit_bytes(
 }
 
 pub(crate) fn reliable_stream_ack_update_bytes(
-    path: Option<PathSnapshot>,
+    _path: Option<PathSnapshot>,
     lane: TrafficClass,
     mux_limits: MuxLimits,
 ) -> u64 {
     if !lane.is_bulk() {
         return 1;
     }
-    let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
+    let advertised_window = reliable_stream_advertised_window_bytes(None, lane, mux_limits);
     let resource_ceiling = reliable_stream_ack_batch_limit_bytes(advertised_window, mux_limits)
         .min(
             (mux_limits.max_repair_bytes as u64)
@@ -212,15 +212,11 @@ pub(crate) fn reliable_stream_ack_update_bytes(
     let service_floor = MAX_RELIABLE_SERVICE_QUANTUM_BYTES
         .min(reliable_relay_buffer_len(mux_limits))
         .max(PATH_OPEN_SCORE_BYTES) as u64;
-    let measured_step = path
-        .map(|path| {
-            (reliable_path_product_bdp_bytes(path) / 2.0)
-                .ceil()
-                .max(1.0) as u64
-        })
-        .unwrap_or(service_floor);
-    measured_step
-        .clamp(service_floor.min(resource_ceiling), resource_ceiling)
+    // This is receive-work geometry, not an estimate of receive capacity.
+    // The caller's snapshot describes local transmission in the opposite
+    // Product direction; it may supply timing, but not this receipt quantum.
+    service_floor
+        .min(resource_ceiling)
         .min(mux_limits.max_repair_bytes as u64)
         .max(PATH_OPEN_SCORE_BYTES as u64)
 }

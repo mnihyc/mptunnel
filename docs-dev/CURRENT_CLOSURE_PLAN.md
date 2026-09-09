@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 22:21 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 23:15 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,19 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Continuing the loop — logical ACK generation, not per-sibling deferral
+
+23:15 +08 candidate component gate:634unique focused relay/request/stream/
+capacity checks pass. Publisher RED[1,2,3,4,5] becomes[1,1,1,1,1], with terminal
+tail still immediate. Actual subsequent bulk blocked write/flush controls pass
+for client and server; client baseline controls also passed before runtime.
+Independent source review caught and corrected prototype generation/capacity
+wake ordering before tests. No opposite-rate estimator, new tuning knob,
+native controller or per-sibling delay. RFC explicitly declares changed timing.
+Proceed with ordinary control→candidate return500→10→500 mixed pair under the
+unchanged500DOWN/30+70ms profile, then healthy mixed and mirrored upload only
+if materially useful without adverse timing. Retain all phases/echoes/gaps/
+completion/wire/CPU/RSS; no same-average or component-green acceptance. This
+runtime is an unaccepted single candidate, not a new baseline or release.
 
 22:54 +08 update: discriminator completes with68,524/85,674 bulk changed
 decisions force-only(~80%). Source observer archived/reversed; ordinary binary

@@ -1472,15 +1472,33 @@ or ACK coalescing alone MUST NOT change the attributable byte union. These
 partitions release the same total original/copy debt and do not create extra
 independent rate observations or confidence samples within an ACK transaction.
 
-Processing newly received unique Product bytes marks Data ACK state pending.
-Materializing the next publication advances one local generation. Before the
-serialized receive actor parks or yields its bounded cooperative turn, it MUST
-offer the latest pending generation independently to every currently live
-exact attachment. Several frames processed in that turn coalesce into the
-latest receive evidence; ACK publication never waits for an application read
-or another Product frame.
+Processing newly received unique Product bytes marks logical Data ACK state
+pending before local application delivery can suspend the receive actor.
+First receipt, latency-class receipt, terminal receipt and important gap
+appearance or filling MUST receive prompt feedback. Ordinary bulk receipt MAY
+coalesce until a bounded receipt-work quantum or one absolute deadline is due.
+The quantum counts unique receipt, not contiguous delivery of a previously
+buffered suffix, and MUST NOT use opposite-direction transmit rate as receive
+capacity. The reference policy uses the existing bounded-service quantum with
+receive/repair resource bounds, without adding a receive window or rate hint.
 
-Forced publication of unchanged state reuses the current generation. Queue
+On the first pending receipt, freeze its deadline from the preceding changed
+materialization time and the existing receive-feedback timing interval. An
+already-expired deadline is immediately due. Later bytes, duplicates, credit
+updates, unchanged retries and path-snapshot changes MUST NOT postpone it.
+Expiry applies to sparse receipt even without contiguous-frontier movement.
+The actor MUST service due receipt independently of further input and local
+application write/flush completion, including while retaining one partially
+completed write. This bounds local eligibility, not native delivery time.
+
+Materializing the pending receipt advances one local generation and MUST
+immediately offer it independently to every currently live exact attachment.
+There is no additional sibling-specific delay. Before parking or yielding a
+bounded cooperative turn, the actor MUST service due logical receipt and arm
+its next deadline independently of materialized publication-capacity wakes.
+
+Forced publication of unchanged state reuses the current generation and MUST
+NOT renew the changed-generation receipt clock. Queue
 acceptance advances only that exact attachment incarnation's publication
 fence; a blocked attachment remains pending and retries on carrier-capacity or
 attachment-membership wakes. A newly accepted attachment starts without a
@@ -1517,8 +1535,8 @@ fence only after all required chunks are accepted. A newer generation MAY
 supersede the unqueued tail of an older generation; already accepted frames
 remain independently valid and idempotent. Each attachment retains only its
 exact-incarnation generation and next-chunk cursor. This reduces repeated
-history without delaying feedback, selecting a preferred ACK carrier, or
-depending on a mutable cross-frame compression dictionary.
+history without adding a per-attachment feedback delay, selecting a preferred
+ACK carrier, or depending on a mutable cross-frame compression dictionary.
 
 ### 8.4 Shared flow control
 

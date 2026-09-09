@@ -12,14 +12,14 @@ use super::io::first_proven_ack_gap;
 use super::io::{
     AuthoritativeStreamAckSnapshot, ReadyStreamDataBatchBounds, ReadyStreamDataDirection,
     ReliableAckGapReinjectionProgress, ReliablePathStalenessObservation,
-    ReliableResponsePathStaleness, apply_and_write_ready_stream_data_batch,
-    begin_reliable_stream_ack, collect_ready_stream_data_batch,
-    exact_contiguous_retransmission_frames, pending_stream_fin_ready,
-    preserve_reinjection_frontier_quantum, read_reliable_relay_payload, receive_stream_fin,
-    reconcile_accepted_copy_wake, resize_reliable_relay_buffer, retain_accepted_copy_wake,
-    stream_ack_gap_frontier_reinjection_frames_normalized,
+    ReliableResponsePathStaleness, apply_ready_stream_data_batch, begin_reliable_stream_ack,
+    collect_ready_stream_data_batch, exact_contiguous_retransmission_frames,
+    pending_stream_fin_ready, preserve_reinjection_frontier_quantum, read_reliable_relay_payload,
+    receive_stream_fin, reconcile_accepted_copy_wake, resize_reliable_relay_buffer,
+    retain_accepted_copy_wake, stream_ack_gap_frontier_reinjection_frames_normalized,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required, update_reinjection_authoritative_ack_snapshot,
+    write_applied_ready_stream_data_batch,
 };
 #[cfg(test)]
 use super::io::{
@@ -2634,6 +2634,29 @@ where
                 retained_frontier_candidate,
             )
         };
+        let request_feedback_path_snapshot =
+            path_stream.request_feedback_path_snapshot(request_lane);
+        // Materialize due receipt before constructing exact-generation
+        // capacity waits, including when no queue accepts the new generation.
+        if remote_open
+            && recv_progress
+                .pending_ack_deadline()
+                .is_some_and(|deadline| deadline <= Instant::now())
+            && enqueue_tcp_recv_progress(
+                path_stream,
+                &mut recv_stream,
+                &mut recv_progress,
+                &mut request_ack_publication,
+                request_feedback_path_snapshot,
+                request_lane,
+                mux_limits,
+                true,
+                false,
+                false,
+            )
+        {
+            last_recv_progress_sent_at = Instant::now();
+        }
         let request_ack_generation = recv_progress.ack_generation();
         if output_membership_changed
             || request_ack_capacity_wait_generation != request_ack_generation
@@ -2711,8 +2734,6 @@ where
         {
             recv_stream.commit_max_data(published_offset);
         }
-        let request_feedback_path_snapshot =
-            path_stream.request_feedback_path_snapshot(request_lane);
         let request_feedback_underlay = request_feedback_path_snapshot
             .map(|snapshot| snapshot.underlay)
             .or_else(|| path_stream.request_feedback_underlay())
@@ -2722,9 +2743,14 @@ where
             .map_or(last_recv_progress_sent_at, |ack_at| {
                 ack_at.max(last_recv_progress_sent_at)
             });
+        let recv_progress_maintenance_deadline = recv_progress_observed_at
+            + reliable_stream_recv_progress_interval(request_feedback_path_snapshot);
         let recv_progress_deadline = tokio::time::Instant::from_std(
-            recv_progress_observed_at
-                + reliable_stream_recv_progress_interval(request_feedback_path_snapshot),
+            recv_progress
+                .pending_ack_deadline()
+                .map_or(recv_progress_maintenance_deadline, |deadline| {
+                    deadline.min(recv_progress_maintenance_deadline)
+                }),
         );
         let recv_progress_ack_update_pending = remote_open && recv_progress.ack_update_pending();
         let (
@@ -3341,8 +3367,7 @@ where
                     );
                     debug_assert!(deferred_path_frame.is_none());
                     deferred_path_frame = deferred;
-                    apply_and_write_ready_stream_data_batch(
-                        &mut local,
+                    let applied = apply_ready_stream_data_batch(
                         &mut recv_stream,
                         &mut ready_path_data,
                         ReadyStreamDataDirection::ServerUpload,
@@ -3388,8 +3413,86 @@ where
                             }
                             Ok(outcome)
                         },
-                    )
-                    .await?;
+                    );
+                    // Receipt and publication remain live while the same
+                    // target write/flush is Pending; no capacity is granted
+                    // for this batch until that exact future succeeds.
+                    enqueue_tcp_recv_progress(
+                        path_stream, &mut recv_stream, &mut recv_progress,
+                        &mut request_ack_publication, request_feedback_path_snapshot,
+                        request_lane, mux_limits, applied.has_apply_error(), false, false,
+                    );
+                    let write_result = {
+                        let write = write_applied_ready_stream_data_batch(
+                            &mut local, &mut ready_path_data, applied,
+                        );
+                        tokio::pin!(write);
+                        loop {
+                            if recv_progress.pending_ack_deadline()
+                                .is_some_and(|deadline| deadline <= Instant::now())
+                            {
+                                enqueue_tcp_recv_progress(
+                                    path_stream, &mut recv_stream, &mut recv_progress,
+                                    &mut request_ack_publication, request_feedback_path_snapshot,
+                                    request_lane, mux_limits, true, false, false,
+                                );
+                            }
+                            let generation = recv_progress.ack_generation();
+                            // Arm before retry so a release racing queue
+                            // admission is not lost. Also reconciles outputs
+                            // accepted while target delivery is blocked.
+                            let ack_capacity_wait = arm_carrier_capacity_notifies(
+                                path_stream.pending_ack_capacity_notifies(generation),
+                            );
+                            if generation != 0 {
+                                let publication = path_stream.retry_pending_ack(
+                                    generation, &request_ack_publication.cumulative_frames,
+                                );
+                                request_ack_publication.record_status(
+                                    generation, publication.published, publication.pending,
+                                );
+                            }
+                            let wait_for_ack_capacity = request_ack_publication.pending
+                                && ack_capacity_wait.is_some();
+                            let receipt_deadline = recv_progress.pending_ack_deadline()
+                                .map(tokio::time::Instant::from_std);
+                            tokio::select! {
+                                biased;
+                                result = &mut write => break result,
+                                () = async {
+                                    match receipt_deadline {
+                                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                        None => std::future::pending().await,
+                                    }
+                                }, if receipt_deadline.is_some() => continue,
+                                () = async {
+                                    if let Some(wait) = ack_capacity_wait { wait.await; }
+                                }, if wait_for_ack_capacity => continue,
+                                changed = async {
+                                    match output_updates.as_mut() {
+                                        Some(updates) => updates.changed().await,
+                                        None => std::future::pending().await,
+                                    }
+                                }, if output_updates.is_some() => {
+                                    if changed.is_err() {
+                                        break Err(RuntimeError::ReliablePathSessionClosed);
+                                    }
+                                    response_path_staleness_dirty = true;
+                                    response_recovery_dirty = true;
+                                    multipath_reinjection_alternative_available =
+                                        path_stream.has_multipath_reinjection_alternative();
+                                }
+                            }
+                        }
+                    };
+                    if let Err(error) = write_result {
+                        enqueue_tcp_recv_progress(
+                            path_stream, &mut recv_stream, &mut recv_progress,
+                            &mut request_ack_publication, request_feedback_path_snapshot,
+                            request_lane, mux_limits, true, false, false,
+                        );
+                        return Err(error);
+                    }
                     if enqueue_tcp_recv_progress(
                         path_stream,
                         &mut recv_stream,

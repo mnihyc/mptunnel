@@ -3501,6 +3501,126 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
 }
 
 #[tokio::test]
+async fn client_received_bulk_ack_coalesces_subquantum_receipts() {
+    use crate::model::capacity::reliable_stream_ack_update_bytes;
+    use crate::runtime::stream::reliable_stream_recv_progress_interval;
+
+    let stream_id = StreamId(922);
+    let context = client_test_context();
+    let limits = context.mux_limits;
+    // Generous fixed timing isolates synchronous receipt policy, not network
+    // performance. The low scalar keeps both old and rate-free byte steps at
+    // the existing resource floor, so the RED cannot come from changed BDP.
+    let snapshot = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 60_000.0, 1000.0);
+    let quantum = reliable_stream_ack_update_bytes(None, TrafficClass::Throughput, limits);
+    assert_eq!(quantum, 64 * 1024);
+    assert_eq!(
+        reliable_stream_ack_update_bytes(Some(snapshot), TrafficClass::Throughput, limits),
+        quantum,
+    );
+    let receipt_bytes = 1024;
+    let receipt_count = 5;
+    assert!(receipt_bytes * receipt_count < quantum as usize);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let (mut remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 4);
+    consume_client_path_proof_for_test(&mut receivers);
+    let mut recv_stream = ReliableRecvStream::new(stream_id, limits);
+    let mut progress = ReliableRecvProgress::default();
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut unforced_progress: Option<ReliableRecvProgress> = None;
+    let mut generations = Vec::new();
+    let mut published = Vec::new();
+
+    for index in 0..receipt_count {
+        let offset = (index * receipt_bytes) as u64;
+        recv_stream
+            .receive_data(offset, Bytes::from(vec![0x71; receipt_bytes]))
+            .expect("valid contiguous response receipt");
+        assert_eq!(recv_stream.next_offset(), offset + receipt_bytes as u64);
+        assert_eq!(recv_stream.reorder_bytes(), 0);
+        assert_eq!(recv_stream.ack_range_summary().count, 1);
+        if let Some(unforced) = unforced_progress.as_mut() {
+            assert!(
+                !unforced.should_send_ack(
+                    &recv_stream,
+                    Some(snapshot),
+                    TrafficClass::Throughput,
+                    limits,
+                    false,
+                ),
+                "after real first publication, no first/gap/byte/deadline trigger is due",
+            );
+        }
+
+        // This is the ordinary DATA prewrite call, not the explicit retry or
+        // terminal call. Candidate integration replaces this one constructor
+        // alongside that production callsite; forced ack_only retains its uses.
+        sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &mut recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::received_ack(Some(snapshot), TrafficClass::Throughput),
+            )
+            .expect("real receive-progress publisher");
+        generations.push(progress.ack_generation());
+        while let Some(command) = try_recv_reliable_path_priority_command(&mut receivers) {
+            receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+            let ReliablePathCommand::SendFrame(frame @ Frame::StreamAck { .. }) = command else {
+                panic!("ACK-only publication must not produce unrelated frames or credit");
+            };
+            assert_eq!(frame, recv_stream.ack_frame());
+            published.push(frame);
+        }
+        if index == 0 {
+            assert_eq!(progress.ack_generation(), 1);
+            assert_eq!(published.len(), 1, "first receipt is immediately published");
+            unforced_progress = Some(progress.clone());
+        }
+    }
+
+    let first_ack_at = unforced_progress.unwrap().last_ack_at().unwrap();
+    assert!(
+        first_ack_at.elapsed() < reliable_stream_recv_progress_interval(Some(snapshot)),
+        "fixture must finish before its generous real deadline; no sleeps or clock mutation",
+    );
+    eprintln!(
+        "subquantum generations={generations:?} published_acks={}",
+        published.len()
+    );
+    assert_eq!(
+        generations,
+        vec![1; receipt_count],
+        "ordinary subquantum bulk receipts retain one pending logical update instead of forcing a generation per callback",
+    );
+    assert_eq!(published.len(), 1);
+    assert!(progress.ack_update_pending());
+    assert!(!remotes.has_pending_stream_ack_publication());
+
+    sender
+        .send_recv_progress(
+            &mut remotes,
+            &context,
+            &mut recv_stream,
+            &mut progress,
+            RelayRecvProgressSend::final_ack(Some(snapshot), TrafficClass::Throughput),
+        )
+        .expect("explicit terminal feedback materializes the retained receipt tail");
+    assert_eq!(progress.ack_generation(), 2);
+    assert!(!progress.ack_update_pending());
+    let command = try_recv_reliable_path_priority_command(&mut receivers)
+        .expect("terminal ACK is immediately queued");
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    let ReliablePathCommand::SendFrame(frame) = command else {
+        panic!("expected terminal ACK frame");
+    };
+    assert_eq!(frame, recv_stream.ack_frame());
+    assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
+}
+
+#[tokio::test]
 async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
     let stream_id = StreamId(92);
     let context = client_test_context();

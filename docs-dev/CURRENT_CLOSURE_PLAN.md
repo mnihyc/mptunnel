@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 15:27 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 15:46 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,57 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — ordinary mixed copy-cause/receipt discriminator.**
+**Current next action — exact repair/receipt timing in one bounded byte window.**
+Ordinary-policy cause capture completes:387.730Mbps,78/78echoes with
+median/p95/max296.971/503.781/947.406ms and bodygap.317860s. All41effective
+profiles remain500/500Mbps,30/70ms and zero configured impairments/drops.
+Accepted copies total318381268B: TCP persistent ACK-gap241184388B (75.75%
+of all copies), TCP tail74989600B, QUIC gap2076208B/tail131072B. No other
+cause or requalification row occurs. TCP dominates actual accepted copy work;
+the earlier active-tail-only hypothesis is not the principal explanation.
+
+Client2,260,437,444B received reconcile as1,944,167,384B new and316,270,060B
+duplicate. TCP duplicate314106580B,33.20% of its receipt; QUIC2163480B.
+All interval/cumulative counts reconcile and no invalid arithmetic is emitted.
+A later server Original flush covers client receipt, but the useful-copy lower
+bound is zero: copies can arrive first and their Originals arrive duplicated.
+This demonstrates material redundancy, not unnecessary repair or a safe fix.
+REPAIR_CAUSE_20260909 retains the full record. Four-file diagnostic is frozen
+and removed; ordinary source and executable are restored. No public promotion.
+
+Next exact question: in established ordinary mixed service, do persistent-gap
+copies beat their Originals, arrive late, or even queue after Original receipt;
+which effective loss/fallback deadline and ETA authorized them? Competing
+causes are productive hedging, delayed feedback, premature assignment clocks
+and native/shared-queue service. Existing aggregates cannot choose among them.
+
+Smallest action: same periodic observer plus range-filtered metadata for one
+fixed[512MiB,528MiB) Product window, enabled from process start through teardown.
+512MiB places it beyond startup in the observed~50MB/s workload;16MiB covers
+roughly0.35s and is expected to contain many repair attempts at the observed
+volume. This is diagnostic selection, never a Product cap/threshold. Preserve
+whole intersecting frame extents and all arrivals, not only winners. Record
+Original claims and exact accepted-copy identities; actual queued enqueue IDs
+and dispatch; aggregate scored-prefix assignment/loss/fallback timing and
+effective retained clocks with signed offsets; receiver full intervals, exact
+ingress and ordered frontier changes. Reconstruct first coverage offline without
+retaining live payloads or scanning runtime ranges. Wire IDs are mapped through
+stable per-endpoint physical identities, never by equating endpoint allocators.
+Ambiguous joins remain unknown. Range selection bounds coverage, not repeat
+events; existing40s observation remains, no sampling or per-frame global flood.
+
+Information forecast: late or already-received Original copies direct review
+to the precise deadline/feedback owner; meaningful first-arrival wins prevent
+a blanket suppression fix. Absent copies or ambiguous identity in the declared
+window stop that attribution rather than prompt favorable window hunting.
+The current316MB duplicated payload corresponds to~63Mbps of payload service
+over40s, a material budget equivalent, not a promised goodput gain: removing
+copies can expose stalls, change native sending and fail to reduce queue delay.
+No policy, timer, congestion, queue, resource or RFC change; one further frozen
+healthy mixed capture only. The next model decision must use exact outcomes.
+
+### Completed ordinary mixed copy-cause/receipt discriminator (contract)
+
 The placement diagnostic is closed without promotion: TCP bulk Originals fall
 42.16%→1.20%, useful service393.901→275.892Mbps, winning QUIC residence
 179→192ms median. No missing-service recovery even at lower useful load.

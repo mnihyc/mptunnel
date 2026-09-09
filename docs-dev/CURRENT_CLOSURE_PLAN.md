@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 17:46 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 18:07 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,47 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — isolate the existing Original ranking rate domain.**
+**Current next action — reuse exact winning-byte handoff/service evidence.**
+
+The predeclared native-rank pair completes and is REJECTED for promotion.
+Control→advised useful396.378→419.059Mbps; echo p50/p95 worsens
+281.651/469.903→318.842/577.845ms, including median in every chronology slice.
+Maximum echo1244.017→761.642ms and bodygap.325905→.271684s improve;
+all79/78 attempts succeed. Allocation really changes: TCP Original share
+33.33%→48.76%, accepted copies275586102→186104196B. QUIC copies nevertheless
+rise4.78→26.06MB, and server QUIC median RTT stays254→251ms. All82 profiles
+retain500/500Mbps,30/70ms, no loss/jitter/QoS/blackhole/drop. Actual source-use
+marker validates the score-only intervention; the unchanged ordinary observer
+does not report the substituted scalar. Full timing and costs remain in
+TCP_NATIVE_RANK_ABLATION_20260909 and its verified572047B/17-file raw archive.
+Source/RFC/Cargo and executable are restored; no runtime correction is retained.
+The information forecast succeeds in separating a real allocation effect from
+an effective composed correction; the latter fails. No favorable repeat or
+compensating scalar/threshold is justified.
+
+Existing mixed issue remains: loaded echo service is materially worse than the
+matched high-capacity raw/Xray/H2 panel and same-build QUIC-only context. Exact
+winning joins already place most response delay after positive native handoff:
+ECHO_OWNER_SERVICE has210/329/461ms median/p95/max handoff→decode, with source
+and postdecode stages near0–2ms. Actual extra-QUIC winners retain228ms median
+versus31ms QUIC-only. Live-hedge suppression, forced-QUIC Original placement
+and native ranking each leave substantial mixed residence; none establishes
+one safe policy correction. Preserve separately measured request-side waits.
+
+Next action is source/capture reuse, not another build: map those exact winning
+TCP/QUIC handoffs to native stream/connection acceptance, queue position,
+packet service and receiver readiness using the archived observer and ordinary
+code. Competing owners are native FIFO/pacing, a shared network queue and peer
+transport/read-task service; aggregate backlog alone cannot choose among them.
+Information forecast: an existing exact queue/service join or reachable model
+mismatch can justify a bounded correction/discriminator; absence of the needed
+boundary must remain explicit. The~200ms mixed postwrite excess is a comparison
+envelope, not a forecast of removable delay. No new observer, controller change,
+queue cap, protocol preference, release or broader issue inventory is selected.
+Independent audits inspect producer and consumer boundaries while root reuses
+the complete timing/cost captures. Global acceptance gates remain unchanged.
+
+### Completed ranking discriminator (predeclared contract)
 
 Actual TCP prepared-input observation completes:398.006Mbps,80/80echoes,
 p95/max408.021/639.834ms, bodygap.273840s. All41 profiles unchanged.131events

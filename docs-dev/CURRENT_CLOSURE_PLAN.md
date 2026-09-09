@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 23:15 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 23:55 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -12,6 +12,48 @@ remains at `git show ebad57f:docs-dev/CURRENT_CLOSURE_PLAN.md`. Linked reports
 retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches.
 
 ## Active transaction: user-requested mixed-mode architectural redesign
+
+### Current decision — reject logical ACK cadence; continue the existing owner
+
+Ordinary trial8a0413d is REJECTED. On the unchanged500Mbps DOWN and
+500→10→500Mbps return cut, restricted body service151.552→195.641Mbps
+improves, but worst echo756.803→1957.233ms, echo p95656.240→1471.908ms and
+maximum body gap.563265→.754914s worsen. Return bytes fall4.27%, yet restricted
+median return backlog539984→908957B and whole return drops0→3950 worsen.
+Native TCP and QUIC RTT rise together.634focused checks establish the candidate
+mechanism, not good composed service. Full histories, costs, failures and
+limits: [ordinary comparison](ACK_CADENCE_ORDINARY_20260909.md).
+
+The trial source/RFC/tests have been reversed with an exact patch. Source
+comparison against39dc2ad passes for src/RFC/Cargo, and target/release matches
+the frozen ordinary scoped-ACK comparator. The rejected executable is retained
+only for historical attribution. No cadence, estimator, controller or threshold
+rescue follows this failure; exact ACK-deadline/assignment causality is not
+claimed from ordinary samples. Healthy/upload trial follow-ons are cancelled.
+
+Two bounded source audits close a tempting duplicate-feedback hypothesis:
+server ACK subsumption skips already-applied positive/negative facts before
+flight, sampling and progress-clock changes; delivery sampling independently
+requires newly released unambiguous Original bytes. A zero-release frame can
+still legitimately carry new scoped negative evidence after the positive
+union frame. Ignoring it would lose recovery authority. No duplicate-specific
+seconds-long mutation chain was found; decode micro-optimization is deferred.
+
+TCP multiplicity audit also finds intentional policy, not a new defect. The
+mixed configuration omits pool overrides; default max-tcp-carriers=3 expands
+one TCP group into three regular members beside QUIC.1a79f69 deliberately
+replaced elastic retention with MAX reconciliation; fc8dcd1 preserves regular
+siblings for a single TCP group. Historical per-flow-policing benefits do not
+prove today's acceptance, but changing3→1 would change the declared case.
+RFC7.2's obsolete MIN–MAX introductory spelling is documentation drift, not
+the mixed performance root cause. Do not restore elastic pools or protocol
+preference from this finding. Existing raw1/3 controls already establish a
+native-contention tradeoff distinct from the asymmetric feedback collapse.
+
+Next decision remains a practical return-feedback service contract, with the
+existing matched raw/QUIC/H2 restriction evidence reused before any redundant
+baseline run. No new runtime proposal is selected by these negative audits.
+Candidate rejection is not task completion. Global gates below remain intact.
 
 ### Continuing the loop — logical ACK generation, not per-sibling deferral
 
@@ -2697,13 +2739,16 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
   Frozen diagnostic:
   `./.tmp/reflection/bin/feedback-fanout-20260909/mptunnel`; its env-set wrapper
   is an intentionally unsafe causal intervention, never an ordinary candidate.
-  target/release has been restored by copying the frozen scoped-ack ordinary
-  binary; the rejected trial remains only in its named frozen directory.
+  Rejected logical-cadence trial8a0413d is frozen only at
+  `./.tmp/reflection/bin/ack-cadence-20260909/mptunnel`. target/release is restored
+  byte-for-byte to the scoped-ACK comparator. Its123s trial build and unused
+  helper warning are historical; reversing the trial removes that warning's
+  cause. No trial cleanup or associated tests remain implementation obligations.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram common-latency attribution report sent:2026-09-09 10:29:48UTC; next nonurgent
-  not before11:30UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram ordinary cadence rejection report sent approximately2026-09-09 15:21UTC;
+  next nonurgent not before16:22UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

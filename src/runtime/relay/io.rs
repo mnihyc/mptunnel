@@ -985,9 +985,9 @@ where
     Ok(delivered_bytes)
 }
 
-/// Test convenience for the same apply/write transaction without interleaved
-/// control. Production actors service receipt independently during the write.
-#[cfg(test)]
+/// Applies and locally delivers one ready batch without an interleaved control
+/// phase. This compatibility wrapper keeps the server path and existing client
+/// behavior unchanged while the receive actor adopts the split boundary.
 pub(in crate::runtime) async fn apply_and_write_ready_stream_data_batch<S, T, A>(
     local: &mut S,
     recv_stream: &mut ReliableRecvStream,

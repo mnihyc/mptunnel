@@ -120,41 +120,17 @@ impl BlockedLocalDeliveryControl {
 
 struct BlockedLocalDelivery {
     state: Arc<BlockedLocalDeliveryState>,
-    block_after_bytes: usize,
-    block_flush: bool,
 }
 
 impl BlockedLocalDelivery {
     fn new() -> (Self, BlockedLocalDeliveryControl) {
-        Self::after_bytes(1, false)
-    }
-
-    fn after_bytes(
-        block_after_bytes: usize,
-        block_flush: bool,
-    ) -> (Self, BlockedLocalDeliveryControl) {
         let state = Arc::new(BlockedLocalDeliveryState::default());
         (
             Self {
                 state: state.clone(),
-                block_after_bytes,
-                block_flush,
             },
             BlockedLocalDeliveryControl { state },
         )
-    }
-
-    fn park(&self, cx: &mut TaskContext<'_>) {
-        self.state.blocked.store(true, Ordering::Release);
-        self.state.blocked_notify.notify_waiters();
-        *self
-            .state
-            .write_waker
-            .lock()
-            .expect("blocked local delivery waker") = Some(cx.waker().clone());
-        if self.state.released.load(Ordering::Acquire) {
-            cx.waker().wake_by_ref();
-        }
     }
 }
 
@@ -179,35 +155,28 @@ impl AsyncWrite for BlockedLocalDelivery {
         }
         let state = &self.state;
         let mut accepted = state.accepted.lock().expect("blocked local delivery bytes");
-        if self.block_flush || state.released.load(Ordering::Acquire) {
+        if accepted.is_empty() {
+            accepted.push(buf[0]);
+            return Poll::Ready(Ok(1));
+        }
+        if state.released.load(Ordering::Acquire) {
             accepted.extend_from_slice(buf);
             return Poll::Ready(Ok(buf.len()));
         }
-        let available = self.block_after_bytes.saturating_sub(accepted.len());
-        if available > 0 {
-            let written = available.min(buf.len());
-            accepted.extend_from_slice(&buf[..written]);
-            return Poll::Ready(Ok(written));
-        }
         drop(accepted);
-        self.park(cx);
+        state.blocked.store(true, Ordering::Release);
+        state.blocked_notify.notify_waiters();
+        *state
+            .write_waker
+            .lock()
+            .expect("blocked local delivery waker") = Some(cx.waker().clone());
+        if state.released.load(Ordering::Acquire) {
+            cx.waker().wake_by_ref();
+        }
         Poll::Pending
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        if self.block_flush
-            && !self.state.released.load(Ordering::Acquire)
-            && self
-                .state
-                .accepted
-                .lock()
-                .expect("blocked local delivery bytes")
-                .len()
-                >= self.block_after_bytes
-        {
-            self.park(cx);
-            return Poll::Pending;
-        }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
@@ -615,174 +584,6 @@ async fn response_startup_ack_open_and_final_progress_during_blocked_local_deliv
             && open_while_blocked
             && final_while_blocked == Some(vec![0]),
         "SEEN-4: contiguous frontier h={STARTUP_TRIGGER_BYTES} reached the blocked Product sink, but independent progress stalled (ACK frontier={ack_frontier_while_blocked}, OPEN={open_while_blocked}, FINAL={final_while_blocked:?}); all three appeared only after local delivery release"
-    );
-}
-
-#[tokio::test]
-async fn subsequent_bulk_receipt_ack_progresses_during_blocked_local_write() {
-    subsequent_bulk_receipt_ack_progresses_during_blocked_local_delivery(false).await;
-}
-
-#[tokio::test]
-async fn subsequent_bulk_receipt_ack_progresses_during_blocked_local_flush() {
-    subsequent_bulk_receipt_ack_progresses_during_blocked_local_delivery(true).await;
-}
-
-async fn subsequent_bulk_receipt_ack_progresses_during_blocked_local_delivery(block_flush: bool) {
-    const LATER_BYTES: usize = 1024;
-    let stream_id = StreamId(58_401 + u64::from(block_flush));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test carrier endpoint");
-    let address = listener.local_addr().expect("test carrier address");
-    let context = ClientPathContext::new(
-        vec![
-            format!("tcp://{address}")
-                .parse::<PathSpec>()
-                .expect("test path"),
-        ],
-        test_security(),
-        ResourceLimits::default(),
-    )
-    .expect("client context");
-    let limits = context.mux_limits;
-    // The actual relay reads the opened stream's lane, not just the open spec.
-    // Its next outer turn classifies this full timing-only demand threshold as
-    // bulk before applying the small second frame; this is not a first ACK or
-    // Latency-only control which would bypass deferred bulk receipt service.
-    let first_bytes = usize::try_from(super::super::flow::reliable_flow_bulk_threshold_bytes(
-        None, limits,
-    ))
-    .expect("bulk demand threshold fits usize");
-    assert!(first_bytes <= reliable_relay_buffer_len(limits));
-    assert!(
-        (LATER_BYTES as u64)
-            < crate::model::capacity::reliable_stream_ack_update_bytes(
-                None,
-                TrafficClass::Throughput,
-                limits,
-            )
-    );
-    let mut demand = ReliableRelayFlowDemandTracker::with_initial_lane(TrafficClass::Throughput);
-    assert_eq!(
-        demand
-            .refresh(
-                ReliableRelayFlowSignals::new(first_bytes as u64),
-                ReliableRelayFlowPathEvidence::timing_only(None),
-                limits,
-            )
-            .lane,
-        TrafficClass::Throughput,
-    );
-    let initial_window = reliable_stream_initial_advertised_window_bytes(
-        UnderlayProtocol::Tcp,
-        TrafficClass::Throughput,
-        limits,
-    );
-    let total_bytes = first_bytes + LATER_BYTES;
-    let (commands, mut receivers) = reliable_path_command_channels(32);
-    let (frames_tx, frames_rx) = mpsc::channel(2);
-    let mut initial = test_opened_remote_stream(stream_id, 0, commands, frames_rx);
-    initial.stream_mut().lane = TrafficClass::Throughput;
-    let accepted_before_release = first_bytes + if block_flush { LATER_BYTES } else { 1 };
-    let (local, control) = BlockedLocalDelivery::after_bytes(accepted_before_release, block_flush);
-    let relay = tokio::spawn(async move {
-        relay_migrating_tcp_stream(
-            local,
-            &context,
-            MppPerformanceConfig::default(),
-            ReliableRelayOpenSpec::new(TargetAddr::Ip(address), TrafficClass::Throughput),
-            initial,
-            None,
-        )
-        .await
-    });
-    let first = Bytes::from(vec![0x5a; first_bytes]);
-    let later = Bytes::from(vec![0xa5; LATER_BYTES]);
-    let first_receipt_started = Instant::now();
-    frames_tx
-        .send(Ok(Frame::StreamData {
-            stream_id,
-            offset: 0,
-            payload: first.clone(),
-        }))
-        .await
-        .expect("inject first bulk response");
-    let mut observation = ResponseStartupProgressObservation::default();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while observation.ack_frontier != first_bytes as u64
-            || observation.maximum_data_offset != Some(initial_window + first_bytes as u64)
-        {
-            let command = recv_reliable_path_command(&mut receivers)
-                .await
-                .expect("live first response feedback output");
-            observation.observe_command(command, stream_id);
-        }
-    })
-    .await
-    .expect("first receipt ACK and post-consumption MAX are actually published");
-    assert_eq!(control.accepted_bytes().as_slice(), first.as_ref());
-    assert!(
-        first_receipt_started.elapsed() < reliable_stream_recv_progress_interval(None),
-        "fixture must inject the second receipt before the previous ACK is already timer-due"
-    );
-    frames_tx
-        .send(Ok(Frame::StreamData {
-            stream_id,
-            offset: first_bytes as u64,
-            payload: later.clone(),
-        }))
-        .await
-        .expect("inject subsequent contiguous subquantum bulk response");
-    control.wait_blocked().await;
-    assert!(
-        first_receipt_started.elapsed() < reliable_stream_recv_progress_interval(None),
-        "the later receipt must actually enter blocked I/O before its deadline"
-    );
-    assert_eq!(control.accepted_bytes().len(), accepted_before_release);
-    let ack_while_blocked = tokio::time::timeout(Duration::from_secs(1), async {
-        while observation.ack_frontier != total_bytes as u64 {
-            let command = recv_reliable_path_command(&mut receivers)
-                .await
-                .expect("live blocked response feedback output");
-            observation.observe_command(command, stream_id);
-        }
-    })
-    .await
-    .is_ok();
-    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
-        observation.observe_command(command, stream_id);
-    }
-    let max_while_blocked = observation.maximum_data_offset;
-    let still_partial = control.accepted_bytes().len();
-    control.release();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while observation.maximum_data_offset != Some(initial_window + total_bytes as u64) {
-            let command = recv_reliable_path_command(&mut receivers)
-                .await
-                .expect("live released response feedback output");
-            observation.observe_command(command, stream_id);
-        }
-    })
-    .await
-    .expect("same retained local write/flush completes and reopens exact credit");
-    let delivered = control.accepted_bytes();
-    relay.abort();
-    let _ = relay.await;
-    let expected = [first.as_ref(), later.as_ref()].concat();
-    assert_eq!(
-        delivered, expected,
-        "pending I/O is retained, not recreated"
-    );
-    assert_eq!(still_partial, accepted_before_release);
-    assert_eq!(
-        max_while_blocked,
-        Some(initial_window + first_bytes as u64),
-        "receipt ACK must not grant consumption credit while write/flush is Pending"
-    );
-    assert!(
-        ack_while_blocked,
-        "a subsequent subquantum bulk ACK must progress without another DATA frame or local write/flush completion (block_flush={block_flush})"
     );
 }
 

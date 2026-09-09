@@ -252,6 +252,12 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- A nonrenewing ACK deadline is not a latency-neutral deadline. The09-09
+  logical-cadence trial passes634checks and improves restricted152→196Mbps,
+  but echo p95/max656/757→1472/1957ms and body gap.563→.755s worsen. Less
+  total return traffic coexists with more transient queueing and overflow.
+  A clean-RTT calculation is not a bound under inflated live RTT. The trial
+  is removed; do not rescue it by adjusting the quantum, PTO or sampling.
 - Check the actual caller's overrides before forecasting a helper correction.
   The09-09 ACK-direction proposal found real opposite-direction input and a
   64KiB versus3.125MB threshold difference, but the download caller forces

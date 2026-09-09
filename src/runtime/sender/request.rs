@@ -346,15 +346,6 @@ impl RelayRecvProgressSend {
             force_max_data: false,
         }
     }
-
-    /// Observe ordinary receipt before local delivery. The logical receipt
-    /// deadline, rather than the application write, owns deferred bulk ACKs.
-    pub(in crate::runtime) fn received_ack(path: Option<PathSnapshot>, lane: TrafficClass) -> Self {
-        Self {
-            force_ack: false,
-            ..Self::ack_only(path, lane)
-        }
-    }
 }
 
 impl RequestSenderService {
@@ -1456,9 +1447,13 @@ impl RequestSenderService {
         progress: &mut ReliableRecvProgress,
         request: RelayRecvProgressSend,
     ) -> Result<bool, RuntimeError> {
-        // Receipt ownership does not depend on current queue admission.
-        // publish_stream_ack retains the latest cumulative state even if all
-        // current outputs are closed, so a successor can independently catch up.
+        if !remotes.has_receive_feedback_output() {
+            // Closed command admission is not attachment-removal authority.
+            // Preserve cumulative feedback until the ordered carrier terminal
+            // event removes this exact attachment or a successor accepts it.
+            return Ok(false);
+        }
+
         let mut sent_any = false;
         let ack_generation_before = progress.ack_generation();
         if progress.should_send_ack(

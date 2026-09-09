@@ -1731,44 +1731,9 @@ where
                 let stall_deadline = accepted_copy_wake_at
                     .map(tokio::time::Instant::from_std)
                     .map_or(stall_deadline, |deadline| deadline.min(stall_deadline));
-                // Service the logical receipt clock before selecting other
-                // ready work. MAX/retries use a separate maintenance clock and
-                // cannot postpone new receipt evidence.
-                if state.endpoint.remote_open
-                    && state
-                        .progress
-                        .recv_progress
-                        .pending_ack_deadline()
-                        .is_some_and(|deadline| deadline <= Instant::now())
-                {
-                    let sent = match sender.send_recv_progress(
-                        remotes,
-                        context,
-                        &mut recv_stream,
-                        &mut state.progress.recv_progress,
-                        RelayRecvProgressSend::ack_only(response_path_snapshot, response_lane),
-                    ) {
-                        Ok(sent) => sent,
-                        Err(err) => break Err(err),
-                    };
-                    state.record_recv_progress_sent(sent);
-                    if remotes.stream_ack_generation() != observed_stream_ack_generation {
-                        observed_stream_ack_generation = remotes.stream_ack_generation();
-                        // A newer generation may block on a different subset
-                        // of outputs; rebuild its exact capacity subscription.
-                        stream_ack_capacity_wait = None;
-                    }
-                }
-                let recv_progress_maintenance_deadline = state.progress.last_recv_progress_sent_at
-                    + reliable_stream_recv_progress_interval(response_path_snapshot);
                 let recv_progress_deadline = tokio::time::Instant::from_std(
-                    state
-                        .progress
-                        .recv_progress
-                        .pending_ack_deadline()
-                        .map_or(recv_progress_maintenance_deadline, |deadline| {
-                            deadline.min(recv_progress_maintenance_deadline)
-                        }),
+                    state.progress.last_recv_progress_sent_at
+                        + reliable_stream_recv_progress_interval(response_path_snapshot),
                 );
                 let recv_progress_resend_active = remotes.path_keys().len() > 1
                     && reliable_relay_recv_progress_resend_active(
@@ -3543,7 +3508,7 @@ where
                                         context,
                                         &mut recv_stream,
                                         &mut state.progress.recv_progress,
-                                        RelayRecvProgressSend::received_ack(
+                                        RelayRecvProgressSend::ack_only(
                                             prewrite_response_path_snapshot,
                                             response_lane,
                                         ),
@@ -3592,23 +3557,7 @@ where
                                             adaptive_chunk,
                                             false,
                                         );
-                                        let product = &mut *product_guard;
-                                        let (sender, remotes) = (&mut product.sender, &mut product.remotes);
-                                        if state.progress.recv_progress.pending_ack_deadline()
-                                            .is_some_and(|deadline| deadline <= Instant::now())
-                                        {
-                                            let path = remotes.lowest_eta_path_snapshot(
-                                                context, response_lane, PATH_OPEN_SCORE_BYTES,
-                                            );
-                                            match sender.send_recv_progress(
-                                                remotes, context, &mut recv_stream,
-                                                &mut state.progress.recv_progress,
-                                                RelayRecvProgressSend::ack_only(path, response_lane),
-                                            ) {
-                                                Ok(sent) => state.record_recv_progress_sent(sent),
-                                                Err(err) => break Err(err),
-                                            }
-                                        }
+                                        let remotes = &mut product_guard.remotes;
                                         if let Err(err) = drive_client_response_startup_control(
                                             context,
                                             &spec,
@@ -3665,18 +3614,9 @@ where
                                         prepared_work_wait.as_mut().enable();
                                         (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, prepared_work_wait)
                                         };
-                                        let receipt_deadline = state.progress.recv_progress
-                                            .pending_ack_deadline()
-                                            .map(tokio::time::Instant::from_std);
                                         tokio::select! {
                                             biased;
                                             result = &mut write => break result,
-                                            () = async {
-                                                match receipt_deadline {
-                                                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                                                    None => std::future::pending().await,
-                                                }
-                                            }, if receipt_deadline.is_some() => continue,
                                             () = &mut prepared_work_wait => continue,
                                             additional_path_open = additional_path_open_rx.recv(), if !state.recovery.pending_additional_path_opens.is_empty() => {
                                                 let mut product_guard = request_product.lock();
@@ -3774,13 +3714,6 @@ where
                                     }
                                 };
                                 if let Err(err) = write {
-                                    let mut product = request_product.lock();
-                                    let product = &mut *product;
-                                    let _ = product.sender.send_recv_progress(
-                                        &mut product.remotes, context, &mut recv_stream,
-                                        &mut state.progress.recv_progress,
-                                        RelayRecvProgressSend::final_ack(None, response_lane),
-                                    );
                                     break Err(err);
                                 }
                                 let data_effect = data_effect.expect("ready data batch contains its first frame");

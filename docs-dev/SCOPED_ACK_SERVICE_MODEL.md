@@ -585,3 +585,22 @@ check frozen expiry, sparse extension, gap closure, all-output retry, credit
 and terminal boundaries. Independent audit then ordinary asymmetric pair,
 healthy mixed/QUIC/TCP and upload if useful. Any absent material benefit or
 adverse timing stops promotion without another sampler/threshold rescue.
+
+### Ordinary disposition: REJECTED, 2026-09-09 23:55 +08:00
+
+The real publisher and634focused checks validate the new local cadence and
+blocked-I/O service, but the ordinary pair fails its temporal acceptance:
+restricted goodput151.552→195.641Mbps, maximum body gap.563265→.754914s,
+echo p95656.240→1471.908ms and maximum756.803→1957.233ms. Total return bytes
+fall4.27%, while restricted median backlog539984→908957B, native RTT and
+overflow losses increase. This is not a universally slower implementation;
+it is an unacceptable service tradeoff. See ACK_CADENCE_ORDINARY_20260909.
+
+The symbolic proof covered receipt truth, finite pending state and nonrenewing
+service. It did not prove a useful wall-clock bound under queue-inflated RTT
+or unchanged native/assignment timing. Fewer callback generations failed to
+establish better transient service. No exact per-echo deadline attribution is
+claimed from the ordinary snapshots. All trial source/RFC/tests are reversed;
+no reduced quantum, PTO adjustment or estimator change rescues this candidate.
+The scoped-ACK comparator is restored. Continue the existing architectural
+owner, not this rejected cadence branch or a new list of hypothetical defects.

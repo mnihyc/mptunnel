@@ -248,6 +248,15 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- Check the actual caller's overrides before forecasting a helper correction.
+  The09-09 ACK-direction proposal found real opposite-direction input and a
+  64KiB versus3.125MB threshold difference, but the download caller forces
+  publication before every application write. That arithmetic therefore does
+  not predict changed download ACK cadence. Trace the complete predicate and
+  generation/publication path before an observer or estimator implementation;
+  do not silently switch to an unforced upload caller to rescue the hypothesis.
+  Preserving first-receipt startup is also not proof of later bulk feedback
+  progress while application I/O is blocked.
 - An absent candidate is not automatically the dominant delay. The09-09
   echo intervention adds a real accepted QUIC member and it wins45 responses,
   yet winning postwrite residence remains228ms median and whole echo median

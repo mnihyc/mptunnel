@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 18:55 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 22:21 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -13,7 +13,135 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ## Active transaction: user-requested mixed-mode architectural redesign
 
-**Current next action — return to the proven asymmetric feedback-service stall.**
+### ACK-direction gate complete — rejected as the download-stall fix
+
+Actual publisher characterization passes:351Kbps and500Mbps snapshots select
+65,536B and3,125,000B thresholds, but identical six receipts produce the same
+generations1,2,3,3,4,5, five ACKs/127codec bytes and three MAX/78codec bytes.
+Eight existing publication/backpressure/startup/terminal controls also pass.
+Independent source and fixture review agree. Exact commands, scopes, outcome
+and test-only patch are in ACK_DIRECTION_CHARACTERIZATION_20260909. The patch
+is archived and removed; runtime/RFC/Cargo remainb2aa215 and the ordinary
+executable is unchanged. No observer or asymmetric capture was necessary.
+
+Disposition: source-valid opposite-direction coupling, but bypassed by the
+actual client's forced prewrite publisher, so it does NOT justify a download
+performance fix. Do not implement a receive-rate estimator or switch to upload
+to rescue this forecast. The plan's expected opportunity failed at the caller,
+not at random network measurement. This completes the selected causal gate,
+not the optimization loop or global acceptance.
+
+Next bounded owner remains return-feedback publication service, not native
+controller tuning or fixed bottleneck groups. A replacement must distinguish
+unmaterialized receipt progress from already-materialized per-attachment debt
+and preserve both while application write/flush is Pending. The existing first-
+receipt/Latency startup test alone would miss force-off's subsequent bulk
+subthreshold starvation. RFC8.3 currently mandates offer-before-park/yield;
+any deferred cadence requires an explicit justified model revision. No such
+candidate is selected by the rejected directional-input hypothesis. Rejected
+ready-receipt batching, first-poll pairing and deferred sibling models remain
+rejected/unselected; new work must supply a new coherent service proof and
+material forecast before another implementation/build. Global gates below stand.
+
+### Completed source gate — caller bypass found before instrumentation
+
+2026-09-09 22:17 +08:00. Source review, independently confirmed, finds that
+ordinary client DATA uses `RelayRecvProgressSend::ack_only` before local write
+(control.rs:3506). That constructor sets force_ack=true. Every changed receive
+batch therefore bypasses the half-BDP byte threshold; the later unforced call
+sees the same receive state, and an unchanged generation only retries pending
+publication. The opposite-direction scalar is real but does not control this
+download publication cadence. The previous proposal missed this actual caller.
+
+Smallest remaining proof is a characterization through the real RequestSenderService
+publisher, receive map, exact live command output and codec: identical contiguous,
+sparse, duplicate and hole-fill traces; vary only351Kbps versus500Mbps at100ms.
+Validate different calculated steps but identical actual ACK generations/frames
+through the production prewrite/postwrite call sequence. This is not a new
+required model or Product RED. Run existing blocked-delivery startup/ACK/FINAL
+and retained-publication controls alongside it; no runtime policy edit.
+
+Information forecast/falsifier: identical forced publication closes this
+directional-rate branch as a download-stall fix. Differing publication needs
+exact attribution before further action. Upload's unforced server DATA caller
+is distinct and has no new material-impact evidence; do not silently switch
+the experiment to it. Expected download gain from changing this unused gate
+is zero for this sequence, not the earlier illustrative48-fold opportunity.
+
+Execution deviation declared before tests: cancel the proposed diagnostic
+observer/build/asymmetric capture if this direct publisher characterization
+confirms the unconditional bypass. Another capture cannot overturn the source
+predicate and would not select a different fix. Preserve444fb38's real
+blocked-application protection; merely turning off force would remove prompt
+feedback while the write future can remain pending. No replacement timing,
+receive-rate estimator or previous rejected batching trial is authorized by
+this finding. Runtime remainsb2aa215 and all broader practical gates stay open.
+
+**Proposed next transaction — test ACK-cadence input direction before changing publication policy.**
+
+User requested a practical deterministic fix plan after the no-fixed-groups
+discussion. This is a source-backed candidate and a causal gate, not a proven
+stall root cause or authorization to promote a runtime change. No runtime,
+RFC, test, build or laboratory change has been made for this proposal.
+
+New exact source finding, independently reviewed: ACK byte cadence compares
+incoming Product progress with half a BDP derived from the opposite local
+outbound snapshot. Client response ACK uses lowest_eta_path_snapshot and
+ClientToServer evidence; server request ACK uses an ingress-matched output
+whose rate evidence is ServerToClient. Ingress identity and response_lane do
+not reverse that rate's meaning. capacity.rs:196/523 reads legacy delivery/
+Product scalars, not a direction-checked receive-service record. These may be
+startup/configured/native fallbacks, not necessarily measured tiny-request
+rates. Borrowing RTT itself is not the claimed defect.
+
+History185377f introduced the half-BDP rule as repair-release cadence;
+28dc39a moved it into model capacity geometry. Neither inspected source nor
+RFC8.2/8.3 declares opposite-direction Product goodput as a reverse-budget
+policy. Shared-scalar ACK coupling was noted earlier, but the actual directional
+producer/consumer mismatch is now explicit. It remains distinct from rejected
+native-rate ranking, which deliberately left feedback cadence untouched.
+
+Smallest causal gate: characterize the real receive/ACK publisher with an
+unchanged incoming trace and timing while varying only the supplied opposite-
+direction rate; then use one existing return-restriction capture with bounded
+ACK-cause/input summaries. Record actual byte threshold, scalar source and
+direction, byte/gap/timer/forced decisions and resulting publication/encoded
+counts. Existing codec totals alone cannot say which trigger dominates. Do not
+build another harness or log every frame. If clamps, gaps or forced publication
+dominate and this input cannot materially explain return cost, end the branch
+without implementing an estimator or compensating threshold.
+
+Conditional arithmetic forecast, not observed service: with default resource
+geometry and100ms RTT,351Kbps selects the64KiB byte floor, while500Mbps gives
+3.125MB half-BDP. Byte-triggered ACK cadence could differ~48-fold for identical
+incoming service. Actual scalar availability, clamping, gap/forced/timer ACKs
+and MAX traffic can erase much or all of that opportunity. The earlier unsafe
+ACK-only withholding pair improved restricted169.929→296.144Mbps and worst
+restricted echo1.246s→.471s; it proves ACK work can matter, not a safe gain
+forecast or bound for this different candidate.
+
+If and only if that gate establishes material impact, the candidate model
+separates received Product progress evidence from local transmit service and
+carrier-ranking snapshots. Use correctly scoped local receipt evidence, with
+explicit freshness/idle/duplicate semantics; do not substitute a peer rate or
+invent capacity. Preserve the existing byte/time geometry pending its own
+justification, immediate first/latency/terminal feedback, scoped gap truth,
+independent publication on every live attachment, exact pending retries,
+MAX credit, native control and all resource bounds. Define the complete
+receive-evidence model and its RED/controls before runtime implementation.
+This changes the evidence domain, not a multiplier or preferred protocol.
+
+Acceptance order after mechanism proof: one ordinary affected control/candidate
+pair first; stop on absent material service benefit or adverse timing. Then
+healthy TCP/QUIC/mixed and mirrored upload, sparse/cold/warm feedback, blocked
+application writes, receive reordering/duplicates and one-way return blackhole
+with restart-free recovery. Retain full bins, first service, gaps, echo tails,
+confirmed completion and wire/CPU/RSS costs. No second change to rescue a failed
+pair. Native-contention allocation remains a separate next owner; do not add
+bottleneck groups or a coupling controller to this candidate. Broader combined
+loss/aggregation/Cloudflare/baseline gates below remain required before release.
+
+### Completed return-feedback source/capture review
 
 Both context discriminators are complete. One versus three independently
 progressing raw TCP bodies gives450.855→452.044Mbps, but sparse echo median

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-09 18:45 +08:00. Authoritative source is `./`.
+Updated:2026-09-09 18:55 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -39,7 +39,7 @@ MAX-only deferral has a tractable scalar but adds alternate-return delay and
 can hurt small-window service. Neither is selected. Preserve the independent
 publication that repaired selected-return blackholes; no new timer or window.
 
-Next bounded source-only question: do already superseded, not-yet-written
+Completed bounded source-only question: do already superseded, not-yet-written
 MAX grants consume immutable output queue/service, or is latest-value
 supersession already owned there? This is distinct from the accepted incoming
 logical MAX fold and rejected ACK batching/pairing. Check exact writer ownership,
@@ -50,6 +50,40 @@ irreversible boundary ends this branch. No new build or speed gain is forecast
 from reading. Removing records is not proof of better timing. Do not implement
 unless the resulting contract preserves prompt per-output service without a
 timer, ACK clock change or unbounded state. Existing scope/gates remain intact.
+
+Outcome: no new contrary evidence. The immutable outbound MAX overlap is
+already the deferred queue-latest branch recorded below at11:39, not a new
+defect. The actual restricted shadow has44,437MAX takes,9,157with newer work
+pending (20.607%). Nine reports show0–1currently pending MAX; the cumulative
+peak86does not increase in that interior. No persistent large pre-writer MAX
+backlog or exact MAX residence is established. Current queues are bounded and
+reclaimed; do not relabel redundant work as a leak or missing retry.
+
+Existing restricted client TCP native Send-Q totals have median/peak244878/
+514653B in the ordinary scoped candidate,519891/889397B in the fanout control,
+and180262/317058B in the scoped queue observer. All three sockets retain work
+in every restricted snapshot. These include native unsent/unacknowledged
+bytes, not specifically MAX. Management queue_bytes is native TCP notsent;
+Product DATA flight is not feedback queue occupancy. QUIC queue is unavailable,
+not zero. A dequeue is also not an irreversible native write. These distinctions
+prevent manufacturing a dominant MAX queue from the dashboard.
+
+Disposition: retain queue-latest deferral, reject an alleged absent retry,
+and keep all runtime/RFC code unchanged. Do not spend another observer/build
+on that known20%opportunity without new evidence of material user-service value.
+The original5e1ace67history explicitly records the locally accepted but
+wire-blackholed selected feedback path; its protection must not be rolled back
+because full fanout now has a demonstrated asymmetric cost.
+
+The next performance transaction still belongs to independent return-feedback
+service. Its prerequisite is a coherent publication contract with bounded work
+and explicit alternate-return timing, not another frame-packaging, scalar or
+controller experiment. Full scoped-ACK deferred catch-up remains blocked by
+generation/chunk starvation and retention costs; MAX-only deferral remains an
+unselected latency tradeoff. No implementation candidate is currently justified.
+This is an unresolved model decision, NOT completion of the optimization loop
+or a new release requirement. Healthy native contention is classified separately;
+seconds-long stalls and the unchanged global experience gates remain open.
 
 ### Completed native-count discriminator (predeclared contract)
 

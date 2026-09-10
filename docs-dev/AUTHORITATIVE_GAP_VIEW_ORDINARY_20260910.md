@@ -1941,3 +1941,196 @@ promotion or guarantee that correcting the observed no-op invalidation will
 remove either measured long gap. The next bounded correctness/performance
 transaction must preserve independent availability wakes and measure its own
 whole outcome; this capture supplies attribution, not a new policy or speed claim.
+
+## Ordinary ACK recovery invalidation: useful partial gain, write-gap gate still fails
+
+This separate ordinary run tests only the exact subsumed-ACK no-op correction.
+`ClientStreamAckOutcome` carries buffer-release bytes and `has_new_facts` to the
+real caller. False is returned only by the existing validated subsumption fast
+path; every successful full ACK application returns true, including novel
+negative evidence that releases zero bytes. The caller preserves prior dirty
+work with `request_recovery_dirty |= has_new_facts`, unchanged buffer release,
+idle progress and independent availability wakes. No ACK cadence, publication,
+controller, timer or recovery geometry changes. Runtime is `d44ca8e` plus the
+saved four-file candidate patch (client/control runtime and both test files).
+
+Forecast: remove recovery scans caused solely by exact no-op ACK invalidation,
+while independent model/capacity/deadline wakes and other work remain. The prior
+diagnostic establishes reachability and material overlap, not removable seconds.
+This ordinary result improves completed bytes, settlement and confirmation gaps
+against preserved `d44`, but the maximum write gap worsens and restored service
+still stalls. **The exact mechanism is corrected; performance promotion remains
+held.** Neither crossing a bandwidth number nor component GREEN clears the gate.
+
+The initial test compilation fails on `Vec` versus required `SmallVec` in the
+new fixture, before any assertion. After the fixture correction, all 12 client
+checks pass in .41s after 2m13s compilation, including exact positive replay and
+new omission with zero released bytes; all 32 affected control checks pass in
+.19s, 44 total. The ordinary build55998 takes 3m34s with the existing unused
+batch-write helper warning. No observer runs in this capture. Runner23406 exits0
+in 46.006965s; result tag remains `ack-recovery-invalidation-0910` although local
+completion/report date is September11. The [verified raw archive](ACK_RECOVERY_INVALIDATION_ORDINARY_20260911.raw.tar.gz)
+is 257,672B with 13 regular files: five results, build, initial compile failure,
+client retry and control-test logs, driver, exact patch, `run.py` and `shape.sh`.
+Gzip integrity, tar comparison and every decompressed member's bytes pass.
+Runner/profile match the preserved `d44` ordinary archive byte-for-byte. No
+configs, credentials, binaries, links or directory entries are included.
+
+### Complete ordinary outcome, not a diagnostic-speed comparison
+
+The comparators below are previously preserved ordinary captures in the same
+declared topology/profile, not simultaneous, equal-work or packet-identical
+trials. `b0` retains the earlier one-head recovery model; `d44` is this candidate's
+direct runtime baseline. The diagnostic6884 result is not a performance control.
+
+| Outcome | Preserved `b0` | Ordinary `d44` | No-op invalidation candidate |
+|---|---:|---:|---:|
+| Accepted = confirmed bytes | 1,294,925,824 | 419,954,688 | 526,385,152 |
+| Exact completed streams | 1/1 | 1/1 | 1/1 |
+| Elapsed, s | 41.538802 | 64.942209 | 45.465808 |
+| Completed whole Mbps | 249.391 | 51.733 | 92.621 |
+| First write / confirmation, s | .105451 /.409741 | .105864 /.408088 | .105228 /.408993 |
+| Maximum write gap, s | .545897 | 5.172138 | **7.235997** |
+| Maximum confirmation gap, s | .634001 | 9.215061 | 4.145083 |
+
+The candidate completes 25.34% more bytes than `d44` in 29.99% less elapsed time;
+the reported whole rate rises 79.04%. Maximum confirmation gap falls 55.02%,
+but maximum write gap grows 39.90%. This is a useful partial ordinary outcome,
+not a causal estimate from one chronological comparison. Probe status is `ok`,
+terminal accounting exact, errors empty, and there is no echo workload or
+censoring. Nominal offered duration is 40s; source backpressure means the last
+local acceptance need not occur at 40s. Final settlement extends 5.465808s beyond
+that nominal endpoint. All 46 raw confirmation bins follow, with 11 zeros;
+the final bin is partial. Trimmed bins are not substituted for wall-clock history.
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 6.856,93.492,167.868,43.42,16.777,0,184.217,62.204,74.54,77.166
+10: 245.559,91.607,185.218,43.324,0,49.047,193.922,150.22,118.473,96.484
+20: 156.991,118.307,81.7,0,22.493,206.909,73.708,0,222.78,143.2
+30: 236.072,36.988,0,0,0,6.12,0,0,5.243,319.121
+40: 0,0,128.768,206.967,221.731,123.592
+```
+
+| Raw confirmation phase | `b0`, Mbps | `d44`, Mbps | Candidate, Mbps | Candidate zeros |
+|---|---:|---:|---:|---:|
+| 0–5s | 262.228 | 75.416 | 65.683 | 0/5 |
+| 5–15s, pre-cut | 308.068 | 87.670 | 96.384 | 2/10 |
+| 15–25s | 34.658 | 55.397 | 98.764 | 1/10 |
+| Interior16–24 inclusive | 16.203 | 61.552 | 104.288 | 1/9 |
+| 25–40s, restored | 328.092 | 41.114 | 83.343 | 6/15 |
+| Own post40s bins, last partial | 349.816 over40–42 | 37.407 over40–65 | 113.510 over40–46 | 2/6 |
+
+Cut service improves materially versus both preserved comparators, while healthy
+and restored performance remains far below `b0`. Startup0–5s is worse than `d44`.
+The zero bins at32–34 and36–37 preserve the restored failure that the whole mean
+would hide; no claim of continuous service follows from the faster bursts.
+
+### Own stalled phases: target and reply holds coexist
+
+The ordinary probe saves maximum gap magnitudes but not their exact endpoints.
+The following sampled plateaus are therefore not labelled the exact7.235997s
+write or4.145083s confirmation interval. Management's source read, successful
+target-socket write, sink-reply read and client local-reply write are separate
+counters, and their producer timestamps are not a saved probe wall-clock origin.
+
+| Management sample | Source read, B | Target write, B | Server reply read, B | Client reply write, B |
+|---|---:|---:|---:|---:|
+| 32 | 467,801,688 | 401,298,232 | 1,496 | 1,482 |
+| 34 | 467,801,688 | 437,113,884 | 1,580 | 1,482 |
+| 35 | 467,801,688 | 437,113,884 | 1,580 | 1,482 |
+| 37 | 467,801,688 | 437,113,884 | 1,580 | 1,496 |
+| 39 | 468,407,096 | 437,113,884 | 1,580 | 1,510 |
+| 40 | 510,941,700 | 444,541,732 | 1,622 | 1,622 |
+| 42 | 511,650,596 | 473,995,758 | 1,664 | 1,622 |
+| 43 | 526,385,152 | 479,799,638 | 1,720 | 1,650 |
+| 45, last sampled | 526,385,152 | 513,633,572 | 1,860 | 1,860 |
+
+Source is fixed over samples32–37, then adds only605,408B through39. Target is
+fixed at437,113,884B from server Unix1789056153140 through1789056158140
+(samples34–39, exactly5s). The return prefix also advances slowly. This is not
+solely a final reply hold after all target bytes arrived: forward target service
+is still incomplete. Sample45 ends before the target's final12,751,580B are
+observed; the exact probe, not that last management row, proves full settlement.
+
+During target-flat34→39, the two used TCP outputs' native forward ACK counters
+increase14,458,224/15,246,028B; both QUIC counters increase30,502B each. Epochs
+are unchanged and used producer timestamps advance. The small idle TCP counters
+sometimes retain old stamps and are not described as freshly polled continuous
+progress. Native bytes while target is flat are not useful ordered bulk bytes
+or a proof of any particular necessary/wasteful copy.
+
+Client Product flight falls29,591,012→20,985,914B in that band. QUIC46/47 retains
+11,581,922/17,047,778B initially and11,064,114/9,448,112B finally despite sampled
+native QUIC flight0 at both endpoints of the band. Native QUIC flight limits
+are approximately5.65/6.15→5.68/5.82MB; they are not free Product recovery credit.
+Client total queued bytes range0–102,244B, not a measurement of command-lane
+permits or readiness. Management exports no command-slot occupancy/full predicate,
+so neither large Product debt nor a zero total queue proves a blocked/full lane
+or a feasible next repair. Native TCP sender windows remain large and bytes
+advance, while the two used client TCP receive queues fall45,126/37,942→
+23,149/15,690B. Those unread bytes are not identified as the critical reply.
+
+Client lifetime `ps` CPU moves125→123% in34–39; RSS stays352,956KiB. These are not
+interval CPU or owner-hold timers. Without diagnostic boundaries or exact queued
+recovery ownership, the ordinary capture cannot assign the remaining stall to
+the old repeated-work mechanism, a new lost wake, or native/read service.
+It also cannot establish that the small source correction caused the larger
+maximum write gap. The adverse user-visible result remains a gate failure.
+
+### Matched physical profile and complete sampled costs
+
+All 46 samples verify the same direct independent links:200Mbps each,
+DOWN30ms/UP70ms, zero configured loss/jitter/outage, netem limit8192 and HTB
+burst/cburst65536. Client eth0/eth1 are links46/47; server eth1/eth0 are46/47.
+Only46UP is first observed at10Mbps at runner15.001773s and restored at25.002925s;
+47 stays200Mbps. Every class rate equals its ceiling, and all class/qdisc drop
+deltas are0. One session5226093404294122106 keeps eight active physical outputs,
+none suspect/failed. All eight native epochs are initialized and stable from
+sample9 onward. No compiler overlaps the ordinary run.
+
+| Actual target-socket sample window | `b0`, Mbps | `d44`, Mbps | Candidate, Mbps |
+|---|---:|---:|---:|
+| 0→5s | 273.573 | 87.037 | 155.060 |
+| 5→15s | 321.800 | 94.412 | **75.944** |
+| Strict16→24s | 17.028 | 59.496 | 119.326 |
+| 25→40s | 340.910 | 62.647 | 68.915 |
+
+Target rates use actual management producer time differences. The pre-cut
+target rate worsens versus `d44` despite better raw confirmation in the nominal
+phase: differently timed counters and previously buffered replies must not be
+equated. Restored target gain is much smaller than the raw-confirmation gain.
+
+| UP class service, Mbps | `d44`46 /47 | Candidate46 /47 |
+|---|---:|---:|
+| 0→15s | 100.203 /145.756 | 89.136 /146.906 |
+| Strict16→24s | 10.019 /137.332 | 10.023 /195.684 |
+| 25→40s | 72.552 /94.617 | 112.396 /91.589 |
+
+| Whole sampled cost | `d44` | Candidate |
+|---|---:|---:|
+| Sample window, s | 65.007846 | 45.006732 |
+| UP46 /47 class bytes | 423,938,161 /705,498,359 | 467,368,412 /749,700,687 |
+| DOWN46 /47 class bytes | 6,673,253 /8,278,284 | 7,015,954 /8,612,499 |
+| Summed UP backlog peak / final, B | 31,303,275 /424,756 | 28,677,318 /12,763,272 |
+| Summed DOWN backlog peak / final, B | 38,033 /810 | 46,620 /13,425 |
+| Client RSS peak / final, KiB | 410,640 /410,640 | 355,388 /342,712 |
+| Server RSS peak / final, KiB | 123,852 /123,852 | 75,776 /75,776 |
+| Client lifetime CPU peak / final, % | 124 /116 | 126 /123 |
+| Server lifetime CPU peak / final, % | 45.9 /26.8 | 66.2 /37.8 |
+
+More completed work coexists with more wire bytes and higher lifetime CPU values,
+but lower peak RSS. Different durations and final in-flight phases prevent
+treating final backlog/RSS as a post-teardown leak or a matched settled-state
+cost comparison. Class traffic is not unique payload, and hierarchical qdisc
+backlogs are not summed twice. Candidate client log and probe stderr are empty;
+two server `H3_NO_ERROR` remote-close warnings occur during normal teardown,
+with no probe error or incomplete transfer. Existing HTB notices are retained.
+
+Disposition: the forecast receives **partial practical support**, including
+better independent-cut service and shorter settlement with more delivered work.
+It does not prove the eliminated ACK transitions caused the full gain, and the
+remaining4.145s confirmation gap, worsened7.236s write gap and poor restored
+service prevent performance promotion. Preserve this result and the narrow
+correctness checkpoint separately; no threshold rescue, diagnostic-as-baseline
+comparison or favorable rerun is justified by this one outcome.

@@ -724,6 +724,15 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     }
 }
 
+/// Successful ACK application separates buffer release from recovery evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClientStreamAckOutcome {
+    pub(super) released_bytes: usize,
+    /// Exact replay can refresh idle progress without invalidating recovery.
+    /// New negative evidence still matters when it releases no source bytes.
+    pub(super) has_new_facts: bool,
+}
+
 /// Commits one peer ACK and derives reinjection work in the same ownership step, so
 /// ACK evidence and queued recovery cannot diverge across select iterations.
 pub(super) fn apply_client_stream_ack(
@@ -731,7 +740,7 @@ pub(super) fn apply_client_stream_ack(
     stream_id: StreamId,
     scope_start: Option<u64>,
     ranges: Vec<OffsetRange>,
-) -> Result<usize, StreamError> {
+) -> Result<ClientStreamAckOutcome, StreamError> {
     // Capture one immutable send-assignment extent before touching any ACK-owned
     // cache, flight, queue, reservation, or recovery evidence.
     let validated_ack = begin_reliable_stream_ack(ack_context.send_stream, scope_start, ranges)?;
@@ -740,7 +749,10 @@ pub(super) fn apply_client_stream_ack(
         .subsumes(&validated_ack, ack_context.send_stream)
     {
         ack_context.state.progress.last_stream_at = Instant::now();
-        return Ok(0);
+        return Ok(ClientStreamAckOutcome {
+            released_bytes: 0,
+            has_new_facts: false,
+        });
     }
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
@@ -820,7 +832,10 @@ pub(super) fn apply_client_stream_ack(
         ),
     );
     state.progress.last_stream_at = Instant::now();
-    Ok(ack.released_bytes)
+    Ok(ClientStreamAckOutcome {
+        released_bytes: ack.released_bytes,
+        has_new_facts: true,
+    })
 }
 
 #[cfg(test)]

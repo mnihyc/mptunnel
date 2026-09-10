@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 23:57 +08:00. Authoritative repository: `./`.
+Updated: 2026-09-11 00:10 +08:00. Authoritative repository: `./`.
 **MPP is not performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; do not conclude at an intermediary commit.
 
@@ -215,6 +215,72 @@ profile/jobs1. This compile error is not a Product RED. Diagnostic6884 report
 and verified11-member/752474B archive are complete. Its local6.246s hold and
 different late-acceptance maximum gap are recorded separately. Ordinary source
 has no observer, rejected chooser or whole-gap observation candidate.
+Retry28256 closes0:12client+32control checks pass (.41/.19s execution), including
+the new positive/replay/novel-negative/replay outcome and prior invalid-ACK,
+ownership, half-close and feedback controls. Release ordinary build55998 is
+active, jobs1, no concurrent lab. Exact four-file patch is retained in
+./.tmp/reflection/ack-recovery-invalidation-0910.patch. No performance acceptance.
+Build55998 closes0/3m34s. Ordinary23406 closes0/46.006965s driver:
+526385152B exact in45.465808s,92.621Mbps,firstwrite/confirm.105228/.408993s,
+maxwrite7.235997/confirm4.145083s. Relative to d44ordinary: whole51.733→92.621,
+settlement64.942→45.466,confirmgap9.215→4.145 improve; writegap5.172→7.236
+WORSENS. Raw5–15/16–24inclusive/25–40=96.384/104.288/83.343Mbps,11zeros
+among46bins. Source467801688B staysflat32–37; target437113884B staysflat34–39,
+with serverreply1580B unchanged. Stable native ACKs continue in that restored
+plateau; total pending command bytes are0–102244B sampled, NOT proof of repair
+slots full/free. No gap endpoints in probe JSON, so do not invent exact joins.
+Useful partial ordinary benefit supports an isolated exact-no-op correction
+checkpoint, but performance promotion remains HELD by the adverse write gap
+and ongoing stalls; no full fix or release claim. Independent wake audit is
+rechecking whether the adverse gap exposes a semantic countercase. Ordinary
+timing alone does not assign its cause to this correction. Preserve all prior
+comparators; next step is attribution, not another parameter or stacked fix.
+Full report and13-member257672B archive ACK_RECOVERY_INVALIDATION_ORDINARY_20260911
+retain all rawbins, failed-fixture build,44passing checks,ordinary source patch,
+build/profile and costs.
+Follow-up source audit finds no lost-wake countercase caused by this diff:
+generic Input still clears retry; exhausted scans retain the before-observation
+capacity/model waiter; false wakes rearm; gap preselect remains unconditional;
+copy/range deadlines and all structural changes still invalidate. Source-read
+gating cannot become newly blocked solely by removing this dirty prerequisite.
+This is not universal producer-wake completeness or proof of unchanged timing.
+
+### Next transaction: identify actual pre-authority repair-plan refusal
+
+Issue/impact remains restored mixed UP stalls, not a new queue-performance
+project. Existing6884 counters already separate989922plan attempts from30235
+authority/reservation entries and18964fencedApply/commits. Thus959687attempts
+(96.946%) stop BEFORE authority;11271later refusals plus those959687 exactly
+match970904blocked+54errors. No native-stale or failed fencedApply is observed.
+Do not equate their count with a measured exclusive elapsed-time fraction.
+
+Competing causes: actual bound chooser cannot enqueue versus the plan's outer
+captured eligibility refusing the selected target; post-plan target/proof/load
+refusal is an invariant control. A full repair-command lane with positive
+stream-local K is a concrete reachable source branch: discovery ignores that
+lane, then bound refinement refuses it. K and command admission are intentionally
+separate (3a6d0ea);1436ff4's direct structural dispatch deliberately preserved
+safe final refinement. Rejected targets reset at each region, so blocked lanes
+can multiply R×P work per finite scan. This is not unsafe admission or an
+infinite loop. Current ordinary queue byte samples do not prove its frequency;
+NO readiness-filter fix is authorized from the coarse counters alone.
+
+Question/information forecast: classify the actual original refusal site and
+already-evaluated bound chooser predicates in one same-cell diagnostic. Record
+prepare/exact-target, chooser error, captured-eligibility error, and post-plan
+fence controls; inside the bound chooser accumulate eligible and ready/not-ready
+facts from EXISTING evaluations, without new reads or reevaluating after failure.
+If queue-negative decisions dominate the held/repeated-work context, select
+an exact command-readiness producer/control before considering a correction.
+If captured eligibility dominates, follow that model mismatch instead; if
+neither, preserve the actual branch rather than rescuing the queue hypothesis.
+This predicts information, not a speed gain. Smallest action is feature-only
+periodic count aggregation emitted outside Product lock, using existing logging
+and the same owned200+200QoSUP runner. No per-attempt log, policy/timing/queue
+change or full harness. Independent review must confirm branch identity and
+observer placement. Save/freeze overlay, reverse it before diagnostic traffic.
+No second runtime correction until this branch attribution closes; all global
+gates and the adverse ordinary ACK-candidate result remain intact.
 
 ### Completed loss-CPU discriminator; no CPU fix justified
 

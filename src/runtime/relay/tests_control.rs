@@ -1231,7 +1231,8 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
         vec![OffsetRange { start: 0, end: 8 }],
     )
     .expect("exact assigned ACK commits");
-    assert_eq!(released, 8);
+    assert_eq!(released.released_bytes, 8);
+    assert!(released.has_new_facts);
     assert!(sender_queue.is_empty());
     assert!(last_send_ack.gaps().is_empty());
 }

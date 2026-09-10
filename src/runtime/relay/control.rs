@@ -3946,7 +3946,7 @@ where
                                 let previous_had_ack_gaps = last_send_ack.has_gaps();
                                 let previous_ack_frontier = send_stream.data_ack_frontier();
                                 let previous_queue_bytes = sender_queue.bytes();
-                                let released_bytes = match apply_client_stream_ack(
+                                let ack_outcome = match apply_client_stream_ack(
                                     ClientStreamAckContext {
                                         state: &mut state,
                                         sender: sender,
@@ -3962,11 +3962,12 @@ where
                                     scope_start,
                                     ranges,
                                 ) {
-                                    Ok(released_bytes) => released_bytes,
+                                    Ok(outcome) => outcome,
                                     Err(err) => break Err(err.into()),
                                 };
+                                let released_bytes = ack_outcome.released_bytes;
                                 send_buffer_reservation.release(released_bytes);
-                                request_recovery_dirty = true;
+                                request_recovery_dirty |= ack_outcome.has_new_facts;
                                 let claim_inputs_changed = released_bytes > 0
                                     || previous_had_ack_gaps != last_send_ack.has_gaps()
                                     || previous_ack_frontier != send_stream.data_ack_frontier()

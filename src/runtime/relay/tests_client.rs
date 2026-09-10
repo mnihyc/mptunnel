@@ -724,6 +724,97 @@ fn completion_requires_terminal_control_ack_and_reorder_drain() {
 }
 
 #[tokio::test]
+async fn request_ack_outcome_distinguishes_subsumption_from_zero_byte_new_omission() {
+    let stream_id = StreamId(615);
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11615"
+                .parse::<PathSpec>()
+                .expect("test path"),
+        ],
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let (mut remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened_request_path(stream_id, 0, commands), 8);
+    let owner = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(owner);
+    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let head = send_stream
+        .send_data(Bytes::from_static(b"head"))
+        .expect("head");
+    let tail = send_stream
+        .send_data(Bytes::from_static(b"tail"))
+        .expect("tail");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &head);
+    sender.record_original_frame_for_test(owner, &tail);
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    sender_queue.push_reinjection(head.clone());
+    let mut state = ClientRelayState::new();
+    let mut last_send_ack = AuthoritativeStreamAckSnapshot::default();
+
+    // The positive set stays identical. Expanding only the authoritative
+    // scope introduces a real omission without releasing any additional byte.
+    for (scope_start, released_bytes, has_new_facts, has_gap) in [
+        (4, 4, true, false),
+        (4, 0, false, false),
+        (0, 0, true, true),
+        (0, 0, false, true),
+    ] {
+        let observed_at = Instant::now();
+        state.progress.last_stream_at = observed_at - Duration::from_secs(1);
+        let outcome = apply_client_stream_ack(
+            ClientStreamAckContext {
+                state: &mut state,
+                sender: &mut sender,
+                sender_queue: &mut sender_queue,
+                context: &context,
+                remotes: &mut remotes,
+                send_stream: &mut send_stream,
+                last_send_ack: &mut last_send_ack,
+                path_snapshot: None,
+                relay_lane: TrafficClass::Throughput,
+            },
+            stream_id,
+            Some(scope_start),
+            vec![OffsetRange { start: 4, end: 8 }],
+        )
+        .expect("valid assigned ACK");
+        assert_eq!(outcome.released_bytes, released_bytes);
+        assert_eq!(outcome.has_new_facts, has_new_facts);
+        assert!(state.progress.last_stream_at >= observed_at);
+        assert_eq!(send_stream.next_offset(), 8);
+        assert_eq!(send_stream.data_ack_frontier(), 0);
+        assert_eq!(state.progress.last_send_ack_frontier, 0);
+        assert_eq!(send_stream.reinjection_bytes(), 4);
+        assert_eq!(sender_queue.reinjection_bytes(), 4);
+        assert!(sender_queue.has_queued_reinjection_overlap(&head));
+        assert!(!sender_queue.has_queued_reinjection_overlap(&tail));
+        assert_eq!(sender.accepted_reinjected_data_bytes_for_test(owner), 0);
+        assert_eq!(last_send_ack.has_gaps(), has_gap);
+        if has_gap {
+            assert_eq!(last_send_ack.gaps(), &[OffsetRange { start: 0, end: 4 }]);
+            assert_eq!(
+                sender
+                    .unacked_original_paths_for_gaps(&remotes, last_send_ack.gaps())
+                    .as_slice(),
+                &[owner],
+            );
+        }
+        // This checks the caller's OR contract, not actor quiescence: existing
+        // independently dirty work must survive an exact no-op outcome.
+        for initially_dirty in [false, true] {
+            let mut dirty = initially_dirty;
+            dirty |= outcome.has_new_facts;
+            assert_eq!(dirty, initially_dirty || has_new_facts);
+        }
+    }
+}
+
+#[tokio::test]
 async fn request_ack_releases_load_only_after_final_original_flight() {
     let stream_id = StreamId(613);
     let context = ClientPathContext::new(
@@ -818,7 +909,8 @@ async fn request_ack_releases_load_only_after_final_original_flight() {
             None,
             vec![OffsetRange { start: 0, end: 2 }],
         )
-        .expect("replayed ACK"),
+        .expect("replayed ACK")
+        .released_bytes,
         0,
     );
     assert!(remotes.paths[0].has_load_reservation());
@@ -962,7 +1054,8 @@ async fn ambiguous_prefix_ack_cannot_withdraw_a_fresh_request_tail_beyond_the_ho
             Some(0),
             vec![OffsetRange::new(0, horizon).expect("prefix ACK range")],
         )
-        .expect("apply prefix ACK"),
+        .expect("apply prefix ACK")
+        .released_bytes,
         horizon as usize,
     );
     assert!(

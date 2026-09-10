@@ -43,9 +43,33 @@ Acceptance/stop: exact same-process extent/incarnation joins and first-winning
 gap attribution select ONE correction with a real producer counterexample.
 No attribution means no fairness implementation. All ordinary timing/cost
 gates, existing half-close/partial-write/FIFO authority, and global scope stay.
-Actual-versus-forecast: pending; previous observer proved local residence, but
-did not select an actor. Its repair-route omission is recorded, not filled with
-invented timestamps. No public update or release follows a diagnostic.
+Actual-versus-forecast:60654 ends incomplete at85s,479,504,771B confirmed of
+547,815,424B. Winner[1229,1243) is handled promptly by its QUIC carrier then
+waits3,474ms after shared Product enqueue; per-frame dequeue→apply is at most
+1ms.234/277 attachment arrivals observe merged capacity131 fully occupied.
+This rejects a carrier-only fairness cure. The final reply head1663 remains
+censored after predecode AND cascading local queue delays; final management
+records26s without reply progress although target reaches all source bytes.
+Full selected-stage report/archive retain these limits and noisy existing
+server recovery events. No timer or queue-capacity correction follows.
+
+Next information transaction: identify the serialized service cost behind this
+full FIFO. Existing profile measures only15.420s gap selection; mux ACK timing
+excludes flight release/path updates. Late input returns2,332 are not merely
+206 non-subsumed mux ACK applications. Full ACK handling, normal preselect
+maintenance, prepared writer ownership and outside-lock scheduling compete.
+Instrument actual RequestProductGuard wait and exclusive hold by STATIC source
+caller, including nonblocking writer claims, with existing periodic aggregation.
+This covers all owner critical sections rather than guessing another partial
+phase. End hold at actual release; emit afterward. Elapsed is not CPU. Keep
+selected reply stages to join the held interval; disable the known noisy
+server_stale_output_recovery event in this observer, not any runtime behavior.
+Forecast: attribute material lock-held or contended portions to exact callers,
+or falsify owner contention/work dominance and stop that hypothesis. No gain
+forecast for measurement. Same ordinary candidate and physical profile; no
+runtime policy, threshold, guard, timers or copied-byte bounds change. A costly
+call site must still yield a source-reachable work counterexample and controls
+before a correction; no automatic scheduling/ACK-batching fix is authorized.
 
 **Ordinary request pilot79ddb41 failed. Work RED79277 is confirmed.**
 Actual evaluator takes5,290 sweep visits versus2,442 after blocked-capacity and
@@ -283,7 +307,7 @@ docs-dev/LIVE_OWNER_FRONTIER_WORK_BOUND.md remains untouched/unstaged.
 Use exact intermediary commits; docs-dev needs exact force-add. PROGRESS is an
 ignored continuity journal, not force-added. AGENTS.md is immutable.
 
-Telegram adverse view milestone sent11:53UTC; next nonurgent after12:54UTC.
+Telegram proven local-delay milestone sent13:00UTC; next nonurgent after14:01UTC.
 Meaningful measured milestones/blockers only; commentary within60s, minute
 lab/build polling. Before compaction preserve exact active session, next
 decision, source/binary identities and adverse/open outcomes. Continue, do not

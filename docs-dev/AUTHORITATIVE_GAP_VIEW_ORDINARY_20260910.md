@@ -664,3 +664,155 @@ not a new independent defect inventory. The practical decision is to investigate
 the now-proven local post-enqueue service premise with a real caller control,
 while preserving predecode delay and uninstrumented repair-route uncertainty.
 This diagnostic neither promotes the request pilot nor justifies timer tuning.
+
+## Separate local-stage capture: shared-input service and propagated backpressure
+
+The next same-profile diagnostic extends the selected-reply observer at carrier
+routing, attachment forwarding and Product dequeue/pre-apply boundaries. The
+complete13-source-file temporary overlay is
+`./.tmp/reflection/authoritative-gap-view-local-stage-0910.patch`; ordinary
+`a747bda` policy is unchanged. Build73093 completes in3m37s with only the existing
+unused-helper warning. The frozen `authoritative-gap-view-local-stage-20260910`
+executable is used after the complete overlay is reversed, without overlapping
+compilation. The [local-stage raw archive](AUTHORITATIVE_GAP_VIEW_LOCAL_STAGE_20260910.raw.tar.gz)
+retains10regular files: five results, build/driver logs, complete overlay and
+unchanged `run.py`/`shape.sh`. Its925,269B gzip passes integrity, tar comparison
+and every member's byte comparison. There is no binary or credential material.
+
+### Failed completion includes a censored26-second reply stall
+
+Runner60654 exits1 at the existing85s settlement guard. The final probe reports
+479,504,771B confirmed of547,815,424B locally accepted in85.400254s:68,310,653B
+remain unconfirmed. Its close-before-terminal error follows runner cleanup,
+not a separately observed native disconnect. This is **not** an exact44.918Mbps
+completed result. First write/confirmation is.105463/.412543s; reported maximum
+write/confirmation gap is1.303973/4.569714s. Both raw/trimmed confirmation-bin
+arrays are empty because accounting is incomplete; no bins are reconstructed
+from target I/O. There is no echo workload.
+
+The reported maximum excludes an unresolved final silence. Client local reply
+writes stay1663B at every management sample from1789045579469 through
+1789045605469:26.000s without progress. The last advancing Product event was
+1789045579360,26.109s before that final sample; later received copies do not
+advance the frontier. During the same sampled26s, server target-socket writes
+continue524,173,811→547,815,424B, reaching all locally accepted bytes. These are
+successful socket writes, **not** proof the sink consumed/confirmed every byte.
+Server reads from the sink's response stream remain2139B, already observed at
+the earlier sample. The retained response prefix remains a demonstrated problem
+even while forward target service continues.
+
+Sampled target-socket service5→15,16→24 and25→40 is51.643,81.601 and78.584Mbps;
+these are coarse I/O-counter slopes, not confirmed timing bins or an ordinary
+candidate comparison. No exact-settlement acceptance follows this observation.
+
+### Exact local owner split on winning frames
+
+Session16038167878315865865/stream0 has274applied frames, each uniquely matched
+to one preceding accepted extent and mapped carrier.143Original extents
+partition[0,2139);364repair admissions contain5899B. Received input is
+3768B=1747unique+2021duplicate;1663B becomes ordered and84B remains buffered.
+Among127first-received extents,78win on QUIC Original,38on QUIC repair,9on TCP
+Original and2on TCP repair. First-winning buffered arrivals are included in the
+stage population, not mislabelled as independently advancing user gaps.
+
+All130ordinary QUIC Originals have successful write-begin/end records, maximum
+write-helper duration1ms.115reach decoded/reader-queue events;112reach normal
+carrier handling/enqueue.72repair frames have decoded/send and enqueue records.
+No normal/deferred/interlock attempt is silently substituted for another: all
+observed ordinary handling is `quic_normal_handle`; no interlock attempt or
+Full/closed outcome is emitted.274frames have dequeue/selected/pre-apply/apply
+events,277have attachment-receive and276have successful shared-send events.
+One received attachment frame remains pending shared send; two shared-enqueued
+frames remain unapplied. There are no repeated extent/physical/phase keys in
+these joins, and no negative post-send→dequeue interval in this capture.
+
+| Local interval, ms | First-winning sample count | Median / p95 / maximum |
+|---|---:|---|
+| Ordinary reader-queue → carrier handle | 78 | 16 /2662 /3229 |
+| Ordinary carrier handle → enqueue | 78 | 0 /52 /92 |
+| Ordinary carrier enqueue → attachment receive | 78 | 37 /2007 /6426 |
+| Repair decoded/send-begin → enqueue | 38 | 2 /117 /192 |
+| Repair enqueue → attachment receive | 38 | 582 /3610 /3783 |
+| Attachment receive → shared-input send completion | 127 | 3 /45 /328 |
+| Shared-input send completion → Product dequeue | 127 | 103 /1825 /3474 |
+| Product dequeue → selected | 127 | 0 /0 /1 |
+| Selected → pre-apply geometry/lock finished | 127 | 0 /1 /1 |
+| Pre-apply finished → applied receipt | 127 | 0 /0 /1 |
+
+The next table uses Unix milliseconds after1789045500000. Both frames are
+unique Original winners; QUIC0 is46 and QUIC1 is47. Client QUIC0physical8/
+attachment3 maps to server QUIC0physical8/incarnation4; client QUIC1physical1/
+attachment2 maps to server QUIC1physical1/incarnation3. Cross-role IDs are
+mapped rather than assumed interchangeable; only Unix time is compared.
+
+| Actual boundary | [1229,1243), QUIC0 | [1355,1369), QUIC1 |
+|---|---:|---:|
+| Prior frontier advance | 52574 | 60781 |
+| Server acceptance/write-begin/write-end | 51438 | 58009 |
+| Decoded / reader enqueue | 51475 /51475 | 60751 /60751 |
+| Carrier handle / enqueue | 51630 /51630 | 61847 /61932 |
+| Attachment receive / shared send complete | 53247 /53555 | 64940 /64980 |
+| Product dequeue / selected / pre-apply / receipt | 57029 /57029 /57029 /57029 | 65351 /65351 /65351 /65351 |
+
+For[1229,1243),3474ms AFTER successful shared admission lies inside its4455ms
+advancing gap. That frame had left carrier handling long beforehand; a
+carrier-only priority fix cannot explain this interval. For the maximum
+completed4570ms gap[1355,1369), the local split is1096ms to carrier handling,
+85ms to carrier enqueue,3008ms to attachment receive,40ms shared send and371ms
+shared-input residence. Those4600ms start30ms before the prior frontier advance;
+they are not an additional4570ms gap. All selected→apply work fits the same millisecond.
+Neither gap is materially explained by the measured per-frame pre-apply lookup.
+The earlier predecode intervals remain37ms and2742ms respectively; those precede
+the displayed frontier gaps and must not be added as independent gain.
+
+The shared input has capacity131 in this configuration.234/277attachment
+arrivals observe131occupied/reserved slots;234/276post-send observations do too.
+220/274Product dequeues leave129or130visible FIFO items. The successful send
+stamp can trail a concurrent consumer; occupied/reserved capacity is not
+identical to FIFO length. Nevertheless the positive3474ms post-send interval
+and actual queued items establish a material shared-input service deficit.
+Late attachment receive can result from that forwarder's earlier blocked send,
+not only from carrier-loop starvation. The observations support propagated
+backpressure but do not time each preceding ACK/control handler or prove one
+continuous lock hold. Per-frame elapsed intervals overlap and are not CPU sums.
+
+### The final blocking[1663,1677) remains explicitly censored
+
+Server QUIC0acceptance/write-begin/write-end occurs at1789045564777. Client
+decode is1789045592532:27,755ms later; then reader enqueue completes.
+normal handle/enqueue at1789045601649 is8940ms after reader enqueue
+1789045592709. Attachment receive finally appears at1789045605879,4230ms
+after carrier enqueue, with131slots occupied/reserved.
+There is no successful shared-send, dequeue or applied receipt for this head
+before cleanup. Five TCP copies admitted1789045577265–1789045578072 also
+have no head receipt.
+
+This unfinished head contains both a long predecode interval and subsequent
+local queue residence. It must not be assigned a successful completion time,
+folded into the completed-gap percentile, or attributed solely to carrier
+priority, a missing repair or the physical46cut. The cut was restored long
+before this final tail. Native ACK counters on both QUIC carriers keep advancing
+with producer stamps and stable epochs; they do not identify the critical
+14bytes. Server displayed RTT/flight remains `local_sender` projection, not
+fresh native latency evidence for that head.
+
+### Physical/cost context and next decision
+
+All86profiles match the prior two200Mbps setup: only46UP10Mbps during15–25s,
+30/70ms delays, zero loss/jitter/outage, burst/cburst65536B and netem8192.
+First restriction/restoration reports are15.001981/25.003067s. All class/netem
+drop counters remain0. Whole sampled accounting spans85.011966s: UP46/47
+class deltas643,958,947/753,976,833B; DOWN46/47 are8,974,076/10,015,978B.
+Summed UP/DOWN backlog maxima are33,761,415/49,565B. Client RSS peak/final is
+320,456/320,000KiB and lifetime CPU129/114%; server127,048/127,048KiB and
+56.9/24.2%. No per-handler CPU or post-teardown leak claim follows these values.
+
+Logs contain16,129lines/7,414,475B, including12,234existing
+`server_stale_output_recovery` events. That observer overhead is retained,
+not called a negligible or ordinary-performance-equivalent capture. No
+runtime WARN/ERROR or probe-stderr output is recorded before guarded cleanup.
+The information forecast succeeds at locating shared-input service and
+backpressure; it rejects an exclusive carrier-priority or measured pre-apply
+lookup explanation. The next bounded question is which intervening owner work
+limits FIFO service, using exact callsite timing rather than a larger queue,
+new timer or presumed speed gain. Ordinary promotion remains stopped.

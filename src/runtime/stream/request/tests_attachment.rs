@@ -174,6 +174,13 @@ async fn client_confirmed_feedback_uses_exact_proof_and_expires_without_renewing
         Some(selected_max)
     );
     assert!(!selected_credit.max_data.pending);
+    let validation_token = probe(&drain(&mut a_commands));
+    assert!(remotes.receive_feedback_receipt(&context, validation_token));
+    assert!(
+        remotes.feedback_deadline().is_some(),
+        "newer MAX must have a next-round wake before the actor waits"
+    );
+    remotes.retry_pending_feedback_with_context(&context);
     let expired_token = probe(&drain(&mut a_commands));
     assert!(drain(&mut b_commands).is_empty());
     assert!(!remotes.has_pending_stream_ack_publication());

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 11:10 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 11:46 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,76 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+11:46 +08 route-round trial: the actual policy test failed at its intended
+second100ms receipt assertion (six old controls passed), then passes after
+removing successor state.52feedback checks and the affected stream/client/
+server groups pass (290/32/92, overlapping); the real client control also
+asserts a next-round wake immediately after receipt with newer MAX, before
+another event/retry. Independent model and source audits find no remaining
+counterexample in this bounded contract. Active rounds never renew on facts,
+RTT or retries; one delayed pre-failure receipt cannot renew its failed child.
+RFC now explicitly states the changed route-liveness bound. No native interval
+or unrelated behavior changes. Source change is unaccepted pending ordinary
+timing; the two historical successor tests deliberately track the new contract,
+not a claim the former implementation violated its old specification.
+
+Next exact ordinary transaction: frozen0cab2b5 CONTROL then this new route-round
+CANDIDATE, existing mixed combined DOWN return restriction, followed by its UP
+mirror.500Mbps data; reverse500→10→500 at15–25s,100ms total delay, zero configured
+jitter/loss/outage; identical existing duration/workload/cost collection.
+No build/lab overlap or diagnostic feature. Preserve whole and phase series,
+all echo attempts/loaded latency, real confirmation/settlement, wire/RSS and
+gaps. This tests composed benefit, not the already established counterexample.
+Adverse critical service stops promotion and selects attribution; no timer,
+cadence/profile rescue. Full failure/competition/global gates remain below.
+
+Observer reports are CONFIRMED_RETURN_OBSERVER_20260910 and
+CONFIRMED_RETURN_OBSERVER_UPLOAD_20260910. Both five-file captures and the67s
+feature-build log are archived/listed in the matching DOWN-named raw archive
+(11files). Observer DOWN additionally has3,367actual UP queue drops; do not
+compare its throughput as an ordinary fix result or attribute every delay to
+the successor rule. No raw packet/physical-queue culprit was established.
+
+11:36 +08 diagnosis result and bounded model question: both captures complete.
+DOWN stream1 actually loses selection with prompt101/100ms proof exchanges:
+token7's successor anchor precedes receipt7, so token11 is created with only
+79.792ms remaining and expires. UP has49valid receipts and44selection losses;
+all44losses are inherited-successor expiries. Actual selected residence is
+about6% of the UP route window. This is a real performance-policy consequence,
+not a byte/credit correctness violation. Every observed probe reaches its real
+logical owner and obtains reply admission; per-frame/actor starvation is not
+the explanation for those exact events.
+
+Keep the second cause separate:427UP discovery attempts also expire with fresh
+deadlines, median811ms round trip versus295ms budget; median618ms lies AFTER
+reply admission and before the local receipt. Removing successor inheritance
+cannot claim to fix that loaded service.125ignored receipts are merely obsolete
+discovery tokens, not expiry failures. Feature observer is checkpoint f2481d0;
+ordinary0cab2b5 is unchanged. Reports preserve exact joins and timing limits.
+
+Before runtime changes, evaluate deleting per-fact successor deadlines rather
+than extending native intervals. Treat confirmation as route liveness (its
+actual authority), not per-fact delivery credit. Each admitted probe remains
+one fixed-deadline round, with no renewal by new facts/RTT/retries. A valid
+receipt can finish that round; if newer facts exist, immediately prepare the
+next round with its own full frozen native interval. Missing proof still
+restores latest AND future full fanout. No controller, pacing, cadence or
+native interval adjustment. This deliberately revises the previous failure
+bound: a single in-flight pre-failure receipt may validate once, then the next
+round must expire. The bound is remaining old interval plus one new interval,
+plus actual actor/alternate service, not an indefinitely renewable wait.
+
+Forecast: removes the observed impossible serialized-successor proof budget
+and may materially increase selective publication, reducing redundant return
+work. No numeric speed gain is justified; fresh-deadline misses/native queues
+and adverse timing can still dominate. Falsifier: bounded healthy individual
+round trips still lose selection, a duplicate/late receipt renews authority,
+or silent failure can postpone alternate publication indefinitely. Smallest
+next action is independent symbolic/caller review and one real-policy RED;
+then coherent deletion plus same ordinary return-cut DOWN/UP comparisons and
+selected-output failure checks if the model survives. Promotion requires actual
+useful timing/completion/cost improvement; no favorable timer or profile rescue.
 
 11:28 +08 observer review: exact session/stream/directional-token transitions
 are feature-only and independently reviewed as policy-neutral. One release

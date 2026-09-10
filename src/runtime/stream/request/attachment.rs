@@ -1430,7 +1430,13 @@ impl ReliableRelayRemoteSet {
         token: u64,
     ) -> bool {
         self.prepare_feedback_route(context);
-        self.feedback_route.receive_receipt(token, Instant::now())
+        let accepted = self.feedback_route.receive_receipt(token, Instant::now());
+        if accepted {
+            // Arm newer work before the actor can await unrelated input or
+            // blocked application I/O; do not wait for another DATA event.
+            self.prepare_feedback_route(context);
+        }
+        accepted
     }
 
     fn feedback_facts_required(&self, path: &ReliableRelayRemotePath) -> bool {

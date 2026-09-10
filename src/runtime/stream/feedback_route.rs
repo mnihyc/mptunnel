@@ -57,15 +57,6 @@ struct Attempt<I> {
     probe: StreamFeedbackProbe,
     deadline: Instant,
     admitted: bool,
-    // A receipt for the current cut must not renew debt formed after it.
-    successor_deadline: Option<Instant>,
-}
-
-impl<I> Attempt<I> {
-    fn next_deadline(&self) -> Instant {
-        self.successor_deadline
-            .map_or(self.deadline, |next| next.min(self.deadline))
-    }
 }
 
 /// One directional logical owner. Exact output identities are supplied by its
@@ -168,45 +159,6 @@ impl<I: Copy + Eq + std::fmt::Debug> StreamFeedbackRoute<I> {
         self.attempts
             .retain(|attempt| live.contains(&attempt.output));
         self.expire(now);
-        let mut finite_successor = true;
-        for attempt in &mut self.attempts {
-            let cut = FeedbackCut {
-                ack_generation: attempt.probe.ack_generation,
-                max_offset: attempt.probe.max_offset,
-            };
-            if cut != self.latest && attempt.successor_deadline.is_none() {
-                attempt.successor_deadline = now.checked_add(interval(attempt.output));
-                finite_successor &= attempt.successor_deadline.is_some();
-                #[cfg(feature = "lab-diagnostics")]
-                lab_feedback_return(
-                    self.diagnostic_scope,
-                    "successor_anchor",
-                    format_args!(
-                        "output={:?} token={} generation={} max_offset={} deadline_from_observation_us={:?} observation_age_us={}",
-                        attempt.output,
-                        attempt.probe.token,
-                        self.latest.ack_generation,
-                        self.latest.max_offset,
-                        attempt
-                            .successor_deadline
-                            .map(|deadline| deadline_from_observation_us(deadline, now)),
-                        now.elapsed().as_micros(),
-                    ),
-                );
-            }
-        }
-        if !finite_successor {
-            #[cfg(feature = "lab-diagnostics")]
-            lab_feedback_return(
-                self.diagnostic_scope,
-                "nonfinite_deadline",
-                format_args!("selected={:?}", self.selected),
-            );
-            self.selected = None;
-            self.attempts.clear();
-            self.last_attempted = Some(self.latest);
-            return;
-        }
         if !self.attempts.is_empty() || self.last_attempted == Some(self.latest) {
             return;
         }
@@ -274,7 +226,6 @@ impl<I: Copy + Eq + std::fmt::Debug> StreamFeedbackRoute<I> {
             },
             deadline,
             admitted: false,
-            successor_deadline: None,
         });
         true
     }
@@ -284,7 +235,7 @@ impl<I: Copy + Eq + std::fmt::Debug> StreamFeedbackRoute<I> {
         for attempt in self
             .attempts
             .iter()
-            .filter(|attempt| attempt.next_deadline() <= now)
+            .filter(|attempt| attempt.deadline <= now)
         {
             lab_feedback_return(
                 self.diagnostic_scope,
@@ -295,23 +246,17 @@ impl<I: Copy + Eq + std::fmt::Debug> StreamFeedbackRoute<I> {
                     attempt.probe.token,
                     attempt.admitted,
                     self.selected,
-                    deadline_from_observation_us(attempt.next_deadline(), now),
+                    deadline_from_observation_us(attempt.deadline, now),
                     now.elapsed().as_micros(),
                 ),
             );
         }
-        if self.selected.is_some()
-            && self
-                .attempts
-                .iter()
-                .any(|attempt| attempt.next_deadline() <= now)
-        {
+        if self.selected.is_some() && self.attempts.iter().any(|attempt| attempt.deadline <= now) {
             self.selected = None;
             self.attempts.clear();
             self.last_attempted = None;
         } else {
-            self.attempts
-                .retain(|attempt| attempt.next_deadline() > now);
+            self.attempts.retain(|attempt| attempt.deadline > now);
         }
     }
 
@@ -345,6 +290,7 @@ impl<I: Copy + Eq + std::fmt::Debug> StreamFeedbackRoute<I> {
 
     /// Prepare current membership first. The receipt's ingress is deliberately
     /// absent: the token identifies the still-owned *probed* exact output.
+    /// Prepare again before waiting so newer feedback starts its own round.
     pub(in crate::runtime) fn receive_receipt(&mut self, token: u64, now: Instant) -> bool {
         self.expire(now);
         let Some(index) = self
@@ -362,42 +308,27 @@ impl<I: Copy + Eq + std::fmt::Debug> StreamFeedbackRoute<I> {
         };
         let attempt = self.attempts.remove(index);
         self.attempts.clear();
-        if attempt
-            .successor_deadline
-            .is_some_and(|deadline| deadline <= now)
-        {
-            #[cfg(feature = "lab-diagnostics")]
-            lab_feedback_return(
-                self.diagnostic_scope,
-                "ignored_receipt",
-                format_args!("token={} reason=successor_expired", token),
-            );
-            self.selected = None;
-            self.last_attempted = None;
-            return false;
-        }
         #[cfg(feature = "lab-diagnostics")]
         lab_feedback_return(
             self.diagnostic_scope,
             "selected",
             format_args!(
-                "output={:?} token={} previous={:?} generation={} max_offset={} successor_from_observation_us={:?} observation_age_us={}",
+                "output={:?} token={} previous={:?} generation={} max_offset={} observation_age_us={}",
                 attempt.output,
                 token,
                 self.selected,
                 attempt.probe.ack_generation,
                 attempt.probe.max_offset,
-                attempt
-                    .successor_deadline
-                    .map(|deadline| deadline_from_observation_us(deadline, now)),
                 now.elapsed().as_micros(),
             ),
         );
         self.selected = Some(attempt.output);
-        if let Some(deadline) = attempt.successor_deadline {
-            self.last_attempted = Some(self.latest);
-            self.start_attempt(attempt.output, self.latest, deadline);
-        }
+        // A receipt qualifies the route, not later receipt facts or credit.
+        // The adapter prepares their next round before waiting for input.
+        self.last_attempted = Some(FeedbackCut {
+            ack_generation: attempt.probe.ack_generation,
+            max_offset: attempt.probe.max_offset,
+        });
         true
     }
 
@@ -408,7 +339,7 @@ impl<I: Copy + Eq + std::fmt::Debug> StreamFeedbackRoute<I> {
     }
 
     pub(in crate::runtime) fn next_deadline(&self) -> Option<Instant> {
-        self.attempts.iter().map(Attempt::next_deadline).min()
+        self.attempts.iter().map(|attempt| attempt.deadline).min()
     }
 
     pub(in crate::runtime) fn forget_output(&mut self, output: I) {
@@ -489,7 +420,43 @@ mod tests {
     }
 
     #[test]
-    fn older_receipt_never_renews_successor_debt_or_changed_native_interval() {
+    fn healthy_individual_proofs_do_not_spend_the_next_rounds_budget() {
+        // The live capture has two prompt ~100ms exchanges and a ~175ms
+        // native interval. Serializing their markers must not serialize both
+        // exchanges inside one per-fact budget: receipts qualify a route,
+        // never release the newer feedback's data or credit.
+        let now = Instant::now();
+        let interval = Duration::from_millis(175);
+        let mut route = StreamFeedbackRoute::default();
+        route.prepare(&state(2, 100), &[10, 20], now, |_| interval);
+        let first = route.probe_for(10).unwrap().token;
+        route.record_probe_admission(10, first);
+        route.prepare(
+            &state(3, 110),
+            &[10, 20],
+            now + Duration::from_millis(5),
+            |_| interval,
+        );
+        assert!(route.receive_receipt(first, now + Duration::from_millis(100)));
+
+        // Both real adapters must prepare current work before their next wait.
+        route.prepare(
+            &state(3, 110),
+            &[10, 20],
+            now + Duration::from_millis(100),
+            |_| interval,
+        );
+        let second = route.probe_for(10).unwrap().token;
+        route.record_probe_admission(10, second);
+        assert!(
+            route.receive_receipt(second, now + Duration::from_millis(200)),
+            "a healthy second 100ms exchange expired against its predecessor's budget"
+        );
+        assert!(!route.requires_output(20, true));
+    }
+
+    #[test]
+    fn one_pre_failure_receipt_cannot_renew_the_next_failed_round() {
         let now = Instant::now();
         let mut route = StreamFeedbackRoute::default();
         route.prepare(&state(2, 100), &[10, 20], now, |_| {
@@ -517,27 +484,47 @@ mod tests {
             &state(5, 130),
             &[10, 20],
             now + Duration::from_millis(30),
-            |_| panic!("existing successor deadline renewed"),
+            |_| panic!("active round deadline renewed"),
         );
         assert_eq!(
             route.next_deadline(),
             Some(now + Duration::from_millis(110))
         );
         assert!(route.receive_receipt(current.token, now + Duration::from_millis(100)));
+        // The old proof can survive a failure that occurs after peer receipt.
+        // Only this one new round may follow it; it cannot receive new proof.
+        route.prepare(
+            &state(5, 130),
+            &[10, 20],
+            now + Duration::from_millis(100),
+            |_| Duration::from_millis(100),
+        );
         let successor = route.probe_for(10).unwrap();
         assert_eq!(successor.ack_generation, 5);
         assert_eq!(successor.max_offset, 130);
         assert_eq!(
             route.next_deadline(),
-            Some(now + Duration::from_millis(120))
+            Some(now + Duration::from_millis(200))
         );
         route.record_probe_admission(10, successor.token);
-        assert!(!route.receive_receipt(successor.token, now + Duration::from_millis(120)));
+        route.prepare(
+            &state(6, 140),
+            &[10, 20],
+            now + Duration::from_millis(150),
+            |_| panic!("new facts renewed the failed round"),
+        );
+        assert!(!route.receive_receipt(current.token, now + Duration::from_millis(190)));
+        assert_eq!(
+            route.next_deadline(),
+            Some(now + Duration::from_millis(200))
+        );
+        // Expiry wins over a simultaneously late receipt, even if real.
+        assert!(!route.receive_receipt(successor.token, now + Duration::from_millis(200)));
         assert!(route.requires_output(10, true) && route.requires_output(20, true));
     }
 
     #[test]
-    fn shrinking_native_interval_cannot_hide_an_earlier_successor_deadline() {
+    fn native_interval_changes_apply_to_the_next_round_not_outstanding_work() {
         let now = Instant::now();
         let mut route = StreamFeedbackRoute::default();
         route.prepare(&state(2, 100), &[10, 20], now, |_| Duration::from_secs(1));
@@ -560,16 +547,33 @@ mod tests {
         );
         assert_eq!(
             route.next_deadline(),
-            Some(now + Duration::from_millis(120))
+            Some(now + Duration::from_millis(1010))
         );
+        assert!(route.receive_receipt(old, now + Duration::from_millis(120)));
         route.prepare(
             &state(4, 120),
             &[10, 20],
             now + Duration::from_millis(120),
-            |_| Duration::from_secs(1),
+            |_| Duration::from_millis(100),
         );
+        assert_eq!(
+            route.next_deadline(),
+            Some(now + Duration::from_millis(220))
+        );
+        let new = route.probe_for(10).unwrap().token;
+        route.record_probe_admission(10, new);
+        route.prepare(
+            &state(5, 130),
+            &[10, 20],
+            now + Duration::from_millis(150),
+            |_| panic!("native change renewed an active round"),
+        );
+        assert_eq!(
+            route.next_deadline(),
+            Some(now + Duration::from_millis(220))
+        );
+        assert!(!route.receive_receipt(new, now + Duration::from_millis(220)));
         assert!(route.requires_output(10, true) && route.requires_output(20, true));
-        assert!(!route.receive_receipt(old, now + Duration::from_millis(120)));
     }
 
     #[test]

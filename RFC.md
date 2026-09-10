@@ -1625,16 +1625,23 @@ Subsequent rounds validate only the selected output. A receipt changes only
 feedback publication policy: it MUST NOT release data/flight, grant credit,
 requalify an attachment, or create delivery samples or progress-clock evidence.
 
-Validation deadlines start when new feedback needs proof, including when the
-marker cannot enter its output queue. Use the existing native PTO estimate
-from that exact local sender, or the existing default PTO when unavailable;
-retained native RTT does not require an available delivery-rate measurement.
-The deadline MUST NOT renew with further data, retries or changing RTT. New
-facts behind an outstanding marker retain their own oldest unproved successor
-deadline. Expiry and actor wake use the earlier active/successor deadline;
-an older receipt cannot postpone newer debt, even when native RTT falls.
-Expiry MUST be serviced during retained application writes, flush and shutdown,
-before accepting a simultaneously late receipt.
+Selected validation is stop-and-wait for probes only: at most one round is
+outstanding, while ACK/MAX remains immediate and pipelined. When no round is
+outstanding, new feedback needing validation starts a deadline before marker
+admission, including when its output queue is blocked. Use the existing native
+PTO estimate from that exact local sender, or the existing default PTO when
+unavailable; retained native RTT does not require an available delivery-rate
+measurement. The round's deadline MUST NOT renew with further data, retries
+or changing RTT. New facts behind its marker update only the desired ACK/MAX
+cut; they do not start a separate successor deadline.
+
+A timely current receipt completes that round. If the desired cut is newer
+than the proven cut, the owner MUST immediately prepare the next round with
+its own frozen native interval, before waiting for any later event. Otherwise
+the selected route may remain idle without a probe; first resumed work starts
+a new round. Expiry MUST be serviced during retained application writes, flush
+and shutdown, before accepting a simultaneously late receipt. Neither a
+duplicate nor an obsolete receipt can start or renew a validation round.
 
 Missing proof, exact output loss or closed admission restores full fanout for
 the latest AND all future feedback until new proof. Previously skipped outputs
@@ -1646,9 +1653,16 @@ identity; exhaustion leaves baseline fanout.
 This is proof of FIFO/logical-owner/reply service, not bandwidth or one-way
 quality. A timely incumbent need not be the fastest available output. Reducing
 healthy duplication deliberately adds failure-detection delay before alternate
-publication: the frozen proof interval plus actual alternate queue/transport
-service, not a universal recovery bound. Native congestion control, ACK fact
-generation, receive credit and data-path eligibility are unchanged.
+publication. After permanent loss of proof service, at most one outstanding
+pre-failure receipt can still validate selection; the next round cannot obtain
+new proof and must expire. With outstanding newer feedback, fallback eligibility
+is therefore bounded by the old round's remaining interval plus one new frozen
+interval and actual actor service. Without such newer feedback there is no
+publication obligation until work resumes. This is a route-liveness bound, not
+a separate deadline for every feedback fact. Actual alternate queue/transport
+service remains additional, so it is not a universal recovery bound. Native
+congestion control, ACK fact generation, receive credit and data-path eligibility
+are unchanged.
 
 ### 8.5 Completion, detach, and reset
 

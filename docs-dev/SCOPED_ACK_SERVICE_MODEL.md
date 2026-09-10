@@ -827,3 +827,51 @@ proof of symmetric cost reduction. CURRENT selects a feature-only exact
 transition/marker capture before any policy change, not a renewed PTO or
 protocol preference. Timely proof would rule out deadline adjustment as the
 next fix; missed proof requires actual stage attribution, not a guessed cause.
+
+### Superseding route-liveness trial — 2026-09-10 11:38 +08
+
+This trial supersedes the oldest-successor deadline rule above and in the
+10:40 integration review; those paragraphs retain its history, not a remaining
+implementation requirement. The old rule prevented an older receipt from
+postponing a newer fact's validation deadline. That was a stronger per-fact
+freshness promise, not a requirement of ACK truth or receive-credit authority.
+
+The exact-token capture now shows its practical conflict with serialized
+probes: DOWN token11 inherits only79.792ms but its complete proof takes100ms.
+UP has44selection losses from inherited-successor expiry and about6%selected
+residence. Each observed probe reaches its logical owner and obtains reply
+admission. A successor budget partly spent awaiting the preceding proof can
+therefore reject an otherwise timely individual round; changing the native
+interval is not required to remove that particular policy consequence.
+
+Keep one outstanding selected probe round, with a deadline frozen before
+admission. New DATA/MAX updates the latest desired cut but cannot renew that
+round. A timely receipt closes it; if latest differs from the proven cut,
+immediately prepare the next round with its own existing native interval before
+any wait. The server's receive-receipt service already calls prepare again;
+the client adapter must do so explicitly. ACK/MAX itself never waits for proof.
+No successor anchor, extra snapshot, journal, knob or native timing change is
+introduced. Discovery still has at most one attempt per exact output; its first
+valid winner invalidates every other token.
+
+Under permanent loss of owner-applied proof service, at most one already
+outstanding pre-failure receipt can still validate selection. It may start one
+new round, but that new token cannot get a valid proof: its fixed expiry
+restores latest AND future full fanout. With newer feedback outstanding, the
+conditional bound is the old remaining interval plus one new frozen interval,
+plus actor service; alternate queue/transport service is additional. This
+explicitly allows an extra interval compared with the old per-fact promise.
+No newer work means no publication obligation; first resumed work starts a
+round. Admission blockage, retries and RTT changes never move an active
+deadline. Expiry precedes receipt acceptance, retained writes/flush still
+service it, and obsolete tokens, exact replacement and terminal processing
+cannot renew selection. Baseline coverage, immutable pending tails, fair MAX
+service and all byte/credit/sample authority remain unchanged.
+
+Forecast is limited to removing inherited-budget selection loss, which may
+reduce redundant return work. No numeric speed gain or acceptance is claimed.
+The separate427UP fresh discovery expiries have median295ms budgets versus
+811ms round trips, including618ms after reply admission. Successor removal
+does not address that loaded service. Root owns the real-policy RED, minimal
+runtime deletion and affected ordinary comparisons; adverse timing or missing
+material benefit still stops promotion rather than inviting interval tuning.

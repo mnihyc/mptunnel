@@ -50,6 +50,26 @@ bulk upload DATA log. Archive/reverse overlay before traffic. Retain ordinary
 result unchanged. No query optimization, new timer or healthy/baseline
 advancement is justified by these measurements.
 
+Joined34863 CLOSED exactly, still poor (~60s): own maximum confirmation gap
+10.716683s is pinned to reply[699,713). Server OriginalQ1accept1789041852602
+to clientQ1receipt1789041864627 is12.025s. Q1 is healthy47, no return QoS;
+sampled47DOWNbacklog max2009B/0drops in the held interior. Already admitted
+copiesQ0/TCP5/TCP2 do not win. This is a postcommit hold, not a missing timer.
+All235replyreceipts join exactacceptedrange/carrier, no ambiguous joins in this
+capture. Forwardstale transitions occur beforeQoS, including gaps below an
+already-written target frontier: lagging receipt knowledge, not proof of loss.
+
+Next discriminator stays this exact postcommit owner: extend the tiny observer
+with serverQUICwritebegin/end and exactclientQUICdecoded/enqueued stamps.
+Reuse archived boundary hooks WITHOUT the old membership intervention. These
+split commit→batch, batch→native acceptance, decode and localProduct service.
+Source permits ready priority batches to bypass carrier input repeatedly, but
+capture has not proved that cause; Pending writes or emptied priority queues
+can instead make progress. No fairness fix until the boundary trace decides.
+Observation-only code staysfeature-scoped, is frozen then reversed before
+sameprofiletraffic. Keep forwardqualification effects separate from reply
+delay until a common mechanism is actually demonstrated.
+
 The original independent-link failure is real: on two200Mbps links, only46
 slows200→10→200 during15–25s while47 stays healthy. Existingb0 upload averages
 249Mbps but RAW16–24 service collapses16.203Mbps versus healthy47control185.887.

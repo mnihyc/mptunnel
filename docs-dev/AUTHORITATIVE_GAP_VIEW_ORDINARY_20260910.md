@@ -369,3 +369,153 @@ confirmation-only tail continues after completed evaluator activity stops.
 Preserve the held prefix/eligible-owner/reply-service question before selecting
 another equivalent-work correction. No timer or throughput-only rescue,
 performance promotion, public update or release follows this diagnostic.
+
+## Separate exact events: request staleness and a delayed healthy-link reply
+
+Capture `aggregate-combined-up-authoritative-gap-view-events-0910` uses ordinary
+`a747bda` with a temporary22-line, two-file observer. The saved overlay is
+`./.tmp/reflection/authoritative-gap-view-events-0910.patch`; it adds exact
+prepared-response Original identity, every response arrival/frontier and gap
+context on existing request-stale transitions. Root builds82s, freezes
+`authoritative-gap-view-events-20260910`, and fully reverses the overlay before
+traffic. The preceding88s timing-free feature build had no traffic. Perf is off;
+diagnostics filter stream0and15event kinds, not bulk upload DATA/ACK logs.
+
+The [exact-event archive](AUTHORITATIVE_GAP_VIEW_EVENTS_20260910.raw.tar.gz)
+contains11regular files, no directory entries: five results, base/joined build
+and driver logs, the two-file overlay patch, `run.py` and `shape.sh`. Relative
+paths are preserved. Gzip integrity, listing, tar comparison and all-member
+byte comparison against sources pass; no binary or configuration keys are included.
+
+This event capture settles287,113,216B exactly in59.641606s,38.512Mbps,
+1/1complete, no probe errors. First write/confirmation is.107010/.414907s;
+maximum local-write/confirmation gaps are4.107995/10.716683s. These are this
+diagnostic's outcomes, not an improved ordinary comparison. All60raw one-second
+confirmation bins follow (36zeros); the final partial bin is not renormalized:
+
+```text
+0:  8.271,99.942,346.318,50.236,0,0,35.649,202.045,0,0
+10: 0,26.835,0,97.754,331.164,62.244,206.384,19.443,27.589,0
+20: 0,0,0,0,0,0,0,0,0,37.845
+30: 0,0,67.211,0,0,0,0,59.813,319.675,0
+40: 0,0,0.428,0.524,0,0,0,0,0,0
+50: 0,0.589,0,0,20.050,0.953,3.293,0,0,272.649
+```
+
+Means over5–15/interior16–24inclusive/25–40/40–60s are
+69.345/28.157/32.303/14.924Mbps. Exact completion does not erase the holds.
+
+### Request direction: stale transitions precede the imposed cut
+
+The eight recorded transitions are per-request exact-output decisions, not
+carrier failure or proof of native loss. `gap_owners` is the candidate-owner
+set across all retained authoritative gaps, not necessarily ownership of only
+the printed first gap. Times below are the client's diagnostic monotonic clock;
+its origin is Unix1789041835416ms, not the probe start.
+
+| Client time, s / sequence | Marked output | First gap at decision |
+|---|---|---|
+| 3.372 /19 | QUIC47, physical1, attachment3 | [64,513,653,64,632,725) |
+| 4.427 /20 | QUIC46, physical8, attachment2 | [64,775,797,65,615,765) |
+| 9.065 /42 | QUIC46, physical8, attachment2 | [96,150,005,96,215,541) |
+| 10.719 /43 | QUIC47, physical1, attachment3 | [96,162,005,96,215,541) |
+| 11.196 /45 | TCP47 index1, physical4, attachment1 | [96,164,605,96,215,541) |
+| 55.142 /231 | QUIC47, physical1, attachment3 | [252,966,581,252,972,117) |
+| 56.558 /233 | QUIC46, physical8, attachment2 | [253,539,691,253,670,763) |
+| 58.387 /234 | TCP47 index1, physical4, attachment1 | [254,578,989,254,739,589) |
+
+The first five are before46UPQoS. Moreover server management at
+1789041845987ms already reports132,027,733B accepted by the ordered raw-upload
+target socket, preceding the96.16MB stale decisions at1846136/1846612ms
+(same178904prefix). Thus those decisions can concern bytes already beyond the
+target-write frontier. This supplies concrete lagging Product-receipt context,
+not proof of forward packet loss or, alone, an incorrect stale timer. It does not
+identify the precise missing ACK's publication/native/consumer stage. Repeated
+stale events must not be interpreted as continuous exclusion without intervening
+eligibility evidence; no response-stale event appears in this selected capture.
+
+### Response direction: complete identity/range accounting
+
+One session,2919368028768285897, owns stream0. All88prepared Original ranges
+exactly partition[0,1202), with no gap or overlap. There are157accepted repairs:
+141tail and16completion-tail,2172payload bytes. Client receives235frames/3236B.
+Every receipt maps to exactly one preceding accepted Original or repair with
+the same extent and mapped output; there are no ambiguous or unmatched receipts.
+All88Originals and147repairs arrive;10accepted repairs/138B have no recorded
+receipt before closure, not necessarily a loss. Unique/duplicate input is
+1202/2034B. First receipts are671BOriginal (648QUIC,23TCP) and531BQUIC repairs;
+no TCP repair wins a first receipt in this capture.
+
+Cross-role IDs are mapped, never presumed interchangeable. Unique startup
+ranges and the remaining exact joins establish these four observed output pairs:
+
+| Server underlay / wire / physical / incarnation | Client underlay / index / physical / attachment |
+|---|---|
+| TCP /2 /5 /1 | TCP /0 /6 /0 |
+| TCP /5 /3 /2 | TCP /1 /4 /1 |
+| QUIC /0 /8 /3 | QUIC /0 /8 /2 |
+| QUIC /1 /1 /4 | QUIC /1 /1 /3 |
+
+For example[70,83)has its only TCP acceptance on server wire5and its TCP
+receipt on client index1; its separate QUIC repair has its own later QUIC
+receipt. The QUIC1pair is configured physical link47, not impaired46.
+Four used response outputs do not prove that every other output is ineligible.
+
+### Exact longest hold: [699,713) on healthy47
+
+Unix times below are milliseconds after1789041800000. Acceptance is Product/
+carrier queue admission, **not measured native write completion**.
+
+| Time / role sequence | Recorded event |
+|---|---|
+| 52602 /server255 | Original[699,713)accepted on QUIC1/physical1/incarnation4 |
+| 53910 /client120 | Previous receipt advances frontier685→699 |
+| 54337 /server269 | Same-range repair dispatched on QUIC0, queue delay0ms |
+| 62192 /server290,292 | Accepted-copy wake1181us late; repair dispatched TCP5, queue delay0ms |
+| 62393 /server297,299 | Accepted-copy wake1089us late; repair dispatched TCP2, queue delay0ms |
+| 64627 /client122 | QUIC1Original receipt advances699→713, reorder0 |
+| 66969 /client126 | QUIC0copy arrives, all14B duplicate |
+| 89914 /client152 | TCP2mapped copy arrives, all14B duplicate |
+| 89917 /client161 | TCP5mapped copy arrives, all14B duplicate |
+
+The frontier hold is10,717ms, matching the probe's10.716683s maximum to the
+logs' millisecond precision. Its winning Original was accepted12,025ms before
+receipt, already1308ms before the hold began. No same-range repair was accepted
+on QUIC1, so the winner cannot be confused with those alternate copies.
+The first repair precedes release by10,290ms; TCP repairs precede it by2435and
+2234ms. Their eventual acceptance-to-receipt delays are27,725/27,521ms on TCP5/2.
+The observation therefore localizes this hold after already accepted work;
+neither late server queue dispatch nor absence of a repair alone explains it.
+It does not yet distinguish active writer, native transport, client reader/
+mailbox or logical-owner service inside that post-acceptance interval.
+
+The native/physical evidence must retain its field semantics. During the strict
+held interior1789041854987→1789041863987ms (management20→29), healthy47DOWN
+class sends92,654B, maximum sampled backlog2009B, zero drops, at200Mbps.
+47UPsends16,357,914B with maximum sampled backlog598,166B;47is never QoSed.
+Server QUIC1`native_delivery` advances527,680→542,446ACKed bytes, with the same
+epoch and producer stamp20,757,825→29,709,416us. These aggregate ACKs do not
+identify the14critical bytes. Server displayed RTT308.569ms/flight3937B/queue0
+is explicitly `local_sender` projection, unchanged and not fresh packet-level
+RTT/flight evidence. Client QUIC47native RTT recovers to approximately100–107ms
+while the reply is still held. No exact native sent-byte/write-handoff event is
+present. Direct attribution of12seconds to the46UPcut or sampled47DOWNqueue
+is unsupported; a hidden earlier queue position is not reconstructed either.
+
+### Physical verification, cost and next attribution boundary
+
+All60management rows verify the unchanged two200Mbps topology,46UP10Mbps only
+at15–25s,30/70ms delays, zero jitter/loss/outage, burst/cburst65536B and netem
+limit8192; class/netem drops remain0. First restriction/restoration reports are
+15.007231/25.008314s. Whole accounting spans59.012116s, not exact probe duration.
+UP46/47class bytes are266,660,235/335,903,733; DOWN46/47are3,326,411/3,781,107.
+Summed UP/DOWN backlog maxima are22,072,946/43,156B. Client RSS peak/final is
+292,888/291,912KiB and lifetime CPU117/108%; server95,768/95,768KiB and52/14.2%.
+These whole-process snapshots are not critical-stage CPU or leakage measurements.
+
+Logs contain786lines/244,333B (client248/70,158B, server538/174,175B), with no
+bulk upload-frame or ACK event flood. The complete ordinary outcomes and the
+earlier stage profile remain separate. The useful next boundary is exact
+post-acceptance native write/read/owner service for the held reply, alongside
+the independently identified request receipt/eligibility question—not another
+timer or copy-budget adjustment. No performance promotion follows this capture.

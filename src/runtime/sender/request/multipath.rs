@@ -74,7 +74,7 @@ use crate::runtime::stream::{
 };
 use crate::scheduler::{self, PathSnapshot, TrafficClass, cyclic_cursor_distance};
 use smallvec::SmallVec;
-use std::cell::Cell;
+use std::cell::{Cell, LazyCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -231,6 +231,19 @@ impl RequestRelayNativeInputs {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static REQUEST_RELAY_SCHEDULING_CAPTURES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_request_relay_scheduling_captures<T>(observe: impl FnOnce() -> T) -> (T, usize) {
+    let before = REQUEST_RELAY_SCHEDULING_CAPTURES.with(Cell::get);
+    let result = observe();
+    let captures = REQUEST_RELAY_SCHEDULING_CAPTURES.with(|count| count.get() - before);
+    (result, captures)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn observe_request_relay_scheduling(
     context: &ClientPathContext,
@@ -243,6 +256,8 @@ pub(super) fn observe_request_relay_scheduling(
     include_bulk_admission: bool,
     requalification: &StreamPathRequalification<RelayPathInstance>,
 ) -> RequestRelaySchedulingObservation {
+    #[cfg(test)]
+    REQUEST_RELAY_SCHEDULING_CAPTURES.with(|count| count.set(count.get() + 1));
     observe_request_relay_scheduling_with_native_override(
         context,
         stream_id,
@@ -2190,6 +2205,22 @@ impl RequestMultipathController {
         reinjection_debt_bytes: usize,
         mux_limits: MuxLimits,
     ) -> (Option<(RelayPathInstance, PathSnapshot, usize)>, bool) {
+        // One advisory Observe view per decision, including the Backup pass.
+        // Keep it lazy: no eligible target must still mean no native/health
+        // observation. Exact target authority is revalidated by the later Apply.
+        let observation = LazyCell::new(|| {
+            observe_request_relay_scheduling(
+                context,
+                self.stream_id,
+                remotes.membership_generation(),
+                &remotes.paths,
+                None,
+                TrafficClass::Throughput,
+                PATH_OPEN_SCORE_BYTES,
+                false,
+                &self.request.requalification,
+            )
+        });
         let saw_exhausted_target = Cell::new(false);
         let choose = |allow_backup: bool| {
             remotes
@@ -2204,8 +2235,11 @@ impl RequestMultipathController {
                 })
                 .filter(|path| path.stream.product_admission_active())
                 .filter_map(|path| {
-                    self.request_reinjection_target_snapshot(context, remotes, path)
-                        .map(|snapshot| (path.instance(), snapshot))
+                    self.request_reinjection_target_snapshot_from_observation(
+                        &observation,
+                        path.instance(),
+                    )
+                    .map(|snapshot| (path.instance(), snapshot))
                 })
                 .filter(|(_, snapshot)| allow_backup || !scheduler::path_is_backup(*snapshot))
                 .filter_map(|(instance, snapshot)| {

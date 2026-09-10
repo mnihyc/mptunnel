@@ -954,3 +954,153 @@ equivalent to an ordinary build. The information forecast succeeds: repeated
 actor work dominates the observed serialized service, with concrete caller
 ownership and small acquisition waits. It does not yet prove which inner
 algorithm should change or waive any ordinary practical failure.
+
+## Ordinary recovery-target observation reuse: late confirmation still fails the gate
+
+This separate ordinary run tests one lazy all-path observation per recovery
+target selector invocation, projected through the unchanged target helper.
+Regular/Backup order, exact copy debt, eligibility and fresh native-fenced Apply
+remain unchanged; there is no observation cached across decisions or awaits.
+The forecast removes repeated whole-path capture from part of the measured
+dispatch scope, not all planning cost or a promised number of stalled seconds.
+
+The real selector RED passes its selection/debt controls then reports(2,4,4)
+captures instead of(1,1,1), .03s runtime after7m47s compilation. The corrected
+selector and zero-candidate control pass with all73request-multipath checks
+in.22s after7m25s compilation. Ordinary build takes3m32s with the existing
+unused-helper warning. The frozen binary is
+`./.tmp/reflection/bin/recovery-target-observation-20260910/mptunnel`; measured
+source is the two-file request-multipath implementation/test change atop
+`78875e8`. No feature observer or CPU wrapper runs in this cell.
+
+Result directory is
+`./.tmp/reflection/results/aggregate-combined-up-recovery-target-observation-qos-0910/`.
+The [verified raw archive](RECOVERY_TARGET_OBSERVATION_ORDINARY_20260910.raw.tar.gz)
+contains11regular files: five results, RED/focused/build/driver logs, `run.py`
+and `shape.sh`. It is451,103B; gzip integrity, tar comparison and every member's
+decompressed-byte comparison pass. No configs, credentials, binaries, links or
+directory entries are included. Runner/profile match the preceding owner-profile
+archive byte-for-byte. Earlier `b0` and view controls remain in their own archives;
+these are preserved comparisons, not simultaneous or identical-work trials.
+
+### Exact settlement and complete ordinary history
+
+| Outcome | Preserved `b0` | Earlier view | Observation reuse |
+|---|---:|---:|---:|
+| Accepted = confirmed bytes | 1,294,925,824 | 323,158,016 | 419,954,688 |
+| Exact completed streams | 1/1 | 1/1 | 1/1 |
+| Elapsed, s | 41.538802 | 56.678022 | 64.942209 |
+| Completed whole Mbps | 249.391 | 45.613 | 51.733 |
+| First write / confirmation, s | .105451 /.409741 | .108528 /.412616 | .105864 /.408088 |
+| Maximum write gap, s | .545897 | 14.915527 | 5.172138 |
+| Maximum confirmation gap, s | .634001 | 7.470709 | 9.215061 |
+
+Runner22211 exits0after66.008063s. Probe status is `ok`, exact terminal
+accounting is valid and no stream/probe error occurs. Confirmation extends
+24.942209s beyond the nominal40s offered-load interval; blocked writes mean
+that interval is not an exact final-byte acceptance timestamp. The longer
+settlement and worse confirmation gap remain adverse despite the improved
+write gap and somewhat higher mean. There is no echo workload or censoring
+in this run. All65raw confirmation bins follow, including32zeros. The last
+bin is partial; the trimmed array is not the wall-clock series.
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 7.981,139.634,62.138,0,167.328,9.009,30.933,0,0,18.778
+10: 501.411,1.049,22.296,274.494,18.729,0,0,11.002,181.545,99.809
+20: 28.932,77.689,56.893,98.098,0,11.943,0,159.478,0,0
+30: 64.583,32.13,0,92.538,0,59.22,0,33.859,134.222,28.738
+40: 0,0,255.998,447.283,0,0,0,0,0,0
+50: 0,7.571,0,0,0,0,0,0,0,0
+60: 172.824,0,0,0,51.5
+```
+
+| Raw confirmation phase | `b0`, Mbps | View, Mbps | Reuse, Mbps | Reuse zero bins |
+|---|---:|---:|---:|---:|
+| 0–5s | 262.228 | 127.922 | 75.416 | 1/5 |
+| 5–15s, pre-cut | 308.068 | 7.336 | 87.670 | 2/10 |
+| 15–25s | 34.658 | 58.420 | 55.397 | 3/10 |
+| Interior16–24 inclusive | 16.203 | 64.911 | 61.552 | 2/9 |
+| 25–40s, restored | 328.092 | 35.519 | 41.114 | 6/15 |
+| Own post40s bins, last partial | Already settled shortly afterward | 44.431 over40–57 | 37.407 over40–65 | 20/25 |
+
+The better pre-cut/restored means versus the view do not approach the preserved
+`b0` healthy service; cut confirmation also falls modestly versus the view.
+Bursts above physical capacity can release earlier buffered work. They do not
+establish either instantaneous link capacity or continuous target progress.
+
+### Forward progress improves, but replies remain held after all target writes
+
+Management counters retain their producer domains: server `from_peer_bytes`
+is successful target-socket write, not sink confirmation; server `to_peer_bytes`
+is sink-reply read, and client `from_peer_bytes` is local reply write. Rates
+below use actual row elapsed differences; management and probe clocks are not
+substituted for one another.
+
+| Target-socket sample window | `b0`, Mbps | View, Mbps | Reuse, Mbps |
+|---|---:|---:|---:|
+| 0→5s | 273.573 | 206.916 | 87.037 |
+| 5→15s | 321.800 | 17.783 | 94.412 |
+| Strict16→24s | 17.028 | 12.133 | 59.496 |
+| 25→40s | 340.910 | 37.919 | 62.647 |
+
+By sample43the client has read all419,954,688upload bytes. By server sample46
+(Unix1789048723340) all are successfully written to the target, and1720reply
+bytes have been read. Client sample46(1789048723339) has delivered only1609reply
+bytes. Target/source and server-reply counters remain unchanged thereafter,
+while client reply delivery is still1609at sample51,1623at52through60,
+1665at61through64, and finally1720at65(1789048742342). These successive
+late reply holds persist after full forward target acceptance; they are not
+explained by remaining upload bytes at that stage. Probe gap endpoints are
+not stored, so these coarse plateaus are not labelled the exact9.215061s gap.
+
+All eight physical output identities remain active in one session; initialized
+native epochs do not change. Over samples46→64all eight native producer stamps
+advance on both roles. Client native ACK counters add47,585,563TCP and236,522
+QUIC bytes; server return counters add13,590TCP and5,719QUIC bytes. Return
+classes carry214,517B combined during that18.002001s sampled band. This is
+progressing-carrier evidence, not identification of the missing reply byte,
+a necessary-copy count or proof that native/read/FIFO service caused this hold.
+Ordinary logs contain no per-frame boundary or owner-cost instrumentation.
+
+### Physical and resource cost, with the adverse result retained
+
+All66profiles verify two independent200Mbps links, only46UP10Mbps15–25s,
+30msDOWN/70msUPdelay, zero configured loss/jitter/outage,65536Bbursts and8192
+netem limit. First restriction/restoration rows are15.002257/25.003517s.
+Class/netem drops remain0. Client eth0/eth1 map to46/47; server eth1/eth0
+map to46/47. The accounting window is65.007846s, not the probe's64.942209s.
+
+| UP class service, Mbps | `b0`46 /47 | View46 /47 | Reuse46 /47 |
+|---|---:|---:|---:|
+| 0→15s | 185.977 /187.386 | 68.051 /68.743 | 100.203 /145.756 |
+| Strict16→24s | 9.991 /31.016 | 10.058 /96.718 | 10.019 /137.332 |
+| 25→40s | 185.632 /193.366 | 57.456 /28.490 | 72.552 /94.617 |
+
+| Whole sampled cost | View | Reuse |
+|---|---:|---:|
+| UP46 /47bytes | 336,022,023 /400,620,890 | 423,938,161 /705,498,359 |
+| DOWN46 /47bytes | 5,258,507 /5,264,669 | 6,673,253 /8,278,284 |
+| Summed UP backlog peak / final, B | 27,190,388 /6,831,910 | 31,303,275 /424,756 |
+| Summed UP backlog median0–40, B | 858,520 | 6,392,053 |
+| Summed DOWN backlog peak / final, B | 47,353 /990 | 38,033 /810 |
+| Client RSS peak / final, KiB | 380,736 /380,736 | 410,640 /410,640 |
+| Server RSS peak / final, KiB | 106,724 /106,724 | 123,852 /123,852 |
+| Client lifetime CPU peak / final, % | 135 /112 | 124 /116 |
+| Server lifetime CPU peak / final, % | 69.3 /19.4 | 45.9 /26.8 |
+
+Different completed work and observation durations prevent declaring cheaper
+CPU or wire service from selected aggregates. CPU is the existing process-
+lifetime percentage, not one-second execution or measured planning savings;
+the separately prepared20%loss CPU observation has not run in this cell.
+Client/server logs and probe stderr are empty. The driver retains its existing
+HTB quantum notices; no shaping parameter is changed to suppress them.
+
+**Disposition: no performance promotion.** The narrow repeated-observation
+counterexample is corrected and semantic controls pass, but practical service
+still has multi-second confirmation stalls, severe restored goodput loss
+against `b0`, and higher RSS/whole wire cost. The result does not prove the
+reuse caused the later tail or quantify how much serialized work it removed.
+It falsifies sufficient-service improvement from this isolated correction;
+neither another parameter adjustment nor the unrelated deployed loss/CPU
+report is justified as its attribution or acceptance waiver.

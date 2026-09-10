@@ -59,6 +59,19 @@ lazy observation preserves zero-candidate no-work and existing Apply. Implement
 only that reuse plus zero-candidate control, then focused/ordinary checks.
 Native scheduler shape reads use cached stamp-validated scalar shapes, not
 controller clones; do not attribute transport deep-clone cost to this selector.
+Focused50226 completes73 request-multipath tests, all PASS in.22s, including
+the new work/zero-candidate controls and existing exact-debt/native-clock Apply
+checks. Ordinary build5669 now running; performance still unaccepted.
+Actual ordinary22211 completes419,954,688B/64.942209s (51.733Mbps), but
+confirmation gap worsens7.471→9.215s; write gap improves14.916→5.172s.
+No practical promotion: restored service remains poor. By server sample46 all
+source bytes reached target and1720reply bytes were read, yet client remains
+at1609 and does not deliver1720 until sample65. This falsifies the narrow
+capture reduction as a sufficient cure; do not call remaining delay upload
+debt or rescue with queue/timer knobs. Preserve the candidate as a tested,
+unaccepted work correction; its ordinary report/cost archive is in progress.
+Proceed with the newly requested loss-CPU discriminator before the next
+preselect/reply-service correction. No release/public README advancement.
 
 ### Newly reported condition: approximately20% QUIC-loss CPU burst
 
@@ -70,6 +83,23 @@ under the reported loss with process CPU and useful progress, separating
 MPP recovery planning, native retransmission/crypto and repeated-ready wake
 work. Preserve the existing global gates; this is an added focused CPU case,
 not a replacement final link profile or authority to change congestion knobs.
+
+Prepared discriminator (after current ordinary comparison): unchanged runner,
+single500Mbps cut, DOWN70/UP30ms without jitter, no QoS/outage. Compare fixed
+DOWN0 versus20% loss, UP0, first QUIC-only then mixed;40s offered/85s guard.
+The temporary loss20_cpu.py invocation only overrides loss and appends process/
+thread /proc ticks to the existing sample command. Original ps% is lifetime
+average, not a burst measurement. Use stable PID/TID/start-time identities,
+CLK_TCK and actual monotonic brackets; do not add thread totals to process CPU.
+Existing profile choices are declared diagnostic ablations, not Product knobs.
+Information forecast: distinguish loss-associated CPU amplification with poor
+useful progress from comparable ordinary transport load, and mixed-specific
+MPP cost from single-carrier cost. This alone cannot name a Rust async task,
+prove a spin loop, or attribute the deployed report. Native/owner attribution
+only follows a material observed cost, not a speculative patch. Historical
+QUIC_LOSS_JOURNAL_RETENTION_DIAGNOSIS records real old lifetime growth and its
+current prefix/ownership corrections; active snapshot cloning still exists,
+but no current loss-journal lifetime regression has been demonstrated here.
 
 ### Current decision: split the proven local reply residence
 

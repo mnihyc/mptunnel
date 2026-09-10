@@ -5188,6 +5188,170 @@ async fn accepted_request_copy_owns_exact_reserve_until_data_ack() {
 }
 
 #[tokio::test]
+async fn request_recovery_target_selection_captures_one_coherent_observation() {
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10341?initial-srtt-s=0.08&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10342?initial-srtt-s=0.005&initial-rate-mbps=1000",
+        "tcp://127.0.0.1:10343?initial-srtt-s=0.04&initial-rate-mbps=200",
+    ]);
+    let stream_id = StreamId(233);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let (mut remotes, _remote_input) =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (regular_commands, mut regular_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, regular_commands));
+    let regular = remotes.paths[1].instance();
+    let (backup_commands, mut backup_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, backup_commands));
+    let backup = remotes.paths[2].instance();
+    for receivers in [
+        &mut owner_receivers,
+        &mut regular_receivers,
+        &mut backup_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [owner, regular, backup] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    for instance in [regular, backup] {
+        seed_client_bulk_evidence_for_test(&context, instance);
+    }
+    assert!(context.update_relay_path_usage_for_test(backup, 1, PathUsage::Backup));
+
+    let limits = context.mux_limits;
+    let mut controller = RequestMultipathController::new(stream_id);
+    let sender_queue = ReliableRelaySenderQueue::default();
+    let ((excluded_target, excluded_exhausted), excluded_captures) =
+        count_request_relay_scheduling_captures(|| {
+            controller.reinjection_path_snapshot(
+                &context,
+                &remotes,
+                &[owner, regular, backup],
+                &sender_queue,
+                4096,
+                limits,
+            )
+        });
+    assert!(excluded_target.is_none() && !excluded_exhausted);
+    assert_eq!(excluded_captures, 0, "excluded paths need no observation");
+    let target_snapshots = [regular, backup].map(|instance| {
+        let path = remotes
+            .paths
+            .iter()
+            .find(|path| path.instance() == instance)
+            .expect("exact attached target");
+        assert!(path.stream.product_admission_active());
+        assert!(
+            path.stream
+                .can_enqueue_reinjection_frame_now(&data_frame(stream_id, 0, 4096))
+        );
+        let snapshot = controller
+            .request_reinjection_target_snapshot(&context, &remotes, path)
+            .expect("real installed path exposes Product repair authority");
+        assert!(snapshot.data_level_limit_bytes > 0);
+        snapshot
+    });
+    assert!(!scheduler::path_is_backup(target_snapshots[0]));
+    assert!(scheduler::path_is_backup(target_snapshots[1]));
+
+    let ((positive, positive_exhausted), positive_captures) =
+        count_request_relay_scheduling_captures(|| {
+            controller.reinjection_path_snapshot(
+                &context,
+                &remotes,
+                &[owner],
+                &sender_queue,
+                4096,
+                limits,
+            )
+        });
+    assert_eq!(positive.map(|(instance, _, _)| instance), Some(regular));
+    assert!(!positive_exhausted);
+
+    // Use the same exact accepted-copy ledger/accounting as the neighboring
+    // reserve controls. Native queue readiness alone must not erase this debt.
+    let occupied_bytes = target_snapshots.map(|snapshot| {
+        reliable_product_recovery_window_bytes(Some(snapshot), TrafficClass::Throughput, limits)
+            .max(
+                adaptive_reliable_relay_reinjection_bytes(
+                    Some(snapshot),
+                    TrafficClass::Throughput,
+                    limits,
+                )
+                .max(reliable_bulk_carrier_feed_quantum_bytes(limits)),
+            )
+    });
+    let original = data_frame(stream_id, 0, occupied_bytes[0].max(occupied_bytes[1]));
+    controller.record_original_frame_for_test(owner, &original);
+    controller
+        .request
+        .flights
+        .record_reinjection_frame_instance_with_suppression_interval(
+            regular,
+            &data_frame(stream_id, 0, occupied_bytes[0]),
+            Duration::from_secs(60),
+        );
+    assert_eq!(
+        controller.accepted_reinjected_data_bytes(regular),
+        occupied_bytes[0]
+    );
+    let ((fallback, fallback_exhausted), fallback_captures) =
+        count_request_relay_scheduling_captures(|| {
+            controller.reinjection_path_snapshot(
+                &context,
+                &remotes,
+                &[owner],
+                &sender_queue,
+                4096,
+                limits,
+            )
+        });
+    assert_eq!(fallback.map(|(instance, _, _)| instance), Some(backup));
+    assert!(
+        !fallback_exhausted,
+        "an eligible Backup must retain independent service"
+    );
+
+    controller
+        .request
+        .flights
+        .record_reinjection_frame_instance_with_suppression_interval(
+            backup,
+            &data_frame(stream_id, 0, occupied_bytes[1]),
+            Duration::from_secs(60),
+        );
+    assert_eq!(
+        controller.accepted_reinjected_data_bytes(backup),
+        occupied_bytes[1]
+    );
+    let ((blocked, exhausted), blocked_captures) = count_request_relay_scheduling_captures(|| {
+        controller.reinjection_path_snapshot(
+            &context,
+            &remotes,
+            &[owner],
+            &sender_queue,
+            4096,
+            limits,
+        )
+    });
+    assert!(
+        blocked.is_none() && exhausted,
+        "all exact target reserves are occupied"
+    );
+
+    // Counts full scheduling captures in this actual selector, not wall time,
+    // individual native reads, ledger work, or later fresh Apply validation.
+    // All semantic controls above must pass before the intended work RED.
+    assert_eq!(
+        (positive_captures, fallback_captures, blocked_captures),
+        (1, 1, 1),
+        "one selector invocation must share its observation across candidates and Regular/Backup passes",
+    );
+}
+
+#[tokio::test]
 async fn request_recovery_skips_exhausted_fast_target_for_free_second_target() {
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10311?initial-srtt-s=0.08&initial-rate-mbps=100",

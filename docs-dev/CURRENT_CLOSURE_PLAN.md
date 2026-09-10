@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 05:40 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 05:51 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -540,6 +540,37 @@ then~156–164% with restored high throughput. No persistent CPU-saturated
 recovery failure. Q74/H280echoes all succeed, but Q's preclear2.478s echo is
 preserved. Independent full distribution/cost/clock archive is in progress.
 No current compiler/lab; no runtime edit or released performance claim.
+
+Next selected main-issue transaction,05:50+08: retain the unresolved healthy
+mixed latency cost and test the higher-impact existing upload-stall correction
+against outage composition. Ordinary a16 control then011b724 candidate, direct
+independent200+200Mbps, UP70/DOWN30ms, no random loss/jitter. Preserve the prior
+QoS-only pair's10Mbps cut on46 UP15–25s;47 stays200Mbps. The sole new condition
+is the existing endpoint UDP blackhole30–33s on both QUIC paths. Three baseline
+native modes are not substituted; this is an exact affected correction pair,
+not the final random-link matrix or a rerun seeking a healthy latency pass.
+Both candidates/binaries already exist; no compiler or runtime change.
+Information forecast: determine whether finite ready ACK/MAX Input retains its
+observed92.621→204.614Mbps /7.236→1.162s write-gap gain when native availability
+changes and TCP must take over. A large confirmation/write stall or failed
+settlement selects its exact actor/native/prefix owner before any new fix.
+Faster aggregate bytes do not waive a worse critical interval. Preserve every
+confirmed/accepted byte, phase, full gap/censoring/settlement and native/resource
+history; no claimed loaded-echo result from this upload-only probe.
+Tags ordered-feedback-outage-{control,candidate}-0911. Use existing management
+and target-socket sampling with fixed40s offered/85s guard, unchanged hints.
+Topology verification: current endpoints each attach both46/47 directly;
+REFLECTION_ROUTED alone would bypass its shaped router and be invalid. Do not
+pretend this is the pinned routed500 harsh case, recreate containers, add routes
+or modify host networking to run this bounded pair. The full routed gate stays
+open. An adverse candidate stops promotion, not the global authorized task.
+
+Execution: control53802 is active; candidate has not started. No concurrent
+compiler/lab. Root read all199loss-clear appendix lines and verified its15file
+archive integrity/manifest; independent byte checks passed. Ask the user
+nonblockingly for incident role/version and whether CPU persists after traffic
+slows/stops; no deployment assumption or task pause. No runtime change follows
+the reproduced startup CPU alone.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

@@ -419,3 +419,202 @@ member matches its source byte-for-byte; no configs, executables or links.
 It contains both five-file result sets, drivers, build log, exact overlay,
 invocation/CPU wrappers, unchanged runner/shape, and read-only analysis script
 `./.tmp/reflection/analyze_native_snapshot_cpu_0911.py` for reproducing tables.
+
+## Loss clear at20s: ordinary QUIC and H2 recovery,2026-09-11
+
+Predeclared QUIC59318 then H299401 both CLOSED0. QUIC uses the unchanged
+ordinary011b724 executable
+`./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel`, not the snapshot
+diagnostic left in target/release. H2 retains its existing explicit500Mbps
+up/down prior; MPP has dynamic discovery. No build, runtime observer, native
+policy change, role override or favourable rerun occurred. This transaction
+tests recovery after removing loss, not whether high-loss backoff is fixed
+or whether the user's deployed CPU incident is explained.
+
+Both40s DOWN bulk+64B echo cells use500Mbps each direction, DOWN70ms/UP30ms,
+20%configured DOWN loss until the existing first5s epoch at/after20s, then0;
+UP loss is0 throughout. No jitter/QoS/blackhole/router/mirror. The existing
+loss20_cpu.py wrapper now applies the change to both46and47 and matches the
+actual H2 process name for tick collection. No second polling loop is added.
+Active traffic is47, verified from endpoints and class counters. Both sides'
+41 service samples retain500Mbps and the declared delays; server netem first
+shows0loss at row20 in both runs, with no further active-cut drops afterward.
+
+### Transition timing and full service
+
+The driver's `profile_elapsed_s` is sampled before issuing the shape commands:
+20.003483114996925s QUIC and20.002201351802796s H2. The successful47 command
+timestamps are monotonic1111310716342114ns/1111423022140336ns and
+Unix1789076549210882675ns/1789076661516680757ns, respectively. The immediately
+preceding46-success stamps bound47's actual update to approximately86.37ms
+and83.79ms intervals, ending at those47-success times. These are measurement
+brackets, not a profile fault or an exact packet-level clearance instant.
+QUIC management row20 was generated atUnix1789076549106ms, before that change;
+the row's later tc/CPU reads already observe the new profile. Keep those
+sequential clocks separate rather than assigning every field the row elapsed.
+
+| Outcome | MPP QUIC | Hysteria2 |
+|---|---:|---:|
+|Exact body bytes|1010139170|1493974976|
+|Bulk elapsed,s|40.000323713|40.000246175|
+|Whole goodput,Mbps|202.026|298.793|
+|Driver elapsed,s|41.141486|41.004637|
+|First body,s|.669212|.905815|
+|Maximum body gap,s|.509998|.310781|
+|Echo successes/failures|74 /0|80 /0|
+|Successful echo p50/p95/max,ms|115.604 /690.206 /2478.386|109.578 /202.653 /307.684|
+
+Both probes report `ok`/HTTP200; each intentionally stops a partial8GiB object,
+not full-object completion. All74/80 echo exchanges succeed,4,736/5,120 exact
+bytes each direction; no timeout/unavailable/restart is hidden. QUIC's fewer
+exchanges reflect long successful service, not discarded failed attempts.
+Its worst echo#31 is16.831422–19.309808s,2.478386s, before clearance; H2's
+worst#23 is11.502265–11.809949s,.307684s. Success-to-success maxima are
+2.875398/.706859s and include the500ms probe cadence.
+
+QUIC's worst body gap16.567709–17.077707s advances206,721,922→206,787,458B;
+H2's18.143187–18.453968s advances299,810,808→299,843,576B. These are body
+offsets, not relay DSNs. The probe exports the worst interval rather than
+every body read; `bulk_recovery_gap=0` is not a measured zero loss-clear delay
+because this mode has no configured failover trigger.
+
+| Probe-clock band | QUIC rawMbps | H2 rawMbps | QUIC echoes;p95/max,ms | H2 echoes;p95/max,ms |
+|---|---:|---:|---:|---:|
+|0–5s|179.386|108.868|10;716.919/716.919|10;218.050/218.050|
+|5–15s|72.309|141.673|18;690.963/888.810|20;237.997/307.684|
+|15–20s|14.121|132.435|6;2478.386/2478.386|10;209.197/209.197|
+|20–25s|31.190|459.957|10;465.721/465.721|10;118.482/118.482|
+|25–30s|402.485|471.716|10;153.482/153.482|10;117.385/117.385|
+|30–40s|422.198|467.003|20;129.350/155.434|20;114.075/115.514|
+
+Echo bands use request starts; quantiles use sorted successes at
+round((n−1)×quantile). Raw body bins use the probe's own clock, not exact
+qdisc-update boundaries. Complete40-bin series, no zeros in either:
+
+```text
+QUIC 0– 9:   1.433  43.872 398.974 324.308 128.344 185.503 111.778  87.370 105.084  60.036
+QUIC10–19:  34.175  54.025  37.259  30.512  17.348  25.034   8.721  14.488  12.355  10.005
+QUIC20–29:  15.153  17.590  17.538  19.922  85.747 281.768 419.335 430.887 445.124 435.309
+QUIC30–39: 432.373 408.783 396.777 424.670 436.898 431.049 441.146 445.129 434.649 370.504
+H2   0– 9:    .406 104.810 147.884 154.665 136.577 172.595 149.946 152.055 115.856 159.121
+H2  10–19: 134.742 123.377 137.705 145.400 125.931 125.307 160.590 142.972  97.780 135.528
+H2  20–29: 413.401 472.359 469.683 472.487 471.857 471.929 471.791 472.998 472.817 469.043
+H2  30–39: 469.956 472.040 473.251 469.762 470.286 469.875 473.043 426.988 473.683 471.143
+```
+
+No arbitrary recovery threshold is needed to see the timing difference:
+QUIC's20–23bins remain15–20Mbps, then24/25/26 rise85.747/281.768/419.335;
+H2's20/21bins are already413.401/472.359Mbps. These sampled windows, not an
+invented exact recovery millisecond or percentage cutoff, define the observed
+several-second MPP delay. Different native policies/rate priors and random
+packet histories prevent calling H2 a controller-neutral oracle.
+
+### QUIC native reopening versus Product receipt
+
+Both QUIC-role native epochs stay unchanged, paths active, and ACK counters
+monotonic. Server ACK progress never stops at the clear. The exact server
+epoch is9749182878209669413; management rows below show the native owner:
+
+| Row /approx runner second | Native window B | Native flight B | Cumulative native ACKed B |
+|---|---:|---:|---:|
+|19|151987|143962|216928448|
+|20,management precedes clear|97333|93588|217937459|
+|21|229108|228000|219645047|
+|22|229108|228000|221831447|
+|23|229108|228000|224145047|
+|24|301714|301200|226722647|
+|25|2513251|2018400|235817447|
+|26|9409651|5568000|268452647|
+|27|7998204|4970400|323695847|
+|30|7998204|4538400|493324247|
+|40|7998204|5823600|1034667047|
+
+Native24→25/25→26/26→27 ACK increments are9.095/32.635/55.243MB. Those
+native-window and delivery increases coincide at sample resolution with the
+body's24–26 acceleration. After reopening, native and body service both
+continue at high rates; this is not observed high native throughput stranded
+behind a persistent Product receive hole. It is also not a permanent frozen
+controller/epoch or connection restart. The several seconds of low native
+window after clear remain an actual service cost, not waived by eventual
+recovery. Final native ACK totals are1,034,667,047B server and5,367,957B client;
+these include transport framing/copies and are not application payload totals.
+Server SRTT stays100.115–144.656ms. H2 exports no corresponding native window/
+ACK/epoch telemetry in this capture: those quantities are unknown, not zero.
+
+### Actual process/thread CPU and wire cost
+
+Each role has41 successful CPU records, one stable boot/PID/starttime identity,
+CLK_TCK100, and no collector/process/thread error. Each adjacent interval uses
+its own `/proc/stat` read's monotonic midpoint:
+CPU% =100×delta(utime+stime)/CLK_TCK/delta(midpoint). Whole/band means divide
+summed CPU seconds by summed elapsed seconds, not an average of percentages.
+Rows are not exactly1s apart: shaping/collection shifts intervals, so use
+actual timestamps and retain short compensating intervals. Bands below span
+the indicated row endpoints; all row20 CPU readings are after successful47
+clear, unlike QUIC's earlier row20 management generation.
+
+| Role | Measured CPU s /observed s | Whole mean% | Maximum interval% | Hottest single-thread interval% |
+|---|---:|---:|---:|---:|
+|QUIC client|16.88 /39.737672|42.479|111.549|29.530|
+|QUIC server|30.19 /39.787072|75.879|174.687|47.985|
+|H2 client|22.38 /39.674385|56.409|97.817|21.741|
+|H2 server|19.95 /39.695404|50.258|87.077|18.933|
+
+Process totals and thread observations overlap and must not be added.
+Threads are OS identities, not Rust/Go tasks or code attribution. QUIC's
+startup server maximum103.561% is1.02CPU-s/.984923s at Unix
+1789076531.151982–1789076532.136905, approximately runner2–3s; one-core-total
+execution is reproduced alongside substantial early native work. Its overall
+maximum174.687% is1.74CPU-s/.996067s at Unix1789076555.194179–1789076556.190246,
+approximately26–27s, AFTER recovery. Client maximum111.549% is.68CPU-s/
+.609598s at Unix1789076559.932416–1789076560.542014. None identifies the user's
+reported incident or proves every executed instruction necessary.
+
+| Row band | QUIC client mean/max% | QUIC server mean/max% | H2 client mean/max% | H2 server mean/max% |
+|---|---:|---:|---:|---:|
+|0–5|21.361/37.442|54.276/103.561|20.146/23.957|17.474/18.912|
+|5–15|7.764/16.291|17.177/37.417|20.260/24.999|19.556/25.240|
+|15–20|4.166/6.729|7.541/9.403|21.294/27.546|18.906/20.471|
+|20–25|15.191/37.828|38.651/89.458|90.586/93.819|78.689/82.095|
+|25–30|96.028/106.790|164.169/174.687|94.995/97.817|84.147/86.539|
+|30–40|95.698/111.549|156.288/172.737|93.133/96.236|83.077/87.077|
+
+QUIC's initial post-clear20→24 server intervals are14.773/13.069/28.838/
+18.041%; the larger24→25 interval is89.458%. Thus sustained local CPU
+saturation is not the observed low-window recovery delay's owner. High CPU
+returns with high delivered work; this does not establish optimal per-byte
+cost. Maximum stat-read brackets are2.641/.227ms QUIC client/server and
+.550/.784ms H2; maximum complete collector invocations6.802/5.400ms and
+6.145/5.686ms. These are collector brackets, not total observer overhead.
+
+| Capture | Active DOWN /UP wire B | Active DOWN /UP drops | Peak DOWN /UP backlog B | Peak client/server RSS,KiB |
+|---|---:|---:|---:|---:|
+|QUIC|1082486452 /18606130|8948 /0|6082074 /36863|83756 /297484|
+|H2|1572069584 /11463289|6473 /0|5167437 /17476|46672 /45476|
+
+Wire/drop values are first→last class deltas. After row20 active drop counters
+remain8,955QUIC/6,476H2; these cumulative counts include seven/three before row0.
+No further configured loss or class/netem drops occur. QUIC's unused46 adds1,529server
+bytes/two drops and42client bytes; H2's unused cut adds0. These do not form a
+second data capacity. Native counters, class wire and body windows differ;
+do not call their ratios exact framing or retransmission amplification.
+All RSS values are in-load observations, not post-load reclamation/leak tests.
+Probe stderr is empty. QUIC broken-pipe/reset/H3closure warnings occur at
+duration teardown; H2 disconnects and closes gracefully, with no failed echo.
+
+Disposition: eventual native/body reopening rejects permanent stuck
+state in this tested QUIC episode, but not its several-second recovery cost
+or very low pre-clear service. H2 returns substantially sooner under the same
+configured cut with a different native policy and explicit rate prior. The
+measured post-clear delay precedes native reopening and is not explained by
+sustained process CPU saturation; no native cause is proven by that exclusion.
+The original CPU report remains unattributed. No loss threshold, larger
+window, snapshot redesign or claim of fixed backoff/promotion follows.
+
+[Verified raw archive](QUIC_LOSS_CLEAR_20260911.raw.tar.gz):15 regular files,
+164,954B compressed/1,882,238B uncompressed. It contains both complete five-file
+result sets, both closed drivers and the exact loss20_cpu.py/run.py/shape.sh.
+Every member was compared byte-for-byte with its source, without hashes.
+No executable/config/secret or new harness is included. Result tags are
+quic-combined-down-loss-clear-quic-0911 and h2-combined-down-loss-clear-h2-0911
+under `./.tmp/reflection/results/`; the ordinary binary path is stated above.

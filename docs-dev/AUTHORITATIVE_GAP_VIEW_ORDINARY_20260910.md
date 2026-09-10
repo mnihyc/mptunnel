@@ -1714,3 +1714,230 @@ exact diagnosis does not upgrade it to acceptance. The next decision must
 distinguish the remaining actual work/authority boundary using this ordinary
 state; neither the earlier diagnostic timer reduction nor component GREEN
 waives failed settlement or authorizes another tuning adjustment.
+
+## ACK invalidation diagnostic: actual re-dirtying overlaps held reply service
+
+The next information capture distinguishes an already-subsumed successful ACK
+from an actual false-to-true recovery-dirty transition. It finds both substantial
+re-dirtying and a directly observed 6.246s post-decode reply hold. This establishes
+a reached invalidation mechanism worth testing, **not** the fraction of dispatch
+time removable by suppressing it. Independent capacity, model and deadline wakes
+can request the same work. The largest 7.746007s confirmation gap has a different
+winning-frame boundary and must not be relabelled as a 7.746s post-decode hold.
+
+Source is ordinary `d44ca8e` plus the saved 18-source-file observation overlay;
+the failed bound-chooser candidate and rejected full-gap shared view are absent.
+Build33516 completes in 3m37s with the existing unused batch helper and ordinary
+dispatch wrappers unused by the diagnostic adapter. Parent verifies exact source
+comparison and fully reverses the overlay before traffic. The frozen
+`ack-invalidation-profile-20260910` binary runs with periodic PERF, samples0 and
+the same selected events as dispatch-inner; no scheduling decision changes.
+Runner6884 exits0 in 61.007750s. The [verified raw archive](ACK_INVALIDATION_PROFILE_20260910.raw.tar.gz)
+is 752,474B: 11 regular files, comprising five results, build/driver logs, complete
+patch, wrapper, `run.py` and `shape.sh`. Gzip, tar comparison and every decompressed
+member's bytes pass; runner/profile are identical to the preceding dispatch-inner
+archive. No configs, binaries, symlinks or directory entries are included.
+
+### Exact completion and complete raw series
+
+All 504,627,200 locally accepted bytes are target-confirmed in 60.621599s,
+66.594Mbps, one completed stream, no failed streams or probe errors. First
+write/confirmation are .105291/.409849s; maximum write/confirmation gaps are
+4.058593/7.746007s. This is a duration-upload workload, not an echo test. Settlement
+extends 20.621599s past nominal 40s load; the actual source-read counter reaches its
+final value only by management sample43. These 61 raw confirmation bins contain
+26 zeros; the last bin is partial. No trimmed-series time origin is substituted.
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 9.551,135.983,54.43,0,70.447,0,133.169,98.566,106.098,10.486
+10: 37.653,27.219,109.344,90.619,64.182,156.886,85.475,120.562,180.144,119.252
+20: 81.122,0,0,0,.524,0,0,917.735,63.439,6.728
+30: 0,0,14.384,0,93.323,36.892,49.903,38.273,275.923,70.618
+40: 11.01,36.286,0,0,0,0,0,0,71.259,0
+50: 0,0,250.862,0,0,0,0,0,0,0
+60: 408.672
+```
+
+| Raw confirmation phase | Mean Mbps | Zero bins |
+|---|---:|---:|
+| 0–5s | 54.082 | 1/5 |
+| 5–15s | 67.734 | 1/10 |
+| 15–25s | 74.397 | 3/10 |
+| Interior16–24 inclusive | 65.231 | 3/9 |
+| 25–40s | 104.481 | 5/15 |
+| 40–61s, last partial | 37.052 | 16/21 |
+
+### Successful ACK partition and actual work
+
+The feature flag records the existing validated subsumption fast path, not
+`released_bytes == 0`. Its caller records only successful ACK applications and
+captures recovery-dirty immediately before the ordinary assignment to true.
+The three `request.ack_facts.*_count` labels use **record count**, with byte
+fields0 and synthetic1us/event. Those artificial durations are not processing
+cost. Through the closing flush at Unix1789054681194:
+
+| Successful caller outcome | Count |
+|---|---:|
+| New facts | 6,094 |
+| Already subsumed | 22,774 |
+| Total successful ACKs | 28,868 |
+| Subsumed, actual false→true dirty transition | 17,870 |
+| Subsumed while already dirty | 4,904 |
+
+Subsumed ACKs are 78.89% of successes; actual re-dirtying is 61.90% of successes
+and 78.47% of subsumed ACKs. These are event frequencies, not saved-work forecasts.
+Every interval count/byte/time delta and its accumulated sum reconciles with the
+cumulative value across 5,433 client/763 server performance rows, single PID per
+role. Inactive components are omitted from later flushes: their last emission
+need not share the close timestamp. All three ACK labels do reach the close.
+
+Client actor hold totals 56.815001s over 583,129 guards; actor acquisition wait
+totals 1.290763s. Writer hold is 1.102658s/42,259 guards, with .042510s successful
+acquisition-call time, not prior Busy/retry residence. Largest actor guard is
+23.663ms at the dispatch callsite, so the multi-second hold is repeated work,
+not a single observed multi-second lock acquisition or guard.
+
+| Observed owner/dispatch scope | Elapsed, s | Actual calls/events |
+|---|---:|---:|
+| Dispatch actor guard, instrumented `control.rs:3103` | 35.783692 | 33,881 guards |
+| Preselect actor guard, `control.rs:1571` | 14.958354 | 87,051 guards |
+| Collection actor guard, `control.rs:3080` | 2.124544 | 33,881 guards |
+| ACK actor guard, `control.rs:4051` | 1.861476 | 28,868 guards |
+| Direct structural recovery, inside dispatch | 35.588522 | 37,292 calls |
+| Queued repair, inside dispatch | .197589 | 30,911 calls |
+| Structural target selection | 3.996898 | 1,752,551 calls |
+| Shared send-plan construction | 30.264546 | 989,922 calls |
+| Fenced Apply | .112075 | 18,964 commits |
+
+Of 989,922 sends, 970,904 return blocked, 54 other errors and 18,964 commit, an exact
+partition. Structural no-target events number 771,384; no `native_stale`
+component is emitted. Recovery payload committed is 855,744,520B, not unique
+repaired bytes or proof that copies were unnecessary. Internal send errors are
+not 54 failed user transfers. The four preselect phase timers total 14.883196s:
+gap 13.848814, source .470534, retained .452075 and residual .111773. All-caller
+inner gap timers, including ACK calls, retain their separate scope; owner/target
+model time 4.739885s is not an exclusive child of preselect alone.
+
+Timers measure elapsed work, including descheduling. Owner, direct, send-plan
+and Apply timers nest and must not be added. Generic dispatch `bytes` means calls
+or events except the explicitly named payload counter; maxima of accumulated
+dispatch phases describe per-guard batches. Logging and1us floors remain
+observation costs, not a CPU profile or an ordinary performance improvement.
+
+### Exact local winner and complete-flush overlap
+
+One session3544478606622885740/stream0 carries this upload. For the following
+unique QUIC joins, serverQ0/path0/incarnation3 maps to clientQ0/physical8/
+attachment3; serverQ1/path1/incarnation4 maps to clientQ1/physical1/attachment2.
+Incarnation and attachment numbers are not interchangeable. Wall timestamps
+below have millisecond resolution; independently zeroed monotonic clocks and
+probe offsets are not treated as a common origin.
+
+The 6.991s advancing-reply gap ends when Q0 repair `[1405,1419)` advances the
+frontier1405→1419. The previous advance is Unix1789054661990. This carrier has
+one matching repair acceptance and decode; the Original is on Q1 and later
+arrives as a duplicate. All times in the next table add Unix1789054660000ms.
+
+| Exact event | Offset, ms | Local sequence |
+|---|---:|---:|
+| Server accepts Q0 stale-path repair | 2705 | server951 |
+| Q0 repair decoded/send begin | 2735 | client2191 |
+| Repair enqueued | 2752 | client2192 |
+| Attachment receives, shared depth131 | 7083 | client2257 |
+| Shared Product send accepted, depth131 | 7194 | client2258 |
+| Product dequeued / selected / preapply lock finished | 8981 | client2277–2279 |
+| Applied; frontier1405→1419 | 8981 | client2280 |
+
+Acceptance→decode is 30ms; decode→Product is 6.246s, including 4.331s from repair
+enqueue to attachment and 1.787s from accepted shared send to dequeue. These
+exact boundaries establish a material local service delay without requiring a
+native-network latency explanation. They do not by themselves assign every
+intervening scheduling turn to a particular ACK.
+
+For periodic counters, reconstruct complete sorted flush groups and subtract
+cumulative states at fully contained group ends. The strict post-decode interval
+Unix1789054663468→1789054668500 spans 5.032s, entirely before application:
+
+| Counter/time in that complete-flush interior | Value |
+|---|---:|
+| Subsumed / new-fact successful ACKs | 414 /63 |
+| Actual subsumed re-dirty / already-dirty duplicates | 136 /278 |
+| Actor hold / acquisition wait | 4.904340 / .016365s |
+| Dispatch guard / preselect guard | 4.758717 / .053776s |
+| Nested direct structural work | 4.755105s;1,527 calls |
+| Nested send plans | 4.103400s;98,243 calls |
+| Blocked / committed sends | 97,268 /975 |
+
+An even narrower 1.012s full-flush band inside the shared-queue wait
+(Unix1789054667488→1789054668500) contains 62 subsumed/9 new-fact ACKs,
+16 re-dirties and 46 already-dirty duplicates, 1.000625s actor hold and .979037s
+dispatch guard. The .004360s preselect guard cannot explain that band's work
+by itself. These nested windows must not be summed. Completed calls can straddle
+counter boundaries, and after-unlock emission/flush ordering adds small skew;
+there is no per-ACK trigger-to-dispatch trace. Actual re-dirtying is present
+during the proven local hold, but its frequency is not the removable dispatch
+fraction: independent wakes and useful committed recovery remain active.
+
+### Preserve the different largest-gap outcome
+
+The 7.746s logged frontier gap is Unix1789054672990→1789054680736,
+frontier1545 waiting for `[1545,1559)`. Its winning Q1 completion-tail copy is
+accepted only at1789054680627 (server1311), decoded0658 (client2493), enqueued0661,
+attached0705 and sent to the shared queue0707; Product applies it0736
+(client2572). That winner spends 31ms acceptance→decode and 78ms decode→Product.
+The earlier Q0 Original, accepted/written at1789054661749, is only observed
+decoded at1789054680890, after the winner. Earlier TCP copies likewise cannot
+be assigned unseen intermediate boundaries. Thus the largest gap is **not**
+proved to be an already-decoded local FIFO hold, even though recovery work is
+busy throughout it.
+
+Its strict 7.041s complete-flush interior (Unix1789054673540→1789054680581)
+contains 1,502 subsumed/209 new-fact ACKs, 784 re-dirties/718 already-dirty duplicates,
+6.883117s actor hold,6.299739s dispatch guard and .097216s preselect guard;
+nested send-plan time is5.424103s. Those counters do not resolve the earlier
+Original/copies' missing native/reader stages.
+
+### Actual target, native and physical/resource context
+
+All 61 management samples keep the same eight physical outputs and session.
+Native telemetry initializes during startup, then all eight epochs remain stable
+from client sample10/server sample9 onward. The sampled target has accepted all
+504,627,200B by server Unix1789054667252 (about runner47s). Server reply production
+reaches 1838B by sample50, while client local reply delivery is 1405B at samples42–48,
+1433B at49–52 and1545B at53–60. The final long gap is therefore settlement-return
+delay after target writes have completed, not absence of target bulk progress.
+
+Inside the earlier local hold, server samples42→48 show 38,912,896B further target
+writes over 6s, while the client reply counter stays 1405B. Inside samples53→60,
+source and target counters stay final, yet the six client TCP native ACK counters
+increase 137,282,902B in their stable epochs. Native timestamps advance; this is
+not new useful application progress and does not identify which copy won.
+Client lifetime `ps` CPU is 123→121% across42–48 and 119→118% across53–60;
+it is not an interval CPU measurement or proof of continuous saturation.
+
+The sampled physical profile is 200Mbps per independent link, DOWN30ms/UP70ms,
+zero jitter/configured loss/outage, netem limit8192, HTB burst/cburst65536.
+Only client eth0/link46 UP is first observed at 10Mbps at runner15.002552s and
+restored to 200Mbps at25.003620s; link47 remains 200Mbps. All 61 rows satisfy
+rate/ceil and delay checks; class and qdisc drop deltas are0. Management target-write rates over
+its own5→15,16→24 and25→40 sample intervals are86.340,25.949 and85.166Mbps,
+respectively, not substitutes for the differently timed raw confirmation bins.
+
+| Sampled cost, first→last over60.007556s | Client / UP | Server / DOWN |
+|---|---:|---:|
+| Link46 class bytes | 679,246,055 | 9,492,698 |
+| Link47 class bytes | 739,826,221 | 10,100,745 |
+| Sum-class peak / final backlog, B | 31,518,748 /4,423,461 | 50,764 /1,686 |
+| RSS peak / final, KiB | 346,596 /302,668 | 129,684 /129,684 |
+| Lifetime process CPU peak / final, % | 125 /118 | 56.4 /32.2 |
+
+Class bytes are not useful payload; nested qdisc backlogs are not added again.
+Client/server logs contain 8,658/2,096 lines and 3,097,063/742,458B, including the
+periodic observers. Their overhead is not measured away. Probe stderr is empty;
+two server `H3_NO_ERROR` remote-close warnings occur after final recorded
+settlement/close, not as independent failed transfers. There is no ordinary
+promotion or guarantee that correcting the observed no-op invalidation will
+remove either measured long gap. The next bounded correctness/performance
+transaction must preserve independent availability wakes and measure its own
+whole outcome; this capture supplies attribution, not a new policy or speed claim.

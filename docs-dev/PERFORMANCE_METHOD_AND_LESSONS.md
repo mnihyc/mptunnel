@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-10 18:02 +08:00. Category: requested global retrospective and
+Updated: 2026-09-10 23:36 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -252,6 +252,17 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- Product-lock immutability does not freeze independently published structural
+  policy. The09-10 whole-gap observation proposal was rejected before runtime:
+  region1 can capture B/C as Backup while copies exclude both; an independently
+  received PathStatus promotesC to Regular before region2 permits both. A reused
+  full view would bind fasterBackupB, whereas current per-region capture choosesC.
+  Later fresh *bound* planning preservesB and does not validate the parent tier
+  set. A future publication wake is not that missing pre-binding validation.
+  Inspect every consumed field's producer and the actual authority carried to
+  Apply, not just Product mutations or a static work-count test. Advisory timing
+  and categorical eligibility are different. Do not add a speculative fence
+  framework merely to rescue a rejected cache optimization.
 - Bounded output is not bounded selection work. The09-10 authoritative-gap
   pilot fixes a real one-head service counterexample and passes95checks, yet
   ordinary upload stalls26.666s and fails settlement. Enumeration multiplied

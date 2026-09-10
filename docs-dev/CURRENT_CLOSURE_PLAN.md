@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 23:06 +08:00. Authoritative repository: `./`.
+Updated: 2026-09-10 23:57 +08:00. Authoritative repository: `./`.
 **MPP is not performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; do not conclude at an intermediary commit.
 
@@ -10,11 +10,11 @@ growing inventory. Complete preceding chronology and adverse outcomes remain at
 `git show 79ddb41:docs-dev/CURRENT_CLOSURE_PLAN.md`, earlier49143f2, and the
 linked reports/archives. Condensation discards no experiment.
 
-## Active transaction: one observation for one finite gap-service decision
+## Active transaction: discriminate recovery invalidation without new ACK facts
 
 ### Completed discriminator and rejected candidate
 
-Runtime source is back to d44ca8e; no build/lab/observer is active. The attempted
+Runtime baseline is back to d44ca8e. The attempted
 bound-chooser reuse and its test are removed, with exact patch, executable,
 RED/focused/build logs and ordinary results retained. It is not a dependency
 of the next candidate. Reports and archives:
@@ -49,7 +49,7 @@ continue; that is not bulk progress. These ordinary counters do not expose the
 critical bytes or exact repair/command authority. No BBR/QoS explanation or
 new CPU/fairness threshold is justified by this state.
 
-### Next bounded model question, before implementation
+### Full-view proposal rejected before runtime
 
 Issue/impact: recovery enumeration introduced by79ddb41 multiplied expensive
 lower model work and preceded multi-second local reply holds. d44's narrower
@@ -108,6 +108,113 @@ incomplete service, material adverse timing/cost or no useful gain stops
 promotion. No favorable reruns, threshold rescue or stacking the removed
 chooser candidate. Actual result must be recorded against this forecast.
 Global gates below remain intact; no new unseen model obligation is added.
+
+Independent challenge rejects the full-view proposal AS STATED. Concrete
+pre-binding countercase: first region forces a view with B/C Backup, B faster,
+but exact existing copies exclude both. TCP PathStatus independently promotes
+C to Regular before a later region that permits both. Current per-region
+capture picksC; reused full view bindsB. Later main plan intentionally preserves
+that bound target and does not compare the original parent tier set. Real
+producer is tcp/client/receive.rs→update_peer_path_usage, outside Product lock.
+Future publication wake is not validation of the already bound choice. Pure
+Product immutability therefore does not freeze structural eligibility.
+Do not bolt on a new generic fence/cache mode to rescue this candidate. Its
+test-only static draft is saved at ./.tmp/reflection/finite-gap-observation-
+test-draft-0910.patch and removed before any build; no RED/GREEN or runtime
+claim follows. No new implementation is present.
+
+### Selected next information capture: exact subsumed-ACK invalidation
+
+Existing source counterexample: apply_client_stream_ack's validated subsumes
+branch changes only idle-progress time and returns0, but its caller still sets
+request_recovery_dirty=true. Do NOT use released_bytes==0 as the proof: new
+negative evidence/copy release can matter without releasing Original bytes.
+The existing exact positive+negative subsumption predicate is the discriminator.
+
+Question/forecast: in the same ordinary failure context, how often do truly
+subsumed ACKs change recovery from quiescent to dirty, and do those events
+coincide with material repeated-dispatch/reply-held intervals? Counts of all
+ACKs or aggregate model time cannot answer this. A temporary periodic counter
+will separate new evidence from exact no-ops and no-op redirty transitions;
+reuse the existing owner/dispatch/reply observer, no bulk ACK logs or runtime
+policy change. This capture predicts information, NOT speed. A rare/nonmaterial
+transition defers the change; a material actual trigger selects a focused
+producer invalidation test and minimal change preserving all new-evidence,
+capacity/model/deadline wakes. No ACK batching, cadence change or fairness knob.
+Same200+200QoSUP profile, d44ordinary source, one frozen diagnostic overlay,
+fully reversed before traffic. Root owns build/lab; independent review checks
+classification and observer cost. No another whole-view implementation.
+Execution: reused18-source-file dispatch-inner overlay is applied on d44,
+plus feature-only TLS classification at the existing synchronous subsumption
+branch and three count-only counters at the actual successful ACK caller.
+The Drop recorder precedes Product guard declaration and emits after unlock,
+including early exits. Successful new-facts + subsumed counts partition only
+successful applies; subsumed_redirty is their exact prior-dirty=false subset.
+Artificial1us floors are not ACK timing. No per-ACK raw logs/new validation.
+Release diagnostic build33516 is active. Initial format-check51603 stopped
+before cargo on pre-existing observer layout; this is not Product/test failure.
+The only final concurrent edit was import ordering, with no semantic or line-
+count change; saved overlay is refreshed. No further source edits during build.
+Build33516 closes0/3m37s; full source matches saved ack-invalidation-profile-
+0910.patch, frozen in bin/ack-invalidation-profile-20260910 and wrapper. All
+18source-file observer changes are fully reversed BEFORE diagnostic6884.
+Same physical/profile/selected reply events, PERF1/SAMPLES0; new counters are
+periodic only. Independent actual observer review passes. Capture is active.
+Diagnostic6884 closes0/61.007750s:exact504,627,200B in60.621599s, maximum
+confirmation7.746007s/write4.058593s. Successful ACK counts are6,094newfacts+
+22,774subsumed=28,868, with17,870actual subsumed false→true redirties and4,904
+duplicates alreadydirty. Whole actorhold56.815s; dispatch35.784s (direct35.589),
+plan30.265s/989,922sends (970,904blocked/18,964commit), preselect14.958s.
+These exact transitions are real producer evidence, not a synthetic dirty-bit
+test; own reply-held interval reconciliation is pending before runtime choice.
+Neither redirty percentage nor counter durations estimate removable time:
+independent native/model/capacity wakes can still require the same scan.
+
+Own decisive window: Q0 repair[1405,1419) spends6.246s decode→Product inside
+a6.991s advancing-reply gap. Complete5.032s interior has414subsumed/63new-fact
+ACKs and136actual redirty transitions, with4.758717s dispatch versus.053776s
+preselect; nested bound plan4.103400s/98,243sends. This establishes material
+overlap, NOT that136resets caused all1,527direct dispatch calls. The largest
+7.746s gap instead has late server acceptance and only78ms postdecode: keep
+that different cause, do not call every stall local.
+
+Selected correction: make successful ClientStreamAckOutcome explicit with
+released_bytes and has_new_facts; false only on existing exact subsumption,
+true on every successful full ACK application. Real caller keeps identical
+buffer release, changes only recovery_dirty=true to |=has_new_facts. Preserve
+already-dirty work, idle-progress update, generic Input retry reset, prepared/
+FIN handling and every independent model/capacity/deadline/membership wake.
+Origin:59fbd22 introduced dirty scheduling; b2aa215 added the helper's exact
+ACK no-op fast path without communicating that distinction back to the caller.
+It intended to avoid repeated ACK-owned work, but still invalidates recovery.
+This is an implementation result/consumer mismatch, not an RFC/rate change.
+
+Capture6884 supplies the real-producer RED (observed exact no-op false→true
+transitions), so do not invent a helper-only failing test for reachability.
+Focused regression must include duplicate positive evidence and a novel negative
+scope with zero released bytes, which MUST still invalidate recovery, plus
+unchanged prior-dirty/idle handling. Independent type/wake audit finds no missed
+service countercase. Foreseeable benefit is removing repeat scans caused solely
+by these replay events; at most the affected fraction of4.759s critical/35.784s
+whole dispatch is removable. Independent wakes and preselect remain, so no
+specific Mbps or complete-cure forecast is justified. A cheap narrow change
+targets a measured material owner without another tuning/observer project.
+Acceptance remains the SAME ordinary200+200QoSUP full completion/timing/cost
+gate after targeted tests. No practical gain/adverse result stops promotion;
+no parameter rescue, broad ACK batching, or revival of either removed view.
+
+Execution: ACK-outcome correction is present only in client.rs/control.rs, with
+focused tests in tests_client.rs/tests_control.rs. Independent final four-file
+semantic/wake review passes. The actual apply sequence is positive scope4/[4,8),
+replay, expanded negative scope0/same positive, replay: expected released/new
+outcomes (4,true),(0,false),(0,true),(0,false). Existing source/copy/queue/frontier,
+idle and invalid-ACK controls remain. Test build72193 stops before tests on a new
+fixture SmallVec-versus-Vec assertion type mismatch; correcting it to compare
+slices changes no runtime/test intention. Retry28256 is active, default test
+profile/jobs1. This compile error is not a Product RED. Diagnostic6884 report
+and verified11-member/752474B archive are complete. Its local6.246s hold and
+different late-acceptance maximum gap are recorded separately. Ordinary source
+has no observer, rejected chooser or whole-gap observation candidate.
 
 ### Completed loss-CPU discriminator; no CPU fix justified
 

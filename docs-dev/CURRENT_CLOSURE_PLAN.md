@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 18:28 +08:00. Authoritative repository: `./`.
+Updated: 2026-09-10 20:02 +08:00. Authoritative repository: `./`.
 **MPP is not performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; do not conclude at an intermediary commit.
 
@@ -24,17 +24,31 @@ restored35.519Mbps, confirmation gap7.471s and local-write gap14.916s.
 [Full result](AUTHORITATIVE_GAP_VIEW_ORDINARY_20260910.md) retains all57bins,
 35zeros, unchanged profiles and costs. Root owns cargo/labs; no promotion.
 
-Next information question: does repeated synchronous recovery work still
-dominate the new view's stalls, and which remaining query stage? Existing
-ordinary native progress cannot answer this. Reuse the prior small periodic
-observer on this exact candidate, separately timing owner eligibility, scored
-ledger/cache query, lower target/native model and assignment clocks within
-the outer evaluation. No per-query log flood or scheduling intervention.
-Same topology/profile; freeze diagnostic separately and reverse overlay before
-traffic. If model work remains dominant, use its actual stage to propose an
-equivalent-work correction; if not, stop that line and trace the exact held
-prefix/repair service. This is information-only, not a promised speed gain or
-a favorable rerun. Do not advance healthy/baseline gates on component GREEN.
+Timing-only72362 CLOSED at unchanged85s guard, incomplete. It falsifies more
+query reduction as a sufficient correction:50,268evaluations/15.420s outer,
+11.954s model. In an actual10.038s forward-flat interval, outer work is2.102s
+(20.94%);3.223M candidate probes all return BEFORE scored-frontier work.
+The independent healthy47cut carries only.035Mbps at16→24. Later68–85target
+and source both equal312,672,256B, but reply delivery remains behind; no gap
+evaluations finish after~56.3s.181ACK applications and51local reply writes
+continue late, excluding one uninterrupted Product lock hold. Async reader
+residence totals across carriers are not CPU or additive critical delays.
+
+Next information question: which exact owner/eligibility excludes the forward
+gap, and separately which reply offset/accepted carrier holds confirmation?
+Reuse existing filtered request-staleness, server dispatch/recovery and client
+receive-hole events on the same ordinary source. Keep these two directions
+separate in analysis; one event capture does not establish a common cause.
+No broad upload-frame/ACK log flood, runtime policy or profile intervention.
+Feature-only build50685 is complete(88s), but independent source inspection
+finds two missing join fields: prepared response Original event omits chosen
+carrier, and client receive-hole events omit in-order arrivals. Add ONLY these
+two temporary observation points (exact Original identity/offset at commit and
+each response arrival/frontier), plus first-gap/candidate context on existing
+request-stale transitions. These are reply-sized/transition events, not the
+bulk upload DATA log. Archive/reverse overlay before traffic. Retain ordinary
+result unchanged. No query optimization, new timer or healthy/baseline
+advancement is justified by these measurements.
 
 The original independent-link failure is real: on two200Mbps links, only46
 slows200→10→200 during15–25s while47 stays healthy. Existingb0 upload averages
@@ -214,7 +228,7 @@ docs-dev/LIVE_OWNER_FRONTIER_WORK_BOUND.md remains untouched/unstaged.
 Use exact intermediary commits; docs-dev needs exact force-add. PROGRESS is an
 ignored continuity journal, not force-added. AGENTS.md is immutable.
 
-Telegram failure milestone sent09:43UTC; next nonurgent after10:44UTC.
+Telegram adverse view milestone sent11:53UTC; next nonurgent after12:54UTC.
 Meaningful measured milestones/blockers only; commentary within60s, minute
 lab/build polling. Before compaction preserve exact active session, next
 decision, source/binary identities and adverse/open outcomes. Continue, do not

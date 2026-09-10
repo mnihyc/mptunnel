@@ -373,3 +373,22 @@ progress. Do not promote reduced sweep visits or smaller exact completion.
 Reuse the small periodic timing observation to separate remaining eligibility,
 scored-ledger/cache, lower target/native and clock work in this exact candidate.
 No new scheduling rule or threshold is justified before that attribution.
+
+2026-09-10 20:03 +08:00 timing-only72362 guard-fails. The new view reduces
+observed cumulative query work, but cannot explain the remaining failure as
+one work bottleneck: forward-flat16–27 has20.94% synchronous occupancy and
+zero scored queries; late68–85 has equal source/target totals and continuing
+ACK/response work after evaluator calls end~56s. Full nested/floor-aware
+evidence is in AUTHORITATIVE_GAP_VIEW_ORDINARY_20260910.md. Do not select
+another prefix/native query optimization from its whole aggregate.
+
+Independent audit finds queue-to-flight publication atomic, critical repairs
+FIFO, current exact copy coverage intact. The next falsifiable composition
+hypothesis is ambiguity from increased copying depriving Original owners of
+unique progress, causing staleness/eligibility exclusion. Ambiguous receipts
+MUST NOT manufacture path qualification; this hypothesis does not justify that
+shortcut. Trace actual stale transitions, first gap and candidate owners.
+The separate late return hold needs exact response Original/copy commitment
+and every reply receipt/frontier. Add only those missing feature observations,
+reuse existing events and reverse overlay before sameprofiletraffic. No runtime
+change or common-cause assertion follows before the exact joined evidence.

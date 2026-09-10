@@ -201,3 +201,171 @@ progress alone does not attribute the unresolved ordered/confirmation holds.
 Preserve this result and choose the next exact owner/work discriminator before
 another runtime or acceptance attempt. No favorable rerun, parameter change,
 public performance update or release is supported by this capture.
+
+## Separate stage profile: residual work does not dominate every held interval
+
+The subsequent timing-only capture
+`aggregate-combined-up-authoritative-gap-view-profile-0910` uses ordinary source
+`a747bda` with the saved two-file temporary overlay
+`./.tmp/reflection/authoritative-gap-view-profile-0910.patch`. Root freezes
+`./.tmp/reflection/bin/authoritative-gap-view-profile-20260910/mptunnel` after
+the83s feature build, then fully reverses the overlay before traffic.
+`MPTUNNEL_LAB_PERF=1`, per-call samples off. No decisions, profile or resource
+parameters change. This diagnostic is not another ordinary speed comparison.
+
+The [stage-profile archive](AUTHORITATIVE_GAP_VIEW_PROFILE_20260910.raw.tar.gz)
+contains11regular files, no directory entries: five results, build/driver logs,
+the two-file overlay patch, wrapper, `run.py` and `shape.sh`. Its size is793,634B.
+Gzip integrity, listing, tar comparison and independent member-by-member byte
+comparison against source files all pass. Relative paths are preserved; no
+binary or credentials are included.
+
+### Incomplete outcome and own progress timeline
+
+The unchanged85s guard ends an incomplete transfer:276,216,058B confirmed of
+312,672,256B locally accepted in85.513042s, leaving36,456,198B unconfirmed.
+`complete=false`,0/1streams complete, invalid exact accounting and lower-bound
+status. Reported25.841Mbps is **censored confirmed throughput**, not completed
+goodput. First local write/confirmation is.105895/.410683s; maximum gaps are
+1.395808s local-write and6.851551s confirmation. The driver exits1with
+`probe failed to settle`; teardown produces the terminal
+`upload sink closed before terminal acknowledgement` error. It is not a separately
+demonstrated spontaneous connection failure. Raw/trimmed confirmation bins are
+empty and maximum-gap endpoints absent; none are reconstructed from other domains.
+
+This run differs from the preceding ordinary view and earlier profile, so use
+its own state to interpret timings:
+
+- Target-socket acceptance is exactly149,532,592B over samples16–27. Source
+  reads grow154,370,256→174,931,024B, leaving4,837,664→25,398,432B not yet
+  accepted at the target socket. This difference is outstanding stage volume,
+  not the exact extent of one missing DSN. Server reply reads remain557B;
+  client reply writes advance252→347B. Forward and reverse progress diverge.
+- Over48→57, target writes continue266,938,032→276,347,130B,8.363Mbps, while
+  source remains312,672,256B. Over58→68, target adds34,773,662B,27.815Mbps.
+  This middle settlement segment is slow but not target-flat.
+- At68the target and source both equal312,672,256B and remain equal through85.
+  Server has already read2068sink-reply bytes. Client reply delivery advances
+  only1229→1607B, and the probe remains36,456,198B short of terminal confirmation.
+  The final target-flat state is therefore a held-confirmation interval, not
+  proof that upload bytes still need to reach the target socket.
+
+The86sampled rows end85.009199s. Their management producer clocks and the
+probe's elapsed clock are separate; the coarse progress joins do not reconstruct
+the exact user-visible maximum-gap interval or a blocking reply's byte identity.
+
+### Nested stage totals, not additive CPU or a new bottleneck assumption
+
+All56rows for each of11new labels reconcile count/query/time deltas with
+cumulative totals:616rows, one client PID. Every label has50,268completed
+outer evaluations; generic `bytes` means queries, not traffic. The table reports
+elapsed time summed within those evaluations. Maxima are per-evaluation aggregate
+stage times, **not per-query maxima**.
+
+| Region after `request.gap_service` | Queries | Aggregate elapsed, s | Maximum per evaluation, ms |
+|---|---:|---:|---:|
+| Outer service | 9,349,268 model queries | 15.420367 | 9.664 |
+| `.owner_model` | 9,349,268 | 11.953549 | 9.420 |
+| `.owner_mask` | 9,349,268 | 3.644743 | 4.422 |
+| `.ownership_frontier` | 9,349,268 | .817712 | 2.302 |
+| `.scored_frontier` | 484,387 | .898272 | 4.277 |
+| `.cache_frames` | 484,387 | .257351 | .903 |
+| `.lower_model` | 484,387 | 5.356034 | 6.365 |
+| `.lower_owner_lookup` | 484,387 | 1.154682 | 3.520 |
+| `.lower_native_observe` | 484,387 | 3.012307 | 4.811 |
+| `.lower_target_selection` | 484,387 | 1.130411 | 4.251 |
+| `.assignment_clock` | 195,739 | .363050 | 1.062 |
+
+Owner mask/frontiers/cache/lower-model are inside owner-model; lower lookup,
+native observation and target selection are nested inside lower-model. Assignment
+clock is outside owner-model but inside service. Do not sum those overlapping
+rows. Each recorder floors elapsed to1us, even when the stage has zero queries.
+Timers include instrumentation/descheduling and synchronous lock-held elapsed,
+not CPU instruction time, lock acquisition or another task's blocked duration.
+View construction and other surrounding service work are included only in outer
+time. The final new-label record is Unix1789041307036ms; other counters continue
+through1789041336203ms. Without a clean terminal flush, totals cover completed
+recorded evaluations, not a categorical measurement of every unfinished action.
+
+Actual cumulative flush stamps give materially different occupancy by phase.
+`interval_ms=1000` is nominal configuration, not actual spacing. The following
+Unix millisecond stamps are exact logged boundaries inside the stated management
+windows, not shared process-monotonic or probe origins:
+
+| Own management window | Flush stamps / outer sequence | Wall s | Completed evaluations | Outer / owner-model elapsed, s |
+|---|---|---:|---:|---:|
+| 5–15s | 1789041255832→1789041264882 /112→318 | 9.050 | 7,941 | 2.021161 /1.502353 |
+| Target-flat16–27s | 1789041266892→1789041276930 /364→594 | 10.038 | 4,081 | 2.102305 /1.447980 |
+| Restored25–40s | 1789041275929→1789041289956 /569→914 | 14.027 | 19,607 | 4.101653 /2.954955 |
+| Target-flat42–45s | 1789041292970→1789041294975 /985→1027 | 2.005 | 525 | 1.021838 /.928556 |
+| Slow drain48–57s | 1789041298986→1789041307036 /1116→1289 | 8.050 | 1,896 | .170459 /.108921 |
+
+The windows overlap and must not be added. Sequential counter recording can
+split one evaluation across a flush: nested counts/query deltas occasionally
+differ at boundaries, although final totals agree. In16–27s, outer occupancy
+is20.94%, not the earlier profile's84.48%regime. The3,222,829nested model queries
+spend.934869s in owner eligibility and.211218s in view membership. **None reaches
+scored-frontier, cache, lower-model or assignment-clock service** in that window;
+each such stage's displayed.004081s is exactly4081×1us recording floor, not
+executed queries. The source returns before scored service when the view has
+no frontier or not exactly one eligible owner; these counters do not distinguish
+which condition occurred for each exact range. Mere lower-model optimization
+cannot remove work that this held interval never executes.
+
+The short42–45s plateau does contain substantial model work:1.021838s outer
+in2.005s wall, including.518116s lower-model, .251959s nested native observation,
+.214746s owner-mask and.107441s scored-frontier. But48–57outer falls to.170459s
+over8.050s while completion is still slow. There is no single remaining stage
+whose aggregate explains every critical interval.
+
+During the final68–85confirmation-held state, no new completed evaluator rows
+appear. Other owner operations do continue: exact flush bounds
+1789041319129→1789041335200contain181mux ACK applications releasing9,056,864B,
+and51receive/local-write operations. Local writes deliver336B in1.610ms aggregate,
+maximum238us. This contradicts an uninterrupted request-Product lock hold across
+that entire tail; it does not rule out all intermittent contention. TCP reader
+queue-send/stream-route elapsed totals in that same16.071s band are96.562/95.948s
+across concurrent carriers, with maxima131.033/130.862ms. Those are asynchronous
+residences/backpressure, not additive CPU or an exact reply's critical delay.
+
+### Same physical profile; different native utilization and collection cost
+
+All86rows retain two independent200Mbps links and the same46UP10Mbps restriction
+at15–25s;47and returns remain200Mbps, DOWN/UP30/70ms, zero loss/jitter/outage,
+burst/cburst65536B and netem limit8192. Class/netem drop deltas are0. First
+restriction/restoration reporting occurs15.001617/25.002677s. These samples verify
+configuration, not identical native histories or timing-neutral instrumentation.
+
+The important negative result is physical underuse of healthy47 during the own
+target-flat cut: strict16→24 UP classes average9.996Mbps on46but only.034584Mbps
+on47. Native TCP ACKs advance6,151,690/15,272B and QUIC15,760/15,714B, with
+unchanged exact epochs and fresh producer stamps. All paths are sampled active,
+eight from9s onward. At27healthy47QUIC RTT is106.882ms, native flight0but Product
+flight36,193,814B. Active/native labels do not supply the missing logical owner
+or prove capacity-admissible recovery for the blocked range.
+
+Later68→85, TCP ACKs advance66,358,148/45,306,642B on46/47and QUIC99,667/130,803B,
+with stable exact identities and advancing producer stamps. UP classes average
+32.410/22.595Mbps despite no new target acceptance. These bytes are not unique
+useful payload; no repair-winner or duplication claim follows from totals.
+
+| Own whole sampled cost | Client UP46 /47 | Server DOWN46 /47 |
+|---|---:|---:|
+| Class bytes over85.009199s | 635,918,102 /421,040,618 | 9,362,042 /7,779,521 |
+| Summed backlog median / maximum / final, B | 547,516 /16,221,486 /355,838 | 660 /52,593 /544 |
+| Process RSS peak / final, KiB | 344,744 /334,684 | 65,336 /65,336 |
+| Lifetime CPU peak / final, % | 117 /109 | 55.3 /19.6 |
+
+CPU/RSS do not locate a critical lock or prove a leak; substantially different
+work/completion and observation windows forbid a cost-efficiency comparison.
+Client/server logs total1,140,410B (1660/1044lines), no per-call samples, no
+product warning/error lines and empty probe stderr. The instrumented run changes
+execution overhead and ends censored; it cannot replace the ordinary57bin result.
+
+**Information disposition:** view-specific remaining synchronous work is real,
+but its whole15.420s total does not justify assuming it dominates the remaining
+failure. The long cut plateau exits before scored service, and the late
+confirmation-only tail continues after completed evaluator activity stops.
+Preserve the held prefix/eligible-owner/reply-service question before selecting
+another equivalent-work correction. No timer or throughput-only rescue,
+performance promotion, public update or release follows this diagnostic.

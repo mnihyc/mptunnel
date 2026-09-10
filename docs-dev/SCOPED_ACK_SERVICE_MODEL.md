@@ -636,12 +636,7 @@ periodic heartbeat requirement. Feedback never waits for proof to be applied.
 The marker must share ACK/MAX's ordinary priority-frame FIFO/native stream,
 not a higher-priority lane or QUIC repair stream. A logical actor replies after
 preceding transactions, including valid already-subsumed ACKs. A marker is an
-ordered logical-application boundary, not a mandatory Input-turn or Product-
-unlock boundary. Ready ACK/MAX and logical probes/receipts can share one finite
-Input quantum while preserving per-item order, exact identities, real credit,
-current-time receipt expiry, and fresh recovery before publication/unlock.
-The probe confirms preceding logical application, not intermediate recovery
-scheduling or a frozen state before later facts. Raw path Ping/Pong/PathProof is insufficient:
+ordered feedback-batch boundary. Raw path Ping/Pong/PathProof is insufficient:
 registry routing can report success after dropping an unknown/closed stream.
 Aggregate/platform-optional TCP ACK counters and local QUIC write completion
 are likewise not exact logical receipts. Two explicit stream-scoped wire kinds

@@ -2381,26 +2381,14 @@ from the final carrier writer's dependency and class priority below: control
 priority there is not a blanket veto on the other Product direction here.
 
 A selected Input turn MAY service an ordered sequence of that stream's
-`STREAM_ACK`, `STREAM_MAX_DATA`, `STREAM_FEEDBACK_PROBE`, and
-`STREAM_FEEDBACK_RECEIPT` under one synchronous Product ownership
-guard. Additional ordered-input dequeue attempts MUST be bounded by one ready-item count
+`STREAM_ACK` and `STREAM_MAX_DATA` under one synchronous Product ownership
+guard. Additional dequeue attempts MUST be bounded by one ready-item count
 captured at entry, without waiting or replenishing that budget. This freezes
 the count, not the contents of independently updated credit state; the existing
 input service order still applies. Every ACK remains a separate fully validated
 transaction, including receipt release, copy attribution and qualification,
 sampling, scoped gap evidence, pruning and progress. MAX applies only actual
-received credit. No ACK is merged or omitted. Each item retains its own exact
-attachment identity; the first item's identity MUST NOT be reused for later
-probes. Each serviced probe additionally reconciles at most one actual coalesced
-MAX state item before recording its pending reply requirement, as in Section
-8.4.1; it MUST NOT loop or wait for credit. This does not replenish the frozen
-ordered-input attempt budget. Its claimed offset never grants credit.
-This is an ordered logical-application boundary, not a requirement to perform
-recovery discovery or release Product ownership between ready feedback facts.
-Receipt processing retains current-time expiry and token-owned output selection,
-not the receipt's ingress or an entry-time snapshot of the clock. These markers
-change feedback routing only; they do not supply byte-receipt or delivery evidence.
-Any other frame, stream mismatch
+received credit. No ACK is merged or omitted. Any other frame, stream mismatch
 or error ends the sequence without overtaking or losing that boundary; an
 invalid ACK changes none of its state and does not undo preceding valid
 transactions. On a fatal feedback error, terminal cleanup MUST revoke new

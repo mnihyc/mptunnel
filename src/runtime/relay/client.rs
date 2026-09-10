@@ -525,7 +525,6 @@ pub(super) struct ReadyFeedbackAckBoundary {
     pub(super) assigned: u64,
     pub(super) frontier: u64,
     pub(super) retained: usize,
-    pub(super) peer_max_offset: u64,
     pub(super) gaps: Vec<OffsetRange>,
 }
 
@@ -535,7 +534,6 @@ pub(super) struct ReadyFeedbackAckBoundary {
 pub(super) struct ReadyFeedbackObserver {
     calls: std::sync::atomic::AtomicUsize,
     gated: std::sync::atomic::AtomicBool,
-    required_ready_successors: usize,
     pub(super) ready_after_first_selection: std::sync::atomic::AtomicUsize,
     pub(super) before: std::sync::Mutex<Vec<ReadyFeedbackAckBoundary>>,
     pub(super) after: std::sync::Mutex<Vec<ReadyFeedbackAckBoundary>>,
@@ -544,14 +542,6 @@ pub(super) struct ReadyFeedbackObserver {
 
 #[cfg(test)]
 impl ReadyFeedbackObserver {
-    pub(super) fn with_ready_successors(required_ready_successors: usize) -> Self {
-        assert!(required_ready_successors > 0);
-        Self {
-            required_ready_successors,
-            ..Self::default()
-        }
-    }
-
     pub(super) async fn run<F: std::future::Future>(
         self: std::sync::Arc<Self>,
         stream_id: StreamId,
@@ -576,9 +566,8 @@ impl ReadyFeedbackObserver {
 }
 
 /// Gate only the first selected ACK, outside Product ownership. The fixture
-/// supplies a fixed ACK2 or Probe/ACK2 suffix behind it, so actual shared-input
-/// readiness proves the entire suffix was available before ACK1 Apply. No
-/// attachment-mailbox shortcut; the default fixture requires one successor.
+/// supplies only ACK2 behind it, so actual shared-input readiness proves the
+/// successor was available before ACK1 Apply. No attachment-mailbox shortcut.
 #[cfg(test)]
 pub(super) async fn gate_ready_feedback_test_input(
     stream_id: StreamId,
@@ -603,12 +592,12 @@ pub(super) async fn gate_ready_feedback_test_input(
         return;
     }
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while input.ready_frame_count() < observer.required_ready_successors.max(1) {
+        while input.ready_frame_count() == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the complete feedback suffix reaches shared input while ACK1 is selected");
+    .expect("ACK2 reaches the actual shared input while ACK1 is selected");
     observer.ready_after_first_selection.store(
         input.ready_frame_count(),
         std::sync::atomic::Ordering::Release,
@@ -635,7 +624,6 @@ fn record_ready_feedback_ack_boundary(
             assigned: send_stream.next_offset(),
             frontier: send_stream.data_ack_frontier(),
             retained: send_stream.reinjection_bytes(),
-            peer_max_offset: send_stream.peer_max_offset(),
             gaps: last_send_ack.gaps().to_vec(),
         };
         if after {

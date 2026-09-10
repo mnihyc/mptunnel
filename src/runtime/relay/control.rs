@@ -81,45 +81,48 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-/// Apply a finite Input quantum without changing logical feedback or credit order.
+/// Apply a finite Input quantum without changing ACK transaction or credit order.
 /// The caller retains Product ownership through its final fresh recovery and
 /// queue-dependent postactions. The first item was selected as valid feedback;
 /// all later non-feedback/error items are returned intact for normal handling.
-fn apply_ready_client_feedback<I>(
-    first: ReliableRelayRemoteFrame,
+fn apply_ready_client_feedback(
+    first: Frame,
     stream_id: crate::protocol::StreamId,
     ready_items: usize,
-    input: &mut I,
-    mut try_next: impl FnMut(&mut I) -> Option<ReliableRelayRemoteFrame>,
-    mut apply: impl FnMut(ReliableRelayRemoteFrame, &mut I) -> Result<(), RuntimeError>,
+    mut try_next: impl FnMut() -> Option<ReliableRelayRemoteFrame>,
+    mut apply: impl FnMut(Frame) -> Result<(), RuntimeError>,
 ) -> Result<Option<ReliableRelayRemoteFrame>, RuntimeError> {
-    let mut item = first;
+    let mut frame = first;
     let mut remaining = ready_items;
     loop {
-        apply(item, input)?;
+        apply(frame)?;
         if remaining == 0 {
             return Ok(None);
         }
         remaining -= 1;
-        let Some(next) = try_next(input) else {
+        let Some(item) = try_next() else {
             return Ok(None);
         };
-        match &next.frame {
-            Ok(
-                Frame::StreamAck {
-                    stream_id: next_id, ..
-                }
-                | Frame::StreamMaxData {
-                    stream_id: next_id, ..
-                }
-                | Frame::StreamFeedbackProbe {
-                    stream_id: next_id, ..
-                }
-                | Frame::StreamFeedbackReceipt {
-                    stream_id: next_id, ..
-                },
-            ) if *next_id == stream_id => item = next,
-            _ => return Ok(Some(next)),
+        match item {
+            ReliableRelayRemoteFrame {
+                frame:
+                    Ok(
+                        next @ Frame::StreamAck {
+                            stream_id: next_id, ..
+                        },
+                    ),
+                ..
+            }
+            | ReliableRelayRemoteFrame {
+                frame:
+                    Ok(
+                        next @ Frame::StreamMaxData {
+                            stream_id: next_id, ..
+                        },
+                    ),
+                ..
+            } if next_id == stream_id => frame = next,
+            barrier => return Ok(Some(barrier)),
         }
     }
 }
@@ -3409,6 +3412,40 @@ where
                         super::client::gate_ready_feedback_test_input(stream_id, &frame, &mut remote_input).await;
                         state.progress.sender_retry_at = None;
                         match frame {
+                            Frame::StreamFeedbackProbe {
+                                stream_id: probe_stream_id, token, max_offset,
+                            } if probe_stream_id == stream_id => {
+                                let mut product = request_product.lock();
+                                // MAX ingress is deliberately coalesced outside FIFO.
+                                // Consume only that real preceding credit, not the
+                                // marker's claimed offset, before confirming service.
+                                if let Some(ReliableRelayRemoteFrame {
+                                    frame: Ok(Frame::StreamMaxData { max_offset, .. }), ..
+                                }) = remote_input.take_pending_credit() {
+                                    prepared_work_changed |= apply_client_peer_max_data(&mut product, max_offset);
+                                    state.progress.last_stream_at = Instant::now();
+                                }
+                                let applied_max = product.send_stream.peer_max_offset();
+                                #[cfg(feature = "lab-diagnostics")]
+                                crate::lab_diagnostics::lab_diagnostic("feedback_return", format_args!(
+                                    "session_id={} stream_id={} kind=owner_received output={:?} token={} required_max_offset={} applied_peer_max_offset={}",
+                                    context.session_id.0, stream_id.0, instance, token, max_offset, applied_max,
+                                ));
+                                product.remotes.observe_applied_peer_max_offset(applied_max);
+                                if let Err(error) = product.remotes.receive_feedback_probe(instance, token, max_offset) {
+                                    break Err(error);
+                                }
+                                stream_ack_capacity_wait = None;
+                            }
+                            Frame::StreamFeedbackReceipt {
+                                stream_id: receipt_stream_id, token,
+                            } if receipt_stream_id == stream_id => {
+                                // The token owns the probed local incarnation. This
+                                // receipt's reverse carrier is not proof authority.
+                                let mut product = request_product.lock();
+                                product.remotes.receive_feedback_receipt(context, token);
+                                stream_ack_capacity_wait = None;
+                            }
                             Frame::StreamRequalifyData {
                                 stream_id: received_stream_id,
                                 probe_id,
@@ -3943,8 +3980,6 @@ where
                             }
                             feedback @ Frame::StreamAck { stream_id: feedback_stream_id, .. }
                             | feedback @ Frame::StreamMaxData { stream_id: feedback_stream_id, .. }
-                            | feedback @ Frame::StreamFeedbackProbe { stream_id: feedback_stream_id, .. }
-                            | feedback @ Frame::StreamFeedbackReceipt { stream_id: feedback_stream_id, .. }
                                 if feedback_stream_id == stream_id => {
                                 // Freeze only the attempt count. Actual coalesced credit can
                                 // advance concurrently; try_recv_frame retains its own order.
@@ -3957,14 +3992,11 @@ where
                                 let mut ack_facts_changed = false;
                                 let mut claim_inputs_changed = false;
                                 let deferred = match apply_ready_client_feedback(
-                                    ReliableRelayRemoteFrame { instance, frame: Ok(feedback) },
+                                    feedback,
                                     stream_id,
                                     ready_items,
-                                    &mut remote_input,
-                                    |input| input.try_recv_frame(),
-                                    |item, input| {
-                                        let ReliableRelayRemoteFrame { instance, frame } = item;
-                                        let feedback = frame?;
+                                    || remote_input.try_recv_frame(),
+                                    |feedback| {
                                         state.progress.sender_retry_at = None;
                                         match feedback {
                                             Frame::StreamAck { scope_start, ranges, .. } => {
@@ -4003,35 +4035,7 @@ where
                                                 stream_ack_capacity_wait = None;
                                                 state.progress.last_stream_at = Instant::now();
                                             }
-                                            Frame::StreamFeedbackProbe { token, max_offset, .. } => {
-                                                // MAX ingress is deliberately coalesced outside FIFO.
-                                                // Consume only actual pending credit, never the
-                                                // marker's claimed offset, before confirming service.
-                                                if let Some(ReliableRelayRemoteFrame {
-                                                    frame: Ok(Frame::StreamMaxData { max_offset, .. }), ..
-                                                }) = input.take_pending_credit() {
-                                                    claim_inputs_changed |= apply_client_peer_max_data(
-                                                        &mut product_guard, max_offset,
-                                                    );
-                                                    state.progress.last_stream_at = Instant::now();
-                                                }
-                                                let applied_max = product_guard.send_stream.peer_max_offset();
-                                                #[cfg(feature = "lab-diagnostics")]
-                                                crate::lab_diagnostics::lab_diagnostic("feedback_return", format_args!(
-                                                    "session_id={} stream_id={} kind=owner_received output={:?} token={} required_max_offset={} applied_peer_max_offset={}",
-                                                    context.session_id.0, stream_id.0, instance, token, max_offset, applied_max,
-                                                ));
-                                                product_guard.remotes.observe_applied_peer_max_offset(applied_max);
-                                                product_guard.remotes.receive_feedback_probe(instance, token, max_offset)?;
-                                                stream_ack_capacity_wait = None;
-                                            }
-                                            Frame::StreamFeedbackReceipt { token, .. } => {
-                                                // The token owns the probed local incarnation. This
-                                                // receipt's reverse carrier is not proof authority.
-                                                product_guard.remotes.receive_feedback_receipt(context, token);
-                                                stream_ack_capacity_wait = None;
-                                            }
-                                            _ => unreachable!("the Input quantum contains only this stream's logical feedback"),
+                                            _ => unreachable!("the Input quantum contains only this stream's ACK/MAX"),
                                         }
                                         Ok(())
                                     },

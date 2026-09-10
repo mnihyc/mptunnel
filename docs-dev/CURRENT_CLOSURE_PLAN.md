@@ -1,14 +1,15 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 06:34 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 06:51 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
 ### Live decision summary
 
-- Source011b724 remains clean. Latest evidence checkpointc6e191f. The user's
-  unrelated seven-line document edit is untouched. A narrow feedback-boundary
-  correction is selected for a real-actor RED, not yet implemented or accepted.
+- Trialf8b8cac is REJECTED from active source after ordinary9690: mean flat,
+  shorter confirmation gap but a3s target plateau and late4.194Mbps forward phase.
+  Source restored exactly to011b724; four→zero work/73checks did not establish
+  net service gain. No live lab/compiler. User's seven-line edit is untouched.
 - The finite client Input correction materially improves upload, including
   QoS+QUIC outage: exact-confirmed56.280→186.629Mbps; settlement79.379→43.147s.
   However,6.382s confirmation gap remains. Trace THIS return prefix now.
@@ -35,14 +36,16 @@ Condensation waives no failure and reactivates no rejected candidate.
 
 ## Current source and proven correction
 
-Runtime checkpoint **011b724**, finite ordered ACK/MAX Input service, is retained.
-Frozen ordinary binary: ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
-target/release/mptunnel is the frozen QUIC-feedback-attachment diagnostic, NOT ordinary.
-Use the explicit ordinary path above. All observer runtime edits are reversed.
+Active runtime is restored exactly to **011b724**, finite ordered ACK/MAX Input
+service, with ordinary binary ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
+Rejected **f8b8cac** remains a tracking checkpoint; its frozen ordinary binary
+./.tmp/reflection/bin/logical-feedback-20260911/mptunnel is NOT active design.
+target/release/mptunnel still matches the rejected trial; do not use it by default.
+Use explicit binary paths. All observer and rejected-trial runtime edits are reversed.
 Only the user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md is unrelated
 dirty source; never edit/stage it. The temporary two-file ACK-admission observer
 is fully reversed; build44306 and lab80295 both CLOSED0. No runtime
-policy changes are currently implemented. The bounded candidate below is not
+other policy changes are implemented. The bounded candidate below is not
 an accepted fix or permission to change controller/queue/timing parameters.
 
 Exact failure: ordinary a16 mixed UP had7.236s write/4.145s confirmation gaps.
@@ -827,6 +830,46 @@ outage-candidate-0911, declared exact200+200/UP70DOWN30/46UP10 then recovery/
 UDPblackhole profile, management+target observation, no diagnostics. No compiler
 overlap. Root will analyse complete series before deciding healthy gate; no
 live partial aggregate is acceptance. All other agents build/lab-idle.
+
+06:51+08 ordinary9690 CLOSED0: exact1016135680B/43.076666s=188.712Mbps
+versus011186.629, complete/noerrors. Worstconfirmation6.382→3.152s andwrite
+2.637→2.216s, zero bins10→3. Firstservice essentially unchanged. BUT phase
+means0–15/15–25 drop213.737→193.112 and120.977→96.203Mbps. Own-clock target
+evidence—not merely confirmation catch-up—shows3s zero progress at518312276B
+from21.961→24.961s; replies1104B both ends, source=target+64MiB. Empty target
+loopback queues and fastQ47nativeACK+58.295MB exclude a stopped sink or all-
+carrier outage, not identify the missing byte's owner. Late37.960→39.960s
+target advances only1MiB (4.194Mbps), versus011204.111Mbps; source again at
+the exact64MiB outstanding ceiling. Native epochs stay stable.
+
+Forecast disposition: source-level redundant work is real, but its removal
+does not demonstrate a net ordinary service benefit. Whole speed improves only
+1.1%; lower maximum confirmation gap redistributes rather than closes material
+forward stalls. UP/DOWN sampled wire per confirmed byte1.68661/.02610 becomes
+1.67294/.02077, while serverpeakRSS126180→140976KiB. No sole aggregate, lower
+wire total or unit proof waives the forward deficit. One pair does not prove
+the new quantum caused it. No favourable repeat or healthy-gate promotion.
+
+REJECT the active trial, preserve exact checkpoint/binary/evidence, and restore
+all five owned runtime/RFC/model files to11e38dc's source011. Reverse applied
+with apply_patch; exact diff against11e38dc is empty for all five files. No
+new knob/controller/cadence or queue change. Root corrected a saved patch's
+trailing context lost by trimEnd; both saved RED/candidate unified patches now
+pass git apply --check. This artifact issue did not affect compiled source or
+measurements. The author's final archive will include corrected patches.
+
+Next practical question stays within the existing forward-stall owner: which
+exact assigned prefix prevents target delivery while healthy native ACKs and
+later work advance? Review existing011 events and immutable recovery/wake model
+before selecting ONE capture. Separate actual target deficit from delayed
+confirmation; native ACK is not Product ordered progress, and Q46's largeRTT
+does not identify it as the missing owner (its displayed Product flight is0).
+No new instrumentation/model correction is selected yet. Information forecast:
+an exact prefix/owner/deadline/admission chain can choose native service versus
+repair eligibility, blocked alternate, or queued logical input. Without that
+join, another feedback-boundary or congestion adjustment would repeat the
+failure of forecasting user gain from local work counts. Do not end here:
+continue this existing material stall attribution; all global gates remain.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

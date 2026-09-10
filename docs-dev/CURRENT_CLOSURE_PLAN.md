@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 13:06 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 13:34 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,51 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+13:34 +08 disposition: retain ba56290's demonstrated receipt-liveness
+correction, NOT performance acceptance or the original5sincident's cause.
+Sharedrequestsourcebudget stays charged until DataACK release; withheld valid
+receipt can block another stream at that budget and retain redundant recovery
+eligibility. Seven existing release/wake/ACK/copy checks also pass. Requestlocal
+explicitgap requalification is not globalcarrierSuspect; do not invent that
+benefit. OrdinaryDOWN390.285→399.803Mbps/bodygap.372→.342s, butmaxecho806→1046ms,
+p95612→616ms. UPgap.408→.605s remains. No favorable-repeat or compensatingtweak.
+Full164bins/155echoes/costs and23-filearchive are retained in
+TARGET_WRITE_RECEIPT_ORDINARY_20260910. No further modelchange selected here.
+
+NEXT: existing TCP-only DOWN loaded-service owner, not a new inventory. Its
+repeatable~900ms echo versus~206ms direct/~213ms native RTT and~50MB aggregate
+NOTSENT motivates a precise kernel-FIFO discriminator. AggregateQ/C≈.8s is an
+information forecast, NOT measured per-echo residence or a justified queuecap.
+Extend feature-only observation of the existing serialized TCP writer: exact
+protected bytes accepted W plus same-socket NOTSENT Q gives native initial-send
+frontier W−Q relative to the SAME writer baseline. Track a selected echo's exact
+protected interval and its first observed frontier crossing, then compare with
+client authenticated delivery/probe response. Must validate counterbaseline,
+incarnation, control/TLS/handshake writes and unknownQ; no fallbacks tozero,
+raw payload capture or per-bulk-frame log. Reuse existing native observation
+turns and bounded one-in-flight diagnostic sample percarrier; no new timer,
+queue limit, nativecontroller or scheduling intervention.
+
+One feature capture on currentba56290 TCP-only healthyDOWN40s, existingsame
+500/500/30–70/noimpairment bulk+echo, will decide whether large nativeunsent
+residence actually contains the materialecho interval. Promptfrontiercrossing
+withlateclientreceipt falsifies that stage; latecrossing supports the native
+handoff owner but still does not choose aLOWATvalue. Too-smallnativequeue can
+starvewake/refill service/highBDP and consumeCPU, so no numericpolicy without
+that model and ordinaryproof. Featurecapture is causalnotbenchmarkevidence.
+Original5sUPhold, fixed-roundoutagetradeoff and globalgates remainopen.
+
+13:22 +08 pending-receipt UPpair complete: exactcontrol2,070,937,600B in
+40.750652s406.558Mbps versuscandidate2,192,441,344B in42.042557s417.185Mbps.
+Firstconfirmation.410337/.411884s essentiallysame; worstgap.408449→.605196s
+adverse, localwritegap.533130→.515499s. Moreacceptedbytes and+2.6%mean cannot
+erase worseconfirmationtail/longersettlement. No promotion. Complete the already
+declared DOWNpair for affectedclassification before disposition, not a new
+intervention or repeat to waiveUPtail. Currentruntimecandidateba56290 remains
+isolated; original5sincident stillunattributed. Ordinarybuild64s emitted the
+pre-existing test-only-wrapper dead_code warning inrelay/io.rs, not a new
+platform/model regression. No runtimechange followed the measurements.
 
 13:17 +08 bounded receipt correction passes all93server checks, including
 the actualfirst+establishedreceipt test with fullACKqueue/capacity-onlywake,

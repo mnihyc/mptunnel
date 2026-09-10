@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 20:02 +08:00. Authoritative repository: `./`.
+Updated: 2026-09-10 20:57 +08:00. Authoritative repository: `./`.
 **MPP is not performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; do not conclude at an intermediary commit.
 
@@ -11,6 +11,41 @@ growing inventory. Complete preceding chronology and adverse outcomes remain at
 linked reports/archives. Condensation discards no experiment.
 
 ## Active transaction: attribute remaining request-pilot service failure
+
+### Current decision: split the proven local reply residence
+
+Boundary34271 closed exactly489,160,704B/47.360233s, but retains5.239s
+confirmation and4.760s write gaps; this is diagnostic, not promotion.
+Winning Original[187,200) on healthyQUIC1 is written at1789042512804,
+decoded/enqueued2512892 and applied2515564:88ms before decode and2,672ms
+after enqueue inside a2,823ms frontier gap. Some OTHER first winners instead
+wait materially before decode. The longest gap is won by a separate QUIC
+repair channel that bypasses the ordinary reader/writer hooks. Full join and
+coverage limits are in AUTHORITATIVE_GAP_VIEW_ORDINARY_20260910.md.
+
+Issue/impact: seconds of delayed ordered replies while other work progresses,
+with severe healthy/restored upload regression in the unaccepted pilot.
+Competing causes: carrier-loop input starvation, attachment backpressure,
+merged input FIFO/relay service, and pre-apply synchronous Product work.
+Exact question: which of these owns the measured post-enqueue interval?
+Information forecast: selected-reply carrier route, attachment receive/send,
+and Product dequeue/pre-apply stamps split that interval without logging bulk
+upload DATA/ACKs. Repair decode/route stamps explicitly cover its distinct
+path. Existing capture cannot distinguish these owners; another controller or
+query-cost change would be unsupported. No promised Mbps gain from observing.
+Falsifier: early carrier routing with late downstream service rejects carrier
+priority starvation for that frame; early downstream delivery rejects a local
+cause for a different predecode hold. Late routing alone still requires
+distinguishing command service from a prior barrier/mailbox wait.
+Smallest action: temporary feature-only extension of the existing observer,
+same source/profile/frozen-executable procedure; no runtime policy change.
+Acceptance/stop: exact same-process extent/incarnation joins and first-winning
+gap attribution select ONE correction with a real producer counterexample.
+No attribution means no fairness implementation. All ordinary timing/cost
+gates, existing half-close/partial-write/FIFO authority, and global scope stay.
+Actual-versus-forecast: pending; previous observer proved local residence, but
+did not select an actor. Its repair-route omission is recorded, not filled with
+invented timestamps. No public update or release follows a diagnostic.
 
 **Ordinary request pilot79ddb41 failed. Work RED79277 is confirmed.**
 Actual evaluator takes5,290 sweep visits versus2,442 after blocked-capacity and

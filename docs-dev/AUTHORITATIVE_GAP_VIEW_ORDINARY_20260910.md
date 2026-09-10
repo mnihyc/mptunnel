@@ -519,3 +519,148 @@ earlier stage profile remain separate. The useful next boundary is exact
 post-acceptance native write/read/owner service for the held reply, alongside
 the independently identified request receipt/eligibility question—not another
 timer or copy-budget adjustment. No performance promotion follows this capture.
+
+## Separate boundary capture: material local reply delay, not one universal cause
+
+The next diagnostic uses ordinary `a747bda` plus the frozen eight-file
+`./.tmp/reflection/authoritative-gap-view-boundary-0910.patch`. Its feature build
+completed in92s; the complete temporary overlay was reversed before traffic.
+The frozen `authoritative-gap-view-boundary-20260910` executable, not a modified
+ordinary control, produced
+`./.tmp/reflection/results/aggregate-combined-up-authoritative-gap-view-boundary-0910/`.
+The [boundary raw archive](AUTHORITATIVE_GAP_VIEW_BOUNDARY_20260910.raw.tar.gz)
+contains10regular files: five results, build/driver logs, the eight-source-file
+overlay patch, and unchanged `run.py`/`shape.sh`. Its308,147B gzip passes integrity,
+tar comparison and every member's byte comparison; no binary or credentials are
+included. The two driver files also match their previous event-capture archive.
+No PERF or bulk upload-frame logging was enabled. The information question was
+whether an already committed reply waits before native submission, during the
+write future, before decoding, or after the decoded frame enters the reader
+queue. This observation changes no scheduler, deadline or recovery policy.
+
+### Own complete outcome and accounting
+
+Runner34271 exits0 after48.006s. The probe exactly confirms all489,160,704B
+locally accepted in47.360233s (82.628Mbps), one complete stream, no probe errors.
+First write/confirmation is.105386/.410646s; maximum write/confirmation gap is
+4.759941/5.239099s. This remains poor practical service, not a performance gain
+over another diagnostic. There are48raw confirmation bins, including16zeros;
+the probe's separately trimmed vector is not a wall-clock series. Raw means
+for5–15,16–24inclusive,25–40 and40–48 are74.031,11.926,119.106 and103.299Mbps.
+The final partial bin is not rescaled. This upload has no echo workload.
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 9.259,116.682,61.105,0,173.776,86.463,0,0,92.088,0
+10: 149.180,115.248,14.872,48.707,233.753,91.837,38.222,25.890,3.582,8.189
+20: 2.333,4.770,21.156,3.190,0,0,0,0,244.134,536.871
+30: 0,380.589,196.844,0,2.834,0,0,401.200,24.117,0
+40: 0,25.594,0,0,46.233,391.255,237.136,126.177
+```
+
+Session8196219730563367013/stream0 is stable in all48management rows.
+142Original extents partition[0,1959) without gaps/overlaps. There are252accepted
+repairs/3490B:237tail,13stale-path, one persistent-gap and one completion-tail
+operation. All392received extents have exactly one preceding acceptance with
+the same extent and mapped carrier:1959unique/3462duplicate B. Two accepted
+14B copies have no receipt by closure, not proof of loss. One uses a newly
+attached TCP4/incarnation5; reply membership is therefore not claimed constant.
+First receipts are1015B from74QUIC Originals,139B from10TCP Originals,791B from
+57QUIC copies and14B from one TCP copy. Five of those QUIC Original first
+receipts buffer behind an older hole; the other69 advance the frontier.
+
+Cross-role output mapping is established by unique extents, not equal integers:
+server TCP3/physical4/incarnation1 maps to client TCP0/physical3/attachment0;
+TCP2/physical5/incarnation2 maps to TCP1/physical5/attachment1. Server
+QUIC0/physical1/incarnation4 maps to client QUIC0/physical1/attachment2;
+QUIC1/physical8/incarnation3 maps to QUIC1/physical8/attachment3. QUIC1 is
+healthy physical47, while only46UP is temporarily restricted.
+
+### Exact stage evidence and the coverage boundary
+
+All128ordinary-channel QUIC Originals join uniquely through acceptance,
+write-begin, successful write-end, decoded frame, successful reader enqueue and
+Product receipt. All writes use the interlocked route; none reports an error.
+The write-end is successful completion of the existing batch write helper,
+not a physical transmission timestamp. The decoder event follows frame decoding;
+reader-queue follows successful channel send. Its downstream interval includes
+carrier-actor routing, Product-owner service and scheduling, not an identified
+single lock or actor. Role-local `t_mono_ms` origins are never subtracted.
+
+| Stage, ms | First-winning QUIC Originals n74: minimum / median / p95 / maximum |
+|---|---|
+| Acceptance → write-begin | 0 /0 /1 /2 |
+| Write-begin → write-end | 0 /0 /1 /2 |
+| Write-end → decoded | 30 /889 /3846 /4489 |
+| Decoded → reader-queue | 0 /0 /8 /11 |
+| Reader-queue → Product receipt | 0 /505 /1854 /4391 |
+
+These are per-frame first-winner observations, not independent samples of all
+user gaps or unbiased native latency. Percentiles select the sorted index
+`round((n-1)*rank)`. The predecode interval includes native transport AND client
+reader scheduling/decoding; it is not exclusively network delay.
+
+The decisive local example is[187,200) on QUIC1. Unix timestamps below are
+milliseconds after1789042500000; sequences are local to their logged role.
+
+| Time / sequence | Actual event |
+|---|---|
+| 12741 /client58 | Prior receipt advances frontier to187 |
+| 12804 /server102,103,104 | Original accepted; write-begin and successful write-end |
+| 12892 /client59,60 | Decoded and successfully enqueued to ordinary reader channel |
+| 15564 /client69 | Same Original advances frontier187→200 |
+
+The2,823ms advancing gap contains2,672ms AFTER successful reader enqueue,
+versus88ms from write-end to decode. Thus a material local downstream service
+delay is directly measured; a server Pending write or late native arrival
+cannot explain this particular2,672ms interval. The trace does not distinguish
+carrier-actor service from Product-actor service, or prove a proposed fairness
+rule removes all of it. The same distinction applies to[213,226) on QUIC0:
+accept/write-begin13481, write-end13483, decode/enqueue13515, Product17906.
+Its4391ms local residence overlaps earlier prefix delays; only1687ms follows
+the preceding frontier advance. These residences cannot be added as a gain.
+
+Conversely, first-winning[448,462) has4489ms write-end→decode and only155ms
+enqueue→Product. The longest observed ordinary Original residence is9986ms
+for[1554,1568) on QUIC0, but that arrival is a losing duplicate. It is not the
+critical user delay. A local-only explanation for every reply is falsified.
+
+The absolute longest advancing gap,5,239ms, remains differently scoped:
+frontier1218 at1789042530791 advances to1232 at1789042536030. TCP2Original is
+accepted32478; the winning QUIC1copy is accepted32758 (Unix suffix within
+1789042500000), giving3272ms accepted-copy→receipt. TCP3copy and QUIC0copy
+are accepted33798/35358 and arrive later. There is NO write/decode/reader-queue
+event for that winning repair. Source `quic/repair.rs` writes and reads its
+separate native repair stream directly, bypassing the instrumented ordinary
+writer and `spawn_quic_path_reader`. Its successful route feeds the shared
+Product input. Do not assign this5.239s gap to any unobserved boundary or infer
+that the repair traversed the same ordinary-channel wait.
+
+### Matched physical scope, costs and bounded disposition
+
+All48rows verify two200Mbps links, only46UP10Mbps during15–25s,30/70ms delays,
+zero configured loss/jitter/blackhole, burst/cburst65536B and netem limit8192.
+First restriction/restoration reports are15.002060/25.003329s. Every class and
+netem drop counter stays0. Whole sampled accounting spans47.005804s, not the
+probe's complete settlement window. UP46/47 class deltas are469,424,872/
+533,166,725B; DOWN46/47 are6,009,269/5,992,313B. Summed UP/DOWN backlog maxima
+are26,255,619/30,746B. Client RSS peak/final is347,620/328,440KiB with lifetime
+CPU121/120%; server138,544/138,544KiB with52.7/36.3%. These are not stage CPU
+or post-teardown retention measurements.
+
+During the exact local[187,200) hold, management samples at1789042513231–
+1789042515231 show server target writes71,353,132→104,683,234B and fresh
+QUIC1ACK-counter progress131,156→250,208B. Client local reply writes remain
+187B at the corresponding three samples. This corroborates continuing other
+work while the decoded reply waits, without identifying the responsible actor.
+Server displayed RTT/flight here is `local_sender` projection; independently
+advancing native counters must not turn those projections into fresh native
+latency measurements. Queue snapshots do not supersede the exact decode event.
+
+Logs contain2045lines/656,048B. The two server H3_NO_ERROR warnings occur during
+client shutdown; probe stderr is empty and exact completion succeeds. Nine
+request-stale transitions and one late response-stale transition are recorded,
+not a new independent defect inventory. The practical decision is to investigate
+the now-proven local post-enqueue service premise with a real caller control,
+while preserving predecode delay and uninstrumented repair-route uncertainty.
+This diagnostic neither promotes the request pilot nor justifies timer tuning.

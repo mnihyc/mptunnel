@@ -3380,6 +3380,11 @@ where
                                     state.progress.last_stream_at = Instant::now();
                                 }
                                 let applied_max = product.send_stream.peer_max_offset();
+                                #[cfg(feature = "lab-diagnostics")]
+                                crate::lab_diagnostics::lab_diagnostic("feedback_return", format_args!(
+                                    "session_id={} stream_id={} kind=owner_received output={:?} token={} required_max_offset={} applied_peer_max_offset={}",
+                                    context.session_id.0, stream_id.0, instance, token, max_offset, applied_max,
+                                ));
                                 product.remotes.observe_applied_peer_max_offset(applied_max);
                                 if let Err(error) = product.remotes.receive_feedback_probe(instance, token, max_offset) {
                                     break Err(error);

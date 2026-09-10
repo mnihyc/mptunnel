@@ -15,6 +15,18 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ### Selected next model gate — confirmed return service with baseline fallback
 
+11:28 +08 observer review: exact session/stream/directional-token transitions
+are feature-only and independently reviewed as policy-neutral. One release
+feature build is running; ordinary executables remain frozen. A symbolic
+discriminator is now explicit: with steady proof round-trip D, native interval
+P, and newer feedback after epsilon, receipt1 arrives at t+D but only then
+starts receipt2's probe with inherited deadline t+epsilon+P. If
+D<P<=2D-epsilon, selection can expire despite two timely individual exchanges.
+This follows the current model; it is not a measured Product defect yet.
+The capture must show whether this serialized-successor condition, delayed
+admission/owner/reply service, or neither dominates the real UP/DOWN behavior.
+Do not lengthen P or rewrite the contract from the symbolic case alone.
+
 11:10 +08 upload outcome: both complete exactly,398.184→385.961Mbps;
 target-confirmed/local-accepted2071920640→2011234304B in41.627353→41.687789s.
 Maximum confirmation/write gaps.664826/.484657→.496251/.348209s improve.

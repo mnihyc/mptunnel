@@ -286,6 +286,18 @@ fn service_feedback(
                 .record_probe_admission(identity, token);
         }
         if attachment.receipt_admitted.is_some() {
+            #[cfg(feature = "lab-diagnostics")]
+            super::super::feedback_route::lab_feedback_return(
+                outputs.feedback_route.diagnostic_scope(),
+                "reply_admitted",
+                format_args!(
+                    "output={:?} token={:?} required_max_offset={:?} applied_peer_max_offset={}",
+                    identity,
+                    attachment.receipt_admitted,
+                    entry.pending_feedback_receipt.map(|(_, required)| required),
+                    outputs.applied_peer_max_offset,
+                ),
+            );
             entry.pending_feedback_receipt = None;
         }
         if let Some(offset) = attachment.feedback.max_data.published_offset {
@@ -444,6 +456,10 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         outputs.feedback.ack_generation = generation;
         outputs.feedback.cumulative_ack_frames = cumulative_frames;
+        #[cfg(feature = "lab-diagnostics")]
+        outputs
+            .feedback_route
+            .set_diagnostic_scope(self.session_id, stream_id);
         service_feedback(&mut outputs, stream_id, Some(update_frames))
     }
 
@@ -455,6 +471,10 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        #[cfg(feature = "lab-diagnostics")]
+        outputs
+            .feedback_route
+            .set_diagnostic_scope(self.session_id, stream_id);
         service_feedback(&mut outputs, stream_id, None)
     }
 
@@ -499,6 +519,8 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        #[cfg(feature = "lab-diagnostics")]
+        let diagnostic_scope = outputs.feedback_route.diagnostic_scope();
         if let Some(entry) = outputs.entries.iter_mut().find(|entry| {
             feedback_output_identity(entry) == output
                 && !entry.commands.control_frame_admission_is_closed()
@@ -507,6 +529,15 @@ impl ResponseStreamBinding {
                 .pending_feedback_receipt
                 .is_none_or(|(previous, _)| token >= previous)
             {
+                #[cfg(feature = "lab-diagnostics")]
+                super::super::feedback_route::lab_feedback_return(
+                    diagnostic_scope,
+                    "reply_bound",
+                    format_args!(
+                        "output={:?} token={} required_max_offset={}",
+                        output, token, required_max_offset,
+                    ),
+                );
                 entry.pending_feedback_receipt = Some((token, required_max_offset));
             }
         }
@@ -523,6 +554,10 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         outputs.applied_peer_max_offset =
             outputs.applied_peer_max_offset.max(applied_peer_max_offset);
+        #[cfg(feature = "lab-diagnostics")]
+        outputs
+            .feedback_route
+            .set_diagnostic_scope(self.session_id, stream_id);
         service_feedback(&mut outputs, stream_id, None)
     }
 
@@ -535,6 +570,10 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        #[cfg(feature = "lab-diagnostics")]
+        outputs
+            .feedback_route
+            .set_diagnostic_scope(self.session_id, stream_id);
         let now = Instant::now();
         prepare_feedback_route(&mut outputs, now);
         outputs.feedback_route.receive_receipt(token, now);
@@ -619,6 +658,10 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         outputs.feedback.max_data_offset = outputs.feedback.max_data_offset.max(max_offset);
+        #[cfg(feature = "lab-diagnostics")]
+        outputs
+            .feedback_route
+            .set_diagnostic_scope(self.session_id, stream_id);
         service_feedback(&mut outputs, stream_id, None)
     }
 
@@ -630,6 +673,10 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        #[cfg(feature = "lab-diagnostics")]
+        outputs
+            .feedback_route
+            .set_diagnostic_scope(self.session_id, stream_id);
         service_feedback(&mut outputs, stream_id, None)
     }
 

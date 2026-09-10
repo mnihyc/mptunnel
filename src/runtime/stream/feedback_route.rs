@@ -3,6 +3,32 @@
 use super::feedback::StreamFeedbackState;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "lab-diagnostics")]
+pub(in crate::runtime) fn lab_feedback_return(
+    scope: Option<(crate::protocol::SessionId, crate::protocol::StreamId)>,
+    kind: &str,
+    fields: std::fmt::Arguments<'_>,
+) {
+    if let Some((session_id, stream_id)) = scope {
+        crate::lab_diagnostics::lab_diagnostic(
+            "feedback_return",
+            format_args!(
+                "session_id={} stream_id={} kind={} {}",
+                session_id.0, stream_id.0, kind, fields
+            ),
+        );
+    }
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn deadline_from_observation_us(deadline: Instant, observed_at: Instant) -> i128 {
+    if deadline >= observed_at {
+        deadline.duration_since(observed_at).as_micros() as i128
+    } else {
+        -(observed_at.duration_since(deadline).as_micros() as i128)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FeedbackCut {
     ack_generation: u64,
@@ -52,6 +78,8 @@ pub(in crate::runtime) struct StreamFeedbackRoute<I> {
     latest: FeedbackCut,
     last_attempted: Option<FeedbackCut>,
     terminal: bool,
+    #[cfg(feature = "lab-diagnostics")]
+    diagnostic_scope: Option<(crate::protocol::SessionId, crate::protocol::StreamId)>,
 }
 
 impl<I> Default for StreamFeedbackRoute<I> {
@@ -63,11 +91,29 @@ impl<I> Default for StreamFeedbackRoute<I> {
             latest: FeedbackCut::default(),
             last_attempted: None,
             terminal: false,
+            #[cfg(feature = "lab-diagnostics")]
+            diagnostic_scope: None,
         }
     }
 }
 
-impl<I: Copy + Eq> StreamFeedbackRoute<I> {
+impl<I: Copy + Eq + std::fmt::Debug> StreamFeedbackRoute<I> {
+    #[cfg(feature = "lab-diagnostics")]
+    pub(in crate::runtime) fn set_diagnostic_scope(
+        &mut self,
+        session_id: crate::protocol::SessionId,
+        stream_id: crate::protocol::StreamId,
+    ) {
+        self.diagnostic_scope = Some((session_id, stream_id));
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    pub(in crate::runtime) fn diagnostic_scope(
+        &self,
+    ) -> Option<(crate::protocol::SessionId, crate::protocol::StreamId)> {
+        self.diagnostic_scope
+    }
+
     /// Called before publication/receipt processing, with current membership.
     /// Native intervals are evaluated only when a deadline is first created.
     pub(in crate::runtime) fn prepare<F>(
@@ -81,6 +127,21 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
     {
         self.latest = state.into();
         if self.terminal || live.len() < 2 || state.ack_generation <= 1 {
+            #[cfg(feature = "lab-diagnostics")]
+            if self.selected.is_some() || !self.attempts.is_empty() {
+                lab_feedback_return(
+                    self.diagnostic_scope,
+                    "ineligible",
+                    format_args!(
+                        "selected={:?} attempts={} live={} generation={} terminal={}",
+                        self.selected,
+                        self.attempts.len(),
+                        live.len(),
+                        state.ack_generation,
+                        self.terminal,
+                    ),
+                );
+            }
             self.selected = None;
             self.attempts.clear();
             self.last_attempted = None;
@@ -90,6 +151,16 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
             .selected
             .is_some_and(|selected| !live.contains(&selected))
         {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_feedback_return(
+                self.diagnostic_scope,
+                "membership_lost",
+                format_args!(
+                    "selected={:?} attempts={}",
+                    self.selected,
+                    self.attempts.len(),
+                ),
+            );
             self.selected = None;
             self.attempts.clear();
             self.last_attempted = None;
@@ -106,9 +177,31 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
             if cut != self.latest && attempt.successor_deadline.is_none() {
                 attempt.successor_deadline = now.checked_add(interval(attempt.output));
                 finite_successor &= attempt.successor_deadline.is_some();
+                #[cfg(feature = "lab-diagnostics")]
+                lab_feedback_return(
+                    self.diagnostic_scope,
+                    "successor_anchor",
+                    format_args!(
+                        "output={:?} token={} generation={} max_offset={} deadline_from_observation_us={:?} observation_age_us={}",
+                        attempt.output,
+                        attempt.probe.token,
+                        self.latest.ack_generation,
+                        self.latest.max_offset,
+                        attempt
+                            .successor_deadline
+                            .map(|deadline| deadline_from_observation_us(deadline, now)),
+                        now.elapsed().as_micros(),
+                    ),
+                );
             }
         }
         if !finite_successor {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_feedback_return(
+                self.diagnostic_scope,
+                "nonfinite_deadline",
+                format_args!("selected={:?}", self.selected),
+            );
             self.selected = None;
             self.attempts.clear();
             self.last_attempted = Some(self.latest);
@@ -123,6 +216,12 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
                 continue;
             }
             let Some(deadline) = now.checked_add(interval(output)) else {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_feedback_return(
+                    self.diagnostic_scope,
+                    "nonfinite_deadline",
+                    format_args!("selected={:?} output={:?}", self.selected, output),
+                );
                 // No finite validation interval: keep ordinary full fanout.
                 self.selected = None;
                 self.attempts.clear();
@@ -136,12 +235,36 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
 
     fn start_attempt(&mut self, output: I, cut: FeedbackCut, deadline: Instant) -> bool {
         let Some(token) = self.next_token else {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_feedback_return(
+                self.diagnostic_scope,
+                "token_exhausted",
+                format_args!("selected={:?}", self.selected),
+            );
             // Tokens never wrap into a still-delayed receipt's identity.
             self.selected = None;
             self.attempts.clear();
             return false;
         };
         self.next_token = token.checked_add(1);
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            let observed_at = Instant::now();
+            lab_feedback_return(
+                self.diagnostic_scope,
+                "probe_created",
+                format_args!(
+                    "output={:?} token={} generation={} max_offset={} selected={:?} deadline_from_observation_us={} observation_age_us={}",
+                    output,
+                    token,
+                    cut.ack_generation,
+                    cut.max_offset,
+                    self.selected,
+                    deadline_from_observation_us(deadline, observed_at),
+                    observed_at.elapsed().as_micros(),
+                ),
+            );
+        }
         self.attempts.push(Attempt {
             output,
             probe: StreamFeedbackProbe {
@@ -157,6 +280,26 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
     }
 
     fn expire(&mut self, now: Instant) {
+        #[cfg(feature = "lab-diagnostics")]
+        for attempt in self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.next_deadline() <= now)
+        {
+            lab_feedback_return(
+                self.diagnostic_scope,
+                "expired",
+                format_args!(
+                    "output={:?} token={} admitted={} selected={:?} deadline_from_observation_us={} observation_age_us={}",
+                    attempt.output,
+                    attempt.probe.token,
+                    attempt.admitted,
+                    self.selected,
+                    deadline_from_observation_us(attempt.next_deadline(), now),
+                    now.elapsed().as_micros(),
+                ),
+            );
+        }
         if self.selected.is_some()
             && self
                 .attempts
@@ -185,6 +328,17 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
             .iter_mut()
             .find(|attempt| attempt.output == output && attempt.probe.token == token)
         {
+            #[cfg(feature = "lab-diagnostics")]
+            if !attempt.admitted {
+                lab_feedback_return(
+                    self.diagnostic_scope,
+                    "probe_admitted",
+                    format_args!(
+                        "output={:?} token={} generation={} max_offset={}",
+                        output, token, attempt.probe.ack_generation, attempt.probe.max_offset,
+                    ),
+                );
+            }
             attempt.admitted = true;
         }
     }
@@ -198,6 +352,12 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
             .iter()
             .position(|attempt| attempt.probe.token == token && attempt.admitted)
         else {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_feedback_return(
+                self.diagnostic_scope,
+                "ignored_receipt",
+                format_args!("token={} selected={:?}", token, self.selected),
+            );
             return false;
         };
         let attempt = self.attempts.remove(index);
@@ -206,10 +366,33 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
             .successor_deadline
             .is_some_and(|deadline| deadline <= now)
         {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_feedback_return(
+                self.diagnostic_scope,
+                "ignored_receipt",
+                format_args!("token={} reason=successor_expired", token),
+            );
             self.selected = None;
             self.last_attempted = None;
             return false;
         }
+        #[cfg(feature = "lab-diagnostics")]
+        lab_feedback_return(
+            self.diagnostic_scope,
+            "selected",
+            format_args!(
+                "output={:?} token={} previous={:?} generation={} max_offset={} successor_from_observation_us={:?} observation_age_us={}",
+                attempt.output,
+                token,
+                self.selected,
+                attempt.probe.ack_generation,
+                attempt.probe.max_offset,
+                attempt
+                    .successor_deadline
+                    .map(|deadline| deadline_from_observation_us(deadline, now)),
+                now.elapsed().as_micros(),
+            ),
+        );
         self.selected = Some(attempt.output);
         if let Some(deadline) = attempt.successor_deadline {
             self.last_attempted = Some(self.latest);
@@ -229,6 +412,12 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
     }
 
     pub(in crate::runtime) fn forget_output(&mut self, output: I) {
+        #[cfg(feature = "lab-diagnostics")]
+        lab_feedback_return(
+            self.diagnostic_scope,
+            "detach",
+            format_args!("output={:?} selected={:?}", output, self.selected),
+        );
         if self.selected == Some(output) {
             self.selected = None;
             self.attempts.clear();
@@ -239,6 +428,18 @@ impl<I: Copy + Eq> StreamFeedbackRoute<I> {
     }
 
     pub(in crate::runtime) fn finish(&mut self) {
+        #[cfg(feature = "lab-diagnostics")]
+        if !self.terminal {
+            lab_feedback_return(
+                self.diagnostic_scope,
+                "terminal",
+                format_args!(
+                    "selected={:?} attempts={}",
+                    self.selected,
+                    self.attempts.len()
+                ),
+            );
+        }
         self.terminal = true;
         self.selected = None;
         self.attempts.clear();

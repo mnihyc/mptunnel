@@ -1361,6 +1361,9 @@ impl ReliableRelayRemoteSet {
         &mut self,
         context: &ClientPathContext,
     ) -> bool {
+        #[cfg(feature = "lab-diagnostics")]
+        self.feedback_route
+            .set_diagnostic_scope(context.session_id, self.stream_id);
         let previous = self.feedback_route.next_deadline();
         let live: SmallVec<[RelayPathInstance; 4]> = self
             .paths
@@ -1404,7 +1407,21 @@ impl ReliableRelayRemoteSet {
         if path.stream.request_control_frame_admission_is_closed() {
             return Ok(());
         }
-        path.feedback_receipt.observe(token, required_max_offset)
+        #[cfg(feature = "lab-diagnostics")]
+        let previous = path.feedback_receipt.latest;
+        let result = path.feedback_receipt.observe(token, required_max_offset);
+        #[cfg(feature = "lab-diagnostics")]
+        if result.is_ok() && path.feedback_receipt.latest != previous {
+            super::super::feedback_route::lab_feedback_return(
+                self.feedback_route.diagnostic_scope(),
+                "reply_bound",
+                format_args!(
+                    "output={:?} token={} required_max_offset={} applied_peer_max_offset={}",
+                    instance, token, required_max_offset, self.applied_peer_max_offset,
+                ),
+            );
+        }
+        result
     }
 
     pub(in crate::runtime) fn receive_feedback_receipt(
@@ -1480,6 +1497,18 @@ impl ReliableRelayRemoteSet {
                 self.feedback_route.record_probe_admission(instance, token);
             }
             if let Some(token) = attachment.receipt_admitted {
+                #[cfg(feature = "lab-diagnostics")]
+                super::super::feedback_route::lab_feedback_return(
+                    self.feedback_route.diagnostic_scope(),
+                    "reply_admitted",
+                    format_args!(
+                        "output={:?} token={} required_max_offset={:?} applied_peer_max_offset={}",
+                        instance,
+                        token,
+                        path.feedback_receipt.latest.map(|(_, required)| required),
+                        self.applied_peer_max_offset,
+                    ),
+                );
                 path.feedback_receipt.admitted(token);
             }
             publication.merge(attachment.feedback);

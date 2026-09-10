@@ -3708,11 +3708,17 @@ where
                     };
                     send_buffer_reservation.release(released_bytes);
                 }
-                Frame::StreamFeedbackProbe { stream_id: probe_stream_id, .. }
+                Frame::StreamFeedbackProbe { stream_id: probe_stream_id, token, max_offset }
                     if probe_stream_id == stream_id => {
                     // The handle retained the exact reply tuple only after
                     // dequeuing this boundary behind its preceding ACK/MAX.
                     let peer_max_offset = response_product.lock().send_stream.peer_max_offset();
+                    #[cfg(feature = "lab-diagnostics")]
+                    crate::lab_diagnostics::lab_diagnostic("feedback_return", format_args!(
+                        "session_id={} stream_id={} kind=owner_received token={} required_max_offset={} applied_peer_max_offset={}", session_id.0, stream_id.0, token, max_offset, peer_max_offset,
+                    ));
+                    #[cfg(not(feature = "lab-diagnostics"))]
+                    let _ = (token, max_offset);
                     request_ack_publication.record_feedback(
                         path_stream.service_feedback_route(peer_max_offset), &mut recv_stream,
                     );

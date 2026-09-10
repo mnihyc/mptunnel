@@ -225,3 +225,26 @@ RAM/CPU report, justify a native or MPP policy change, or establish acceptable
 performance under loss. Any next correction needs the exact responsible
 state/decision and its own falsifier, not a throughput-only or CPU-threshold
 adjustment.
+
+### Current-callsite audit, 2026-09-11
+
+The old all-transactions-empty collection rule introduced by61c2059 is not
+present in the active controller path. Its concrete rolling-overlap test
+retained8192records with only three live transactions.6636091 replaced it
+with finalized-prefix folding/resource authority;42d1b86 delivered terminal
+proof to both active and parked rollback owners;7677fd9 made exact pending
+packet proof, rather than transaction lifetime, the classification owner.
+
+Current loss insertion, round advance, ACK/expiry batch terminals and episode/
+CE transitions reach the prefix compactor. It uses the earliest open, current
+batch or late-ACK-pending record, folds finalized chronological prefixes and
+reclaims unreferenced consumed storage. The MPP wrapper forwards native packet
+terminal callbacks, and Cargo selects the local corrected Quinn fork.20%loss
+does not select a legacy collector branch. Checked journal exhaustion falls
+back to RawOnly, not repeated growth beyond that journal authority.
+
+This excludes the known bypass, not a new CPU incident. A legitimately mutable
+suffix can still require proportional scanning/replay and deep snapshot clones;
+the64MiB default bounds journal allocation, not callback CPU or total RSS. No
+current stack/interval capture links the user's random burst to those costs.
+The audit changed no code and claims no new runtime or performance verification.

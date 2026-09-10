@@ -12,7 +12,9 @@ does not waive any failure or reactivate any rejected candidate.
 
 ## Active transaction: current late-stall owner and inner work
 
-Ordinary HEAD is a16b404. No runtime correction or lab is currently active.
+Runtime is a16b404 (docs checkpoint6239ba6). Diagnostic build28234 completed0
+in3m36s. Its exact seven-file overlay was frozen and FULLY REVERSED before
+traffic;90510 is now running the unchanged cell. Ordinary source is clean.
 Diagnostic61411 completed; its three-file classifier was fully reversed.
 Its result changes the next decision: **do not implement a queue-readiness filter**.
 
@@ -86,6 +88,53 @@ Artifacts will use ./.tmp/reflection/late-owner-profile-0911.patch,
 bin/late-owner-profile-20260911/mptunnel, bin/late-owner-profile and
 results/aggregate-combined-up-late-owner-profile-0911/.
 Root alone builds/runs; reader analyzes after explicit closed-run handoff.
+
+### Actual90510 outcome and next bounded work correction
+
+90510closed0:459276288B/50.410371s,72.886Mbps; maximum confirmation4.711260s,
+write9.271768s. In its OWN restored29→35band, full-flush5.024s has4.960852s
+actor hold,4.394542s preselect (4.355900s gap) and only.035209s dispatch.
+All-caller owner/target model takes3.179285s/435745calls; this overlaps ACK
+guard.447779s and must not be called wholly preselect. Stable-absent queries
+take only.046474s there. Different later/cut bands remain direct-dispatch
+dominated. Thus queued-retry suppression and stale-owner pruning are not the
+selected practical correction. Full evidence appendix/archive is being saved.
+
+General assignment-boundary skipping is rejected: identical owner/avoid sets
+can have inverted retained assignment deadlines; queue readiness can change
+between regions. Moving gap work into selected Dispatch needs its own pending
+service owner and retained model/capacity/deadline wakes; the current structural
+dirty contract does not cover them. Do not implement an incomplete gate or
+reopen the rejected full-observation cache.
+
+Selected next experiment: remove unused GLOBAL Original-admission projection
+inside the existing per-region repair observation, without changing its fresh
+attached evidence. dc4853d correctly paired owner and alternate in one coherent
+observation, but reused9c5a125's full admission capture. The lower gap model
+never reads global_bulk_candidates or latency_pressure. Full configured-vector
+construction, global scoring/sorting/ordinal projection are pure unused work.
+The existing include_bulk_admission=false is NOT equivalent: it suppresses
+measured/proof flags and would erase valid targets. Preserve identical health
+maintenance (including eligibility publications), exact native capture, attached
+measured/fresh proof fields, Product qualification and every final queue/Apply
+check. Give recovery an explicit internal observation scope, not a user knob.
+
+Benefit forecast: this removes part of435745actual heavy model evaluations in
+the5.024s stalled band, including work under shared health ownership.3.179s is
+an upper bound for ALL lower-model elapsed there, not removable/exclusive time;
+the unused projection fraction is unknown and no Mbps gain is promised. It
+may be too small or expose another owner. This is the smallest semantically
+equivalent hot-path work trial before an independently justified actor-service
+redesign, not an acceptance milestone or required theoretical cleanup.
+
+Prove actual recovery producer keeps the same owner/target snapshots, fresh
+measured evidence, Regular/Backup and unavailable-native outcomes while it
+does not construct global candidates; retain ordinary/global-admission controls.
+Independent diff review and focused tests precede ONE ordinary same-cell run
+against the existing a16 comparator. Preserve complete timing/costs/adverse
+phases. No material benefit or a new practical regression stops promotion and
+returns to attribution; no knob/profile tuning or untested second candidate.
+No RFC semantic change is warranted by deletion of an unused pure projection.
 
 ## Just-completed correction: exact subsumed ACK invalidation
 

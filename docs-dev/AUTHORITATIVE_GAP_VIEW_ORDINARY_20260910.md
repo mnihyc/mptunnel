@@ -2268,3 +2268,154 @@ results do not replace the ordinary ACK-correction capture. Information outcome:
 the refusal branch is identified, but its timing contradicts attributing the
 largest late stalls to continued execution of those plans. No queue-filter
 implementation or performance promotion is selected by this result.
+
+## Current late-owner diagnostic: preselect and direct recovery dominate different intervals
+
+On current `a16b404`, local Product ownership remains material, but no single
+whole-run caller explains every interval. A restored slow-service band spends
+4.394542s of a5.024s measured interior in preselect, predominantly its gap
+evaluator; queued dispatch consumes only .000747s. A later reply plateau instead
+has1.250684s direct-dispatch-owner time and .558662s preselect in2.014s.
+This locates current work, not an exact critical reply's residence or an
+ordinary performance improvement. It does not revive the rejected queue filter
+or make the preceding classifier's different late plateau a dispatch stall.
+
+Build28234 completes in3m36s; the saved seven-file periodic observer is frozen
+and fully reversed before traffic. It includes caller-keyed owner timing,
+preselect and inner recovery phases, but **no per-reply-stage trace**. Correct
+`MPTUNNEL_LAB_PERF_SAMPLES=0` is used; no sample rows occur. Warnings are the
+existing unused batch helper and ordinary wrappers unused by this diagnostic.
+Runner90510 exits0 in51.014213s. The [verified raw archive](LATE_OWNER_PROFILE_20260911.raw.tar.gz)
+is500,562B/11regular files: five results, build/driver, exact patch, wrapper,
+`run.py` and `shape.sh`. Gzip, tar comparison and every decompressed member's
+bytes pass; runner/profile match the preceding classifier archive. No configs,
+binaries or links are included.
+
+### Actual intervals and dominant owner
+
+All source/target/reply counters below use their own management producer time.
+The probe does not retain exact maximum-gap endpoints. Periodic counter windows
+subtract cumulative states at complete groups wholly contained within each
+management band; boundaries and nesting remain explicit. The static callsite
+map is reconstructed in memory from `a16b404` plus the saved patch, not guessed
+from today's source lines: instrumented control1569preselect,3101dispatch,
+3078collection and4032ACK application.
+
+| Own sampled band | Complete-flush interior, Unix ms | Span, s | Actor hold, s | Preselect guard, s | Dispatch guard, s | Queued child, s |
+|---|---|---:|---:|---:|---:|---:|
+| Target flat17–25 | 1789058811218→1789058818253 | 7.035 | 6.904566 | 1.303594 | 5.030220 | .001163 |
+| Restored slow29–35 | 1789058823274→1789058828298 | 5.024 | 4.960852 | 4.394542 | .035209 | .000747 |
+| Target flat39–41 | 1789058833320→1789058834323 | 1.003 | .977568 | .695865 | .134804 | .000207 |
+| Reply flat43–46 | 1789058837335→1789058839349 | 2.014 | 1.945711 | .558662 | 1.250684 | .000659 |
+| Target flat45–47 | 1789058839349→1789058840352 | 1.003 | .979794 | .307918 | .599702 | .000160 |
+
+Target writes are231,822,908B at17–25,393,940,374B at39–41, and454,116,882B
+at45–47. The restored29–35 band is slow rather than flat: source grows
+326,953,294→364,711,198B, target306,333,454→318,899,718B (16.755Mbps over6s),
+and local replies745→829B. At43–46, source is already final459,276,288B;
+target412,172,598→454,116,882B and server replies1403→1501B advance, while local
+reply delivery stays1403B. These different producer states must not be merged.
+
+In the restored5.024s interior, preselect's directly timed gap phase is4.355900s;
+source/retained/residual total only .034484s. Actor acquisition wait is .022489s,
+writer hold .009402s, and ACK guard .447779s. Inner gap counters cover **all
+callers**, including that ACK guard, so they are not an exclusive preselect
+partition: owner/target model3.179285s, scored metadata .411250s, cache .251782s,
+assignment clock .335958s, boundaries .028315s and ownership view .037609s.
+There are435,745 scored/present-owner queries; their mask/frontier time is
+.241829s. The97,544 stable-absent queries consume only .046474s, with no dynamic-
+absent increase. Small stale-only pruning and queued retry are not the dominant
+work in this band. The separate observation-classification timer is .014756s.
+
+During the later2.014s reply plateau, direct work is1.247611s and send plans
+1.042342s/41,337attempts (40,553blocked,770committed,14other errors). During the
+7.035s cut plateau, direct work is5.035808s and plans4.265653s/187,805attempts,
+187,153blocked/652committed. These are materially different from the restored
+preselect-dominant band. Parent/child timings overlap; small boundary skew can
+make an emitted child total slightly exceed its corresponding owner delta.
+Do not sum overlapping windows or call these elapsed durations CPU execution.
+
+### Whole counter accounting and scope
+
+All interval count/byte/time deltas and sums reconcile across4,509client and
+660server perf rows, one PID per role. Client closes with a
+`multipath_stream_close` flush through Unix1789058844522, server `stream_close`
+through8844589; inactive components retain older last timestamps. Dispatch
+timing `bytes` counts calls, count-label `bytes` counts events, and only explicit
+payload bytes represent data. Generic record counts are emitted batches;
+synthetic1us floors are not event costs or per-attempt maxima.
+
+| Whole scope | Elapsed, s | Calls/guards or events |
+|---|---:|---:|
+| Actor hold / acquisition wait | 46.672479 /1.298395 | 401,855 guards |
+| Writer hold / successful acquisition-call time | 1.210977 /.046769 | 46,676 guards |
+| Preselect guard / gap child | 22.012764 /21.224716 | 62,811 guards |
+| Dispatch guard / direct child / queued child | 18.946815 /18.795869 /.152581 | 15,652 guards;21,996direct/17,860queued calls |
+| ACK guard / collection guard | 2.978602 /1.126054 | 25,789 /15,652 guards |
+| Shared send plans | 15.764799 | 668,540 attempts |
+| Authority / reservation / fenced Apply | .027788 /.035540 /.125994 | 19,014 /19,014 /15,370 |
+| Product commit, inside Apply | .072546 | 15,370 |
+
+All sends partition into652,828blocked +342other errors +15,370commits.
+Recorded recovery payload is623,797,774B, not unique useful repair or proof of
+unnecessary copies. No native-stale component occurs. Largest dispatch/preselect
+guard is19.022/13.136ms: observed seconds accumulate across many short guards,
+not one multi-second lock acquisition. The four preselect phase timers total
+21.951128s; their source/retained/residual values are .315575/.327231/.083606s.
+All-caller gap owner/target model totals10.359173s/1,297,003calls; it cannot be
+subtracted from preselect alone. Writer wait omits prior Busy/retry residence,
+and observer recording/classification remains within some enclosing timers.
+
+### Complete own outcome and raw history
+
+The probe completes exactly459,276,288B in50.410371s,72.886Mbps,1/1stream,
+no errors. First write/confirmation are .105804/.410417s; maximum write and
+confirmation gaps are9.271768/4.711260s. No echo workload or censoring occurs.
+The cut includes source unchanged at237,146,714B over samples16–24, but absent
+gap endpoints prevent assigning the exact9.271768s maximum to those rows.
+Source reaches its final count by42; at last sample50 target writes are still
+237,490B short of final, so the probe supplies final settlement, not management.
+All51raw bins, including22zeros and the partial final bin, follow:
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 5.115,125.502,0,219.817,0,0,71.591,241.46,217.956,169.987
+10: 0,35.837,209.571,0,28.215,0,0,0,0,35.775
+20: 0,0,0,0,478.744,64.957,0,123.704,37.845,0
+30: 239.992,0,72.749,53.654,0,119.775,0,76.015,84.583,247.12
+40: 131.11,123.137,41.559,0,0,0,42.135,0,35.792,10.558
+50: 329.955
+```
+
+Raw0–5 /5–15 /15–25 /16–24inclusive /25–40 /40–51 means are
+70.087 /97.462 /51.452 /57.169 /74.693 /64.931Mbps; zero-bin counts are
+2/5,3/10,8/10,7/9,5/15,4/11. These are not native capacity estimates or
+ordinary comparisons against the smaller classifier or previous candidate.
+
+All51profiles preserve independent200+200Mbps, DOWN30ms/UP70ms, zero configured
+loss/jitter/outage,65536Bbursts and8192netem limit. Only46UP is observed at10Mbps
+at15.004332s, restored at25.006070s;47 stays200. All class/qdisc drops are0.
+Eight physical outputs stay stable; all native epochs are initialized and
+stable from sample8. In restored29–35, native forward ACKs add6,092,428TCP and
+14,010,685QUIC bytes while Product flight falls32,169,412→21,297,384B. At35,
+native flight and total queue are0 but Product ownership remains substantial;
+that is not exact copy/command authority or evidence of continuous readiness.
+Client lifetime CPU121→118% in that band is not interval CPU; the directly
+observed owner durations, not `ps`, locate the repeated synchronous work.
+
+| Sampled cost,50.013981s window | Client / UP | Server / DOWN |
+|---|---:|---:|
+| Link46 /47 class bytes | 547,712,017 /591,614,863 | 7,166,317 /7,214,463 |
+| Sum-class backlog peak / final, B | 22,515,830 /352,272 | 43,116 /3,200 |
+| RSS peak / final, KiB | 371,612 /366,628 | 113,972 /113,972 |
+| Lifetime CPU peak / final, % | 124 /121 | 45.5 /32.3 |
+
+Client/server logs are1,919,810/277,890B; probe stderr is empty. Two server
+`H3_NO_ERROR` warnings occur during post-completion teardown, not as failed
+transfers. No post-teardown retention inference follows from the last sample.
+Information forecast is met: current repeated owner work is material, with
+preselect gap scoring dominant in one restored band and direct planning in
+others; queued work and mutex acquisition are small there. Exact per-reply
+causality, a safe work correction and ordinary practical acceptance remain
+separate obligations. No runtime change or performance promotion follows from
+these nested totals alone.

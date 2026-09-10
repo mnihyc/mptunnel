@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 15:55 +08:00. Authoritative repository is `./`.
+Updated: 2026-09-10 16:16 +08:00. Authoritative repository is `./`.
 **MPP is not performance-accepted. No release, push, public README update or
 ideality claim. Continue the authorized closure task, not just this checkpoint.**
 
@@ -13,7 +13,77 @@ exact joins, source overlays, tests and archives. Condensation deletes no eviden
 
 ## Decision and active transaction
 
-**Current next transaction: independent200Mbps links.** All12combined stress
+**QoS pair CLOSED — material heterogeneous service failure selects attribution.**
+Both uploads settle exactly: single healthy47=177.889Mbps, aggregate46+47=
+249.391Mbps whole. But aggregate RAW bins16–24 are8.196,6.573,7.147,13.352,
+21.267,22.069,21.711,24.005,21.506Mbps while only46 is restricted to10Mbps;
+47 remains200Mbps and the one-link control retains useful~180Mbps service.
+Good whole throughput and immediate restored burst do not excuse this sustained
+loss of healthy independent capacity. No random loss/jitter/UDP outage is active.
+All34 files (six healthy/QoS captures plus logs/driver/shaper) are archived in
+NATIVE_REFILL_INDEPENDENT_20260910.raw.tar.gz before further measurement.
+
+Active question: is healthy47 still transmitting a suffix behind an impaired46
+prefix, or does assignment/admission stop its useful native service? Reuse
+ordinary per-path native counters, queues and target writes first; inspect
+the existing request Original/retained/ACK-gap/copy ownership model independently.
+If exact critical ownership is absent, select one existing-event diagnostic
+capture, not a new tuning candidate. Forecast: this distinguishes recovery debt
+from admission/placement starvation and selects a coherent root correction;
+it cannot promise a gain before attribution. No timeout/reserve/hint changes,
+fixed bottleneck grouping or protocol preference. Pause the additional loss/
+blackhole gate until this existing failure is understood. Same direct topology
+remains active; no lab/compiler is running after closed session65984.
+
+Ordinary attribution: healthy Q47 ACKs advance38.764MB during15–17s while target
+writes advance1.786MB. Later47 remains~100ms RTT but underloaded; impairedQ46
+retains22–31MB Product flight. Client read minus target writes is near64MiB.
+Sink confirmations normally return promptly, so this is not the reverse ACK
+hold. Strict16–24s confirms46~10Mbps,47~31Mbps versus single47~196Mbps;
+allqdisc drops0. Ordered service16–24 averages16.203vs185.887Mbps control.
+
+NEXT one information-only exact request capture on SAME profile/current b0:
+ordinary telemetry lacks current prepared Original DSN ownership. Existing
+sender_service_decision covers repairs, not prepared Original claims. A TEMPORARY
+lab-diagnostics-only event at successful commit_fenced_frame_product records
+selected-stream exact DSN/path/cause and accepted-copy deadline; no decisions,
+clock renewal or public metrics change. Existing server_receive_hole and
+server_receive_delivery_stall supply actual receive frontiers. Include existing
+relay_local_read_blocked, reinjection, request_retained_frontier_reinjection,
+data_ack_loss_timer, feedback_return. Periodic perf/all-ACK tracing stays off.
+One feature build; archive then reverse overlay before traffic, retain ordinary
+binary separately. No new passing performance claim from observed build.
+
+Competing causes: continued bad-path Original assignment, timely copies placed
+back on46, or too little in-flight distinct repair service despite healthy47.
+Exact request Original+copy intervals over the measured collapse decide among
+them; finite same-range suppression must not be confused with whole-stream
+service. Preserve T06 score/Apply range equality and original amplification
+counterexample before any model proposal. Forecast: locate those decisions,
+not a guaranteed speed gain. Nonrecurrence or observer overhead remains honest;
+do not turn it into favorable ordinary evidence or retune timers/quantum.
+
+**Independent healthy pair CLOSED:** one200→two×200 gives DOWN148.236→302.319Mbps,
+echo median477→150/p95918→262ms; UP exact169.362→315.648Mbps. Both independent
+class counters carry roughlyequalbulk work; no false four/eight-link sum.
+All four captures complete (DOWNduration-partial, UPexact). Costsand minor
+UPtiming changesremain: confirmationgap.411→.420s, localwritegap.317→.528s,
+CPU/RSSgrow.169profile rowsverify200Mbps percut/30–70ms/zeroimpairments.
+
+NEXT smallest existing heterogeneous recovery discriminator: same direct topology,
+singlemixedUPon47 versusaggregateUP46+47,200Mbps each, no loss/jitter/UDPoutage.
+Only link46 UP data capacity changes200→10→200Mbps at15–25s;47 stays200.
+Question: does temporary poor extra capacity choke ordered service despite a
+healthy independent alternative, or recover/preserve useful aggregation?
+Forecast: aggregate should materially use both before/after, and retain useful
+healthy-link service duringthecut, with unavoidable initialinflight/reordering
+transients disclosed. No instantaneousclairvoyantfloor is asserted. A sustained
+collapse below the singlehealthycontrol selects exactownership/recovery before
+adding simultaneousloss/blackholes. Do not changehint/threshold/guard to pass.
+Tag native-refill-independent-qos-0910, lognative-refill-independent-qos-0910.log.
+The wholeUDP and randomloss additions follow only after this bounded result.
+
+**Completed preparation for independent200Mbps links:** All12combined stress
 cells are captured and61rawfiles archived before any topology/driver change.
 See NATIVE_REFILL_COMBINED_20260910: currentDOWN TCP/Q/mixed/raw/Xray/H2
 404.684/311.418/312.384/363.575/299.315/144.912Mbps. Loaded latency remains
@@ -458,8 +528,8 @@ must remain untouched/unstaged. Commit exact intermediary sets; docs-dev is
 ignored and needs exact force-add. PROGRESS is an ignored continuity journal,
 not force-added public documentation. Do not change AGENTS.md.
 
-Telegram latest measured milestone:2026-09-10 07:12UTC (TCP gain/mixed recovery hold).
-Next nonurgent notification not before08:13UTC; meaningful milestones/blockers
+Telegram latest measured milestone:2026-09-10 08:16UTC (aggregation/QoS collapse).
+Next nonurgent notification not before09:17UTC; meaningful milestones/blockers
 only, no component-only success. Respect soft-frequency advice. During work
 keep concise commentary within60s and poll verification/labs on minute cadence.
 

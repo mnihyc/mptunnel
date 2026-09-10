@@ -4797,3 +4797,222 @@ Every archived member was compared byte-for-byte to
 its source without hashes. The runner and shape scripts plus observed classes
 preserve the measurement method; preceding sections state source, binary,
 event filter and profile. No runtime, threshold or controller change follows.
+
+### Diagnostic80295: ACK-admission capture, full service and costs
+
+2026-09-11. Closed driver0 in41.004515s; source011b724 plus the frozen9058B
+two-file observation patch, build44306 (1m25s, pre-existing unused-wrapper
+warning only). Executable:
+`./.tmp/reflection/bin/server-ack-admission-20260911/mptunnel`.
+Both source changes were reversed before this single capture. The only events
+are server_ack_actor_admission,server_data_ack_recovery,
+server_repair_carrier_accept and stream_ack_received. No client-receive,
+native-trace, perf or tick-CPU observer is enabled. The exact admission/decision
+join is separate from these full-run statistics; this is not an ordinary
+performance comparison or a runtime correction.
+
+HTTP200 delivers2,023,458,600 body B in40.000054553s,404.691168Mbps. The8GiB
+object is intentionally partial after40s: one partial request, none completed.
+First body arrives0.583049s after probe start. Worst read gap0.516832s is
+9.716537–10.233369s, body436,713,470→436,779,006B. These are body offsets,
+not relay DSNs; probe.json exports the worst interval rather than every read.
+There is no failover/recovery phase in this healthy cell.
+
+All79 sequential64B echo exchanges succeed,5,056 bytes each way. Median/p95/
+maximum are360.218/492.354/745.859ms; zero timeouts, unavailable records or
+probe-reported restarts. Worst#44 runs22.291715–23.037574s; #22 takes715.761ms
+at11.002191–11.717952s. The next largest#43 is543.625ms at
+21.748071–22.291697s. Largest successive-success spacing0.835875s lies between
+#21 and#22 and includes the500ms probe cadence; it is not one request's RTT.
+First#0 takes100.627ms; last#78 completes39.847458s after303.187ms.
+
+All40 RAW one-second body bins are positive. The stored34-bin trimmed mean
+427.532Mbps must not replace whole-run404.691Mbps. Complete rawMbps:
+
+```text
+ 0– 9:   2.620 125.142 454.078 570.959 348.831 475.958 291.433 546.832 413.447 264.409
+10–19: 569.071 464.956 257.035 548.834 411.571 355.226 383.018 356.949 658.202 372.064
+20–29: 477.198 423.927 304.324 439.908 556.786 369.977 394.333 368.150 370.480 543.693
+30–39: 393.463 459.431 399.403 409.410 306.406 554.138 476.270 355.661 439.193 274.790
+```
+
+| Probe-clock band,s | Raw-bin mean,Mbps | Echoes starting in band | Echo p50/p95/max,ms |
+|---|---:|---:|---:|
+|0–5|300.326|10|248.883 /488.483 /488.483|
+|5–15|424.355|20|350.952 /480.251 /715.761|
+|15–25|432.760|19|380.844 /543.625 /745.859|
+|25–40|407.653|30|366.748 /464.414 /466.002|
+|30–40,overlapping late subset|406.817|20|406.401 /464.414 /466.002|
+
+Quantiles use sorted successful attempts at round((n−1)×quantile), matching
+the probe convention. Sampling windows/buffered ordered delivery can produce
+one-second bursts above500Mbps without implying a larger physical cut.
+
+All41 service rows verify500Mbps rate/ceil in both directions, UP70ms/DOWN30ms,
+no configured loss/jitter, no UDP blackhole and zero actual class/netem drops.
+The5s epoch changes retain this same profile. Traffic uses47, clienteth1 and
+servereth0; the unused opposite interfaces each add42B. The three TCP plus
+one QUIC attached carriers all address10.238.47.20:7443 despite `*-46` names.
+This is one shared cut per direction, not four independent500Mbps paths.
+
+Active first→last class samples add2,392,055,287B DOWN and34,149,490B UP.
+Ratios to final body are1.18216 and0.01688; those mismatched observation
+windows are not exact lifetime wire amplification. DOWN backlog peaks
+28,798,828B/2,775 packets and UP160,425B/895 packets. These queue bytes can
+overlap transport flight and must not be added to it as separate occupancy.
+
+Final server native ACK counters total2,298,843,763B:1,040,398,993B TCP
+(45.257%) plus1,258,444,770B QUIC. Four exact native epochs stay stable,
+counters never regress, and every sampled live path remains active. These
+are native delivery counters with framing/copies, not Original payload or
+application receipt. Management path/physical-instance IDs below are not
+response-copy incarnations and must not be borrowed from an earlier capture.
+
+| Server native path/instance | Final ACKed B | SRTT final / sampled max,ms | Native flight final / sampled max,B |
+|---|---:|---:|---:|
+|TCP0/2|697880718|273.648 /515.697|7929248 /11504360|
+|TCP1/3|155708911|263.780 /540.189|40544 /6617360|
+|TCP2/4|186809364|270.693 /512.402|1077312 /4241192|
+|QUIC0/1|1258444770|267.173 /517.387|10249668 /20093157|
+
+Summed server native flight peaks31,487,469B and ends19,296,772B. Reported
+native TCP unsent queues peak391,428B summed and end145,108B. Separate `ss`
+snapshots show summed Send-Q peak12,722,640B/end9,692,374B; Send-Q includes
+unacknowledged bytes and is not unsent. Final QUIC native window22,179,893B
+versus25,239,627B sampled peak is not an independently attributed delay.
+Client reverse native ACK counters end11,057,447B TCP plus436,554B QUIC,
+also without epoch change/regression. Management/native sampling times differ;
+these totals do not locate the critical ACK or copy's physical residence.
+
+| One stable process PID per role | Lifetimeps CPU first / final / peak,% of one core | RSS first / final / peak,KiB |
+|---|---:|---:|
+|Client|2.7 /70.7 /71.3|34224 /85956 /85956|
+|Server|3.3 /173 /173|31276 /276152 /284624|
+
+Lifetime `ps` is not interval CPU, exclusive on-CPU cost or thread attribution.
+No per-byte CPU or post-load reclamation conclusion is supported. Management
+contains no errors and its final snapshot precedes full probe teardown. Bulk
+client relay delivery there is2,022,392,888B and server target-read progress
+2,086,411,644B; both echo management directions reach5,056B. Different body,
+relay and snapshot endpoints cannot establish a final retained-byte leak.
+Client Connection reset by peer and server RemoteClosed/H3_NO_ERROR warnings
+occur at teardown; the complete probe has zero failed echo attempts.
+
+The logs total75,500,435B: client19,437B/server75,480,998B. There are199,280
+diagnostic records,80 client plus199,200 server, and three warning lines.
+Server event counts are142,373 admission observations,27,413 applied-ACK
+observations,13,267 recovery decisions and16,147 accepted-copy observations.
+An admission observation includes its recorded disposition and must not be
+counted as successful enqueue without classification. The capture omits
+client-receive history intentionally; absence is not a negative receipt fact.
+This sizeable observer cost prevents an ordinary speed/cost ranking from
+these numbers. Exact causal conclusions belong to the following join.
+
+Raw archive: [ORDERED_FEEDBACK_SERVER_ACK_ADMISSION_20260911.raw.tar.gz](ORDERED_FEEDBACK_SERVER_ACK_ADMISSION_20260911.raw.tar.gz).
+Ten regular files contain both logs, probe.json/probe.err, service.jsonl,
+closed driver,9058B patch, build log and existing run.py/shape.sh. Size is
+4,488,384B compressed,77,234,621B uncompressed. Every member was compared
+byte-for-byte to its source, without hashes. No binary/config/secret is
+included. No runtime, controller, queue or timer change follows this report.
+
+### Diagnostic80295: positive ACK admission before accepted-copy decisions
+
+2026-09-11. Independent all-positive-range join of the preceding archived
+capture; no additional experiment or source change. The sole observed session
+is15085197147764974401, serverPID515449, bulkstream1; echo isstream0. Recovery
+events without a session field are joined only within this same process/stream
+and the observed single session. Exact target underlay/path/incarnation is part
+of the join; management physical IDs are not substituted for copy identities.
+
+All142,284 bulk ACK admissions succeed:135,112async and7,172try. The89 echo
+admissions also succeed(87async/2try). There are no Full or Closed observations.
+Thus the observer's explicitly unknown later PendingMailboxFrame publication
+path is not exercised here. All143,123 bulk positive intervals parse as valid
+nonempty ranges with matching declared counts; scoped ACK positives are
+included, not just explicit[0,x) prefixes. Admission is raw mailbox evidence;
+it does not itself perform ACK validation or establish actor application.
+
+Match each accepted persistent-gap copy to the latest preceding decision with
+the same start and exact target tuple, requiring its end to lie within the
+decision's range. This conservatively identifies the first accepted fragment;
+unjoined fragments are unknown, not attributed to a convenient older decision.
+For each joined range, query the earliest actual successful ACK that wholly
+covers it. Independently union every admitted positive interval by its captured
+admission time, allowing different ACKs to cover different pieces. Both methods
+identify exactly the same full-coverage set: sparse/combined coverage adds no
+extra whole-copy cases beyond the independent prefix-only join.
+
+| Bulk persistent-gap accepted-copy domain | Copies | Payload B |
+|---|---:|---:|
+|All accepted|15,141|190,290,388|
+|Exact first-fragment decision join|13,237|176,346,843|
+|Unjoined; timing classification unknown|1,904|13,943,545|
+|Entire copy positively admitted before its decision|4,497|56,804,208|
+
+These are accepted-copy payload sums, not unique source bytes or physical wire
+bytes. An additional1,631 joined copy extents have only partial prior admitted
+coverage:19,572,000B of their23,802,094B payload. That intersection is not
+authority to remove the entire copy; its uncovered remainder still matters.
+For all13,237 joins the decision's actual ack_frontier equals accepted.offset,
+and no prior logged stored frontier enters the copied extent. Thus a covering
+positive fact was not already applied at the decision: its first byte was still
+the lowest unacknowledged byte. The logs do not export the entire historical
+sparse Apply ledger, so this is not a claim about every interior byte.
+
+Ordering uses the same-process monotonic instants, not millisecond log adjacency:
+admitted_at is captured after successful publication, whereas decision_at is the
+existing recovery observation. Strict admitted_at<decision_at therefore proves
+publication before that decision even if the diagnostic lines interleave. The
+reverse inequality would not prove the ACK absent: a producer can be preempted
+between publication and its timestamp. One14,600B witness is logged after its
+decision despite its captured admission being earlier, illustrating the limit
+of log-sequence-only joins. All required instants parse in this capture.
+
+Among the4,497 full-coverage cases, earliest covering admission leads the
+decision by median210.571us,p95958.586us,max8,209.844us. Witness routes are
+4,222async/53,264,586B and275try/3,539,622B. Every such extent later obtains a
+logged validated contiguous positive cover. This establishes later receipt
+truth, not one-to-one identity between a raw input ACK and a synthesized
+ServerFeedbackBatch result. Exposure recurs throughout the run: each successive
+five-second band from the first bulk server event contains6.01,8.00,6.60,7.22,
+5.13,10.44,7.48,5.92MB respectively; these are event-clock bands, not probe bins.
+
+Two exact examples use server diagnostic sequence numbers A/D/C/V for successful
+admission, recovery decision, actual accepted copy and later positive cover:
+
+| Copied DSN interval | A / D / C / V | Admission lead | Original owner -> copy target |
+|---|---|---:|---|
+|[3851812,3866412)|353 /354 /355 /358|99.361us|TCP2/inc2 -> TCP0/inc3|
+|[1620793780,1620808380)|156697 /156741 /156743 /156752|8,209.844us|QUIC0/inc4 -> TCP0/inc3|
+
+First example: ACK[0,3917348) finishes admission at local monotonic
+1110097369414733ns; decision is1110097369514094ns with actual frontier3851812.
+The accepted range/target match exactly; subsequent stored frontier3917348
+covers it. Longest-lead example: ACK[0,1620817780) finishes admission at
+1110128051611164ns; decision is1110128059821008ns, actual frontier1620793780.
+Later stored frontier1621437398 covers the accepted14,600B. These prove real
+available positive information, not a failed send or inferred native receipt.
+
+The legal service boundary remains unresolved. Current handle.rs recv_frame
+collects only events.len() at batch entry, emits all collected positives before
+scopes/MAX, and retains ordered DATA/lifecycle/probe/error boundaries. Pending
+synthesized frames do not reopen that collection. Server relay still performs
+recovery before selecting Input and after each returned novel ACK; a later
+admission can consequently precede a decision without belonging to the earlier
+batch. Crucially, it can also arrive after a proposed finite Input quantum's
+entry budget. The four events record neither that cutoff nor intervening
+non-ACK barriers. Even the longest example is therefore not proof that a legal
+011b724-style server quantum could consume that witness before its decision.
+Same-batch positive-first ordering is not contradicted by this capture.
+
+Disposition: real mailbox-ready advisory work, not a demonstrated mandatory
+ACK-authority violation or a measured safely catchable batch. The56.8MB is
+29.85% of all persistent-copy payload here, nominally11.36Mbps over40s/about
+2.81% of404.691Mbps useful service. That is a work scale, not a predicted
+goodput/latency gain; unjoined decisions, partial copies, publication races and
+shared native competition remain. No winning echo interval is joined to this
+work, and the capture intentionally lacks client receipt history. With native
+competition independently reproducing hundred-millisecond latency, this
+small/uncertain removable portion does not select a server Input rewrite,
+copy ban, merge/cadence change or new observer. Preserve it for a later scoped
+decision; proceed with the already-declared matched baseline context instead.

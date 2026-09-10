@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 05:13 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 05:40 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -15,10 +15,12 @@ Condensation waives no failure and reactivates no rejected candidate.
 
 Runtime checkpoint **011b724**, finite ordered ACK/MAX Input service, is retained.
 Frozen ordinary binary: ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
-target/release/mptunnel is the frozen repair-deadline diagnostic, NOT ordinary.
+target/release/mptunnel is the frozen server-ACK-admission diagnostic, NOT ordinary.
 Use the explicit ordinary path above. All observer runtime edits are reversed.
-Only the user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md remains unrelated
-dirty source; never edit/stage it. No runtime changes are currently proposed.
+Only the user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md is unrelated
+dirty source; never edit/stage it. The temporary two-file ACK-admission observer
+is fully reversed; build44306 and lab80295 both CLOSED0. No runtime
+policy changes are currently proposed.
 
 Exact failure: ordinary a16 mixed UP had7.236s write/4.145s confirmation gaps.
 Diagnostic61091 joins an ACK prefix already in client FIFO to actor processing
@@ -392,8 +394,15 @@ success/full/closed disposition; do not call a pre-send observation admission.
 No payload clone, queue change, ACK union/folding, wait, timer or policy change.
 All instrumentation is feature-only and event-gated; preserve failed/full
 coverage so a missing admission event cannot be read as proof of absence.
-One file, one unchanged shared500 mixed DOWN capture, existing receive,
-accepted-copy and applied-ACK events. No need to stack deadline or CPU overlays.
+One unchanged shared500 mixed DOWN capture. Keep only the new admission event
+and existing decision, accepted-copy and applied-ACK events; client receive
+history is not needed for the already-ready question. No deadline or CPU overlay.
+Necessary two-file clock refinement before build: retain actual post-success
+Instant and add the existing decision's observed_at to its event, both as local
+Rust Instant Debug scalars. Compare those same-process monotonic instants, not
+the later millisecond log stamps. This is a local diagnostic representation,
+not a portable wire format or a new clock helper/framework. Unknown parses
+remain unknown. Failed/full results are not admission instants.
 
 Question: did a positive ACK covering a later accepted copy already finish
 queue admission before the decision, while its application was still pending?
@@ -410,6 +419,72 @@ is not the proof. The all-copy payload scale is~39.6Mbps over40s, not a promised
 goodput or latency gain; native shared contention remains even if all copy
 work disappeared. Freeze exact overlay/binary and reverse before traffic;
 ordinary011b724 comparisons remain the performance gate. No release promotion.
+
+Build44306 running,4cargo jobs, no lab overlap. Independent actual two-file
+review PASS: admitted_at is post-actual-success and before async perf recording;
+Full/Closed carry no admission time. Existing decision uses its actual
+observed_at, not a later logging instant. Exact patch9058B comparison passes at
+./.tmp/reflection/server-ack-admission-observer-0911.patch. On build completion
+freeze bin/server-ack-admission-20260911/mptunnel and reverse both runtime files.
+Then one tag ordered-feedback-server-ack-admission-down-0911 with events
+server_ack_actor_admission,server_data_ack_recovery,server_repair_carrier_accept,
+stream_ack_received. No per-role override, native trace, perf or other overlay.
+
+Build44306 CLOSED0 in1m25, one existing unused-wrapper warning. Exact executable
+frozen and both source files fully reversed, git diff clean, before lab80295
+starts. The capture uses precisely the four declared events and unchanged
+shared500/UP70DOWN30 profile. No compiler runs alongside it.
+Lab80295 CLOSED0; both exact clock forms appear as declared. Independent
+range/admission causality and full probe/native/cost archive are in progress.
+No ordinary performance or runtime policy acceptance follows from this capture.
+
+Closed information result: both independent all-range and root prefix-only
+joins identify4497persistent copies/56804208B with a covering successful ACK
+admitted before the ACTUAL recovery decision. All later obtain positive Apply;
+all142284bulk admission records succeed (async135112,try7172), no Full/Closed.
+This is real mailbox availability, not an invented1ms timestamp inference.
+But the admission can occur after a proposed finite Input quantum's entry
+count, and non-ACK boundaries remain unobserved. It is therefore an exposure
+ceiling, not a measured safely catchable batch. The nominal payload scale is
+11.36Mbps over40s, about2.8% of this capture's404.691Mbps; unknown interaction
+effects are not permission to promise a larger gain. This does not establish
+a mandatory RFC violation: the contract requires already-applied facts, not
+waiting indefinitely for arrivals. No server Input rewrite selected from this
+small/uncertain practical forecast. Preserve the finding for a scoped later
+transaction; do not resuscitate ACK merging, cadence or a wider ready budget.
+
+Next practical discriminator,05:30+08: matched ordinary healthy500Mbps DOWN
+rawTCP, Xray and Hysteria2 bulk+64B echo. Existing ordinary MPP shared comparisons
+already show both native competition and mixed latency; compare real baselines
+before treating every delay difference from QUIC-only as a uniquely MPP defect.
+This is diagnostic acceptance-context, not a resumed final release matrix.
+Same active47cut,70msUP/30msDOWN, no loss/jitter/QoS/blackhole,40s offered.
+Keep existing H2 explicit500Mbps prior visible; MPP has dynamic discovery.
+Use existing programs/probes, no build or runtime change. The sole runner
+addition is an explicit raw-target override so raw traffic crosses47 rather
+than the historical46default; observed class traffic must verify it. This is
+measurement routing, not a Product fix or altered impairment. No CPU-per-byte
+claim from lifetimeps, no summed unaligned throughput, no discarded failures.
+Information forecast: establish the relevant throughput/latency frontier under
+the identical healthy cut and expose whether the mixed cost is exceptional
+against these baselines. Either outcome retains the two ordinary mixed timing
+regressions; no automatic promotion, protocol preference or smaller lab queue.
+The current static-rank counterexample review remains read-only: old131-slot
+Original queues changed, but native/shared-Product refill may still invalidate
+a static allocator. No T03 runtime migration is selected.
+
+05:40+08 checkpoint: raw52570 and Xray75884 CLOSED0; H2 lab29931 is the sole
+live experiment. Actual Xray/H2 endpoint47 and H2's explicit500Mbps prior
+verified before launch. Raw whole451.669Mbps,80/80echoes,p50103.384/p95126.229/
+max294.789ms; maxreadgap.100167s. All41samples verify the intended active47
+cut,500Mbps/UP70DOWN30/noimpairment/noactualdrops. This is meaningful evidence
+that low loaded latency is possible, not a native-controller attribution.
+Independent full-baseline comparison/archive follows all three closures.
+Root read all117stats+104causal ACK-admission lines and checked archive integrity
+and exact10member manifest. No new runtime change follows the small/uncertain
+copy-work forecast. Separate20%loss review asks whether native contraction
+recovers after loss clears; do not equate intentional above-allowance responses
+with proof that arbitrarily low sustained service is unavoidable.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 
@@ -545,6 +620,6 @@ nonrenewing clocks, half-close/cancel and retained capacity wakes.
 Build/artifact identities and failed candidates remain explicit; never run an
 old target/release by assumption. Exact commits only; docs-dev requires force-add.
 PROGRESS is ignored continuity. AGENTS.md immutable; userdoc+7lines untouched.
-Telegram last20:22:42UTC, next nonurgent>=21:22:42UTC. Commentary within60s; verification
+Telegram last21:23UTC, next nonurgent>=22:23UTC. Commentary within60s; verification
 polls by minutes. Before compaction record current sessions, next decision,
 source/binary identities and open/adverse outcomes. Do not stop at a checkpoint.

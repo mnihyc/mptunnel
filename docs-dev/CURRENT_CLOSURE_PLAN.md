@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 04:55 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 05:13 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -15,7 +15,7 @@ Condensation waives no failure and reactivates no rejected candidate.
 
 Runtime checkpoint **011b724**, finite ordered ACK/MAX Input service, is retained.
 Frozen ordinary binary: ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
-target/release/mptunnel is the frozen native-snapshot-CPU diagnostic, NOT ordinary.
+target/release/mptunnel is the frozen repair-deadline diagnostic, NOT ordinary.
 Use the explicit ordinary path above. All observer runtime edits are reversed.
 Only the user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md remains unrelated
 dirty source; never edit/stage it. No runtime changes are currently proposed.
@@ -348,6 +348,68 @@ Join actual accepts, preserve split extents and unjoined cases, and exclude
 boundary-ambiguous timestamps rather than pretending exact sub-ms clocks.
 Reuse one unchanged shared500 healthy mixed DOWN cell and the same six events;
 one-file cfg-only extension, freeze/reverse before running. No public claim.
+
+Execution81130 build CLOSED0 in1m22; exact one-file patch frozen at
+./.tmp/reflection/repair-deadline-observer-0911.patch, diagnostic binary at
+./.tmp/reflection/bin/repair-deadline-20260911/mptunnel. Runtime fully reversed
+before lab38507, which CLOSED0. Diagnostic414.221Mbps, echo79/79successful,
+p50/p95/max375.743/582.986/656.397ms; maximum body gap.772739s. These are not
+ordinary acceptance numbers. Independent exact-range appendix is complete.
+Of171149109 persistent accepted-copy bytes,42396292 (24.77%) join pre-fallback
+decisions,117454867 (68.63%) post-fallback,11297950 remain unjoined. Early
+decision does not prove early admission; split and clock ambiguities remain.
+Most first receipts again precede acceptance by70ms and sender cover follows
+1–2ms later. An actual post-fallback TCP copy rescues the missing QUIC head;
+a blanket copy ban would discard demonstrated useful recovery.
+
+Disposition: early-owner score removal is NOT the dominant direct remedy.
+Even ideal removal of its42.396MB observed association represents only about
+8.48Mbps of payload over40s, before replacement work or indirect effects; this
+is a scale calculation, not a guaranteed saving. Later accepted Originals can
+indeed raise the legacy whole-output owner ETA without adding predecessors to
+the exact head. History93e6284/T03 explicitly retains that approximation;
+do not turn this known limitation into an unrelated mandatory score migration.
+
+Next bounded question uses existing source/captures before another experiment:
+why does the retained fallback mature during ordinary positive-ACK return?
+Trace exact Original claim/sent_at, actual native service, aggregate clock
+retention and ACK return ownership. Separately check whether ready positive
+ACKs can be hidden behind server Input boundaries despite its positive-first
+ServerFeedbackBatch. Neither a1ms later logged ACK nor an old assignment age
+proves already-ready feedback or a wrong timer. Information forecast: a real
+clock-domain or service-order counterexample with material captured exposure
+selects that exact owner; a deliberate bounded-recovery/feedback uncertainty
+alone does not authorize a larger timer, copy ban or additional parameter.
+Preserve useful winners and loaded native competition in the decision. No
+runtime proposal has been selected.
+
+Selected05:15+08 information transaction: instrument successful ACK admission
+at the existing registry async send AND try-send seams. Preserve the actual
+send result: async wrapper Ok currently includes a closed receiver, and try
+Full becomes a PendingMailboxFrame whose later permit publication bypasses
+the registry success branch. Record exact positive ranges, stream, scope and
+success/full/closed disposition; do not call a pre-send observation admission.
+No payload clone, queue change, ACK union/folding, wait, timer or policy change.
+All instrumentation is feature-only and event-gated; preserve failed/full
+coverage so a missing admission event cannot be read as proof of absence.
+One file, one unchanged shared500 mixed DOWN capture, existing receive,
+accepted-copy and applied-ACK events. No need to stack deadline or CPU overlays.
+
+Question: did a positive ACK covering a later accepted copy already finish
+queue admission before the decision, while its application was still pending?
+ServerFeedbackBatch correctly sends all collected positives before scopes;
+new arrivals after its fixed entry count or other Input boundaries remain a
+reachable domain, not measured prevalence.38507decision neighborhoods are
+mostly positive-only frontier-advance transactions, not old pending scopes.
+Information forecast: material successful-admission coverage selects actual
+ready-fact service ordering before any server Input correction. Little such
+coverage, with all relevant enqueue paths accounted, rejects it as the
+dominant remedy. Full/unknown coverage instead bounds the conclusion. Keep
+strict timestamp separation and lifecycle/probe barriers;1ms adjacency alone
+is not the proof. The all-copy payload scale is~39.6Mbps over40s, not a promised
+goodput or latency gain; native shared contention remains even if all copy
+work disappeared. Freeze exact overlay/binary and reverse before traffic;
+ordinary011b724 comparisons remain the performance gate. No release promotion.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

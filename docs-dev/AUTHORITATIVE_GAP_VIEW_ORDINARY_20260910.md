@@ -4566,3 +4566,234 @@ post-fallback-dominated work rejects an early-comparison change as its direct
 remedy; material early work selects that model for a counterexample before a
 fix. Decision-before-fallback does not imply later admission-before-fallback.
 No batching change,copy ban,timer increase or performance promotion follows.
+
+### Frozen fallback classification: closed diagnostic38507
+
+2026-09-11; source011b724 with the temporary one-file decision-event extension,
+build81130, then the runtime overlay fully reversed before traffic. Raw input:
+`./.tmp/reflection/results/mixed-combined-down-ordered-feedback-repair-deadline-down-0911/`.
+This section concerns exact recovery chronology, not ordinary performance;
+full probe/profile/resource accounting is separate.
+
+One session10333278507748740352, bulk stream1, is observed. Server/client event
+sequences are complete1..53452/1..221943, with no Unix timestamp regression
+after sequence ordering. Cross-role joins use shared Unix milliseconds, never
+the processes' independent t_mono origins. Client contiguous-frontier advances
+are conservative positive receipt witnesses, not sender knowledge or complete
+nonprogressing-arrival history. No bulk accepted copy partly crosses the
+previously logged server contiguous stored_frontier; the complete sparse
+positive set is not exposed, so this is not a general authority audit.
+
+The11934 queued persistent-recovery decision events classify3198 pre-fallback
+and8736 post-fallback at their EXISTING observation epoch. Their generated
+frame counts are10395 single,1519 double and20 triple. Queued decisions are
+not carrier accepts. All bulk accepted copies total14274/197872941 payload B:
+13453/171149109B persistent and821/26723832B tail. Tail decisions are outside
+this added timing event and remain separately classified.
+
+As in46891, match a persistent accept only to the latest preceding decision
+with identical start, containing end, and exact target underlay/path/incarnation.
+This joins11897 distinct decisions to11897 accepts; it does not infer timing
+for split successors. Quantiles below are per accepted copy, not byte-weighted.
+Receipt→accept uses only strictly earlier full-cover witnesses; subsequent
+server-cover delay is measured for that same already-received subset.
+
+| Decision epoch | Accepted copies / payload B | Persistent-byte share | Already client-received copies / B | Receipt→accept p50/p95,ms | Accept→server cover p50/p95,ms |
+|---|---:|---:|---:|---:|---:|
+| Before retained fallback | 3162 /42396292 | 24.772% | 3158 /42337892 | 71 /74 | 2 /7 |
+| At/after retained fallback | 8735 /117454867 | 68.627% | 8720 /117238467 | 70 /74 | 1 /6 |
+| Unjoined timing | 1556 /11297950 | 6.601% | 1555 /11295350 | 71 /75 | 1 /6 |
+
+One already-received post-fallback copy has no later logged server cover;
+the post-group last column therefore has8719 observations, not8720. The
+pre-associated payload is21.426% of ALL bulk copy bytes. Even assigning every
+unjoined persistent byte to early decisions gives only27.136% of all copy
+bytes; this is an observed-category ceiling, not a counterfactual speed gain
+or assurance that delayed work would disappear without replacement copies.
+
+The early minority is not only startup. Using5s bands from the first server
+event (not the application's start), its accepted MB are
+1.987,9.792,3.130,2.310,3.756,8.278,7.889,5.254. Post-fallback MB in those
+same bands are17.269,12.449,16.758,24.721,17.831,7.887,7.139,13.401.
+Both early and mature work repeatedly coexist with the normal return journey.
+
+All3162 joined early decisions have target ETA below their actual legacy
+owner-completion projection. Their median owner/target projections are
+778523/671738us; median retained fallback remaining is89105us. Of8735
+post-fallback decisions,1364 have target ETA at least the owner projection:
+the already-due fallback legitimately does not require that early comparison.
+Do not derive native PTO or per-assignment timing by subtracting the logged
+first-owner age from the independently retained fallback fields.
+
+Admission-clock qualification matters. `decision_before_fallback` is exact
+at observed_at; a later accepted copy need not still be early. The
+decision_to_log scalar ends just before the diagnostic call, not after all
+possible scheduling delay before its stamp. The accept event likewise follows
+the actual mutation. Millisecond subtraction is not an exact admission clock.
+Thirty early-associated copies/410808B have nominal remaining margin<=1ms;
+2937/39361580B have nominal margin>10ms, but these descriptive margins are
+not runtime thresholds or proof against unmeasured descheduling.
+
+There is an exact maturation control without a cross-event clock inference:
+server50008 records [1915124643,1915139243), fallback_in2us and
+decision_to_log10us. The boundary has passed inside the synchronous decision
+function before its return and later actor dispatch; server50010 accepts the
+14600B. Intent enqueue only mutates the actor-owned sender queue, so it cannot
+publish this carrier copy before that function returns. Separately,
+server36793→36795 shows only52us remaining then an accept-event2ms later;
+this5536B case is consistent with maturation but is not exact mutation-time
+proof. Keep it in the pre-decision-associated group rather than silently
+relabeling all early decisions as early admissions.
+
+Representative late pre-fallback chronology: [1278110428,1278125028),
+Original QUIC0/incarnation4. Client133025–133027 wholly covers it at
+Unix1789073998359ms. Server36356 decides and36358 accepts at8427ms;
+retained fallback remaining82538us, owner projection572511us, target
+TCP1/incarnation2 ETA381429us, diagnostic decision-to-log6us. Server36363
+covers the range at8430ms. The already-arrived Original head is proven:
+none of the capture's three accepted QUIC-copy intervals covers it.
+
+Nearby post-fallback example [1285439844,1285454444) also releases on Original
+QUIC (client134139–134141,Unix1789073998547ms). Server36710/36712 at8623ms
+has fallback already5610us late, owner projection623921us and target
+TCP1/incarnation2 ETA669748us; server36714 covers it at8624ms. Thus normal
+feedback-in-transit duplication is present on BOTH sides of the fallback,
+including a case that the early owner-completion comparison does not authorize.
+
+Useful mature recovery remains directly witnessed. For [576660968,576675568),
+server16818/16820 atUnix1789073985416ms records Original QUIC0/incarnation4,
+fallback496433us late and a TCP2/incarnation3 copy with ETA662548us.
+Client60199 at5541ms receives the exact14600B on TCPindex1 and releases the
+head125ms after copy admission. Token5's same-direction proof maps that index to the exact
+server target. Only two accepted copies cover this head; the second,
+server16873 at5801ms, targets TCP1/incarnation2 AFTER the first copy already
+delivered. Server16887 first logs positive cover at5892ms. The second event
+is385ms after the first, near its logged384674us copy deadline, not an exact
+reconstruction of expiry. This is a useful alternate winner followed by a
+sender-not-yet-informed retry, not evidence for banning all copies.
+
+Disposition: the information forecast resolves a material EARLY MINORITY,
+but rejects early-comparison removal as the dominant direct remedy for this
+capture's mixed copy cost. Its42.396MB accepted association is a legitimate
+scope for a separate owner-model counterexample, not proof that a new formula,
+None, unconditional loss timing or suppression would be correct or useful.
+Most classified accepted work is already post-fallback and would remain under
+an early-only change. Preserve that ceiling, the useful alternate winner and
+ordinary latency tradeoffs; no runtime recovery policy is selected here.
+
+### Diagnostic38507: full service, native cost and raw archive
+
+2026-09-11, statistics companion to the preceding exact-copy analysis. The
+closed driver returns0 in41.047531s. This is source011b724 plus the frozen
+2644B one-file diagnostic patch, build81130 (1m22s, only the pre-existing
+unused-wrapper warning), executable
+`./.tmp/reflection/bin/repair-deadline-20260911/mptunnel`.
+The observer was reversed before traffic; none of these measurements promotes
+the ordinary candidate or ranks it against a less-instrumented run.
+
+The probe reports HTTP200,2,071,133,239 body B in40.000497821s:
+414.221493Mbps. This is one duration-limited partial8GiB response, not a
+completed object. First body is0.614160s. Maximum body-read gap0.772739s runs
+from9.874723 to10.647462s, body453,763,060→453,787,060B. These are application
+body offsets, not relay DSNs. The capture preserves the worst gap, not an
+independent complete list of every body read or gap.
+
+All79 sequential64B echo exchanges succeed,5,056 exact bytes each direction;
+no timeout, unavailable record or restart is reported. Median/p95/max are
+375.743/582.986/656.397ms. Worst echo#57 runs28.915970–29.572367s; #24 is
+653.654ms at12.017202–12.670856s, and #56 is644.008ms at
+28.271938–28.915946s. Largest successive-success spacing is0.775494s between
+#23 and#24; that includes the probe's500ms cadence and is not one echo's RTT.
+Final echo#78 completes at40.246728s, after the bulk's40s work window.
+
+The40 RAW one-second body bins have no zero; the stored34-bin trimmed average
+432.787Mbps is not whole-run goodput. Complete rawMbps, by ten-second blocks:
+
+```text
+ 0– 9:   .466 146.165 457.275 473.769 403.110 451.250 348.659 578.334 412.432 358.644
+10–19: 534.729 369.331 198.060 662.621 364.215 405.278 434.066 398.098 353.302 556.139
+20–29: 431.528 409.160 450.546 386.235 447.200 450.387 470.535 420.987 412.904 241.247
+30–39: 672.038 413.773 472.767 424.319 434.062 231.237 643.795 442.102 418.193 390.013
+```
+
+| Probe-clock band,s | Raw-bin mean,Mbps | Echoes starting in band | Echo p50/p95/max,ms |
+|---|---:|---:|---:|
+|0–5|296.157|10|193.932 /332.353 /332.353|
+|5–15|427.828|20|378.240 /505.161 /653.654|
+|15–25|427.155|20|375.743 /496.500 /504.565|
+|25–40|435.891|29|439.726 /644.008 /656.397|
+|30–40,overlapping late subset|454.230|20|422.852 /582.986 /588.331|
+
+Band quantiles use the sorted successful attempts at index
+round((n−1)×quantile), matching the probe convention. High one-second bursts
+can reflect buffered delivery and sampling windows; they do not establish that
+the500Mbps cut is misconfigured. There is no QoS/restoration phase here.
+
+All41 service rows verify each class rate/ceil62,500,000B/s, UP70ms and DOWN30ms,
+zero configured loss/jitter, no whole-UDP blackhole, and zero observed class
+or netem drops. Class changes at5s epochs preserve that profile. Active traffic
+is on47: clienteth1→servereth0. The four attached carriers are three TCP and
+one QUIC, all using10.238.47.20:7443 despite their configured `*-46` names.
+The unused clienteth0/servereth1 each add only42B. This is one shared500Mbps
+cut per direction, not independent capacity for every carrier.
+
+Over first→last class samples, active DOWN wire grows2,398,404,235B and UP
+34,853,191B. Their ratios to final body are1.1580 and0.01683, respectively;
+these differently bounded native/wire/application windows are not exact
+lifetime amplification. Active DOWN class backlog peaks31,241,202B/2,815
+packets; UP peaks177,245B/1,552 packets. Native flight and qdisc backlog can
+refer to overlapping bytes and must not be added as independent queues.
+
+The final server native-delivery counters total2,298,724,017B: TCP1,120,928,198B
+(48.763%) and QUIC1,177,795,819B. These are transport ACK bytes, including
+framing/copies, not successful Original payload or application delivery.
+All four exact native epochs remain stable and counters never regress; every
+observed path remains active. Per-carrier final observations follow. IDs are
+management path/physical-instance identities, not response-copy incarnations.
+
+| Server native path/instance | Final ACKed B | SRTT final / sampled max,ms | Native flight final / sampled max,B |
+|---|---:|---:|---:|
+|TCP0/4|302386151|488.322 /651.991|405440 /9501776|
+|TCP1/3|456015755|485.120 /650.249|7926352 /7926352|
+|TCP2/2|362526292|486.305 /654.068|1640584 /6956192|
+|QUIC0/1|1177795819|487.088 /631.344|14727636 /21504037|
+
+Summed server native flight peaks35,827,564B and ends24,700,012B. Reported
+native TCP unsent queues peak530,044B summed and end125,942B; the distinct
+`ss` snapshots show summed Send-Q peak17,585,108B/end9,281,880B. Send-Q includes
+unacknowledged bytes and is not synonymous with unsent. QUIC final native
+window is26,981,413B, versus37,506,392B sampled peak; this scalar is not a
+new policy or evidence of a loss-induced stall. Client reverse native ACK
+counters end11,109,731B TCP and644,386B QUIC, with the same stable-epoch
+qualification. Management/native sampling times differ; no subsecond winner
+or exact physical residence is derived from these aggregate observations.
+
+| Process,one stable PID each | Lifetimeps CPU first / final / peak,% of one core | RSS first / final / peak,KiB |
+|---|---:|---:|
+|Client|2.7 /85.7 /85.8|32348 /92936 /94304|
+|Server|3.2 /160 /160|31968 /247892 /269816|
+
+These are lifetime `ps` percentages, not interval CPU, exclusive on-CPU work or
+thread attribution; this capture has no tick/owner/perf counters. Neither CPU
+per delivered byte nor post-load reclamation is established. Management has
+no errors. Its final snapshot precedes probe completion: bulk client delivery
+is2,069,666,495 relay B and server target-read progress2,133,139,685B. Thus
+that row cannot be used as exact final settlement, leaked retention or missing
+echo evidence. Client Broken pipe and server RemoteClosed/H3_NO_ERROR warnings
+occur at the teardown end; the complete probe still reports no echo failure.
+
+Observation cost is material: client61,983,301B plus server28,083,768B logs,
+90,067,069B total. The six enabled event types produce275,395 diagnostic
+records: client221,943/server53,452; remaining three lines are the warnings
+above. No unrelated event or perf recorder is present. This reinforces the
+information-only disposition; the414.221Mbps observation is not an ordinary
+speed win. Exact copy/receipt conclusions remain those in the prior section.
+
+Raw archive: [ORDERED_FEEDBACK_REPAIR_DEADLINE_20260911.raw.tar.gz](ORDERED_FEEDBACK_REPAIR_DEADLINE_20260911.raw.tar.gz).
+It contains the five exact result files, closed driver, frozen observer patch,
+build log, and existing run.py/shape.sh:10 regular files, no executable/config
+or secret-bearing input;5,711,088B compressed,91,792,713B uncompressed.
+Every archived member was compared byte-for-byte to
+its source without hashes. The runner and shape scripts plus observed classes
+preserve the measurement method; preceding sections state source, binary,
+event filter and profile. No runtime, threshold or controller change follows.

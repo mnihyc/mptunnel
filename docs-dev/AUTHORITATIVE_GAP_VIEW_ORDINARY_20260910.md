@@ -4027,3 +4027,261 @@ only late cannot establish a long already-decoded Input hold. Native/writer/
 decode and indirect allocation remain alternatives requiring their own exact
 join if this boundary is too small. No policy parameter, global acceptance or
 claim of optimality is justified by the current ordinary samples.
+
+## Feedback-quantum observer: measured boundary is too small
+
+This information capture falsifies direct feedback-quantum/deferred-slot
+occupancy as the material owner of its echoed-latency tail. Across both selected
+streams, every measured quantum occupies only1.836ms of wall-interval union in
+total, and the union including all measured deferred intervals is16.811ms over
+39.623923s. The run nevertheless has716.686ms echo p95 and934.747ms maximum.
+This does not rule out indirect allocation effects or other client/carrier work;
+it provides no basis to shrink the finite feedback quantum or promote performance.
+
+### Capture identity and complete measured scope
+
+Root feature build92718 exits0 in1m23s with the one existing unused-helper
+warning. Ordinary runtime011b724 plus the one-file temporary
+`feedback-quantum-observer-0911.patch` was frozen at
+`./.tmp/reflection/bin/feedback-quantum-observer-20260911/mptunnel`;
+all source instrumentation was reversed before traffic. Only
+`client_feedback_quantum` events were enabled. Lab96888 and the concurrent
+existing direct-echo worker18374 both exit0; lab driver duration41.004744s.
+No policy,shape,controller or service rule changed. This diagnostic and its
+tiny additional direct TCP connection are not an ordinary speed comparator.
+
+The [raw archive](./FEEDBACK_QUANTUM_SHARED_20260911.raw.tar.gz) is201,289B,
+13 regular files: five result files under
+`./.tmp/reflection/results/mixed-combined-down-feedback-quantum-shared-down-0911/`,
+build/driver logs,exact patch,direct-echo JSONL/stderr and unchanged helper,
+run.py and shape.sh. Gzip,tar and every decompressed-byte comparison pass.
+It preserves all40 raw body bins,76 MPP and100 direct echo attempts without
+trimming or repetition below. No configs,credentials or binaries are archived.
+
+ClientPID501844,session15081739296404950121 emits206 contiguous events,
+seq1–206:133 quanta and73 deferred records. Stream0/port10022 is the echo;
+stream1/port8080 is the bulk request. Every quantum completes, all73 barriers
+join exactly to a subsequent same-stream/kind/range deferred consumption;
+none errors,censors or remains unmatched. Consumption is Input selection,
+not DATA application or successful local delivery.
+
+| Measured quanta | Echo stream0 | Bulk stream1 | Both |
+|---|---:|---:|---:|
+| Quanta | 129 | 4 | 133 |
+| ACK /MAX frames | 119 /74 | 4 /1 | 123 /75 |
+| Successfully novel ACKs | 76 | 1 | 77 |
+| Elapsed sum,µs | 1,729 | 37 | 1,766 |
+| Pre-guard sum,µs | 2 | 0 | 2 |
+| Held-through-unlock sum,µs | 1,681 | 35 | 1,716 |
+| Maximum elapsed,µs | 84 | 33 | 84 |
+| Wall elapsed union,µs | 1,796 | 40 | 1,836 |
+| Wall held union,µs | 1,762 | 38 | 1,800 |
+
+The finite quanta contain70 single-frame,61 two-frame and2 three-frame groups;
+maximum additional-ready count is3. Bulk's four quanta end within .272899s
+of its first quantum; the changed request-feedback scope is not a bulk response
+ACK-processing trace. Barriers are60 none,58 Probe,14 DATA and1 Receipt.
+Deferred monotonic sums/maxima are DATA1,461/216µs,Probe13,482/3,777µs,
+Receipt129/129µs; all73 total15,072µs,wall union15,117µs. Thirteen DATA
+barriers are echo replies and one is the bulk header range[0,208).
+
+The maximum84µs quantum is echo seq134 at Unix1789071377143907→1789071377143991µs,
+with two applied frames and DATA barrier[3200,3264). Its deferred slot is
+stored1789071377143988µs and consumed1789071377144205µs (216µs monotonic). The largest
+3.777ms deferred interval,seq164,is a Probe, not a delayed DATA frame.
+Deferred intervals begin before the quantum unlock and overlap its tail:
+never add their sums as independent CPU or wall occupancy. Their combined
+wall union with all quanta is16,811µs,not16,953µs summed wall lengths.
+
+Instant-derived integer microseconds truncate submicrosecond work; separately
+read Unix stamps differ from elapsed values by at most1µs per quantum.
+Thus zero pre-guard values are not mathematical zero. Pre-guard includes
+ready-count work and lock acquisition, not pure lock wait. Held time ends
+after guard release/notification, before event formatting/emission. All logs
+are after unlock, so measured times are not total observer overhead or CPU.
+The observer excludes unrelated Product guards, native writers and time before
+this Input boundary. Barrier metadata lacks ingress identity; no repair/winner
+carrier or per-echo decoded residence can be manufactured from these records.
+
+### Own service and direct-path context
+
+MPP returns HTTP200 with2,044,950,416 bodyB over40.000416s,408.986Mbps,
+one duration-limited partial8GiB request. First body .578227s; maximum gap
+.493925s at11.583174→12.077099s,557,515,494→557,581,030B. All40 raw bins
+are positive. All76 MPP echoes succeed,4,864 request/responseB,p50/p95/max
+359.938/716.686/934.747ms; maximum success spacing1.108154s. Worst echo42
+is22.257505→23.192252s. Echo8 at4.000833→4.917966s takes917.133ms.
+Neither is assigned to a carrier or actor by this observer.
+
+| Own probe phase | Body,Mbps | Echo n | Echo p50 /p95 /max,ms |
+|---|---:|---:|---:|
+| 0–5 | 314.683 | 10 | 217.882 /917.133 /917.133 |
+| 5–15 | 429.063 | 18 | 415.911 /688.184 /716.686 |
+| 15–25 | 447.810 | 19 | 438.493 /679.994 /934.747 |
+| 25–40 | 401.158 | 29 | 241.479 /436.051 /797.185 |
+
+The direct worker independently starts at Unix1789071348951676502ns and runs
+50s; all100 attempts succeed,6,400 request/responseB. Its full50s median
+282.774ms is NOT a loaded-only median. First foreground management stamps are
+1789071349566/1789071349571ms,first echo quantum1789071349804.677ms;
+last management1789071389570ms and final server teardown warning1789071390635ms.
+There is no exact saved
+probe wall-start, so unmatched probe/direct medians cannot be subtracted into
+an exact MPP stage. Coarse loaded overlap is clear: source/body counters advance
+at every management adjacency1→40. Direct offsets3–39s lie inside that active
+body-service interval with margin; offsets43–50s follow teardown.
+
+| Direct worker start-offset band,s | Interpretation | n | p50 /p95 /max,ms |
+|---|---|---:|---:|
+| 0–1 | Early startup,not a matched loaded baseline | 2 | 100.283 /100.384 /100.384 |
+| 1–3 | Startup transition | 4 | 108.909 /276.446 /276.446 |
+| 3–39 | Conservative loaded interior | 72 | 361.195 /528.898 /570.255 |
+| 39–43 | End/teardown transition | 8 | 100.466 /185.421 /185.421 |
+| 43–50 | Post-teardown quiet | 14 | 100.226 /100.249 /100.254 |
+
+The bypass therefore independently experiences substantial loaded common-path
+or host delay, with a quiet return to≈100ms. It does not traverse MPP's logical
+feedback owner, but has its own TCP connection/controller and host work; this
+is not proof that a particular MPP echo has the same delay or zero extra delay.
+
+### Physical/native cost and disposition
+
+All41 profiles verify unchanged500Mbps rate=ceil,65536B bursts,8192 netem
+limit,UP70/DOWN30ms,zero loss/jitter/blackhole and zero class/qdisc drop deltas.
+Only47 materially contributes; unused46 adds42B per role. ServerPID506778 and
+client501844 retain four active path/native-epoch identities from sample1.
+Native distributions below use samples5–40; TCP quantiles pool three paths.
+
+| Own sampled cost/context | Measurement |
+|---|---:|
+| Sample duration | 40.004548s |
+| DOWN /UP47 class bytes | 2,384,181,163 /39,405,200 |
+| DOWN backlog p50 /p95 /max /final,B | 15,130,020 /28,333,797 /30,003,942 /3,069,990 |
+| UP backlog p50 /p95 /max /final,B | 61,158 /103,402 /110,834 /151 |
+| Client RSS peak /final,KiB | 80,512 /80,512 |
+| Server RSS peak /final,KiB | 324,052 /298,404 |
+| Client lifetime CPU peak /final,% | 77.9 /77.8 |
+| Server lifetime CPU peak /final,% | 191 /191 |
+| Server QUIC RTT p50 /p95 /max,ms | 348.929 /526.576 /545.392 |
+| Server TCP RTT p50 /p95 /max,ms | 352.895 /543.296 /568.560 |
+| Server QUIC flight p50 /p95 /max,B | 13,801,260 /22,031,196 /25,335,895 |
+| Final sampled native TCP /QUIC ACKedB | 779,978,913 /1,515,345,191 |
+
+Socket snapshots identify BBR. These native and physical queues corroborate
+loaded delay, not critical-byte ownership; sample tails/native control-copy
+domains are not synchronized with final body bytes. Lifetime ps CPU is not
+instantaneous CPU or observer overhead. Client log100,054B contains206 events
+and one final Broken pipe warning; server316B has the final RemoteClosed and
+H3_NO_ERROR. Both probe/direct stderr files are empty. No failed echo or
+post-teardown memory-leak conclusion is hidden in those warnings.
+
+Information forecast succeeds: the full measured quantum/deferred occupancy
+is far too small to own this run's100ms-class excess. Native/shared delay is
+independently visible through the direct companion, while any additional MPP
+echo service delay remains unassigned. Stop the quantum-size hypothesis here;
+do not infer a replacement timer/queue policy or ordinary performance acceptance.
+
+## Ordinary single-underlay context: mixed tail/cost penalty remains
+
+The declared QUIC-only58584 and TCP-only48379 cells both finish0, sequentially,
+using ordinary011b724 and the same shared500Mbps zero-impairment profile.
+There is no diagnostic overlay or extra direct companion. The two existing
+ordinary mixed-candidate realizations are retained as comparators, not rerun.
+Both single-underlay cells deliver more body bytes and lower echo p95 than
+either mixed realization. This establishes a practical mixed-context penalty,
+not its causal owner or a fixed protocol preference. TCP-only's median302.990ms
+is worse than mixed's first268.514ms median but better than its second348.040ms;
+do not turn the tail result into a uniform ranking of all metrics.
+
+The [context archive](./ORDERED_FEEDBACK_SHARED_CONTEXT_20260911.raw.tar.gz)
+is206,917B,14 regular files: both five-file results,two drivers,run.py and
+shape.sh. Gzip,tar and every decompressed-byte comparison pass. Result stems
+are `{quic,tcp}-combined-down-ordered-feedback-shared-context-{quic,tcp}-down-0911`.
+Every80 raw one-second bins and160 echo attempts are retained there, without
+trimming or reprinting the full series. No configs,credentials or binaries.
+Drivers close in41.005560/41.004401s. No runtime/build/queue/controller change
+or equal-load intervention was made for this comparison.
+
+| Ordinary DOWN outcome | QUIC-only | TCP-only | Mixed first | Mixed reverse-order |
+|---|---:|---:|---:|---:|
+| HTTP body,B | 2,147,273,508 | 2,215,548,070 | 1,989,019,582 | 2,020,457,306 |
+| Body duration,s | 40.000307 | 40.035023 | 40.000153 | 40.000157 |
+| Whole goodput,Mbps | 429.451 | 442.722 | 397.802 | 404.090 |
+| First body,s | .412756 | .579834 | .583844 | .580545 |
+| Maximum body gap,s | .100666 | .368722 | .372282 | .274600 |
+| Echo successes /attempts | 80 /80 | 80 /80 | 80 /80 | 79 /79 |
+| Echo p50 /p95 /max,ms | 103.955 /155.291 /312.639 | 302.990 /348.148 /472.096 | 268.514 /530.808 /581.266 | 348.040 /526.798 /788.622 |
+| Maximum echo-success spacing,s | .683827 | .667702 | .848482 | 1.035332 |
+
+The new cells both have HTTP200,one duration-limited partial8GiB request,
+40 positive raw body bins and zero failed/disconnected echoes; each echoes
+5120B in each direction. TCP's final read extends body duration35ms beyond40s;
+retain its actual duration and counters, not an inferred exact40s rate.
+Q's maximum body gap is .513080→.613746s,48,000→113,536B; worst echo4
+is2.000680→2.313319s. TCP's maximum body gap is11.379579→11.748301s,
+596,295,024→596,360,507B; worst echo44 is22.005952→22.478048s.
+Body and echo maxima need not identify the same service interval.
+
+| New-cell probe phase | QUIC body,Mbps | TCP body,Mbps | QUIC echo p50 /p95,ms | TCP echo p50 /p95,ms |
+|---|---:|---:|---:|---:|
+| 0–5,10 echoes each | 344.759 | 350.620 | 105.002 /312.639 | 296.348 /321.981 |
+| 5–15,20 each | 445.343 | 457.921 | 104.192 /153.503 | 306.289 /348.374 |
+| 15–25,20 each | 437.628 | 453.903 | 103.452 /151.333 | 305.032 /341.551 |
+| 25–40,30 each | 441.636 | 456.835 | 103.762 /144.841 | 299.352 /316.520 |
+
+Both sets of41 physical samples verify500Mbps rate=ceil,65536B burst/cburst,
+8192 netem limit,physical UP70/DOWN30ms,no loss/jitter/blackhole and zero
+class/qdisc drop deltas. Only47 materially contributes; unused46 adds42B per
+role. QUIC session6844004768702610990 keeps one native path/epoch from sample0;
+TCP session17844283929592175503 keeps three from sample1,all active throughout.
+TCP socket records identify BBR with kernel minrtt100.019–100.020ms. Neither
+mode is a raw single-flow baseline or an equal-independent-controller control
+for mixed's three TCP plus one QUIC paths.
+
+| Sampled cost/native context | QUIC-only | TCP-only |
+|---|---:|---:|
+| Sample duration,s | 40.005358 | 40.004167 |
+| DOWN /UP47 class bytes | 2,269,813,446 /36,995,741 | 2,337,535,995 /8,581,149 |
+| DOWN backlog p50 /p95 /max,B | 1,912,320 /5,739,948 /11,787,660 | 14,075,786 /16,415,244 /16,850,144 |
+| DOWN final backlog,B | 1,937,718 | 13,911,668 |
+| UP backlog p50 /max /final,B | 55,498 /80,920 /84 | 16,103 /25,541 /7,950 |
+| Client RSS peak /final,KiB | 37,844 /37,844 | 32,744 /26,524 |
+| Server RSS peak /final,KiB | 368,200 /360,328 | 137,344 /129,828 |
+| Client lifetime CPU peak /final,% | 93.7 /93.3 | 21.4 /21.3 |
+| Server lifetime CPU peak /final,% | 155 /155 | 56 /53.6 |
+| Server native RTT p50 /p95 /max,ms | 101.377 /149.317 /162.480 | 295.454 /341.291 /342.625 |
+| Server native flight p50 /p95,B | 5,960,460 /9,771,960 | 1,920,048 /16,905,400 per TCP path |
+| Server native queue p50 /p95 /max,B | 0 /0 /0 | 125,680 /130,933 /166,466 per TCP path |
+| Final sampled native ACKedB | 2,200,349,184 | 2,231,778,855 |
+
+Native distributions use samples5–40 (36 QUIC or108 TCP path samples).
+QUIC's near-baseline echo coexists with≈101ms native RTT and low shared queue;
+TCP's≈303ms echo coexists with≈295ms native RTT and a14.076MB median shared
+queue. Mixed's native/physical tails are larger and more variable in the two
+preserved cells. These coarse similarities are not matched per-request
+latency-stage subtraction. They identify an important context confounder, not
+the exact winning echo path or the cause of its excess residence.
+
+Observed DOWN class-byte/body-byte ratios are1.057068/1.055060 in Q/TCP,
+versus1.209765/1.186704 in mixed. Return ratios are .017229/.003873 versus
+mixed .019481/.018184. Thus mixed serves fewer useful bytes with more sampled
+wire overhead and higher server lifetime CPU (188/187% versus155/53.6%).
+Q has higher server RSS than either mixed realization, whereas TCP is much
+lower; retain that tradeoff. Native ACK counts include control,Original and
+repair domains; ordinary captures do not expose accepted repair-cause/unique-
+duplicate receipt counters. Neither class/body residual nor native ACK/body
+subtraction proves repair volume,unnecessary copies or an allocation defect.
+Timing windows and final transit/cancellation tails remain unequal.
+
+Both stderr files are empty. Q has final client Broken pipe and server
+H3_NO_ERROR; TCP has final client reset and server RemoteClosed after successful
+duration-limited results. These are not additional failed echo attempts.
+Lifetime CPU is not interval CPU,finite-headroom cost is not waived,and final
+RSS/backlog is not a post-teardown leak measurement.
+
+Disposition: the mode context strengthens the mixed tail/throughput/cost
+concern but does not select a native or MPP policy change. Existing quantum
+observation already rejects that measured boundary as the material delay owner
+in its own capture; these ordinary modes do not identify the remaining owner.
+No fixed TCP/QUIC preference,copy suppression,release acceptance or claim that
+the overall model is proved follows. Root retains the next exact-cause decision.

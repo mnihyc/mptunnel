@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 03:56 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 04:40 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -15,7 +15,8 @@ Condensation waives no failure and reactivates no rejected candidate.
 
 Runtime checkpoint **011b724**, finite ordered ACK/MAX Input service, is retained.
 Frozen ordinary binary: ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
-target/release/mptunnel is the same ordinary candidate, not an observer.
+target/release/mptunnel is the frozen feedback-quantum diagnostic, NOT ordinary.
+Use the explicit ordinary path above. All observer runtime edits are reversed.
 Only the user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md remains unrelated
 dirty source; never edit/stage it. No runtime changes are currently proposed.
 
@@ -201,6 +202,105 @@ one unchanged shared500 healthy DOWN cell with the observer, freeze exact patch/
 binary and reverse source before running. Ordinary pairs remain the performance
 evidence. No old membership injection or12-file observer transplanted.
 
+04:12+08: source observer is one file,255insertions/1 textual brace rewrite;
+cfg-stripped ordinary semantics unchanged. Root starts the witness before
+ready_frame_count, so pre_guard_us includes that capture plus Product wait;
+held_until_post_unlock includes release/notification. Actual deferred-slot
+take/censored actor exit is scalar-tracked; monotonic durations are separate
+from approximate Unix alignment. Independent actual-diff audit PASS.
+Root sole feature build92718 running,4cargo jobs, no lab overlap. Exact patch
+./.tmp/reflection/feedback-quantum-observer-0911.patch; build log same stem
+with -build. Freeze bin/feedback-quantum-observer-20260911/mptunnel on success,
+reverse all observer source before one same shared500 DOWN diagnostic capture.
+
+Reuse the existing direct_echo_context.py alongside that capture:64B raw TCP
+echo every500ms across the SAME active47 cut. This adds a tiny diagnostic load,
+not an ordinary performance comparison. Its existing start wall timestamp and
+all50s records distinguish coarse common-queue delay from tunnel-only delay;
+pre-load/post-load records stay visible. It does not identify the winning MPP
+copy's exact native residence. No new harness, source/controller tweak or
+additional shaping is needed. This cheap context avoids guessing network delay
+from global queue/RTT values if local quantum occupancy proves too small.
+
+04:15+08 execution: build92718 CLOSED0 in1m23 (one existing unused-wrapper
+warning), exact patch comparison passes. Frozen diagnostic binary exists;
+ALL observer source reversed, runtime011b724 clean. target/release/mptunnel
+is now diagnostic—do NOT use it for an ordinary comparison by assumption.
+Diagnostic lab96888 and direct-echo18374 running, no compile overlap. Tag
+feedback-quantum-shared-down-0911, event client_feedback_quantum only;
+direct-echo-feedback-quantum-0911.jsonl preserves the separate wall start.
+Both sessions CLOSED0. Diagnostic408.986Mbps; MPP echo76/76successful,
+p50/p95/max359.938/716.686/934.747ms. Exact206events:133completedquanta,
+73consumeddeferreditems, no censored. Across both streams allquantumelapsed
+sum1.766ms (max84us), held1.716ms; all deferredsum15.072ms (max3.777msProbe).
+Fourteen DATA barriers total1.461ms,max216us. Overlap is NOT additive CPU.
+This is too little direct changed-boundary residence to explain100ms-class
+echo harm; do not shrink or remove the quantum from that causal hypothesis.
+Unchanged preselect/native residence and indirect allocation remain distinct.
+
+Existing raw companion100/100succeeds. Safely interior direct-offset3–39s:
+72echoes p50/p95/max361.195/528.898/570.255ms. Postteardown43–50s returns
+to100.226/100.249/100.254ms. Approximate wall anchors support those conservative
+bands, NOT exact request pairing or quantile subtraction. Common loaded-link
+queueing is demonstrated; extra MPP delay remains unassigned. Reader is archiving
+all data and checking timing/costs; no deployedCPU attribution follows.
+
+Next predeclared context ablation,04:20+08: ordinary current011b724 QUIC-only
+then TCP-only DOWN, same shared500/UP70DOWN30/zeroimpairment/40s bulk+echo as
+the original ordinary mixed pairs. Reuse those TWO mixed candidate outcomes;
+do not rerun mixed to get a better tail. No extra raw companion in these ordinary
+cells, no build/controller/queue/parameter change. Tags
+ordered-feedback-shared-context-{quic,tcp}-down-0911.
+Information forecast: if single-mode tails remain much lower with comparable
+useful service, joint carrier/native load is a material mixed-context owner;
+if they also inflate, do not call the penalty mixed-only. Native/wire/copy
+attribution still requires its own evidence; neither outcome justifies fixed
+QUIC preference or bottleneck partitions. These are bounded existing-owner
+ablations, not resumed release promotion or a final baseline comparison.
+
+Context58584/48379 both CLOSED0: QUIC429.451Mbps with echo p50/p95/max
+103.955/155.291/312.639ms; TCP442.722Mbps with302.990/348.148/472.096ms;
+80/80successful each. Both beat the two ordinary mixed candidates in throughput
+and echo p95, while TCP median is not uniformly better. Full matched profiles
+and native queues verified: TCP-only already has ~14MB median shared backlog.
+The native/joint-load versus MPP cross-carrier mechanism remains unseparated.
+
+Next one context discriminator,04:30+08: unchanged ordinary QUIC-only foreground
+bulk+echo, plus THREE independent raw TCP downloads on the SAME active47 cut.
+Use existing failover_download_probe.py --parallel-downloads3, synchronized
+start, fixed one HTTP request per worker,40s/50s guard, no proxy, target47:8080.
+This matches the three native TCP competitors plus one QUIC count, but removes
+MPP TCP-carrier striping, TCP-associated Product repair and TCP tunnel framing.
+It is not an equal-byte/encryption workload or a baseline rank. Source/CC/
+shaping unchanged; workload-only ablation. Save raw start anchor and every
+series/failure; one native socket snapshot verifies raw TCP CC/path while active.
+Information forecast: if large QUIC/echo/shared-queue inflation appears, native
+competition is sufficient without MPP cross-carrier ordering; if absent, those
+MPP work/allocation differences remain live causes, not a proof of one. Compare
+coarsely aligned interior phases, not summed unaligned rates or an oracle claim.
+No new harness, protocol preference, inferred bottleneck partition or runtime fix.
+
+Native-competition29796/raw93933/socket71552 all CLOSED0, no process remains.
+QUIC foreground179.994Mbps; echo80/80successful, p50/p95/max
+252.303/412.535/773.214ms. Three fixed raw TCP requests carry284.129Mbps over
+their own40.001199s; all duration-partial,0failed/0replacement. Native snapshot
+verifies three BBR sockets on the SAME47cut, RTT331–339ms/minRTT100ms.
+Do not add unmatched whole-window rates as exact aggregate service or identify
+echo queue residence from socket NOTSENT. The raw start anchor is preserved.
+Native competition produces substantial loaded delay without MPP TCP framing,
+striping or associated Product repair; it does NOT prove all mixed overhead
+unavoidable or authorize fixed protocol preference. Reader is closing the full
+phase/native/cost comparison and archive. Current source remains011b724 clean.
+
+The observer and ordinary single-mode context appendices are complete. Root
+read their152/104lines and checked both gzip/manifests; reader verified every
+decompressed input byte. The direct quantum-occupancy hypothesis is stopped.
+Next bounded source question: can existing accepted Original/copy and receipt
+observation identify the current mixed wire cost and its exact repair owner?
+Do not infer repair volume merely from the class/body residual. Separately,
+review the smallest CPU/journal snapshot discriminator without changing native
+coherence or claiming elapsed wait is on-CPU work. No new runtime fix selected.
+
 ## Separate open issue: one-core burst near20%QUIC loss
 
 [Four ordinary500Mbps DOWN controls](QUIC_LOSS_CPU_20260910.md) on d44:
@@ -285,6 +385,6 @@ nonrenewing clocks, half-close/cancel and retained capacity wakes.
 Build/artifact identities and failed candidates remain explicit; never run an
 old target/release by assumption. Exact commits only; docs-dev requires force-add.
 PROGRESS is ignored continuity. AGENTS.md immutable; userdoc+7lines untouched.
-Telegram last19:21UTC, next nonurgent>=20:21UTC. Commentary within60s; verification
+Telegram last20:22:42UTC, next nonurgent>=21:22:42UTC. Commentary within60s; verification
 polls by minutes. Before compaction record current sessions, next decision,
 source/binary identities and open/adverse outcomes. Do not stop at a checkpoint.

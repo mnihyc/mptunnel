@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 07:38 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 07:54 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -12,8 +12,10 @@ Continue the authorized closure loop; an intermediary commit is not completion.
   net service gain. User's seven-line edit is untouched.
 - Diagnostic83561 exposes clipped-range owner-target refusals on real blocked
   prefixes; true producer RED46767 fails0vs14600B after its reachability checks.
-  The bounded exact-range exclusion correction is under targeted GREEN79627
-  after independent review. No practical gain or timer/controller change claimed.
+  The bounded exact-range exclusion correction04f1e56 passes152focused checks
+  and independent review. Ordinary95178 completes, but shorter stalls accompany
+  lower useful speed and higher wire/queue cost. Exact defect fixed; composition
+  UNACCEPTED. Next separate assigned/received/completed frontiers, not tune.
 - The finite client Input correction materially improves upload, including
   QoS+QUIC outage: exact-confirmed56.280→186.629Mbps; settlement79.379→43.147s.
   However,6.382s confirmation gap remains. Trace THIS return prefix now.
@@ -42,12 +44,13 @@ Condensation waives no failure and reactivates no rejected candidate.
 
 Ordinary comparator runtime is **011b724**, finite ordered ACK/MAX Input
 service, with binary ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
-Current uncommitted candidate adds only the two-file clipped repair-range
+Current trial04f1e56 adds only the two-file clipped repair-range
 correction described below, plus its focused tests and RFC clarification.
 Rejected **f8b8cac** remains a tracking checkpoint; its frozen ordinary binary
 ./.tmp/reflection/bin/logical-feedback-20260911/mptunnel is NOT active design.
-target/release/mptunnel is the frozen gap-avoidance DIAGNOSTIC, not ordinary
-source or the current candidate; do not use it by default. Use explicit binary
+Ordinary04f1e56 is frozen under ./.tmp/reflection/bin/clipped-range-20260911/mptunnel.
+target/release/mptunnel is the two-file prefix DIAGNOSTIC, also frozen under
+./.tmp/reflection/bin/clipped-prefix-20260911/mptunnel. Use explicit binary
 paths. All observer and rejected-trial runtime edits are reversed.
 The user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md is unrelated
 dirty source; never edit/stage it. The temporary two-file ACK-admission observer
@@ -1054,6 +1057,84 @@ not accepted as a speed improvement. Exact five-file patch is frozen at
 ./.tmp/reflection/clipped-range-candidate-0911.patch. Next ordinary build with
 four jobs, no diagnostics; then the one predeclared outage UP comparison.
 
+07:42+08 ordinary build91090 CLOSED0 in1m23, existing unused-wrapper warning
+only. Frozen patch exactly matches04f1e56. No source edits during/after build;
+the unrelated userdoc remains untouched. Sole lab95178 uses explicit
+clipped-range-20260911 binary and tag clipped-range-outage-candidate-0911,
+the declared independent200+200/UP70DOWN30/46UP10/UDPoutage profile, default
+config and management+target observation, no diagnostics or compiler overlap.
+Compare complete ordinary timing/cost, not live partial rates.
+
+07:50+08 ordinary95178 CLOSED0:960823296B/43.614186s=176.241Mbps versus
+011186.629 (-5.57%). Every accepted byte confirms; no failures. First write/
+confirmation .105407/.408633s versus .105107/.407922s. Worst write2.636582→
+1.865375s and confirmation6.382488→1.717023s, raw zeros10→1 are material
+continuity improvements, not "no benefit". However late36–38raw bins4.717/0/
+2.623Mbps remain poor. Actual server target790859308B stays flat over distinct
+36.956163/37.956163s snapshots, then reaches791186988 at38.956163:327680B
+over2s, versus baseline185.855Mbps in its own corresponding target window.
+Source−target=64MiB at both later snapshots. Q46/Q47nativeACKs advance39.171/
+42.051MB with stable epochs; this is neither whole native freeze nor solely
+held confirmation. Independent source correction confirms public target totals
+come from ObservedProductIo successful poll_write/vectored, not PathDeliveryStats
+pre-write receipt. They include successful partial writes, not whole flushes.
+
+Costs: sampledUP1.698→1.803GB, wire/confirmed1.6866→1.8760 (+11.23%); peak
+summedUPbacklog23.89→38.66MB, clientnativeflight24.34→61.23MB. These are sampled
+windows, not lifetime exact efficiency. Five repeated client management producer
+timestamps and one server repeat must not be treated as fresh observations.
+No source-level CPU attribution from lifetimeps. Full independent appendix and
+archive in progress. No healthy-gate promotion or favourable ordinary repeat.
+
+Disposition: retain04f1e56 as **exact defect fixed / composition unaccepted**.
+Unlike the elective f8 feedback-boundary change, this repairs an existing exact
+range-selection contract with actual producer/live-prefix evidence. Its necessity
+does not waive the observed wire/queue/late-service tradeoff; one local fix is
+not required to solve every unrelated stall, and one pair does not prove it
+caused this one. No new runtime correction may be stacked without attribution.
+
+Next bounded information transaction: reuse ONLY the client/server prefix fields
+from ./.tmp/reflection/prefix-owner-trace-final-0911.patch on04f1e56, not its
+owner/perf infrastructure or old executable. One coherent client Product sample
+of assigned A, unassigned U, retained C, positive F, known G and peerMAX; server
+received R/reorder plus completed-write W. Sample at existing service points,
+once per second, selected stream0. Keep successful write/flush completion
+accounting across unlogged batches. Paired sampled write begin/end distinguish
+their exact await residence; unlogged long writes remain unknown, not proof of
+absence. Public target totals/sink queues corroborate partial write acceptance.
+No new async task, waits, controller, timers, queue, eligibility or ownership.
+
+Question: does late actual target stagnation have A=R=W with source U waiting,
+R>W pending delivery, or A>R with an actual receive hole? The first selects
+assignment/feedback ownership, second local write/service, third exact missing
+range recovery. Silence is not a state; snapshots cannot prove native or reader
+starvation without another exact readiness witness. No critical plateau means
+no attribution, not a favourable performance result or automatic extra capture.
+This reuses a previously decisive low-volume discriminator instead of another
+large repair log. One unchanged200+200QoS/outageUP capture; freeze/reverse the
+two-file feature-only overlay before traffic. No claimed speed gain from it.
+
+07:52+08 observer subset root/independent review PASS: only control.rs(+53) and
+server.rs(+109/−2), copied from the saved earlier instrument with current context/
+formatting. No owner/perf files restored. The existing write future is constructed
+once and its result propagated unchanged; successful W advances for every batch,
+errors preserve unknown partial progress. Sample await includes feedback wrapper/
+scheduling and begin-log cost, not pure socket CPU/time. Sole featurebuild30981
+is running, fourjobs; exact patch frozen at clipped-prefix-observer-0911.patch.
+On completion freeze bin/clipped-prefix-20260911, reverse both source files,
+then ONE tag clipped-range-prefix-diagnostic-0911 with request_prefix_state,
+server_request_prefix_state,server_request_target_write,server_receive_hole,
+server_receive_delivery_stall; selected stream0. No all-repair/ACK/perf logging.
+
+07:54+08 build30981 CLOSED0 in1m23, existing unused-wrapper warning only.
+Exact two-file patch unchanged during build; binary frozen and all observer
+source reversed before solelab77827. Root's first reverse-patch converter read
+git diff -R's swapped a/b header incorrectly and failed before modifying files;
+corrected header parsing and empty source diff verified before launch. No Product
+or measurement failure followed. No compiler/lab overlap. Root read all160lines
+of the95178 appendix and verified21-member archive integrity/manifest; independent
+raw byte checks pass. Main source04f1e56; only user's seven-line file unrelated.
+
 ## Separate open issue: one-core burst near20%QUIC loss
 
 [Four ordinary500Mbps DOWN controls](QUIC_LOSS_CPU_20260910.md) on d44:
@@ -1123,6 +1204,16 @@ saturation is not this collapse's owner. One actual echo timeout plus27later
 unavailable records are preserved. No loss threshold or native tuning follows.
 Root read the complete116line appendix; reader's19file archive verifies both
 invocations and every input byte. Source remains011b724; no runtime fix here.
+
+07:50+08 read-only follow-up finds no proven spin. Native BBR3 callbacks retain/
+scan packet metadata and mutable journal epochs for current ACK/late-terminal
+evidence; checked journal admission still compacts before its absorbing RawOnly
+fallback. Finite storage does not prove cheap callbacks, nor their CPU dominance.
+A harmless task-clock profiler preflight is permission-denied; no sudo/settings/
+capability or attach bypass followed. User was asked asynchronously for scoped
+sudo lab profiling approval; none received yet. No new CPU observer/experiment
+selected while main ordinary recovery attribution continues. Incident remains
+unassigned, separate from the demonstrated low-CPU late native contraction.
 
 ## Preserved dispositions: do not revive or erase
 

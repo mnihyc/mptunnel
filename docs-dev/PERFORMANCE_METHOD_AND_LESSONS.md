@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-10 15:13 +08:00. Category: requested global retrospective and
+Updated: 2026-09-10 18:02 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -252,6 +252,19 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- Bounded output is not bounded selection work. The09-10 authoritative-gap
+  pilot fixes a real one-head service counterexample and passes95checks, yet
+  ordinary upload stalls26.666s and fails settlement. Enumeration multiplied
+  the earlier corrected uniform-frontier query by many unavailable regions.
+  A separate small periodic observer locates31.400s synchronous owner work in
+  a37.167s target-flat/reply-held interval; max single call19.387ms. This is a
+  material cumulative-work defect, not a microsecond optimization or one19s
+  call. Before adding an enumerator, compose query cost with candidate count
+  and invocation frequency, and include blocked/no-target service, not just a
+  successful first candidate. Preserve exact masks and clock ownership when
+  sharing immutable geometry. A view/work-count GREEN still needs the SAME
+  ordinary failure/completion and cost gates; elapsed totals do not promise an
+  equal wall-clock gain or identify each reply's lock wait.
 - Native handoff correction can change allocation without changing congestion
   control. The09-10 exact W−Q observation locates1.353s of a1.497s echo inside
   TCP unsent FIFO; native refill reduces ordinary TCP p95 from1269→323ms and

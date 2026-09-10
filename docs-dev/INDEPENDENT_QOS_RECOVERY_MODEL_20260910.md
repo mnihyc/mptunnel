@@ -303,3 +303,55 @@ periodic timing/region-count observer is selected to distinguish expensive
 enumeration from short wake/dispatch loops or downstream native service. It
 does not change timing, quantum, congestion, admission or the tested profile.
 This is an information forecast, not another claimed performance correction.
+
+## Measured work owner and equivalent query correction
+
+2026-09-10 17:54 +08:00. The information-only capture settles exactly427,098,112B
+in83.485s but reproduces19.444s confirmation gaps. It is not ordinary acceptance.
+There are30,766 synchronous service evaluations totaling55.692s elapsed; nested
+owner-model queries consume53.014s over7,776,602queries, clock queries only.911s.
+Actual flush stamps delimit37.167s inside the target-flat/reply-held interval;
+31.400s is synchronous evaluation,30.334s of it model queries. Max single call
+is19.387ms there: repeated cumulative work, not one19-second critical section.
+Source locates these non-awaiting calls under SharedRequestProduct, ahead of
+the cooperative event selector. Per-reply lock residence is not directly
+measured; nested durations cannot be summed or converted into a promised gain.
+
+The earlier uniform-frontier sweep fixed one query's quadratic coverage work.
+The new enumeration multiplied whole-horizon queries by unavailable assignment
+regions, reinstating expensive repeated work at the caller. One bounded output
+quantum is not a bound on the work required to select it. This practical failure
+is why component ownership proofs cannot replace ordinary timing acceptance.
+
+Selected minimum correction: build one transient per-evaluation exact-instance
+view with normalized Original coverage and all-accepted-flight avoidance
+coverage. All ledger spans participate, including copies crossing the queried
+start. Query with the current eligible-instance mask, not a cached native/
+qualification decision. Binary search locates membership at the candidate
+start and its next change; the minimum such change is exactly the old constant
+owner/avoid frontier. Adjacent same-identity intervals merge, but assignment
+boundaries used for maturity enumeration remain separate.
+
+Replace only the first full-horizon query. Keep the existing second scored-
+quantum query for exact assignment metadata, lazy timing and immediate sibling
+writeback, target observation/scoring, exact-start lower copy lookup, and final
+Apply. The first view's avoidance is a set; its order never ranks targets.
+Compare that set with the scored query by membership, while the latter's
+target-facing order stays unchanged. No timing or shared response modification.
+
+For F retained spans, P exact instances and B candidate regions, this removes
+repeated whole-horizon endpoint construction/sorting in favor of one expected
+O(F) coverage build plus per-region membership/binary searches. Existing scored
+and lower-helper prefix scans remain; no blanket linear evaluator complexity
+claim is made. The view is dropped after one evaluation, with no durable index,
+new parameter, iteration cap or stale target reservation.
+
+Forecast: remove a material fraction of the observed53s model work and let
+receipt/claimants reach their existing service loop sooner. It cannot promise
+that all19–26s gaps disappear or erase duplicate/native queue costs. RED must
+exercise actual evaluation with real assignments and unavailable target, then
+an available-target control, counting the existing model sweep's work rather
+than a wall-time threshold. GREEN includes view/oracle range+membership checks,
+old95controls and the identical ordinary QoS upload. Reject promotion again
+if it still fails completion or materially regresses healthy/restored service;
+do not tune the quantum, clocks, reserve or profile to rescue it.

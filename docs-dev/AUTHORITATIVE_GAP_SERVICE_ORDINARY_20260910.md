@@ -190,3 +190,145 @@ other stages, without changing decisions. That capture has not run at report
 creation. Preserve this ordinary failure independently; a later observer cannot
 retroactively complete its missing bytes or replace its empty confirmation bins.
 No public README update, release or performance acceptance follows this trial.
+
+## Separate diagnostic: expensive repeated owner work during confirmation starvation
+
+The subsequent `aggregate-combined-up-authoritative-gap-service-profile-0910`
+capture is information-only, not a replacement ordinary comparison. Its one-file
+feature overlay adds three aggregate counters around the existing request
+evaluator/model/assignment-clock regions, without changing decisions. The exact
+patch is `./.tmp/reflection/authoritative-gap-service-profile-0910.patch`;
+the optimized feature build takes86s with the same existing dead-code warning.
+Root freezes `./.tmp/reflection/bin/authoritative-gap-service-profile-20260910/`
+and reverses the overlay before traffic. No per-query or per-call samples run.
+
+This capture **settles eventually but reproduces severe confirmation stalls**:
+427,098,112B accepted=confirmed in83.485320s, valid exact accounting,1/1complete,
+no probe errors. Whole goodput is40.927Mbps, first write/confirmation
+.106131/.417416s, maximum confirmation gap19.443960s and local-write gap2.793370s.
+The driver exits0after84.009204s. These outcomes do not clear the ordinary
+incomplete trial or establish improvement. There is no concurrent echo workload
+in this upload probe. The exact maximum-gap endpoints are not recorded.
+
+All84raw one-second confirmation bins are preserved below, including58zeros.
+Rows start at the printed zero-based second; the last bin is partial and not
+renormalized. The trimmed array discards three bins at either end and must not
+be used as a wall-clock timeline.
+
+```text
+0:  5.107,199.460,27.027,0,0,0,0,0,0,4.669
+10: 58.341,86.936,400.696,96.233,182.836,163.767,116.107,35.556,16.445,0
+20: 0,23.113,391.882,28.358,213.588,26.162,321.742,95.134,232.760,0
+30: 0,0,0,0,0,0,0,0,0,0
+40: 0,0,0,0,0,0,0,0,49.669,0
+50: 0,0,0,0,0,0,0,0,0,0
+60: 0,0,0,0,0,0,88.080,0,0,0
+70: 0,0,0,0,0,0,0,0,0,120.180
+80: 0,0,265.998,166.938
+```
+
+Raw-bin means over5–15/15–25/25–40s are82.971/98.882/45.053Mbps;
+40–79s averages3.532Mbps with37of39bins zero. Actual target-socket acceptance
+over sampled5→15/16→24/25→40s is44.901/79.933/83.296Mbps. These are different
+measurement stages, not inconsistent versions of one throughput counter.
+
+### Timing/count attribution and its limits
+
+Only the client emits the three new labels, under one PID. All72rows per label
+reconcile interval count/query/time deltas with the cumulative totals. The
+generic `bytes` fields are **query counts, not traffic**. Each counter's count
+is one completed outer evaluation, including evaluations with no queries;
+model/clock durations sum their respective queries within that evaluation.
+
+| Client region | Completed evaluations | Evaluated queries | Aggregate elapsed, s | Mean per evaluation, ms | Maximum per evaluation, ms |
+|---|---:|---:|---:|---:|---:|
+| `request.gap_service` | 30,766 | 7,776,602 model queries | 55.691934 | 1.810178 | 20.847 |
+| `request.gap_service.owner_model` | 30,766 | 7,776,602 | 53.013520 | 1.723120 | 20.487 |
+| `request.gap_service.assignment_clock` | 30,766 | 466,829 | .911119 | .029614 | 2.437 |
+
+The nested model region accounts for95.19%of outer elapsed time. **Do not add
+these three times**, or interpret the model maximum as one individual query's
+time. Each recorder floors elapsed to1us and synchronous timing includes
+instrumentation and possible descheduling, not CPU instructions alone. Source
+places the evaluated region inside the request Product lock, without an await.
+It therefore consumes elapsed time while that owner is held; this is not a
+measurement of another task's lock wait or a19-second uninterrupted lock hold.
+The outer timer also excludes some surrounding actor and recorder work.
+
+For phase attribution, compare actual `ts_unix_ms` cumulative snapshots. The
+printed `interval_ms=1000` is the configured flush interval, not measured
+spacing; inactive components can be absent. Process monotonic origins and
+probe elapsed time are not interchangeable. The following flush pairs lie
+strictly within the indicated management plateau windows. Wall timestamps are
+given as milliseconds after1789033600000; outer sequence IDs identify endpoints.
+
+| Management window | Actual flush bounds / outer seq | Wall s | Calls | Model query delta | Outer / model / clock elapsed, s |
+|---|---|---:|---:|---:|---:|
+| 40–48s | 75510→82533 /561→635 | 7.023 | 767 | 830,023 | 5.637801 /5.414779 /.087715 |
+| 49–65s | 84551→99635 /659→821 | 15.084 | 1,739 | 1,849,977 | 12.730043 /12.297976 /.127511 |
+| 67–78s | 102646→112677 /859→975 | 10.031 | 1,456 | 1,440,210 | 8.773010 /8.506989 /.027162 |
+| Combined40–78s | 75510→112677 /561→975 | 37.167 | 4,561 | 4,752,156 | 31.400284 /30.334409 /.283590 |
+
+The last row overlaps the preceding rows; it is not additional work. Outer
+elapsed occupies84.48%of that37.167s span, with at most19.387ms per call and
+about1042model queries per evaluation. Outer query deltas differ slightly from
+the nested model deltas at some boundaries: the three sequential recorder calls
+can straddle a flush. Final counts/query totals agree; do not manufacture a
+conservation defect or an exact per-call timeline from those split snapshots.
+
+The late plateau has a decisive direction distinction. At management samples
+40through78, target acceptance is exactly414,045,459B. Client source reads equal
+that total throughout40–77, then add12,000B at78. Thus this long interval is not
+merely an outstanding upload suffix slowly draining into the target. The server
+has already read1581bytes of sink confirmations, while the client has delivered
+only1301at40,1315at49and1329at67. Those client totals remain flat over40–48,
+49–66and67–78respectively. The source/target counters then resume, and all bytes
+eventually settle. The raw confirmation history preserves the long holds.
+
+This establishes substantial repeated synchronous model work during the same
+capture's withheld-confirmation/new-source episodes. It falsifies an inexpensive
+gap-evaluator assumption and supports correcting repeated ownership-query work
+before another performance attempt. It does **not** prove which exact reply
+range is blocked, how much of its residence is waiting on this lock, or that
+eliminating the measured region will eliminate every stall. No per-reply trace,
+CPU sampler or lock-acquisition timer is present; other actor/native service
+remains a competing contributor. The1.810ms whole mean must not hide the
+repeated late work, and the55.692s cumulative time is not a predicted speed gain.
+
+### Physical/native context and collection cost
+
+All84service rows verify the same direct two-link200Mbps profile: only46UPis
+10Mbps at samples15–24;47and return directions remain200Mbps. First reporting
+restriction/restoration samples are15.001599/25.002671s. Delay30/70ms,
+jitter/loss0, burst/cburst65536, netem limit8192 and no UDP blackout are unchanged;
+all class/netem drop deltas are0. Physical class accounting spans83.008907s,
+not the exact probe or counter-flush window.
+
+| Whole sampled cost | Client UP46 /47 | Server DOWN46 /47 |
+|---|---:|---:|
+| Class bytes | 287,521,532 /655,949,566 | 5,425,342 /7,378,856 |
+| Summed backlog p50 / maximum / final, B | 137,276 /37,339,491 /2,538,529 | 396 /47,387 /7,296 |
+| Process RSS peak / final, KiB | 328,268 /299,500 | 90,388 /90,388 |
+| Process lifetime CPU peak / final, % | 127 /111 | 58.4 /16.8 |
+
+RSS/CPU describe whole-role snapshots, not per-region CPU or a teardown leak.
+There are eight active native paths from sample10onward; all observed path
+states are active. Exact native identities/epochs remain stable over40→78,
+and producer timestamps advance. TCP ACK bytes add264,520on46and22,075,374on47;
+QUIC adds255,652and555. UP classes carry564,603/23,299,135B in that window.
+These are not unique useful payload or repair-winner counts. At78both QUIC
+native flights are0, while Product flights remain28,593,050/22,410,870B.
+Continuing native service does not equate to delivered confirmations.
+
+Logs total870,220B: client459,756B/1087lines, server410,464B/975lines, no
+per-call perf samples and empty probe stderr. The two server warnings are
+`ApplicationClose: H3_NO_ERROR` at09:48:39.444UTC, after exact settlement and
+the stream-close flush; they are not independent failed transfers. The observer
+is much smaller than the earlier per-event capture, but still changes execution
+cost and is not an ordinary speed comparison. No performance promotion follows.
+
+The [diagnostic archive](AUTHORITATIVE_GAP_SERVICE_PROFILE_20260910.raw.tar.gz)
+contains11 regular files plus one directory entry: five result files, build/
+driver logs, exact temporary overlay, perf wrapper, driver and shaper. Root
+created and listed it before further runtime changes. The ordinary failure's
+separate archive and original accounting remain untouched.

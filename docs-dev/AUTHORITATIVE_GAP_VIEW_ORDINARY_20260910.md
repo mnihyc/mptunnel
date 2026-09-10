@@ -3171,3 +3171,172 @@ the critical completed prefix; its earliest material lag is before common
 attachment arrival, with secondary local FIFO/actor delay. Exact writer/native/
 decode/mailbox attribution remains open. Preserve the7.816s practical gap and
 do not turn this diagnostic into a performance win or select another gap tweak.
+
+## ACK carrier-prefix diagnostic: early decode lag and coupled local service
+
+Information-only run61091, `aggregate-combined-up-ack-carrier-prefix-0911`,
+closes normally after50.005532s. It extends the preceding six-slot observation
+with successful carrier-write and fully decoded-frame witnesses; it does not
+change runtime policy or constitute an ordinary performance comparison.
+Build45395 succeeds in3m35s with the existing unused-helper warning. The exact
+13-source-file,45,693B overlay was frozen and completely reversed before traffic;
+ordinary source remains a16b404. The explicitly selected executable is
+`./.tmp/reflection/bin/ack-carrier-prefix-20260911/mptunnel`, with periodic PERF
+enabled and samples disabled. Session7591395517251646329/stream0 is stable;
+client/server PIDs are490729/495753.
+
+[Raw capture and exact observer inputs](ACK_CARRIER_PREFIX_20260911.raw.tar.gz)
+contains11 regular files: five results, build/driver logs, complete patch,
+wrapper, run.py and shape.sh. Archive375,249B; gzip integrity, member identities
+and every decompressed member's byte comparison pass. No configs or executable
+are included. This archive, not a selected subset of stage rows, is authoritative.
+
+### Outcome and unchanged physical conditions
+
+| Own diagnostic outcome | Value |
+|---|---:|
+| Local accepted = target confirmed bytes | 303,562,752 |
+| Exact completed streams / failures | 1 /0 |
+| Delivery elapsed / mean | 49.539437s /49.022Mbps |
+| First write / confirmation | .109156 / .414570s |
+| Maximum write / confirmation gap | 11.405079 /12.064186s |
+| Settlement beyond nominal40s | 9.539437s |
+| Raw bins / zero bins | 50 /29 |
+
+There is no separate echo workload in this UP probe. Status is `ok`, exact
+accounting true, lower-bound false, errors empty and stderr0B. Full one-second
+target-confirmation bins are below; bin49 is partial. The484.769Mbps burst
+releases accumulated confirmation and is not a physical400Mbps-cut violation.
+
+| Raw seconds | Mbps, in chronological order |
+|---|---|
+| 0–9 | 8.854,138.443,317.431,59.865,0,0,57.243,29.648,274.880,52.896 |
+| 10–19 | 23.389,0,0,0,0,0,0,39.858,0,0 |
+| 20–29 | 484.769,0,0,59.013,7.436,0,0,0,88.602,0 |
+| 30–39 | 0,0,0,0,0,0,0,0,0,0 |
+| 40–49 | 76.328,0,76.494,145.878,.569,90.333,0,0,299.685,96.889 |
+
+Raw-bin means are104.919Mbps at0–5s,43.806 at5–15s,65.675 at16–25s,
+5.907 at25–40s and76.587 at40–49s. These are full listed intervals, not the
+probe's trimmed series or a reconstructed exact final partial-bin rate.
+All50management rows preserve two independent links: client eth0/eth1=46/47,
+server eth1/eth0=46/47; each200Mbps, DOWN30ms/UP70ms, jitter/loss0,
+netem limit8192, HTB burst65,536B. Only46UP is10Mbps from15.001689 until
+25.002646s;47 stays200. No UDP blackout and all class/qdisc drop deltas are0.
+
+### Eight-stage joins: first witnesses, not per-frame or per-output traces
+
+The preceding fixed-prefix witness contract remains in force. `carrier_written`
+means a complete ordinary TCP write/flush or successful generic QUIC native
+write; batch success is stamped after the batch, partial/error paths are
+censored. It is not physical transmission. `decoded` is after authenticated
+TCP decoding / complete QUIC frame read, before downstream attachment service.
+Each slot retains the greatest explicit positive prefix and its first producer
+timestamp. There is no frame identity, selected-output identity or arrival
+history; unequal prefixes give bounds, not exact per-frame transit times.
+Replay does not refresh a prefix's first timestamp. Raw early witnesses do not
+replace logical validation. All following wall times subtract1789066773000ms
+for readability; this is not either process's monotonic origin or probe start.
+
+| Explicit prefix,B | Generated / admitted / written,s | Decoded witness,s | Supported bound |
+|---|---|---|---|
+| 189,358,948 | 13.200 /13.200 /13.200 | same prefix23.133 | 9.933s written→first same-prefix decoded |
+| 241,245,149 | 25.550 /25.550 /25.550 | smaller216,737,014 first42.366; larger242,001,409 first43.372 | ≥16.816s before an equal-or-greater decoded witness;43.372 upper-brackets crossing, not this frame's transit |
+| 242,633,878 | 33.044 /33.044 /33.044 | smaller242,001,409 first43.372; larger242,699,414 first43.478 | ≥10.328s, with43.478 crossing upper witness |
+
+These are producer-stamp bounds, not later reporting times. At23distinct retained
+server prefixes, generation/admission stamps match and written differs by0–1ms;
+the periodic admitted/written counts track together. This does not prove every
+unretained ACK's timing or permit unsynchronized final count conservation.
+
+The critical prefix joins still show already completed target service with
+unassigned local source and delayed positive sender knowledge:
+
+| Bracketed stage | Client coherent state | Server coherent state |
+|---|---|---|
+| Early | at13.165–22.189s A=189,358,948,U=3,051,282,F=125,301,366 | at13.395–22.427s R=T=189,358,948,reorder0 |
+| Restored | at26.194–31.286s A=241,245,149,U32,341,433→32,893,633,F205,089,158→205,641,358 | at26.433–30.587s R=T=241,245,149,reorder0 |
+| Later | at33.321–41.386s A=242,633,878,U31,653,504→34,853,120,F205,687,758→208,404,534 | at33.682–41.236s R=T=242,633,878,reorder0 |
+
+Cross-role ranges are sampled brackets, not synchronized state. The same client
+response cursor remains436B at29.275–40.385s with reorder0, then advances478B
+at41.386s. This is its own return-service plateau; no exact probe wall anchor
+was saved, so it is not asserted to equal the12.064186s confirmation interval.
+All19sampled target-write begin/end pairs succeed, maximum618us, none unmatched;
+unsampled writes remain outside that claim.
+
+Crucially, the early decode lag is not independent of local downstream pressure.
+Prefix125,301,366 has the complete retained chain: generated/admitted9.473,
+written9.474, decoded9.504, attachment11.650, FIFO11.695, actor/applied12.678s.
+That is30ms written→decoded,2.146s decoded→attachment,45ms attachment→FIFO
+and983ms FIFO→actor. Later exact scalar-prefix witnesses show:
+
+| Prefix,B | Local first-witness interval | Delay |
+|---|---|---:|
+| 206,492,318 | FIFO26.804→actor39.330; Apply39.331 | 12.526s FIFO→actor |
+| 206,331,718 | attachment25.152→Apply38.112 | 12.960s |
+| 210,511,094 | decoded25.721→Apply42.380 | 16.659s |
+
+At39retained actor/Apply matches, first timestamps differ0–1ms. Across50client
+reports, decoded-minus-attachment count difference peaks1,823; at26–42s it is
+180–242, attachment-minus-FIFO3–4 and FIFO-minus-actor125–131. These are witness
+count differences, not exact command-slot occupancy. They establish material
+downstream delay; a reader held behind earlier decoded frames can propagate
+backpressure upstream into the written→decoded interval. This capture therefore
+does not establish a separate physical/native fault or isolate one carrier.
+
+### Same-capture owner and native context
+
+All2,509client/585server periodic rows reconcile interval counts/bytes/time to
+cumulative deltas and final totals. The51client flushes have unique components
+per flush and maximum4ms printing width. Complete-flush differences contained
+inside the corresponding producer-witness intervals are:
+
+| Wall-offset flush interval,s | Span | Actor hold | Preselect | Direct+queued dispatch | ACK handling |
+|---|---:|---:|---:|---:|---:|
+| 14.080–22.104 | 8.024 | 7.889881 | 1.636177 | 5.630300 | .251759 |
+| 27.141–39.262, inside the12.526s FIFO wait | 12.121 | 12.071026 | 11.276617 | .131231 | .585652 |
+| 26.134–42.273, inside restored written→decoded bound | 16.139 | 16.047490 | 14.823558 | .190532 | .862851 |
+
+Seconds are completed-call elapsed time, floored1us, including descheduling and
+observer cost—not CPU or one uninterrupted call. These windows overlap; never
+sum them. Static instrumented control.rs sites1621/3091/4008 own the displayed
+preselect/dispatch/ACK scopes. Whole actor/writer holds are46.127488/.801561s;
+waits .775139/.035059s. Largest single preselect/dispatch/ACK holds are
+34.915/19.620/23.671ms. Inside27.141–39.262s actor wait is only .004666s.
+Thus actual repeated local service occupies nearly the full measured long FIFO
+residence; scalar stages still cannot identify each ACK's particular blocking task.
+
+All eight native output epochs per role remain stable from sample10. Management
+26→42 adds265,686DOWN class bytes, server native ACK13,360TCP/15,945QUIC B;
+server observed carrier queue bytes stay0. QUIC46 native RTT100.083ms/flight9,926B
+persists with advancing producer stamps, while QUIC47 ends107.985ms/0Bflight.
+Forward native ACK adds34,297,738TCP/25,287,512QUIC B. These small reverse/native
+counters include control and other frames, not the critical ACK's native progress;
+forward counts likewise are not new useful originals. Client queue observations
+include34NULL values in these17rows, not zeros. No command-lane slot count is
+exported. Management33→41 target-write totals rise65,536B while local source
+reads rise2,542,616B; this does not erase the bracketed A=R=T plateaus above.
+
+| Whole sampled cost,49.005309s | Value |
+|---|---:|
+| UP46 /47 class bytes | 337,265,211 /405,193,828 |
+| DOWN46 /47 class bytes | 3,723,359 /3,891,508 |
+| Summed UP backlog peak / final,B | 27,835,236 /13,529,703 |
+| Summed DOWN backlog peak / final,B | 35,611 /12,115 |
+| Client RSS peak / final,KiB | 321,956 /314,292 |
+| Server RSS peak / final,KiB | 116,896 /116,896 |
+| Client lifetime CPU peak / final,% | 120 /112 |
+| Server lifetime CPU peak / final,% | 54 /19.4 |
+
+CPU is process-lifetime `ps`, not interval CPU. Final samples precede full
+settlement and teardown; no retention/leak conclusion follows. Client/server
+logs are1,266,249/440,056B, including50/46eight-slot reports and50/46prefix
+snapshots. Two server H3_NO_ERROR warnings follow completion; client has none.
+
+The information forecast succeeds: early critical ACK knowledge has already
+been generated, admitted and accepted by a carrier, yet remains undecoded for
+material time; separately, decoded knowledge waits materially in local service.
+The coupled backpressure interpretation remains necessary. Preserve this run's
+12.064s gap and weak restored service; no ordinary performance promotion,
+independent-native-fault claim, or new algorithm selection follows from it.

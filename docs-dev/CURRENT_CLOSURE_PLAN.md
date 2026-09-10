@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 02:44 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 03:15 +08:00. Authoritative repository: ./.
 **MPP is NOT performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -528,6 +528,59 @@ scope, changed nativeadmission or control scheduling. Preserve oldseven-file
 observer; unique ack-carrier-prefix-0911 binary/patch/tag. Same200+200cell and
 fullcompletion/series/costs; removeALLtemporarysource beforetraffic. Inconclusive
 result stops guessedpromotion, not globalclosure. No compiler/laboverlap.
+
+Build45395closed0 in3m35s, existingwarningonly. Frozen13file45693Bpatch matches
+sourceexactly; bin/ack-carrier-prefix-20260911/mptunnel saved. All13sourcefiles
+reversedbefore run61091 started18:59UTC. ActualTCPmetadata coversTLS+Noise;
+QUICsuccessfulgenericwrite coverssingle/batched/deferredACKs. Completion is
+localnativeacceptance, notphysicaltransmit/peerreceipt; partiallysuccessful
+failedbatchcensored. Current report/archive79321 committed52e22df afterroot
+readall196lines andgzip/tarcheck (11files488198B). Userdocremainsuntouched.
+Stageboundaries can be causally coupled by backpressure: upstreamdelay doesNOT
+prove that faster downstream receipt service cannot remove it. Keep this
+alternative untilnewdecoded/writtenevidence identifiescurrentholdingqueues.
+
+61091 CLOSED0: exact303562752B/49.539437s=49.022Mbps, maximum write11.405079s
+and confirmation12.064186s,50raw bins including29zeros. Diagnostic only.
+Server generation/admission/successful native write already reach exact prefix
+189358948 at1789066786200; first client decoded witness arrives9.933s later.
+Restored prefix241245149 is written at6798550, while decoded witness remains
+below it at6815366: at least16.816s. Generation and local writer acceptance
+are not the withholding boundaries for these prefixes. Native write is not
+physical transmission. Crucially the exact prefix206492318 already in client
+FIFO waits12.526s before actor service; decoded210511094 waits16.659s until
+Apply. This is material local service delay, not an independent native-only
+fault. Downstream blocking can propagate into the carrier reader.
+
+Inside that FIFO wait, complete12.121s flush span has12.071026s actor hold,
+11.276617s preselect and.131231s dispatch. Inside the restored write/decode
+bound,16.139s contains14.823558s preselect. Timers are overlapping elapsed,
+not CPU/removable critical time. Whole actual TCP reader queue-send waits total
+76.592s over26480calls (max.758s); routes also await bounded attachment queues.
+These concurrent waits cannot be summed or called a memory leak. Full168-line
+appendix and11-member375249B archive retain every bin, stage, cost and input.
+
+Next bounded decision: finite ordered feedback Input service. Current actor
+applies one ACK, scans recovery inline, then repeats heavy preselect before
+another already-ready ACK can discharge the same gap. A candidate would retain
+every ACK transaction in order (validation, scope, positive release, copy
+qualification, sampling, pruning and progress), consume only a fixed snapshot
+of already-ready ACK/MAX feedback, then perform fresh recovery once at that
+service boundary. MAX is applied as actual input, not skipped to find ACKs;
+all other frames are barriers. No retained target/range view, coalesced ACK,
+new timer/limit or resurrected pending-job owner. This is NOT yet implemented.
+
+Forecast: N ready feedback facts can avoid N intermediate heavy discovery/
+preselect cycles before the next fair service boundary. The measured16s band
+shows material opportunity, not a Mbps prediction. Frequent barriers, irreducible
+per-ACK work, changes in sampling/copy interleaving and first timing observations
+may limit or reverse benefit. Keep frozen assignment minima, but do not claim
+identical initial clock observation. Queue-dependent FIN/prepared decisions
+must see required fresh recovery; retained local I/O and other service classes
+must still progress. Independent symbolic audit precedes a real-actor RED:
+ready ACK1 exposes a gap that already-ready ACK2 fills. Full feedback truth and
+barrier/half-close controls precede ONE unchanged ordinary a16 comparison.
+Adverse or absent material benefit stops promotion, not the global task.
 
 ## Just-completed correction: exact subsumed ACK invalidation
 

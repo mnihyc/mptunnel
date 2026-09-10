@@ -437,6 +437,14 @@ async fn run_server_udp_reliable_stream_loop(
                         stream_id: received_stream_id,
                         ..
                     }
+                    | Frame::StreamFeedbackProbe {
+                        stream_id: received_stream_id,
+                        ..
+                    }
+                    | Frame::StreamFeedbackReceipt {
+                        stream_id: received_stream_id,
+                        ..
+                    }
                     | Frame::StreamReturnPlanFinal {
                         stream_id: received_stream_id,
                         ..
@@ -477,6 +485,8 @@ async fn run_server_udp_reliable_stream_loop(
                 Ok(Some(Ok(
                     Frame::StreamData { .. }
                     | Frame::StreamAck { .. }
+                    | Frame::StreamFeedbackProbe { .. }
+                    | Frame::StreamFeedbackReceipt { .. }
                     | Frame::StreamReturnPlanFinal { .. }
                     | Frame::StreamRequalifyData { .. }
                     | Frame::StreamRequalifyAck { .. }
@@ -623,6 +633,8 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                     Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
                         | Frame::StreamAck { stream_id: received_stream_id, .. }
+                        | Frame::StreamFeedbackProbe { stream_id: received_stream_id, .. }
+                        | Frame::StreamFeedbackReceipt { stream_id: received_stream_id, .. }
                         | Frame::StreamReturnPlanFinal { stream_id: received_stream_id, .. }
                         | Frame::StreamRequalifyAck { stream_id: received_stream_id, .. }
                         | Frame::StreamMaxData { stream_id: received_stream_id, .. }

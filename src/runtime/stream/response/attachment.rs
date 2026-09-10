@@ -23,9 +23,12 @@ use crate::runtime::path::commands::{
     ReliablePathCommandQueueSnapshot, ReliablePathCommandSender, ReliablePathLoadRegistration,
 };
 use crate::runtime::path::proof::PathProofObservation;
+use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::runtime::stream::feedback::{
-    StreamFeedbackPublication, StreamFeedbackPublicationCursor, StreamFeedbackState,
+    StreamFeedbackPublication, StreamFeedbackPublicationCursor, StreamFeedbackService,
+    StreamFeedbackState,
 };
+use crate::runtime::stream::feedback_route::StreamFeedbackRoute;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use crate::transport::RateHint;
 use std::sync::atomic::Ordering;
@@ -191,6 +194,8 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) published_max_data_offset: u64,
     /// Exact ACK catch-up and fair ACK/MAX service owned by this attachment.
     pub(super) ack_publication: StreamFeedbackPublicationCursor,
+    /// One owner-applied incoming probe awaiting its exact captured reply port.
+    pub(super) pending_feedback_receipt: Option<(u64, u64)>,
     pub(super) local_path_metrics: Option<ServerPathMetricsEntry>,
     pub(super) peer_path_metrics: Option<ServerPathMetricsEntry>,
     /// Complete endpoint-local NativeMode decision/shape for this exact QUIC
@@ -220,6 +225,9 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
     pub(super) data_level_queue_bytes: u64,
     /// Sole materialized latest ACK and receive-grant owner, shared by outputs.
     pub(super) feedback: StreamFeedbackState,
+    pub(super) feedback_route: StreamFeedbackRoute<ServerReinjectionOutputIdentity>,
+    /// Actual peer credit applied by the logical actor, never a probe grant.
+    pub(super) applied_peer_max_offset: u64,
     /// Greatest grant actually admitted, including an output later detached.
     /// Registry attachment replay can advertise credit outside the relay actor.
     pub(super) admitted_max_data_offset: u64,
@@ -234,6 +242,7 @@ fn service_feedback(
     stream_id: StreamId,
     update_frames: Option<&[Frame]>,
 ) -> StreamFeedbackPublication {
+    prepare_feedback_route(outputs, Instant::now());
     let mut publication = StreamFeedbackPublication {
         ack_generation: outputs.feedback.ack_generation,
         ..Default::default()
@@ -243,26 +252,100 @@ fn service_feedback(
             // Closed control admission never reopens on this exact command
             // queue. Keep lifecycle/flight ownership, not an unserviceable tail.
             entry.ack_publication = StreamFeedbackPublicationCursor::default();
+            entry.pending_feedback_receipt = None;
             continue;
         }
+        let identity = feedback_output_identity(entry);
+        let allow_facts = outputs
+            .feedback_route
+            .requires_output(identity, feedback_baseline_ready(entry));
+        let receipt = entry
+            .pending_feedback_receipt
+            .filter(|(_, required)| *required <= outputs.applied_peer_max_offset)
+            .map(|(token, _)| token);
         let commands = &entry.commands;
         let attachment = entry.ack_publication.service(
             &outputs.feedback,
             update_frames,
             stream_id,
             &mut entry.published_max_data_offset,
+            StreamFeedbackService {
+                allow_facts,
+                probe: outputs.feedback_route.probe_for(identity),
+                receipt,
+            },
             |frame| {
                 commands
                     .try_enqueue_admitted_frame(frame, TrafficClass::Control)
                     .is_ok()
             },
         );
-        if let Some(offset) = attachment.max_data.published_offset {
+        if let Some(token) = attachment.probe_admitted {
+            outputs
+                .feedback_route
+                .record_probe_admission(identity, token);
+        }
+        if attachment.receipt_admitted.is_some() {
+            entry.pending_feedback_receipt = None;
+        }
+        if let Some(offset) = attachment.feedback.max_data.published_offset {
             outputs.admitted_max_data_offset = outputs.admitted_max_data_offset.max(offset);
         }
-        publication.merge(attachment);
+        publication.merge(attachment.feedback);
     }
     publication
+}
+
+fn feedback_output_identity(entry: &ResponseStreamOutputEntry) -> ServerReinjectionOutputIdentity {
+    ServerReinjectionOutputIdentity {
+        key: entry.key,
+        incarnation: entry.incarnation,
+    }
+}
+
+fn feedback_baseline_ready(entry: &ResponseStreamOutputEntry) -> bool {
+    entry.ack_publication.has_ack_baseline() && entry.published_max_data_offset > 0
+}
+
+fn prepare_feedback_route(outputs: &mut ResponseStreamOutputs, now: Instant) {
+    let live: Vec<_> = outputs
+        .entries
+        .iter()
+        .filter(|entry| !entry.commands.control_frame_admission_is_closed())
+        .map(feedback_output_identity)
+        .collect();
+    let entries = &outputs.entries;
+    outputs
+        .feedback_route
+        .prepare(&outputs.feedback, &live, now, |identity| {
+            let entry = entries
+                .iter()
+                .find(|entry| feedback_output_identity(entry) == identity)
+                .expect("live feedback identity comes from this binding");
+            if let Some(shape) = entry.native_scheduling_shape.filter(|shape| {
+                let scope = shape.stamp().scope();
+                scope.carrier_instance_id() == entry.path_instance_id
+                    && scope.direction() == crate::protocol::PathMetricDirection::ServerToClient
+                    && !shape.srtt().is_zero()
+            }) {
+                return crate::model::timing::transport_pto_from_ms(
+                    shape.srtt().as_secs_f64() * 1000.0,
+                    shape.rttvar().as_secs_f64() * 1000.0,
+                );
+            }
+            super::evidence::server_output_local_path_metrics(entry)
+                // Like the native controller, retain exact local RTT across
+                // idle periods. Rate freshness is a different authority; the
+                // frozen proof deadline estimates failure-detection delay,
+                // not current service quality or available capacity.
+                .filter(|metrics| metrics.metrics.srtt_us > 0)
+                .map_or_else(crate::model::timing::default_transport_pto, |metrics| {
+                    crate::model::timing::transport_pto_from_ms(
+                        f64::from(metrics.metrics.srtt_us) / 1000.0,
+                        f64::from(metrics.metrics.jitter_us) / 1000.0,
+                    )
+                })
+        });
 }
 
 fn feedback_status(outputs: &ResponseStreamOutputs) -> StreamFeedbackPublication {
@@ -275,6 +358,12 @@ fn feedback_status(outputs: &ResponseStreamOutputs) -> StreamFeedbackPublication
         (outputs.admitted_max_data_offset > 0).then_some(outputs.admitted_max_data_offset);
     for entry in &outputs.entries {
         if entry.commands.control_frame_admission_is_closed() {
+            continue;
+        }
+        if !outputs.feedback_route.requires_output(
+            feedback_output_identity(entry),
+            feedback_baseline_ready(entry),
+        ) {
             continue;
         }
         let ack_pending = entry.ack_publication.is_pending(generation);
@@ -380,6 +469,118 @@ impl ResponseStreamBinding {
         )
     }
 
+    pub(in crate::runtime) fn feedback_reply_output(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> Option<ServerReinjectionOutputIdentity> {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.key == key
+                    && entry.path_instance_id == path_instance_id
+                    && !entry.commands.control_frame_admission_is_closed()
+            })
+            .map(feedback_output_identity)
+    }
+
+    /// Called only while dequeuing the ordered logical Probe event, after all
+    /// its preceding ACK/MAX transactions. Captured reply identity never moves.
+    pub(in crate::runtime) fn record_feedback_probe(
+        &self,
+        output: ServerReinjectionOutputIdentity,
+        token: u64,
+        required_max_offset: u64,
+    ) {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        if let Some(entry) = outputs.entries.iter_mut().find(|entry| {
+            feedback_output_identity(entry) == output
+                && !entry.commands.control_frame_admission_is_closed()
+        }) {
+            if entry
+                .pending_feedback_receipt
+                .is_none_or(|(previous, _)| token >= previous)
+            {
+                entry.pending_feedback_receipt = Some((token, required_max_offset));
+            }
+        }
+    }
+
+    pub(in crate::runtime) fn service_feedback_route(
+        &self,
+        stream_id: StreamId,
+        applied_peer_max_offset: u64,
+    ) -> StreamFeedbackPublication {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs.applied_peer_max_offset =
+            outputs.applied_peer_max_offset.max(applied_peer_max_offset);
+        service_feedback(&mut outputs, stream_id, None)
+    }
+
+    pub(in crate::runtime) fn receive_feedback_receipt(
+        &self,
+        stream_id: StreamId,
+        token: u64,
+    ) -> StreamFeedbackPublication {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let now = Instant::now();
+        prepare_feedback_route(&mut outputs, now);
+        outputs.feedback_route.receive_receipt(token, now);
+        service_feedback(&mut outputs, stream_id, None)
+    }
+
+    pub(in crate::runtime) fn finish_feedback_route(&self) {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .feedback_route
+            .finish();
+    }
+
+    pub(in crate::runtime) fn feedback_route_deadline(&self) -> Option<Instant> {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .feedback_route
+            .next_deadline()
+    }
+
+    pub(in crate::runtime) fn feedback_route_capacity_notifies(
+        &self,
+    ) -> Vec<std::sync::Arc<tokio::sync::Notify>> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.commands.control_frame_admission_is_closed()
+                    && (outputs
+                        .feedback_route
+                        .probe_for(feedback_output_identity(entry))
+                        .is_some()
+                        || entry.pending_feedback_receipt.is_some_and(|(_, required)| {
+                            required <= outputs.applied_peer_max_offset
+                        }))
+            })
+            .map(|entry| entry.commands.capacity_notify())
+            .collect()
+    }
+
     pub(in crate::runtime) fn pending_ack_capacity_notifies(
         &self,
         generation: u64,
@@ -396,6 +597,10 @@ impl ResponseStreamBinding {
             .iter()
             .filter(|entry| {
                 !entry.commands.control_frame_admission_is_closed()
+                    && outputs.feedback_route.requires_output(
+                        feedback_output_identity(entry),
+                        feedback_baseline_ready(entry),
+                    )
                     && entry.ack_publication.is_pending(generation)
             })
             .map(|entry| entry.commands.capacity_notify())
@@ -435,6 +640,10 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         outputs.entries.iter().any(|entry| {
             !entry.commands.control_frame_admission_is_closed()
+                && outputs.feedback_route.requires_output(
+                    feedback_output_identity(entry),
+                    feedback_baseline_ready(entry),
+                )
                 && entry.published_max_data_offset < outputs.feedback.max_data_offset
         })
     }
@@ -451,6 +660,10 @@ impl ResponseStreamBinding {
             .iter()
             .filter(|entry| {
                 !entry.commands.control_frame_admission_is_closed()
+                    && outputs.feedback_route.requires_output(
+                        feedback_output_identity(entry),
+                        feedback_baseline_ready(entry),
+                    )
                     && entry.published_max_data_offset < outputs.feedback.max_data_offset
             })
             .map(|entry| entry.commands.capacity_notify())
@@ -661,6 +874,7 @@ impl ResponseStreamBinding {
                 entry.original_data_acked_bytes = 0;
                 entry.published_max_data_offset = 0;
                 entry.ack_publication = StreamFeedbackPublicationCursor::default();
+                entry.pending_feedback_receipt = None;
                 entry.local_path_metrics = None;
                 entry.peer_path_metrics = None;
                 entry.native_scheduling_shape = None;
@@ -712,6 +926,7 @@ impl ResponseStreamBinding {
                 original_data_acked_bytes: 0,
                 published_max_data_offset: 0,
                 ack_publication: StreamFeedbackPublicationCursor::default(),
+                pending_feedback_receipt: None,
                 local_path_metrics: None,
                 peer_path_metrics: None,
                 native_scheduling_shape: None,
@@ -809,6 +1024,10 @@ impl ResponseStreamBinding {
         // cannot service its unsent feedback job. The shared latest state
         // remains available to every live successor.
         entry.ack_publication = StreamFeedbackPublicationCursor::default();
+        entry.pending_feedback_receipt = None;
+        outputs
+            .feedback_route
+            .forget_output(feedback_output_identity(&entry));
         let output_incarnation = entry.incarnation;
         outputs.detaching.push(entry);
         self.clear_request_feedback_ingress_if(key, path_instance_id);

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 09:37 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 10:45 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,32 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+10:45 +08 mechanism outcome:339unique focused checks pass, including both
+actors' blocked-I/O and actual-credit proof controls, capacity-one marker
+ordering, exact replacement/terminal authority and shrinking-RTT expiry.
+Independent cross-review also corrected client pending flags that counted
+deliberately skipped siblings; enabled-policy checks now prove debt becomes
+eligible again after expiry. No other conforming-path defect was established.
+Duplicate-Probe reply-history expansion was rejected: nonce-once reliable FIFO
+does not reach the alleged replay, and it added no demonstrated benefit.
+The first compile omitted two new diagnostic frame labels; exhaustive matching
+identified it before tests. Corrected build90s, tests0.53s; nine additional
+affected groups pass. Logs: confirmed-return-{focused,affected}-0910.log under
+./.tmp/reflection/. Checkpoint the candidate, build ordinary release binary,
+then run the unchanged full phase/timing return-cut comparison. Still no
+performance promotion, controller tuning, README update or release.
+
+10:40 +08 integration checkpoint: client/server/wire candidate is source-complete,
+with full-fanout discovery, exact token ownership, actual-MAX-gated logical
+replies, retained-I/O expiry and terminal full fanout. Common review caught
+and corrected a shrinking-RTT successor deadline hidden behind an older longer
+deadline; expiry and next wake use their minimum. No timing parameter changed.
+Wire15 is an explicit no-compatibility break, not an optional unknown-frame
+extension. Root's first focused build is running; direction adapters are under
+independent cross-review. This is not a successful performance milestone.
+Next: affected mechanism controls, then the one ordinary asymmetric return-cut
+pair against the frozen scoped comparator, preserving all phases/tails/costs.
 
 Prerequisite result: both generation-churn REDs now pass (95s compilation,
 0.01s execution); all220unique focused stream/sender/client/server checks pass.

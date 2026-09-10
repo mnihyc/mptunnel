@@ -83,6 +83,10 @@ pub(in crate::runtime) enum ReliablePathStreamInput {
 
 pub(in crate::runtime) enum ServerReliableStreamEvent {
     Frame(Frame),
+    FeedbackProbe {
+        frame: Frame,
+        reply_output: Option<ServerReinjectionOutputIdentity>,
+    },
     PathDetached {
         key: CarrierPathKey,
         path_instance_id: CarrierPathInstanceId,
@@ -327,6 +331,22 @@ impl ReliablePathStream {
                             return Ok(first);
                         }
                         Some(ServerReliableStreamEvent::Frame(frame)) => return Ok(frame),
+                        Some(ServerReliableStreamEvent::FeedbackProbe {
+                            frame,
+                            reply_output,
+                        }) => {
+                            if let (
+                                Some(output),
+                                Frame::StreamFeedbackProbe {
+                                    token, max_offset, ..
+                                },
+                            ) = (reply_output, &frame)
+                                && let ReliablePathStreamOutput::Switchable(binding) = &self.output
+                            {
+                                binding.record_feedback_probe(output, *token, *max_offset);
+                            }
+                            return Ok(frame);
+                        }
                         Some(ServerReliableStreamEvent::PathDetached {
                             key,
                             path_instance_id,
@@ -366,7 +386,10 @@ impl ReliablePathStream {
             ReliablePathStreamInput::Server { events, pending } => {
                 if matches!(
                     pending.front(),
-                    Some(ServerReliableStreamEvent::PathDetached { .. })
+                    Some(
+                        ServerReliableStreamEvent::PathDetached { .. }
+                            | ServerReliableStreamEvent::FeedbackProbe { .. }
+                    )
                 ) {
                     return None;
                 }
@@ -375,7 +398,10 @@ impl ReliablePathStream {
                 }
                 match events.try_recv() {
                     Ok(ServerReliableStreamEvent::Frame(frame)) => Some(Ok(frame)),
-                    Ok(boundary @ ServerReliableStreamEvent::PathDetached { .. }) => {
+                    Ok(
+                        boundary @ (ServerReliableStreamEvent::PathDetached { .. }
+                        | ServerReliableStreamEvent::FeedbackProbe { .. }),
+                    ) => {
                         pending.push_back(boundary);
                         None
                     }
@@ -526,6 +552,52 @@ impl ReliablePathStream {
         match &self.output {
             ReliablePathStreamOutput::Switchable(binding) => binding.feedback_status(),
             ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
+        }
+    }
+
+    pub(in crate::runtime) fn service_feedback_route(
+        &self,
+        peer_max_offset: u64,
+    ) -> StreamFeedbackPublication {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.service_feedback_route(self.stream_id, peer_max_offset)
+            }
+            ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
+        }
+    }
+
+    pub(in crate::runtime) fn receive_feedback_receipt(
+        &self,
+        token: u64,
+    ) -> StreamFeedbackPublication {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.receive_feedback_receipt(self.stream_id, token)
+            }
+            ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
+        }
+    }
+
+    pub(in crate::runtime) fn finish_feedback_route(&self) {
+        if let ReliablePathStreamOutput::Switchable(binding) = &self.output {
+            binding.finish_feedback_route();
+        }
+    }
+
+    pub(in crate::runtime) fn feedback_route_deadline(&self) -> Option<Instant> {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => binding.feedback_route_deadline(),
+            ReliablePathStreamOutput::Fixed(_) => None,
+        }
+    }
+
+    pub(in crate::runtime) fn feedback_route_capacity_notifies(&self) -> Vec<Arc<Notify>> {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.feedback_route_capacity_notifies()
+            }
+            ReliablePathStreamOutput::Fixed(_) => Vec::new(),
         }
     }
 

@@ -2189,6 +2189,7 @@ impl ServerReliableStreamRegistry {
     async fn route_frame_to_target(
         frame: Frame,
         target: ServerStreamFrameRouteTarget,
+        reply_output: Option<crate::runtime::sender::ServerReinjectionOutputIdentity>,
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "lab-diagnostics")]
         let bytes = reliable_path_frame_pacing_bytes(&frame);
@@ -2199,7 +2200,7 @@ impl ServerReliableStreamRegistry {
         // not failure of the multiplexed carrier that delivered it.
         let _ = target
             .events
-            .send(ServerReliableStreamEvent::Frame(frame))
+            .send(Self::frame_event(frame, reply_output))
             .await;
         #[cfg(feature = "lab-diagnostics")]
         lab_perf_record(
@@ -2213,19 +2214,21 @@ impl ServerReliableStreamRegistry {
     fn try_route_frame_to_target(
         frame: Frame,
         target: ServerStreamFrameRouteTarget,
+        reply_output: Option<crate::runtime::sender::ServerReinjectionOutputIdentity>,
     ) -> Result<ServerStreamFrameRoute, RuntimeError> {
         match target
             .events
-            .try_send(ServerReliableStreamEvent::Frame(frame))
+            .try_send(Self::frame_event(frame, reply_output))
         {
             Ok(()) => Ok(ServerStreamFrameRoute::Routed),
-            Err(mpsc::error::TrySendError::Full(ServerReliableStreamEvent::Frame(frame))) => {
-                Ok(ServerStreamFrameRoute::Mailbox(PendingMailboxFrame::new(
-                    frame,
-                    target.events,
-                    ServerReliableStreamEvent::Frame,
-                )))
-            }
+            Err(mpsc::error::TrySendError::Full(
+                ServerReliableStreamEvent::Frame(frame)
+                | ServerReliableStreamEvent::FeedbackProbe { frame, .. },
+            )) => Ok(ServerStreamFrameRoute::Mailbox(PendingMailboxFrame::new(
+                frame,
+                target.events,
+                move |frame| Self::frame_event(frame, reply_output),
+            ))),
             // See `route_frame`: retirement owns this short closed-receiver
             // interval, and one finished stream must not close its carrier.
             Err(mpsc::error::TrySendError::Closed(_)) => Ok(ServerStreamFrameRoute::Routed),
@@ -2234,6 +2237,20 @@ impl ServerReliableStreamRegistry {
             })) => {
                 unreachable!("server frame routing only sends frame events")
             }
+        }
+    }
+
+    fn frame_event(
+        frame: Frame,
+        reply_output: Option<crate::runtime::sender::ServerReinjectionOutputIdentity>,
+    ) -> ServerReliableStreamEvent {
+        if matches!(frame, Frame::StreamFeedbackProbe { .. }) {
+            ServerReliableStreamEvent::FeedbackProbe {
+                frame,
+                reply_output,
+            }
+        } else {
+            ServerReliableStreamEvent::Frame(frame)
         }
     }
 
@@ -2349,7 +2366,14 @@ impl ServerReliableStreamRegistry {
             _ => {}
         }
         Self::record_request_feedback_ingress_from_path_target(identity, &frame, &target);
-        Self::route_frame_to_target(frame, target).await
+        let reply_output = if matches!(frame, Frame::StreamFeedbackProbe { .. }) {
+            target
+                .binding
+                .feedback_reply_output(key, identity.path_instance_id)
+        } else {
+            None
+        };
+        Self::route_frame_to_target(frame, target, reply_output).await
     }
 
     fn try_route_frame_from_path(
@@ -2427,7 +2451,14 @@ impl ServerReliableStreamRegistry {
             _ => {}
         }
         Self::record_request_feedback_ingress_from_path_target(identity, &frame, &target);
-        Self::try_route_frame_to_target(frame, target)
+        let reply_output = if matches!(frame, Frame::StreamFeedbackProbe { .. }) {
+            target
+                .binding
+                .feedback_reply_output(key, identity.path_instance_id)
+        } else {
+            None
+        };
+        Self::try_route_frame_to_target(frame, target, reply_output)
     }
 
     pub(in crate::runtime) fn close(&self, session_id: SessionId, stream_id: StreamId) {

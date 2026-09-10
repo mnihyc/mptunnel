@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 14
+# MPTunnel Multipath Proxy Protocol (MPP) Version 15
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 14: its wire format, carrier profiles,
+This document specifies MPP version 15: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,7 +21,7 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 14 is identified by the frame header in Section 12. A peer MUST
+Wire version 15 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
@@ -1475,8 +1475,9 @@ independent rate observations or confidence samples within an ACK transaction.
 Processing newly received unique Product bytes marks Data ACK state pending.
 Materializing the next publication advances one local generation. Before the
 serialized receive actor parks or yields its bounded cooperative turn, it MUST
-offer the latest pending generation independently to every currently live
-exact attachment. Several frames processed in that turn coalesce into the
+offer the latest pending generation independently to every currently eligible
+exact attachment under Section 8.4.1 (all live attachments without confirmed
+return selection). Several frames processed in that turn coalesce into the
 latest receive evidence; ACK publication never waits for an application read
 or another Product frame.
 
@@ -1545,7 +1546,7 @@ credit.
 The logical receive owner MUST retain its greatest grant as idempotent
 connection state until the stream becomes terminal. When that grant advances,
 the owner MUST attempt to publish the latest value independently on every
-currently live attachment. Acceptance by one attachment publishes the shared
+currently eligible attachment under Section 8.4.1. Acceptance by one attachment publishes the shared
 grant and permits the receiver to admit bytes through that offset; an
 attachment whose carrier queue is blocked remains pending rather than
 consuming the publication. A newly attached carrier MUST receive the retained
@@ -1571,8 +1572,8 @@ configured absolute stream bound, the retained grant is exactly the checked
 monotone maximum of its prior value and `a_r + W`. The initial successful target
 grant therefore equals `W`. Every advance of `a_r` immediately updates the
 retained latest grant, and before the serialized receive actor parks or yields
-its bounded cooperative turn it MUST offer that latest value on every live
-attachment. Several advances in one turn coalesce; queue blockage retains one
+its bounded cooperative turn it MUST offer that latest value on every eligible
+attachment under Section 8.4.1. Several advances in one turn coalesce; queue blockage retains one
 latest pending value and the exact capacity wake retries it. Arithmetic
 exhaustion grants no wrapped credit and starts no new Product admission.
 
@@ -1586,6 +1587,68 @@ and credit can advance only when receive-buffer capacity is actually freed.
 `STREAM_MAX_DATA` grants offsets but acknowledges no byte. Transport enqueue
 capacity and native congestion state are additional local constraints, not
 alternate MPP receive windows.
+
+### 8.4.1 Confirmed return service
+
+Without live proof, ACK/MAX publication MUST independently serve every live
+exact attachment. An endpoint MAY reduce redundant subsequent publication to
+one confirmed output, using `STREAM_FEEDBACK_PROBE(stream_id, token, max_offset)`
+and `STREAM_FEEDBACK_RECEIPT(stream_id, token)`. First-generation feedback,
+each new attachment's complete ACK and meaningful receive-credit baseline,
+and terminal feedback MUST retain full fanout. Single-output or quiescent
+streams require no redundancy-reduction probe.
+
+Discovery retains full fanout while offering at most one probe per exact output.
+An attempt captures the output incarnation, a non-reused stream-directional
+token, its current ACK generation and MAX offset, and a fixed deadline. The
+probe MUST use the same ordinary FIFO and native stream as preceding ACK/MAX,
+never a command bypass or QUIC repair stream. Once the captured ACK job and
+MAX admission fences are covered, the probe receives the next ordinary
+admission opportunity before newer feedback. Otherwise continuous feedback
+could starve its own validation. ACK/MAX remains immediate and pipelined;
+data service MUST NOT wait for a proof receipt.
+
+Only the actual logical stream owner may reply, after applying preceding ACK
+transactions and real received MAX through the probe's required offset. A
+coalesced MAX input MUST be reconciled before this test. The probe's offset
+is a requirement, not a credit grant. Registry enqueue success, native write
+completion, Ping/Pong, or an unknown/closed stream does not constitute this
+proof. Retain at most one pending reply tuple per captured live reply output;
+do not retarget a tuple after waiting for its mailbox or output capacity.
+Replies use ordinary FIFO service, are single-copy, and do not elicit replies.
+
+The first timely receipt for an actually admitted current token selects the
+PROBED local output, not the receipt's ingress. The reply carrier is merely
+authenticated return service; the still-live exact probed incarnation and
+pending token supply proof authority. Other discovery tokens become obsolete.
+Subsequent rounds validate only the selected output. A receipt changes only
+feedback publication policy: it MUST NOT release data/flight, grant credit,
+requalify an attachment, or create delivery samples or progress-clock evidence.
+
+Validation deadlines start when new feedback needs proof, including when the
+marker cannot enter its output queue. Use the existing native PTO estimate
+from that exact local sender, or the existing default PTO when unavailable;
+retained native RTT does not require an available delivery-rate measurement.
+The deadline MUST NOT renew with further data, retries or changing RTT. New
+facts behind an outstanding marker retain their own oldest unproved successor
+deadline. Expiry and actor wake use the earlier active/successor deadline;
+an older receipt cannot postpone newer debt, even when native RTT falls.
+Expiry MUST be serviced during retained application writes, flush and shutdown,
+before accepting a simultaneously late receipt.
+
+Missing proof, exact output loss or closed admission restores full fanout for
+the latest AND all future feedback until new proof. Previously skipped outputs
+retain their actual fences and use Section 8.3 finite cumulative catch-up;
+another output's fence cannot be borrowed. Terminal processing invalidates
+selection and probe authority. Tokens MUST NOT wrap into an old receipt's
+identity; exhaustion leaves baseline fanout.
+
+This is proof of FIFO/logical-owner/reply service, not bandwidth or one-way
+quality. A timely incumbent need not be the fastest available output. Reducing
+healthy duplication deliberately adds failure-detection delay before alternate
+publication: the frozen proof interval plus actual alternate queue/transport
+service, not a universal recovery bound. Native congestion control, ACK fact
+generation, receive credit and data-path eligibility are unchanged.
 
 ### 8.5 Completion, detach, and reset
 
@@ -2513,7 +2576,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        14
+4      version        15
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -2567,6 +2630,8 @@ frames.
 | 43 | `STREAM_REQUALIFY_ACK` | `stream_id:u64, probe_id:u64, offset:u64, payload_bytes:u32` |
 | 49 | `STREAM_RETURN_PLAN_FINAL` | `stream_id:u64, retained_count:u8, retained_ordinals[retained_count]` |
 | 50 | `OPEN_STREAM_REPAIR` | `stream_id:u64, parent_request_id:u64` |
+| 51 | `STREAM_FEEDBACK_PROBE` | `stream_id:u64, token:u64, max_offset:u64` |
+| 52 | `STREAM_FEEDBACK_RECEIPT` | `stream_id:u64, token:u64` |
 
 Kinds 5, 6, 15, 19, 25, 26, 28, 29, and 44 through 48 are reserved and
 MUST NOT be sent. A receiver rejects them as unknown kinds.
@@ -2579,7 +2644,7 @@ server-to-client only and requires a matching `PATH_DRAIN`.
 
 Kind50 is QUIC-only and client-to-server, valid only as the first frame of the
 companion request defined in Section6.2. It carries neither a destination nor
-Product admission authority. Unsupported versions are rejected; wire14 does
+Product admission authority. Unsupported versions are rejected; wire15 does
 not silently fall back to the wire11 single-ordering-stream mapping.
 
 Kinds 38 through 41 are valid only when the endpoint has enabled the IP packet
@@ -2601,6 +2666,13 @@ the retained `candidate_total`, and each names an exact startup attachment
 enrolled under the same frozen return-plan signature. An empty retained set is
 valid. The first valid frame is absorbing; an equal duplicate is idempotent and
 a different duplicate is a protocol violation.
+
+Kinds 51 and 52 are bidirectional reliable-stream control on TCP and QUIC's
+ordinary attached stream only, under Section 8.4.1. Their payloads are exactly
+24 and 16 bytes; every field accepts its full u64 domain. The token is opaque
+outside its owning transaction. Neither kind is valid on a repair companion
+or datagram/IP service. Unsupported versions, including version 14, are rejected;
+there is no optional-frame downgrade or compatibility mode.
 
 ### 12.3 Common field encodings
 
@@ -4048,7 +4120,7 @@ A conforming implementation preserves all of the following:
     ordinals, atomically withdraws omitted enrolled outputs before removing the
     ceiling, and is absorbing and idempotent only for an equal repetition.
 42. Kinds 44 through 48 are reserved and MUST be rejected as unknown under
-    version 14.
+    version 15.
 43. Stale requalification uses one finite cyclic exact-incarnation cursor and
     at most one pending proof and one stream-owned ACK publication per
     direction. The ACK carrier is authenticated return service only; the exact

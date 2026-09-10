@@ -268,6 +268,14 @@ async fn handle_client_udp_stream_input(
             stream_id: received_stream_id,
             ..
         }
+        | Frame::StreamFeedbackProbe {
+            stream_id: received_stream_id,
+            ..
+        }
+        | Frame::StreamFeedbackReceipt {
+            stream_id: received_stream_id,
+            ..
+        }
         | Frame::StreamRequalifyData {
             stream_id: received_stream_id,
             ..

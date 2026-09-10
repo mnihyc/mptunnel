@@ -2496,6 +2496,8 @@ fn reliable_path_frame_stream_id(frame: &Frame) -> Option<StreamId> {
         | Frame::StreamRequalifyData { stream_id, .. }
         | Frame::StreamRequalifyAck { stream_id, .. }
         | Frame::StreamMaxData { stream_id, .. }
+        | Frame::StreamFeedbackProbe { stream_id, .. }
+        | Frame::StreamFeedbackReceipt { stream_id, .. }
         | Frame::StreamReturnPlanFinal { stream_id, .. }
         | Frame::StreamFin { stream_id, .. }
         | Frame::StreamDetach { stream_id }
@@ -2546,6 +2548,8 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::StreamRequalifyData { .. } => "stream_requalify_data",
         Frame::StreamRequalifyAck { .. } => "stream_requalify_ack",
         Frame::StreamMaxData { .. } => "stream_max_data",
+        Frame::StreamFeedbackProbe { .. } => "stream_feedback_probe",
+        Frame::StreamFeedbackReceipt { .. } => "stream_feedback_receipt",
         Frame::StreamReturnPlanFinal { .. } => "stream_return_plan_final",
         Frame::StreamFin { .. } => "stream_fin",
         Frame::StreamDetach { .. } => "stream_detach",

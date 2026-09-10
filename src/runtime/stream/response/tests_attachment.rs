@@ -642,6 +642,9 @@ fn retained_response_ack_catchup_services_newer_max_data_under_generation_churn(
     assert_eq!(limits.max_ack_ranges, 256);
     let stream_id = StreamId(7);
     let (binding, a_key, mut a_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    // This prerequisite is the permanently required full-fanout fallback,
+    // independent of the optional confirmed-return routing optimization.
+    binding.finish_feedback_route();
     let b_key = alternate_key(UnderlayProtocol::Tcp);
     let (b_commands, mut b_receivers) = reliable_path_command_channels(1);
     assert_eq!(
@@ -916,6 +919,154 @@ fn request_feedback_ingress_is_non_owning_and_exact_to_path_instance() {
             .iter()
             .all(|target| !target.observation.is_request_feedback)
     );
+}
+
+#[test]
+fn confirmed_feedback_return_preserves_reply_credit_and_terminal_fanout() {
+    use crate::mux::stream::ReliableRecvStream;
+    use crate::runtime::path::commands::{
+        ReliablePathCommandReceivers, reliable_path_command_pending_bytes,
+    };
+    fn drain(receivers: &mut ReliablePathCommandReceivers) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Some(command) = try_recv_reliable_path_priority_command(receivers) {
+            receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+            let ReliablePathCommand::SendFrame(frame) = command else {
+                panic!("ordinary feedback")
+            };
+            frames.push(frame);
+        }
+        frames
+    }
+    let stream_id = StreamId(7);
+    let (binding, a, mut a_rx) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let b = alternate_key(UnderlayProtocol::Tcp);
+    let (b_commands, mut b_rx) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(b.underlay, b.path_id, b_commands, TrafficClass::Throughput),
+        ResponseStreamAttachOutcome::Attached
+    );
+    let b_id = with_output_entry_for_key(&binding, b, |entry| ServerReinjectionOutputIdentity {
+        key: b,
+        incarnation: entry.incarnation,
+    });
+    let mut recv =
+        ReliableRecvStream::new_with_initial_max_offset(stream_id, MuxLimits::default(), 0);
+    let max = binding
+        .publish_max_data(stream_id, 1024)
+        .max_data
+        .published_offset
+        .unwrap();
+    recv.commit_max_data(max);
+    assert!(matches!(
+        drain(&mut a_rx).as_slice(),
+        [Frame::StreamMaxData {
+            max_offset: 1024,
+            ..
+        }]
+    ));
+    assert!(matches!(
+        drain(&mut b_rx).as_slice(),
+        [Frame::StreamMaxData {
+            max_offset: 1024,
+            ..
+        }]
+    ));
+    for generation in 1..=2 {
+        recv.receive_data(generation - 1, bytes::Bytes::from_static(b"x"))
+            .unwrap();
+        let update = recv.take_ack_update();
+        binding.publish_ack(generation, &update, recv.ack_frames());
+        if generation == 1 {
+            assert!(matches!(
+                drain(&mut a_rx).as_slice(),
+                [Frame::StreamAck { .. }]
+            ));
+            assert!(matches!(
+                drain(&mut b_rx).as_slice(),
+                [Frame::StreamAck { .. }]
+            ));
+            assert!(binding.feedback_route_deadline().is_none());
+        }
+    }
+    let a_discovery = drain(&mut a_rx);
+    let b_discovery = drain(&mut b_rx);
+    assert!(matches!(
+        a_discovery.as_slice(),
+        [
+            Frame::StreamAck { .. },
+            Frame::StreamFeedbackProbe {
+                max_offset: 1024,
+                ..
+            }
+        ]
+    ));
+    assert!(matches!(
+        b_discovery.as_slice(),
+        [
+            Frame::StreamAck { .. },
+            Frame::StreamFeedbackProbe {
+                max_offset: 1024,
+                ..
+            }
+        ]
+    ));
+    let Frame::StreamFeedbackProbe { token, .. } = a_discovery[1] else {
+        unreachable!()
+    };
+    binding.receive_feedback_receipt(stream_id, token);
+    recv.receive_data(2, bytes::Bytes::from_static(b"x"))
+        .unwrap();
+    let update = recv.take_ack_update();
+    let publication = binding.publish_ack(3, &update, recv.ack_frames());
+    assert!(publication.ack.published && !publication.ack.pending);
+    assert!(
+        binding.pending_ack_capacity_notifies(3).is_empty(),
+        "skipped debt is not eligible work"
+    );
+    let a_selected = drain(&mut a_rx);
+    assert!(matches!(
+        a_selected.as_slice(),
+        [Frame::StreamAck { .. }, Frame::StreamFeedbackProbe { .. }]
+    ));
+    assert!(drain(&mut b_rx).is_empty());
+
+    binding.record_feedback_probe(b_id, 900, 2048);
+    binding.service_feedback_route(stream_id, 1024);
+    assert!(
+        drain(&mut b_rx).is_empty(),
+        "Probe cannot grant its own required MAX"
+    );
+    binding.service_feedback_route(stream_id, 2048);
+    assert_eq!(
+        drain(&mut b_rx),
+        vec![Frame::StreamFeedbackReceipt {
+            stream_id,
+            token: 900
+        }]
+    );
+    assert!(
+        drain(&mut a_rx).is_empty(),
+        "Receipt is neither fanned out nor eliciting"
+    );
+
+    binding.finish_feedback_route();
+    let terminal = binding.retry_pending_ack(stream_id);
+    assert!(terminal.ack.published && !terminal.ack.pending);
+    assert_eq!(
+        drain(&mut b_rx),
+        recv.ack_frames(),
+        "terminal restores cumulative sibling coverage"
+    );
+    let Frame::StreamFeedbackProbe {
+        token: old_token, ..
+    } = a_selected[1]
+    else {
+        unreachable!()
+    };
+    binding.receive_feedback_receipt(stream_id, old_token);
+    assert!(binding.feedback_route_deadline().is_none());
+    assert_eq!(with_output_entry_for_key(&binding, a, |entry| entry.key), a);
 }
 
 #[test]

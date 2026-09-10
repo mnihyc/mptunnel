@@ -309,6 +309,7 @@ pub(in crate::runtime) struct RelayRecvProgressSend {
     force_ack: bool,
     publish_max_data: bool,
     force_max_data: bool,
+    terminal: bool,
 }
 
 impl RelayRecvProgressSend {
@@ -323,6 +324,7 @@ impl RelayRecvProgressSend {
             force_ack: force_max_data,
             publish_max_data: true,
             force_max_data,
+            terminal: false,
         }
     }
 
@@ -335,6 +337,7 @@ impl RelayRecvProgressSend {
             // Once the final receive offset is contiguous, new receive credit
             // has no consumer and must not precede the terminal Data ACK.
             force_max_data: false,
+            terminal: true,
         }
     }
 
@@ -345,6 +348,7 @@ impl RelayRecvProgressSend {
             force_ack: true,
             publish_max_data: false,
             force_max_data: false,
+            terminal: false,
         }
     }
 }
@@ -1448,6 +1452,10 @@ impl RequestSenderService {
         progress: &mut ReliableRecvProgress,
         request: RelayRecvProgressSend,
     ) -> Result<StreamFeedbackPublication, RuntimeError> {
+        if request.terminal {
+            remotes.finish_feedback_route();
+        }
+        remotes.prepare_feedback_route(context);
         if !remotes.has_receive_feedback_output() {
             // Closed command admission is not attachment-removal authority.
             // Preserve cumulative feedback until the ordered carrier terminal
@@ -1466,7 +1474,7 @@ impl RequestSenderService {
         ) {
             let generation = progress.ack_generation();
             let publication = if generation == ack_generation_before {
-                remotes.retry_pending_stream_ack()
+                remotes.retry_pending_feedback_with_context(context)
             } else {
                 #[cfg(feature = "lab-diagnostics")]
                 let ack_started = Instant::now();
@@ -1506,7 +1514,12 @@ impl RequestSenderService {
                         );
                     }
                 }
-                remotes.publish_stream_ack(generation, update_frames, ack_frames)
+                remotes.publish_stream_ack_with_context(
+                    context,
+                    generation,
+                    update_frames,
+                    ack_frames,
+                )
             };
             if let Some(published_offset) = publication.max_data.published_offset {
                 recv_stream.commit_max_data(published_offset);
@@ -1541,7 +1554,7 @@ impl RequestSenderService {
                 context.mux_limits,
             );
             let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
-            let publication = remotes.publish_max_data(max_offset);
+            let publication = remotes.publish_max_data_with_context(context, max_offset);
             if let Some(published_offset) = publication.max_data.published_offset {
                 recv_stream.commit_max_data(published_offset);
             }

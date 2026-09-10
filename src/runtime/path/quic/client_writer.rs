@@ -394,6 +394,8 @@ fn try_route_client_udp_stream_frame_during_write(
     let received_stream_id = match &frame {
         Frame::StreamData { stream_id, .. }
         | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamFeedbackProbe { stream_id, .. }
+        | Frame::StreamFeedbackReceipt { stream_id, .. }
         | Frame::StreamRequalifyData { stream_id, .. }
         | Frame::StreamRequalifyAck { stream_id, .. }
         | Frame::StreamMaxData { stream_id, .. } => *stream_id,

@@ -360,6 +360,19 @@ pub enum Frame {
         stream_id: StreamId,
         max_offset: u64,
     },
+    /// Ordered feedback-service marker for the live logical stream owner.
+    /// `max_offset` is a required already-applied credit fence, never a grant.
+    StreamFeedbackProbe {
+        stream_id: StreamId,
+        token: u64,
+        max_offset: u64,
+    },
+    /// Logical-owner receipt for one exact feedback marker. It carries no
+    /// Product-byte receipt, capacity sample, or requalification authority.
+    StreamFeedbackReceipt {
+        stream_id: StreamId,
+        token: u64,
+    },
     StreamFin {
         stream_id: StreamId,
         final_offset: u64,
@@ -463,6 +476,8 @@ impl Frame {
             Self::StreamRequalifyData { .. } => "STREAM_REQUALIFY_DATA",
             Self::StreamRequalifyAck { .. } => "STREAM_REQUALIFY_ACK",
             Self::StreamMaxData { .. } => "STREAM_MAX_DATA",
+            Self::StreamFeedbackProbe { .. } => "STREAM_FEEDBACK_PROBE",
+            Self::StreamFeedbackReceipt { .. } => "STREAM_FEEDBACK_RECEIPT",
             Self::StreamFin { .. } => "STREAM_FIN",
             Self::StreamDetach { .. } => "STREAM_DETACH",
             Self::StreamReset { .. } => "STREAM_RESET",

@@ -12,14 +12,14 @@ use super::io::first_proven_ack_gap;
 use super::io::{
     AuthoritativeStreamAckSnapshot, ReadyStreamDataBatchBounds, ReadyStreamDataDirection,
     ReliableAckGapReinjectionProgress, ReliablePathStalenessObservation,
-    ReliableResponsePathStaleness, apply_and_write_ready_stream_data_batch,
-    begin_reliable_stream_ack, collect_ready_stream_data_batch,
-    exact_contiguous_retransmission_frames, pending_stream_fin_ready,
-    preserve_reinjection_frontier_quantum, read_reliable_relay_payload, receive_stream_fin,
-    reconcile_accepted_copy_wake, resize_reliable_relay_buffer, retain_accepted_copy_wake,
-    stream_ack_gap_frontier_reinjection_frames_normalized,
+    ReliableResponsePathStaleness, apply_ready_stream_data_batch, begin_reliable_stream_ack,
+    collect_ready_stream_data_batch, exact_contiguous_retransmission_frames,
+    pending_stream_fin_ready, preserve_reinjection_frontier_quantum, read_reliable_relay_payload,
+    receive_stream_fin, reconcile_accepted_copy_wake, resize_reliable_relay_buffer,
+    retain_accepted_copy_wake, stream_ack_gap_frontier_reinjection_frames_normalized,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required, update_reinjection_authoritative_ack_snapshot,
+    write_applied_ready_stream_data_batch,
 };
 #[cfg(test)]
 use super::io::{
@@ -687,6 +687,67 @@ impl ServerAckPublicationState {
 
     fn current_generation_is_fully_published(&self) -> bool {
         !self.pending && (self.generation == 0 || self.published_generation == self.generation)
+    }
+}
+
+/// Feedback liveness does not belong to the target socket. Keep the same
+/// partially completed write/flush/shutdown future while servicing its exact
+/// route deadline and existing retained publication work. This does not
+/// consume more input or manufacture receive credit before local delivery.
+async fn service_server_feedback_while_pending<F, T>(
+    operation: F,
+    path_stream: &ReliablePathStream,
+    recv_stream: &mut ReliableRecvStream,
+    publication: &mut ServerAckPublicationState,
+    peer_max_offset: u64,
+) -> Result<T, RuntimeError>
+where
+    F: std::future::Future<Output = Result<T, RuntimeError>>,
+{
+    tokio::pin!(operation);
+    // A separate watch cursor preserves the outer actor's own recovery wake.
+    let mut updates = path_stream.subscribe_output_updates();
+    loop {
+        publication.record_feedback(
+            path_stream.service_feedback_route(peer_max_offset),
+            recv_stream,
+        );
+        publication.record_feedback(path_stream.feedback_status(), recv_stream);
+        let mut notifies = path_stream.pending_ack_capacity_notifies(publication.generation);
+        for notify in path_stream
+            .pending_max_data_capacity_notifies()
+            .into_iter()
+            .chain(path_stream.feedback_route_capacity_notifies())
+        {
+            if !notifies.iter().any(|current| Arc::ptr_eq(current, &notify)) {
+                notifies.push(notify);
+            }
+        }
+        let mut capacity = arm_carrier_capacity_notifies(notifies);
+        // Arm before the final retry, including recipients exposed by expiry.
+        publication.record_feedback(
+            path_stream.service_feedback_route(peer_max_offset),
+            recv_stream,
+        );
+        let deadline = path_stream.feedback_route_deadline();
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = async { if let Some(wait) = capacity.as_mut() { wait.as_mut().await; } }, if capacity.is_some() => {}
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            changed = async {
+                match updates.as_mut() {
+                    Some(updates) => updates.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if updates.is_some() => {
+                changed.map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+            }
+        }
     }
 }
 
@@ -2628,6 +2689,11 @@ where
                 retained_frontier_candidate,
             )
         };
+        let applied_peer_max_offset = response_product.lock().send_stream.peer_max_offset();
+        request_ack_publication.record_feedback(
+            path_stream.service_feedback_route(applied_peer_max_offset),
+            &mut recv_stream,
+        );
         // Attachment replay can service feedback outside this actor. Observe
         // its durable advertised credit and current exact-recipient fences;
         // this is reconciliation, not a new send/progress event.
@@ -2705,6 +2771,14 @@ where
         }
         let request_feedback_path_snapshot =
             path_stream.request_feedback_path_snapshot(request_lane);
+        let feedback_route_capacity_wait =
+            arm_carrier_capacity_notifies(path_stream.feedback_route_capacity_notifies());
+        let has_feedback_route_capacity_wait = feedback_route_capacity_wait.is_some();
+        request_ack_publication.record_feedback(
+            path_stream.service_feedback_route(applied_peer_max_offset),
+            &mut recv_stream,
+        );
+        let feedback_route_deadline = path_stream.feedback_route_deadline();
         let request_feedback_underlay = request_feedback_path_snapshot
             .map(|snapshot| snapshot.underlay)
             .or_else(|| path_stream.request_feedback_underlay())
@@ -3162,6 +3236,15 @@ where
         // ready during an upload. Fair polling keeps response progress from
         // being hidden behind an unbounded run of incoming STREAM_DATA.
         tokio::select! {
+        _ = async {
+            match feedback_route_deadline {
+                Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+                None => std::future::pending().await,
+            }
+        } => { continue; }
+        _ = async move {
+            if let Some(wait) = feedback_route_capacity_wait { wait.await; }
+        }, if has_feedback_route_capacity_wait => { continue; }
         () = prepared_work_wait => {
             // Re-read C, source credit and error/terminal state under the owner.
             continue;
@@ -3343,8 +3426,7 @@ where
                     // its advertising attachment has already been removed.
                     request_ack_publication
                         .record_feedback(path_stream.feedback_status(), &mut recv_stream);
-                    apply_and_write_ready_stream_data_batch(
-                        &mut local,
+                    let applied = apply_ready_stream_data_batch(
                         &mut recv_stream,
                         &mut ready_path_data,
                         ReadyStreamDataDirection::ServerUpload,
@@ -3390,8 +3472,12 @@ where
                             }
                             Ok(outcome)
                         },
-                    )
-                    .await?;
+                    );
+                    let peer_max_offset = response_product.lock().send_stream.peer_max_offset();
+                    service_server_feedback_while_pending(
+                        write_applied_ready_stream_data_batch(&mut local, &mut ready_path_data, applied),
+                        path_stream, &mut recv_stream, &mut request_ack_publication, peer_max_offset,
+                    ).await?;
                     if enqueue_tcp_recv_progress(
                         path_stream,
                         &mut recv_stream,
@@ -3409,6 +3495,7 @@ where
                         last_recv_progress_sent_at = Instant::now();
                     }
                     if pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset) {
+                        path_stream.finish_feedback_route();
                         if enqueue_tcp_recv_progress(
                             path_stream,
                             &mut recv_stream,
@@ -3424,7 +3511,11 @@ where
                             response_sender_retry_at = None;
                             last_recv_progress_sent_at = Instant::now();
                         }
-                        local.shutdown().await?;
+                        let peer_max_offset = response_product.lock().send_stream.peer_max_offset();
+                        service_server_feedback_while_pending(
+                            async { local.shutdown().await.map_err(RuntimeError::Io) },
+                            path_stream, &mut recv_stream, &mut request_ack_publication, peer_max_offset,
+                        ).await?;
                         remote_open = false;
                         pending_remote_fin_offset = None;
                     }
@@ -3617,6 +3708,22 @@ where
                     };
                     send_buffer_reservation.release(released_bytes);
                 }
+                Frame::StreamFeedbackProbe { stream_id: probe_stream_id, .. }
+                    if probe_stream_id == stream_id => {
+                    // The handle retained the exact reply tuple only after
+                    // dequeuing this boundary behind its preceding ACK/MAX.
+                    let peer_max_offset = response_product.lock().send_stream.peer_max_offset();
+                    request_ack_publication.record_feedback(
+                        path_stream.service_feedback_route(peer_max_offset), &mut recv_stream,
+                    );
+                }
+                Frame::StreamFeedbackReceipt { stream_id: receipt_stream_id, token }
+                    if receipt_stream_id == stream_id => {
+                    request_ack_publication.record_feedback(
+                        path_stream.receive_feedback_receipt(token), &mut recv_stream,
+                    );
+                    request_ack_capacity_wait = None;
+                }
                 Frame::StreamMaxData {
                     stream_id: max_stream_id,
                     max_offset,
@@ -3633,6 +3740,7 @@ where
                     stream_id: fin_stream_id,
                     final_offset,
                 } if fin_stream_id == stream_id => {
+                    path_stream.finish_feedback_route();
                     if receive_stream_fin(
                         &recv_stream,
                         &mut pending_remote_fin_offset,
@@ -3653,7 +3761,11 @@ where
                             response_sender_retry_at = None;
                             last_recv_progress_sent_at = Instant::now();
                         }
-                        local.shutdown().await?;
+                        let peer_max_offset = response_product.lock().send_stream.peer_max_offset();
+                        service_server_feedback_while_pending(
+                            async { local.shutdown().await.map_err(RuntimeError::Io) },
+                            path_stream, &mut recv_stream, &mut request_ack_publication, peer_max_offset,
+                        ).await?;
                         remote_open = false;
                         pending_remote_fin_offset = None;
                     }

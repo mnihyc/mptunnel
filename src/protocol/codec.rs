@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 14;
+const VERSION: u8 = 15;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 116;
@@ -130,6 +130,8 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
             payload.len().saturating_add(16)
         }
         Frame::StreamAck { ranges, .. } => 21usize.saturating_add(ranges.len().saturating_mul(16)),
+        Frame::StreamFeedbackProbe { .. } => 24,
+        Frame::StreamFeedbackReceipt { .. } => 16,
         Frame::PeerStatusResponse { paths, .. } => PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN
             .saturating_add(paths.len().saturating_mul(PEER_PATH_STATUS_ENCODED_LEN)),
         Frame::IpTunnelReady { addresses, .. } => {
@@ -481,6 +483,21 @@ fn encode_payload(
             put_u64(out, *max_offset);
             Ok(FrameKind::StreamMaxData)
         }
+        Frame::StreamFeedbackProbe {
+            stream_id,
+            token,
+            max_offset,
+        } => {
+            put_u64(out, stream_id.0);
+            put_u64(out, *token);
+            put_u64(out, *max_offset);
+            Ok(FrameKind::StreamFeedbackProbe)
+        }
+        Frame::StreamFeedbackReceipt { stream_id, token } => {
+            put_u64(out, stream_id.0);
+            put_u64(out, *token);
+            Ok(FrameKind::StreamFeedbackReceipt)
+        }
         Frame::StreamFin {
             stream_id,
             final_offset,
@@ -771,6 +788,15 @@ fn decode_payload(
         FrameKind::StreamMaxData => Ok(Frame::StreamMaxData {
             stream_id: StreamId(reader.get_u64()?),
             max_offset: reader.get_u64()?,
+        }),
+        FrameKind::StreamFeedbackProbe => Ok(Frame::StreamFeedbackProbe {
+            stream_id: StreamId(reader.get_u64()?),
+            token: reader.get_u64()?,
+            max_offset: reader.get_u64()?,
+        }),
+        FrameKind::StreamFeedbackReceipt => Ok(Frame::StreamFeedbackReceipt {
+            stream_id: StreamId(reader.get_u64()?),
+            token: reader.get_u64()?,
         }),
         FrameKind::StreamFin => Ok(Frame::StreamFin {
             stream_id: StreamId(reader.get_u64()?),
@@ -1528,6 +1554,8 @@ enum FrameKind {
     StreamRequalifyAck = 43,
     StreamReturnPlanFinal = 49,
     OpenStreamRepair = 50,
+    StreamFeedbackProbe = 51,
+    StreamFeedbackReceipt = 52,
 }
 
 impl FrameKind {
@@ -1570,6 +1598,8 @@ impl FrameKind {
             43 => Ok(Self::StreamRequalifyAck),
             49 => Ok(Self::StreamReturnPlanFinal),
             50 => Ok(Self::OpenStreamRepair),
+            51 => Ok(Self::StreamFeedbackProbe),
+            52 => Ok(Self::StreamFeedbackReceipt),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }

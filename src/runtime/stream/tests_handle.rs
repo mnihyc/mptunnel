@@ -1634,6 +1634,117 @@ async fn server_input_does_not_coalesce_feedback_across_path_detach() {
 }
 
 #[tokio::test]
+async fn server_feedback_probe_is_an_ordered_applied_state_boundary() {
+    use crate::runtime::path::commands::reliable_path_command_pending_bytes;
+    use crate::runtime::stream::response::ResponseStreamBinding;
+    let stream_id = StreamId(7);
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let (commands, mut replies) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new_with_limits(
+        crate::protocol::SessionId(7),
+        key.underlay,
+        key.path_id,
+        commands,
+        TrafficClass::Throughput,
+        MuxLimits::default(),
+    );
+    let instance = binding.sender_path_targets(TrafficClass::Control, 1)[0]
+        .observation
+        .path_instance_id;
+    let captured = binding.feedback_reply_output(key, instance).unwrap();
+    let probe = Frame::StreamFeedbackProbe {
+        stream_id,
+        token: 9,
+        max_offset: 32,
+    };
+    assert!(!ServerFeedbackBatch::accepts(&probe));
+    let (events, input) = mpsc::channel(4);
+    for event in [
+        ServerReliableStreamEvent::Frame(Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: vec![OffsetRange { start: 0, end: 8 }],
+        }),
+        ServerReliableStreamEvent::Frame(Frame::StreamMaxData {
+            stream_id,
+            max_offset: 32,
+        }),
+        ServerReliableStreamEvent::FeedbackProbe {
+            frame: probe.clone(),
+            reply_output: Some(captured),
+        },
+        ServerReliableStreamEvent::Frame(Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: vec![OffsetRange { start: 0, end: 16 }],
+        }),
+    ] {
+        events.try_send(event).unwrap();
+    }
+    let mut stream = server_stream_with_events(input);
+    stream.output = ReliablePathStreamOutput::Switchable(binding.clone());
+    let mut peer =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, MuxLimits::default(), 16);
+    peer.send_data(Bytes::from_static(b"0123456789abcdef"))
+        .unwrap();
+    let Frame::StreamAck { ranges, .. } = stream.recv_frame().await.unwrap() else {
+        panic!("preceding ACK")
+    };
+    assert_eq!(ranges, vec![OffsetRange { start: 0, end: 8 }]);
+    peer.apply_ack(&ranges).unwrap();
+    let Frame::StreamMaxData { max_offset, .. } = stream.recv_frame().await.unwrap() else {
+        panic!("preceding MAX")
+    };
+    assert!(
+        stream.try_recv_frame().is_none(),
+        "ready DATA drains cannot swallow Probe metadata"
+    );
+    assert_eq!(stream.recv_frame().await.unwrap(), probe);
+    assert_eq!(
+        peer.reinjection_bytes(),
+        8,
+        "following ACK cannot overtake the Probe cut"
+    );
+    stream.service_feedback_route(peer.peer_max_offset());
+    assert!(
+        try_recv_reliable_path_command(&mut replies).is_none(),
+        "required MAX is not probe-provided credit"
+    );
+    peer.update_max_offset(max_offset);
+    stream.service_feedback_route(peer.peer_max_offset());
+    let command = try_recv_reliable_path_command(&mut replies).expect("owner-applied receipt");
+    replies.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    assert!(matches!(
+        command,
+        ReliablePathCommand::SendFrame(Frame::StreamFeedbackReceipt { token: 9, .. })
+    ));
+    assert!(try_recv_reliable_path_command(&mut replies).is_none());
+    let Frame::StreamAck { ranges, .. } = stream.recv_frame().await.unwrap() else {
+        panic!("following ACK")
+    };
+    peer.apply_ack(&ranges).unwrap();
+    assert_eq!(peer.reinjection_bytes(), 0);
+
+    drop(replies);
+    let (replacement, mut replacement_rx) = reliable_path_command_channels(8);
+    binding.attach(
+        key.underlay,
+        key.path_id,
+        replacement,
+        TrafficClass::Throughput,
+    );
+    binding.record_feedback_probe(captured, 10, 32);
+    stream.service_feedback_route(peer.peer_max_offset());
+    assert!(
+        try_recv_reliable_path_command(&mut replacement_rx).is_none(),
+        "captured old output cannot retarget its reply after replacement"
+    );
+}
+
+#[tokio::test]
 async fn ready_server_input_never_crosses_a_path_detach_lifecycle_boundary() {
     let first_data = stream_data_frame_at(0, 16);
     let second_data = stream_data_frame_at(16, 16);

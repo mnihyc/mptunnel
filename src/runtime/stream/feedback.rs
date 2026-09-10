@@ -3,6 +3,7 @@
 //! This module decides when connection-level Data ACK and receive-window
 //! updates are due. Carrier ACK and loss recovery remain owned by TCP or QUIC.
 
+use super::feedback_route::StreamFeedbackProbe;
 use crate::model::capacity::{
     QUIC_TIMER_GRANULARITY, reliable_stream_ack_update_bytes,
     reliable_stream_advertised_window_bytes,
@@ -65,6 +66,33 @@ impl StreamFeedbackPublication {
     }
 }
 
+/// One exact output's current service eligibility. Proof and reply messages
+/// use the same ordinary FIFO even when this output owes no eligible ACK/MAX.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct StreamFeedbackService {
+    pub(in crate::runtime) allow_facts: bool,
+    pub(in crate::runtime) probe: Option<StreamFeedbackProbe>,
+    /// Already accepted by the logical actor and covered by actual peer MAX.
+    pub(in crate::runtime) receipt: Option<u64>,
+}
+
+impl Default for StreamFeedbackService {
+    fn default() -> Self {
+        Self {
+            allow_facts: true,
+            probe: None,
+            receipt: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(in crate::runtime) struct StreamFeedbackOutputPublication {
+    pub(in crate::runtime) feedback: StreamFeedbackPublication,
+    pub(in crate::runtime) probe_admitted: Option<u64>,
+    pub(in crate::runtime) receipt_admitted: Option<u64>,
+}
+
 /// Exact-output publication ownership. Only a blocked immutable ACK tail is
 /// retained; admitted prefix frames release their range allocations at once.
 /// New generations cannot restart this finite job. MAX remains one latest
@@ -84,8 +112,9 @@ impl StreamFeedbackPublicationCursor {
         update_frames: Option<&[Frame]>,
         stream_id: StreamId,
         published_max_offset: &mut u64,
+        policy: StreamFeedbackService,
         mut enqueue: E,
-    ) -> StreamFeedbackPublication
+    ) -> StreamFeedbackOutputPublication
     where
         E: FnMut(Frame) -> bool,
     {
@@ -94,18 +123,57 @@ impl StreamFeedbackPublicationCursor {
         debug_assert!(state.cumulative_ack_frames.iter().chain(update_frames.into_iter().flatten()).all(
             |frame| matches!(frame, Frame::StreamAck { stream_id: id, .. } if *id == stream_id)
         ));
-        let mut result = StreamFeedbackPublication {
-            ack_generation: generation,
+        let mut output = StreamFeedbackOutputPublication {
+            feedback: StreamFeedbackPublication {
+                ack_generation: generation,
+                ..Default::default()
+            },
             ..Default::default()
         };
+        let result = &mut output.feedback;
 
         // Keep the common immediate path borrowed. Materialize an immutable
         // tail only on actual blocked admission, never a second healthy copy.
         let mut current_frames: Option<&[Frame]> = None;
         let mut current_index = 0;
         loop {
-            let ack_pending = self.is_pending(generation);
-            let max_pending = *published_max_offset < state.max_data_offset;
+            if let Some(token) = policy.receipt
+                && output.receipt_admitted.is_none()
+            {
+                if !enqueue(Frame::StreamFeedbackReceipt { stream_id, token }) {
+                    if let Some(frames) = current_frames {
+                        self.retain_tail(generation, &frames[current_index..]);
+                    }
+                    break;
+                }
+                output.receipt_admitted = Some(token);
+                continue;
+            }
+            if let Some(probe) = policy.probe
+                && output.probe_admitted.is_none()
+                && self.published_generation != 0
+                // Published lies within the captured-to-current generation
+                // interval, including counter wrap. No active proof can span
+                // a complete u64 generation cycle.
+                && self.published_generation.wrapping_sub(probe.ack_generation)
+                    <= generation.wrapping_sub(probe.ack_generation)
+                && *published_max_offset >= probe.max_offset
+            {
+                if !enqueue(Frame::StreamFeedbackProbe {
+                    stream_id,
+                    token: probe.token,
+                    max_offset: probe.max_offset,
+                }) {
+                    if let Some(frames) = current_frames {
+                        self.retain_tail(generation, &frames[current_index..]);
+                    }
+                    break;
+                }
+                output.probe_admitted = Some(probe.token);
+                continue;
+            }
+            let ack_pending = policy.allow_facts && self.is_pending(generation);
+            let max_pending = policy.allow_facts && *published_max_offset < state.max_data_offset;
             if !ack_pending && !max_pending {
                 break;
             }
@@ -164,10 +232,12 @@ impl StreamFeedbackPublicationCursor {
                 current_index = 0;
             }
         }
-        result.ack.published = generation != 0 && !self.is_pending(generation);
-        result.ack.pending = self.is_pending(generation);
-        result.max_data.pending = *published_max_offset < state.max_data_offset;
-        result
+        result.ack.published =
+            policy.allow_facts && generation != 0 && !self.is_pending(generation);
+        result.ack.pending = policy.allow_facts && self.is_pending(generation);
+        result.max_data.pending =
+            policy.allow_facts && *published_max_offset < state.max_data_offset;
+        output
     }
 
     fn retain_tail(&mut self, generation: u64, frames: &[Frame]) {
@@ -179,6 +249,10 @@ impl StreamFeedbackPublicationCursor {
 
     pub(in crate::runtime) fn is_pending(&self, generation: u64) -> bool {
         generation != 0 && self.published_generation != generation
+    }
+
+    pub(in crate::runtime) fn has_ack_baseline(&self) -> bool {
+        self.published_generation != 0
     }
 }
 
@@ -335,14 +409,21 @@ mod publication_tests {
         slots: usize,
     ) -> (StreamFeedbackPublication, Vec<Frame>) {
         let mut frames = Vec::new();
-        let result = cursor.service(state, update, StreamId(1), max_offset, |frame| {
-            if frames.len() == slots {
-                return false;
-            }
-            frames.push(frame);
-            true
-        });
-        (result, frames)
+        let result = cursor.service(
+            state,
+            update,
+            StreamId(1),
+            max_offset,
+            StreamFeedbackService::default(),
+            |frame| {
+                if frames.len() == slots {
+                    return false;
+                }
+                frames.push(frame);
+                true
+            },
+        );
+        (result.feedback, frames)
     }
 
     #[test]
@@ -446,6 +527,127 @@ mod publication_tests {
         );
         assert!(result.ack.published && !result.max_data.pending);
         assert_eq!(cursor.pending_frames.capacity(), 0);
+    }
+
+    #[test]
+    fn feedback_probe_follows_complete_frozen_ack_and_credit_before_newer_facts() {
+        let mut cursor = StreamFeedbackPublicationCursor::default();
+        let mut max_offset = 0;
+        let mut state = StreamFeedbackState {
+            ack_generation: 1,
+            cumulative_ack_frames: vec![ack(1)],
+            max_data_offset: 100,
+        };
+        service_slots(&mut cursor, &state, None, &mut max_offset, 2);
+        state.ack_generation = 2;
+        state.cumulative_ack_frames = vec![ack(2), ack(3)];
+        state.max_data_offset = 200;
+        let policy = StreamFeedbackService {
+            probe: Some(StreamFeedbackProbe {
+                token: 7,
+                ack_generation: 2,
+                max_offset: 200,
+            }),
+            ..Default::default()
+        };
+        let mut admitted = Vec::new();
+        for turn in 0..4 {
+            if turn == 1 {
+                state.ack_generation = 3;
+                state.cumulative_ack_frames.push(ack(4));
+            }
+            let mut slot = None;
+            let result = cursor.service(
+                &state,
+                None,
+                StreamId(1),
+                &mut max_offset,
+                policy,
+                |frame| {
+                    if slot.is_some() {
+                        return false;
+                    }
+                    slot = Some(frame);
+                    true
+                },
+            );
+            if turn < 3 {
+                assert_eq!(result.probe_admitted, None);
+            } else {
+                assert_eq!(result.probe_admitted, Some(7));
+                assert!(
+                    result.feedback.ack.pending,
+                    "proof is not current ACK publication"
+                );
+            }
+            admitted.push(slot.unwrap());
+        }
+        assert_eq!(
+            admitted,
+            vec![
+                ack(2),
+                Frame::StreamMaxData {
+                    stream_id: StreamId(1),
+                    max_offset: 200
+                },
+                ack(3),
+                Frame::StreamFeedbackProbe {
+                    stream_id: StreamId(1),
+                    token: 7,
+                    max_offset: 200
+                },
+            ]
+        );
+        assert_eq!(cursor.pending_generation, 3);
+        assert!(cursor.is_pending(3));
+    }
+
+    #[test]
+    fn feedback_ready_receipt_has_no_ack_or_credit_publication_authority() {
+        let mut cursor = StreamFeedbackPublicationCursor::default();
+        let mut max_offset = 0;
+        let state = StreamFeedbackState {
+            ack_generation: 2,
+            cumulative_ack_frames: vec![ack(1), ack(2)],
+            max_data_offset: 100,
+        };
+        service_slots(&mut cursor, &state, None, &mut max_offset, 0);
+        let retained = cursor.pending_frames.clone();
+        let mut frames = Vec::new();
+        let result = cursor.service(
+            &state,
+            None,
+            StreamId(1),
+            &mut max_offset,
+            StreamFeedbackService {
+                allow_facts: false,
+                receipt: Some(9),
+                probe: None,
+            },
+            |frame| {
+                frames.push(frame);
+                true
+            },
+        );
+        assert_eq!(
+            frames,
+            vec![Frame::StreamFeedbackReceipt {
+                stream_id: StreamId(1),
+                token: 9
+            }]
+        );
+        assert_eq!(result.receipt_admitted, Some(9));
+        assert!(
+            !result.feedback.ack.accepted
+                && !result.feedback.ack.published
+                && !result.feedback.ack.pending
+        );
+        assert_eq!(
+            result.feedback.max_data,
+            StreamMaxDataPublication::default()
+        );
+        assert_eq!(max_offset, 0);
+        assert_eq!(cursor.pending_frames, retained);
     }
 
     #[test]

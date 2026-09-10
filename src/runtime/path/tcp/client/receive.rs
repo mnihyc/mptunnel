@@ -22,6 +22,8 @@ fn client_tcp_inbound_frame_is_product_stream(frame: &Frame) -> bool {
             | Frame::StreamReset { .. }
             | Frame::StreamData { .. }
             | Frame::StreamAck { .. }
+            | Frame::StreamFeedbackProbe { .. }
+            | Frame::StreamFeedbackReceipt { .. }
             | Frame::StreamRequalifyData { .. }
             | Frame::StreamRequalifyAck { .. }
             | Frame::StreamFin { .. }
@@ -190,6 +192,24 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[test]
+    fn idle_tcp_receive_routes_feedback_markers_to_the_logical_stream_owner() {
+        let stream_id = StreamId(74);
+        for frame in [
+            Frame::StreamFeedbackProbe {
+                stream_id,
+                token: 7,
+                max_offset: 11,
+            },
+            Frame::StreamFeedbackReceipt {
+                stream_id,
+                token: 7,
+            },
+        ] {
+            assert!(client_tcp_inbound_frame_is_product_stream(&frame));
+        }
+    }
 
     #[test]
     fn idle_tcp_receive_classifies_both_requalification_frames_as_product_stream_work() {

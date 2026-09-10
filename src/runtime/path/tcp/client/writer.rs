@@ -815,6 +815,8 @@ fn client_tcp_write_barrier_reason(
         | Frame::StreamReset { stream_id, .. }
         | Frame::StreamData { stream_id, .. }
         | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamFeedbackProbe { stream_id, .. }
+        | Frame::StreamFeedbackReceipt { stream_id, .. }
         | Frame::StreamRequalifyData { stream_id, .. }
         | Frame::StreamRequalifyAck { stream_id, .. }
         | Frame::StreamFin { stream_id, .. }
@@ -898,6 +900,8 @@ fn try_route_client_tcp_frame_during_write(
         | Frame::StreamReset { stream_id, .. }
         | Frame::StreamData { stream_id, .. }
         | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamFeedbackProbe { stream_id, .. }
+        | Frame::StreamFeedbackReceipt { stream_id, .. }
         | Frame::StreamRequalifyData { stream_id, .. }
         | Frame::StreamRequalifyAck { stream_id, .. }
         | Frame::StreamFin { stream_id, .. } => *stream_id,

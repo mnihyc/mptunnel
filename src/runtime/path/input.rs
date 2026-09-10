@@ -27,7 +27,7 @@ impl PendingMailboxFrame {
     pub(in crate::runtime) fn new<T: Send + 'static>(
         frame: Frame,
         recipient: mpsc::Sender<T>,
-        wrap: fn(Frame) -> T,
+        wrap: impl FnOnce(Frame) -> T + Send + 'static,
     ) -> Self {
         let permit = Box::pin(async move {
             recipient.reserve_owned().await.ok().map(|permit| {

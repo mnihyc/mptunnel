@@ -282,6 +282,7 @@ impl ResponseStreamBinding {
                     // later publishes the retained logical receive grant.
                     published_max_data_offset: 0,
                     ack_publication: Default::default(),
+                    pending_feedback_receipt: None,
                     local_path_metrics: None,
                     peer_path_metrics: None,
                     native_scheduling_shape: None,
@@ -292,6 +293,8 @@ impl ResponseStreamBinding {
                 original_data_in_flight_bytes: 0,
                 data_level_queue_bytes: 0,
                 feedback: Default::default(),
+                feedback_route: Default::default(),
+                applied_peer_max_offset: 0,
                 admitted_max_data_offset: 0,
                 next_requalification_probe_id: Some(1),
                 next_requalification_candidate_index: 0,

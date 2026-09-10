@@ -549,6 +549,8 @@ impl ServerTcpPathSession {
             }
             frame @ (Frame::StreamData { stream_id, .. }
             | Frame::StreamAck { stream_id, .. }
+            | Frame::StreamFeedbackProbe { stream_id, .. }
+            | Frame::StreamFeedbackReceipt { stream_id, .. }
             | Frame::StreamReturnPlanFinal { stream_id, .. }
             | Frame::StreamRequalifyAck { stream_id, .. }
             | Frame::StreamMaxData { stream_id, .. }
@@ -1070,6 +1072,8 @@ impl ServerTcpPathSession {
                         let stream_id = match &frame {
                             Frame::StreamData { stream_id, .. }
                             | Frame::StreamAck { stream_id, .. }
+                            | Frame::StreamFeedbackProbe { stream_id, .. }
+                            | Frame::StreamFeedbackReceipt { stream_id, .. }
                             | Frame::StreamReturnPlanFinal { stream_id, .. }
                             | Frame::StreamRequalifyData { stream_id, .. }
                             | Frame::StreamRequalifyAck { stream_id, .. }

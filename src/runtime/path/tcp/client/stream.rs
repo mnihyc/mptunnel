@@ -506,6 +506,10 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
             )
             .await
         }
+        frame @ (Frame::StreamFeedbackProbe { stream_id, .. }
+        | Frame::StreamFeedbackReceipt { stream_id, .. }) => {
+            route_client_tcp_stream_frame(streams, closed_streams, stream_id, frame).await
+        }
         Frame::StreamRequalifyData {
             stream_id,
             probe_id,

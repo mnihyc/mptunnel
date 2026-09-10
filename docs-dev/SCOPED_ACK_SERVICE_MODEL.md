@@ -775,3 +775,33 @@ version14 rejects unknown versions/kinds, and RFC already declares no downgrade
 mode. Do not silently extend version14 or invent a compatibility fallback.
 The existing performance forecast and adverse-timing stop conditions still
 govern this prototype; no new baseline run is needed before its mechanism tests.
+
+### Integration review — 2026-09-10 10:40 +08
+
+The candidate uses required wire15 kinds51/52 with24/16-byte payloads;
+unsupported versions remain rejected. Exact local client attachment identity
+and server output incarnation own tokens. Reply output is captured once before
+mailbox waiting; the reply leg itself does not prove the probed leg. An older
+input already delivered to the logical actor can legitimately reply through
+that captured still-live output. No new attachment identity layer is needed.
+New outputs receive their first complete ACK and meaningful MAX baseline even
+while another output is selected. Receipt-only service does not change ACK
+generation fences or granted credit. Actual peer MAX is read as u64, not
+reconstructed from platform-width send-credit bytes.
+
+Independent review found a real frozen-deadline violation in the first policy
+prototype: a current attempt with a1000ms interval could conceal a newer
+successor's100ms interval after native RTT fell. Expiry and next wake now use
+the minimum of both captured deadlines. No threshold changes; a dedicated
+control exercises the shrinking-interval case. Retained exact native RTT is
+usable independently of delivery-rate freshness; otherwise the existing
+default PTO applies. This is failure-detection timing, not a capacity claim.
+
+Both actors service route expiry and eligible publication during a retained
+write/flush without duplicating its prefix or advancing consumption credit.
+They do not pull later Product input through a blocked application delivery;
+a queued receipt can therefore expire conservatively into full fanout. That
+is intentional fallback, not proof that selection survives target backpressure.
+Common tests cover capacity-one marker ordering after complete captured ACK/MAX
+and receipt-only service without byte/credit authority. First build and affected
+tests are running; ordinary practical acceptance remains the next gate.

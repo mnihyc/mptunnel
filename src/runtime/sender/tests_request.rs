@@ -3656,6 +3656,9 @@ async fn scoped_ack_actual_two_attachment_publication_preserves_catchup_and_repl
     let (mut remotes, _remote_input) =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, blocked_commands), 4);
     remotes.attach(opened_test_relay_stream(stream_id, 1, available_commands));
+    // This fixture isolates scoped ACK codec/catch-up invariants. Confirmed
+    // return selection and its markers have separate context-aware controls.
+    remotes.finish_feedback_route();
     consume_client_path_proof_for_test(&mut available_rx);
     let mut mux_limits = MuxLimits::default();
     mux_limits.max_ack_ranges = 1;

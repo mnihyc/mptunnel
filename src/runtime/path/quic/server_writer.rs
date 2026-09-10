@@ -521,6 +521,8 @@ fn try_route_server_udp_stream_frame_during_write(
     let received_stream_id = match &frame {
         Frame::StreamData { stream_id, .. }
         | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamFeedbackProbe { stream_id, .. }
+        | Frame::StreamFeedbackReceipt { stream_id, .. }
         | Frame::StreamReturnPlanFinal { stream_id, .. }
         | Frame::StreamRequalifyData { stream_id, .. }
         | Frame::StreamRequalifyAck { stream_id, .. }

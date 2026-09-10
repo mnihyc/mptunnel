@@ -74,6 +74,7 @@ struct BlockedLocalDeliveryState {
     released: AtomicBool,
     blocked_notify: Notify,
     write_waker: Mutex<Option<Waker>>,
+    block_flush: bool,
 }
 
 #[derive(Clone)]
@@ -124,7 +125,14 @@ struct BlockedLocalDelivery {
 
 impl BlockedLocalDelivery {
     fn new() -> (Self, BlockedLocalDeliveryControl) {
-        let state = Arc::new(BlockedLocalDeliveryState::default());
+        Self::with_flush_block(false)
+    }
+
+    fn with_flush_block(block_flush: bool) -> (Self, BlockedLocalDeliveryControl) {
+        let state = Arc::new(BlockedLocalDeliveryState {
+            block_flush,
+            ..Default::default()
+        });
         (
             Self {
                 state: state.clone(),
@@ -155,6 +163,10 @@ impl AsyncWrite for BlockedLocalDelivery {
         }
         let state = &self.state;
         let mut accepted = state.accepted.lock().expect("blocked local delivery bytes");
+        if state.block_flush {
+            accepted.extend_from_slice(buf);
+            return Poll::Ready(Ok(buf.len()));
+        }
         if accepted.is_empty() {
             accepted.push(buf[0]);
             return Poll::Ready(Ok(1));
@@ -176,7 +188,16 @@ impl AsyncWrite for BlockedLocalDelivery {
         Poll::Pending
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if self.state.block_flush && !self.state.released.load(Ordering::Acquire) {
+            self.state.blocked.store(true, Ordering::Release);
+            self.state.blocked_notify.notify_waiters();
+            *self.state.write_waker.lock().expect("blocked flush waker") = Some(cx.waker().clone());
+            if self.state.released.load(Ordering::Acquire) {
+                cx.waker().wake_by_ref();
+            }
+            return Poll::Pending;
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -1879,6 +1900,141 @@ async fn final_feedback_backpressure_keeps_fin_pending_until_ack_is_queued() {
     );
 
     relay.abort();
+}
+
+#[tokio::test]
+async fn client_feedback_probe_requires_logical_delivery_and_actual_max_in_write_and_flush() {
+    async fn receipt(receivers: &mut ReliablePathCommandReceivers) -> u64 {
+        loop {
+            let command = recv_reliable_path_command(receivers)
+                .await
+                .expect("live carrier");
+            receivers.release_pending_command_bytes(
+                crate::runtime::path::commands::reliable_path_command_pending_bytes(&command),
+            );
+            if let ReliablePathCommand::SendFrame(Frame::StreamFeedbackReceipt { token, .. }) =
+                command
+            {
+                return token;
+            }
+        }
+    }
+
+    for block_flush in [false, true] {
+        let stream_id = StreamId(if block_flush { 619 } else { 618 });
+        let address = "127.0.0.1:9".parse().unwrap();
+        let context = ClientPathContext::new(
+            vec!["tcp://127.0.0.1:9".parse::<PathSpec>().unwrap()],
+            test_security(),
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        let initial_peer_max = context.mux_limits.max_stream_window_bytes;
+        let (commands, mut receivers) = reliable_path_command_channels(16);
+        let (frames_tx, frames_rx) = mpsc::channel(8);
+        let opened = test_opened_remote_stream(stream_id, 0, commands, frames_rx);
+        let (local, control) = BlockedLocalDelivery::with_flush_block(block_flush);
+        let relay = tokio::spawn(async move {
+            relay_migrating_tcp_stream(
+                local,
+                &context,
+                MppPerformanceConfig::default(),
+                ReliableRelayOpenSpec::new(TargetAddr::Ip(address), TrafficClass::Latency),
+                opened,
+                None,
+            )
+            .await
+        });
+        frames_tx
+            .send(Ok(Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from_static(b"ab"),
+            }))
+            .await
+            .unwrap();
+        control.wait_blocked().await;
+        frames_tx
+            .send(Ok(Frame::StreamAck {
+                stream_id,
+                scope_start: None,
+                ranges: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        frames_tx
+            .send(Ok(Frame::StreamFeedbackProbe {
+                stream_id,
+                token: 73,
+                max_offset: 0,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), receipt(&mut receivers))
+                .await
+                .is_err(),
+            "native decode/FIFO admission cannot confirm a marker ahead of its blocked logical owner"
+        );
+        control.release();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receipt(&mut receivers))
+                .await
+                .unwrap(),
+            73
+        );
+        assert_eq!(
+            control.accepted_bytes(),
+            b"ab",
+            "retained write is neither dropped nor replayed"
+        );
+
+        let required = initial_peer_max + 1;
+        frames_tx
+            .send(Ok(Frame::StreamFeedbackProbe {
+                stream_id,
+                token: 74,
+                max_offset: required,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), receipt(&mut receivers))
+                .await
+                .is_err(),
+            "Probe.max_offset is not a credit grant"
+        );
+        frames_tx
+            .send(Ok(Frame::StreamMaxData {
+                stream_id,
+                max_offset: required,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receipt(&mut receivers))
+                .await
+                .unwrap(),
+            74,
+            "actual diverted MAX wakes the retained exact reply"
+        );
+        frames_tx
+            .send(Ok(Frame::StreamFeedbackProbe {
+                stream_id,
+                token: 74,
+                max_offset: required,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), receipt(&mut receivers))
+                .await
+                .is_err(),
+            "an already admitted exact receipt is not a reply loop"
+        );
+        relay.abort();
+        let _ = relay.await;
+    }
 }
 
 #[tokio::test]

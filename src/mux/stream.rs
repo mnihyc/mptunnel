@@ -56,6 +56,11 @@ impl ReliableSendStream {
         usize::try_from(self.max_offset.saturating_sub(self.next_offset)).unwrap_or(usize::MAX)
     }
 
+    /// Exact peer-advertised bound, without platform-width credit saturation.
+    pub(crate) fn peer_max_offset(&self) -> u64 {
+        self.max_offset
+    }
+
     pub fn reinjection_bytes(&self) -> usize {
         self.reinjection_bytes
     }

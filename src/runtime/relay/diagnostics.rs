@@ -113,6 +113,19 @@ fn frame_subject(frame: &Frame) -> String {
             stream_id,
             max_offset,
         } => format!("stream_id={} max_offset={max_offset}", stream_id.0),
+        Frame::StreamFeedbackProbe {
+            stream_id,
+            token,
+            max_offset,
+        } => {
+            format!(
+                "stream_id={} token={token} max_offset={max_offset}",
+                stream_id.0
+            )
+        }
+        Frame::StreamFeedbackReceipt { stream_id, token } => {
+            format!("stream_id={} token={token}", stream_id.0)
+        }
         Frame::StreamReturnPlanFinal {
             stream_id,
             retained_ordinals,

@@ -24,6 +24,116 @@ fn round_trip(frame: Frame) {
     assert_eq!(decoded, frame);
 }
 
+#[test]
+fn stream_feedback_v15_has_exact_stream_token_and_credit_fence_layout() {
+    let stream_id = StreamId(0x0102_0304_0506_0708);
+    let token = 0x1112_1314_1516_1718;
+    let max_offset = 0x2122_2324_2526_2728;
+    for (frame, kind, payload_len) in [
+        (
+            Frame::StreamFeedbackProbe {
+                stream_id,
+                token,
+                max_offset,
+            },
+            51,
+            24,
+        ),
+        (Frame::StreamFeedbackReceipt { stream_id, token }, 52, 16),
+    ] {
+        let wire = encode_frame(&frame, CodecLimits::default()).unwrap();
+        assert_eq!(wire.len(), FRAME_HEADER_LEN + payload_len);
+        assert_eq!(encoded_frame_capacity_hint(&frame), wire.len());
+        assert_eq!(&wire[..6], &[b'M', b'P', b'T', b'F', 15, kind]);
+        assert_eq!(&wire[6..10], &(payload_len as u32).to_be_bytes());
+        assert_eq!(&wire[10..18], &stream_id.0.to_be_bytes());
+        assert_eq!(&wire[18..26], &token.to_be_bytes());
+        if kind == 51 {
+            assert_eq!(&wire[26..34], &max_offset.to_be_bytes());
+        }
+        assert_eq!(
+            decode_frame_bytes(Bytes::from(wire), CodecLimits::default()).unwrap(),
+            frame
+        );
+        assert_eq!(
+            crate::protocol::frame::reliable_stream_frame_extent(&frame),
+            None
+        );
+        assert_eq!(
+            crate::protocol::frame::reliable_stream_frame_accounted_bytes(&frame),
+            1
+        );
+        assert_eq!(
+            crate::protocol::frame::reliable_path_frame_pacing_bytes(&frame),
+            1
+        );
+        assert!(!frame.is_path_capacity());
+    }
+}
+
+#[test]
+fn stream_feedback_roundtrip_preserves_full_scalar_domain_without_data_authority() {
+    for value in [0, u64::MAX] {
+        round_trip(Frame::StreamFeedbackProbe {
+            stream_id: StreamId(value),
+            token: value,
+            max_offset: value,
+        });
+        round_trip(Frame::StreamFeedbackReceipt {
+            stream_id: StreamId(value),
+            token: value,
+        });
+    }
+}
+
+#[test]
+fn stream_feedback_rejects_truncation_trailing_fields_and_frame_limit_overflow() {
+    for frame in [
+        Frame::StreamFeedbackProbe {
+            stream_id: StreamId(7),
+            token: 9,
+            max_offset: 11,
+        },
+        Frame::StreamFeedbackReceipt {
+            stream_id: StreamId(7),
+            token: 9,
+        },
+    ] {
+        let wire = encode_frame(&frame, CodecLimits::default()).unwrap();
+        for len in 0..wire.len() {
+            assert_eq!(
+                decode_frame_bytes(Bytes::copy_from_slice(&wire[..len]), CodecLimits::default()),
+                Err(CodecError::UnexpectedEof),
+                "every field is required: {} length {len}",
+                frame.kind_name(),
+            );
+        }
+        let mut extra = wire.clone();
+        extra.push(0);
+        assert_eq!(
+            decode_frame_bytes(Bytes::from(extra.clone()), CodecLimits::default()),
+            Err(CodecError::TrailingBytes),
+        );
+        let extra_payload_len = (extra.len() - FRAME_HEADER_LEN) as u32;
+        extra[6..10].copy_from_slice(&extra_payload_len.to_be_bytes());
+        assert_eq!(
+            decode_frame_bytes(Bytes::from(extra), CodecLimits::default()),
+            Err(CodecError::TrailingBytes),
+            "declared payload length cannot add an unrecognized field",
+        );
+        let limits = CodecLimits {
+            max_frame_bytes: wire.len() - 1,
+            ..CodecLimits::default()
+        };
+        let expected = CodecError::FrameTooLarge {
+            actual: wire.len(),
+            limit: limits.max_frame_bytes,
+        };
+        assert_eq!(encode_frame(&frame, limits), Err(expected.clone()));
+        assert_eq!(decode_frame_bytes(Bytes::from(wire), limits), Err(expected));
+    }
+}
+
 fn peer_status_metrics(
     path_id: u16,
     underlay: UnderlayProtocol,
@@ -145,7 +255,7 @@ fn stream_frames_round_trip() {
 }
 
 #[test]
-fn open_stream_v14_canonically_carries_return_plan() {
+fn open_stream_v15_canonically_carries_return_plan() {
     let frame = Frame::OpenStream {
         stream_id: StreamId(0x0102_0304_0506_0708),
         target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
@@ -163,7 +273,7 @@ fn open_stream_v14_canonically_carries_return_plan() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 14, 7, 0, 0, 0, 28, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            b'M', b'P', b'T', b'F', 15, 7, 0, 0, 0, 28, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
             187, 2, 0, 0, 0, 0, 0, 0, 228, 32, 4, 0, 0, 2,
         ]
     );
@@ -202,7 +312,7 @@ fn open_stream_creation_and_enrollment_have_distinct_wire_authority() {
 }
 
 #[test]
-fn stream_return_plan_final_v14_has_canonical_kind_and_count() {
+fn stream_return_plan_final_v15_has_canonical_kind_and_count() {
     let frame = Frame::StreamReturnPlanFinal {
         stream_id: StreamId(0x0102_0304_0506_0708),
         retained_ordinals: vec![0, 2, 7],
@@ -211,7 +321,7 @@ fn stream_return_plan_final_v14_has_canonical_kind_and_count() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 14, 49, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 3, 0, 2, 7,
+            b'M', b'P', b'T', b'F', 15, 49, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 3, 0, 2, 7,
         ]
     );
     assert_eq!(
@@ -348,8 +458,8 @@ fn decoder_rejects_unknown_path_usage() {
 }
 
 #[test]
-fn decoder_rejects_old_frames_after_v14_wire_cut() {
-    for version in [9, 10, 11, 12, 13] {
+fn decoder_rejects_old_frames_after_v15_wire_cut() {
+    for version in [9, 10, 11, 12, 13, 14] {
         let mut encoded =
             encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
         encoded[4] = version;

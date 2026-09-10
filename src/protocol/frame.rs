@@ -118,6 +118,8 @@ pub(crate) fn reliable_path_frame_pacing_bytes(frame: &Frame) -> usize {
         | Frame::StreamAck { .. }
         | Frame::StreamRequalifyAck { .. }
         | Frame::StreamMaxData { .. }
+        | Frame::StreamFeedbackProbe { .. }
+        | Frame::StreamFeedbackReceipt { .. }
         | Frame::StreamReturnPlanFinal { .. }
         | Frame::StreamReset { .. }
         | Frame::StreamDetach { .. } => 1,

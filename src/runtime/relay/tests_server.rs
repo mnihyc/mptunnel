@@ -32,6 +32,146 @@ use crate::runtime::stream::response::{
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[tokio::test]
+async fn server_confirmed_return_expiry_services_siblings_during_retained_write() {
+    let stream_id = StreamId(714);
+    let limits = MuxLimits::default();
+    let (a_tx, mut a_rx) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new_with_limits(
+        SessionId(714),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        a_tx,
+        TrafficClass::Throughput,
+        limits,
+    );
+    let (b_tx, mut b_rx) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            UnderlayProtocol::Tcp,
+            PathId(1),
+            b_tx,
+            TrafficClass::Throughput
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    let (_input_tx, input_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 64,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: input_rx.into(),
+    };
+    fn drain(
+        receivers: &mut crate::runtime::path::commands::ReliablePathCommandReceivers,
+    ) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Some(command) = try_recv_reliable_path_command(receivers) {
+            receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+            let ReliablePathCommand::SendFrame(frame) = command else {
+                panic!("ordinary feedback")
+            };
+            frames.push(frame);
+        }
+        frames
+    }
+    let mut received = ReliableRecvStream::new_with_initial_max_offset(stream_id, limits, 0);
+    let mut publication = ServerAckPublicationState::default();
+    publication.record_feedback(path_stream.publish_max_data(64), &mut received);
+    drain(&mut a_rx);
+    drain(&mut b_rx);
+    for generation in 1..=2 {
+        received
+            .receive_data(generation - 1, Bytes::from_static(b"x"))
+            .unwrap();
+        let update = received.take_ack_update();
+        publication.record_feedback(
+            path_stream.publish_ack(generation, &update, received.ack_frames()),
+            &mut received,
+        );
+        if generation == 1 {
+            drain(&mut a_rx);
+            drain(&mut b_rx);
+        }
+    }
+    let a_discovery = drain(&mut a_rx);
+    let token = a_discovery
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::StreamFeedbackProbe { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("actual admitted discovery probe");
+    drain(&mut b_rx);
+    publication.record_feedback(path_stream.receive_feedback_receipt(token), &mut received);
+    received.receive_data(2, Bytes::from_static(b"x")).unwrap();
+    let update = received.take_ack_update();
+    publication.record_feedback(
+        path_stream.publish_ack(3, &update, received.ack_frames()),
+        &mut received,
+    );
+    drain(&mut a_rx);
+    assert!(
+        drain(&mut b_rx).is_empty(),
+        "selected route initially skips caught-up sibling"
+    );
+    let deadline = path_stream
+        .feedback_route_deadline()
+        .expect("fixed proof obligation");
+
+    let (mut target_write, mut target_read) = tokio::io::duplex(1);
+    let operation = async {
+        target_write.write_all(b"abcdefgh").await?;
+        target_write.flush().await?;
+        Ok::<_, RuntimeError>(())
+    };
+    let service = service_server_feedback_while_pending(
+        operation,
+        &path_stream,
+        &mut received,
+        &mut publication,
+        64,
+    );
+    let release = async {
+        // The one-byte target cannot drain the write. Only proof expiry can
+        // make B receive this already-materialized current ACK generation.
+        let command = recv_reliable_path_command(&mut b_rx)
+            .await
+            .expect("expiry fallback ACK");
+        b_rx.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        assert!(Instant::now() >= deadline);
+        assert!(
+            matches!(command, ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. })
+            if ranges == vec![OffsetRange { start: 0, end: 3 }])
+        );
+        let mut bytes = [0_u8; 8];
+        target_read.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"abcdefgh");
+    };
+    let (result, ()) = tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(2),
+        async { tokio::join!(service, release) },
+    )
+    .await
+    .expect("bounded native deadline plus test scheduling guard");
+    result.unwrap();
+    assert_eq!(
+        received.published_max_offset(),
+        64,
+        "pending target write cannot manufacture more credit"
+    );
+    drop(target_write);
+    let mut extra = Vec::new();
+    target_read.read_to_end(&mut extra).await.unwrap();
+    assert!(
+        extra.is_empty(),
+        "one retained write future must not replay a prefix"
+    );
+}
+
 fn tail_recovery_candidate(start: u64, sent_at: Instant) -> ReliableRelayTailRecoveryCandidate {
     ReliableRelayTailRecoveryCandidate::Untracked {
         start,

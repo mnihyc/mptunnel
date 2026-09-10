@@ -88,6 +88,17 @@ async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// Apply actual peer credit at its logical owner. Probe requirements never
+/// enter this function: they may only compare with the resulting exact offset.
+fn apply_client_peer_max_data(product: &mut RequestProductState, max_offset: u64) -> bool {
+    let previous_credit = product.send_stream.send_credit_bytes();
+    product.send_stream.update_max_offset(max_offset);
+    product
+        .remotes
+        .observe_applied_peer_max_offset(product.send_stream.peer_max_offset());
+    previous_credit != product.send_stream.send_credit_bytes()
+}
+
 async fn finish_request_attachment(
     context: &ClientPathContext,
     owner: &SharedRequestProduct,
@@ -278,16 +289,16 @@ where
 
 /// Completes the same remote-FIN transition after a retained receive ACK wins
 /// carrier admission that the immediate FIN path completes on first publish.
-fn retry_stream_ack_and_commit_ready_fin<'a, S>(
+fn commit_published_feedback_and_ready_fin<'a, S>(
     local: &'a mut S,
     state: &'a mut ClientRelayState,
     recv_stream: &'a mut ReliableRecvStream,
-    remotes: &mut ReliableRelayRemoteSet,
+    remotes: &ReliableRelayRemoteSet,
+    publication: StreamFeedbackPublication,
 ) -> impl Future<Output = Result<(), RuntimeError>> + use<'a, S>
 where
     S: AsyncWrite + Unpin,
 {
-    let publication = remotes.retry_pending_stream_ack();
     if let Some(published_offset) = publication.max_data.published_offset {
         recv_stream.commit_max_data(published_offset);
     }
@@ -307,6 +318,20 @@ where
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn retry_stream_ack_and_commit_ready_fin<'a, S>(
+    local: &'a mut S,
+    state: &'a mut ClientRelayState,
+    recv_stream: &'a mut ReliableRecvStream,
+    remotes: &mut ReliableRelayRemoteSet,
+) -> impl Future<Output = Result<(), RuntimeError>> + use<'a, S>
+where
+    S: AsyncWrite + Unpin,
+{
+    let publication = remotes.retry_pending_stream_ack();
+    commit_published_feedback_and_ready_fin(local, state, recv_stream, remotes, publication)
 }
 
 fn client_relay_finished(
@@ -1172,9 +1197,12 @@ where
             }
             let stream_ack_generation = remotes.stream_ack_generation();
             let feedback_max_offset = remotes.feedback_max_data_offset();
+            remotes.observe_applied_peer_max_offset(send_stream.peer_max_offset());
+            let feedback_route_changed = remotes.prepare_feedback_route(context);
             if request_membership_changed
                 || stream_ack_generation != observed_stream_ack_generation
                 || feedback_max_offset != observed_feedback_max_offset
+                || feedback_route_changed
             {
                 observed_stream_ack_generation = stream_ack_generation;
                 observed_feedback_max_offset = feedback_max_offset;
@@ -1876,11 +1904,13 @@ where
                 } else if stream_ack_capacity_wait.is_none() {
                     let capacity_wait =
                         arm_carrier_capacity_notifies(remotes.pending_feedback_capacity_notifies());
-                    let local_shutdown = retry_stream_ack_and_commit_ready_fin(
+                    let publication = remotes.retry_pending_feedback_with_context(context);
+                    let local_shutdown = commit_published_feedback_and_ready_fin(
                         &mut local,
                         &mut state,
                         &mut recv_stream,
                         remotes,
+                        publication,
                     );
                     Some((capacity_wait, local_shutdown))
                 } else {
@@ -2178,7 +2208,16 @@ where
                 prepared_work_wait,
             )
         };
+        let feedback_deadline = request_product
+            .lock()
+            .remotes
+            .feedback_deadline()
+            .map(tokio::time::Instant::from_std);
         tokio::select! {
+            _ = wait_for_optional_deadline(feedback_deadline), if feedback_deadline.is_some() => {
+                stream_ack_capacity_wait = None;
+                continue;
+            }
             () = &mut prepared_work_wait => {
                 // A real writer commit or source/eligibility change requires
                 // fresh Product state; it does not grant actor Data dispatch.
@@ -3327,6 +3366,35 @@ where
                         };
                         state.progress.sender_retry_at = None;
                         match frame {
+                            Frame::StreamFeedbackProbe {
+                                stream_id: probe_stream_id, token, max_offset,
+                            } if probe_stream_id == stream_id => {
+                                let mut product = request_product.lock();
+                                // MAX ingress is deliberately coalesced outside FIFO.
+                                // Consume only that real preceding credit, not the
+                                // marker's claimed offset, before confirming service.
+                                if let Some(ReliableRelayRemoteFrame {
+                                    frame: Ok(Frame::StreamMaxData { max_offset, .. }), ..
+                                }) = remote_input.take_pending_credit() {
+                                    prepared_work_changed |= apply_client_peer_max_data(&mut product, max_offset);
+                                    state.progress.last_stream_at = Instant::now();
+                                }
+                                let applied_max = product.send_stream.peer_max_offset();
+                                product.remotes.observe_applied_peer_max_offset(applied_max);
+                                if let Err(error) = product.remotes.receive_feedback_probe(instance, token, max_offset) {
+                                    break Err(error);
+                                }
+                                stream_ack_capacity_wait = None;
+                            }
+                            Frame::StreamFeedbackReceipt {
+                                stream_id: receipt_stream_id, token,
+                            } if receipt_stream_id == stream_id => {
+                                // The token owns the probed local incarnation. This
+                                // receipt's reverse carrier is not proof authority.
+                                let mut product = request_product.lock();
+                                product.remotes.receive_feedback_receipt(context, token);
+                                stream_ack_capacity_wait = None;
+                            }
                             Frame::StreamRequalifyData {
                                 stream_id: received_stream_id,
                                 probe_id,
@@ -3526,7 +3594,7 @@ where
                                     );
                                     tokio::pin!(write);
                                     loop {
-                                        let (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, mut prepared_work_wait) = {
+                                        let (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, feedback_deadline, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, mut prepared_work_wait) = {
                                         let mut product_guard = request_product.lock();
                                         if let Some(error) = product_guard.prepared.pending_error.take() {
                                             break Err(error);
@@ -3539,7 +3607,10 @@ where
                                             adaptive_chunk,
                                             false,
                                         );
+                                        let applied_max = product_guard.send_stream.peer_max_offset();
                                         let remotes = &mut product_guard.remotes;
+                                        remotes.observe_applied_peer_max_offset(applied_max);
+                                        remotes.prepare_feedback_route(context);
                                         if let Err(err) = drive_client_response_startup_control(
                                             context,
                                             &spec,
@@ -3564,7 +3635,7 @@ where
                                             })
                                             .flatten();
                                         if stream_ack_pending {
-                                            let publication = remotes.retry_pending_stream_ack();
+                                            let publication = remotes.retry_pending_feedback_with_context(context);
                                             if let Some(published_offset) = publication.max_data.published_offset {
                                                 recv_stream.commit_max_data(published_offset);
                                             }
@@ -3574,6 +3645,8 @@ where
                                             remotes.has_pending_feedback_publication();
                                         let has_stream_ack_capacity_wait =
                                             stream_ack_capacity_wait.is_some();
+                                        let feedback_deadline = remotes.feedback_deadline()
+                                            .map(tokio::time::Instant::from_std);
 
                                         let return_plan_final_pending =
                                             remotes.has_pending_return_plan_final_publication();
@@ -3597,11 +3670,12 @@ where
                                             product_guard.prepared.work_changed.clone().notified_owned(),
                                         );
                                         prepared_work_wait.as_mut().enable();
-                                        (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, prepared_work_wait)
+                                        (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, feedback_deadline, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, prepared_work_wait)
                                         };
                                         tokio::select! {
                                             biased;
                                             result = &mut write => break result,
+                                            _ = wait_for_optional_deadline(feedback_deadline), if feedback_deadline.is_some() => continue,
                                             () = &mut prepared_work_wait => continue,
                                             additional_path_open = additional_path_open_rx.recv(), if !state.recovery.pending_additional_path_opens.is_empty() => {
                                                 let mut product_guard = request_product.lock();
@@ -3971,11 +4045,8 @@ where
                                 max_offset,
                             } if max_stream_id == stream_id => {
                                 let mut product_guard = request_product.lock();
-                                let send_stream = &mut product_guard.send_stream;
-                                let previous_credit = send_stream.send_credit_bytes();
-                                send_stream.update_max_offset(max_offset);
-                                prepared_work_changed |=
-                                    previous_credit != send_stream.send_credit_bytes();
+                                prepared_work_changed |= apply_client_peer_max_data(&mut product_guard, max_offset);
+                                stream_ack_capacity_wait = None;
                                 state.progress.last_stream_at = Instant::now();
                             }
                             Frame::StreamFin {
@@ -3986,6 +4057,8 @@ where
                                 let mut product_guard = request_product.lock();
                                 let product = &mut *product_guard;
                                 let (sender, remotes) = (&mut product.sender, &mut product.remotes);
+                                remotes.finish_feedback_route();
+                                stream_ack_capacity_wait = None;
                                 state.progress.last_stream_at = Instant::now();
                                 return_plan.observe_response_terminal(
                                     final_offset,

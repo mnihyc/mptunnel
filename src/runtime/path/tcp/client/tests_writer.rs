@@ -68,8 +68,8 @@ fn client_tcp_stale_probe_normal_exit_requires_prior_transaction_commit() {
     assert!(ensure_client_tcp_transaction_closed(&[], 0).is_ok());
 }
 
-#[test]
-fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
+#[tokio::test]
+async fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
     let stream_id = StreamId(81);
     let (frames, mut frame_rx) = mpsc::channel(1);
     let mut streams = HashMap::from([(
@@ -101,6 +101,52 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
         frame_rx.try_recv().expect("routed ACK"),
         Ok(frame) if frame == ack
     ));
+
+    for feedback in [
+        Frame::StreamFeedbackProbe {
+            stream_id,
+            token: 9,
+            max_offset: 64,
+        },
+        Frame::StreamFeedbackReceipt {
+            stream_id,
+            token: 9,
+        },
+    ] {
+        streams
+            .get(&stream_id)
+            .unwrap()
+            .frames
+            .try_send(Ok(ack.clone()))
+            .unwrap();
+        let ClientTcpWriteFrameRoute::Mailbox {
+            mut pending,
+            stream_id: recipient,
+            retires_attachment,
+        } = try_route_client_tcp_frame_during_write(
+            feedback.clone(),
+            &mut streams,
+            &mut closed_streams,
+            &mut datagrams,
+        )
+        .expect("stream marker must use the ordinary logical-owner mailbox")
+        else {
+            panic!("full mailbox must retain the exact feedback marker, not a carrier barrier");
+        };
+        assert_eq!(recipient, stream_id);
+        assert!(!retires_attachment);
+        let delivery = pending.deliver();
+        tokio::pin!(delivery);
+        tokio::select! {
+            biased;
+            _ = &mut delivery => panic!("feedback marker overtook the preceding ACK"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(matches!(frame_rx.try_recv(), Ok(Ok(frame)) if frame == ack));
+        assert!(delivery.await);
+        assert!(matches!(frame_rx.try_recv(), Ok(Ok(frame)) if frame == feedback));
+        assert!(streams.contains_key(&stream_id));
+    }
 
     streams
         .get(&stream_id)

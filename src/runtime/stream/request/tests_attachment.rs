@@ -69,6 +69,230 @@ fn opened_stream_at_with_command_capacity(
 }
 
 #[tokio::test]
+async fn client_confirmed_feedback_uses_exact_proof_and_expires_without_renewing_on_data() {
+    use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
+    use crate::mux::stream::ReliableRecvStream;
+    use crate::transport::PathSpec;
+
+    fn drain(receivers: &mut ReliablePathCommandReceivers) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Some(command) = try_recv_reliable_path_command(receivers) {
+            receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+            if let ReliablePathCommand::SendFrame(frame) = command {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+    fn probe(frames: &[Frame]) -> u64 {
+        frames
+            .iter()
+            .find_map(|frame| match frame {
+                Frame::StreamFeedbackProbe { token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("actual admitted proof marker")
+    }
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:9".parse::<PathSpec>().unwrap(),
+            "tcp://127.0.0.1:10".parse::<PathSpec>().unwrap(),
+        ],
+        ClientSecurityConfig::for_test(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).unwrap(),
+        ),
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    let stream_id = StreamId(819);
+    let (a, _a_input, mut a_commands) = opened_stream_at(stream_id, 0);
+    let (mut remotes, _input) = ReliableRelayRemoteSet::new(a, 8);
+    let (b, _b_input, mut b_commands) = opened_stream_at(stream_id, 1);
+    remotes.attach(b);
+    for path in &remotes.paths {
+        context.install_relay_path_instance_for_test(path.instance());
+    }
+    drain(&mut a_commands);
+    drain(&mut b_commands);
+    let mut received = ReliableRecvStream::new(stream_id, MuxLimits::default());
+    let initial_max =
+        received.max_data_offset_with_window(MuxLimits::default().max_stream_window_bytes);
+    remotes.publish_max_data_with_context(&context, initial_max);
+    drain(&mut a_commands);
+    drain(&mut b_commands);
+    for generation in 1..=2 {
+        received
+            .receive_data(generation - 1, Bytes::from_static(b"x"))
+            .unwrap();
+        remotes.publish_stream_ack_with_context(
+            &context,
+            generation,
+            received.take_ack_update(),
+            received.ack_frames(),
+        );
+        if generation == 1 {
+            assert!(
+                drain(&mut a_commands)
+                    .iter()
+                    .all(|f| matches!(f, Frame::StreamAck { .. }))
+            );
+            assert!(
+                drain(&mut b_commands)
+                    .iter()
+                    .all(|f| matches!(f, Frame::StreamAck { .. }))
+            );
+            assert!(
+                remotes.feedback_deadline().is_none(),
+                "first ACK remains full fanout"
+            );
+        }
+    }
+    let a_token = probe(&drain(&mut a_commands));
+    let b_token = probe(&drain(&mut b_commands));
+    assert_ne!(a_token, b_token);
+    // No receipt-ingress parameter exists: the token identifies the local
+    // probed output, independently of the authenticated reply's carrier.
+    assert!(remotes.receive_feedback_receipt(&context, a_token));
+    assert!(
+        !remotes.receive_feedback_receipt(&context, b_token),
+        "late sibling cannot replace the winner"
+    );
+    received.receive_data(2, Bytes::from_static(b"x")).unwrap();
+    let selected_ack = remotes.publish_stream_ack_with_context(
+        &context,
+        3,
+        received.take_ack_update(),
+        received.ack_frames(),
+    );
+    assert!(!selected_ack.ack.pending);
+    let selected_max =
+        received.max_data_offset_with_window(MuxLimits::default().max_stream_window_bytes);
+    assert!(selected_max > initial_max);
+    let selected_credit = remotes.publish_max_data_with_context(&context, selected_max);
+    assert_eq!(
+        selected_credit.max_data.published_offset,
+        Some(selected_max)
+    );
+    assert!(!selected_credit.max_data.pending);
+    let expired_token = probe(&drain(&mut a_commands));
+    assert!(drain(&mut b_commands).is_empty());
+    assert!(!remotes.has_pending_stream_ack_publication());
+    assert!(!remotes.has_pending_max_data_publication());
+    assert!(
+        !remotes.has_pending_feedback_publication(),
+        "skipped catch-up is not eligible capacity work"
+    );
+    let deadline = remotes.feedback_deadline().unwrap();
+    received.receive_data(3, Bytes::from_static(b"x")).unwrap();
+    remotes.publish_stream_ack_with_context(
+        &context,
+        4,
+        received.take_ack_update(),
+        received.ack_frames(),
+    );
+    assert_eq!(
+        remotes.feedback_deadline(),
+        Some(deadline),
+        "new DATA cannot renew the proof round"
+    );
+    drain(&mut a_commands);
+    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    remotes.prepare_feedback_route(&context);
+    assert!(
+        remotes.has_pending_stream_ack_publication(),
+        "expiry makes skipped ACK debt eligible again"
+    );
+    assert!(
+        remotes.has_pending_max_data_publication(),
+        "expiry makes skipped MAX debt eligible again"
+    );
+    remotes.retry_pending_feedback_with_context(&context);
+    let catchup = drain(&mut b_commands);
+    assert!(
+        catchup
+            .iter()
+            .any(|f| matches!(f, Frame::StreamAck { ranges, .. }
+        if ranges == &vec![OffsetRange { start: 0, end: 4 }]))
+    );
+    assert!(catchup.iter().any(|frame| matches!(frame,
+        Frame::StreamMaxData { max_offset, .. } if *max_offset == selected_max)));
+    assert!(!remotes.receive_feedback_receipt(&context, expired_token));
+    let current_b = probe(&catchup);
+    let old_b = remotes.paths[1].instance();
+    remotes.remove_path_instance(old_b).unwrap();
+    let (replacement, _replacement_input, mut replacement_commands) =
+        opened_stream_at(stream_id, 1);
+    remotes.attach(replacement);
+    assert_ne!(remotes.paths[1].instance(), old_b);
+    assert!(
+        !remotes.receive_feedback_receipt(&context, current_b),
+        "key reuse cannot inherit a proof token"
+    );
+    drain(&mut a_commands);
+    drain(&mut replacement_commands);
+    remotes.finish_feedback_route();
+    remotes.retry_pending_feedback_with_context(&context);
+    assert!(remotes.feedback_deadline().is_none());
+    assert!(
+        drain(&mut replacement_commands)
+            .iter()
+            .any(|f| matches!(f, Frame::StreamAck { .. })),
+        "terminal mode catches up a replacement without proof traffic"
+    );
+}
+
+#[tokio::test]
+async fn client_feedback_reply_retains_one_exact_output_and_waits_for_applied_credit() {
+    let stream_id = StreamId(820);
+    let (opened, _input, mut commands) = opened_stream_at_with_command_capacity(stream_id, 0, 1);
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
+    let old = remotes.paths[0].instance();
+    // The initial PathProof occupies the sole ordinary-priority slot.
+    remotes.receive_feedback_probe(old, 10, 5).unwrap();
+    remotes.retry_pending_stream_ack();
+    assert!(
+        !remotes.has_pending_feedback_publication(),
+        "unapplied MAX is not queue capacity debt"
+    );
+    remotes.observe_applied_peer_max_offset(5);
+    remotes.retry_pending_stream_ack();
+    assert!(remotes.has_pending_feedback_publication());
+    remotes.receive_feedback_probe(old, 11, 6).unwrap();
+    assert!(remotes.receive_feedback_probe(old, 11, 7).is_err());
+    assert!(!remotes.has_pending_feedback_publication());
+    let command = try_recv_reliable_path_command(&mut commands).unwrap();
+    commands.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    remotes.observe_applied_peer_max_offset(6);
+    remotes.retry_pending_stream_ack();
+    let command = try_recv_reliable_path_command(&mut commands).unwrap();
+    commands.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    assert!(matches!(
+        command,
+        ReliablePathCommand::SendFrame(Frame::StreamFeedbackReceipt { token: 11, .. })
+    ));
+    remotes.receive_feedback_probe(old, 11, 6).unwrap();
+    remotes.retry_pending_stream_ack();
+    assert!(try_recv_reliable_path_command(&mut commands).is_none());
+    remotes.receive_feedback_probe(old, 12, 7).unwrap();
+    remotes.remove_path_instance(old).unwrap();
+    let (replacement, _replacement_input, mut replacement_commands) =
+        opened_stream_at(stream_id, 0);
+    remotes.attach(replacement);
+    remotes.observe_applied_peer_max_offset(7);
+    remotes.receive_feedback_probe(old, 12, 7).unwrap();
+    remotes.retry_pending_stream_ack();
+    while let Some(command) = try_recv_reliable_path_command(&mut replacement_commands) {
+        assert!(
+            !matches!(
+                command,
+                ReliablePathCommand::SendFrame(Frame::StreamFeedbackReceipt { .. })
+            ),
+            "a removed probe's reply must not retarget its replacement"
+        );
+    }
+}
+
+#[tokio::test]
 async fn skipped_ack_backup_completes_old_sparse_facts_under_generation_churn() {
     use crate::mux::stream::{ReliableRecvStream, ReliableSendStream, validate_stream_ack};
     use crate::protocol::codec::{CodecLimits, decode_frame_bytes, encode_frame};

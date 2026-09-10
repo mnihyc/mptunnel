@@ -5016,3 +5016,163 @@ competition independently reproducing hundred-millisecond latency, this
 small/uncertain removable portion does not select a server Input rewrite,
 copy ban, merge/cadence change or new observer. Preserve it for a later scoped
 decision; proceed with the already-declared matched baseline context instead.
+
+### Matched ordinary shared500 DOWN baselines: raw, Xray and Hysteria2
+
+2026-09-11; predeclared sequential raw52570, Xray75884 and H229931, all CLOSED0.
+No MPP rerun, build, observer, controller change or impairment change. Existing
+ordinary011b724 QUIC/TCP and BOTH mixed candidate runs remain the comparison;
+the observer-heavy repair captures are excluded from performance ranking.
+The new cells use40s bulk plus sequential64B echo every500ms,3s timeout.
+All probes are `ok`, with one intentionally duration-partial HTTP200/8GiB
+response each and no failed echo attempt. They do not complete the whole object.
+
+| New baseline | Exact body B | Bulk time,s | Driver elapsed,s | Echo successes/failures |
+|---|---:|---:|---:|---:|
+|Raw TCP|2258393472|40.000859527|41.004685|80 /0|
+|Xray VMess/TCP|2246741684|40.000440936|41.004703|80 /0|
+|Hysteria2|2328880635|40.000067099|41.010263|80 /0|
+
+Each new service capture has41 rows. Every class rate/ceil is500Mbps throughout,
+UP70ms and DOWN30ms, no configured loss/jitter/QoS/UDP outage, and zero observed
+class/netem drops. The same settings survive all5s epoch changes. Actual
+traffic is on47, servereth0/clienteth1; both unused interfaces add0B in all
+three cells. Raw's explicit `REFLECTION_RAW_TARGET=10.238.47.20` is verified
+by both probe target addresses and class traffic. The existing runner's sole
+two-line override changes measurement routing, not Product or shaping policy.
+
+Xray logs identify26.3.27, VMess over TCP; the existing configuration has no
+outer TLS transport. H2's client retains explicit500Mbps up/down priors,
+with both connection logs recording62,500,000B/s negotiated tx. MPP retains
+dynamic discovery. Encryption/framing, native controllers and multiplexing
+are not identical; raw has no tunnel, and MPP TCP/mixed use three TCP carriers.
+Thus matched physical cuts do not create an equal-controller/connection-count
+oracle. These priors remain visible rather than being normalized away.
+
+| Ordinary cell | Whole body,Mbps | First body,s | Worst body gap,s | Echo p50 /p95 /max,ms | Echo success/failure |
+|---|---:|---:|---:|---:|---:|
+|Raw TCP,new|451.669|.402872|.100167|103.384 /126.229 /294.789|80 /0|
+|Xray,new|449.343|.409272|.200224|103.672 /128.192 /296.470|80 /0|
+|H2,new|465.775|.407294|.009613|111.030 /113.856 /118.589|80 /0|
+|MPP QUIC,58584|429.451|.412756|.100666|103.955 /155.291 /312.639|80 /0|
+|MPP TCP,48379|442.722|.579834|.368722|302.990 /348.148 /472.096|80 /0|
+|MPP mixed,2857|397.802|.583844|.372282|268.514 /530.808 /581.266|80 /0|
+|MPP mixed,5956 reverse order|404.090|.580545|.274600|348.040 /526.798 /788.622|79 /0|
+
+The new worst body gaps are preserved in the application's byte/time domain:
+raw18.717490–18.817657s,1,040,324,288→1,040,330,080B;
+Xray30.658962–30.859186s,1,711,329,440→1,711,337,550B;
+H212.063080–12.072693s,686,404,787→686,470,323B. No complete per-read timeline
+is exported. Raw/Xray worst echoes are startup#4,2.000551–2.295340s and
+2.000749–2.297219s. H2's worst#36 is18.005586–18.124176s. Success-to-success
+maximum spacings are.687870/.677125/.506222s respectively; these include the
+probe cadence, not just each echo's latency. Every baseline exchanges5,120
+exact echo bytes per direction; no successful-only exclusion hides failures.
+
+All new RAW40-bin series have no zero. The report uses raw-bin means below,
+not trimmed steady-state averages, and does not rename a healthy band as a
+QoS/restoration phase. Existing MPP phases are recomputed from their unchanged
+raw probes; the30–40s column overlaps the25–40s column.
+
+| Ordinary cell | 0–5s | 5–15s | 15–25s | 25–40s | 30–40s |
+|---|---:|---:|---:|---:|---:|
+|Raw,Mbps|360.415|474.868|457.450|462.762|456.866|
+|Xray,Mbps|357.096|473.086|454.452|460.837|454.780|
+|H2,Mbps|433.996|469.411|470.915|470.514|470.680|
+|MPP QUIC,Mbps|344.759|445.343|437.628|441.636|437.825|
+|MPP TCP,Mbps|350.620|457.921|453.903|456.835|449.504|
+|MPP mixed2857,Mbps|273.739|447.451|413.692|395.462|387.472|
+|MPP mixed5956,Mbps|291.736|432.958|423.632|409.266|402.594|
+
+| Echo starts in band | Raw count;p95,max ms | Xray count;p95,max ms | H2 count;p95,max ms |
+|---|---:|---:|---:|
+|0–5s|10;294.789,294.789|10;296.470,296.470|10;112.873,112.873|
+|5–15s|20;125.423,126.229|20;125.599,129.830|20;113.856,114.086|
+|15–25s|20;117.424,128.209|20;124.239,127.278|20;114.668,118.589|
+|25–40s|30;125.665,127.874|30;122.552,128.192|30;113.593,114.825|
+|30–40s,overlapping|20;125.665,127.874|20;122.552,128.192|20;112.658,113.593|
+
+Quantiles use sorted success index round((n−1)×quantile), as in the probe.
+Full new rawMbps, each line ten consecutive one-second bins:
+
+```text
+Raw  0– 9:   5.699 369.993 477.979 475.407 472.998 471.758 477.145 477.319 473.901 473.844
+Raw 10–19: 475.060 472.280 474.828 475.627 476.913 477.261 475.141 476.265 343.269 421.356
+Raw 20–29: 474.191 475.755 475.755 477.956 477.550 472.106 474.133 472.453 478.141 475.940
+Raw 30–39: 285.627 476.740 477.319 477.921 476.183 470.496 474.678 473.901 477.724 478.072
+Xray 0– 9:   5.242 362.921 470.826 473.627 472.866 470.302 472.853 472.005 472.448 473.237
+Xray10–19: 473.131 474.216 473.134 474.681 474.849 474.216 474.432 329.237 428.468 472.275
+Xray20–29: 473.146 474.042 472.903 472.929 472.876 475.200 474.702 467.125 473.658 474.065
+Xray30–39: 284.418 472.134 472.173 474.156 475.210 473.443 473.962 474.151 474.011 474.140
+H2   0– 9: 280.706 472.998 471.927 471.301 473.046 471.493 471.597 471.335 466.766 474.230
+H2  10–19: 471.699 463.995 461.853 469.807 471.335 473.500 474.345 469.934 465.988 471.073
+H2  20–29: 469.866 468.713 471.549 471.803 472.383 469.934 470.376 472.110 469.249 469.238
+H2  30–39: 470.915 470.774 472.840 469.477 470.309 471.118 470.346 471.321 469.776 469.920
+```
+
+Observed first→last active class wire and peak backlog follow; resource
+windows differ slightly from application windows, so do not read ratios as
+exact lifetime framing/copy amplification. All reported class/netem drop
+deltas are zero; the table does not cover every loss source or kernel queue.
+
+| Ordinary cell | DOWN /UP wire B | Peak DOWN /UP backlog B |
+|---|---:|---:|
+|Raw|2358738162 /2646917|14037808 /6334|
+|Xray|2361748173 /2654703|14040836 /6374|
+|H2|2453311562 /16310307|2813301 /33230|
+|MPP QUIC|2269813446 /36995741|11787660 /80920|
+|MPP TCP|2337535995 /8581149|16850144 /25541|
+|MPP mixed2857|2406246587 /38747547|29870398 /158124|
+|MPP mixed5956|2397685386 /36739177|29975905 /111747|
+
+Baseline native congestion/flight/ACK counters and socket CC are NOT captured:
+run.py collects no MPP management or `ss` for raw/Xray/H2. Their absence is
+not zero native work/flight, and queue totals are not exact echo residence.
+The MPP native evidence stays in the earlier full mode/candidate sections;
+this comparison does not manufacture equivalent baseline observations.
+
+| Tunnel process | Client lifetime CPU final/peak,% | Server lifetime CPU final/peak,% | Client/server peak RSS,KiB |
+|---|---:|---:|---:|
+|Raw|no tunnel|no tunnel|not comparable|
+|Xray|10.8 /10.9|6.1 /6.2|35308 /36996|
+|H2|89.4 /89.4|79.6 /79.6|29628 /45080|
+|MPP QUIC|93.3 /93.7|155 /155|37844 /368200|
+|MPP TCP|21.3 /21.4|53.6 /56.0|32744 /137344|
+|MPP mixed2857|76.9 /76.9|188 /188|79380 /325316|
+|MPP mixed5956|78.9 /79.5|187 /187|82120 /322524|
+
+These are lifetime `ps` percentages from one stable PID per tunnel role,
+not interval/exclusive CPU or instruction attribution. Raw's client probe
+appears in40 samples, last lifetime2.6%,peak16.6%,RSS17,972KiB; it is NOT a
+native transport CPU measurement. Long-lived target-process percentages
+also cannot quantify this cell's kernel/network work. No CPU-per-byte or
+post-load leak/reclamation conclusion is supported by these snapshots.
+
+All probe stderr files are empty. Xray's logs contain its startup VMess
+deprecation notice and started messages, no runtime/probe error. H2 logs its
+bulk stream cancellation at the40s stop and graceful server closure; neither
+corresponds to a failed echo. There are no Product diagnostic overlays here.
+Raw emits no tunnel logs, rather than missing expected MPP records.
+
+Disposition: on the declared healthy cut, raw/Xray sustain about449–452Mbps
+and p95 about126–128ms; H2 sustains465.775Mbps/p95113.856ms with its explicit
+rate prior. Both mixed MPP runs deliver less while their p95 remains about
+527–531ms, and they consume materially more sampled process resources than
+Xray. MPP QUIC is much closer in latency; MPP TCP approaches TCP baseline
+speed but retains higher loaded echo delay. This defeats a blanket claim
+that every mixed penalty is required by the physical cut, without attributing
+one queue/controller/repair mechanism or assuming identical configurations.
+The earlier native-competition witness and both candidate/control regressions
+remain valid. No protocol preference, timer increase, model fix or performance
+promotion follows automatically; retain the measured throughput/latency/cost
+frontier for the next bounded decision.
+
+Archive: [ORDERED_FEEDBACK_SHARED_BASELINES_20260911.raw.tar.gz](ORDERED_FEEDBACK_SHARED_BASELINES_20260911.raw.tar.gz).
+It contains26 regular files: three new probes/stderr/service sets, the four
+Xray/H2 logs, three closed drivers, existing run.py/shape.sh, and the four
+unchanged MPP comparison probe/service pairs. Size611,328B compressed,
+6,738,677B uncompressed; every member compared byte-for-byte to its source,
+without hashes. No executable/config/secret or new harness is included.
+New result tags are ordered-feedback-shared-baseline-{raw,xray,h2}-down-0911;
+MPP tags remain shared-context-{quic,tcp}-down, shared-candidate-down and
+shared-reverse-candidate-down, all with ordered-feedback prefix/0911 suffix.

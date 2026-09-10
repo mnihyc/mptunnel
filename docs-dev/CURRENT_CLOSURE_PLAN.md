@@ -486,6 +486,61 @@ copy-work forecast. Separate20%loss review asks whether native contraction
 recovers after loss clears; do not equate intentional above-allowance responses
 with proof that arbitrarily low sustained service is unavoidable.
 
+Selected05:42+08 recovery discriminator: ordinary011b724 QUIC-only then H2,
+same500Mbps both directions, DOWN70/UP30ms, no jitter/QoS/blackhole, existing
+40s bulk+64B echo. DOWN loss20% for the first20s then0% without restarting
+either endpoint; UP stays0%. H2 retains its explicit500Mbps prior, MPP retains
+default10%compensation/dynamic discovery. No native/MPP setting changes.
+Issue: current native sender remains non-app-limited and almost window-full
+while window/pacing contract and late CPU is low. Default20% response is
+deliberate, but whether restored service reopens promptly is unproved here.
+Competing causes: native recovery slope/phase, Product supply or logical-prefix
+stall, versus in-flight physical recovery and prior differences. Existing
+native FIFO tests prove eventual10x recovery in their model, not this live
+encrypted20%-loss timeline or a loaded-latency bound.
+Information forecast: successful prompt MPP return rejects a permanent stuck
+state in this case; delayed native reopening selects its actual window/ACK
+history; reopened native delivery with poor body progress selects Product
+ordering. H2 comparison tests whether the same physical loss process alone
+forces the observed service, not a policy-neutral controller oracle. No speed
+gain is promised by this observation. Preserve every echo failure/censored
+success series; no threshold, lower rate, or favourable rerun to rescue it.
+Smallest invocation change extends existing loss20_cpu.py with optional loss
+clear time and H2 process-name CPU collection. Existing runner only changes46
+at5s epochs, so the wrapper explicitly updates47 as well; actual before/after
+qdisc and monotonic/Unix transition records must verify the used cut. Both
+initializations and both directions remain as declared. This is lab routing/
+timeline instrumentation, not a Product fix. No build or runtime overlay.
+Tags loss-clear-{quic,h2}-0911. Analyse full phases/recovery/gaps/native/cost
+before deciding any model intervention; healthy mixed gate remains open.
+
+05:48+08 outcome: healthy raw/Xray/H2 all CLOSED0, respectively451.669/449.343/
+465.775Mbps with80/80echoes and p95126.229/128.192/113.856ms. Root read the
+complete160line ordinary comparison and verified26file archive integrity/
+manifest; independent byte checks pass. Both mixed ordinary398–404Mbps and
+527–531ms p95 remain uncompetitive in this cell. Native competition contributes
+but does not make every penalty necessary. A read-only actual allocator audit
+found no justified stale-rate or duplicate-backlog fix. Counting all QUIC
+buffered work as FIFO would be wrong: priority1 echo/repair can preempt bulk0,
+and exported pending_bytes is only the current H3 transaction, not that buffer.
+Unobserved high-priority repair work can theoretically underprice a subsequent
+bulk action, but its critical volume is not measured; no runtime change follows.
+
+Loss-clear QUIC59318/H299401 both CLOSED0. Actual47successful-change Unix
+timestamps are1789076549.210883/1789076661.516681, not the wrapper's earlier
+profile_elapsed observation; qdisc histories verify both changes. Q raw phase
+15–20/20–25/25–30/30–40Mbps is14.121/31.190/402.485/422.198; H2 is132.435/
+459.957/471.716/467.003. Native QUIC window rises~97KB at20s to~9.4MB at26s
+in the same epoch, with matching ACK/body progress; no permanent stuck state
+or later Product stall is demonstrated. Its first four restored bins remain
+15–20Mbps, while H2 returns to~472Mbps by21s. Existing native probe waiting/
+growth and the explicit-prior difference remain candidate explanations, not
+a proven bug or permission to shorten timers. Qserver CPU20–25mean38.651%,
+then~156–164% with restored high throughput. No persistent CPU-saturated
+recovery failure. Q74/H280echoes all succeed, but Q's preclear2.478s echo is
+preserved. Independent full distribution/cost/clock archive is in progress.
+No current compiler/lab; no runtime edit or released performance claim.
+
 ## Separate open issue: one-core burst near20%QUIC loss
 
 [Four ordinary500Mbps DOWN controls](QUIC_LOSS_CPU_20260910.md) on d44:

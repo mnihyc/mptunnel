@@ -15,6 +15,66 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ### Selected next model gate — confirmed return service with baseline fallback
 
+13:17 +08 bounded receipt correction passes all93server checks, including
+the actualfirst+establishedreceipt test with fullACKqueue/capacity-onlywake,
+unchangedMAX and partialwrite-once. Existingretainedrouteexpiry/terminal/repair
+controls pass. Independentdiff review finds no concretecredit/wake/cancel
+counterexample. Removed oneunusedimport warning; no other change. Runtime
+remains unpromoted pending ordinarycost/timing, not the5shold's proved cure.
+
+Next fixed comparison: build one ordinarycandidate and retain364d417control;
+CONTROL thenCANDIDATE healthy mixedUP, then mixedDOWN, each40s500/500Mbps,
+DOWN30/UP70, zerojitter/loss/QoS/outage, existingprobe/managementsampling and
+sameunchangedtarget. No extrasocketobserver inperformancepair. Forecast is
+receipt-liveness correctness, not a guaranteed bulk gain. Keep firstresponse,
+allbins/echoes/maxgaps/exactUPsettlement/classbytes/CPU/RSS and adversephases.
+Material ordinaryharm stops promotion; do not add cadence/timeout tweaks or
+attribute any fasterstartup to the originaluncaptured5scause. Broaderreturncut,
+outage/TCPservice/randomlinks/experience gates stillremain after thispair.
+
+13:12 +08 exact contract RED: the real server DATA actor admits[0,2), a real
+duplex target accepts one byte then returns Pending, output credit/capacity are
+valid, yet no StreamAck is offered. The focused test fails at that intended
+assertion (not setup), log target-write-receipt-red-0910.log;64s build.
+
+Bounded correction forecast: at the FIRST actual Pending of this one retained
+DATA write/flush, force one ACK-only materialization of the already admitted
+receipt. Keep the same pinned write, current actual MAX grant, exact output
+fences/retries/return-route deadlines and normal postwrite credit publication.
+If it is immediately Ready, preserve the current postwrite cadence entirely.
+Further Pending wakes retry the same generation, not rematerialize it. This
+implements existingRFC8.3/8.4; no new threshold, native controller, timing policy
+or RFC redesign. Established subthreshold receipt must also be offered, so the
+existing force=false predicate is insufficient at the park boundary.
+
+History/tradeoff: postwrite receipt ordering predates364d417; the earlier broad
+8a0413d cadence trial was fully reverted5d2af0c after adverse timing. Its global
+cadence/timer changes stay rejected. This narrowly restores a required actual
+park boundary. Expected benefit is timely receipt/owner release under target
+backpressure, not an asserted Mbps gain or proof of the episodic5s cause.
+Immediately-ready service has no predicted speed gain. Actual pending writes,
+including cooperative pending, can produce more/earlier feedback, so ordinary
+UP/DOWN timing/cost controls remain mandatory and may reject promotion. Preserve
+partialwrite-once, no premature credit and immediateReady/nonfirst-receipt
+controls. Do not fix unrelated duplex target-read scheduling in this patch.
+
+13:08 +08 target observation outcome: no recurrence of the5.14s hold. Exact
+2,133,524,480B settle in41.651823s; maxconfirmation/writegap.383092/.403622s.
+All41 sink socket samples have zero receive/send queues, receipts/replies
+advance, and sink majorfaultdelta is0 with~6.26%one-core CPU over the capture.
+The same sinkPID remains. Source1080backpressure is sustained but progresses.
+No evidence here attributes the original episodic stall; keep it unresolved,
+not fixed by the409.783Mbps average. Sequential sample timing cannot localize
+subsecond pauses. The sink retains unused lifetime receive tuples even without
+a progress output; that is a concrete observer-resource defect, not proof of
+GC/paging as this event's cause or an MPP runtime leak. No sink change yet.
+
+The actual-DATA blocked-target test is compiling under the current runtime.
+This is a necessary receipt-contract check, not a throughput optimization;
+do not promote it as the cure for the original5s. Native/deadline parameters
+stay unchanged. Healthy panel/TCP companion are committed4ef9f50. Telegram
+balanced comparison sent05:08UTC; next nonurgent update not before06:09UTC.
+
 13:06 +08 completed healthy panel: all MPP UP cells settle exactly, but mixed
 has a5.140055s positive-confirmation gap (TCP.477220s, QUIC.246492s), with four
 zero one-second bins during startup. Final371Mbps does not excuse this hold.

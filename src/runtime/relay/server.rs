@@ -86,7 +86,9 @@ use crate::runtime::telemetry::{ObservedProductIo, RuntimeTelemetry};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -690,16 +692,26 @@ impl ServerAckPublicationState {
     }
 }
 
+struct ServerPendingReceiveAck<'a> {
+    progress: &'a mut ReliableRecvProgress,
+    path: Option<PathSnapshot>,
+    lane: TrafficClass,
+    limits: MuxLimits,
+}
+
 /// Feedback liveness does not belong to the target socket. Keep the same
 /// partially completed write/flush/shutdown future while servicing its exact
-/// route deadline and existing retained publication work. This does not
-/// consume more input or manufacture receive credit before local delivery.
+/// route deadline and retained publication work. A DATA write that actually
+/// parks first offers its admitted receipt, independently of target consumption.
+/// Immediately completed writes retain their normal postwrite publication.
+/// This consumes no more input and grants no credit before local delivery.
 async fn service_server_feedback_while_pending<F, T>(
     operation: F,
     path_stream: &ReliablePathStream,
     recv_stream: &mut ReliableRecvStream,
     publication: &mut ServerAckPublicationState,
     peer_max_offset: u64,
+    mut pending_receipt: Option<ServerPendingReceiveAck<'_>>,
 ) -> Result<T, RuntimeError>
 where
     F: std::future::Future<Output = Result<T, RuntimeError>>,
@@ -730,8 +742,26 @@ where
             recv_stream,
         );
         let deadline = path_stream.feedback_route_deadline();
+        let observe_first_pending = pending_receipt.is_some();
         tokio::select! {
-            result = &mut operation => return result,
+            result = poll_fn(|cx| match operation.as_mut().poll(cx) {
+                Poll::Ready(result) => Poll::Ready(Some(result)),
+                Poll::Pending if observe_first_pending => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            }) => {
+                if let Some(result) = result {
+                    return result;
+                }
+                let receipt = pending_receipt.take().expect("first pending DATA write");
+                enqueue_tcp_recv_progress(
+                    path_stream, recv_stream, receipt.progress, publication,
+                    receipt.path, receipt.lane, receipt.limits, true, false, false,
+                );
+                // The new generation can introduce blocked recipients. Re-arm
+                // their exact capacity waits before parking, rather than using
+                // the wait set collected before this receipt was materialized.
+                continue;
+            }
             _ = async { if let Some(wait) = capacity.as_mut() { wait.as_mut().await; } }, if capacity.is_some() => {}
             _ = async {
                 match deadline {
@@ -3477,6 +3507,12 @@ where
                     service_server_feedback_while_pending(
                         write_applied_ready_stream_data_batch(&mut local, &mut ready_path_data, applied),
                         path_stream, &mut recv_stream, &mut request_ack_publication, peer_max_offset,
+                        Some(ServerPendingReceiveAck {
+                            progress: &mut recv_progress,
+                            path: request_feedback_path_snapshot,
+                            lane: request_lane,
+                            limits: mux_limits,
+                        }),
                     ).await?;
                     if enqueue_tcp_recv_progress(
                         path_stream,
@@ -3515,6 +3551,7 @@ where
                         service_server_feedback_while_pending(
                             async { local.shutdown().await.map_err(RuntimeError::Io) },
                             path_stream, &mut recv_stream, &mut request_ack_publication, peer_max_offset,
+                            None,
                         ).await?;
                         remote_open = false;
                         pending_remote_fin_offset = None;
@@ -3771,6 +3808,7 @@ where
                         service_server_feedback_while_pending(
                             async { local.shutdown().await.map_err(RuntimeError::Io) },
                             path_stream, &mut recv_stream, &mut request_ack_publication, peer_max_offset,
+                            None,
                         ).await?;
                         remote_open = false;
                         pending_remote_fin_offset = None;

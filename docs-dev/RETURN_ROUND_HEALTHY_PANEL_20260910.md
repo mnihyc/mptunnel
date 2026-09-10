@@ -307,3 +307,85 @@ It does not identify a specific FIFO, actor, native-write or MPP admission cause
 establish full-run direct behavior, or justify a queue threshold. This partial
 discriminator is useful without rerunning it into a falsely cleaner control;
 the higher-impact mixed upload stall remains the active priority.
+
+## Separate mixed UP target/socket observation: original stall did not recur
+
+This is one predeclared diagnostic capture on unchanged ordinary `364d417`, not
+a replacement for the original healthy-panel mixed upload. The question was
+whether its five-second interruption reflects a nonreading sink, unread target
+replies, or absent ordered input before the target socket. Root added read-only
+samples of target port 10023, client source port 1080, the existing sink's
+PID 25 `stat`/`status`, and the probe's existing started-file anchor. Root verified
+that the listener was the existing `python3 /workspace/lab/tcp_sink.py` process
+without extra arguments; it was not restarted. No MPP build, runtime, controller,
+profile or workload change was made. These extra observations have a cost and
+do not turn this capture into an ordinary favorable repeat.
+
+Evidence is the six files under
+`./.tmp/reflection/results/mixed-combined-up-return-round-target-observer-0910/`.
+Root created/listed the separate [seven-file archive](RETURN_ROUND_TARGET_OBSERVER_20260910.raw.tar.gz)
+with those files and the observation runner. This section does not clear the original
+5.140055-second confirmation gap or its 3.523470-second local write gap.
+
+| Diagnostic outcome | Value |
+|---|---:|
+| Accepted = target-confirmed bytes | 2,133,524,480 |
+| Exact complete streams / failed streams | 1 / 0 |
+| Elapsed / nominal offered duration, s | 41.651823 / 40 |
+| Confirmed whole rate, Mbps | 409.783 |
+| First local write / target confirmation, s | 0.109601 / 0.543843 |
+| Maximum confirmation / local write gap, s | 0.383092 / 0.403622 |
+| Confirmation Mbps, 0–5 / 5–15 / 15–25 / 25–40 s | 268.537 / 455.186 / 418.699 / 408.009 |
+
+The probe reports `ok`, valid exact terminal accounting, no probe errors and
+empty stderr. There is no five-second recurrence to join to a target or native
+event. The larger average is not evidence of a fix. No echo worker runs in this
+upload capture. The 42 untrimmed confirmation bins, including settlement, are:
+
+```text
+17.417,114.488,705.935,140.937,363.908,728.332,218.960,282.687,812.314,353.990,412.651,445.135,420.760,479.353,397.678,465.190,329.121,505.554,416.341,459.171,402.377,430.396,374.243,460.983,343.617,560.781,323.679,360.390,503.738,428.984,363.484,455.773,189.761,725.090,340.743,353.688,210.970,122.824,859.360,320.864,494.411,372.117
+```
+
+Independent socket/PID review and report extraction agree on the narrower facts:
+
+- All 41 target samples retain the same loopback pair: sink PID 25 port 10023
+  and MPP PID 417321 port 42870. Sink Recv-Q, Send-Q and NOTSENT are zero at
+  every sampled instant. Its received/reply-sent byte counters increase across
+  all 40 adjacent samples, ending at 2,077,381,608 / 2,884 bytes; sampling ends
+  before final settlement, so these are not whole-transfer counters.
+- MPP's target-side NOTSENT is also always zero. Its Send-Q median/max are
+  12,000 / 415,033 bytes; reply Recv-Q median/max are 0 / 15 bytes. These domains
+  are not interchangeable with the sink's empty queues.
+- Source-side pressure exists: MPP port 1080 Recv-Q median/max are
+  14,274,338 / 14,793,487 bytes; the probe's native NOTSENT median/max are
+  10,387,879 / 15,029,487 bytes. Progress continues; this is not an observed
+  five-second source freeze or evidence of an MPP memory leak.
+- Sink PID/starttime stay 25 / 71521824. Major faults stay at 152,438 (delta
+  zero), swap at 210,796 KiB, and RSS grows from 362,904 to 380,116 KiB.
+  Minor faults increase by 21,545. CPU advances 255 ticks, or 2.55 seconds at
+  the verified 100 Hz accounting rate: approximately 6.26% of one core over
+  the 40.740962-second sample span. Sampled state is sleeping with two threads;
+  that does not mean it was continuously idle. No GC/application-read events
+  were collected, so neither GC nor paging explains the old stall here.
+
+The `probe.started` anchor is Unix 1789016660.871500731 seconds; first cached
+server management generation is 1789016660.840 seconds. Service `elapsed` is
+recorded before sequential server/client/socket commands: in row zero the
+server target has zero received bytes while the later source sample already
+shows roughly 82 MB. A shared row is therefore not a simultaneous snapshot,
+and it cannot place an individual subsecond gap at an exact queue boundary.
+Zero queue occupancy at 41 instants is not a proof of continuously empty queues.
+
+All 41 profile rows retain 500/500 Mbps, 30/70 ms delay and no configured
+impairments or actual class/qdisc drop deltas. The class window ends at
+40.741023 seconds: DOWN/UP bytes are 47,832,370 / 2,462,092,212 and sampled peak
+backlogs 54,179 / 17,149,980 bytes. MPP client RSS peak/final is
+304,972 / 297,476 KiB; server 114,412 / 114,412 KiB. Last lifetime `ps` CPU is
+175% / 102%, not an interval or total-host CPU measurement. The only warning
+is the later QUIC `H3_NO_ERROR` close; exact probe settlement succeeds.
+
+Disposition: this capture documents normal target progress under source
+backpressure, but does not attribute the original episodic five-second hold.
+It supplies no basis for a deadline, native controller, socket-buffer or sink
+change, and no performance acceptance. Any separate receipt-contract test has
+its own correctness scope and cannot be presented as this stall's proved cause.

@@ -33,6 +33,328 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
+async fn server_data_ack_is_offered_before_first_target_write_completes() {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    struct WriteObserved {
+        inner: tokio::io::DuplexStream,
+        accepted: Arc<AtomicUsize>,
+        pending: Arc<AtomicBool>,
+    }
+    impl AsyncRead for WriteObserved {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buffer)
+        }
+    }
+    impl AsyncWrite for WriteObserved {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
+            match &result {
+                Poll::Ready(Ok(bytes)) => {
+                    self.accepted.fetch_add(*bytes, Ordering::Release);
+                }
+                Poll::Pending => self.pending.store(true, Ordering::Release),
+                Poll::Ready(Err(_)) => {}
+            }
+            result
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let limits = MuxLimits::default();
+    let session_id = SessionId(717);
+    let stream_id = StreamId(717);
+    let lane = TrafficClass::Throughput;
+    let (commands, mut receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new_with_limits(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        commands.clone(),
+        lane,
+        limits,
+    );
+    let (frames_tx, frames_rx) = mpsc::channel(1);
+    let mut path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: limits.max_stream_window_bytes,
+        lane,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frames_rx.into(),
+    };
+    // Use the same initial grant as a successful target open. No receipt is
+    // published by the fixture: only the actual DATA actor may create one.
+    let initial_grant =
+        reliable_stream_initial_advertised_window_bytes(path_stream.underlay, lane, limits);
+    assert_eq!(
+        path_stream
+            .publish_max_data(initial_grant)
+            .max_data
+            .published_offset,
+        Some(initial_grant),
+    );
+    let initial = try_recv_reliable_path_command(&mut receivers).expect("initial target grant");
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&initial));
+    assert!(
+        matches!(initial, ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+        stream_id: id, max_offset,
+    }) if id == stream_id && max_offset == initial_grant)
+    );
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert_eq!(binding.feedback_status().ack_generation, 0);
+
+    let outbound_id = crate::product::OutboundId::parse("test-direct").expect("outbound ID");
+    let outbound_registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: outbound_id.clone(),
+            config: OutboundConfig::Direct,
+            connect_timeout: Duration::from_secs(1),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("outbound registry");
+    let router = ClientIngressRouter::new(
+        &ProductPolicyConfig {
+            generation: 1,
+            routes: vec![RouteRuleSpec::new(
+                RuleId::parse("default").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(outbound_id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )],
+        },
+        outbound_registry,
+    )
+    .expect("router");
+    let context = ServerReliableRelayContext {
+        router,
+        inbound: InboundId::parse("test-inbound").expect("inbound ID"),
+        performance: MppPerformanceConfig::default(),
+        mux_limits: limits,
+        max_paths_per_session: ResourceLimits::default().max_paths,
+        session_retention_timeout: Duration::from_secs(60),
+        flow_idle_timeout: None,
+        telemetry: RuntimeTelemetry::new(1),
+    };
+    let (mut application, relay_side) = tokio::io::duplex(1);
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let pending = Arc::new(AtomicBool::new(false));
+    let payload = Bytes::from_static(b"ab");
+    assert!(payload.len() as u64 <= initial_grant);
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: payload.clone(),
+        }))
+        .await
+        .expect("first legal DATA through the actor input");
+    let mut close = ServerRelayClose { sent: false, lane };
+    let mut relay = Box::pin(relay_reliable_stream_body(
+        WriteObserved {
+            inner: relay_side,
+            accepted: accepted.clone(),
+            pending: pending.clone(),
+        },
+        &mut path_stream,
+        &context,
+        session_id,
+        crate::runtime::stream::SessionSendBuffer::from_limits(limits),
+        &mut close,
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !pending.load(Ordering::Acquire) {
+            tokio::select! {
+                result = relay.as_mut() => panic!("live target must retain the actor: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("actual target write reaches backpressure");
+    assert_eq!(accepted.load(Ordering::Acquire), 1);
+
+    let mut acknowledgements = Vec::new();
+    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        if let ReliablePathCommand::SendFrame(frame @ Frame::StreamAck { .. }) = command {
+            acknowledgements.push(frame);
+        }
+    }
+    // The first receipt is urgent under the existing policy. This is the
+    // offer-before-park boundary, not a byte threshold or ACK-cadence test.
+    assert_eq!(
+        acknowledgements,
+        vec![Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: vec![OffsetRange { start: 0, end: 2 }],
+        }],
+        "new DATA receipt must be offered before its target write completes",
+    );
+    assert_eq!(binding.feedback_status().ack_generation, 1);
+    assert_eq!(
+        binding.feedback_status().max_data.published_offset,
+        Some(initial_grant),
+        "a blocked receipt ACK must not grant the whole undelivered batch",
+    );
+
+    let mut delivered = [0_u8; 2];
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = relay.as_mut() => panic!("open stream must remain live: {result:?}"),
+            result = application.read_exact(&mut delivered) => result.expect("release retained write"),
+        }
+    })
+    .await
+    .expect("the same retained write completes when the target drains");
+    assert_eq!(&delivered, payload.as_ref());
+    assert_eq!(accepted.load(Ordering::Acquire), 2);
+
+    // The real postwrite grant is a barrier: the first transaction, including
+    // its postwrite feedback call, must finish before the next DATA arrives.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while binding.feedback_status().max_data.published_offset != Some(initial_grant + 2) {
+            tokio::select! {
+                result = relay.as_mut() => panic!("open stream must remain live: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("first write reaches its ordinary postwrite grant");
+    let grant = try_recv_reliable_path_command(&mut receivers).expect("postwrite grant");
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&grant));
+    assert!(
+        matches!(grant, ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+        stream_id: id, max_offset,
+    }) if id == stream_id && max_offset == initial_grant + 2)
+    );
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert_eq!(binding.feedback_status().ack_generation, 1);
+
+    // The second two-byte receipt is no longer a first-ACK case. Also occupy
+    // every ordinary control slot so its new generation must retain and wake
+    // from real carrier capacity while the SAME target write remains blocked.
+    for nonce in 0..8 {
+        commands
+            .try_enqueue_admitted_frame(Frame::Ping { nonce }, TrafficClass::Control)
+            .expect("fill the existing eight-slot control queue");
+    }
+    pending.store(false, Ordering::Release);
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 2,
+            payload: Bytes::from_static(b"cd"),
+        }))
+        .await
+        .expect("established subquantum DATA through the actor input");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !pending.load(Ordering::Acquire) {
+            tokio::select! {
+                result = relay.as_mut() => panic!("live target must retain the actor: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("second real target write reaches backpressure");
+    assert_eq!(accepted.load(Ordering::Acquire), 3);
+    let blocked = binding.feedback_status();
+    assert_eq!(
+        blocked.ack_generation, 2,
+        "established receipt is materialized before parking"
+    );
+    assert!(blocked.ack.pending && !blocked.ack.published);
+    assert_eq!(blocked.max_data.published_offset, Some(initial_grant + 2));
+    for nonce in 0..8 {
+        let filler = try_recv_reliable_path_command(&mut receivers).expect("held control slot");
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&filler));
+        assert!(
+            matches!(filler, ReliablePathCommand::SendFrame(Frame::Ping { nonce: actual })
+            if actual == nonce)
+        );
+    }
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !binding.feedback_status().ack.published {
+            tokio::select! {
+                result = relay.as_mut() => panic!("target is still blocked: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("carrier capacity alone retries the newly pending generation");
+    let ack = try_recv_reliable_path_command(&mut receivers).expect("retried second receipt");
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&ack));
+    assert!(
+        matches!(ack, ReliablePathCommand::SendFrame(Frame::StreamAck {
+        stream_id: id, scope_start: None, ranges,
+    }) if id == stream_id && ranges == vec![OffsetRange { start: 0, end: 4 }])
+    );
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert_eq!(binding.feedback_status().ack_generation, 2);
+    assert_eq!(
+        binding.feedback_status().max_data.published_offset,
+        Some(initial_grant + 2)
+    );
+    assert_eq!(
+        accepted.load(Ordering::Acquire),
+        3,
+        "ACK retry did not drain the target"
+    );
+
+    let mut second = [0_u8; 2];
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = relay.as_mut() => panic!("open stream must remain live: {result:?}"),
+            result = application.read_exact(&mut second) => result.expect("release second write"),
+        }
+    })
+    .await
+    .expect("second retained write completes when the target drains");
+    assert_eq!(&second, b"cd");
+    assert_eq!(accepted.load(Ordering::Acquire), 4);
+    drop(relay);
+    let mut extra = Vec::new();
+    application
+        .read_to_end(&mut extra)
+        .await
+        .expect("target EOF");
+    assert!(
+        extra.is_empty(),
+        "partial target writes must not be replayed"
+    );
+}
+
+#[tokio::test]
 async fn server_confirmed_return_expiry_services_siblings_during_retained_write() {
     let stream_id = StreamId(714);
     let limits = MuxLimits::default();
@@ -134,6 +456,7 @@ async fn server_confirmed_return_expiry_services_siblings_during_retained_write(
         &mut received,
         &mut publication,
         64,
+        None,
     );
     let release = async {
         // The one-byte target cannot drain the write. Only proof expiry can

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 16:16 +08:00. Authoritative repository is `./`.
+Updated: 2026-09-10 16:51 +08:00. Authoritative repository is `./`.
 **MPP is not performance-accepted. No release, push, public README update or
 ideality claim. Continue the authorized closure task, not just this checkpoint.**
 
@@ -13,7 +13,62 @@ exact joins, source overlays, tests and archives. Condensation deletes no eviden
 
 ## Decision and active transaction
 
-**QoS pair CLOSED — material heterogeneous service failure selects attribution.**
+**Active: authoritative ACK-gap service correction; request RED first.**
+
+The exact capture is CLOSED. It rules out continued Original placement on the
+impaired link or repairs placed back on that link during the sustained collapse.
+One Q46-owned missing prefix receives successive Q47 repair quanta of14,600B
+108–203ms apart, with only17–25KB accepted above the latest logged receive
+frontier. Healthy47 remains200Mbps/~100ms, requiring roughly2.5MB of useful
+pipeline. The ordinary cut-phase service is16.203Mbps versus185.887Mbps on the
+healthy single-link control; the observer reproduces12.260Mbps, not a new
+ordinary comparison. Full exact joins and limitations:
+[recovery model](INDEPENDENT_QOS_RECOVERY_MODEL_20260910.md).
+
+Root cause/model decision: existing first-missing-byte enumeration serializes
+independently due authoritative omissions behind one accepted live-owner hedge.
+T06 correctly prevents one14.6KB-ranked action expanding into a10.67MB suffix;
+its stream-wide one-head policy does not supply sustained heterogeneous repair.
+Keep each fresh rank/Apply extent bound. Select at most ONE lowest due,
+serviceable authoritative missing range per existing actor evaluation, excluding
+exact queued and unexpired-copy coverage as service, never as receipt. Next
+evaluation follows actual commit/yield without requiring another Data ACK.
+Silent retained fallback and structural failure recovery stay unchanged.
+
+Before runtime: actual evaluator RED for a protected prefix plus independently
+due disjoint successor. Preserve per-Original assignment clocks across visits
+and ACK fragmentation, exact slot occupancy after suppression expiry, negative
+evidence scope, native/Product admission, and future timer/capacity wakes.
+Scalar first-gap timing cannot be recycled for this enumeration. The bounded
+clock-owner implementation is under independent review; no new timer, quantum,
+controller, reserve, hint or bottleneck grouping is authorized.
+
+Forecast: remove the ACK-per-quantum component of the measured multi-second
+repair collapse, potentially reclaiming a material fraction of the~170Mbps
+healthy-link deficit. No full200Mbps floor or startup clairvoyance is promised:
+actual per-range maturity, native queueing, reordered debt and physical loss
+remain. New speculative copies can increase shared-congestion cost. Reject
+promotion if exact successor service remains unavailable under its existing
+rules, the ordinary cut-phase deficit does not materially improve, or healthy/
+restored throughput, completion, gaps, latency or wire/resource costs materially
+regress without a justified practical tradeoff. Do not rescue by tuning.
+
+Rejected BEFORE implementation: post-fallback-only enumeration does not cover
+the exact capture because inflated owner PTO is5.5–11.1s while copy ages are
+6.8–9.1s; observed copies use the earlier authoritative-gap branch. Likewise
+aggregate owner-flight ETA is not a per-range arrival proof and will not be
+introduced as a new safety guarantee. Its existing advisory predicate remains.
+
+Root owns cargo/labs; request agent owns actual evaluator RED, independent agent
+reviews assignment timing/service wakes, evidence agent preserves the report.
+No compiler/lab running; direct topology remains active. Target/release is
+ordinary b0, observer overlay reversed and nine-file archive retained. After
+focused GREEN and audit, build one ordinary candidate and run the SAME existing
+aggregate QoS UP cell first, then healthy/affected ordinary controls. No public
+README, release or performance acceptance at this checkpoint. Older NEXT
+entries below are CLOSED chronology, not instructions to rerun them.
+
+**QoS pair CLOSED — material heterogeneous service failure attributed.**
 Both uploads settle exactly: single healthy47=177.889Mbps, aggregate46+47=
 249.391Mbps whole. But aggregate RAW bins16–24 are8.196,6.573,7.147,13.352,
 21.267,22.069,21.711,24.005,21.506Mbps while only46 is restricted to10Mbps;

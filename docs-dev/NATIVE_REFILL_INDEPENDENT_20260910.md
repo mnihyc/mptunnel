@@ -326,3 +326,96 @@ and attribute the existing exact ordered/allocation/recovery owner first.
 Do not change a rate hint, reserve, deadline or observation guard to make the
 table pass. The whole249Mbps result is not an adequate performance claim for
 an upload that spends nine seconds around16Mbps with an unaffected200Mbps cut.
+
+## Separate exact-request diagnostic: collapse recurs under observation
+
+This is an information-only capture, **not another ordinary candidate trial**:
+`./.tmp/reflection/results/aggregate-combined-up-native-refill-independent-qos-observer-0910/`.
+It uses the same working `b0baca2` policy and QoS profile with a temporary35-line
+`lab-diagnostics` observer in `RequestSenderService::commit_fenced_frame_product`.
+The saved patch is `./.tmp/reflection/independent-qos-request-observer-0910.patch`;
+root has reversed that source overlay. The frozen feature build completes in
+82s with one existing dead-code warning. The runner completes with return0in
+42.008198s; there is no further runtime correction or parameter adjustment.
+The [separate diagnostic archive](INDEPENDENT_QOS_REQUEST_OBSERVER_20260910.raw.tar.gz),
+created and tar-listed by root, retains nine files: the five result files,
+run/build logs, exact observer patch and runner. It is separate from the
+six-cell ordinary archive above.
+
+The information forecast is exact request ownership across the collapse:
+continued Original commitment to46, copies targeted back to46, or insufficient
+distinct repair service on47. The new event records Product/source commitment,
+**not** final carrier queue publication, native completion or remote receipt.
+It is joined separately with existing repair, receive-hole and delivery-stall
+events; none of the scalar results below decides those competing causes.
+Per-process monotonic origins must not be equated across client and server.
+
+| Diagnostic outcome | Result |
+|---|---:|
+| Confirmed = locally accepted bytes | 1,275,592,704 |
+| Exact terminal settlement / failed streams | 1/1 /0 |
+| Elapsed including settlement / exact whole Mbps | 41.842690s /243.883 |
+| First local write / confirmation | .105024s /.411588s |
+| Maximum confirmation / local-write gap | .455345s /2.038853s |
+| Raw confirmation bins / service rows | 42 /42 |
+| 0–5 /5–15s confirmation Mbps | 230.473 /319.379 |
+| 15–25 /16–25s confirmation Mbps | 30.327 /12.260 |
+| 25–40s confirmation Mbps | 319.110 |
+
+Both exact byte accounting and terminal settlement succeed, with no probe
+errors. The sustained collapse recurs: raw bins16–24range1.978–39.550Mbps,
+averaging12.260Mbps. The maximum local-write wait also exceeds2s. A smaller
+maximum confirmation gap does not indicate stable throughput; repeated tiny
+progress remains poor service. The UP probe retains no exact gap endpoints
+and runs no concurrent echo workload. This observed run neither improves nor
+supersedes the ordinary16.203Mbps restricted result.
+
+All42rows verify the same direct topology profile: only46UP10Mbps at rows15–24,
+47UPand both return cuts200Mbps, DOWN30/UP70ms, no jitter/loss/blackhole and
+zero class/netem drop deltas. First reported shape transitions occur at
+15.002229/25.003242s. The native paths remain sampled active in one session per
+role; this is not a failed-carrier/restart test.
+
+| Diagnostic class/resource cost | Result |
+|---|---:|
+| Whole UP46 / UP47 class bytes | 691,396,821 /788,737,456 |
+| Whole DOWN46 / DOWN47 class bytes | 18,709,133 /16,082,932 |
+| Strict rows16→24 UP46 / UP47 bytes | 9,940,828 /15,207,022 |
+| Same-window UP46 / UP47 class Mbps | 9.940 /15.205 |
+| Same-window DOWN46 / DOWN47 bytes | 68,475 /267,854 |
+| Client RSS peak / final, KiB | 395,496 /366,196 |
+| Server RSS peak / final, KiB | 107,720 /107,720 |
+| Client lifetime CPU peak / final, % | 155 /138 |
+| Server lifetime CPU peak / final, % | 95.3 /82.2 |
+| Summed UP backlog p50 / max, B | 7,940,520 /18,270,476 |
+| Summed DOWN backlog p50 / max, B | 27,037 /53,347 |
+
+Across strict rows16→24, healthy47QUIC native ACKs advance21,252,772B with
+producer stamps advancing every row from16,647,174to24,716,724us; its RTT
+p50/max is100.192/208.136ms. Its TCP ACKs add39,414B. Restricted46QUIC/TCP
+ACKs add5,924,160/3,206,218B; QUIC RTT p50/max is3678.498/7412.854ms. Native
+epochs are unchanged within this window. These counts contain protocol/copy
+traffic and use their own sampling windows, not target-confirmed bytes or an
+exact blocking-range attribution. The class window ends41.007922s, before final
+upload settlement. Lifetime CPU, sampled memory and shared-host limitations
+remain unchanged; no leak or critical CPU bottleneck follows from this table.
+
+Logging is a material limitation: client35,732,373B/131,977lines plus
+server1,163,342B/3,592lines totals**36,895,715B (36.9MB),135,569lines**. Neither
+log contains a WARN/ERROR; probe stderr is empty. Formatting/output work can
+perturb scheduling and service despite unchanged policy. Its cost is not a
+measured isolated overhead percentage, and this capture is not an unbiased
+ordinary throughput, latency or CPU comparison. Exact ownership evidence is
+the purpose of paying this diagnostic cost, not a favorable performance claim.
+
+All42raw confirmation bins follow; their rounded integral differs from the
+exact confirmed counter by46B. No trimmed index is used as wall-clock time.
+
+```text
+QoS request observer UP: 13.275,299.085,195.892,251.710,392.401,319.722,330.929,240.212,450.415,288.784,407.610,283.027,299.664,322.378,251.053,192.928,9.053,21.851,7.975,6.456,4.955,1.978,2.313,39.550,16.209,390.356,444.589,194.001,190.976,248.754,246.231,263.799,456.715,248.754,314.322,329.312,361.493,349.537,505.475,242.338,238.230,530.435
+```
+
+The ordinary heterogeneity gate remains failed. The independent exact
+commit/repair/receipt join determines the next model decision; this outcome
+section alone identifies no correction and authorizes no further impairment
+expansion, public performance claim or release.

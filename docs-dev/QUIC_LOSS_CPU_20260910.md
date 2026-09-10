@@ -248,3 +248,59 @@ suffix can still require proportional scanning/replay and deep snapshot clones;
 the64MiB default bounds journal allocation, not callback CPU or total RSS. No
 current stack/interval capture links the user's random burst to those costs.
 The audit changed no code and claims no new runtime or performance verification.
+
+### Snapshot work and the remaining measurement boundary, 2026-09-11
+
+Read-only audit of current011b724; the four ordinary CPU captures above remain
+d44ca8e evidence. No new runtime fix, test, diagnostic or benchmark was run.
+Commit3a6d0ea introduced coherent active-controller/PathData snapshots so an
+activation, controller lineage, RTT and flight could not be fused across a
+migration or rollback. That useful coherence/fencing requirement remains;
+it is not a requirement to copy the controller's mutable history.
+
+The exact snapshot entry is `src/transport/quic/endpoint.rs:241`, not Quinn's
+endpoint/rebind code. Quinn's connection-state lock protects the controller
+clone; `InstrumentedController::clone_box` delegates to derived `Bbr3::clone`,
+including retained journal records, epoch-ID vectors and packet metadata.
+
+| Actual caller | Snapshot work |
+|---|---|
+| Authority construction / initial server shape | One deep clone per capture attempt |
+| Successful per-carrier `UdpPathConnection::tx_metrics` | Two: scheduling shape, then congestion metrics |
+| Coalesced native-authority notification → `refresh` | One per capture attempt |
+| Final native precommit / ordinary native write | No clone through these APIs |
+
+Final `commit_with_current_scheduling_shape` reads the cached scalar shape under
+activation-fence → coordinator → shape locks and must not call Quinn. Thus this
+is not a per-write/precommit journal-copy claim. Client/server metric tasks use
+`max(SRTT/2, granularity)` while active; a backlog0→positive write wake waits
+the ACK interval before another observation. Idle polling instead uses PTO.
+
+That cadence is NOT a global clone-rate cap. Both metric tasks also wait on
+the accepted-authority watch and repoll immediately when it changes. Native
+activation/terminal changes and changed positive operational bandwidth after
+ACK-epoch/congestion/spurious callbacks notify the authority publisher. Its
+Notify and the accepted watch coalesce, but an accepted change can still cause
+one authority clone plus two metric clones without waiting SRTT/2. Startup
+therefore has a reachable high-frequency observation path; these captures do
+not measure its frequency or cost. No always-ready loop is established.
+
+Existing `quic_carrier_ack_poll` reports only polls with nonzero ACK/loss,
+not all captures, authority refreshes or retained journal occupancy. The real
+encrypted `partial_late_original_corrects_its_loss_class_without_undoing_real_loss`
+fixture in `crates/quinn-proto/src/tests/mod.rs` already produces retained BBR
+loss records at an actual connection snapshot boundary. The existing rolling
+callback fixture measures clone work and reclamation; the endpoint snapshot
+fixture checks coherent/non-consuming observations. They provide small
+reachability/control seams, not evidence of the startup burst's material cost.
+
+Before materiality or a runtime correction is claimed, the missing evidence is
+actual capture count, retained size at those captures, and exclusive on-CPU
+cost of the copying/projection, distinguished from connection-lock waiting
+and unrelated nested work. Operation counts or simulated callback timings
+alone cannot supply that attribution. A bounded in-process thread-CPU measure
+could supply actual execution evidence without equating elapsed wait with CPU;
+none is implemented or selected here. The current container lacks perf/gdb and
+has restrictive perf permissions; that is a diagnostic limitation, not a root
+cause or permission to install tools/change capabilities. The user incident
+and the material contribution of these snapshots remain **not attributed**.

@@ -3670,3 +3670,360 @@ does not require the QoS transition, and the control's multisecond sampled
 plateaus do not recur here. Longer elapsed/settlement, absolute CPU cost and
 remaining variable service stay visible. No echo, DOWN, blackhole, harsh-loss,
 cross-mode or release acceptance is inferred, and this does not prove optimality.
+
+## Shared500 ordinary four-cell gate: UP gain, DOWN timing failure
+
+This predeclared gate stops practical promotion. Relative to a16b404,011b724
+raises shared UP confirmed goodput75.240→362.459Mbps and removes the control's
+multisecond sampled reply/target plateaus. DOWN goodput rises8.53%, but echo
+median/p95/max rise19.01%/25.07%/8.62% and the maximum body-read gap rises79.22%.
+All160 echoes succeed; success does not erase the latency regression.
+This is one sequential realization per cell, not proof that the quantum causes
+every changed interval, nor an accepted whole-model/release result.
+
+### Identity, matched conditions and complete outcomes
+
+Order was control-UP39206,candidate-UP28579,control-DOWN75855,candidate-DOWN2857.
+All four drivers exit0 in46.006416/42.005313/41.006080/41.005369s.
+Frozen ordinary binaries are a16b404 and011b724; no diagnostic flags, new build,
+controller/queue/quantum adjustment or per-role override was used.
+The result stems are `mixed-combined-{up,down}-ordered-feedback-shared-
+{control,candidate}-{up,down}-0911` under `./.tmp/reflection/results/`.
+The [raw archive](./ORDERED_FEEDBACK_SHARED_20260911.raw.tar.gz) contains26
+regular files: all four five-file results, four driver logs, unchanged run.py
+and shape.sh;733,084B. Gzip integrity,tar comparison and every decompressed
+member's byte comparison pass. No configs,credentials,binaries or reverse-order
+follow-up data are included.
+
+All170 management/shape rows (46/42/41/41) retain500Mbps rate=ceil on both
+interfaces,65536B burst/cburst,8192 netem limit, physical UP70ms/DOWN30ms,
+zero jitter, no configured loss, no blackhole and zero class/qdisc drop deltas.
+Both Docker networks remain attached, but traffic uses47: client eth1/server
+eth0; unused46 contributes only42B per role/cell. This is one active shared cut,
+not independent capacity aggregation. Each role has one process/session and
+four active native identities stable from sample1 onward; no suspect/failed
+path state appears. Native epochs are role-specific, not cross-role IDs.
+
+| Ordinary outcome | UP control | UP candidate | DOWN control | DOWN candidate |
+|---|---:|---:|---:|---:|
+| Confirmed upload /HTTP body,B | 428,146,688 | 1,896,284,160 | 1,832,624,456 | 1,989,019,582 |
+| Probe duration,s | 45.523054 | 41.853765 | 40.000358 | 40.000153 |
+| Whole goodput,Mbps | 75.240 | 362.459 | 366.522 | 397.802 |
+| First local write /body,s | .106385 | .105157 | .577328 | .583844 |
+| First upload confirmation,s | .409480 | .408451 | — | — |
+| Maximum local upload-write gap,s | 1.488886 | .403995 | — | — |
+| Maximum confirmation /body-read gap,s | 8.879382 | .708430 | .207720 | .372282 |
+| Raw bins /zero bins | 46 /24 | 42 /0 | 40 /0 | 40 /0 |
+| Echo successes /attempts | — | — | 80 /80 | 80 /80 |
+| Echo p50 /p95 /max,ms | — | — | 225.620 /424.413 /535.156 | 268.514 /530.808 /581.266 |
+| Maximum echo-success spacing,s | — | — | .712793 | .848482 |
+
+Both uploads finish1/1, accepted=target-confirmed, exact=true, no upload errors
+or censoring. They offer different amounts of work; this is not equal-work
+completion time. DOWN is HTTP200 with one duration-limited partial8GiB request,
+not completion of that full object. Each DOWN echo sends/receives5120B in80
+64B requests, nominal500ms cadence and3s timeout, with no failed/disconnected
+attempt. Candidate's final echo ends40.121014s, beyond nominal40s, and remains
+included. UP has no competing echo; its confirmation gaps are not echoed latency.
+
+### Complete service phases and adverse chronology
+
+Means below use every raw one-second bin in the indicated half-open probe
+interval, without trimming zeros. Last upload bins may be partial settlement
+bins; short confirmation/body bursts above500Mbps are application release,
+not evidence that the physical cut exceeded its configured rate.
+
+| Raw-bin phase,Mbps | UP control | UP candidate | DOWN control | DOWN candidate |
+|---|---:|---:|---:|---:|
+| 0–5 | 46.895 | 239.404 | 278.871 | 273.739 |
+| 5–15 | 29.484 | 380.595 | 403.065 | 447.451 |
+| 15–25 | 83.721 | 379.179 | 378.987 | 413.692 |
+| 25–40 | 88.515 | 372.142 | 363.068 | 395.462 |
+| After40,available bins | 121.819 | 396.692 | — | — |
+
+DOWN startup body service falls1.84%; subsequent phase throughput improves.
+Echo deterioration is spread across phases, not only the single largest value.
+Quantiles reproduce the probe's sorted nearest-index rule; phases use actual
+attempt starts, not nominal scheduling slots.
+
+| DOWN echo start phase | n each | Control p50 /p95 /max,ms | Candidate p50 /p95 /max,ms |
+|---|---:|---:|---:|
+| 0–5 | 10 | 229.683 /325.021 /325.021 | 235.826 /488.348 /488.348 |
+| 5–15 | 20 | 233.897 /501.217 /535.156 | 277.555 /530.808 /581.266 |
+| 15–25 | 20 | 261.956 /367.113 /381.873 | 328.909 /553.055 /554.155 |
+| 25–40 | 30 | 172.537 /282.313 /290.213 | 249.382 /400.032 /514.305 |
+
+Control's worst body gap is startup .577328→.785048s,58,192→65,536 bodyB.
+Candidate's is22.897019→23.269301s,1,147,355,934→1,147,367,934B; the next
+12,000B read does not identify the missing Product/native range.
+Candidate echo45 overlaps that body gap:22.840983→23.258414s,417.431ms.
+Control's worst echo22 is11.005758→11.540914s; candidate's echo23 is
+11.502135→12.083402s. Candidate also has a15.116617→19.230080s cluster
+of eight completed echoes with391.526–554.155ms latencies, and echo78 at
+39.350719→39.865025s takes514.305ms. None is hidden by an all-success status.
+All160 full attempt records and exact body-gap counters remain in the archive.
+
+UP management corroborates different service, without identifying exact
+per-frame causality. Control's client-delivered reply counter stays417B from
+samples20→28 (Unix1789069616103→1789069624104); server target/reply counters
+stay222,474,354B/571B at24→29 (1789069620104→1789069625104).
+The8s and5s sampled plateaus overlap but are not the probe's exact8.879382s
+gap endpoints: the upload JSON does not retain those endpoints.
+Candidate source,target and both reply counters advance at every one of41
+adjacent samples. Its final management target is1,855,826,542B,40,457,618B
+short of final exact probe settlement; do not truncate or extrapolate that tail.
+Control's final sampled source/target reach428,146,688B.
+Management captures and the probe have no saved exact shared wall-start anchor;
+same-numbered seconds below are coarse bands, not request-level joins.
+
+### Native allocation, physical queues and resources
+
+DOWN's latency shift coexists with increased shared/native residence.
+The following native quantiles use samples5–40,36 QUIC samples or108
+TCP-path samples per cell; they are not echo-carrier measurements.
+
+| DOWN server native context | Control | Candidate |
+|---|---:|---:|
+| QUIC RTT p50 /p95 /max,ms | 215.750 /385.188 /551.865 | 263.845 /522.415 /551.092 |
+| TCP RTT p50 /p95 /max,ms | 218.769 /436.601 /522.824 | 267.757 /519.079 /580.292 |
+| QUIC delivery-rate p50 /p95,Mbps | 395.566 /437.740 | 365.236 /381.606 |
+| TCP per-path delivery-rate p50 /p95,Mbps | 35.689 /124.894 | 89.798 /171.290 |
+| QUIC flight p50 /p95,B | 9,646,248 /14,759,687 | 9,914,256 /18,587,052 |
+| TCP per-path flight p50 /p95,B | 993,328 /5,218,592 | 2,423,952 /7,060,448 |
+| TCP aggregate socket Send-Q p50 /max,B | 3,872,276 /11,007,740 | 6,260,018 /15,538,934 |
+| TCP aggregate NOTSENT p50 /max,B | 48,424 /479,288 | 0 /295,392 |
+| Final sampled native TCP /QUIC ACKedB | 756,925,382 /1,530,438,725 | 1,038,165,396 /1,269,759,515 |
+
+TCP share of these native ACK bytes rises33.092→44.983%; this includes native
+control/copy bytes and is NOT measured Original lane allocation or useful-copy
+ownership. Ordinary telemetry cannot provide accepted Original×lane/cause
+conservation. All TCP socket snapshots identify BBR; kernel minrtt stays
+100.018–100.020ms across the two cases, while smoothed RTT varies widely.
+BBR's windowed mrtt is a different field, not a new propagation measurement.
+Observed NOTSENT is lower while Send-Q/RTT are higher, so one queue scalar
+cannot stand in for total delay.
+
+The candidate's coarse sample15–19 band has QUIC RTT497.114–551.092ms,
+DOWN HTB backlog16.754–29.870MB and TCP Send-Q10.325–15.539MB. Every native
+TCP/QUIC ACK counter progresses. Control's same band has lower endpoints
+but its own queue/RTT peaks; candidate's late25–40 QUIC RTT median251.309ms
+versus170.669ms accompanies the sustained late echo shift.
+Candidate sample22→24 also progresses TCP654,700,640→692,719,078B and
+QUIC578,230,904→660,667,295B. This excludes a wholly frozen sampled carrier,
+not a delayed critical byte or local Input residence. No exact echo-to-output,
+native handoff/decode or Input-guard timing was captured.
+
+| Sampled whole-cell cost | UP control | UP candidate | DOWN control | DOWN candidate |
+|---|---:|---:|---:|---:|
+| Sample window,s | 45.006213 | 41.005118 | 40.005887 | 40.005100 |
+| Active47 UP class bytes | 482,275,851 | 2,222,673,577 | 46,979,419 | 38,747,547 |
+| Active47 DOWN class bytes | 11,870,376 | 62,134,940 | 2,379,297,575 | 2,406,246,587 |
+| UP backlog peak /final,B | 22,825,520 /0 | 16,707,307 /4,471,394 | 150,370 /0 | 158,124 /32,011 |
+| DOWN backlog peak /final,B | 75,294 /0 | 91,425 /34,732 | 29,971,974 /2,810,816 | 29,870,398 /11,279,382 |
+| Client RSS peak /final,KiB | 402,996 /383,540 | 366,524 /366,524 | 70,388 /70,388 | 79,380 /79,380 |
+| Server RSS peak /final,KiB | 39,296 /39,296 | 57,348 /57,348 | 392,664 /371,516 | 325,316 /325,316 |
+| Client lifetime CPU peak /final,% | 112 /112 | 179 /179 | 82.6 /82.5 | 76.9 /76.9 |
+| Server lifetime CPU peak /final,% | 35.9 /21.7 | 108 /108 | 196 /196 | 188 /188 |
+
+DOWN HTB backlog p50/p95 rises9,319,052/17,325,850→12,203,796/28,655,236B.
+Its return backlog median falls86,669→69,526B. More bulk is therefore not
+equivalent to uniformly less queueing. DOWN class bytes/bodyB improve
+1.298301→1.209765(−6.82%), return bytes/bodyB .025635→.019481(−24.01%);
+lower absolute CPU/server RSS and better wire ratios do not waive worse timing.
+
+UP has4.429×completed work and4.609×UP/5.234×DOWN sampled wire. Its UP
+class-byte/confirmed-byte proxy rises1.126427→1.172120(+4.06%), reverse
+.027725→.032767(+18.18%). This is adverse observed traffic cost, not a pure
+wire-efficiency win. Sample40 Product flight19,183,585→57,631,344B and
+client QUIC native flight6,682,241→9,182,448B belong to different accounting
+domains, not a synchronized final settlement. Client native TCP/QUIC ACK progress at25→40 is
+16,182,944/118,696,732→118,977,204/681,678,550B; it corroborates useful
+progress but is not unique payload attribution. Server QUIC RTT over sample10
+onward has median100.097→112.222ms; client111.726→156.397ms.
+
+All wire ratios use unequal sampled windows and complete useful-byte
+denominators, not exact lifetime amplification. Rounded process-lifetime
+`ps` is not interval CPU or CPU-seconds; no precise per-byte CPU regression,
+core saturation or leak follows. Higher absolute UP CPU/server memory still
+matters on a finite host. Queue NULL is unobserved, not zero or a full command
+lane. Both UP client logs and all four probe stderr files are empty. Each UP
+server logs one H3_NO_ERROR at teardown; DOWN clients log a final Broken pipe
+or reset, servers RemoteClosed then H3_NO_ERROR. These follow successful
+duration-limited probes; no additional independent echo failure is invented.
+Drivers retain the existing HTB large-quantum warnings.
+
+### Full raw one-second series and bounded disposition
+
+The archive is authoritative for all168 raw bins and160 echo attempts.
+Displayed bins retain the recorded precision; an em dash means no bin, not zero.
+
+| Bin start,s | UP control | UP candidate | DOWN control | DOWN candidate |
+|---:|---:|---:|---:|---:|
+| 0 | 4.576 | 10.694 | 2.097 | 2.620 |
+| 1 | 151.351 | 137.792 | 224.920 | 141.010 |
+| 2 | 0.000 | 390.715 | 279.305 | 369.815 |
+| 3 | 78.547 | 387.587 | 633.436 | 591.397 |
+| 4 | 0.000 | 270.230 | 254.595 | 263.852 |
+| 5 | 201.807 | 295.809 | 532.677 | 620.188 |
+| 6 | 0.000 | 432.675 | 292.549 | 253.366 |
+| 7 | 0.000 | 405.109 | 505.894 | 531.353 |
+| 8 | 0.000 | 402.519 | 398.143 | 410.269 |
+| 9 | 0.000 | 430.692 | 398.837 | 442.455 |
+| 10 | 0.000 | 408.756 | 451.658 | 406.304 |
+| 11 | 93.035 | 324.852 | 352.700 | 305.137 |
+| 12 | 0.000 | 292.872 | 344.007 | 461.916 |
+| 13 | 0.000 | 468.730 | 316.197 | 440.646 |
+| 14 | 0.000 | 343.933 | 437.987 | 602.876 |
+| 15 | 0.000 | 480.927 | 348.131 | 398.897 |
+| 16 | 79.839 | 340.499 | 453.843 | 464.995 |
+| 17 | 226.558 | 506.388 | 394.315 | 375.625 |
+| 18 | 183.996 | 401.125 | 372.877 | 416.039 |
+| 19 | 346.819 | 333.957 | 375.065 | 381.170 |
+| 20 | 0.000 | 522.479 | 374.128 | 520.909 |
+| 21 | 0.000 | 345.300 | 412.743 | 398.465 |
+| 22 | 0.000 | 222.394 | 428.694 | 379.545 |
+| 23 | 0.000 | 278.619 | 321.416 | 495.880 |
+| 24 | 0.000 | 360.105 | 308.660 | 305.399 |
+| 25 | 0.000 | 314.957 | 473.380 | 470.111 |
+| 26 | 0.000 | 459.705 | 364.099 | 407.372 |
+| 27 | 0.000 | 321.566 | 351.684 | 397.715 |
+| 28 | 94.735 | 271.190 | 344.143 | 389.942 |
+| 29 | 0.000 | 426.350 | 307.995 | 392.069 |
+| 30 | 0.000 | 414.106 | 357.554 | 300.194 |
+| 31 | 0.000 | 388.963 | 359.270 | 503.650 |
+| 32 | 321.817 | 352.986 | 340.933 | 357.794 |
+| 33 | 71.399 | 417.057 | 348.380 | 427.379 |
+| 34 | 211.052 | 391.927 | 305.055 | 363.224 |
+| 35 | 238.296 | 386.400 | 348.138 | 304.053 |
+| 36 | 93.599 | 387.257 | 380.176 | 473.132 |
+| 37 | 0.000 | 304.753 | 411.484 | 364.082 |
+| 38 | 84.409 | 449.629 | 368.815 | 379.505 |
+| 39 | 212.423 | 295.285 | 384.919 | 401.711 |
+| 40 | 203.842 | 396.800 | — | — |
+| 41 | 0.000 | 396.584 | — | — |
+| 42 | 81.426 | — | — | — |
+| 43 | 274.922 | — | — | — |
+| 44 | 63.300 | — | — | — |
+| 45 | 107.424 | — | — | — |
+
+The useful UP change survives this topology, but this DOWN realization fails
+the predeclared timing/non-regression gate. Larger local synchronous Input
+service remains a possible contributor; increased native RTT/backlog and
+changed carrier allocation are observed confounders. The changed client request
+ACK/MAX owner is not the unchanged server response-ACK owner, yet short
+requests can still exercise it. Neither source reachability nor correlated
+global RTT assigns an individual echo's delay.
+
+Root selected one unchanged reverse-order healthy DOWN pair, candidate then
+control, to distinguish repeatability/order variation before any further
+mechanism change. It is not an equal-load causal test and cannot alone isolate
+Input quantum from changed offered bulk or native history. Preserve both
+orders, including contrary outcomes; do not promote on a favourable scalar or
+add repeats/parameters until an outcome is obtained. The four-cell archive
+above is closed independently of that follow-up. No broader matrix or optimality
+claim follows from this checkpoint.
+
+## Reverse-order shared DOWN: echoed-latency harm repeats
+
+The one predeclared order discriminator is now closed: candidate5956 then
+control7714,011b724 versus a16b404, unchanged ordinary binaries and profile.
+Both drivers exit0 in41.014422/41.005408s. No additional repeat or runtime
+adjustment follows. Candidate echo median/p95/max are again worse, by
+44.96%/53.82%/96.16%, despite7.03% higher bulk goodput. The maximum body-gap
+ordering reverses, so that scalar is not a consistent regression across pairs.
+Promotion remains stopped; reverse order does not isolate quantum causality
+from native history, carrier allocation or different delivered bulk load.
+
+The [separate reverse-pair archive](./ORDERED_FEEDBACK_SHARED_REVERSE_20260911.raw.tar.gz)
+is364,594B with14 regular files: both five-file result cells, two driver logs,
+run.py and shape.sh. Gzip,tar and all decompressed-byte comparisons pass.
+It retains every80 raw body bins and159 echo attempts; none is discarded,
+and no first-pair result is replaced. Result stems are
+`mixed-combined-down-ordered-feedback-shared-reverse-{candidate,control}-down-0911`.
+There are no configs,credentials or binaries in the archive.
+
+| Reverse pair,control→candidate | Control | Candidate |
+|---|---:|---:|
+| HTTP200 duration-limited body,B | 1,887,752,556 | 2,020,457,306 |
+| Body duration,s | 40.000334 | 40.000157 |
+| Whole goodput,Mbps | 377.547 | 404.090 |
+| First body,s | .584497 | .580545 |
+| Maximum body gap,s | .346357 | .274600 |
+| Echo successes /attempts | 80 /80 | 79 /79 |
+| Echo p50 /p95 /max,ms | 240.086 /342.481 /402.024 | 348.040 /526.798 /788.622 |
+| Maximum success spacing,s | .683616 | 1.035332 |
+| Echo request /response bytes | 5,120 /5,120 | 5,056 /5,056 |
+
+Both40-bin body series have zero zero-bins; each transfer remains one partial
+8GiB HTTP request. All attempted echoes succeed, with no timeout/disconnect.
+Candidate's79 rather than80 attempts reflects its actual serial scheduling
+history, not a fabricated failed80th attempt. Quantiles include all successes.
+
+| Probe phase | Control /candidate body,Mbps | Echo n,control /candidate | Control echo p50 /p95,ms | Candidate echo p50 /p95,ms |
+|---|---:|---:|---:|---:|
+| 0–5 | 271.896 /291.736 | 10 /10 | 198.821 /353.527 | 209.303 /635.605 |
+| 5–15 | 406.871 /432.958 | 20 /19 | 230.995 /342.481 | 391.521 /635.777 |
+| 15–25 | 387.472 /423.632 | 20 /20 | 207.240 /309.627 | 372.657 /486.427 |
+| 25–40 | 386.601 /409.266 | 30 /30 | 264.684 /335.443 | 316.888 /423.407 |
+
+Candidate's worst echo14 is7.158169→7.946791s,788.622ms; echo9 at
+4.521128→5.156733s and echo22 at11.541699→12.177476s each exceed635ms.
+Control's worst echo51 is25.510588→25.912612s,402.024ms. Candidate's
+maximum body gap is startup .580545→.855146s,58,192→123,728B; echo1
+at .503506→.985875s overlaps it. Control's worst body gap instead occurs
+32.259009→32.605366s,1,524,928,052→1,524,940,052B, overlapping portions
+of echoes64/65. These are exact probe-clock intervals, not reconstructed
+native byte ranges or management wall-time matches.
+
+All82 saved profiles independently confirm500Mbps rate=ceil,65536B bursts,
+8192 netem queues, physical UP70/DOWN30ms, zero loss/jitter/blackhole and
+zero class/qdisc drop deltas. Only47 materially contributes; unused46 adds42B
+per role again. Each role/session retains four active native path/epoch
+identities from sample1 onward, with no suspect/failed states. Candidate
+session787599877491418959 and control8332347493666251804 are distinct.
+
+| Reverse-pair sampled cost/context | Control | Candidate |
+|---|---:|---:|
+| Sample duration,s | 40.005199 | 40.014224 |
+| DOWN47 class bytes | 2,384,889,212 | 2,397,685,386 |
+| UP47 class bytes | 45,051,364 | 36,739,177 |
+| DOWN backlog p50 /p95 /max,B | 10,832,282 /16,570,970 /18,900,356 | 16,462,092 /25,548,830 /29,975,905 |
+| DOWN final backlog,B | 10,832,282 | 10,649,646 |
+| UP backlog p50 /max /final,B | 76,960 /114,492 /29,673 | 62,136 /111,747 /28,830 |
+| Client RSS peak /final,KiB | 71,084 /71,084 | 82,120 /82,120 |
+| Server RSS peak /final,KiB | 399,756 /385,556 | 322,524 /316,760 |
+| Client lifetime CPU peak /final,% | 82.8 /82.8 | 79.5 /78.9 |
+| Server lifetime CPU peak /final,% | 200 /200 | 187 /187 |
+| Server QUIC RTT p50 /p95 /max,ms | 231.557 /308.932 /332.996 | 335.609 /458.716 /538.665 |
+| Server TCP RTT p50 /p95 /max,ms | 231.241 /332.074 /346.781 | 339.689 /495.302 /556.705 |
+| Server QUIC flight p50 /p95,B | 10,454,400 /14,649,228 | 11,943,087 /16,252,236 |
+| Server TCP per-path flight p50 /p95,B | 1,390,080 /3,585,248 | 2,257,432 /8,556,232 |
+| Final sampled native TCP /QUIC ACKedB | 711,220,256 /1,579,847,532 | 968,273,942 /1,335,224,830 |
+
+Native distributions again use samples5–40, not echo-winner attribution.
+The native/shared-queue shift repeats with the echo shift: candidate coarse
+samples7→11 have DOWN backlog17.764→29.976MB and QUIC RTT239.195→458.716ms,
+with a524.475ms intermediate sample. TCP ACK counters205,669,886→317,506,304B
+and QUIC130,296,449→250,519,345B progress throughout that band. This is
+context for candidate's early echo-tail cluster, not an exact causal join.
+Higher RTT and lower aggregate CPU can coexist; neither rules out individual
+actor holds or identifies the decoded/writer boundary of a delayed echo.
+
+Observed DOWN class-byte/body-byte proxy improves1.263348→1.186704(−6.07%),
+return .023865→.018184(−23.81%). Server CPU/RSS fall while client RSS rises;
+these tradeoffs repeat and still do not waive worse echoed latency. Sampling
+excludes final application tails, native bytes are not unique Originals,
+and lifetime CPU is not instantaneous CPU or equal-work efficiency. Both
+stderr files are empty; the two client Broken pipe and server RemoteClosed/
+H3_NO_ERROR sequences are after successful duration-limited captures.
+
+The decisive practical result is repeated echoed-latency harm in both orders,
+not a repeated body-gap penalty or proof of a particular local owner defect.
+Root therefore selected a narrow client-quantum and deferred-slot residence
+observer first, with no runtime fix or further favourable repeat. Summed/union
+occupancy can test whether those changed boundaries directly explain the extra
+100ms-class latency; it does not assign any remaining wait. A frame arriving
+only late cannot establish a long already-decoded Input hold. Native/writer/
+decode and indirect allocation remain alternatives requiring their own exact
+join if this boundary is too small. No policy parameter, global acceptance or
+claim of optimality is justified by the current ordinary samples.

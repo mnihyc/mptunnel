@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 03:44 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 03:56 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -139,10 +139,67 @@ selects one causal discriminator, not a favourable rerun or quota adjustment.
 Only after this bounded gate proceed to the existing changing-impairment/baseline
 matrix. A checkpoint is not authorization to skip any global gate.
 
-Execution03:45+08: shared500 a16UP control started; no build/source change.
-Root runs the four declared cells one at a time, reading closed status before
-starting each successor. Healthy independent pair evidence is complete;
-no mixed-up interim maximum is a performance claim.
+Execution03:53+08: shared500 UP pair CLOSED0: control39206 exact428146688B/
+45.523054s=75.240Mbps, candidate28579 exact1896284160B/41.853765s=362.459Mbps.
+Worst write/confirmation1.489/8.879s becomes .404/.708s; raw zeros24/46→0/42.
+All accepted bytes confirmed, no upload errors. This is bounded practical gain,
+not final acceptance or a claim that short confirmation bins exceed link capacity.
+Control-DOWN75855 and candidate-DOWN2857 also CLOSED0. Bulk366.522→397.802Mbps,
+but echo median225.620→268.514ms,p95424.413→530.808ms,max535.156→581.266ms;
+body maximum read gap .207720→.372282s. Both80/80successful echoes, no failures.
+This adverse/ambiguous timing STOPS promotion; do not advance the matrix or
+compensate with a queue/controller/quantum parameter. SharedUP sampled wire per
+confirmedbyte also rises4.06%UP/18.18%DOWN; absolute CPU rises. More useful work
+does not waive either cost. All four closed files are with the independent reader.
+
+Next bounded attribution transaction: separate larger synchronous client Input
+service from shared native/allocation variation and higher offered bulk load.
+The correction directly handles client request ACK/MAX; DOWN bulk response ACK
+processing is a different unchanged owner. Existing short requests may still
+exercise the quantum, so do not assume it irrelevant. Root/independent reviewer
+first trace actual request/response callers and exact adverse intervals using
+the existing four captures. Information forecast: identify whether a current
+owner observation is sufficient, or select ONE causal discriminator. No new
+runtime proposal, quota change or diagnostic build.
+
+04:01+08 decision: ONE order-reversed ordinary DOWN pair, candidate then control,
+same500Mbps/70+30ms/zeroimpairment/40s bulk+echo and existing binaries. Tags
+ordered-feedback-shared-reverse-{candidate,control}-down-0911. Independent source
+review confirms high-volume response ACKs use unchanged server ServerFeedbackBatch;
+the new client handler receives the one HTTP request's and80x64B echo requests'
+feedback. A following echo DATA barrier can still wait, so direct effect is not
+ruled out. Information forecast: distinguish repeatable adverse ordering from
+run-order/native-allocation variation. This pair cannot separate a causal higher
+offeredload effect from direct quantum cost. Preserve BOTH orders; no repeated
+sampling until favourable. Repeated adverse timing selects an actual echo-stage/
+shared-native discriminator; disappearance holds the regression attribution,
+not proof of exact latency equivalence. No runtime change or build.
+
+Reverse pair5956/7714 CLOSED0. Candidate404.090Mbps versus control377.547;
+echo median348.040/240.086ms, p95526.798/342.481ms, max788.622/402.024ms.
+Candidate79successful/0failed, control80/0; no censored failed attempts.
+Body gap .274600/.346357s reverses ordering, so body-gap regression is not
+repeatable here. Echo harm DOES repeat; no more ordinary repeats are selected.
+Initial pair's larger native RTT and shared HTB backlog coexist with the echo
+harm, but neither is an exact winning-byte timing join. Next source reviewer
+is selecting the smallest actual echo/client-Input residence discriminator;
+do not claim either local quantum or the network caused it from these scalars.
+
+Selected next observation,04:07+08: a cfg-only, one-file client ACK/MAX quantum
+observer on current011b724. Verify the actual target port10022 echo and8080 bulk
+request streams; record start/guard-acquired/post-unlock end, entry ready count,
+actual ACK/MAX and novel ACK counts, and existing deferred barrier metadata.
+One log after unlock per quantum; no waits, policy, new queue or per-frame logs.
+Include fatal/early-exit coverage or explicitly retain its censoring. The actual
+clock is elapsed ownership/residence, NOT CPU attribution. Compare conservative
+SUM/UNION across each adverse echo interval, not only the maximum single call.
+Information forecast: if even all potentially blocking quantum occupancy is
+far below the added100ms-class delay, direct synchronous batching is not its
+dominant explanation. Large occupancy selects that exact owner instead. Neither
+outcome resolves decoded/FIFO waiting or indirect allocation by itself. Reuse
+one unchanged shared500 healthy DOWN cell with the observer, freeze exact patch/
+binary and reverse source before running. Ordinary pairs remain the performance
+evidence. No old membership injection or12-file observer transplanted.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

@@ -3400,9 +3400,14 @@ retained-range bounds defined below. The current recovery owner
 ranks eligible alternate repair actions with its existing legacy projected-
 path rank while using one common captured positive frontier payload, also
 defined below. A future allocator may substitute the Section 10.2 component
-only as one part of a proved sustained policy. The current rank
-neither scores the already-accepted owner with a zero-size action nor proves
-that an alternate will complete before the owner. Exercising or declining this
+only as one part of a proved sustained policy. Alternate ranking uses the
+positive repair quantum. Separately, current pre-fallback timing eligibility
+compares that alternate estimate with the exact owner's legacy projected-path
+estimate using zero **additional** payload, since its retained OriginalData
+already contributes to Product debt. This is not a zero-size Section 10.2
+action or proof that the alternate will beat the exact retained OriginalData:
+the legacy estimate includes aggregate queue and flight, not that range's
+measured remaining residence. Exercising or declining this
 optional opportunity is local policy and grants no additional traffic
 authority. Without a current measured alternate there is no pre-fallback
 target-bound candidate; the independent owner fallback remains retained.

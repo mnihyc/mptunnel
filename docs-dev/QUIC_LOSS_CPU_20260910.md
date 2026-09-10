@@ -304,3 +304,118 @@ none is implemented or selected here. The current container lacks perf/gdb and
 has restrictive perf permissions; that is a diagnostic limitation, not a root
 cause or permission to install tools/change capabilities. The user incident
 and the material contribution of these snapshots remain **not attributed**.
+
+## Complete native-snapshot CPU falsifier, 2026-09-11
+
+**Outcome: complete snapshot execution is not the dominant startup CPU owner
+in this capture. No snapshot/API/controller fix is selected. The deployed
+incident remains unattributed.** This executes the narrower first measurement,
+not the prospective nested-clone/occupancy observer described above.
+
+Build4900 succeeds in1m21s with one existing unused-wrapper warning. The4779B
+endpoint-only overlay wraps the three nonnested authority/shape/metrics calls
+with Linux`CLOCK_THREAD_CPUTIME_ID`, including projection and temporary-clone
+destruction. Recording happens after the ending CPU read and native unlock.
+It changes no policy, ACK cursor, queue, await or native authority. Source was
+fully reversed before traffic. Frozen binary
+`./.tmp/reflection/bin/native-snapshot-cpu-20260911/mptunnel` preserves that build.
+The underlying runtime is011b724, not the older d44four-cell comparator.
+
+First run27528, tag`native-snapshot-cpu-twenty-quic-0911`, returns0but is
+**invalid for snapshot CPU attribution**: host`MPTUNNEL_LAB_PERF` was not
+forwarded into the container. Missing owner records are not zero CPU. Its
+243,976,456B/40.076604s,48.702Mbps and.884466s body gap are retained, as are
+37echo successes, one timeout and26subsequent unavailable records. Its server
+process peak is113.356%; that does not recover the absent owner measurement.
+
+Only the invocation changes: four-line`native_snapshot_cpu_observer.sh` sets
+the existing periodic recorder inside the container, with per-call samples
+disabled. Run38084, tag`native-snapshot-cpu-recorded-twenty-quic-0911`, returns0
+in41.005834s. Both use the declared QUIC-only40s DOWN bulk+64B echo cell,
+500Mbps, DOWN70ms/20%loss, UP30ms/0%loss, no jitter/QoS/blackhole. All41shape
+rows verify it; actual active47is servereth0/clienteth1. These are diagnostic
+runs, not a before/after speed comparison or packet-identical loss realization.
+
+### Measured owner and actual process CPU
+
+| Role / snapshot | Completed calls | Recorded CPU, us | Largest call, us |
+|---|---:|---:|---:|
+| Server authority | 611 | 27,136 | 674 |
+| Server shape | 1,144 | 22,056 | 392 |
+| Server metrics | 1,142 | 9,930 | 318 |
+| Client authority | 18 | 147 | 29 |
+| Client shape | 509 | 4,478 | 210 |
+| Client metrics | 508 | 630 | 21 |
+
+There are no clock-error records. Counts and CPU sums of every interval equal
+the latest per-component cumulative totals; all byte fields are0. Server total
+is59.122ms/2,897calls; client5.255ms/1,035calls. Final metric flushes extend to
+41.280/41.279s of recorder lifetime. These scopes do not overlap one another;
+they include acquisition/projection/destruction CPU, not exclusively cloning,
+and exclude descheduled wall time. No retained-state size was measured.
+
+The recorder truncates/floors each call to at least1us. Its absolute aggregation
+error is bounded by1us per call: conservative upper totals are62.019ms(server)
+and6.290ms(client). This does not bound all observer overhead or clock accuracy;
+clock-read overhead is not subtracted, while recorder/logging work is outside
+the measured scopes. Other existing feature perf records are also enabled.
+
+| Role | Process CPU-s / observed-s | Whole mean / max, % | Sample30→40 mean / max, % |
+|---|---:|---:|---:|
+| Server | 5.54 /39.813852 | 13.915 /99.475 | 2.751 /3.937 |
+| Client | 2.62 /39.779696 | 6.586 /49.868 | 1.429 /2.453 |
+
+All82CPU observations have stable PID/starttime/boot identity and no collector
+errors; the earlier stat-midpoint/CLK_TCK100formula applies. Server startup
+peak is1.01CPU-s over1.015331s, Unix1789073181.306197→1789073182.321528
+(approximately runner2–3s): **roughly one core is reproduced**. Its hottest
+individual thread interval is26.591%, not a contradiction to process-total
+CPU. Client peak is.53CPU-s/1.062814s around runner1–2s; hottest thread15.054%.
+The largest stat bracket is.546504ms and collector invocation7.978622ms;
+those are not total diagnostic overhead.
+
+The largest server snapshot flush contains34.622ms/674calls, ending at
+Unix1789073181465ms; the preceding flush is1789073180464ms. The next contains
+5.478ms/66calls and ends1789073182467ms. Thus rapid startup repolling is real,
+but small in total execution. The largest client flush is.342ms/26calls.
+`interval_ms=1000` is the recorder's configured period, not an exact measured
+denominator; sparse/close flushes and interval boundaries must remain visible.
+These completion buckets do not give each call's wall interval or exact
+overlap with process ticks. Even assigning ALL recorded server snapshot CPU
+plus its rounding bound to the single1.01CPU-s peak accounts for only6.14%.
+Across the larger capture, that conservative total is1.12%of sampled server
+CPU; client is.24%. Window mismatch is conservative for this coarse bound,
+not permission to present a precisely matched per-interval fraction.
+
+### Service, costs and disposition
+
+Valid38084receivesHTTP200 but intentionally stops a partial8GiB response:
+193,870,592B/40.214757s=38.567Mbps, first body.665752s, maximum gap.660790s
+at11.974343→12.635133s. Raw0–5/5–15/15–25/25–40/30–40Mbps are
+174.364/57.157/8.269/1.637/1.025. All40raw bins remain in the archive.
+Echo has35successes, one timeout23.835588→26.837897s, then27unavailable
+records—not28independent timeouts. Successful median/p95/max are
+224.100/1568.208/2147.462ms; no successful late echo is invented.
+
+During the approximate peak band, native server ACK samples advance46,344,956B
+and body bin2is482.229Mbps. This shows offered/completed native work alongside
+CPU, not its instruction-level cause. Native ACKs continue in one epoch;
+server window13,775,791B at row2contracts to20,000B at row40. Active sampled
+DOWN/UP wire is206,862,636/3,856,477B with9,074/0class drops. Server/client
+peak RSS252,616/74,824KiB remains finite in-load evidence, not a leak test.
+Probe stderr is empty; logged broken-pipe/reset/HTTP3close warnings occur at
+duration teardown, not the echo timeout. No native-policy tuning follows.
+
+The information forecast succeeds narrowly: snapshot calls are too small to
+dominate the reproduced process-total startup burst. Do not implement the
+proposed nested-clone/occupancy observer or scalar snapshot redesign from this
+result. It does not identify the remaining CPU owner, establish acceptable
+20%loss service, or attribute the user's deployment. Diagnostic inconvenience
+was not treated as a root cause, and elapsed lock time was not called CPU.
+
+[Verified raw evidence](QUIC_NATIVE_SNAPSHOT_CPU_20260911.raw.tar.gz) preserves
+both invocations:19regular files/244,029B,2,977,920B uncompressed. Every archive
+member matches its source byte-for-byte; no configs, executables or links.
+It contains both five-file result sets, drivers, build log, exact overlay,
+invocation/CPU wrappers, unchanged runner/shape, and read-only analysis script
+`./.tmp/reflection/analyze_native_snapshot_cpu_0911.py` for reproducing tables.

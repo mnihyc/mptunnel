@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 04:40 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 04:55 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -15,7 +15,7 @@ Condensation waives no failure and reactivates no rejected candidate.
 
 Runtime checkpoint **011b724**, finite ordered ACK/MAX Input service, is retained.
 Frozen ordinary binary: ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
-target/release/mptunnel is the frozen feedback-quantum diagnostic, NOT ordinary.
+target/release/mptunnel is the frozen native-snapshot-CPU diagnostic, NOT ordinary.
 Use the explicit ordinary path above. All observer runtime edits are reversed.
 Only the user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md remains unrelated
 dirty source; never edit/stage it. No runtime changes are currently proposed.
@@ -301,6 +301,54 @@ Do not infer repair volume merely from the class/body residual. Separately,
 review the smallest CPU/journal snapshot discriminator without changing native
 coherence or claiming elapsed wait is on-CPU work. No new runtime fix selected.
 
+Selected mixed transaction: reuse the ALREADY BUILT feedback-quantum diagnostic,
+with its quantum event disabled. One unchanged shared500 healthy mixed DOWN
+capture enables existing server_data_ack_recovery,server_repair_carrier_accept,
+receive_hole,receive_hole_release,stream_ack_received,feedback_return events.
+No rebuild or new observer. Question: among cross-underlay actual repair ranges,
+does the blocking prefix release on the Original owner or accepted alternate,
+and is receipt already complete before acceptance? Preserve exact ranges,
+all preceding accepted copies, sender/receiver clock domains and mapping.
+Information forecast: material actual late/unhelpful receipt chronology selects
+feedback/repair timing for exact owner attribution; alternate wins or absent
+material examples stop that causal assertion. A late copy alone is not ex-ante
+unnecessary: feedback may legitimately be in transit. These events omit frozen
+fallback deadlines and nonprogressing arrivals, so do NOT infer pre/post-fallback
+from age/latest RTT or claim complete winner accounting. This goes beyond an
+already-known aggregate copy-volume finding without another observer project.
+
+Closed46891:410.317Mbps, echo78/78,p95577.826ms; diagnostic91.7MB logs are NOT
+ordinary performance. No accepted copy crosses previously logged server stored
+frontier. Of14460persistent copies,14439/183027847B already have client
+contiguous receipt before admission. Earliest logged receipt→admission median
+70ms,p9573ms; admission→server positive cover median1ms,p956ms. Dominant volume
+therefore matches the configured70ms return journey, not a proven large local
+ACK-processing hold. >100ms lead is only0.527% of bulk accepted-copy bytes;
+do not chase that small outlier before the material normal-return interaction.
+Late receipt does not prove ex-ante unnecessary repair or corrupted authority.
+
+Next model discriminator: add only scalar fields to existing
+server_data_ack_recovery: its retained owner fallback relative to observed_at,
+decision-before-fallback, actual legacy owner_completion, and diagnostic
+decision-to-log elapsed time to bound the join to later accepted frames.
+No timer, eligibility, queue, observer framework or policy change. Both request
+and response intentionally still use the legacy owner score; the request None
+test concerns replaced attachment identity, NOT a migrated direction.
+Independent history review: dc4853d introduced both owner races,93e6284 removed
+their duplicate extra payload; aa4f55d/ba177f3 changed RFC wording, not these
+callers. T03 explicitly deferred this owner's migration. Clarify RFC15.2's
+alternate-ranking versus timing-eligibility distinction without changing any
+authority or runtime. Neither None nor unconditional loss_at is a semantics-
+neutral cleanup; both would require an independently justified model transaction.
+Information forecast: post-fallback-dominated accepted work rejects an early
+comparison change as its direct remedy. Material pre-fallback work selects the
+legacy owner-completion model for a reachable counterexample before a fix.
+No aggregate residual/late-loser observation alone justifies suppression.
+Join actual accepts, preserve split extents and unjoined cases, and exclude
+boundary-ambiguous timestamps rather than pretending exact sub-ms clocks.
+Reuse one unchanged shared500 healthy mixed DOWN cell and the same six events;
+one-file cfg-only extension, freeze/reverse before running. No public claim.
+
 ## Separate open issue: one-core burst near20%QUIC loss
 
 [Four ordinary500Mbps DOWN controls](QUIC_LOSS_CPU_20260910.md) on d44:
@@ -320,6 +368,56 @@ No Rust/BBR/leak resolution or threshold fix is justified. Native contraction an
 prior bounded journal fixes do not identify this incident. Preserve27-file evidence.
 If a CPU-focused intervention becomes next, capture actual on-CPU ownership at
 the burst, not elapsed diagnostics; no sudo or permission bypass.
+
+Next CPU transaction: first measure the COMPLETE synchronous endpoint
+authority, shape and metrics snapshot calls, with Linux THREAD_CPUTIME_ID.
+These nonnested public entry points include controller cloning, projection and
+temporary destruction; no await occurs inside them. Do not instrument the
+nested active_native_controller_snapshot a second time or add totals together.
+One cfg-only endpoint file, existing periodic perf recorder, explicit event
+enablement; clock failure is a separate unknown/error counter, not zero CPU.
+Per-call recorder microsecond rounding/floor error is bounded by call count;
+logging/recorder time occurs after the endpoint measurement and native unlock.
+Construction's once-only telemetry clone and ordinary migration clones are
+outside the declared measured owner. No proto feature/API/TLS or controller
+change is needed for this first falsifier.
+
+Information forecast: a small complete-owner CPU contribution in a reproduced
+burst rejects snapshot work as its dominant cause, avoiding an unnecessary
+deepcopy redesign. A material share selects nested clone/retained-state
+attribution before any scalar snapshot correction. No burst means no incident
+attribution. Benefit of a runtime correction is unknown until this measurement;
+no speed gain forecast from clone counts. Reuse loss20_cpu.py, one QUIC20 DOWN
+cell (500Mbps,DOWN70/UP30ms,no jitter/QoS/blackhole), current011b724 feature
+binary, preserving existing process/thread ticks and full service series.
+Freeze exact patch/binary and reverse source before traffic. This diagnostic
+is not an ordinary comparison or threshold/calibration intervention.
+
+04:46+08 execution: build4900 CLOSED0 in1m21; one existing unused-wrapper
+warning only. Exact4779B endpoint-only patch frozen, ordinary source fully
+restored and checked clean before traffic. Diagnostic binary is
+./.tmp/reflection/bin/native-snapshot-cpu-20260911/mptunnel; target/release
+is diagnostic. First run27528 CLOSED0 but snapshot CPU recording is INVALID:
+host MPTUNNEL_LAB_PERF was not forwarded by docker exec, so no owner CPU records
+exist. This is an invocation failure, not a Product failure or zero CPU result.
+Preserve that capture under native-snapshot-cpu-twenty-quic-0911. Correct only
+the invocation using a four-line exec/env wrapper, as existing observers do;
+rerun the identical declared cell with unique tag
+native-snapshot-cpu-recorded-twenty-quic-0911, no source/build/profile change.
+
+Valid38084 CLOSED0. Roughly one-core startup99.475% reproduced (1.01CPU-s/
+1.015331s) with46.345MB native ACK progress in the approximate band. All three
+complete server snapshot owners total59.122ms/2897calls; rounding upper62.019ms
+is at most6.14% even if ALL capture work were put into that one peak. Across
+capture this is≤1.12% of sampled process CPU; no clock errors. Thus stop the
+snapshot-dominant hypothesis: no nested observer, deepcopy/API redesign or
+sampling change justified. Remaining burst execution is unassigned; startup
+native work and lower late CPU do not prove every instruction necessary.
+Late service1.025Mbps coexists with2.751%onecore CPU: sustained local CPU
+saturation is not this collapse's owner. One actual echo timeout plus27later
+unavailable records are preserved. No loss threshold or native tuning follows.
+Root read the complete116line appendix; reader's19file archive verifies both
+invocations and every input byte. Source remains011b724; no runtime fix here.
 
 ## Preserved dispositions: do not revive or erase
 

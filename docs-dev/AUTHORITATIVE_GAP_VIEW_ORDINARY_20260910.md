@@ -4285,3 +4285,284 @@ observation already rejects that measured boundary as the material delay owner
 in its own capture; these ordinary modes do not identify the remaining owner.
 No fixed TCP/QUIC preference,copy suppression,release acceptance or claim that
 the overall model is proved follows. Root retains the next exact-cause decision.
+
+## Native-competition discriminator: external TCP reproduces common delay
+
+Ordinary011b724 QUIC-only with three independent raw TCP downloads reproduces
+substantial echoed-latency inflation without any MPP TCP carrier in that
+session. Relative to the preserved Q-only context cell, echo median/p95 rise
+103.955/155.291→252.303/412.535ms,while native QUIC RTT and the physical
+shared queue also rise. This supports independent TCP/QUIC competition as a
+material contributor in this topology. It does not prove pure kernel causality,
+assign every mixed echo delay,or make all MPP overhead unavoidable.
+
+Foreground `quic-combined-down-ordered-feedback-native-competition-down-0911`
+and the fixed raw sidecar both close0; driver duration41.004663s. Same500Mbps
+UP70/DOWN30ms profile,ordinary executable and40s bulk+echo workload; no observer
+or runtime change. The sidecar uses the existing failover_download_probe,
+three synchronized fixed requests to10.238.47.20:8080,not additional MPP
+paths or repeated replacement requests. Its three physical sockets are
+independently identified in the saved read-only socket snapshot.
+
+The [raw archive](./ORDERED_FEEDBACK_NATIVE_COMPETITION_20260911.raw.tar.gz)
+is63,880B with14 regular files: foreground five-file result,driver,sidecar
+JSON/stderr/started marker,socket snapshot,both existing probe sources,
+run.py and shape.sh. Gzip,tar and all decompressed-byte comparisons pass.
+It retains40 foreground and41 sidecar raw bins plus all80 foreground echo
+attempts. No configs,credentials or binaries are included.
+
+| Outcome/domain | Q-only reference | Q with external TCP | Raw three-request sidecar |
+|---|---:|---:|---:|
+| HTTP body,B | 2,147,273,508 | 899,977,722 | 1,420,687,824 |
+| Own duration,s | 40.000307 | 40.000449 | 40.001199 |
+| Own goodput,Mbps | 429.451 | 179.994 | 284.129 |
+| First body,s | .412756 | .423362 | .102866 |
+| Maximum body-read gap,s | .100666 | .354890 | .090955 |
+| Echo successes /attempts | 80 /80 | 80 /80 | — |
+| Echo p50 /p95 /max,ms | 103.955 /155.291 /312.639 | 252.303 /412.535 /773.214 | — |
+
+Foreground is HTTP200,one duration-limited partial8GiB request,all40 body
+bins positive. All80 echoes succeed with5120 request/responseB and no failure
+or disconnect; maximum success spacing .881118s. The worst echo2 is
+1.000710→1.773924s. Maximum body gap5.342904→5.697793s advances
+37,210,170→37,222,170B. The sidecar has exactly3 started requests,3 partial,
+0 completed,0 failed,0 early termination and0 replacements. Its
+`complete=true` only means positive received bytes in this duration-mode
+implementation; it does NOT mean three complete8GiB transfers. Its aggregate
+max gap is not a per-worker gap and has no saved endpoints.
+
+### Overlap and native evidence
+
+The sidecar's post-connect cohort release is recorded at Unix
+1789072123.459934473s,after .101843s setup. Its started marker is written by
+the barrier release before all three workers issue their HTTP requests,so raw
+bins share that cohort origin. First foreground management is1789072123987ms,
+about .527s later; there is no exact saved foreground probe wall-start.
+The raw and foreground40s measurement windows therefore overlap closely but
+are not identical. Do not add179.994+284.129 as an exact common-window rate,
+nor compare same-indexed bins as simultaneous independent observations.
+
+| Own-clock phase | Foreground body,Mbps | Foreground echo n,p50 /p95,ms | Sidecar body,Mbps |
+|---|---:|---:|---:|
+| 0–5 | 52.969 | 10,236.113 /773.214 | 358.666 |
+| 5–15 | 144.367 | 20,340.615 /491.579 | 334.262 |
+| 15–25 | 224.364 | 20,246.127 /331.310 | 239.966 |
+| 25–40 | 216.496 | 30,237.302 /349.890 | 255.309 |
+
+The management0→5/5→15/15→25/25→40 bands record combined DOWN class service
+491.389/490.435/489.931/484.675Mbps. Native QUIC ACK bytes progress in those
+same sampled bands by32,146,342/178,551,936/293,558,100/406,783,608B.
+Those physical/native counters establish simultaneous active service,not
+ownership of the foreground's critical byte. Class totals include the raw
+sidecar and must not be divided by foreground Q bytes as MPP amplification.
+
+At Unix1789072139.554362450s (sidecar offset16.094428s),the saved socket
+read has exactly three physical raw server8080 connections to client ports
+55228/55212/55234,all BBR. Their RTTs are331.564/338.746/331.630ms,kernel
+minrtt100.019–100.021ms and BBR windowed mrtt100.032–100.039ms. Aggregate
+Send-Q is81,099,584B,NOTSENT72,104,608B and ACKed668,049,904B. The two
+loopback HTTP socket records are excluded from these physical totals.
+This is one timestamped snapshot,not a whole-run distribution or direct
+measurement of the echo's residence. Native counters and queues have different
+domains; Send-Q minus NOTSENT is not a reconstructed Product prefix.
+
+All41 profiles verify unchanged500Mbps rate=ceil,65536B bursts,8192 netem
+limit,zero loss/jitter/blackhole and zero class/qdisc drop deltas. Only47 is
+material; unused46 adds42B per role. Session3326591589660230011 has one active
+QUIC path/native epoch,stable from sample0 in both roles (client505059,
+server509965). Raw TCP ownership is outside that session. The lack of MPP TCP
+paths does not remove shared physical/host contention or all MPP processing.
+
+| Same sampled cost/context | Q-only reference | Q plus external TCP |
+|---|---:|---:|
+| Sample duration,s | 40.005358 | 40.004435 |
+| DOWN /UP47 class bytes | 2,269,813,446 /36,995,741 | 2,441,612,709 /25,466,371 |
+| DOWN backlog p50 /p95 /max,B | 1,912,320 /5,739,948 /11,787,660 | 10,443,100 /15,684,790 /18,457,802 |
+| DOWN final backlog,B | 1,937,718 | 953,172 |
+| UP backlog p50 /max /final,B | 55,498 /80,920 /84 | 47,489 /61,555 /0 |
+| Client MPP RSS peak /final,KiB | 37,844 /37,844 | 34,920 /34,920 |
+| Server MPP RSS peak /final,KiB | 368,200 /360,328 | 285,000 /285,000 |
+| Client MPP lifetime CPU peak /final,% | 93.7 /93.3 | 48.1 /48.1 |
+| Server MPP lifetime CPU peak /final,% | 155 /155 | 121 /121 |
+| Server Q RTT p50 /p95 /max,ms | 101.377 /149.317 /162.480 | 250.033 /306.804 /381.257 |
+| Server Q flight p50 /p95 /max,B | 5,960,460 /9,771,960 /10,727,376 | 6,743,088 /8,998,044 /14,233,956 |
+| Server Q delivery-rate p50 /p95,Mbps | 491.607 /495.378 | 252.278 /288.124 |
+
+Native quantiles use samples5–40. Process CPU/RSS here cover mptunnel only,
+not the raw client or HTTP-server work,and lifetime ps is not instantaneous
+CPU or equal-work efficiency. Lower MPP CPU accompanies less foreground work;
+it cannot be used as whole-host contention cost. Physical counters combine
+both workloads and sampled tails differ. No accepted repair/cause/winner
+observer is present,so no copy-necessity or exact wire-cause claim is available.
+Foreground/sidecar stderr and foreground server log are empty; the client has
+one final Broken pipe warning after a successful duration-limited capture.
+
+The foreground echo tail is materially worse than Q-only yet lower than both
+mixed p95 values530.808/526.798ms; its maximum773.214ms lies between the two
+mixed maxima. These are different offered-load/allocation contexts,not a
+per-stage difference to subtract. External TCP competition is sufficient to
+reproduce a substantial penalty without MPP scheduling those TCP carriers;
+the remaining mixed wire/tail/resource cost is still neither proved avoidable
+nor waived as unavoidable. No protocol preference,native knob,MPP fix or
+performance promotion is selected by this discriminator alone.
+
+## Mixed repair chronology: closed diagnostic evidence
+
+Capture46891 closes0 in41.011350s using the existing frozen
+`feedback-quantum-observer-20260911/mptunnel` executable:011b724 ordinary
+semantics,quantum observer disabled by the event filter. No new source observer,
+build or policy was introduced for this run. Only the six existing repair,
+receive-hole,ACK and return-feedback events listed below were enabled.
+This is chronological evidence,not an ordinary speed comparison or complete
+repair-volume/winner audit. In particular,the logs include duration-stop cleanup.
+
+The [raw archive](./ORDERED_FEEDBACK_REPAIR_TIMING_20260911.raw.tar.gz) is
+5,691,879B,10 safe regular files: five results under
+`./.tmp/reflection/results/mixed-combined-down-ordered-feedback-repair-timing-down-0911/`,
+driver,reused feature-build log/exact patch,run.py and shape.sh. Gzip,tar and
+all decompressed bytes compare successfully. Every40 raw body bins and78 echo
+attempts remain in the archived probe; no configs,credentials or binaries.
+
+### Own timing and observation coverage
+
+HTTP200 returns2,052,589,850 bodyB over40.019585s,410.317Mbps,one
+duration-limited partial8GiB request. First body .583014s; every raw body bin
+is positive. Maximum read gap .467867s spans11.706182→12.174050s,
+560,167,574→560,179,574B. All78 echoes succeed,4,992 request/responseB,
+p50/p95/max388.370/577.826/1011.305ms,maximum success spacing1.054411s.
+Worst echo19 is9.505479→10.516784s; no failed or disconnected attempts are
+omitted. The read and echo maxima are different intervals. Actual probe/echo
+durations extend about19ms beyond40s and are retained,not forced to40s.
+
+| Own probe phase | Body,Mbps | Echo n | Echo p50 /p95 /max,ms |
+|---|---:|---:|---:|
+| 0–5 | 298.282 | 10 | 209.052 /327.463 /327.463 |
+| 5–15 | 442.488 | 19 | 376.071 /662.967 /1011.305 |
+| 15–25 | 429.650 | 20 | 458.876 /520.494 /544.283 |
+| 25–40 | 413.855 | 29 | 405.214 /581.163 /601.946 |
+
+| Enabled event | Client records | Server records |
+|---|---:|---:|
+| receive_hole | 126,228 | 0 |
+| receive_hole_release | 100,633 | 0 |
+| stream_ack_received | 79 | 27,330 |
+| server_data_ack_recovery | 0 | 12,782 |
+| server_repair_carrier_accept | 0 | 15,193 |
+| feedback_return | 957 | 1,007 |
+
+Client seq1–227897 and server seq1–56312 are contiguous within these filtered
+logs;there are no client_feedback_quantum events. This does not establish
+coverage of unlogged producers. Client log is63,608,006B/227,898lines,server
+28,084,624B/56,314lines:91,692,630B combined. Their costs are material
+observation context,not a measured zero-overhead trace. Timing cannot replace
+either ordinary mixed realization or prove that the ordinary echo winner had
+the same history. Decision,accepted-copy,ACK and receive-event counts have
+different meanings; summing them or their overlapping ranges is not all repair
+traffic,unique receipt bytes or proof that every copy was useful/unnecessary.
+
+Session18012237210639543726 is stable across management and return-feedback
+records. ClientPID506137 and server511027 have separate diagnostic monotonic
+origins; cross-role chronology uses Unix stamps with their actual precision.
+The bulk stream is1 and echo0. Events without a session field can be scoped
+to this single-session capture,not reused across unrelated StreamId values.
+
+### Matched physical/native and resource context
+
+All41 samples verify500Mbps rate=ceil,65536B burst/cburst,8192 netem limit,
+physical UP70/DOWN30ms,zero loss/jitter/blackhole and zero class/qdisc drop
+deltas. Traffic materially uses47; unused46 adds42B per role. All four
+path/native-epoch identities remain active and stable from sample1 in each
+role. Native distributions below use samples5–40 (36 QUIC/108 TCP-path values).
+
+| Own sampled cost/context | Measurement |
+|---|---:|
+| Sample duration,s | 40.011122 |
+| DOWN /UP47 class bytes | 2,400,348,141 /36,532,529 |
+| DOWN backlog p50 /p95 /max /final,B | 20,069,158 /31,575,698 /35,138,136 /6,065,808 |
+| UP backlog p50 /p95 /max /final,B | 67,480 /83,294 /88,290 /25,380 |
+| Client RSS peak /final,KiB | 87,564 /87,564 |
+| Server RSS peak /final,KiB | 296,536 /281,596 |
+| Client lifetime CPU peak /final,% | 85.6 /85.1 |
+| Server lifetime CPU peak /final,% | 160 /160 |
+| Server QUIC RTT p50 /p95 /max,ms | 406.718 /553.488 /649.081 |
+| Server TCP RTT p50 /p95 /max,ms | 403.178 /566.367 /600.848 |
+| Server QUIC flight p50 /p95 /max,B | 13,609,596 /21,859,860 /25,598,760 |
+| Server TCP per-path flight p50 /p95 /max,B | 4,148,520 /7,415,208 /8,696,688 |
+| Final sampled native TCP /QUIC ACKedB | 1,067,379,504 /1,236,526,113 |
+
+Final management client local-delivery2,052,582,986B and server source-read
+2,117,663,146B are different IO domains and timestamps; neither is a final
+unique-body/copy conservation equation. Native counters include control/copy
+traffic. Lifetime ps CPU is not interval CPU or exact logging overhead;
+sampled RSS and final queues are not post-teardown leak measurements.
+
+Stop censoring is explicit: client Broken pipe is logged at
+Unix1789072912603ms; a final accepted path_failure_reinjection record appears
+at1789072912676ms,after that local stop. Last client feedback terminal event
+is1789072912757ms,while final server/client management is
+1789072912550/1789072912545ms. Thus post-stop recovery/return facts must not be promoted
+to completed useful workload service. The server then logs RemoteClosed and
+H3_NO_ERROR;probe stderr is empty. Existing all-active sampled states do not
+contradict later teardown labels,and those labels are not an independent
+mid-workload carrier failure claim.
+
+Exact range/admission/receiver attribution is outside this aggregate subsection;
+no unsupplied winner or unavoidable-overhead conclusion is inferred from these
+counters. The retained diagnostic supports that separate causal review,not a
+runtime change or performance promotion.
+
+### Exact copy/receipt chronology
+
+Independent range review scopes these records to session18012237210639543726,
+bulk stream1. All15,190 bulk accepted copies total206,389,209 payload bytes.
+None even partly crosses the server's previously logged contiguous stored
+frontier. This excludes that concrete violation, not every sparse-positive
+violation: the event does not expose the complete positive set.
+
+Client frontier observations strictly earlier in Unix milliseconds already
+wholly cover15,117 copies/204,128,529B (98.9048%). These are receipt witnesses,
+not sender knowledge or proof a repair was ex-ante unnecessary. Same-ms
+chronology is excluded. The dominant pattern follows configured70ms return
+propagation, not a demonstrated large server Input stall:
+
+| Accepted cause | Copies / payload B | Already received copies / B | Receipt→admission p50 /p95,ms | Admission→server cover p50 /p95,ms |
+|---|---:|---:|---:|---:|
+| Persistent gap | 14,460 /183,334,447 | 14,439 /183,027,847 | 70 /73 | 1 /6 |
+| Active tail | 714 /22,253,394 | 677 /21,085,746 | 70 /74 | 2 /8 |
+
+The owner join uses the latest preceding decision with identical start,
+containing end and exact target underlay/path/incarnation, without inventing
+split-frame continuations. It joins12,732 persistent copies/171,081,881B;
+1,728 TCP copies/12,252,566B remain owner-unjoined. QUIC-owner→TCP contributes
+12,717/170,865,481B;12,702/170,646,481B are already received before admission.
+Their receipt lead is70/73ms and subsequent server-cover delay1/6ms.
+All12,717 critical heads release on Original QUIC ingress: none of the only
+ten accepted QUIC-copy intervals covers those heads. This identifies the head's
+provenance, not every byte's arrival in its containing extent/frame.
+
+Long-delay witness [1136212242,1136226842): client receipt
+Unix1789072894973ms (client lines118751–118753); server decision
+1789072895693,acceptance1789072895694,positive cover1789072895695ms
+(server lines31504/31506/31508). Original owner QUIC0/incarnation4 has
+age1,216,092us; alternate TCP0/incarnation1 projected ETA895,980us.
+Thus full receipt precedes admission721ms,server knowledge follows1ms later.
+These logs do not split generation/native-return/local Input residence.
+It is not dominant volume: >80ms lead is136copies/1,928,224B (0.934% of bulk
+copy bytes); >100ms71/1,086,880B (0.527%); >500ms31/350,400B (0.170%).
+Those descriptive bands are not runtime thresholds or physical delay bounds.
+
+Blanket suppression has a contrary witness: [560167782,560182382) is accepted
+from Original TCP2/incarnation3 to QUIC0/incarnation4 atUnix1789072884361ms
+(server lines15373/15375),owner age1,059,380us,alternate ETA1,726,906us.
+Client lines53809/53811 at1789072884756ms confirm both exact QUIC fragments
+and release all14,600B395ms later. No earlier QUIC copy covers the head.
+Here alternate recovery genuinely supplies missing ordered data.
+
+Cross-role joins use shared Unixms,not separate diagnostic monotonic origins.
+Per-stream ordering is checked; concurrent log interleaving is not lost data.
+Nonprogressing arrivals and frozen fallback deadlines remain unobserved.
+Next add only existing fallback/owner-estimate scalars to the decision event:
+post-fallback-dominated work rejects an early-comparison change as its direct
+remedy; material early work selects that model for a counterexample before a
+fix. Decision-before-fallback does not imply later admission-before-fallback.
+No batching change,copy ban,timer increase or performance promotion follows.

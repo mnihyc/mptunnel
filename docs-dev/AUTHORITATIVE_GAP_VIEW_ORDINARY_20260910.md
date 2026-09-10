@@ -5176,3 +5176,226 @@ without hashes. No executable/config/secret or new harness is included.
 New result tags are ordered-feedback-shared-baseline-{raw,xray,h2}-down-0911;
 MPP tags remain shared-context-{quic,tcp}-down, shared-candidate-down and
 shared-reverse-candidate-down, all with ordered-feedback prefix/0911 suffix.
+
+## Ordinary ordered-feedback UP: independent QoS plus QUIC outage, 2026-09-11
+
+Predeclared control53802 then candidate76242 both closed0. This is the
+affected upload correction pair, not a healthy mixed-DOWN latency pass or the
+routed500Mbps/random-loss matrix. Control is a16b404, frozen at
+./.tmp/reflection/bin/ack-recovery-invalidation-20260910/mptunnel; candidate
+is011b724 at ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
+No build/diagnostic overlay overlapped these ordinary runs. The subsequent
+return diagnostic58328 is a separate experiment, not a replacement result.
+
+The existing run.py uses one40s duration upload through local SOCKS1080 to
+server10023, with50s completion timeout and the unchanged85s runner guard.
+Environment: REFLECTION_LINK_RATE=200mbit, MIRROR_IMPAIRMENT=1, NO_LOSS=1,
+NO_JITTER=1, MANAGEMENT=1 and TARGET_OBSERVE=1, each with the REFLECTION_
+prefix. NO_QOS/NO_BLACKHOLE/ROUTED are not enabled. Both endpoints attach
+directly to independent46/47 links. Thus UP is70ms and DOWN30ms;46 UP alone
+changes200→10→200Mbps at15–25s,47 stays200Mbps. Both QUIC UDP return/input
+paths are dropped by the existing endpoint port rules at30–33s. No echo
+workload runs in this upload probe; confirmation gaps are not echo latency.
+
+### Complete outcome and all phases
+
+| Ordinary outcome | Control a16 | Candidate011 |
+|---|---:|---:|
+| Exact locally accepted = target-confirmed bytes | 558,432,256 | 1,006,567,424 |
+| Complete / failed streams; probe errors | 1 /0; none | 1 /0; none |
+| Probe elapsed,s | 79.378582 | 43.147312 |
+| Whole confirmed Mbps | 56.280 | 186.629 |
+| Driver elapsed,s | 79.908270 | 43.736129 |
+| First local write / confirmation,s | .106028 /.410062 | .105107 /.407922 |
+| Maximum local-write gap,s | 9.323858 | 2.636582 |
+| Maximum confirmation gap,s | 11.950836 | 6.382488 |
+| Raw1s bins / zero bins | 80 /42 | 44 /10 |
+
+Both probes have valid exact target-sink ACK accounting, not lower bounds or
+guard-censored failures. Candidate confirms80.25% more bytes and finishes
+45.64% sooner. This is a fixed offered-duration comparison with differing
+accepted work, not a fixed-byte completion speedup. Its shorter post-offer
+drain is material, while6.382s confirmation and2.637s write gaps remain.
+
+Raw confirmation-bin means below use the full untrimmed timeline; nominal
+[a,b) means bin indicesa throughb−1. These are confirmations credited at the
+client, not contemporaneous forward throughput. A burst can release prior
+target service and exceed the physical link rate. Last bins are partial;
+whole goodput above uses exact bytes/elapsed, not a mean of rounded bins.
+
+| Nominal probe phase,s | Control Mbps | Candidate Mbps |
+|---|---:|---:|
+| 0–5 | 88.743 | 188.133 |
+| 5–15 | 112.379 | 226.539 |
+| 15–25, changing46 restriction | 5.396 | 120.977 |
+| 16–25, strict interior bins | .952 | 129.808 |
+| 25–30, restored before outage | 0 | 78.634 |
+| 30–33, nominal outage | 101.059 | 0 |
+| 33–40, restoration and load end | 265.121 | 336.344 |
+| 40–50 | 0 | already complete at43.147s |
+| 50–60 | 21.464 | complete |
+| 60–70 | 4.407 | complete |
+
+Candidate's zero30–33s confirmation versus control101.059Mbps is an adverse
+phase, even though its complete result and worst gaps improve. No favourable
+whole mean waives that interval. Control's remaining raw70–79 values and the
+candidate's40–43 values are preserved below instead of treating their partial
+last bins as full-duration phase averages.
+
+```text
+Control raw Mbps, ten consecutive bins per line, starting at0,10,...,70:
+13.454,116.449,140.369,0,173.443,138.122,45.999,297.847,0,64.681
+26.353,65.900,81.326,0,403.566,45.394,0,0,0,0
+0,0,0,0,8.570,0,0,0,0,0
+283.490,19.687,0,0,0,1317.110,360.964,175.907,1.282,.586
+0,0,0,0,0,0,0,0,0,0
+0,76.445,0,0,0,134.838,0,0,3.354,0
+0,0,.428,5.051,32.345,0,0,0,6.247,0
+4.502,9.954,8.755,60.280,9.282,4.719,2.371,53.670,215.269,59.446
+Candidate raw Mbps, starting at0,10,20,30,40:
+5.100,235.382,213.297,236.643,250.241,257.523,213.319,214.892,259.086,245.153
+226.010,240.434,207.829,125.082,276.063,41.497,218.895,39.732,0,28.031
+603.551,53.861,224.203,0,0,152.649,0,0,240.523,0
+0,0,0,0,1716.168,98.159,154.459,175.386,29.477,180.762
+425.232,216.549,82.388,164.962
+```
+
+### Actual profile, identities and bounded progress joins
+
+Recorded runner epochs for46 UP restriction/restoration are15.239669/
+25.294734s in control and15.065798/25.077047s in candidate. UDP state changes
+are30.295285→33.624651s and30.171348→33.488531s respectively. Runner elapsed
+is sampled before sequential shaping/drop commands; these are transition
+epochs, not nanosecond installation timestamps. Native/probe/management
+timestamps must not silently be substituted for that clock. All recorded
+classes show25,000,000B/s except46 UP's1,250,000B/s restriction. Netem shows
+the declared70/30ms delays, zero jitter, no random loss and limit8192;
+class/netem drop counters remain0. Explicit UDP DROP counts are not exported
+by these class counters, so zero netem drops does not mean no outage loss.
+
+probe.started Unix seconds are1789077003.744022369 /1789077114.393684626.
+There are79/43 sequential service rows. Management has independent per-role
+generated_unix_ms clocks, sometimes repeated or about1s apart in one row;
+socket samples also precede management. A repeated snapshot is not a new
+duration witness. Session identities are5268158578382450209 /
+5895720326878686499; management reliable flow1 targets127.0.0.1:10023.
+Management flow IDs are not relay stream IDs. Local probe acceptance, client
+Product source ingestion, target-write bytes and returned confirmation bytes
+remain separate domains.
+
+Control has both forward and return delay. Client source ingestion stays
+269,949,639B over rows15–24. Later, server target-write stays497,102,100B
+at its generated Unix1789077045733→1789077050733: exactly5s, approximately
+probe41.989–46.989s. Both target loopback endpoints have Recv-Q=Send-Q=0,
+the relay's target-socket busy counter stays6172ms, and native client ACK
+counters still advance10,408,227B in those rows. Thus this is not a global
+native freeze or a target socket full of undrained request bytes. The exact
+missing Product prefix/owner is not exposed by ordinary telemetry.
+
+Separately, control client reply delivery stays1478B at generated Unix
+1789077043745→1789077054746, approximately40.001–51.002s. Server reply-read
+eventually advances1520→1590B while that count is held. Its largest11.950836s
+confirmation gap crosses positive bins39→51, with zeros40–50; exact subsecond
+gap endpoints are absent. Source ingestion reaches final558,432,256B only
+by the56.001s management observation, while target-write is507,597,168B.
+Target-write reaches final by78.990s. This is actual extended source/forward/
+return settlement, not a successful40s transfer mislabeled by driver cleanup.
+
+Candidate's largest6.382488s confirmation gap crosses positive bins28→34,
+with zeros29–33. Client reply delivery stays1457B at generated Unix
+1789077143362→1789077148362, approximately28.968–33.968s: exactly5s of
+sampled flat return delivery. Over the near-matched server observations,
+target-write grows670,097,794→796,902,394B and reply-read1709→1961B. At the
+next client observation,34.968s, delivered replies reach2003B and match
+server reply-read; subsequent paired observations remain equal through42.968s.
+The target sink's1961B reply is already locally TCP-ACKed in row33 with empty
+loopback queues. Row29 had a transient12KB request Recv-Q, so do not describe
+every socket sample as empty. These observations establish a reverse-service
+component and rule out total forward outage; they do not locate native write,
+decode, FIFO, Product receipt or the winning repair stage of that return hold.
+
+Client QUIC native ACK counters are unchanged over rows30–34 in both runs,
+while TCP continues: candidate TCP advances126,316,623B over rows30→33.
+Both QUIC counters advance again in row35. Candidate46 QUIC was already flat
+over rows24–29, so not every such plateau begins with the UDP drop. Native
+sample ages vary; these counters are not exact DSN receipt or current capacity.
+All eight client and eight server carrier identities retain one observed
+native epoch each after initial unknown TCP evidence, with no ACK regression
+or active-carrier replacement. Management state remains active even during
+the blackhole; that label is not proof of contemporaneous serviceability.
+
+Final observed client native ACK counters by underlay/link, bytes:
+
+| Native counter domain | Control | Candidate |
+|---|---:|---:|
+| QUIC46 | 278,516,060 | 480,362,738 |
+| QUIC47 | 215,228,812 | 707,410,858 |
+| TCP46, three carriers | 534,139,691 | 195,915,291 |
+| TCP47, three carriers | 400,864,263 | 246,061,394 |
+
+These include native-carried work and are not unique Original placement or
+accepted-copy counters. Candidate Product source ingestion first reaches its
+final1,006,567,424B at40.969s. Its last sampled target-write is987,039,906B,
+so the final probe's exact settlement, not that unfinished snapshot, proves
+complete confirmation. No per-copy winner or ACK-stage trace was enabled.
+
+### Wire, native pressure, process and sink context
+
+| Sampled quantity | Control | Candidate |
+|---|---:|---:|
+| UP46 class byte delta | 864,396,072 | 705,048,807 |
+| UP47 class byte delta | 649,020,769 | 992,634,423 |
+| DOWN46 class byte delta | 7,980,850 | 16,365,591 |
+| DOWN47 class byte delta | 8,545,166 | 9,904,394 |
+| UP / DOWN bytes per final confirmed byte | 2.71012 /.02959 | 1.68661 /.02610 |
+| UP46 /47 peak class backlog,bytes | 16,749,608 /13,489,464 | 21,952,433 /7,928,328 |
+| Client native-flight / Product-flight peak,bytes | 48,971,384 /49,254,321 | 24,337,208 /61,673,500 |
+| Client / server peak carrier queue,bytes | 1,045,983 /55,326 | 683,790 /149,629 |
+| Client / server peak RSS,KiB | 363,672 /72,120 | 371,528 /126,180 |
+| Client / server final RSS,KiB | 334,020 /72,120 | 361,636 /119,432 |
+| Client / server maximum lifetime ps CPU,% | 127 /55.3 | 165 /70.8 |
+| Client / server final lifetime ps CPU,% | 117 /24.4 | 164 /67.2 |
+
+Wire is last-minus-first class counters over differing observed windows,
+not exact lifetime amplification. The contextual UP/DOWN per-confirmed-byte
+ratios fall37.77%/11.81%, while absolute return bytes and server RSS rise.
+Client46's larger backlog and Product flight are retained costs, not a reason
+to tune native limits. Product-flight is not an exact accepted-copy byte count.
+Sampled UP wire rates between rows5→15 /15→25 /25→30 /30→33 /33→39 are
+236.560/51.142/112.151/382.830/354.250Mbps for control and
+377.805/211.338/267.982/355.461/337.571Mbps for candidate. These use each
+runner elapsed delta and cannot be added to probe confirmation-bin means.
+
+There is one stable process PID per role/capture, with no management errors.
+No process/thread CPU tick collector was enabled; ps is cumulative lifetime
+CPU, not interval CPU, exclusive actor cost or CPU per useful byte. Higher
+candidate absolute CPU accompanies more delivered work but does not establish
+its cause. The long-lived target sink retains PID25/starttime71521824 across
+both cells. Its sampled cumulative CPU increases102/190ticks, minor faults
+31,561/84,545 and major faults0/0. Peak RSS is116,340/137,304KiB; existing
+VmSwap672,424KiB stays unchanged. At the control5s target plateau, only1CPU
+tick, no minor/major faults and constant115,980KiB RSS are observed. No sink
+restart, history reset, fault-driven hold or GC attribution follows.
+
+Probe stderr and both candidate tunnel logs are empty. Control server emits
+two H3_NO_ERROR remote-close warnings at Unix1789077083.695, after the probe's
+79.378582s completion endpoint1789077083.122604 and in teardown context;
+there is no preceding sampled carrier replacement or probe failure. Drivers
+contain the existing HTB quantum warnings; shaping and both probes return0.
+
+Disposition: the finite ordered-feedback correction retains a substantial
+ordinary UP completion/write-gap gain under this composed QoS/outage case.
+It does not solve failover confirmation latency: the candidate's6.382s hold
+and adverse30–33s confirmation phase remain high-impact evidence. Neither
+these upload results nor the separate diagnostic waive the previously held
+healthy mixed-DOWN latency/cost gate, identify a native-controller defect, or
+authorize a timer/queue/repair-policy change.
+
+Archive: [ORDERED_FEEDBACK_OUTAGE_ORDINARY_20260911.raw.tar.gz](ORDERED_FEEDBACK_OUTAGE_ORDINARY_20260911.raw.tar.gz).
+It contains16 regular files: both complete six-file result directories,
+two closed drivers, and the exact existing run.py/shape.sh. Size1,137,696B
+compressed /8,312,958B uncompressed; every member compared byte-for-byte to
+its source. No executable/config/secret, hash or new harness is included.
+Result directories are ./.tmp/reflection/results/aggregate-combined-up-
+ordered-feedback-outage-{control,candidate}-0911/. Frozen executable paths
+are references above; no diagnostic result is part of this ordinary archive.

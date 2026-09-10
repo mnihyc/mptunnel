@@ -1,8 +1,28 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 05:51 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 06:10 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
+
+### Live decision summary
+
+- Source011b724 remains clean, no new runtime adjustment. Latest evidence
+  checkpoint02c9658. The user's unrelated seven-line document edit is untouched.
+- The finite client Input correction materially improves upload, including
+  QoS+QUIC outage: exact-confirmed56.280→186.629Mbps; settlement79.379→43.147s.
+  However,6.382s confirmation gap remains. Trace THIS return prefix now.
+- Lab58328 CLOSED0; no live compiler/lab. The frozen diagnostic identifies a
+  3.775s reply-prefix gap, principally before actual repair admission. Exact
+  timing/eligibility review continues; ordinary6.382s remains acceptance evidence.
+- Healthy shared mixed latency remains uncompetitive: p95527–531ms versus
+  raw/Xray/H2114–128ms, while delivering fewer useful bytes. Neither generic
+  native-buffer counting nor small ready-ACK copy savings justifies a fix.
+- The20%loss CPU report is not resolved: local startup one-core execution
+  reproduced, snapshot-dominant cause falsified. Loss-clear speed recovers in
+  ~6s versus H2~1s; actual native reopening—not sustainedCPU—owns that ramp.
+  Exact policy/implementation attribution remains open, with no timer tweak.
+- All global both-direction/mode/aggregation/changing-link/browser/baseline/
+  sustainability/platform gates remain below. No public README/push/release.
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before each new
 transaction and after compaction. This is the active ledger, not a second RFC.
@@ -571,6 +591,60 @@ archive integrity/manifest; independent byte checks passed. Ask the user
 nonblockingly for incident role/version and whether CPU persists after traffic
 slows/stops; no deployment assumption or task pause. No runtime change follows
 the reproduced startup CPU alone.
+
+Closed53802/76242 outcome,05:57+08: both1/1complete with every accepted byte
+confirmed and no probe error. Control558432256B/79.378582s=56.280Mbps;
+candidate1006567424B/43.147312s=186.629Mbps. Worst write9.324→2.637s,
+confirmation11.951→6.382s. Candidate removes the extended post-offer tail,
+but zero confirmation in raw30–33s versus control101.059Mbps remains an
+adverse phase; do not declare failover solved from the mean. Its longest
+gap spans positive events in bins28→34, partly before the actual30.171–33.489s
+UDP drop. Source/target and TCP native ACKs progress during missing return
+confirmation, which rules out total forward outage. Client reply count1457B
+is flat over five management seconds while server reply-read rises1709→1961B.
+Replies catch up by34.968s. Exact max-gap endpoints/internal stage are not
+exported; no invented assignment of the full6.382s to physical outage.
+Control also has a genuine forward target plateau and a separate~12s return
+hold with empty local sink/probe queues. Independent full report/archive is
+being finalized. Source011b724 remains unchanged, no new runtime fix selected.
+
+Next one bounded diagnostic: reuse ALREADY BUILT repair-deadline-20260911
+binary (011b724 plus its frozen one-file scalar observer), same exact candidate
+independent200+200QoS+UDPoutage UP profile. No quantum observer: its old port
+filter only covers8080/10022, not this10023 upload. No new build or source edit.
+Observe tiny sink-return DATA via existing server sender dispatch/output updates,
+accepted repairs and exact relative fallback fields, client receive-hole/release,
+applied ACKs, feedback route/proof, attachment mapping and writer-drain events.
+Question: does the critical return prefix wait before any eligible repair,
+after actual copy admission, or after already-consumed client receipt? Preserve
+same-role clocks, actual dropped interval, identity/range joins and unjoined
+frames; dispatch/admission is not native transmission, and these events do not
+log every prepared Original or every raw decode. No winner or barrier claim
+from absence. Information forecast: choose the earliest material observed owner
+for a scoped correction; no recurring return hold means no causal conclusion,
+not a favourable replacement of the ordinary result. Do not change timers,
+copy budgets, native gains, usage or admission. Tag ordered-feedback-outage-
+return-diagnostic-0911; root sole runner, management/target observations retained.
+
+06:10+08: diagnostic58328 CLOSED0, exact1093926912B/43.391260s,
+201.686Mbps; maximum confirmation3.774884s/write2.797807s,1/1complete,
+no errors. Its132243691B logs can perturb scheduling; never substitute its
+smaller gap for the ordinary6.382488s outcome. Exact response head[1067,1081)
+is a known omission at21.073s, lowest at21.718s; first repair is admitted
+25.403s. There are2096 output updates with this lowest frontier, maximum
+adjacent gap279ms, so this is not a wholly parked3.775s server actor. The
+eventual decision's retained loss boundary is about24.774s, fallback28.476s;
+earlier eligibility/target observations are not recorded. ClientQ0 releases
+the prefix25.419s, whereas this observed repair selectedQ1. Do not assign the
+winning byte to that copy or claim the whole delay is native/outage latency.
+During the actual outage, Q1 repair[1515,1529) at32.236s expires at32.647s,
+TCP4 repair then releases it at32.677s; a second exact head also reaches TCP.
+TCP takeover is reachable, but the initial eligibility wait remains unassigned.
+Root/independent reviewers are checking the actual clock producer and ranking
+contract before any correction; no timer change or new observer is selected.
+Root read all223 ordinary-outage appendix lines and checked the16file gzip
+integrity/manifest; independent byte-for-byte checks passed. Archive preserves
+adverse outage-phase confirmation, wire/resource costs and all raw bins.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

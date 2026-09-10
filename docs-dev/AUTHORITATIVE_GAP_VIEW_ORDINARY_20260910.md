@@ -5689,3 +5689,103 @@ Archive: [ORDERED_FEEDBACK_OUTAGE_QUIC_ATTACHMENT_20260911.raw.tar.gz](ORDERED_F
 Ten regular files: six closed capture files, driver, composite observer patch,
 existing run.py/shape.sh;598,612B compressed,4,396,630B member bytes. Combined
 logs1,629,507B; every member compares equal to its source. No binary/config/harness.
+
+## 2026-09-11: logical-feedback ordinary trial9690 — rejected from active source
+
+Disposition: STOP, no practical net-benefit acceptance. Trial f8b8cac removes
+four intermediate discoveries in the real ACK→Probe→ACK actor counterexample;
+35 control+12 client+5 service+21 attachment checks pass. Ordinary completion
+and worst gaps improve, but actual restricted and late forward service worsen.
+This does not prove code causality. Root restored the exact five owned files
+to pre-trial11e38dc/ordinary011b724; f8b8cac and the frozen ordinary executable
+./.tmp/reflection/bin/logical-feedback-20260911/mptunnel remain evidence only.
+
+| Exact ordinary outcome | 011 baseline76242 | Trial9690 |
+|---|---:|---:|
+| Accepted = confirmed bytes |1,006,567,424|1,016,135,680|
+| Probe elapsed / Mbps |43.147312s /186.629|43.076666s /188.712|
+| Driver elapsed |43.736129s|43.740859s|
+| First write / confirmation |.105107 /.407922s|.105788 /.409414s|
+| Maximum write / confirmation gap |2.636582 /6.382488s|2.216079 /3.151618s|
+| Complete / failed / probe errors |1 /0 /none|1 /0 /none|
+| Raw bins / zero bins |44 /10|44 /3|
+
+Both are40s offered-duration uploads with exact target-sink ACK accounting,
+not fixed-byte speedups. Whole goodput rises1.12%, accepted work .95%; the
+shorter maximum confirmation gap does not establish uniform service improvement.
+Both43-row profiles retain independent200+200Mbps, UP70/DOWN30ms, no random
+loss/jitter and zero sampled netem drops. Only46UP changes200→10→200Mbps;
+recorded restriction/restoration epochs are15.065798/25.077047s versus
+15.010840/25.011875s. UDP blackholes are30.171348–33.488531s versus
+30.024116–33.438716s. Runner timestamps precede sequential shaping commands;
+zero netem drops do not count the explicit UDP DROP rules.
+
+| Nominal confirmation-bin phase | 011 Mbps | Trial Mbps |
+|---|---:|---:|
+|0–15 /5–15|213.737 /226.539|193.112 /211.607|
+|15–25 /strict16–25|120.977 /129.808|96.203 /72.544|
+|25–30|78.634|361.281|
+|30–33|0|130.069|
+|33–40|336.344|192.106|
+|40–44, including partial final bin|222.283|182.254|
+
+All raw Mbps bins, ten consecutive bins per line from0,10,20,30,40:
+```text
+011:
+5.100,235.382,213.297,236.643,250.241,257.523,213.319,214.892,259.086,245.153
+226.010,240.434,207.829,125.082,276.063,41.497,218.895,39.732,0,28.031
+603.551,53.861,224.203,0,0,152.649,0,0,240.523,0
+0,0,0,0,1716.168,98.159,154.459,175.386,29.477,180.762
+425.232,216.549,82.388,164.962
+Trial:
+7.846,152.276,171.679,393.888,54.921,374.375,82.505,368.653,137.886,162.054
+231.258,229.252,203.133,171.897,155.060,309.135,87.651,213.536,113.921,11.342
+5.767,220.675,0,0,0,933.001,185.058,110.736,387.382,190.230
+70.836,129.403,189.969,454.320,328.911,276.273,199.048,77.802,1.048,7.341
+20.543,524.135,141.571,42.768
+```
+Confirmation-time bins include catch-up bursts/partial bins, not contemporaneous path throughput or link capacity.
+
+Own-clock target observations nevertheless establish real adverse forward service.
+Near15s, target bytes fall403,764,556→380,065,204. That deficit is mostly present
+by5s; subsequent5–15s target growth is nearly equal281.722/282.474MB, so do not
+claim a uniformly lower steady pre-cut rate. Trial target and server reply-read
+then remain518,312,276B/1104B from21.960645→24.960645s, exactly3s. Client reply
+1104B is also flat21.957645→24.957645s; source reaches585,421,140B by22.957645s.
+The source-minus-target difference is64MiB, consistent with window pressure,
+not an exact assigned-prefix or applied-credit measurement. Target loopback
+Recv-Q/Send-Q are0 in samples21.011–25.012s. Q47 native ACKs still advance
+58,294,941B over21.958–24.958s; Q46 retains4,782,187B native flight with unchanged
+ACK count and3.724sSRTT, but its Product flight is0. The missing owner is unknown.
+The trial3.151618s maximum spans positive bins21→25; subsecond endpoints are absent.
+
+Later trial target advances only1,048,576B over37.959645→39.959645s,4.194Mbps,
+versus baseline51,027,848B/204.111Mbps over its corresponding own-clock2s.
+Trial source advances the same amount and stays target+64MiB while load is active;
+target then jumps63.453MB by40.962s. This decline is not solely return accounting.
+The baseline's longer28–34s confirmation gap had ongoing target/reply production;
+the trial moves the largest hold to actual forward/target service, not a solved
+universal recovery path. Ordinary telemetry exports no exact blocked DSN/winner.
+
+| Sampled cost | 011 | Trial |
+|---|---:|---:|
+|UP /DOWN class-byte deltas|1,697,683,230 /26,269,985|1,699,930,428 /21,107,411|
+|UP /DOWN per final confirmed byte|1.68661 /.02610|1.67294 /.02077|
+|Client /server peak RSS,KiB|371,528 /126,180|358,788 /140,976|
+|Client /server final RSS,KiB|361,636 /119,432|311,144 /133,644|
+|Client /server maximum lifetime CPU|165 /70.8%|161 /64.4%|
+|Client /server final lifetime CPU|164 /67.2%|152 /56.8%|
+|Client native /Product flight peak,B|24,337,208 /61,673,500|26,241,732 /60,869,960|
+|Client /server carrier-queue peak,B|683,790 /149,629|996,300 /90,461|
+|UP46 /47 peak HTB backlog,B|21,952,433 /7,928,328|12,349,672 /18,150,470|
+
+Wire windows end before complete settlement; ps is lifetime, not interval CPU.
+Native epochs stay stable without ACK regressions; sink has no restart/major-fault increase.
+Historical swap stays constant per run; two trial H3_NO_ERROR warnings follow probe completion.
+No copy-volume, native-controller defect, memory leak or code-causal claim follows.
+
+Archive: [LOGICAL_FEEDBACK_OUTAGE_ORDINARY_20260911.raw.tar.gz](LOGICAL_FEEDBACK_OUTAGE_ORDINARY_20260911.raw.tar.gz).
+Sixteen regular files: candidate six raw files, driver, exact patch, RED log,
+four GREEN logs, build log, run.py/shape.sh;504,912B compressed /2,797,977B members.
+Every member byte-compares equal; control remains in its existing ordinary archive.
+Restored patch trailing context passes apply-check; no built/tested source changed and no binary/config is archived.

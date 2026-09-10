@@ -782,6 +782,52 @@ mixed DOWN gate, where011 has repeatable527–531ms p95. No improvement or adver
 timing stops promotion and prompts attribution, not a favourable rerun/timer.
 All global gates remain intact; this is not a full CPU or native-recovery fix.
 
+06:37+08 real-actor RED2442 CLOSED101 after59.98s compile. Actual claims,
+receiver ACK scopes, entire two-item successor readiness, real MAX unchanged,
+matching exact-owner Probe receipt and full final byte release all pass before
+the intended assertion: FOUR recovery discoveries occur between ACK1 and ready
+ACK2, expected zero. Independent reachability review passes. No fabricated
+flight/cache or timeout failure. This proves redundant work, not its measured
+wall-time fraction. Exact test-only patch/log: logical-feedback-red-0911 under
+./.tmp/reflection/. A bounded implementation is now authorized: carry full
+per-item identity and pass one mutable input state sequentially to existing
+read/apply closures, avoiding a new queue, trait or admission framework. RFC10.4
+and the old scoped-model boundary wording are intentionally updated alongside
+the candidate, not silently presumed already compliant. Ordinary promotion
+remains withheld until practical tests; no performance forecast is upgraded
+merely because the operation-count RED is decisive.
+
+The finite bound is explicit: first item plus R frozen ordered-input attempts,
+and at most one actual coalesced-MAX reconciliation per serviced Probe, retaining
+the old standalone Probe operation. No waiting/replenishment or drain loop;
+credit contents can advance concurrently. This is O(R) work, not a claim that
+only R state applications occur. Marker-only prepared publication can reconcile
+registrations/lane earlier than the former next-loop head; it creates no new
+byte/target authority and notifies only actual changes. Keep that interleaving
+risk in ordinary acceptance rather than claiming timing equivalence.
+
+06:44+08 GREEN8906 CLOSED0:35control checks including realactor four→zero
+discovery counterexample, original ACK-only case, malformed real Probe state,
+blocked write/flush/MAX, exact barriers and terminal cleanup. Additional12client,
+5service and21attachment checks pass (73distinct checks total). Independent
+actual source/RFC/test review PASS. Fatal prepared revocation and fresh receipt
+expiry are source-audited existing branches, not falsely described as a new
+two-path actor expiry or malformed-Probe actor-revocation test. Root rustfmt
+on the three owned source files resolves only formatting in changed hunks;
+targeted format/diff checks pass. No semantic runtime change after GREEN.
+Next sole ordinary release-profile build, four cargo jobs; no feature observer
+or lab overlap. Freeze exact candidate patch and executable before the one
+declared200+200QoS/outage UP comparison. No performance promotion from GREEN.
+
+06:45+08 ordinary build43682 CLOSED0 in1m21, only existing unused-wrapper
+warning. Exact five-file candidate patch unchanged during build; frozen binary
+./.tmp/reflection/bin/logical-feedback-20260911/mptunnel. target/release is now
+ordinary candidate, not011 control. Sole lab9690 active, tag logical-feedback-
+outage-candidate-0911, declared exact200+200/UP70DOWN30/46UP10 then recovery/
+UDPblackhole profile, management+target observation, no diagnostics. No compiler
+overlap. Root will analyse complete series before deciding healthy gate; no
+live partial aggregate is acceptance. All other agents build/lab-idle.
+
 ## Separate open issue: one-core burst near20%QUIC loss
 
 [Four ordinary500Mbps DOWN controls](QUIC_LOSS_CPU_20260910.md) on d44:

@@ -55,26 +55,50 @@ fn ready_client_feedback_preserves_each_ack_and_max_in_order() {
     };
     let expected = vec![
         sparse.clone(),
+        Frame::StreamFeedbackProbe {
+            stream_id,
+            token: 5,
+            max_offset: 32,
+        },
         Frame::StreamMaxData {
             stream_id,
             max_offset: 32,
         },
+        Frame::StreamFeedbackReceipt {
+            stream_id,
+            token: 5,
+        },
         complete.clone(),
         complete,
     ];
+    let first = ready_feedback_item(Ok(sparse));
+    let expected_instances = (0..expected.len())
+        .map(|index| crate::model::path::RelayPathInstance {
+            attachment_id: first.instance.attachment_id + index as u64,
+            path_instance_id: crate::model::path::CarrierPathInstanceId::from_raw(
+                19 + index as u64,
+            ),
+            ..first.instance
+        })
+        .collect::<Vec<_>>();
     let mut pending = expected[1..]
         .iter()
         .cloned()
-        .map(|frame| ready_feedback_item(Ok(frame)))
+        .zip(expected_instances[1..].iter().copied())
+        .map(|(frame, instance)| ReliableRelayRemoteFrame {
+            instance,
+            frame: Ok(frame),
+        })
         .collect::<VecDeque<_>>();
     let mut applied = Vec::new();
     let deferred = apply_ready_client_feedback(
-        sparse,
+        first,
         stream_id,
         pending.len(),
-        || pending.pop_front(),
-        |frame| {
-            applied.push(frame);
+        &mut pending,
+        |input| input.pop_front(),
+        |item, _input| {
+            applied.push((item.instance, item.frame?));
             Ok(())
         },
     )
@@ -82,8 +106,12 @@ fn ready_client_feedback_preserves_each_ack_and_max_in_order() {
     assert!(deferred.is_none());
     assert!(pending.is_empty());
     assert_eq!(
-        applied, expected,
-        "replay and both ACK scopes remain separate transactions"
+        applied,
+        expected_instances
+            .into_iter()
+            .zip(expected)
+            .collect::<Vec<_>>(),
+        "each ACK/MAX/Probe/Receipt retains its order and exact input instance"
     );
 }
 
@@ -109,13 +137,25 @@ fn ready_client_feedback_retains_first_barrier_and_its_exact_instance() {
             stream_id,
             reason: crate::protocol::ResetReason::RemoteClosed,
         }),
-        Ok(Frame::StreamFeedbackProbe {
+        Ok(Frame::StreamRequalifyData {
             stream_id,
+            probe_id: 4,
+            offset: 0,
+            payload: Bytes::from_static(b"x"),
+        }),
+        Ok(Frame::StreamRequalifyAck {
+            stream_id,
+            probe_id: 4,
+            offset: 0,
+            payload_bytes: 1,
+        }),
+        Ok(Frame::StreamFeedbackProbe {
+            stream_id: StreamId(743),
             token: 5,
             max_offset: 32,
         }),
         Ok(Frame::StreamFeedbackReceipt {
-            stream_id,
+            stream_id: StreamId(743),
             token: 5,
         }),
         Ok(Frame::StreamMaxData {
@@ -136,12 +176,13 @@ fn ready_client_feedback_retains_first_barrier_and_its_exact_instance() {
         let mut pending = VecDeque::from([barrier, ready_feedback_item(Ok(ack.clone()))]);
         let mut applied = Vec::new();
         let deferred = apply_ready_client_feedback(
-            ack.clone(),
+            ready_feedback_item(Ok(ack.clone())),
             stream_id,
             pending.len(),
-            || pending.pop_front(),
-            |frame| {
-                applied.push(frame);
+            &mut pending,
+            |input| input.pop_front(),
+            |item, _input| {
+                applied.push(item.frame?);
                 Ok(())
             },
         )
@@ -177,14 +218,15 @@ fn ready_client_feedback_bounds_replenished_input_and_stops_on_apply_error() {
         let mut polls = 0;
         let mut applied = 0;
         let deferred = apply_ready_client_feedback(
-            ack.clone(),
+            ready_feedback_item(Ok(ack.clone())),
             stream_id,
             ready_items,
-            || {
-                polls += 1;
+            &mut polls,
+            |polls| {
+                *polls += 1;
                 Some(ready_feedback_item(Ok(ack.clone())))
             },
-            |_| {
+            |_item, _input| {
                 applied += 1;
                 Ok(())
             },
@@ -208,11 +250,13 @@ fn ready_client_feedback_bounds_replenished_input_and_stops_on_apply_error() {
     ]);
     let mut applied = Vec::new();
     let result = apply_ready_client_feedback(
-        ack.clone(),
+        ready_feedback_item(Ok(ack.clone())),
         stream_id,
         pending.len(),
-        || pending.pop_front(),
-        |frame| {
+        &mut pending,
+        |input| input.pop_front(),
+        |item, _input| {
+            let frame = item.frame?;
             if frame == rejected {
                 return Err(RuntimeError::Protocol("apply rejected"));
             }
@@ -235,6 +279,90 @@ fn ready_client_feedback_bounds_replenished_input_and_stops_on_apply_error() {
         "no successor is consumed after Apply fails"
     );
     assert_eq!(pending.pop_front().unwrap().frame.unwrap(), ack);
+}
+
+#[tokio::test]
+async fn ready_client_feedback_changed_probe_fence_stops_before_successor_ack() {
+    let stream_id = StreamId(745);
+    let (commands, mut receivers) = reliable_path_command_channels(8);
+    let (_frames_tx, frames_rx) = mpsc::channel(8);
+    let opened = test_opened_remote_stream(stream_id, 0, commands, frames_rx);
+    let required = opened.stream().max_offset;
+    let instance = crate::model::path::RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        path_instance_id: opened.path_instance_id(),
+        attachment_id: 0,
+    };
+    let (mut remotes, _input) = ReliableRelayRemoteSet::new(opened, 4);
+    remotes.observe_applied_peer_max_offset(required);
+    let probe = |max_offset| ReliableRelayRemoteFrame {
+        instance,
+        frame: Ok(Frame::StreamFeedbackProbe {
+            stream_id,
+            token: 9,
+            max_offset,
+        }),
+    };
+    let ack = Frame::StreamAck {
+        stream_id,
+        scope_start: None,
+        ranges: Vec::new(),
+    };
+    let mut pending = VecDeque::from([
+        probe(required + 1),
+        ReliableRelayRemoteFrame {
+            instance,
+            frame: Ok(ack.clone()),
+        },
+    ]);
+    let mut applied = 0;
+    let result = apply_ready_client_feedback(
+        probe(required),
+        stream_id,
+        pending.len(),
+        &mut pending,
+        |input| input.pop_front(),
+        |item, _input| {
+            let Frame::StreamFeedbackProbe {
+                token, max_offset, ..
+            } = item.frame?
+            else {
+                panic!("no ACK may pass a fatal changed probe fence");
+            };
+            remotes.receive_feedback_probe(item.instance, token, max_offset)?;
+            applied += 1;
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(RuntimeError::Protocol(
+            "feedback probe token changed its credit fence"
+        ))
+    ));
+    assert_eq!(
+        applied, 1,
+        "the accepted first Probe remains applied exactly once"
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.pop_front().unwrap().frame.unwrap(), ack);
+    // The failed replacement did not overwrite the first exact requirement.
+    // This exercises real receipt state, not a closure-synthesized error.
+    remotes.retry_pending_stream_ack();
+    let mut receipts = Vec::new();
+    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
+        receivers.release_pending_command_bytes(
+            crate::runtime::path::commands::reliable_path_command_pending_bytes(&command),
+        );
+        if let ReliablePathCommand::SendFrame(Frame::StreamFeedbackReceipt { token, .. }) = command
+        {
+            receipts.push(token);
+        }
+    }
+    assert_eq!(receipts, [9]);
 }
 
 #[test]
@@ -2250,6 +2378,17 @@ async fn client_feedback_probe_requires_logical_delivery_and_actual_max_in_write
 
 #[tokio::test]
 async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
+    ready_ack_gap_is_filled_before_intermediate_recovery_discovery_case(false).await;
+}
+
+#[tokio::test]
+async fn ready_probe_between_acks_does_not_force_intermediate_recovery_discovery() {
+    ready_ack_gap_is_filled_before_intermediate_recovery_discovery_case(true).await;
+}
+
+async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery_case(
+    probe_between_acks: bool,
+) {
     use super::super::client::ReadyFeedbackObserver;
     use crate::model::capacity::PathRateSample;
     use crate::model::path::RelayPathInstance;
@@ -2257,7 +2396,7 @@ async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
     use crate::runtime::path::commands::reliable_path_command_pending_bytes;
     use crate::runtime::sender::PreparedOriginalClaim;
 
-    let stream_id = StreamId(723);
+    let stream_id = StreamId(if probe_between_acks { 724 } else { 723 });
     // Long real initial RTT keeps setup away from due recovery. Actual source
     // claims and receiver-generated ACKs, not fabricated flight/cache state,
     // create and then discharge the interior omission.
@@ -2278,6 +2417,10 @@ async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
     let (owner_frames, owner_input) = mpsc::channel(8);
     let mut initial = test_opened_remote_stream(stream_id, 0, owner_commands, owner_input);
     initial.stream_mut().lane = TrafficClass::Throughput;
+    // The probe requires the actual nonzero initial peer grant carried by the
+    // opened owner, not a credit value synthesized from the probe itself.
+    let probe_required_max = initial.stream_mut().max_offset;
+    assert!(probe_required_max > 0);
     let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
     let (_target_frames, target_input) = mpsc::channel(8);
     let mut target = test_opened_remote_stream(stream_id, 1, target_commands, target_input);
@@ -2319,7 +2462,9 @@ async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
     let (local, mut peer) = duplex(source.len());
     peer.write_all(&source).await.unwrap();
     peer.shutdown().await.unwrap();
-    let observer = Arc::new(ReadyFeedbackObserver::default());
+    let observer = Arc::new(ReadyFeedbackObserver::with_ready_successors(
+        if probe_between_acks { 2 } else { 1 },
+    ));
     let relay_observer = observer.clone();
     let relay_context = context.clone();
     let relay = tokio::spawn(async move {
@@ -2483,19 +2628,53 @@ async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
     );
     let signatures = [(*scope1, ranges1.clone()), (*scope2, ranges2.clone())];
     owner_frames.send(Ok(ack1)).await.unwrap();
+    const PROBE_TOKEN: u64 = 75;
+    if probe_between_acks {
+        // This passes through the real owner attachment forwarder, preserving
+        // its exact installed path/attachment identity and the shared FIFO.
+        owner_frames
+            .send(Ok(Frame::StreamFeedbackProbe {
+                stream_id,
+                token: PROBE_TOKEN,
+                max_offset: probe_required_max,
+            }))
+            .await
+            .unwrap();
+    }
     owner_frames.send(Ok(ack2)).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), observer.wait_for_applied(2))
         .await
         .expect("both actual ordered ACK transactions apply");
     let before = observer.before.lock().unwrap().clone();
     let after = observer.after.lock().unwrap().clone();
+    if probe_between_acks {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let command = recv_reliable_path_command(&mut owner_receivers)
+                    .await
+                    .expect("the exact probe owner remains live");
+                owner_receivers
+                    .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+                if let ReliablePathCommand::SendFrame(Frame::StreamFeedbackReceipt {
+                    stream_id: actual,
+                    token,
+                }) = command
+                {
+                    assert_eq!((actual, token), (stream_id, PROBE_TOKEN));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("real applied MAX permits the probe receipt on its exact owner");
+    }
     relay.abort();
     let _ = relay.await;
 
     assert_eq!(
         observer.ready_after_first_selection.load(Ordering::Acquire),
-        1,
-        "ACK2 alone is already ready in the shared input before ACK1 Apply"
+        if probe_between_acks { 2 } else { 1 },
+        "the entire fixed feedback suffix is ready in shared input before ACK1 Apply"
     );
     assert_eq!(before.len(), 2);
     assert_eq!(after.len(), 2);
@@ -2509,6 +2688,8 @@ async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
             (*scope, ranges)
         );
         assert_eq!(before[index].assigned, source.len() as u64);
+        assert_eq!(before[index].peer_max_offset, probe_required_max);
+        assert_eq!(after[index].peer_max_offset, probe_required_max);
     }
     assert_eq!(before[0].retained, source.len());
     assert_eq!(after[0].gaps, vec![expected_gap]);
@@ -2523,7 +2704,7 @@ async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
     assert_eq!(after[1].retained, 0);
     assert_eq!(
         before[1].calls, before[0].calls,
-        "already-ready ACK2 must fill ACK1's real gap before intermediate recovery discovery"
+        "already-ready ACK2 must fill ACK1's real gap before intermediate recovery discovery, including across a logical Probe"
     );
 }
 

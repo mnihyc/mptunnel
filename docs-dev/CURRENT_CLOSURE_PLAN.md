@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 14:38 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 14:44 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,38 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+14:44 +08 reverse mixed DOWN completes: control 405.132 versus candidate
+397.269Mbps (-1.94%); p95 echo 459.753→417.421ms and max 1084.704→526.756ms,
+body gap .397366→.324793s improve. Late 25–40s body 424.329→402.805Mbps repeats
+the first pair's approximately 5% loss; late median/p95 echo also worsen in
+BOTH orders. This is a real retained practical tradeoff, not universal slowdown
+or a new admission bug. No third repeat or LOWAT tuning. Candidate/eight-cell
+evidence is isolated in b0baca2; reverse evidence is appended separately.
+
+NEXT single bounded attribution question: did native-refill increase accepted
+MPP repair work/duplicate receipt at useful load, or does native mixed contention
+remain the relevant cost with unchanged/lower copies? Ordinary native counters
+cannot separate these. Reuse the already audited four-file periodic Original,
+accepted-copy-cause/underlay and checked new/duplicate receipt observer from
+REPAIR_CAUSE_20260909. No per-frame bulk log, new metric, queue limit or recovery
+suppression. Add only a feature-only startup opt-out of native-refill acquisition
+to obtain same-build structural-only CONTROL and current-policy CANDIDATE;
+None preserves the former claim path and native socket option. Prove that
+equivalence in source review. This switch is diagnostic, never a user setting.
+
+One feature build, frozen before traffic; run CONTROL then CANDIDATE under the
+same healthy 500/500, DOWN30/UP70, 40s mixed DOWN profile and identical periodic
+observation. Retain all useful bins/echoes/costs and counter flush boundaries.
+Information forecast only: extra accepted copies and duplicates select the
+existing repair-service owner for causal review; unchanged/decreased copies
+falsify that volume explanation. Different realized admission/observer overhead
+limits comparisons; do not advertise these Mbps as ordinary performance.
+An ambiguous or nonrecurring result ends this small-cost attribution branch,
+not another observer or parameter search. No copy is called unnecessary without
+winning-byte evidence. This does not reopen rejected blanket hedge suppression.
+Then make the retained trial's explicit scoped disposition and proceed to the
+existing larger return/failure recovery gate; no new issue inventory.
 
 14:38 +08 native-refill's four ordinary UP cells settle every accepted byte.
 TCP control/candidate: 422.329/449.668 Mbps, first confirmation .408636/.408035s,

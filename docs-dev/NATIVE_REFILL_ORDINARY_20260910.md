@@ -10,6 +10,8 @@ The mixed DOWN pair is adverse for goodput (417.539 to 394.076 Mbps) despite
 better whole echo tails; later phase timings and some resource costs worsen.
 Uploads settle exactly in all four cells, but both candidate modes have longer
 maximum confirmation gaps; mixed upload adds native queue/RTT/resource costs.
+The single declared reverse-order mixed DOWN pair again loses late-phase
+goodput and worsens late echo timing, despite better whole echo tails.
 **Promotion is held.** No impairment or release acceptance follows this panel.
 
 ## Cause, policy and forecast
@@ -365,6 +367,96 @@ are not exact start/settlement boundaries. The TCP logs have no warnings; mixed
 server logs contain only the later `H3_NO_ERROR` close. No integrity, incomplete
 settlement or new transport error accompanies these four uploads.
 
+## One reversed-order mixed DOWN discriminator
+
+After preserving the original eight cells in checkpoint `b0baca2`, root ran
+one declared CANDIDATE→CONTROL pair with the same unmodified ordinary binaries,
+reserve, profile, membership and workload. This is a separately retained
+order discriminator, not a replacement control or repeated search for a good
+outcome. Inputs are
+`./.tmp/reflection/results/mixed-combined-down-native-refill-reverse-{candidate,control}-0910/`.
+Both runners exit zero; both probes are `ok`, HTTP 200, duration-partial bodies
+and empty stderr. All 158 recorded echo attempts succeed. No independent
+per-request loss, timeout or mismatched reply is omitted.
+
+| Metric | Reverse control | Reverse candidate |
+|---|---:|---:|
+| Body bytes / elapsed, s | 2,025,769,306 / 40.002185 | 1,986,460,956 / 40.002356 |
+| Whole goodput, Mbps | 405.132 | 397.269 |
+| First body, s | 0.590003 | 0.577041 |
+| Maximum read gap, s | 0.397366 | 0.324793 |
+| Gap interval, s | 14.820119–15.217485 | 12.079897–12.404690 |
+| Body counters around gap, B | 695,436,602 / 695,451,202 | 563,951,080 / 563,975,080 |
+| Echo successes / failures | 78 / 0 | 80 / 0 |
+| Echo p50 / p95 / max, ms | 272.623 / 459.753 / 1084.704 | 273.113 / 417.421 / 526.756 |
+| Worst echo interval, s | 12.054124–13.138828 | 12.003360–12.530115 |
+| Maximum successful-echo spacing, s | 1.084724 | 0.730003 |
+| Last echo completion, s | 39.842451 | 39.869080 |
+
+The whole goodput loss repeats, now 1.94% rather than 5.62%; whole p95/max and
+read gap improve. Median echo is nearly unchanged. These are not uniformly
+adverse outcomes. The phase result is more specific: candidate startup and
+5–15-second goodput improve, but both subsequent windows worsen. In the last
+15 seconds, all three echo summaries worsen alongside roughly 5% less goodput.
+
+| Phase, s: body Mbps; echoes / p50 / p95 / max ms | Reverse control | Reverse candidate |
+|---|---|---|
+| 0–5 | 239.633; 10 / 148.711 / 749.085 / 749.085 | 279.998; 10 / 235.200 / 366.924 / 366.924 |
+| 5–15 | 436.533; 18 / 342.642 / 802.823 / 1084.704 | 444.490; 20 / 313.414 / 500.113 / 526.756 |
+| 15–25 | 427.755; 20 / 326.461 / 407.386 / 409.718 | 400.463; 20 / 224.836 / 336.903 / 346.814 |
+| 25–40 | 424.329; 30 / 204.904 / 342.994 / 357.752 | 402.805; 30 / 276.506 / 417.421 / 420.026 |
+
+The first pair's late body mean was 423.098→402.070 Mbps, with echo median/p95
+286.719/424.823→301.496/439.597 ms. Reversed order gives
+424.329→402.805 Mbps and 204.904/342.994→276.506/417.421 ms. Thus the late mixed
+service deficit appears in both orders; it is not explained solely by an
+unusually slow first startup or one worst echo. Two pairs still do not identify
+the exact causal allocation/native mechanism or prove universality. They do
+not authorize automatic promotion or another threshold adjustment.
+
+All 80 reverse-pair body bins follow. All 158 actual attempts remain in raw.
+
+```text
+Reverse control: 2.620,108.217,145.848,692.156,249.324,589.159,367.008,438.290,337.222,463.365,451.368,365.193,536.871,383.118,433.733,292.002,643.324,402.683,450.367,331.362,514.068,348.552,456.881,385.698,452.609,386.122,411.047,458.994,403.353,405.777,378.267,469.385,393.414,456.656,469.096,444.757,453.943,346.323,445.154,442.640
+Reverse candidate: 2.620,146.253,419.526,577.337,254.252,599.532,264.848,543.066,400.268,434.594,444.202,236.538,554.981,555.514,411.359,446.454,472.627,437.549,378.335,424.901,401.282,395.132,326.014,330.156,392.175,350.681,417.278,467.928,399.459,383.055,407.756,392.038,395.123,392.059,300.084,504.250,385.692,432.985,318.551,495.138
+```
+
+### Reverse-pair cost and native context
+
+All 82 service rows independently verify 500/500 Mbps, DOWN 30 / UP 70 ms,
+zero configured impairment/blackhole and zero class/qdisc drop deltas. Both
+roles retain three established `bbr` sockets and one stable QUIC native epoch.
+The same counter-scope, quantile and non-simultaneous sampling limits apply.
+
+| Sampled observation | Reverse control | Reverse candidate |
+|---|---:|---:|
+| Rows / final elapsed, s | 41 / 40.004915 | 41 / 40.004656 |
+| DOWN / UP class-byte deltas | 2,386,870,451 / 38,460,919 | 2,410,941,177 / 40,864,538 |
+| DOWN backlog p50 / max, B | 10,830,635 / 23,125,268 | 11,838,788 / 24,812,076 |
+| UP backlog p50 / max, B | 65,357 / 193,645 | 75,115 / 232,611 |
+| Client RSS peak / final, KiB | 95,412 / 95,412 | 80,508 / 80,508 |
+| Server RSS peak / final, KiB | 346,688 / 338,216 | 377,816 / 326,576 |
+| Last client / server lifetime CPU, % | 75.7 / 196.0 | 82.3 / 195.0 |
+| Server TCP NOTSENT p50 / p95 / max, B | 257,768 / 3,890,132 / 8,588,536 | 0 / 226,973 / 260,708 |
+| Server TCP sent-unacknowledged estimate p50 / max, B | 6,670,532 / 16,174,408 | 4,797,140 / 14,547,938 |
+| Server TCP RTT p50 / p95 / max, ms | 257.115 / 399.838 / 447.793 | 274.889 / 382.265 / 478.458 |
+| Server QUIC RTT p50 / p95 / max, ms | 248.561 / 412.209 / 457.280 | 266.693 / 399.461 / 516.573 |
+| Server QUIC flight p50 / max, B | 6,634,653 / 16,578,936 | 10,200,300 / 19,334,832 |
+
+Candidate uses more class bytes in both directions despite fewer delivered
+body bytes. Its peak server RSS, client CPU and median/max router backlog are
+higher; final server RSS and server CPU are lower. Native TCP/QUIC median and
+maximum RTT rise while p95 falls. Those mixed directions are retained, not
+collapsed into one efficiency or quality score.
+
+Over common management rows 1→40, unchanged exact-output epochs show server
+TCP native acknowledged bytes 1,090,000,566→830,471,084 and QUIC
+1,187,449,057→1,465,255,645; TCP share is 47.861%→36.175%. Client return deltas
+are TCP 10,700,340→13,375,679 and QUIC 615,492→842,066. This repeats the
+directional service redistribution from the first pair, not a measured unique
+Original/repair split. No rate estimate substitutes for these counters. Logs
+contain only duration-stop BrokenPipe/RemoteClosed and later `H3_NO_ERROR`.
+
 ## Current disposition
 
 The TCP healthy DOWN result meets the ordered-service forecast materially;
@@ -373,7 +465,11 @@ native/shared latency grows, both upload maximum confirmation gaps worsen,
 mixed DOWN loses 5.62% goodput, and mixed UP has adverse queue/RTT/return-traffic
 and client-memory costs. Those are part of the model's practical composition,
 not waived by the bounded-wake proof or a good TCP-only average. This complete
-eight-cell panel does not support unqualified non-regression or promotion.
+eight-cell panel plus the separately declared order discriminator does not
+support unqualified non-regression or promotion. The late mixed DOWN goodput
+and median/p95 echo deficit repeats in both orders even though whole echo tails
+improve. This is practical evidence requiring a bounded model decision, not
+permission to call the native gate universally harmful or universally good.
 
 These are fixed ordinary pairs, not identical native histories or proof of one
 specific causal regression. The next decision must retain this tradeoff and
@@ -386,3 +482,8 @@ Root created and listed `NATIVE_REFILL_ORDINARY_20260910.raw.tar.gz`: 49 files
 (40 exact result files, eight build/test/run logs and the runner). It preserves
 all eight ordinary cells before further disposition. The separately declared
 reverse-order mixed pair is not included in this closed archive.
+
+The reverse pair is separately preserved in
+`NATIVE_REFILL_REVERSE_20260910.raw.tar.gz`. Root created and listed all eleven
+files: ten exact result files plus its pair run log. Neither archive replaces
+the adverse observations in the other.

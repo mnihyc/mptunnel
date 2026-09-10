@@ -3520,3 +3520,153 @@ isolated mechanism checkpoint is supported; universal optimality, full stall
 closure and performance/release acceptance are not. Preserve the residual gaps,
 absolute resource cost and reverse RTT tradeoff, then use the declared healthy
 and affected-direction gates rather than diagnostic speed or a favourable rerun.
+
+## Separate healthy ordinary pair: gain persists without QoS
+
+Predeclared control7360 then candidate91118 reuse the same frozen ordinary a16
+and ordered-feedback binaries; only `NO_QOS=1` removes the46UP rate change.
+There is no new build, runtime parameter or observer. This is an independent
+healthy pair, not a replacement for the preceding QoS result. Candidate runtime
+and its52focused checks are preserved by checkpoint011b724 and the preceding
+ordinary archive. Drivers exit0 after42.007560/43.005078s.
+[Healthy raw evidence](ORDERED_FEEDBACK_HEALTHY_20260911.raw.tar.gz) contains
+14regular files: both five-file result sets, two driver logs, run.py and shape.sh;
+441,963B, gzip/tar/every-member byte verification pass. No configs/binaries.
+
+The forecast was to preserve healthy service, with a possible gain where ready
+feedback still backlogs; no gain was promised without that backlog. The control
+does exhibit such stalls. This pair supports a material gain in bytes, all-phase
+delivery and worst gaps, while
+preserving higher absolute CPU, slightly higher client peak memory and longer
+final elapsed time. One pair is not statistical proof or global acceptance.
+
+| Healthy UP outcome | a16 control | Candidate |
+|---|---:|---:|
+| Local accepted = target confirmed,B | 526,188,544 | 1,180,565,504 |
+| Exact completed streams /failures | 1 /0 | 1 /0 |
+| Elapsed,s | 41.740160 | 42.766993 |
+| Whole confirmed Mbps | 100.850 | 220.837 |
+| First write /confirmation,s | .108411 /.411490 | .107294 /.410305 |
+| Maximum write gap,s | 2.002279 | .722869 |
+| Maximum confirmation gap,s | 4.587237 | .532616 |
+| Settlement beyond nominal40s,s | 1.740160 | 2.766993 |
+| Raw bins /zeros | 42 /8 | 43 /0 |
+
+Candidate completes2.244×the work at118.98%higher whole rate. Maximum write
+and confirmation gaps fall63.90%/88.39%; first service improves by~1ms, not a
+material startup-latency claim. Elapsed/settlement grows1.026833s (+2.46%whole)
+while delivered work more than doubles. Neither shorter equal-work completion
+nor lower tail settlement is claimed. Both statuses/accounting are exact/ok,
+with no probe errors or censoring; UP has no echo workload.
+
+| Raw confirmation phase | Control,Mbps | Candidate,Mbps |
+|---|---:|---:|
+| 0–5s | 38.311 | 190.638 |
+| 5–15s | 66.730 | 234.401 |
+| 15–25s, still healthy | 114.820 | 206.824 |
+| 25–40s, still healthy | 109.649 | 222.018 |
+| Own post40 bins,last partial | 278.860 over2 | 249.605 over3 |
+
+All85raw bins are retained below. The post40 averages include different partial
+final bins and are not an equal-duration tail comparison. No phase is trimmed.
+
+| Case /raw seconds | Mbps,in chronological order |
+|---|---|
+| Control0–9 | 10.719,180.838,0,0,0,0,39.750,48.094,144.319,186.130 |
+| Control10–19 | 58.764,48.995,141.249,0,0,367.787,20.866,20.792,0,44.680 |
+| Control20–29 | 37.280,75.734,194.121,346.280,40.661,50.549,22.640,30.578,53.455,94.517 |
+| Control30–39 | 25.370,32.016,327.516,61.462,111.639,208.654,45.805,555.125,25.402,0 |
+| Control40–41 | 417.237,140.483 |
+| Candidate0–9 | 8.220,219.923,243.270,256.479,225.298,231.307,233.724,195.876,216.227,162.119 |
+| Candidate10–19 | 213.987,279.274,302.333,279.665,229.497,238.042,247.071,193.929,165.043,237.087 |
+| Candidate20–29 | 229.855,155.625,138.815,262.847,199.928,243.765,193.507,181.027,168.762,343.896 |
+| Candidate30–39 | 286.192,233.752,196.685,202.412,111.972,242.702,302.629,205.520,213.020,204.427 |
+| Candidate40–42 | 279.416,253.882,215.516 |
+
+After startup, the weakest full candidate bin is111.972Mbps at34s: improved
+service is not a flat400Mbps pipeline. Control's555.125Mbps confirmation burst
+can unlock buffered progress and does not exceed physical capacity on the wire.
+No exact maximum-gap endpoints or ACK-stage observations exist in these ordinary
+captures, so individual raw dips are not assigned to a new mechanism.
+
+### Actual service and native context
+
+All42candidate adjacent target-write samples advance. Control target/reply-read
+is fixed at74,592,906B/162B over server Unix1789069061079→1789069066079ms
+(samples3→8), and227,864,784B/714B over1789069077079→1789069080079ms(19→22).
+Control source still adds12,680,584/14,747,398B in those respective bands.
+The corresponding candidate target gains145,781,886/74,757,450B; these are
+same nominal windows, not matched per-byte paths. Native/controller startup
+and offered work differ, so absence of the plateau is not a per-ACK causal trace.
+
+| Actual target-socket producer window | Control,Mbps | Candidate,Mbps |
+|---|---:|---:|
+| 0→5 | 119.373 | 192.181 |
+| 5→15 | 61.137 | 235.492 |
+| 15→25 | 93.922 | 206.815 |
+| 25→40 | 123.850 | 224.405 |
+
+At the last sample, control source/target totals are522,712,846/519,752,654B,
+candidate1,180,565,504/1,157,816,504B. Final source/target/confirmation settlement
+is not synchronized with sampling: the exact probe covers the missing tail,
+including22,749,000candidate target bytes after its last management sample.
+
+Each role keeps one PID/session: control493112/498113,
+session5463748244420873100; candidate494194/499191,
+session13188515728276293598. Startup adds outputs through sample10; no existing
+native epoch changes or suspect/failed states are observed. All eight output
+epochs per role are stable from10, not from9. IDs are role-scoped.
+
+In25→40, forward native ACKs add255,560,836TCP/264,028,630QUIC B in control,
+65,341,248/644,594,790B in candidate. Native work shifts materially; these
+counters cannot separate accepted Originals, copies or useful repair winners.
+Candidate Product flight grows12,919,924→32,984,472B (control24,651,819→
+65,154,784B). At40, candidate client QUIC46/47 RTT is166.611/100.194ms versus
+406.339/100.519ms control; server QUIC path_id0 RTT is212.033ms versus101.322ms,
+an adverse reverse observation. No uniform native-latency or echo claim follows.
+Client observed queue peak in25–40 is142,844B versus244,660B; each band includes
+32NULL path-queue values, not measured zeros or command-slot counts.
+
+### Matched healthy profile and resource/wire tradeoffs
+
+All42control/43candidate samples confirm both independent links remain200Mbps
+in both directions throughout: no10Mbps phase, jitter, configured loss or
+blackout. DOWN30ms/UP70ms, limit8192, HTB burst/cburst65536 and rate=ceil match.
+Client eth0/eth1 map46/47; server eth1/eth0 map46/47. All class/qdisc drop deltas
+are0; no double-counting parent/child backlog or offload-derived loss claim.
+
+| UP class service,Mbps | Control46 /47 | Candidate46 /47 |
+|---|---:|---:|
+| 0→15 | 96.666 /80.780 | 190.501 /188.621 |
+| 15→25 | 135.645 /157.754 | 195.947 /197.890 |
+| 25→40 | 166.852 /113.146 | 191.457 /191.076 |
+
+| Whole sampled cost | Control | Candidate |
+|---|---:|---:|
+| Sample window,s | 41.007358 | 42.004850 |
+| UP46 /47 class bytes | 689,760,580 /574,398,615 | 1,010,402,957 /1,008,992,453 |
+| DOWN46 /47 class bytes | 8,493,801 /8,828,085 | 15,999,823 /14,013,137 |
+| Summed UP backlog peak /final,B | 21,066,756 /9,198,894 | 19,323,664 /3,611,778 |
+| Summed DOWN backlog peak /final,B | 45,791 /1,183 | 48,906 /48,906 |
+| Client RSS peak /final,KiB | 346,152 /346,152 | 349,380 /335,796 |
+| Server RSS peak /final,KiB | 87,984 /87,984 | 78,580 /78,580 |
+| Client lifetime CPU peak /final,% | 125 /125 | 193 /193 |
+| Server lifetime CPU peak /final,% | 50.6 /41.3 | 80.9 /80.9 |
+
+For2.244×completed bytes, sampled UP/DOWN traffic grows1.597×/1.733×.
+Observed UP class-byte/confirmed-byte proxy falls2.402→1.711(−28.80%);
+DOWN .032920→.025423(−22.77%). Sample windows differ and exclude final tails;
+these are not exact lifetime copy/retransmission ratios. Absolute CPU grows
+materially and client peak RSS rises3,228KiB, while server RSS falls9,404KiB.
+Rounded lifetime `ps` is not CPU ticks; no precise CPU-per-byte efficiency or
+instantaneous core-saturation claim is available. Finite-server headroom remains
+a practical cost, not waived by higher throughput. Final memory/queues are not
+post-teardown leak measurements. Both client logs/stderr are empty; each server
+has only two normal-teardown H3_NO_ERROR warnings.
+
+Disposition: healthy independent-UP performance supports the same isolated
+checkpoint and proceeding to the declared affected shared500 gate. The benefit
+does not require the QoS transition, and the control's multisecond sampled
+plateaus do not recur here. Longer elapsed/settlement, absolute CPU cost and
+remaining variable service stay visible. No echo, DOWN, blackhole, harsh-loss,
+cross-mode or release acceptance is inferred, and this does not prove optimality.

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 12:33 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 13:06 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,72 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+13:06 +08 completed healthy panel: all MPP UP cells settle exactly, but mixed
+has a5.140055s positive-confirmation gap (TCP.477220s, QUIC.246492s), with four
+zero one-second bins during startup. Final371Mbps does not excuse this hold.
+At samples4–6 target socket acceptance stops57,046,163B and target replies
+already read remain70B. Carrier TCP live queues are empty by then, QUIC fresh
+ACK progress continues slowly and both router queues drain. These observations
+do not establish the missing byte or distinguish Product recovery from target
+application/relay I/O. No congestion or deadline parameter change is justified.
+
+Next ONE unchanged ordinary mixed healthy UP40s observation, same500/500,
+DOWN30/UP70ms/no impairments. Add read-only target10023 loopback socket state,
+client1080 source socket state, exact sink PID25 stat/status, and the probe's
+existing started-file clock anchor. Listener identity was verified as python3
+/workspace/lab/tcp_sink.py without progress-file options. Do not restart it or
+change source/model/load. Information forecast: sink Recv-Q/nonreading versus
+MPP target Recv-Q/unread replies versus empty target queues/absent ordered input
+selects the corresponding owner. Full timing and resource evidence remain;
+nonrecurrence cannot clear the original hold. Do not add finer instrumentation
+until this materially narrows the question. This is not a favorable rerun.
+
+Independent source audit also finds new receipt materialization occurs AFTER
+the retained target write, whereas its pending helper services only previously
+materialized feedback. RFC8.3/8.4 require receipt independent of consumption.
+One actual-DATA/blocked-target focused RED will test that exact contract, not
+restore the rejected ACK cadence or claim it caused the5s event. Generic duplex
+write/read cycles are reachable, but the short-ACK sink has no proved cycle.
+
+The separate TCP direct-echo companion completed with limited early overlap:
+its launch preceded foreground by36s, not the intended short margin. Preserve
+that limitation, not a full40s loaded-control claim. Conservative overlapping
+bands show direct206ms, native197–219ms and MPP870ms; foreground417.667Mbps,
+45/45 tunnel echoes and100/100 direct echoes succeed. This supports an extra
+carrier-local service component but not a specific queue position/threshold.
+The12-cell report and archives retain Xray/H2 UP terminal-ACK lower bounds.
+
+12:45 +08 healthy panel finds a larger existing carrier-service knot. DOWN
+TCP418.339Mbps has sustained median/p95echo912/1276ms; Q426.231Mbps105/160ms;
+mixed389.236Mbps267/429ms; raw446.488Mbps103/124ms; Xray449.000Mbps103/128ms;
+H2465.296Mbps111/114ms. All DOWN echoes succeed. TCP server native RTT median
+213ms and router backlog median9.12MB closely match the earlier three-raw-body
+control214ms/8.82MB. TCP MPP has aggregate native NOTSENT median50.30MB. Raw3
+has even more72.40MB, but its independent echo socket remains214ms; native
+unsent bytes are not inflight or a new memory leak. Exact echo queue position
+is not observed, so these facts select a discriminator, not a queue threshold.
+
+Next after the running UP settlement panel: ONE unchanged TCP-only healthy
+40s cell with the existing50s direct_echo_context.py companion. It uses the
+same remote echo service/cut/host but bypasses MPP's shared TCP byte stream.
+Question: does direct echo inherit~0.9s latency, or stay near native/common-cut
+~0.2s while tunnel echo remains slow? Preserve companion anchors/unloaded
+margins, conservatively aligned loaded interior, all attempts and full existing
+workload/costs. Ordinary binary has no exact request-event anchor; do not reuse
+old feature-capture millisecond alignment. No new helper/source/build/native
+queue/controller/limit change. If same-cell separation persists, the existing
+carrier-local ordered handoff owner has material support for targeted modeling;
+similar delays retain shared-cut/host attribution. No TCP preference, socket
+buffer shrink or NOTSENT parameter is authorized by aggregates alone.
+
+UP baseline caveat: raw settles exactly. Xray again closes before terminal sink
+acknowledgment (2,286,658,677confirmed versus2,290,548,736accepted), matching the
+already documented HIGH_CAPACITY_REFERENCE half-close limitation. Preserve its
+partial/lower-bound result; do not call439Mbps completed speed. This known
+non-MPP comparator boundary is not a new runtime defect or permission to change
+the probe. Continue the already running panel's MPP settlement checks; any new
+MPP integrity/settlement failure stops promotion and selects its exact owner.
 
 12:33 +08 reverse-order outcome: candidate376.650Mbps versuscontrol358.091;
 candidate maxbodygap.947738s versus.647854s and echo p95705.587versus650.642ms

@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 10:45 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 11:10 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,109 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+11:10 +08 upload outcome: both complete exactly,398.184→385.961Mbps;
+target-confirmed/local-accepted2071920640→2011234304B in41.627353→41.687789s.
+Maximum confirmation/write gaps.664826/.484657→.496251/.348209s improve.
+Return bytes instead rise1.24% (47.84→48.43MB), restricted median return queue
+279059→631202B, client peakRSS306312→358888KiB. This proves bounded settlement
+in this cell, not mirrored cost/speed benefit or a leak. Full series/cost report:
+CONFIRMED_RETURN_UPLOAD_20260910. Candidate0cab2b5 remains unaccepted; four
+ordinary pairs preserve multidimensional and direction-dependent outcomes.
+
+Next bounded diagnosis, before any policy change or broader matrix: establish
+actual confirmed-return participation in DOWN and UP. Competing causes are
+(a) logical proof misses its frozen deadline and baseline fanout dominates,
+(b) selection works but retained/new-output service or other native traffic
+dominates cost, and(c) native/shared queue history changes critical service
+despite selected publication. Existing ordinary totals cannot distinguish them;
+neither lower bytes nor a QUIC Active label identifies the selected token.
+Information forecast only: selected/fanout residence and exact probe creation,
+admission, logical receipt/reply, confirmation and expiry will accept or rule
+out(a), and establish whether the outage gate actually covered a selected leg.
+If proof is normally timely, do NOT change its interval; follow existing native/
+allocation evidence instead. If it misses, attribute the actual elapsed stages
+before proposing a model correction. No assumed failure, new tuning knob,
+controller change, rate forecast or public performance claim.
+
+Smallest action: feature-only transition/marker observer on this frozen trial,
+using existing lab_diagnostic and exact stream/output/token identities. No
+DATA-frame log, payload, per-frame dump, periodic heartbeat or harness rewrite.
+Ordinary binaries stay frozen. Build once, then same return-cut DOWN/UP
+diagnostic captures; run-selected-output failure only after participation is
+known. Stop observation when this question is answered. Observer timing is not
+ordinary performance acceptance; full global gates below remain intact.
+
+11:01 +08 outage outcome: control→candidate370.001→375.288Mbps;
+maxbodygap.782613→.594647s, echo max2496.604→1119.198ms,
+p95585.031→567.280ms;73→77 successes and no failures/restarts. Median echo
+286.851→328.362ms worsens; preserve that tradeoff. Both deliver through the
+three-second QUIC outage and restoration, but no selected-feedback identity
+was observed, so that narrower gate remains unproven. This supports continued
+bounded validation, not release or a universal recovery bound. All six download
+cells and three mechanism/build logs are archived and listed in
+CONFIRMED_RETURN_ORDINARY_20260910.raw.tar.gz (33files, no configs/keys).
+Full phase review adds an adverse restoration result:33–40s379.962→336.794Mbps
+(−11.36%), despite improved worst echo/read gap. Do not hide this with whole
+averages. This remains a multidimensional unaccepted candidate; mirrored upload
+is a necessary direction/settlement diagnostic, not an acceptance promotion.
+Telegram delivered the three measured outcomes and this adverse phase at
+approximately03:02UTC; next nonurgent update not before04:03UTC, with a soft
+frequency advisory to reduce nonessential reports.
+
+Next exact question: does symmetric server-owned feedback routing preserve
+receiver-confirmed UP service and post-load settlement through the same RETURN
+restriction? Existing caller/credit ownership differs by direction, so download
+results cannot answer it. Run unchanged CONTROL then CANDIDATE with existing
+40s single-upload probe,500Mbps UP and500→10→500Mbps DOWN15–25s,30/70ms delay,
+zero configured jitter/loss/outage. This is the directional mirror, using
+MIRROR_IMPAIRMENT=0, not a10Mbps upload-data test. Forecast: potential return
+work reduction but no quantified upload gain; real confirmation/completion and
+write/confirmation gaps decide. Preserve local accepted versus target-confirmed
+bytes, drain time and censored/missing bins. Stop promotion on a new stalled
+settlement or adverse critical service; no sampler, native or timing rescue.
+
+10:56 +08 healthy reverse-order result: control→candidate392.069→378.423Mbps,
+maxbodygap.277598→.271791s, echo p50348.907→247.177ms,
+p95687.778→426.991ms, max781.019→538.751ms;49→50 successes, no failures.
+The first pair's latency penalty does not repeat; healthy throughput is3.5%
+lower. Retain both observations, not a claim of non-regression or rejection
+based on a single tail. Independent decision review recommends the existing
+failure/recovery gate before any participation observer or policy redesign.
+
+Next exact question: does the unchanged candidate preserve useful mixed service
+and future feedback when QUIC is silently blackholed, then recovers, without
+restart or failed settlement? Run CONTROL then CANDIDATE in existing combined
+40s workload with500/500,100msRTT,no configured jitter/randomloss/QoS, and
+the unchanged UDP outage30–33s. This isolates failure from the prior restriction.
+Information forecast: detects a material recovery regression caused by reduced
+healthy redundancy, not a promised speed gain. Retain all read/echo gaps,
+failed attempts, phase history, cost and restoration. Native/DATA/return service
+are all affected by a whole-QUIC outage. Without evidence that QUIC owned the
+selected feedback output, do not call it a selected-output proof; add a minimal
+observer only if that exact coverage is required and remains inconclusive.
+Any new regression stops promotion and targets its owner, not timeout tuning.
+
+10:52 +08 ordinary pair: control→candidate whole336.578→345.632Mbps;
+restricted180.238→226.058 and maxbodygap.502562→.452162s improve, but echo
+p95465.621→567.032ms and restored p95/max341.525/452.349→731.948/805.945ms
+worsen. Return bytes fall16.12%, no class drops in either. Healthy5–15 body
+440.255→420.434Mbps and worst echo560.703→964.550ms also worsen; this is not
+solely restriction/recovery. Candidate promotion is stopped, not task execution.
+Full report is CONFIRMED_RETURN_ORDINARY_20260910; no packet/deadline causality
+is inferred from serial management/queue samples.
+
+Next discriminator (predeclared before running): same ordinary executables,
+dedicated healthy500/500,100ms RTT, zero configured jitter/loss/outage, existing
+25s workload, CANDIDATE then CONTROL to reverse the first pair's order. Exact
+question: does the healthy service penalty persist without preceding return
+restriction, or is the first pair insufficient to separate candidate impact
+from shared-native/run variation? Existing healthy portions are short and
+restored portions retain preceding queue history. Information forecast only;
+no expected improvement, parameter/source change or favorable rerun. If the
+penalty recurs, reject promotion and inspect its actual owner before another
+model; if mixed, retain uncertainty and select one causal service question.
+No upload/blackhole/global gate claim follows this discriminator alone.
 
 10:45 +08 mechanism outcome:339unique focused checks pass, including both
 actors' blocked-I/O and actual-credit proof controls, capacity-one marker
@@ -2850,15 +2953,21 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
   `./.tmp/reflection/bin/feedback-fanout-20260909/mptunnel`; its env-set wrapper
   is an intentionally unsafe causal intervention, never an ordinary candidate.
   Rejected logical-cadence trial8a0413d is frozen only at
-  `./.tmp/reflection/bin/ack-cadence-20260909/mptunnel`. target/release is restored
-  byte-for-byte to the scoped-ACK comparator. Its123s trial build and unused
+  `./.tmp/reflection/bin/ack-cadence-20260909/mptunnel`. Its123s trial build and unused
   helper warning are historical; reversing the trial removes that warning's
   cause. No trial cleanup or associated tests remain implementation obligations.
+  Current ordinary trial0cab2b5 is frozen at
+  `./.tmp/reflection/bin/confirmed-return-20260910/mptunnel`; target/release
+  currently contains that ordinary trial until the feature-only observer build.
+  Its64s build has one now test-only compatibility helper warning. No cleanup
+  changed the eight ordinary cells. Do not confuse upcoming diagnostic binary
+  with either frozen ordinary executable. Protocol trial is wire15; use matched
+  binaries at both endpoints, no mixed-version compatibility assumption.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram ordinary cadence rejection report sent approximately2026-09-09 15:21UTC;
-  next nonurgent not before16:22UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram latest three-pair report sent approximately2026-09-10 03:02UTC;
+  next nonurgent not before04:03UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

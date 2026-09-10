@@ -805,3 +805,25 @@ is intentional fallback, not proof that selection survives target backpressure.
 Common tests cover capacity-one marker ordering after complete captured ACK/MAX
 and receipt-only service without byte/credit authority. First build and affected
 tests are running; ordinary practical acceptance remains the next gate.
+
+### Ordinary outcome — 2026-09-10 11:10 +08
+
+Candidate0cab2b5 has339unique focused passes and four complete ordinary pairs,
+not performance promotion. Download return restriction improves180→226Mbps
+and reduces return bytes16%, while first-pair healthy/restored echo tails
+worsen. A dedicated reverse-order healthy pair improves echo latency but gives
+3.5% less goodput. A three-second QUIC outage completes without restart/failed
+echoes and improves maximum gap/echo, but restored body service is11% lower.
+Mirrored upload settles exactly and shortens maximum confirmation/write gaps,
+yet goodput falls3% and return bytes rise1%. Resource observations and all
+series/costs remain in CONFIRMED_RETURN_ORDINARY_20260910 and
+CONFIRMED_RETURN_UPLOAD_20260910. Neither timing-only nor aggregate-only wins
+establish the intended composed service.
+
+The unresolved causal boundary is now explicit: these ordinary builds do not
+record whether proof remains timely/selected, or baseline fanout dominates.
+Direction-specific caller/queue behavior makes symmetric code insufficient
+proof of symmetric cost reduction. CURRENT selects a feature-only exact
+transition/marker capture before any policy change, not a renewed PTO or
+protocol preference. Timely proof would rule out deadline adjustment as the
+next fix; missed proof requires actual stage attribution, not a guessed cause.

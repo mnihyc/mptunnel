@@ -5495,3 +5495,197 @@ Archive: [ORDERED_FEEDBACK_OUTAGE_RETURN_DIAGNOSTIC_20260911.raw.tar.gz](ORDERED
 Ten regular files: six closed capture files, driver, used observer patch and
 existing run.py/shape.sh;6,349,052B compressed,135,002,911B member bytes.
 Archive comparison against every source passes; no binary/config/new harness.
+
+## 2026-09-11: bounded QUIC decode capture81095
+
+Category: diagnostic attribution, not an ordinary performance comparison.
+The frozen011b724 binary adds only the35-line QUIC feedback decode observer;
+the source overlay was reversed before traffic. Same independent200+200Mbps,
+UP70/DOWN30ms, with actual46UP10Mbps15.187–25.215s and all-QUIC blackhole
+30.215–33.515s; no random loss/jitter. CLOSED0, exact accepted=confirmed
+940,507,136B in47.313948s,159.024Mbps, one complete stream and zero errors.
+Maximum confirmation/write gaps are2.066601/2.765480s. These diagnostic values
+do not replace the ordinary6.382488s gap or resolve healthy mixed-DOWN latency.
+
+Sampled UP/DOWN wire totals are1,814,713,317/17,374,150B; peak client/server
+RSS343,860/116,768KiB and lifetime ps CPU148/72%. The77,582,669B of logs can
+perturb scheduling. This capture is not a new CPU or throughput comparison.
+Times below are producer Unix milliseconds relative to probe.started
+1789078393.194037437. Cross-process t_mono origins are not joined; rounded
+millisecond equality is not submillisecond ordering.
+
+### Exact feedback triples separate two real delay domains
+
+Session506281510968149807, stream0: server Q0/inc3 maps to client Qindex0,
+attachment2/physical1 (link46), and Q1/inc4 to Qindex1, attachment3/physical8
+(link47). All77 server-origin QUIC probes have exactly one admission, one
+client quic_feedback_decoded(kind=probe), and one client owner_received;
+39 use Q0 and38 use Q1. No missing/duplicate triple or mismatched index.
+The decode event lacks session/output: its join is valid here because the
+selected stream belongs to one new process/session and origin tokens are
+unique. Receipt events and opposite-origin token namespaces are not mixed.
+
+| Interval,77 probes | Median | Nearest-rank p95 | Maximum | At least1s |
+|---|---:|---:|---:|---:|
+| Server admitted→client decoded |31ms|3849ms|7197ms|15|
+| Client decoded→logical Input owner |9ms|515ms|1277ms|2|
+
+These overlapping event intervals must not be summed as serial critical-path
+time or CPU cost. The two post-decode waits above1s occur early, before QoS:
+
+| Token/output | Admitted | Decoded | Owner received | Post-decode |
+|---|---:|---:|---:|---:|
+|60/Q0|5.999s|6.029s|7.173s|1144ms|
+|61/Q1|5.999s|6.029s|7.306s|1277ms|
+|162/Q0|17.318s|23.206s|23.207s|1ms|
+|167/Q0|18.157s|25.354s|25.354s|0ms|
+|189/Q0|31.439s|35.793s|35.802s|9ms|
+|190/Q1|31.439s|34.870s|34.876s|6ms|
+
+For60/61 the required MAX is214,414,138, independently already applied as
+214,603,146 by6.041s on a TCP owner event. That excludes a still-missing MAX
+as the reason for their remaining>1s arrival delays; owner_received itself
+also precedes validation. Required MAX for162/167/189 is already applied by
+17.348/18.188/31.517s. A deferred credit fence does not explain these endpoints.
+
+Early post-decode waits overlap actual growing reply backlog: at own producer
+times5.975/6.975/7.975s server reply-read bytes are367/437/451, while client
+reply-write bytes are353/367/381. At8.975s they are451/437. This establishes
+useful return-service delay, not merely a slow losing proof. There is no
+per-DATA decode/arrival/winning-copy trace establishing the exact responsible
+reply byte or maximum confirmation-gap endpoints.
+
+### Late decode is not proof of native-only residence
+
+Token167 takes7197ms before decode;162 takes5888ms and189 takes4354ms.
+Their post-decode waits are0/1/9ms. However, all three current read_elapsed_us
+values are0. The helper timer begins only when udp_path_read_frame is entered;
+it excludes prior frame reads, prior reader-channel backpressure and time before
+this call is scheduled. All77 probe reads have maximum current-call elapsed
+7316us. A quickly completed current call cannot locate an earlier multi-second
+wait at native transport rather than an earlier reader or downstream blockage.
+
+Same-output completed server writer drains following162/167/189 admission
+are same-ms, with pending_bytes_after=0 and respectively1item34B/23us,
+3items560B/25us and2items257B/50us. For60/61 they are also same-ms,3items235B/
+39us and4items309B/109us. Accounting survives dequeue until write/flush;
+these bound prompt server handoff but do not label each token's native write
+or physical transmission. Native ACK progress likewise is not stream receipt.
+
+receive_hole and receive_hole_release WERE enabled and emitted zero events.
+That is no logged reordered-data hole transition, not proof of no missing tail.
+Some later own-clock samples have server reply-read=client reply-write while
+the upload target is unchanged; consequently the longest proof cannot simply
+be assigned to the probe's maximum confirmation gap or every later plateau.
+
+Disposition: both pre-decode and downstream residence are real. No runtime
+fix, native-only attribution, exact maximum-gap winner or new deadline claim
+is selected. The next bounded discriminator is attachment entry versus actual
+shared-FIFO admission for these same feedback identities, retaining the decode
+boundary; it can separate local forwarding backpressure from later Product
+Input residence without changing service or treating a marker read as continuous.
+
+Archive: [ORDERED_FEEDBACK_OUTAGE_QUIC_DECODE_20260911.raw.tar.gz](ORDERED_FEEDBACK_OUTAGE_QUIC_DECODE_20260911.raw.tar.gz).
+Ten regular files: six closed capture files, driver, used one-file observer
+patch and existing run.py/shape.sh;3,870,947B compressed,80,619,138B member bytes.
+Every archive member compares equal to its source; no binary/config/new harness.
+
+## 2026-09-11: bounded QUIC attachment capture51839
+
+Category: diagnostic attribution, not ordinary performance acceptance. Frozen
+011b724 plus the two-file decode/attachment observer; source reversed before
+traffic. CLOSED0: accepted=confirmed 916,127,744B in43.391247s,168.906Mbps,
+1/1 complete and no errors; driver43.522890s after40s offered load. First local
+write/confirmation .105355/.408272s; maximum gaps3.252321/2.469176s. These do
+not replace the ordinary6.382488s confirmation gap or waive mixed-DOWN latency.
+
+The43 profile rows span0–42.522759s: independent200+200Mbps, UP70/DOWN30ms;
+46UP alone changes200→10→200Mbps at15.049158/25.070412s. Actual all-QUIC
+blackhole30.072940–33.336378s; no random loss/jitter and no sampled netem drops.
+The blackhole is separate from those netem counters. Both DOWN cuts and47UP
+remain200Mbps. Epoch boundaries and observations are not assumed exactly on time.
+Sampled UP/DOWN class-byte deltas are1,510,288,215/26,715,332B; peak HTB backlog
+21,315,246/60,182B. Peak client/server RSS354,576/85,392KiB; maximum lifetime
+ps CPU164/72.5%, final160/66.7% (not interval CPU). Sampling ends before complete
+settlement and server management can be older than its client row. The exact
+probe, not a final sampled management value, establishes full confirmation.
+
+All44 raw one-second confirmation bins, Mbps; the final bin is partial:
+```text
+ 0–10: 8.678,272.698,250.418,223.635,193.132,199.787,212.751,144.777,285.615,220.694,139.782
+11–21: 25.856,302.528,234.378,286.929,180.232,171.004,80.955,171.023,146.081,364.078,20.159
+22–32: 298.728,106.646,193.734,198.365,43.995,392.083,210.178,153.194,18.486,10.698,0
+33–43: 0,213.946,70.783,0,112.004,220.992,228.918,117.965,289.816,167.211,146.087
+```
+Arithmetic means for nominal bins0–15/15–25/25–30/30–33/33–40/40–44 are
+200.111/173.264/199.563/9.728/120.949/180.270Mbps. They are bin summaries,
+not exact realized-impairment phases or substitutes for whole confirmed goodput.
+
+### Five actual boundaries: forwarding send is not the main local residence
+
+Session13409176026516942495, stream0. Server Q1/inc3 maps to client Qindex1,
+physical1/attachment2 (link47); Q0/inc4 maps to Qindex0, physical8/attachment3
+(link46). Do not reuse81095's incarnation mapping. All94 server-origin QUIC
+probes join uniquely through admitted→decoded→attachment_received→shared_admitted
+→owner_received, with identical exact client instances and no missing stages.
+The sessionless decode event is joinable only under this one-session, selected
+stream and direction-specific unique-token capture; opposite-origin receipts
+are not mixed. All142 logged client decodes (94 probes,48 receipts) have one
+attachment entry and successful shared admission; no censor among those records.
+
+| Interval,94 probes | Median | Nearest-rank p95 | Maximum |
+|---|---:|---:|---:|
+| Server admitted→client decoded |31ms|3539ms|5072ms|
+| Decoded→attachment entry |1ms|196ms|594ms|
+| Attachment entry→shared admission |0ms|1ms|33ms|
+| Shared admission→logical Input owner |17ms|198ms|594ms|
+| Entire decoded→owner interval |22ms|294ms|768ms|
+
+Times below use Unix producer milliseconds minus probe.started
+1789078915.926850557; process t_mono origins are independent. Rounded same-ms
+stamps are not submillisecond ordering. Intervals overlap and cannot be summed
+as CPU or serial critical-path cost. The maximum measured forwarding send is
+32,601us across all142 logged feedback messages, not a multi-second send stall.
+
+| Token/output | Admission | Decode | Attachment/shared | Owner |
+|---|---:|---:|---:|---:|
+|108/Q1|10.508s|10.539s|10.539/10.539s|11.133s|
+|109/Q0|10.508s|10.538s|10.538/10.538s|11.043s|
+|113/Q0|10.884s|11.640s|12.234/12.234s|12.408s|
+|202/Q1|30.430s|35.502s|35.502/35.502s|35.512s|
+
+108/109 share server generation4706 and required MAX336,730,532. TCP token105
+already observes applied337,665,572 at10.608s; TCP107/106 subsequently process
+at10.898/11.016s with338,652,182/338,700,182. Missing credit cannot explain the
+remaining525/435ms before108/109 owner arrival. Owner_received precedes probe
+validation. The actor progresses through other inputs: this is not deadlock.
+The90ms between109/108 does not identify an intervening ACK count or one scan.
+
+Own-clock reply samples at10.979/11.979s show server read645→715 bytes, while
+client write617→631 at10.978/11.978s. Thus the local holds overlap actual reply
+backlog.113 has594ms before attachment and174ms after shared admission, whereas
+108/109 are already shared-admitted before594/505ms owner delays. No per-DATA
+decode/winner trace ties one such marker to the exact maximum confirmation gap.
+
+### Attribution limits and decision
+
+202's5072ms before decode dominates its own chain, but read_elapsed_us=0:
+the current read excludes earlier read calls, earlier reader-send backpressure
+and time before helper scheduling. It is not a native-only delay measurement.
+Writer-drain/dispatch logging is deliberately OFF, so this capture supplies no
+new writer accounting bound. Six receive_hole and five receive_hole_release
+events exist; sparse hole transitions do not describe all missing-tail holds.
+Later equal server/client reply totals coexist with stalled upload target
+samples, so the longest proof is not automatically the user-critical interval.
+
+The observed local delay lies before attachment entry and after shared admission,
+not mainly in the selected forwarder send. The latter interval includes FIFO
+service, Product-lock acquisition and work before owner handling; its clock is
+not CPU attribution. This supports reviewing actual Input barrier/recovery work,
+not a proven batching correction, missing wake or deadline/native defect. No
+runtime change or performance promotion follows from these stage counts alone.
+
+Archive: [ORDERED_FEEDBACK_OUTAGE_QUIC_ATTACHMENT_20260911.raw.tar.gz](ORDERED_FEEDBACK_OUTAGE_QUIC_ATTACHMENT_20260911.raw.tar.gz).
+Ten regular files: six closed capture files, driver, composite observer patch,
+existing run.py/shape.sh;598,612B compressed,4,396,630B member bytes. Combined
+logs1,629,507B; every member compares equal to its source. No binary/config/harness.

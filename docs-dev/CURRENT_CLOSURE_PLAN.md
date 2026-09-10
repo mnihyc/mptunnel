@@ -1,19 +1,21 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 06:10 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 06:34 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
 ### Live decision summary
 
-- Source011b724 remains clean, no new runtime adjustment. Latest evidence
-  checkpoint02c9658. The user's unrelated seven-line document edit is untouched.
+- Source011b724 remains clean. Latest evidence checkpointc6e191f. The user's
+  unrelated seven-line document edit is untouched. A narrow feedback-boundary
+  correction is selected for a real-actor RED, not yet implemented or accepted.
 - The finite client Input correction materially improves upload, including
   QoS+QUIC outage: exact-confirmed56.280→186.629Mbps; settlement79.379→43.147s.
   However,6.382s confirmation gap remains. Trace THIS return prefix now.
-- Lab58328 CLOSED0; no live compiler/lab. The frozen diagnostic identifies a
-  3.775s reply-prefix gap, principally before actual repair admission. Exact
-  timing/eligibility review continues; ordinary6.382s remains acceptance evidence.
+- Labs58328/81095/51839 CLOSED0; no live compiler/lab. Latest exact queue capture
+  proves505–594ms shared-FIFO→owner holds despite already-applied required MAX.
+  It does not identify intervening ACK work. Ordinary6.382s remains acceptance
+  evidence, and predecode5–7s delays are not attributed to native transport alone.
 - Healthy shared mixed latency remains uncompetitive: p95527–531ms versus
   raw/Xray/H2114–128ms, while delivering fewer useful bytes. Neither generic
   native-buffer counting nor small ready-ACK copy savings justifies a fix.
@@ -35,12 +37,13 @@ Condensation waives no failure and reactivates no rejected candidate.
 
 Runtime checkpoint **011b724**, finite ordered ACK/MAX Input service, is retained.
 Frozen ordinary binary: ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
-target/release/mptunnel is the frozen QUIC-feedback-decode diagnostic, NOT ordinary.
+target/release/mptunnel is the frozen QUIC-feedback-attachment diagnostic, NOT ordinary.
 Use the explicit ordinary path above. All observer runtime edits are reversed.
 Only the user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md is unrelated
 dirty source; never edit/stage it. The temporary two-file ACK-admission observer
 is fully reversed; build44306 and lab80295 both CLOSED0. No runtime
-policy changes are currently proposed.
+policy changes are currently implemented. The bounded candidate below is not
+an accepted fix or permission to change controller/queue/timing parameters.
 
 Exact failure: ordinary a16 mixed UP had7.236s write/4.145s confirmation gaps.
 Diagnostic61091 joins an ACK prefix already in client FIFO to actor processing
@@ -725,6 +728,60 @@ attachment-20260911, reverse bothfiles, then one tag ordered-feedback-outage-
 quic-attachment-0911. Capture deliberately omits high-volume writerdrain/
 senderdispatch logs; no claimed timing comparability of diagnostic averages.
 
+### Selected finite logical-feedback transaction,06:34+08
+
+Build20039 and lab51839 CLOSED0; observer source fully reversed before traffic.
+Exact916127744B/43.391247s=168.906Mbps, all accepted bytes confirmed, no errors;
+maximum confirmation/write2.469176/3.252321s. Only1.63MB logs in this stage
+capture; these remain diagnostic, not an ordinary improvement claim.
+All94 probes join exact five-stage identities. Admission→decode median/p95/max
+31/3539/5072ms; decode→attachment1/196/594ms; attachment→shared0/1/33ms;
+shared→Product17/198/594ms. Tokens108/109 wait594/505ms after successful shared
+admission; actual required credit was already applied during those intervals.
+All142 selected decoded Probe/Receipt frames reach shared admission successfully.
+Reply backlog overlaps local holds, but exact maximum-gap attribution and the
+intervening ACK identities remain unknown. No deadlock or native-only claim.
+
+Issue/question: does treating pure StreamFeedbackProbe/Receipt as mandatory
+Input-quantum barriers cause repeated recovery before an already-ready later ACK
+invalidates it? Current011 intentionally retained the older standalone marker
+branches. Their original purpose was ordered ACK/MAX application before logical
+proof, not a required unlock or recovery-discovery pass. RFC8.4.1 and exact
+receive_feedback_probe/receipt operations support preserving that authority
+within a finite transaction. RFC10.4's ACK/MAX-only whitelist must therefore
+be deliberately corrected if the counterexample passes; do not call it unchanged.
+
+Reachable RED: actual Original claims, receiver-produced ACK exposing a gap,
+then a ready Probe and ACK filling it, all in existing Input order. Assert the
+real gap and final release first; observe heavy discovery between those facts.
+The correction would preserve every ACK transaction, actual MAX, marker order,
+exact per-item attachment, current receipt expiry and final recovery-before-
+publication/unlock. Probe.max never grants credit. A marker may observe facts
+already applied but does not certify recovery scheduling or freeze future state.
+DATA/FIN/RESET/requalification/error/mismatched-stream barriers remain unchanged;
+fatal processing revokes prepared claims before unlock. No wait, replenishment,
+larger input budget, pacing/cadence parameter, protocol preference or server rewrite.
+
+Benefit forecast: the measured local holds are material half-second service,
+but their removable fraction is unknown because intervening work was not logged.
+This candidate can remove repeated recovery/turns across READY logical feedback
+only. It cannot remove DATA barriers, one expensive final scan, predecode/native
+delay or all five-second holds. Zero practical gain or worse latency is possible;
+larger Product holds and changed route-publication timing are opposite risks.
+Value: one bounded real-actor RED can establish whether the same proven011
+feedback-work defect remains reachable through these markers without another
+diagnostic logging project. Do not convert call counts into predicted Mbps.
+
+Root solely runs tests/builds/labs. First test-only RED, then smallest coherent
+implementation and independent semantic/opposite-control review. If no causal
+RED or authority fails, reject before ordinary work. After GREEN, ONE ordinary
+candidate run on the unchanged independent200+200 QoS/outage UP cell against
+the preserved011 result (186.629Mbps/6.382s confirmation); no new observer.
+Material improvement without adverse service selects the healthy shared500
+mixed DOWN gate, where011 has repeatable527–531ms p95. No improvement or adverse
+timing stops promotion and prompts attribution, not a favourable rerun/timer.
+All global gates remain intact; this is not a full CPU or native-recovery fix.
+
 ## Separate open issue: one-core burst near20%QUIC loss
 
 [Four ordinary500Mbps DOWN controls](QUIC_LOSS_CPU_20260910.md) on d44:
@@ -859,6 +916,6 @@ nonrenewing clocks, half-close/cancel and retained capacity wakes.
 Build/artifact identities and failed candidates remain explicit; never run an
 old target/release by assumption. Exact commits only; docs-dev requires force-add.
 PROGRESS is ignored continuity. AGENTS.md immutable; userdoc+7lines untouched.
-Telegram last21:23UTC, next nonurgent>=22:23UTC. Commentary within60s; verification
+Telegram last22:23:28UTC, next nonurgent>=23:23:28UTC. Commentary within60s; verification
 polls by minutes. Before compaction record current sessions, next decision,
 source/binary identities and open/adverse outcomes. Do not stop at a checkpoint.

@@ -110,6 +110,74 @@ Smallest action: one extension of the same temporary observer on d44ca8e,
 same physical QoSUP cell. No runtime correction until dominant exact owner and
 reachable producer invariant are established; no repeated favorable cell or
 new tuning follows. The global acceptance order below remains unchanged.
+Execution: dispatch-inner-profile build8383 is active on the frozen d44 runtime
+plus observer. A stack per-dispatch accumulator separates direct/queued and
+records all failed-region/send/native-stamp retries without per-attempt log or
+telemetry lock; it emits after the exact Product guard drops. Gap subphases
+are locally accumulated too. Build/patch/wrapper use dispatch-inner-profile-
+0910 names. Root owns build/lab; independent complete observer review passes,
+and source diff equals saved patch during build. The new unused ordinary-entry
+warnings are feature-wrapper artifacts, not runtime/platform failures.
+Potential reuse constraint (not a selected fix): failed bound sends can
+reconcile/remove attachments without a commit. Fresh bound planning and Apply
+do not themselves rerank a cached Backup against a newly available Regular:
+the target is already pinned. Apply DOES check the fresh plan's full eligibility
+set; it does not revalidate the earlier outer discovery's tier choice.
+Do not call a no-commit span immutable or broad reuse equivalent without
+resolving those actual mutation/tier boundaries. No such reuse is implemented.
+Build8383 closes0/3m35s. Complete18-source-file overlay saved at
+./.tmp/reflection/dispatch-inner-profile-0910.patch and frozen in
+bin/dispatch-inner-profile-20260910, then fully reversed before run16610.
+Same cell/profile/selected events; no source runtime changes. Capture active.
+Actual16610 closes0:480,378,880B/48.576457s, confirmation9.000672s/write
+1.872985s. Diagnostic only. Direct dispatch13.409747s versus queued.218317s;
+bound plan11.122946s/472,741calls dominates send11.460190s.459,573blocked,
+610other errors,12,558commits/450,316,407B; native-stale counter absent.
+Successful Productcommit.072298s and fencedApply.119824s are not the dominant
+cost, so do NOT select a flight-insertion index or stale-stamp retry fix.
+Across ALL gap-service callers (preselect and ACK handling), owner/target model
+records13.746046s; metadata2.625237s, clocks1.905566s/cache1.162965s remain.
+Preselect's enclosing gap phase is23.313297s, NOT an exact exclusive parent of
+all these inner calls. Do not subtract/sum differently scoped nested timers.
+
+Own longest9s gap is won by Q1 repair[1708,1722): server acceptance→decode30ms,
+but decode→Product8.381s. Complete8.033s interior records7.931464s actor hold:
+preselect4.638369s and dispatch2.497864s. Bound plan alone2.086050s/88,727calls
+(88,071blocked/656commits), whereas selected gap owner/target model1.718160s.
+Unlike the preceding capture, BOTH owners materially occupy this interval.
+The next source question is one repair-ranking observation, not cross-region
+caching: non-Original ranking recaptures all paths repeatedly per target/pass.
+Do NOT blindly reuse the outer plan view: its include_bulk_admission=false
+also exports has_bulk_model_evidence=false, whereas legacy bound persistent
+repair separately checks actual measured evidence. Treating that partial view
+as full recovery evidence would regress legitimate persistent repairs.
+
+Selected bounded proposal, pending real RED: inside the existing chooser,
+share ONE lazy authority-only capture with EXACT old arguments across target/
+tier passes when no full recovery observation was supplied. Keep measured-
+evidence predicate unchanged (live when currently live, captured when supplied
+by full recovery model); keep live cause-specific command admission and fresh
+final Apply. The separate outer plan eligibility/fence capture remains intact.
+No new caller-mode flags, namespace/state, cross-region cache or thresholds.
+This targets the actually expensive chooser left outside d44's earlier narrow
+selector reuse, not a second arbitrary capture API cleanup.
+Forecast ceiling: at most the affected portion of2.086s critical/11.123s whole
+plan elapsed; remaining gap work prevents a claim of complete cure. Avoid
+new tier/queue predicates or unchanged-role assumptions. Actual removable
+fraction still depends on source equivalence and targeted work proof; no
+runtime patch is authorized just by the attempt count. Actual producer RED
+must exercise bound planning with a real full command lane, then positive
+Regular/Backup/exact-target/measured persistent controls BEFORE capture count.
+Forecast: for an exhausted exact target, repeated authority captures across
+rank/capacity/error-classification passes fall to one; outer eligibility
+capture stays. A material fraction of measured bound-plan work may disappear,
+but projection/ranking cost and other gap work persist. A semantic failure
+rejects the change; ordinary same-cell failed completion, material adverse
+timing/cost or no practical benefit prevents promotion. No tuning rescue.
+Targeted semantic/work checks will use the existing default unoptimized test
+profile/cache: no Mbps conclusion depends on unit-test optimization, and the
+preceding release-unit builds consumed7m each for subsecond assertions. This
+changes no Product/lab setting; ordinary affected runs remain optimized release.
 
 ### Completed loss-CPU discriminator; no CPU fix justified
 

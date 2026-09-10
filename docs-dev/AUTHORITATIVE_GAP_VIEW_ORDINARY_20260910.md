@@ -1317,3 +1317,227 @@ the ordinary rejection. This capture supports splitting the remaining complete
 gap and dispatch cost scopes before selecting a work-model correction; it does
 not support a stale-only pruning patch, native timer adjustment, an unavoidable
 physical-stall explanation or a new performance claim.
+
+## Dispatch-inner diagnostic: bound replanning, with substantial gap-model work
+
+The next information capture separates direct structural recovery from queued
+repair and the expensive bound-send plan from successful publication. It does
+not change scheduling authority or supply an ordinary speed comparison. Exact
+settlement again coexists with a material confirmation stall: 480,378,880B in
+48.576457s, 79.113Mbps, maximum confirmation gap9.000672s. The earlier
+17.859206s diagnostic gap remains preserved, not replaced by this outcome.
+
+Source is ordinary `d44ca8e` plus the frozen 18-source-file temporary overlay.
+Build8383 completes in3m35s; warnings are the existing unused batch-write helper
+and the ordinary dispatch wrappers unused by this feature-only adapter. The
+complete overlay is reversed before traffic. Frozen
+`dispatch-inner-profile-20260910` runs with periodic PERF, no performance
+samples, and the existing selected reply-stage events. Runner16610 exits0
+after49.006014s. The [verified raw archive](DISPATCH_INNER_PROFILE_20260910.raw.tar.gz)
+is569,079B with11regular files: five results, build/driver logs, complete patch,
+wrapper, `run.py` and `shape.sh`. Gzip integrity, tar comparison and every member's
+decompressed-byte comparison pass. Runner/profile match the preceding archive;
+no configs, binaries, links or directory entries are included.
+
+### Exact outcome and full timing series
+
+Accepted and confirmed bytes are equal, one stream completes, and there are
+no probe errors or censored bins. First write/confirmation are .105755/.242271s;
+maximum write gap is1.872985s. There is no echo workload. The49raw confirmation
+bins below contain20zeros; the final bin is partial. Completion is8.576457s
+beyond nominal40s load, not proof that every source write ended at40s.
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 14.754,205.137,208.334,50.332,30.217,234.408,44.276,28.836,44.126,195.857
+10: 65.536,164.242,0,142.114,301.823,0,0,0,27.411,0
+20: 86.879,0,0,0,42.851,36.981,23.497,63.343,570.067,0
+30: 373.625,38.37,174.114,0,0,0,0,0,0,0
+40: 0,3.382,0,0,0,32.987,66.363,175.695,397.472
+```
+
+| Raw confirmation phase | Mean Mbps | Zero bins |
+|---|---:|---:|
+| 0–5s | 101.755 | 0/5 |
+| 5–15s | 122.122 | 1/10 |
+| 15–25s | 15.714 | 7/10 |
+| Interior16–24 inclusive | 17.460 | 6/9 |
+| 25–40s | 85.333 | 8/15 |
+| 40–49s, last partial | 75.100 | 4/9 |
+
+### Complete counter reconciliation and timer scope
+
+Every interval count/byte/time delta matches its cumulative counter across
+4,234client and677server performance rows, with one PID per role. For dispatch
+timing labels, generic `bytes` means **phase calls**; for event-count labels it
+means **events**. Only `request.dispatch.payload_bytes` is actual committed
+payload. Generic record counts count emitted nonempty batches, not attempts.
+Maximum elapsed values are per-guard accumulated phase batches, not individual
+attempt maxima. Event-only durations are synthetic1us floors, not measured cost.
+
+Dispatch direct/queued are disjoint children of its owner body. Prepare/select/
+send are children of direct; send-total occurs in direct and queued; plan,
+authority, reservation and fenced Apply nest inside send-total. Product commit
+nests in fenced Apply. Do not add parents and children. Timings measure elapsed
+work, including descheduling, not CPU execution; local accumulation and logging
+overhead remain within some enclosing timers.
+
+| Dispatch scope | Cumulative elapsed, s | Actual calls/events |
+|---|---:|---:|
+| Direct structural recovery | 13.409747 | 22,553 calls |
+| Queued repair | .218317 | 24,748 calls |
+| Structural candidate preparation | .392297 | 1,471,424 region visits |
+| Structural target selection | 1.485480 | 1,471,051 calls |
+| Structural bound send | 11.296259 | 463,360 calls |
+| Shared bound/unbound send-total | 11.460190 | 472,741 calls |
+| Send-plan construction | 11.122946 | 472,741 calls |
+| Avoid-history lookup | .069813 | 472,741 calls |
+| Target authority | .023274 | 14,971 calls |
+| Reservation and eligibility before native fence | .027714 | 14,971 calls |
+| Fenced Apply | .119824 | 12,558 calls |
+| Product commit, inside Apply | .072298 | 12,558 calls |
+
+Selection returns no target1,007,691times; structural bound attempts return
+blocked/migratable456,279times. Across all observed sends,459,573return
+`SenderServiceBlocked`,610return other errors and12,558commit, exactly
+accounting for472,741send calls. Committed payload is450,316,407B of recovery
+traffic; this is neither unique repaired bytes nor proof that copies were
+unnecessary. No `native_stale` component is emitted: no such recorded outcome
+occurs, rather than an unmeasured value treated as zero. Other error attempts
+are internal publication outcomes, not610independent failed user transfers.
+No-target count does not independently time failed selections. Source and
+these measurements distinguish costly replanning from successful flight
+recording, but do not yet identify the exact repeated plan predicate to change.
+
+The four preselect phases total24.060029s: gap23.313297, source.329930,
+retained.321184 and residual.095618. The following helper counters cover
+**all gap-service calls**, including ACK-triggered calls in `relay/client.rs`,
+not only the preselect caller. They are not an exclusive partition of that
+23.313297s; subtracting them from it would mix caller scopes.
+
+| Inner gap-service scope, all callers | Elapsed, s | Calls |
+|---|---:|---:|
+| Coverage/subtraction | .400861 | 31,279 |
+| Boundaries | .553453 | 27,699 |
+| Ownership view | .671884 | 27,699 |
+| Scored metadata | 2.625237 | 1,768,251 |
+| Exact cache preview | 1.162965 | 1,768,251 |
+| Owner/target model | 13.746046 | 1,768,251 |
+| Assignment clocks | 1.905566 | 1,580,224 |
+
+Owner queries separately record present1,768,251/.910376s and stable-absent
+4,469,451/1.734640s; dynamic-absent has no emitted component. Classification
+observer time is.242135s. These nested all-call domains likewise cannot be
+summed into an exact preselect budget. Actor guards total44.699875s hold and
+1.470677s acquisition wait over452,079acquisitions; writer guards total
+1.269273s hold and.046542s successful-try-lock time over46,383acquisitions.
+Largest individual actor hold is20.673ms. Instrumented owner sites are
+preselect `control.rs:1569`24.086979s, dispatch `:3101`13.627873s and ACK
+application `:4047`3.058333s, using the archived source line map.
+
+### Winning repair and complete-flush critical intervals
+
+Session10028713324498556993/stream0 has383Product receipts and158advancing
+receipts. The maximum advancing gap is Unix1789051946189→1789051955189,
+9.000s at millisecond resolution, consistent with the probe maximum. Its
+winning missing interval [1708,1722) is a Q1 repair, physical1/client attachment3,
+not the Q0 Original or a later duplicate. Server repair acceptance at
+1789051946778 (Q1/incarnation4) matches client repair decode at1789051946808.
+Repair queue admission finishes1789051947145; attachment delivery occurs only
+1789051953447. Shared Product queue admission succeeds1789051953500 at
+recorded depth131; dequeue, input selection, preapply-lock completion and
+Product application occur1789051955189, advancing1708→1722.
+
+Thus acceptance→decode is30ms, decode→repair enqueue337ms,
+repair enqueue→attachment6.302s, and admitted shared-FIFO→dequeue1.689s.
+Decode→Product is8.381s of directly observed local residence. Admission is not
+native write completion, and the30ms stage is not a measured wire-only delay.
+The same-range Q0 Original is decoded only at1789051960597 and later applied
+as a duplicate. It must not replace the winning copy in this causal join.
+
+Using whole periodic flushes strictly inside the held intervals, carrying
+inactive cumulative counters forward and differencing after each full flush:
+
+| Held interval; interior flush endpoints, Unix ms | Wall, s | Actor hold, s | Preselect hold, s | Dispatch hold, s | ACK hold, s |
+|---|---:|---:|---:|---:|---:|
+| Maximum gap;1789051946675→1789051954708 | 8.033 | 7.931464 | 4.638369 | 2.497864 | .498973 |
+| Repair queue→attachment;1789051947678→1789051952700 | 5.022 | 4.949824 | 2.699114 | 1.734398 | .314247 |
+| Shared FIFO;1789051953704→1789051954708 | 1.004 | .995539 | .631806 | .256898 | .071332 |
+
+Intervals overlap; do not sum them. In the maximum-gap interior, direct
+dispatch is2.495686s versus queued.002182s. Plan work is2.086050s over88,727
+calls, with88,071blocked and656committed sends (36,525,800payload bytes).
+Structural selection is.271628s/189,623calls with100,975no-target results;
+fenced Apply is.015761s and Product commit.011521s. No native-stale outcome
+is recorded there. Gap phase is4.613013s; all-call owner/target model is
+1.718160s, scored metadata.681257s and assignment clocks.531905s, some of
+which may belong to ACK-triggered evaluations. Actor acquisition wait is
+.024581s and writer hold.018749s. Completed calls can cross flush boundaries;
+these are measured aggregate ownership within a held interval, not an exact
+CPU or removable-delay budget.
+
+Both preselect and repeated bound planning therefore matter in this capture,
+unlike the preceding observer's dispatch-dominated long interval. An earlier
+3.554s advancing gap ending with Q1 Original[966,980) has a2.008s full-flush
+interior containing1.982901s actor hold,1.781324s preselect and only about1ms
+direct dispatch; all-call owner/target model is1.273920s there. Its decode
+arrives late in that interval, so the whole earlier gap is not labelled local
+postdecode delay. This difference is retained rather than forcing every stall
+into one owner or selecting only the favorable stage breakdown.
+
+### Forward progress, physical service and cost
+
+During the maximum reply hold, target writes continue: sample33 records
+396,316,796B, sample35 448,639,696B and sample41 456,831,696B. Client source
+read is463,411,060B at33–40,463,425,660B at41, and finally480,378,880B at48.
+The final management row still has only472,250,240target-written bytes and
+2,226server-read/1,820client-written reply bytes; exact settlement follows
+that sample. Unlike the preceding capture, this is not a hold wholly after
+full forward target acceptance. At closure Product receive frontier is2253,
+reorder0 and sender/reinjection queues0. That finite close is not a latency pass.
+
+All eight native outputs in samples33→41 retain epochs and advance producer
+sample stamps and ACK bytes on each role, including the winning Q1 carrier.
+Native progress does not identify the critical bytes, invalidate the exact
+local residence, or classify the differing forward debt as useful versus
+duplicate copies.
+
+All49profiles match two independent200Mbps links, only46UP10Mbps during
+rows15–24, DOWN30ms/UP70ms, zero loss/jitter/outage,65536Bbursts and limit8192.
+Actual restriction/restoration rows are15.002002/25.003163s. All class and
+netem drop deltas are0. Cost accounting spans48.005810s, not the probe or
+complete-flush interval. Physical46/47 mappings are unchanged.
+
+| Sampled phase | UP46 /47 class Mbps | Target-socket Mbps |
+|---|---:|---:|
+| 0→15s | 175.836 /68.528 | Separate startup below |
+| Strict16→24s | 9.979 /7.456 | 6.018 |
+| 25→40s | 91.096 /115.759 | 117.585 |
+| 33→41s | 45.602 /55.452 | 60.507 |
+
+Target-socket service is176.403Mbps at0→5s and94.820Mbps at5→15s.
+These are successful target writes, not receiver confirmation bins. Link47
+remains physically200Mbps during the cut, but is lightly used in this particular
+capture. The decoded winning reply's local delay is stronger attribution than
+inferring a cause from that aggregate utilization or comparing diagnostic means.
+
+| Whole sampled cost | Value |
+|---|---:|
+| UP46 /47 bytes | 538,504,313 /434,666,729 |
+| DOWN46 /47 bytes | 8,056,057 /6,607,685 |
+| Summed UP backlog peak / final, B | 33,850,496 /4,325,690 |
+| Summed DOWN backlog peak / final, B | 42,447 /6,874 |
+| Client RSS peak / final, KiB | 352,052 /340,928 |
+| Server RSS peak / final, KiB | 121,992 /114,036 |
+| Client lifetime CPU peak / final, % | 129 /123 |
+| Server lifetime CPU peak / final, % | 64.2 /33.4 |
+
+CPU remains process-lifetime `ps`, not interval execution. Logs contain
+9,187lines/3,211,386B, including observer summaries; total measurement overhead
+is not known. Probe stderr is empty. Two H3_NO_ERROR warnings occur at teardown,
+not two additional failed streams. **No performance promotion:** the information
+forecast identifies repeated direct bound planning and all-call gap-model work
+as material owners, while successful commit/native-stale replan and queued
+dispatch are small in the decisive interval. The next correction requires a
+reachable invariant in that measured planning scope; neither a new parameter
+nor another isolated minor query optimization follows from these totals.

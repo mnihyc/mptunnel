@@ -42,7 +42,9 @@ use crate::mux::stream::{
     AckOutcome, ReliableRecvStream, ReliableSendStream, StreamError, ValidatedStreamAck,
 };
 use crate::performance::MppPerformanceConfig;
-use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_accounted_bytes};
+use crate::protocol::frame::{
+    normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_accounted_bytes,
+};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
@@ -253,6 +255,20 @@ pub(in crate::runtime) struct RequestDataAckGapObservation {
     pub(in crate::runtime) target_model_pending: bool,
     pub(in crate::runtime) uniform_frontier_extent_bytes: usize,
     pub(in crate::runtime) owner_recovery_timing: Option<ReliableDataAckGapTiming>,
+}
+
+/// One existing-size action plus independent future service obligations.
+/// The range is a subset of actual receiver omissions, never the complement
+/// of an ACK horizon or permission to copy an unobserved retained suffix.
+#[derive(Debug, Default)]
+pub(in crate::runtime) struct RequestDataAckGapService {
+    pub(in crate::runtime) range: Option<OffsetRange>,
+    pub(in crate::runtime) observation: RequestDataAckGapObservation,
+    pub(in crate::runtime) ready: bool,
+    pub(in crate::runtime) due_recovery_work: bool,
+    pub(in crate::runtime) target_service_exhausted: bool,
+    pub(in crate::runtime) has_measured_target: bool,
+    pub(in crate::runtime) next_deadline: Option<Instant>,
 }
 
 /// Immutable target authority captured by one completion-tail Decide step.
@@ -808,6 +824,127 @@ impl RequestSenderService {
         model.uniform_frontier_extent_bytes = uniform_frontier_extent_bytes;
         model.owner_recovery_timing = owner_recovery_timing;
         model
+    }
+
+    /// Selects one independently due omission extent after already serviced
+    /// coverage. Native dispatch remains a separate normal actor turn; this
+    /// does not turn one ranked hedge into a whole-window copy batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn data_ack_gap_reinjection_service(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        sender_queue: &ReliableRelaySenderQueue,
+        gaps: &[OffsetRange],
+        preview_limit: usize,
+        lane: TrafficClass,
+        observed_at: Instant,
+    ) -> RequestDataAckGapService {
+        let live = remotes
+            .paths
+            .iter()
+            .map(|path| path.instance())
+            .collect::<Vec<_>>();
+        let (mut covered, copy_deadline) = self.multipath.live_copy_coverage(&live, observed_at);
+        covered.extend(sender_queue.queued_reinjection_ranges());
+        let covered = normalize_offset_ranges(covered);
+        let ranges = offset_ranges_not_covered(gaps, &covered);
+        let boundaries = self.multipath.recovery_service_boundaries(gaps);
+        let mut service = RequestDataAckGapService {
+            next_deadline: copy_deadline,
+            ..RequestDataAckGapService::default()
+        };
+        let mut observation_deadline = None::<Instant>;
+        for range in ranges {
+            let mut cursor = range.start;
+            while cursor < range.end {
+                let boundary = boundaries
+                    .get(boundaries.partition_point(|end| *end <= cursor))
+                    .copied()
+                    .unwrap_or(range.end)
+                    .min(range.end);
+                // First rank the unchanged quantum. A later assignment with
+                // a future clock must not hide a due earlier assignment; only
+                // that case retries the shorter real assignment boundary.
+                let mut candidate_end = range.end;
+                loop {
+                    let mut model = self.data_ack_gap_reinjection_model(
+                        context,
+                        remotes,
+                        send_stream,
+                        sender_queue,
+                        &[OffsetRange {
+                            start: cursor,
+                            end: candidate_end,
+                        }],
+                        preview_limit,
+                        lane,
+                    );
+                    let extent = preview_limit.min(model.uniform_frontier_extent_bytes);
+                    if !model.has_live_original_path || extent == 0 {
+                        break;
+                    }
+                    let scored = OffsetRange {
+                        start: cursor,
+                        end: cursor.saturating_add(extent as u64),
+                    };
+                    let Some(timing) =
+                        self.multipath
+                            .observe_original_recovery_timing_for_range(scored, |_| {
+                                // The pure model verified one exact live owner
+                                // throughout this scored range. Preserve its same
+                                // native timing observation through the decision.
+                                model.original_path_timing
+                            })
+                    else {
+                        break;
+                    };
+                    model.owner_recovery_timing = Some(timing);
+                    let deadline = timing
+                        .target_deadline(
+                            model.reinjection_completion,
+                            model.owner_completion,
+                            observed_at,
+                        )
+                        .unwrap_or(timing.fallback_at);
+                    let due = deadline <= observed_at;
+                    service.has_measured_target |= model.reinjection_target.is_some();
+                    service.due_recovery_work |= due;
+                    service.target_service_exhausted |= due && model.target_service_exhausted;
+                    if !due {
+                        service.next_deadline = Some(
+                            service
+                                .next_deadline
+                                .map_or(deadline, |current| current.min(deadline)),
+                        );
+                    }
+                    if service.range.is_none()
+                        || observation_deadline.is_some_and(|current| deadline < current)
+                    {
+                        service.range = Some(scored);
+                        service.observation = model;
+                        observation_deadline = Some(deadline);
+                    }
+                    if due && model.reinjection_target.is_some() && !model.target_service_exhausted
+                    {
+                        service.range = Some(scored);
+                        service.observation = model;
+                        service.ready = true;
+                        return service;
+                    }
+                    if !due && boundary > cursor && boundary < scored.end {
+                        candidate_end = boundary;
+                        continue;
+                    }
+                    break;
+                }
+                // No target/clock service for this region: jump to its real
+                // ownership/assignment boundary, never probe it q-by-q.
+                cursor = boundary;
+            }
+        }
+        service
     }
 
     /// Prepared Original source belongs to native claimants. The Product

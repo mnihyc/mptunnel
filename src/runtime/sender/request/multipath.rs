@@ -46,7 +46,7 @@ use crate::model::request_evidence::{
     request_path_rate_coverage_floor_bytes,
 };
 use crate::model::timing::{
-    reliable_data_retransmission_interval, reliable_path_stale_interval,
+    ReliableDataAckGapTiming, reliable_data_retransmission_interval, reliable_path_stale_interval,
     transport_rate_sample_freshness_horizon,
 };
 use crate::model::work::{
@@ -1522,6 +1522,30 @@ impl RequestMultipathController {
         self.request
             .flights
             .live_owner_uniform_frontier(range, live_instances)
+    }
+
+    pub(super) fn live_copy_coverage(
+        &self,
+        live_instances: &[RelayPathInstance],
+        observed_at: Instant,
+    ) -> (Vec<OffsetRange>, Option<Instant>) {
+        self.request
+            .flights
+            .live_copy_coverage(live_instances, observed_at)
+    }
+
+    pub(super) fn recovery_service_boundaries(&self, gaps: &[OffsetRange]) -> Vec<u64> {
+        self.request.flights.recovery_service_boundaries(gaps)
+    }
+
+    pub(super) fn observe_original_recovery_timing_for_range(
+        &mut self,
+        range: OffsetRange,
+        owner_snapshot: impl FnMut(RelayPathInstance) -> Option<PathSnapshot>,
+    ) -> Option<ReliableDataAckGapTiming> {
+        self.request
+            .flights
+            .observe_original_recovery_timing_for_range(range, owner_snapshot)
     }
 
     pub(super) fn tail_reinjection_owner_keys(

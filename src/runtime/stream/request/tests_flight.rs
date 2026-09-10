@@ -1180,6 +1180,284 @@ fn partial_ack_splits_and_preserves_only_exact_qualification_receipts() {
     );
 }
 
+fn recovery_timing_snapshot(
+    owner: RelayPathInstance,
+    srtt_ms: f64,
+) -> crate::scheduler::PathSnapshot {
+    crate::scheduler::PathSnapshot::new(
+        crate::protocol::PathId(owner.key.index as u16),
+        owner.key.underlay,
+        srtt_ms,
+        1_000_000.0,
+    )
+}
+
+#[test]
+fn recovery_service_copy_coverage_uses_exact_membership_and_immutable_expiry() {
+    let owner = path(UnderlayProtocol::Udp, 0, 209);
+    let copy = path(UnderlayProtocol::Tcp, 1, 210);
+    let predecessor = path(UnderlayProtocol::Tcp, 1, 211);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 32));
+    let (_, deadline) = ledger.record_reinjection_frame_instance_with_suppression_interval(
+        copy,
+        &data_frame(0, 12),
+        Duration::from_secs(1),
+    );
+    ledger.record_reinjection_frame_instance(predecessor, &data_frame(20, 4));
+    let deadline = deadline.expect("actual accepted copy publishes D");
+    let before = deadline.checked_sub(Duration::from_nanos(1)).unwrap();
+    assert_eq!(
+        ledger.live_copy_coverage(&[copy], before),
+        (vec![OffsetRange { start: 0, end: 12 }], Some(deadline)),
+        "same numeric path key does not include another attachment's copy"
+    );
+    assert_eq!(ledger.live_copy_coverage(&[owner], before), (vec![], None));
+    assert_eq!(ledger.live_copy_coverage(&[copy], deadline), (vec![], None));
+    assert_eq!(
+        ledger.reinjected_data_in_flight_bytes(copy),
+        12,
+        "expiry does not release accepted target ownership"
+    );
+
+    ledger.release_normalized_acked_ranges(&[OffsetRange { start: 4, end: 8 }]);
+    assert_eq!(
+        ledger.live_copy_coverage(&[copy], before),
+        (
+            vec![
+                OffsetRange { start: 0, end: 4 },
+                OffsetRange { start: 8, end: 12 }
+            ],
+            Some(deadline),
+        ),
+        "coverage follows retained ACK fragments without renewing D"
+    );
+    assert!(
+        ledger
+            .flights
+            .values()
+            .flatten()
+            .all(|flight| flight.original_recovery_timing.is_none())
+    );
+}
+
+#[test]
+fn recovery_service_boundaries_keep_assignment_and_retained_copy_scope() {
+    let owner = path(UnderlayProtocol::Udp, 0, 212);
+    let copy = path(UnderlayProtocol::Tcp, 1, 213);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 16));
+    ledger.record_original_frame_instance(owner, &data_frame(16, 8));
+    ledger.record_original_frame_instance(owner, &data_frame(32, 8));
+    ledger.record_reinjection_frame_instance(copy, &data_frame(2, 12));
+    ledger.release_normalized_acked_ranges(&[OffsetRange { start: 4, end: 8 }]);
+    let gaps = [
+        OffsetRange { start: 1, end: 4 },
+        OffsetRange { start: 8, end: 20 },
+    ];
+    assert_eq!(
+        ledger.recovery_service_boundaries(&gaps),
+        vec![1, 2, 4, 8, 14, 16, 20],
+        "only scoped assignment/copy boundaries, not an unrelated silent extent"
+    );
+    assert!(ledger.recovery_service_boundaries(&[]).is_empty());
+    assert!(
+        ledger
+            .flights
+            .values()
+            .flatten()
+            .all(|flight| flight.original_recovery_timing.is_none())
+    );
+}
+
+#[test]
+fn original_recovery_timing_initializes_siblings_split_before_observation() {
+    let owner = path(UnderlayProtocol::Udp, 0, 201);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 16));
+    ledger.record_original_frame_instance(owner, &data_frame(32, 8));
+    ledger.release_normalized_acked_ranges(&[OffsetRange { start: 4, end: 12 }]);
+    assert!(ledger.flights[&0][0].original_recovery_timing.is_none());
+    assert!(ledger.flights[&12][0].original_recovery_timing.is_none());
+
+    let first = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 4 }, |instance| {
+            assert_eq!(instance, owner);
+            Some(recovery_timing_snapshot(owner, 100.0))
+        })
+        .expect("real retained Original prefix");
+    for start in [0, 12] {
+        assert_eq!(
+            ledger.flights[&start][0].assignment_range,
+            OffsetRange { start: 0, end: 16 },
+        );
+        assert_eq!(
+            ledger.flights[&start][0].original_recovery_timing,
+            Some(first)
+        );
+    }
+    assert!(
+        ledger.flights[&32][0].original_recovery_timing.is_none(),
+        "another silent assignment is not initialized by this query"
+    );
+    let sibling = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 12, end: 16 }, |_| {
+            Some(recovery_timing_snapshot(owner, 1_000.0))
+        })
+        .expect("right sibling inherits the first observation");
+    assert_eq!(sibling, first);
+}
+
+#[test]
+fn original_recovery_timing_survives_another_range_and_later_inflation() {
+    let owner = path(UnderlayProtocol::Udp, 0, 202);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 4));
+    ledger.record_original_frame_instance(owner, &data_frame(4, 4));
+    let first = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 4 }, |_| {
+            Some(recovery_timing_snapshot(owner, 100.0))
+        })
+        .unwrap();
+    assert!(ledger.flights[&4][0].original_recovery_timing.is_none());
+    let second = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 4, end: 8 }, |_| {
+            Some(recovery_timing_snapshot(owner, 500.0))
+        })
+        .unwrap();
+    assert!(second.fallback_at > first.fallback_at);
+    let revisited = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 4 }, |_| {
+            Some(recovery_timing_snapshot(owner, 2_000.0))
+        })
+        .unwrap();
+    assert_eq!(revisited, first);
+    assert_eq!(ledger.flights[&4][0].original_recovery_timing, Some(second));
+}
+
+#[test]
+fn original_recovery_timing_tightens_all_siblings_but_not_copy_clocks() {
+    let owner = path(UnderlayProtocol::Udp, 0, 203);
+    let copy = path(UnderlayProtocol::Tcp, 1, 204);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 12));
+    ledger.record_reinjection_frame_instance(copy, &data_frame(0, 4));
+    let copy_deadline = ledger.flights[&0][1].reinjection_suppression_deadline;
+    ledger.release_normalized_acked_ranges(&[OffsetRange { start: 4, end: 8 }]);
+    let initial = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 8, end: 12 }, |_| {
+            Some(recovery_timing_snapshot(owner, 2_000.0))
+        })
+        .unwrap();
+    let tightened = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 4 }, |instance| {
+            assert_eq!(instance, owner, "copies cannot lend owner timing");
+            Some(recovery_timing_snapshot(owner, 50.0))
+        })
+        .unwrap();
+    assert!(tightened.loss_at < initial.loss_at);
+    assert!(tightened.fallback_at < initial.fallback_at);
+    for start in [0, 8] {
+        assert_eq!(
+            ledger.flights[&start][0].original_recovery_timing,
+            Some(tightened)
+        );
+    }
+    assert!(ledger.flights[&0][1].original_recovery_timing.is_none());
+    assert_eq!(
+        ledger.flights[&0][1].reinjection_suppression_deadline,
+        copy_deadline
+    );
+}
+
+#[test]
+fn original_recovery_timing_aggregates_absolute_clocks_not_latest_assignment() {
+    let owner = path(UnderlayProtocol::Udp, 0, 205);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 4));
+    ledger.record_original_frame_instance(owner, &data_frame(4, 4));
+    let older_at = ledger.flights[&0][0].sent_at;
+    let newer_at = ledger.flights[&4][0].sent_at;
+    // Derive the fixture's interval from actual producer timestamps so no
+    // scheduler pause can invalidate the deliberately later older deadline.
+    let slow_rtt_ms = (newer_at.saturating_duration_since(older_at).as_secs_f64() + 1.0) * 1_000.0;
+    let older = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 4 }, |_| {
+            Some(recovery_timing_snapshot(owner, slow_rtt_ms))
+        })
+        .unwrap();
+    let newer = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 4, end: 8 }, |_| {
+            Some(recovery_timing_snapshot(owner, 10.0))
+        })
+        .unwrap();
+    assert!(older.fallback_at > newer.fallback_at);
+    assert!(older.loss_at > newer.loss_at);
+    let combined = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 8 }, |_| {
+            Some(recovery_timing_snapshot(owner, slow_rtt_ms))
+        })
+        .unwrap();
+    assert_eq!(combined.assignment_at, newer_at);
+    assert_eq!(combined.fallback_at, older.fallback_at);
+    assert_eq!(combined.loss_at, older.loss_at);
+}
+
+#[test]
+fn original_recovery_timing_is_inherited_and_reclaimed_by_ack() {
+    let owner = path(UnderlayProtocol::Tcp, 0, 206);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 8));
+    let first = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 8 }, |_| {
+            Some(recovery_timing_snapshot(owner, 100.0))
+        })
+        .unwrap();
+    ledger.release_normalized_acked_ranges(&[OffsetRange { start: 0, end: 4 }]);
+    assert_eq!(
+        ledger.flights[&4][0].assignment_range,
+        OffsetRange { start: 0, end: 8 }
+    );
+    assert_eq!(ledger.flights[&4][0].original_recovery_timing, Some(first));
+    ledger.release_normalized_acked_ranges(&[OffsetRange { start: 4, end: 8 }]);
+    assert!(ledger.flights.is_empty());
+    assert_eq!(ledger.total_original_data_in_flight_bytes(), 0);
+    assert_eq!(
+        ledger.observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 8 }, |_| {
+            panic!("fully ACKed timing has no separate retained owner")
+        }),
+        None,
+    );
+    ledger.record_original_frame_instance(owner, &data_frame(8, 4));
+    assert!(ledger.flights[&8][0].original_recovery_timing.is_none());
+    ledger.drain_all();
+    assert!(ledger.flights.is_empty());
+}
+
+#[test]
+fn original_recovery_timing_requires_full_original_coverage_before_observation() {
+    let owner = path(UnderlayProtocol::Tcp, 0, 207);
+    let copy = path(UnderlayProtocol::Udp, 1, 208);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 4));
+    ledger.record_reinjection_frame_instance(copy, &data_frame(4, 4));
+    ledger.record_original_frame_instance(owner, &data_frame(8, 4));
+    assert_eq!(
+        ledger
+            .observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 12 }, |_| {
+                panic!("a copy-covered Original hole cannot initialize any clocks")
+            }),
+        None,
+    );
+    assert!(
+        ledger
+            .flights
+            .values()
+            .flatten()
+            .all(|flight| flight.original_recovery_timing.is_none())
+    );
+}
+
 #[test]
 fn reinjection_scrubs_the_flight_owner_not_a_same_range_replacement() {
     let predecessor = path(UnderlayProtocol::Tcp, 0, 41);

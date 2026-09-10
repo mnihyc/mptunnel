@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 16:51 +08:00. Authoritative repository is `./`.
+Updated: 2026-09-10 17:36 +08:00. Authoritative repository is `./`.
 **MPP is not performance-accepted. No release, push, public README update or
 ideality claim. Continue the authorized closure task, not just this checkpoint.**
 
@@ -13,7 +13,61 @@ exact joins, source overlays, tests and archives. Condensation deletes no eviden
 
 ## Decision and active transaction
 
-**Active: authoritative ACK-gap service correction; request RED first.**
+**Active: failed authoritative-gap pilot; exact service-work attribution next.**
+
+Ordinary53390 CLOSED at the unchanged85s guard:368,664,530B confirmed of
+442,040,320B locally accepted; maximum confirmation gap26.666s. Not a completed
+34.503Mbps result. Target writes stop entirely at423,847,786B during60–85s,
+although every path remains active and native counters progress. The reverse
+confirmation leg also has outstanding data. This candidate is NOT accepted.
+
+Whole/phase evidence rejects promotion: sampled target service5–15s67.617Mbps
+versus b0 321.800 BEFORE the cut; strict16→24s improves17.028→72.555 but
+restored25→40s falls340.910→110.545. Cut-phase healthy-link wire service rises
+31.016→165.060Mbps; extra service is real, yet not sufficient ordered delivery.
+All86profiles match, no qdisc drops. Peak summed UP backlog15.06→63.22MB.
+Client consumes roughly one core throughout the eventual flat interval.
+
+Next exact question: does synchronous gap enumeration hold the request Product
+lock for long scans, starving receipt/reverse delivery and prepared writers, or
+are quick repeated wake/dispatch or native stages responsible? Source shows
+per-boundary whole-horizon owner scans, but ordinary counters do not prove the
+critical execution owner. One information-only feature overlay will aggregate
+full evaluator duration, model-query and clock-query work plus evaluated region
+counts using existing periodic lab perf; no per-evaluation log flood. Same
+profile, ordinary failed binary retained, overlay reversed before traffic.
+No runtime parameter/model change or response expansion. An inexpensive scan
+would falsify that cause; a critical expensive scan selects an ownership-view
+correction, not a new quantum, timer or cap. Preserve the failed ordinary
+capture/archive and continuing global gates. No healthy rerun to hide failure.
+
+The implementation/component chronology below is CLOSED, not acceptance.
+
+Focused implementation checks are GREEN:95 distinct tests in the request actor,
+flight ledger/request sender and response T06 opposite control.1.06s runtime;
+last42.62s test compile. New primary test commits two disjoint repairs without
+head ACK and verifies same-range suppression and expired target-slot retention.
+Two migrated-fixture mistakes (pre-loss projection and queue priority order)
+were corrected without changing runtime. The old request scalar clock is
+removed, not retained as dead compatibility state. Shared response/io unchanged.
+
+Ordinary release build41399 CLOSED successfully (81s), frozen at
+`./.tmp/reflection/bin/authoritative-gap-service-request-20260910/mptunnel`.
+Ordinary session53390 is running, tag authoritative-gap-service-qos-0910,
+aggregate combined UP, same direct
+200/200Mbps and46UP200→10→20015–25s,47healthy200,30/70ms, no loss/jitter/outage.
+Explicitly unset per-role binaries, ROUTED, NO_QOS and all diagnostic overrides.
+Existing ordinaryb0 affected/control captures are preserved; no favorable rerun.
+Ordinary timing, phase-specific usefulness and wire/resource cost decide next
+action. No runtime performance promotion, public update or release yet.
+
+RED now CONFIRMED on unchanged b0: actual evaluator refuses independent second
+quantum (0vs14,600B) after all real source, receipt, first-copy, successor timing,
+target and capacity preconditions pass.0.21s test/42.78s compilation. Initial
+private-helper compile error was fixture setup, not the RED. Implementation now
+proceeds request-locally: ledger assignment clocks and evaluator service ranges
+in parallel; no cargo/lab running after closed72409. Focused tests then ordinary
+same-profile QoS UP decide acceptance, not this component result.
 
 The exact capture is CLOSED. It rules out continued Original placement on the
 impaired link or repairs placed back on that link during the sustained collapse.

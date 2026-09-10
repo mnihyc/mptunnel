@@ -5,6 +5,7 @@
 
 use super::state::RequestProductQualificationReceipt;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::timing::{ReliableDataAckGapTiming, reliable_data_ack_gap_timing};
 use crate::model::work::{
     CarrierWorkKind, RangeRecoveryState, ReliableFlightSpan, ReliableLiveOwnerFrontier,
     ambiguous_flight_intervals, flight_evidence_segments, flight_interval_bytes,
@@ -14,8 +15,9 @@ use crate::protocol::frame::{
     normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_extent,
 };
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
+use crate::scheduler::PathSnapshot;
 use smallvec::SmallVec;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -103,6 +105,82 @@ impl RequestFlightLedger {
             .collect()
     }
 
+    /// Exact accepted-copy service coverage at one caller-supplied observation.
+    /// Expiry removes suppression, not the accepted target's flight ownership.
+    pub(in crate::runtime) fn live_copy_coverage(
+        &self,
+        live_instances: &[RelayPathInstance],
+        observed_at: Instant,
+    ) -> (Vec<OffsetRange>, Option<Instant>) {
+        let mut coverage = Vec::new();
+        let mut next_deadline = None::<Instant>;
+        for (start, flights) in &self.flights {
+            for flight in flights {
+                if flight.kind != CarrierWorkKind::ReinjectedData
+                    || !live_instances.contains(&flight.instance)
+                {
+                    continue;
+                }
+                let Some(deadline) = flight.reinjection_suppression_deadline else {
+                    continue;
+                };
+                if deadline <= observed_at {
+                    continue;
+                }
+                coverage.push(OffsetRange {
+                    start: *start,
+                    end: flight.end,
+                });
+                next_deadline =
+                    Some(next_deadline.map_or(deadline, |current| current.min(deadline)));
+            }
+        }
+        (normalize_offset_ranges(coverage), next_deadline)
+    }
+
+    /// One transient boundary view for supplied normalized authoritative gaps.
+    /// Original assignment boundaries survive ACK fragmentation; accepted
+    /// copies contribute their retained boundaries even after expiry because
+    /// their exact targets still own those ranges. This is not new gap evidence.
+    pub(in crate::runtime) fn recovery_service_boundaries(&self, gaps: &[OffsetRange]) -> Vec<u64> {
+        let Some(last_gap) = gaps.last() else {
+            return Vec::new();
+        };
+        let mut boundaries = Vec::new();
+        // This scans the retained ledger prefix through the last gap, once per
+        // view. It does not promise an intersecting-only interval-tree lookup.
+        for (start, flights) in self.flights.range(..last_gap.end) {
+            let first_gap = gaps.partition_point(|gap| gap.end <= *start);
+            for flight in flights {
+                let extent = if flight.kind.is_original_transmission() {
+                    flight.assignment_range
+                } else if flight.kind == CarrierWorkKind::ReinjectedData {
+                    OffsetRange {
+                        start: *start,
+                        end: flight.end,
+                    }
+                } else {
+                    continue;
+                };
+                for gap in gaps[first_gap..]
+                    .iter()
+                    .take_while(|gap| gap.start < flight.end)
+                {
+                    let clipped = OffsetRange {
+                        start: extent.start.max(gap.start),
+                        end: extent.end.min(gap.end),
+                    };
+                    if !clipped.is_empty() {
+                        boundaries.extend([clipped.start, clipped.end]);
+                    }
+                }
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+    }
+
     /// Exact actor-attached live-owner/accepted-copy shape at the lowest
     /// recovery frontier.  Storage chunk boundaries do not divide the result.
     pub(in crate::runtime) fn live_owner_uniform_frontier(
@@ -130,6 +208,106 @@ impl RequestFlightLedger {
                     })
                 }),
         )
+    }
+
+    /// Observes clocks only for Original assignments covering this exact range.
+    ///
+    /// The caller supplies current exact-owner evidence from one coherent
+    /// observation and separately establishes authoritative omission/eligibility.
+    /// Unknown timing keeps the existing underlay-specific fallback; this method
+    /// neither declares an omission nor qualifies a replacement attachment.
+    ///
+    /// ACK fragments retain their full assignment extent. Initializing or
+    /// tightening one fragment synchronizes its siblings inside that extent,
+    /// including siblings outside the queried range, but never other assignments.
+    pub(in crate::runtime) fn observe_original_recovery_timing_for_range(
+        &mut self,
+        range: OffsetRange,
+        mut owner_snapshot: impl FnMut(RelayPathInstance) -> Option<PathSnapshot>,
+    ) -> Option<ReliableDataAckGapTiming> {
+        if range.is_empty() {
+            return None;
+        }
+
+        // Prove complete Original coverage before observing any clock. A copy
+        // or an ACK-released hole cannot supply missing assignment authority.
+        // The transient set is bounded by assignments intersecting this range;
+        // it has no lifetime beyond this serialized query.
+        let mut covered_until = range.start;
+        let mut seen = HashSet::new();
+        let mut assignments = Vec::new();
+        for (start, flights) in self.flights.range(..range.end) {
+            for flight in flights
+                .iter()
+                .filter(|flight| flight.kind.is_original_transmission() && flight.end > range.start)
+            {
+                if *start > covered_until {
+                    return None;
+                }
+                covered_until = covered_until.max(flight.end.min(range.end));
+                let identity = (
+                    flight.instance,
+                    flight.sent_at,
+                    flight.assignment_range.start,
+                    flight.assignment_range.end,
+                );
+                if seen.insert(identity) {
+                    assignments.push(*flight);
+                }
+            }
+        }
+        if covered_until < range.end {
+            return None;
+        }
+
+        let mut aggregate = None::<ReliableDataAckGapTiming>;
+        for assignment in assignments {
+            let observed = reliable_data_ack_gap_timing(
+                Some(assignment.sent_at),
+                Some(assignment.instance.key.underlay),
+                owner_snapshot(assignment.instance),
+            )?;
+            let retained = assignment
+                .original_recovery_timing
+                .map_or(observed, |previous| ReliableDataAckGapTiming {
+                    assignment_at: assignment.sent_at,
+                    loss_at: previous.loss_at.into_iter().chain(observed.loss_at).min(),
+                    fallback_at: previous.fallback_at.min(observed.fallback_at),
+                });
+            if assignment.original_recovery_timing != Some(retained) {
+                // Every survivor starts inside its immutable accepted extent.
+                // Unchanged observations need no sibling walk. Timestamp
+                // equality alone is never an assignment identity.
+                for flights in self
+                    .flights
+                    .range_mut(assignment.assignment_range.start..assignment.assignment_range.end)
+                    .map(|(_, flights)| flights)
+                {
+                    for sibling in flights.iter_mut().filter(|sibling| {
+                        sibling.kind.is_original_transmission()
+                            && sibling.instance == assignment.instance
+                            && sibling.sent_at == assignment.sent_at
+                            && sibling.assignment_range == assignment.assignment_range
+                    }) {
+                        sibling.original_recovery_timing = Some(retained);
+                    }
+                }
+            }
+            // Latest assignment time alone is insufficient once different
+            // assignments have retained different first-observation intervals.
+            aggregate = Some(match aggregate {
+                None => retained,
+                Some(current) => ReliableDataAckGapTiming {
+                    assignment_at: current.assignment_at.max(retained.assignment_at),
+                    loss_at: match (current.loss_at, retained.loss_at) {
+                        (Some(current), Some(next)) => Some(current.max(next)),
+                        _ => None,
+                    },
+                    fallback_at: current.fallback_at.max(retained.fallback_at),
+                },
+            });
+        }
+        aggregate
     }
 
     /// One retained OriginalData range for a non-owning requalification copy.
@@ -228,6 +406,7 @@ impl RequestFlightLedger {
             .or(reinjection_suppression_interval.map(|_| sent_at));
         self.flights.entry(offset).or_default().push(RequestFlight {
             instance,
+            assignment_range: OffsetRange { start: offset, end },
             end,
             bytes,
             sent_at,
@@ -235,6 +414,7 @@ impl RequestFlightLedger {
             evidence_eligible,
             qualification,
             reinjection_suppression_deadline,
+            original_recovery_timing: None,
         });
         if kind.is_original_transmission() {
             self.original_data_in_flight_bytes = self
@@ -1043,6 +1223,8 @@ fn latest_original_transmission(flights: &[RequestFlight]) -> Option<&RequestFli
 #[derive(Debug, Clone, Copy)]
 struct RequestFlight {
     instance: RelayPathInstance,
+    /// Full accepted extent, unchanged when a Data ACK clips this flight.
+    assignment_range: OffsetRange,
     end: u64,
     bytes: usize,
     sent_at: Instant,
@@ -1051,6 +1233,9 @@ struct RequestFlight {
     qualification: Option<RequestProductQualificationReceipt>,
     /// Frozen from the selected carrier's exact snapshot at command commit.
     reinjection_suppression_deadline: Option<Instant>,
+    /// Original-only owner clocks, first observed by authoritative-gap service.
+    /// All retained fragments of one exact assignment share identical minima.
+    original_recovery_timing: Option<ReliableDataAckGapTiming>,
 }
 
 #[cfg(test)]

@@ -1888,12 +1888,10 @@ where
                     )
                 });
                 let data_ack_reinjection_at = state.progress.data_ack_reinjection_at;
-                let retained_data_ack_recovery_due = data_ack_reinjection.has_multipath_alternative
-                    && state
-                        .progress
-                        .ack_gap_reinjection
-                        .next_reinjection_deadline()
-                        .is_some_and(|deadline| deadline <= Instant::now());
+                // Independent authoritative gaps carry their own cause clocks.
+                // Any due range may need the existing native-capacity wake;
+                // the first missing byte alone no longer represents this set.
+                let retained_data_ack_recovery_due = data_ack_reinjection.due_recovery_work;
                 let pending_remote_fin_ready = pending_stream_fin_ready(
                     &recv_stream,
                     state.endpoint.pending_remote_fin_offset,

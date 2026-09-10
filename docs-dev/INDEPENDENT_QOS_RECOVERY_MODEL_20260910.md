@@ -206,3 +206,100 @@ affected shared mixed controls. Retain full timing/completion, both actual link
 loads, copies/duplicates where available, CPU/RSS and latency. No parameter
 adjustment follows an adverse or absent benefit. Response symmetry is assessed
 after the attributable request pilot, not silently claimed from a shared idea.
+
+## Pre-change production RED
+
+2026-09-10 17:05 +08:00. Unchanged b0 runtime; one new test only.
+`runtime::relay::client::tests::authoritative_request_gap_serves_distinct_successor_before_head_copy_ack`
+fails at its intended last admission assertion: queue0 instead of14,600 bytes.
+All preceding actual Original publication, receiver-produced sparse ACK,
+positive ownership release, first repair commitment, frozen copy suppression,
+and successor timing/target/native/Product-room checks pass. Runtime0.21s;
+42.78s compilation. No original assignment time or copy deadline was fabricated.
+
+The receiver acknowledges quanta0 and3, proving only1 and2 missing. First gap
+service queues/commits quantum1. Without acknowledging that repair, the exact
+successor quantum2 has its own matured cause, a measured healthy target and
+available command/Product service. The actual evaluator nevertheless reports
+no measured target and queues nothing because it examines only quantum1.
+This proves the model defect without changing a congestion controller or
+declaring the original carrier failed. It is not yet a performance improvement.
+
+Initial compilation failed because the fixture referenced a private helper;
+that is test setup, not Product RED. The corrected fixture uses the existing
+non-reinjection frame entry, which invokes the same ordinary planner and the
+attached stream's Throughput lane. It adds no production visibility bridge.
+Logs: `./.tmp/reflection/authoritative-gap-service-red-0910.log` and
+`authoritative-gap-service-red-run-0910.log`. Runtime implementation is now
+authorized for this bounded candidate, with ordinary gates still outstanding.
+
+## Implementation boundary review
+
+Original flights retain their full accepted extent and an optional timing
+observation; ACK survivors inherit both. A first/tighter observation updates
+only siblings in that assignment's exact extent, with instance and assignment
+time also checked. A queried range aggregates all contributing absolute clocks,
+not only the latest assignment timestamp. Metadata is reclaimed with existing
+flight ownership; no separate lifetime map, Arc or configured parameter exists.
+It adds per-flight memory, which belongs in ordinary resource comparison.
+Initial coverage queries still scan the retained prefix, not an interval tree;
+only changed-clock sibling updates have assignment-local scan bounds.
+
+Enumeration snapshots queued/live-copy coverage and real assignment/copy
+boundaries once per evaluation. It advances by those regions when unavailable,
+not by an artificial number of14.6KB iterations. It does not establish an
+intersecting-only complexity bound; ordinary CPU cost remains a falsifier.
+
+Important unchanged executor limitation: accepted/drained head copies do not
+block selection/dispatch of disjoint service in this pilot. A provisionally
+queued earlier bound repair that subsequently loses native capacity can still
+block the existing FIFO's later dispatch until that head is reconsidered.
+Selecting independent work is not a universal no-head-of-line queue guarantee.
+The measured capture and intended RED isolate an already accepted head, so no
+new queue scheduler is bundled into this correction. A separate queue-level
+failure would require its own reachable material evidence before expansion.
+
+## Focused candidate result
+
+All95 distinct selected checks pass: real request actor, request flight ledger,
+request sender and unchanged response T06 bound. Primary successor test also
+checks repeated evaluation does not stack queued/accepted ranges, expiry does
+not vacate an accepted target slot, and the second repair actually commits
+without a head-copy ACK. Eight new ledger tests cover timing/clipping/coverage.
+No count is added for the primary test's earlier individual run.
+
+The migrated old integration fixture initially used a pre-loss projected
+deadline as though it necessarily chose the early branch. The existing target
+model can correctly prefer fallback at that earlier instant; the test now waits
+the real loss boundary and evaluates the intended early race there. Its next
+failure assumed the normal queued head would pop before a newly critical
+successor; assertions now check exact one-head/one-disjoint-quantum contents
+irrespective of class order. Neither failure selected a runtime policy change.
+Logs focused, focused-r2 and focused-r3 retain these outcomes.
+
+Independent read-only reviews found no concrete timing, range, capacity-wake,
+rank/Apply or migrated-safety-coverage counterexample in the stable candidate.
+This is component evidence only. The ordinary direct heterogeneous upload is
+next, with the predeclared healthy and shared opposite gates if supported.
+
+## Ordinary pilot rejected for promotion
+
+2026-09-10 17:43 +08:00. The unchanged85s observation guard ends an incomplete
+upload:368,664,530of442,040,320B confirmed, maximum confirmation gap26.666s.
+The actual target-write counter is flat60–85s while all eight native paths
+remain active. This is not merely a slowly draining final tail. Reverse
+confirmation delivery also remains outstanding; cleanup causes the final reset.
+
+Sampled target service during the cut improves17.028→72.555Mbps, but already
+before QoS5–15s falls321.800→67.617; restored25–40s340.910→110.545. The hoped-for
+additional repair pipeline therefore brings some service but fails composition
+badly. No promotion or healthy gate follows. Full ordinary record/archive:
+AUTHORITATIVE_GAP_SERVICE_ORDINARY_20260910.
+
+Source review exposes repeated whole-horizon owner queries per unavailable
+structural boundary under the serialized Product lock. One active CPU core and
+stalled Product service are compatible with that cause, but not proof. A single
+periodic timing/region-count observer is selected to distinguish expensive
+enumeration from short wake/dispatch loops or downstream native service. It
+does not change timing, quantum, congestion, admission or the tested profile.
+This is an information forecast, not another claimed performance correction.

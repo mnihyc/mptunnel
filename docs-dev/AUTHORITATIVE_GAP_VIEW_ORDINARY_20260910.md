@@ -5899,3 +5899,119 @@ no fix, whole-gate acceptance or claim that all repair traffic is unnecessary fo
 Archive: [ORDERED_PREFIX_OUTAGE_DIAGNOSTIC_20260911.raw.tar.gz](ORDERED_PREFIX_OUTAGE_DIAGNOSTIC_20260911.raw.tar.gz).
 Nine regular members: six raw result files, driver, run.py and shape.sh; no config
 or binary.1,610,425B compressed /24,298,353B members; every member byte-compares equal.
+
+## 2026-09-11: avoidance diagnostic83561 — refused target overlaps a real receive head
+
+Information result only. Frozen gap-avoidance-20260911 is011 plus the one-file
+request_gap_avoidance_refusal observer; build succeeds in1m22s with the existing
+unused-wrapper warning. The observer was reversed before traffic. Only that
+event and existing sender decisions/receive-hole/stall events were enabled;
+no ACK, PERF or decode overlay. Active policy remains011, with no fix accepted.
+
+| Own outcome | Result |
+|---|---:|
+| Accepted = confirmed; complete / failed / probe errors |982,056,960B;1 /0 /none|
+| Probe elapsed / whole Mbps; driver elapsed |42.996546s /182.723;43.483085s|
+| First write / confirmation |.105612 /.409245s|
+| Maximum write / confirmation gap |2.447173 /4.184808s|
+| Offered load / raw bins / zero bins |40s /43 /6|
+
+All42 sampled profiles retain independent200+200Mbps, UP70/DOWN30ms and zero
+random loss/jitter/netem drops. Only46UP changes200→10→200 at runner
+15.572685/25.716601s; UDP blackhole state changes30.840716/33.179048s.
+These precede sequential commands, not atomic cut instants; DROP rules are
+separate from netem drops. The43 raw confirmation Mbps bins are:
+```text
+9.552,231.019,222.630,246.296,199.017,210.629,220.888,310.863,229.899,100.998
+356.120,235.294,293.812,319.183,295.019,222.410,57.602,320.223,94.479,206.714
+158.239,195.251,124.853,0,0,0,744.708,88.176,313.676,220.935
+210.314,106.862,0.096,1.690,0,23.209,0,0,8.889,466.054
+279.567,236.042,295.245
+```
+Phase means0–15/15–25/25–30/30–33/33–40/40–43 are
+232.081/137.977/273.499/105.757/71.406/270.285Mbps;5–15=257.271,
+strict16–25=128.596. Final bin is partial; catch-up confirmation is not path capacity.
+
+Client logs contain76,893 guard refusals and25,431 admitted sender decisions
+(25,429 DATA repairs, two FINs); server has126 hole transitions,31 release
+gaps≥100ms and60 sender decisions. Sequences1..102324/1..217 are complete,
+with no Unix regression. Log volume97,652,211B is substantial observer overhead.
+Of all refusals,76,257 select the exact Original owner;636 select another
+avoid-set member. Counts are repeated evaluations, not unique missing bytes,
+guard execution time, or the fraction of delay that a correction could remove.
+
+Exhaustive scored-range/time joins use R_before=next_offset−delivered_bytes.
+Only138 refusals cover the current R_before inside five of31 recorded gaps;
+107 precede every recorded covering repair, across three gaps. All138 select
+the Original owner. The other76,755 do not overlap these logged current heads;
+they are not thereby harmless—shorter/unlogged gaps and future heads remain.
+
+| Current receive head | Gap interval / duration | Refusals | First covering repair relative to release |
+|---|---|---:|---|
+|255,861,123|9.679490–10.058457s /.378967s|20|179ms AFTER|
+|818,222,539|32.053289–32.633457s /.580168s|6|1.717s before|
+|818,344,211|33.465817–33.841457s /.375640s|25|2.907s before|
+|822,407,107|34.950060–35.655457s /.705397s|37|71ms before|
+|824,295,651|35.712194–36.733457s /1.021263s|50|2.002s AFTER|
+
+The strongest first-cover chain is exactly `[822407107,822414243)`,7,136B:
+
+| Boundary | Probe-relative time | Exact log line |
+|---|---:|---:|
+| Previous positive release ends at822,407,107 |34.950060s|derived from server157|
+| First refusal selects forbidden sole owner Q1 |34.955457s|client73144|
+| Last of37 refusals, same range/owner |35.568457s|client75767|
+| First covering persistent repair admitted on Q0 |35.584457s|client75828|
+| Ordered release36,336B;25,056,424B remains reordered |35.655457s|server157|
+
+Thus refusals span613ms of a705.397ms release gap; this is event residence,
+NOT613ms of CPU/guard work. Last refusal→admission is16ms; admission stamp→
+release is71ms. Every refusal has owners=avoid=[Q1 physical1/attachment2],
+target=that same Q1; its scored frontier equals the actual blocked receive head.
+Client retained F advances821,320,267→821,421,803, still below that head:
+the scored gap is not necessarily the sender's lowest retained byte.
+Original frames and the releasing input path are unlogged, so the Q0 repair
+is consistent with release but not proven the winner. No interior server
+management sample exists for this705ms interval; prior target-write parking
+cannot be excluded for every part merely from the receive-gap duration.
+
+The1.021s case contains a genuine T=R824,295,651 sample at35.963457s;
+the next row repeats that SAME generated timestamp, not a second1s plateau.
+Its first repair occurs after release, retaining a concrete Original-delivery
+alternative. No copy was needed to establish that some refusals hit a blocked head.
+Conversely, the largest1.976206s receive gap37.076251–39.052457s has ZERO
+covering refusals. It starts at server165's full reorder drain to866,221,427
+and ends with hole_open=false at server171; an authoritative hole is not proved.
+Distinct target/reply samples866,221,427B/2072B are flat37.963457–38.963457s,
+with zero target socket queues in nearby samples; its remaining owner is unknown.
+
+The4.184808s maximum has no saved exact endpoints. In the zero-bin23–25 band,
+client reply1414B is flat22.962457–25.962457s while server target grows
+617,775,539→682,787,251B and reply1428→1638B over the corresponding wall interval.
+This proves a return hold with forward progress, not whole-gap guard causality.
+
+| Sampled cost | Result |
+|---|---:|
+| UP46 /47; total DOWN class-byte deltas |629,232,347 /829,102,111B;25,901,090B|
+| Total UP /DOWN per confirmed byte |1.484980 /.026374|
+| Client /server peak RSS; final RSS,KiB |306,416 /90,936;289,356 /90,936|
+| Client /server maximum lifetime CPU; final |157 /81.6%;152 /70.3%|
+| UP46 /47 peak backlog; simultaneous sum peak |9,747,056 /8,987,432B;17,401,374B|
+| Client native /Product flight peak; client /server carrier-queue peak |26,347,796 /51,946,024B;636,762 /182,725B|
+
+All eight native identities per role retain epochs without ACK regression; active/suspect/failed summary8/0/0 is not Product qualification. SinkPID25 stays
+alive with no major-fault increase; historical swap672,492KiB is unchanged.
+ps is lifetime CPU, not interval work. Samples do not cover equal settlement
+endpoints; two H3_NO_ERROR warnings follow probe completion. No ordinary speed comparison follows.
+
+Clock anchor is probe.started1789082097.612542868s; log Unix precision is1ms.
+observed_timing is the already-computed pure assignment aggregate BEFORE
+retained-clock observation, not retained D or maturity. Instant Debug lacks an
+event-time anchor; no age/eligibility inference is made. The event proves this
+existing refusal branch was reached, not command capacity or a successful alternative.
+Disposition: material exact-head overlap supports the bounded exclusion-lookup
+regression test; it proves neither whole-gap causality nor practical fix acceptance.
+
+Archive: [ORDERED_PREFIX_AVOIDANCE_DIAGNOSTIC_20260911.raw.tar.gz](ORDERED_PREFIX_AVOIDANCE_DIAGNOSTIC_20260911.raw.tar.gz).
+Eleven regular members: six raw files, driver, observer patch/build log, run.py/shape.sh;
+3,534,161B compressed /100,355,504B members, byte-verified. No binary/config or test RED is included.

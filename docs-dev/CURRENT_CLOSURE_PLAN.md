@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 07:13 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 07:28 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -969,6 +969,66 @@ is rejected by source: only actual covering positives remove retained G; exact
 duplicate elimination does not hide new scoped omissions. Initial unknown
 scope remains distinct. No additional ACK-publication fix or full-range log.
 
+07:23+08 lab83561 CLOSED0: exact982056960B/42.996546s=182.723Mbps,1/1complete,
+allacceptedconfirmed; maxconfirmation4.184808/write2.447173s.97.652MBdiagnostic
+logs are not ordinary performance. The refusal guard actually fires76893times;
+76257selectOriginal,636selectanexistingcopy. On real receiver head822407107,
+37owner-targetrefusals span34.955→35.568s inside a.705s ordered-release gap;
+first coveringQ0copy35.584s precedes release71ms. No direct target management
+sample falls inside that whole gap; do not exclude every localwrite portion.
+Othercriticalmatchesexist, but maximum1.976s receive gap hasNOrefusaloverlap
+andNOopenhole;4.185sconfirmation also includes actualreturnholding whiletarget
+advances65.012MB. This is material range-selection exposure, not all-stall cause.
+
+Test60276 FAILED FIXTURE, not ProductRED: proposed fasterOriginal ranking is
+false before recoveryassertion; panic underProductguard also poisons cleanup.
+7582 repeats onlythat projection aftermovingassertionoutsideguard and confirms
+bothpathsPortableStartup351472bps/333ms,notseeded20/100ms. Sharedhelper seeds
+PerFlowGoodput, intentionally stripped from unrelated path-capacity authority;
+owner29200BProductdebt then makesit slowerthanemptyalternate. No runtimefault
+follows. Correctthefixture's declared typed initial-rate-mbps AND initial-srtt-s
+inputs (existingconfiguration), keep actualclaims/ACK/debt/clocks, and recheck
+actualscoresbeforeintendedRED. Do not boostruntimehints or mutateflightage.
+The failedpatch/log and projectionlog stay preserved. No newlab or runtimefix
+is selected from testcasefailure. Currentcompile/labidle whiletestauthorcorrects.
+
+07:26+08 TRUE RED46767 CLOSED101 at intendedassertion0vs14600B after all
+actualclaim/receiverACK/firstacceptedcopy/unsuppressednextslice/availabletarget/
+immutablematurity controls pass. Typedfixturepriors200Mbpsboth,20/100msRTT
+areassertedfromactualprojections beforetheknownfasterOriginalrank. No artificial
+flightaging or nativeclockadjustment.33xlineproducerfixture stays onecountercase,
+not a newharness. ExacttrueREDpatch/log separatelypreserved fromfailedfixture.
+
+Selected bounded correction: target ranking must consume the SAME byte-range
+ownership alreadyrequiredby the finalguard, not rederive it fromframe-startkeys.
+Pass an explicitrequiredscoring-avoid slice through both productiongap and
+retainedfallback extentadapters beforelowerselection. No optional fallback,
+extra ledgerwalk/index, newclock/quantum/queue/rate or globalhelperreinterpretation.
+Reviewalsofoundownership/eligibility distinction: actor-attached expiredcopies
+stillownbytes whiletemporarilyineligible. Useexistingfrontiersweeps/view withthe
+actualattachedmask; separatelyretain thecurrentcapableOriginal requirement.
+Forward fullscoredM exclusions, notonlyfirstprevieworsoleOriginal. Freshnative/
+policy/Regular-before-Backup andfinalApply checks remainindependentandunchanged.
+This avoids silentlyclaimingall-attached rangecompleteness fromtheoldexact-key
+union. Include a focusedopposite-copy/mask control; noresponse rewrite because
+responsealreadyusesoverlapqueries. RFCclarificationwillstateexistingrangecontract.
+
+Benefitforecast: remove demonstratedfalse-no-target service for clippedregions,
+including .613s observedrefusalspan onablockingprefix. Thatspanis exposure, not
+a measured whollyremovable delay;1.976smaxreceivegap andreturnholdingremainoutside
+thiscause. Extra timelycopiesmaycostwire/sharedlatency; a lowercallcountdoesnot
+promiseCPUorMbpsgain. AfterRED/GREEN+independentmodelreview, oneordinarycandidate
+on the SAME200+200QoS/outageUP cellagainstretained011 baseline. Evaluatefull
+target/confirmationseries, firstservice, everygap/completion andcost. Adverseor
+no materialbenefitstops promotion; nofavourablererun or tuning. Ifsupported,
+affectedhealthyshared500mixedDOWN latencygate follows, not automaticrelease.
+
+Root read complete115line83561appendix and verified11member archiveintegrity/
+manifest; independent bytecomparisons pass. Telegrammilestone sent23:27:19UTC,
+nextnonurgent>=00:27:19UTC; no CPU-resolution/performancevictory claimed. RFC's
+existing range-based exclusion contract is clarified beside its ranked-frontier
+rule; codecorrection is underindependentmaskreview, notacceptedfromcomponentRED.
+
 ## Separate open issue: one-core burst near20%QUIC loss
 
 [Four ordinary500Mbps DOWN controls](QUIC_LOSS_CPU_20260910.md) on d44:
@@ -1103,6 +1163,6 @@ nonrenewing clocks, half-close/cancel and retained capacity wakes.
 Build/artifact identities and failed candidates remain explicit; never run an
 old target/release by assumption. Exact commits only; docs-dev requires force-add.
 PROGRESS is ignored continuity. AGENTS.md immutable; userdoc+7lines untouched.
-Telegram last22:23:28UTC, next nonurgent>=23:23:28UTC. Commentary within60s; verification
+Telegram last23:27:19UTC, next nonurgent>=00:27:19UTC. Commentary within60s; verification
 polls by minutes. Before compaction record current sessions, next decision,
 source/binary identities and open/adverse outcomes. Do not stop at a checkpoint.

@@ -10,8 +10,9 @@ use crate::model::capacity::{
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableRecvStream;
-use crate::protocol::{Frame, UnderlayProtocol};
+use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::scheduler::{PathSnapshot, TrafficClass};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,122 +33,148 @@ pub(in crate::runtime) struct StreamAckPublication {
     pub(in crate::runtime) pending: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(in crate::runtime) struct StreamAckAttachmentPublication {
-    pub(in crate::runtime) accepted: bool,
-    pub(in crate::runtime) published: bool,
+/// One desired feedback state per directional logical stream, not per output.
+#[derive(Debug, Default)]
+pub(in crate::runtime) struct StreamFeedbackState {
+    pub(in crate::runtime) ack_generation: u64,
+    pub(in crate::runtime) cumulative_ack_frames: Vec<Frame>,
+    pub(in crate::runtime) max_data_offset: u64,
 }
 
-/// Per-attachment publication fence for cumulative MPP Data ACK state.
-///
-/// The receive stream remains the sole range owner. This cursor retains only
-/// generation and chunk position, so attachment fanout does not duplicate the
-/// bounded receive-range ledger.
+/// Every service entrypoint may publish either kind. Callers must apply both
+/// effects, including receiver credit and the latest-generation terminal fence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::runtime) struct StreamFeedbackPublication {
+    pub(in crate::runtime) ack_generation: u64,
+    pub(in crate::runtime) ack: StreamAckPublication,
+    pub(in crate::runtime) max_data: StreamMaxDataPublication,
+}
+
+impl StreamFeedbackPublication {
+    pub(in crate::runtime) fn merge(&mut self, other: Self) {
+        debug_assert!(self.ack_generation == 0 || self.ack_generation == other.ack_generation);
+        self.ack_generation = other.ack_generation;
+        self.ack.accepted |= other.ack.accepted;
+        self.ack.published |= other.ack.published;
+        self.ack.pending |= other.ack.pending;
+        self.max_data.published_offset = self
+            .max_data
+            .published_offset
+            .max(other.max_data.published_offset);
+        self.max_data.pending |= other.max_data.pending;
+    }
+}
+
+/// Exact-output publication ownership. Only a blocked immutable ACK tail is
+/// retained; admitted prefix frames release their range allocations at once.
+/// New generations cannot restart this finite job. MAX remains one latest
+/// scalar and receives alternating successful service beside ACK chunks.
 #[derive(Debug, Clone, Default)]
-pub(in crate::runtime) struct StreamAckPublicationCursor {
+pub(in crate::runtime) struct StreamFeedbackPublicationCursor {
     published_generation: u64,
     pending_generation: u64,
-    next_cumulative_frame: usize,
+    pending_frames: VecDeque<Frame>,
+    prefer_max_data: bool,
 }
 
-impl StreamAckPublicationCursor {
-    pub(in crate::runtime) fn publish_update<E>(
+impl StreamFeedbackPublicationCursor {
+    pub(in crate::runtime) fn service<E>(
         &mut self,
-        generation: u64,
-        update_frames: &[Frame],
-        cumulative_frames: &[Frame],
+        state: &StreamFeedbackState,
+        update_frames: Option<&[Frame]>,
+        stream_id: StreamId,
+        published_max_offset: &mut u64,
         mut enqueue: E,
-    ) -> StreamAckAttachmentPublication
+    ) -> StreamFeedbackPublication
     where
         E: FnMut(Frame) -> bool,
     {
-        debug_assert!(generation != 0);
-        debug_assert!(!update_frames.is_empty());
-        debug_assert!(!cumulative_frames.is_empty());
-        debug_assert!(
-            update_frames
-                .iter()
-                .chain(cumulative_frames)
-                .all(|frame| matches!(frame, Frame::StreamAck { .. }))
-        );
-        if self.published_generation == generation {
-            return StreamAckAttachmentPublication {
-                accepted: false,
-                published: true,
-            };
-        }
+        let generation = state.ack_generation;
+        debug_assert!(generation == 0 || !state.cumulative_ack_frames.is_empty());
+        debug_assert!(state.cumulative_ack_frames.iter().chain(update_frames.into_iter().flatten()).all(
+            |frame| matches!(frame, Frame::StreamAck { stream_id: id, .. } if *id == stream_id)
+        ));
+        let mut result = StreamFeedbackPublication {
+            ack_generation: generation,
+            ..Default::default()
+        };
 
-        let previous_generation = generation.wrapping_sub(1);
-        if self.pending_generation == 0 && self.published_generation == previous_generation {
-            let mut accepted = false;
-            for frame in update_frames {
-                if !enqueue(frame.clone()) {
-                    self.pending_generation = generation;
-                    self.next_cumulative_frame = 0;
-                    return StreamAckAttachmentPublication {
-                        accepted,
-                        published: false,
-                    };
-                }
-                accepted = true;
+        // Keep the common immediate path borrowed. Materialize an immutable
+        // tail only on actual blocked admission, never a second healthy copy.
+        let mut current_frames: Option<&[Frame]> = None;
+        let mut current_index = 0;
+        loop {
+            let ack_pending = self.is_pending(generation);
+            let max_pending = *published_max_offset < state.max_data_offset;
+            if !ack_pending && !max_pending {
+                break;
             }
-            self.published_generation = generation;
-            return StreamAckAttachmentPublication {
-                accepted,
-                published: true,
-            };
-        }
+            if max_pending && (self.prefer_max_data || !ack_pending) {
+                if !enqueue(Frame::StreamMaxData {
+                    stream_id,
+                    max_offset: state.max_data_offset,
+                }) {
+                    // ACK may already have an admitted prefix in this call.
+                    // Preserve its remaining borrowed tail before returning.
+                    if let Some(frames) = current_frames {
+                        self.retain_tail(generation, &frames[current_index..]);
+                    }
+                    break;
+                }
+                *published_max_offset = state.max_data_offset;
+                result.max_data.published_offset = Some(state.max_data_offset);
+                self.prefer_max_data = false;
+                continue;
+            }
 
-        self.retry_cumulative(generation, cumulative_frames, enqueue)
+            if let Some(frame) = self.pending_frames.front() {
+                if !enqueue(frame.clone()) {
+                    break;
+                }
+                self.pending_frames.pop_front();
+                result.ack.accepted = true;
+                self.prefer_max_data = true;
+                if self.pending_frames.is_empty() {
+                    self.published_generation = self.pending_generation;
+                    self.pending_generation = 0;
+                    // Drop even the now-empty container's backing storage.
+                    self.pending_frames = VecDeque::new();
+                }
+                continue;
+            }
+
+            let frames = *current_frames.get_or_insert_with(|| {
+                if self.published_generation == generation.wrapping_sub(1) {
+                    update_frames.unwrap_or(&state.cumulative_ack_frames)
+                } else {
+                    &state.cumulative_ack_frames
+                }
+            });
+            debug_assert!(!frames.is_empty());
+            if !enqueue(frames[current_index].clone()) {
+                self.retain_tail(generation, &frames[current_index..]);
+                break;
+            }
+            result.ack.accepted = true;
+            self.prefer_max_data = true;
+            current_index += 1;
+            if current_index == frames.len() {
+                self.published_generation = generation;
+                current_frames = None;
+                current_index = 0;
+            }
+        }
+        result.ack.published = generation != 0 && !self.is_pending(generation);
+        result.ack.pending = self.is_pending(generation);
+        result.max_data.pending = *published_max_offset < state.max_data_offset;
+        result
     }
 
-    pub(in crate::runtime) fn retry_cumulative<E>(
-        &mut self,
-        generation: u64,
-        cumulative_frames: &[Frame],
-        mut enqueue: E,
-    ) -> StreamAckAttachmentPublication
-    where
-        E: FnMut(Frame) -> bool,
-    {
-        debug_assert!(generation != 0);
-        debug_assert!(!cumulative_frames.is_empty());
-        debug_assert!(
-            cumulative_frames
-                .iter()
-                .all(|frame| matches!(frame, Frame::StreamAck { .. }))
-        );
-        if self.published_generation == generation {
-            self.pending_generation = 0;
-            self.next_cumulative_frame = 0;
-            return StreamAckAttachmentPublication {
-                accepted: false,
-                published: true,
-            };
-        }
-        if self.pending_generation != generation {
-            self.pending_generation = generation;
-            self.next_cumulative_frame = 0;
-        }
-
-        let mut accepted = false;
-        while let Some(frame) = cumulative_frames.get(self.next_cumulative_frame) {
-            if !enqueue(frame.clone()) {
-                return StreamAckAttachmentPublication {
-                    accepted,
-                    published: false,
-                };
-            }
-            accepted = true;
-            self.next_cumulative_frame = self.next_cumulative_frame.saturating_add(1);
-        }
-        self.published_generation = generation;
-        self.pending_generation = 0;
-        self.next_cumulative_frame = 0;
-        StreamAckAttachmentPublication {
-            accepted,
-            published: true,
-        }
+    fn retain_tail(&mut self, generation: u64, frames: &[Frame]) {
+        debug_assert!(self.pending_frames.is_empty());
+        debug_assert!(!frames.is_empty());
+        self.pending_generation = generation;
+        self.pending_frames = frames.iter().cloned().collect();
     }
 
     pub(in crate::runtime) fn is_pending(&self, generation: u64) -> bool {
@@ -282,4 +309,171 @@ pub(in crate::runtime) fn reliable_stream_recv_progress_interval(
     transport_pto_from_snapshot(path)
         .div_f64(2.0)
         .max(QUIC_TIMER_GRANULARITY)
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use crate::protocol::OffsetRange;
+
+    fn ack(end: u64) -> Frame {
+        Frame::StreamAck {
+            stream_id: StreamId(1),
+            scope_start: None,
+            ranges: vec![OffsetRange {
+                start: end - 1,
+                end,
+            }],
+        }
+    }
+
+    fn service_slots(
+        cursor: &mut StreamFeedbackPublicationCursor,
+        state: &StreamFeedbackState,
+        update: Option<&[Frame]>,
+        max_offset: &mut u64,
+        slots: usize,
+    ) -> (StreamFeedbackPublication, Vec<Frame>) {
+        let mut frames = Vec::new();
+        let result = cursor.service(state, update, StreamId(1), max_offset, |frame| {
+            if frames.len() == slots {
+                return false;
+            }
+            frames.push(frame);
+            true
+        });
+        (result, frames)
+    }
+
+    #[test]
+    fn feedback_partial_delta_finishes_before_new_generation_without_claiming_latest() {
+        let mut cursor = StreamFeedbackPublicationCursor::default();
+        let mut max_offset = 0;
+        let mut state = StreamFeedbackState {
+            ack_generation: 1,
+            cumulative_ack_frames: vec![ack(1)],
+            max_data_offset: 0,
+        };
+        assert!(
+            service_slots(&mut cursor, &state, Some(&[ack(1)]), &mut max_offset, 1)
+                .0
+                .ack
+                .published
+        );
+        assert_eq!(cursor.pending_frames.capacity(), 0);
+        state.ack_generation = 2;
+        state.cumulative_ack_frames = vec![ack(1), ack(2), ack(3)];
+        let (partial, frames) = service_slots(
+            &mut cursor,
+            &state,
+            Some(&[ack(2), ack(3)]),
+            &mut max_offset,
+            1,
+        );
+        assert_eq!(frames, vec![ack(2)]);
+        assert!(partial.ack.pending);
+        assert_eq!(
+            cursor.pending_frames.iter().cloned().collect::<Vec<_>>(),
+            vec![ack(3)]
+        );
+
+        state.ack_generation = 3;
+        state.cumulative_ack_frames.push(ack(4));
+        state.max_data_offset = 100;
+        let (credit, frames) =
+            service_slots(&mut cursor, &state, Some(&[ack(4)]), &mut max_offset, 1);
+        assert_eq!(
+            frames,
+            vec![Frame::StreamMaxData {
+                stream_id: StreamId(1),
+                max_offset: 100
+            }]
+        );
+        assert_eq!(credit.max_data.published_offset, Some(100));
+        assert!(!credit.ack.published);
+        let (old, frames) = service_slots(&mut cursor, &state, Some(&[ack(4)]), &mut max_offset, 1);
+        assert_eq!(frames, vec![ack(3)]);
+        assert!(
+            !old.ack.published,
+            "old job completion is not the current terminal fence"
+        );
+        assert_eq!(cursor.pending_generation, 3);
+        assert_eq!(
+            cursor.pending_frames.iter().cloned().collect::<Vec<_>>(),
+            vec![ack(4)]
+        );
+        let (latest, frames) = service_slots(&mut cursor, &state, None, &mut max_offset, 1);
+        assert_eq!(frames, vec![ack(4)]);
+        assert!(latest.ack.published && !latest.ack.pending);
+        assert_eq!(cursor.pending_frames.capacity(), 0);
+    }
+
+    #[test]
+    fn feedback_failed_credit_admission_preserves_borrowed_ack_tail_and_turn() {
+        let mut cursor = StreamFeedbackPublicationCursor::default();
+        let mut max_offset = 0;
+        let state = StreamFeedbackState {
+            ack_generation: 1,
+            cumulative_ack_frames: vec![ack(1), ack(2), ack(3)],
+            max_data_offset: 100,
+        };
+        let (result, frames) = service_slots(&mut cursor, &state, None, &mut max_offset, 1);
+        assert_eq!(frames, vec![ack(1)]);
+        assert!(result.ack.pending && result.max_data.pending);
+        assert_eq!(cursor.pending_frames.len(), 2);
+        let retained_pointer = cursor.pending_frames.front().unwrap() as *const Frame;
+        for _ in 0..3 {
+            let (retry, frames) = service_slots(&mut cursor, &state, None, &mut max_offset, 0);
+            assert!(frames.is_empty() && !retry.ack.accepted);
+            assert_eq!(retry.max_data.published_offset, None);
+            assert!(cursor.prefer_max_data);
+            assert_eq!(
+                cursor.pending_frames.front().unwrap() as *const Frame,
+                retained_pointer
+            );
+        }
+        let (result, frames) = service_slots(&mut cursor, &state, None, &mut max_offset, 3);
+        assert_eq!(
+            frames,
+            vec![
+                Frame::StreamMaxData {
+                    stream_id: StreamId(1),
+                    max_offset: 100
+                },
+                ack(2),
+                ack(3)
+            ]
+        );
+        assert!(result.ack.published && !result.max_data.pending);
+        assert_eq!(cursor.pending_frames.capacity(), 0);
+    }
+
+    #[test]
+    fn feedback_skipped_generation_requires_cumulative_not_delta() {
+        let mut cursor = StreamFeedbackPublicationCursor::default();
+        let mut max_offset = 0;
+        let mut state = StreamFeedbackState {
+            ack_generation: 1,
+            cumulative_ack_frames: vec![ack(1)],
+            max_data_offset: 100,
+        };
+        let (_, frames) = service_slots(&mut cursor, &state, Some(&[ack(1)]), &mut max_offset, 2);
+        assert_eq!(
+            frames,
+            vec![
+                ack(1),
+                Frame::StreamMaxData {
+                    stream_id: StreamId(1),
+                    max_offset: 100
+                }
+            ]
+        );
+        state.ack_generation = 3;
+        state.cumulative_ack_frames.extend([ack(2), ack(3)]);
+        let (result, frames) =
+            service_slots(&mut cursor, &state, Some(&[ack(3)]), &mut max_offset, 3);
+        assert_eq!(frames, state.cumulative_ack_frames);
+        assert!(result.ack.published);
+        assert_eq!(cursor.pending_frames.capacity(), 0);
+    }
 }

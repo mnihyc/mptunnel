@@ -853,6 +853,155 @@ async fn exact_requalification_capacity_release_wakes_an_open_idle_source() {
 }
 
 #[test]
+fn server_feedback_joint_retry_preserves_credit_and_current_terminal_fence() {
+    let limits = MuxLimits {
+        max_ack_ranges: 1,
+        ..MuxLimits::default()
+    };
+    let stream_id = StreamId(714);
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let binding = ResponseStreamBinding::new_with_limits(
+        SessionId(714),
+        key.underlay,
+        key.path_id,
+        commands,
+        TrafficClass::Throughput,
+        limits,
+    );
+    let instance = binding.sender_path_targets(TrafficClass::Control, 1)[0]
+        .observation
+        .path_instance_id;
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 0,
+        lane: TrafficClass::Throughput,
+        underlay: key.underlay,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frames_rx.into(),
+    };
+    let mut take_frame = || {
+        let command =
+            try_recv_reliable_path_command(&mut receivers).expect("one admitted feedback frame");
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        let ReliablePathCommand::SendFrame(frame) = command else {
+            panic!("expected ordinary feedback");
+        };
+        assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+        frame
+    };
+    let mut received = ReliableRecvStream::new_with_initial_max_offset(stream_id, limits, 0);
+    let mut progress = ReliableRecvProgress::default();
+    let mut status = ServerAckPublicationState::default();
+    status.record_feedback(path_stream.publish_max_data(5), &mut received);
+    assert_eq!(
+        take_frame(),
+        Frame::StreamMaxData {
+            stream_id,
+            max_offset: 5
+        }
+    );
+    for offset in [0, 2] {
+        received
+            .receive_data(offset, Bytes::from_static(b"x"))
+            .unwrap();
+    }
+    assert!(progress.should_send_ack(&received, None, TrafficClass::Throughput, limits, true));
+    let cumulative = received.ack_frames();
+    assert_eq!(cumulative.len(), 2);
+    let first = path_stream.publish_ack(1, &received.take_ack_update(), cumulative);
+    assert!(first.ack.accepted && first.ack.pending && !first.ack.published);
+    status.record_feedback(first, &mut received);
+
+    received.receive_data(4, Bytes::from_static(b"x")).unwrap();
+    assert!(progress.should_send_ack(&received, None, TrafficClass::Throughput, limits, true));
+    let latest = received.ack_frames();
+    assert_eq!(latest.len(), 3);
+    status.record_feedback(
+        path_stream.publish_ack(2, &received.take_ack_update(), latest.clone()),
+        &mut received,
+    );
+    let blocked = path_stream.publish_max_data(6);
+    assert!(blocked.ack.pending && blocked.max_data.pending);
+    assert_eq!(blocked.max_data.published_offset, None);
+    status.record_feedback(blocked, &mut received);
+    assert_eq!(received.published_max_offset(), 5);
+    assert!(matches!(take_frame(), Frame::StreamAck { ranges, .. }
+        if ranges == vec![OffsetRange { start: 0, end: 1 }]));
+
+    let max_only = path_stream.retry_pending_ack();
+    assert!(!max_only.ack.accepted && !max_only.ack.published && max_only.ack.pending);
+    assert_eq!(max_only.max_data.published_offset, Some(6));
+    status.record_feedback(max_only, &mut received);
+    assert_eq!(
+        received.published_max_offset(),
+        6,
+        "ACK retry must commit admitted MAX"
+    );
+    assert!(
+        !status.current_generation_is_fully_published(),
+        "MAX alone cannot finalize ACK state"
+    );
+    assert_eq!(
+        take_frame(),
+        Frame::StreamMaxData {
+            stream_id,
+            max_offset: 6
+        }
+    );
+
+    let old_tail = path_stream.retry_pending_max_data();
+    assert_eq!(old_tail.ack_generation, 2);
+    assert!(old_tail.ack.accepted && old_tail.ack.pending && !old_tail.ack.published);
+    status.record_feedback(old_tail, &mut received);
+    assert!(
+        !status.current_generation_is_fully_published(),
+        "finishing generation 1 cannot finalize generation 2"
+    );
+    assert!(matches!(take_frame(), Frame::StreamAck { ranges, .. }
+        if ranges == vec![OffsetRange { start: 2, end: 3 }]));
+    for expected in &latest {
+        let publication = path_stream.retry_pending_max_data();
+        status.record_feedback(publication, &mut received);
+        assert_eq!(&take_frame(), expected);
+    }
+    assert!(
+        status.current_generation_is_fully_published(),
+        "MAX retry also reconciles complete latest ACK service"
+    );
+
+    // Like registry attachment replay, this admission happens outside the
+    // actor's local state. Remove its advertising output before reconciliation.
+    let external = path_stream.publish_max_data(7);
+    assert_eq!(external.max_data.published_offset, Some(7));
+    assert_eq!(
+        take_frame(),
+        Frame::StreamMaxData {
+            stream_id,
+            max_offset: 7
+        }
+    );
+    binding.detach_path_instance(key, instance);
+    assert!(!binding.has_live_output());
+    assert_eq!(received.published_max_offset(), 6);
+    let observed = path_stream.feedback_status();
+    assert!(
+        !observed.ack.accepted,
+        "status observation is not new transmission"
+    );
+    assert_eq!(observed.max_data.published_offset, Some(7));
+    status.record_feedback(observed, &mut received);
+    received
+        .receive_data(6, Bytes::from_static(b"x"))
+        .expect("DATA obeying actually advertised credit remains valid after detach");
+}
+
+#[test]
 fn server_completion_waits_for_every_live_ack_publication() {
     let mut publication = ServerAckPublicationState::default();
     publication.record_status(1, true, true);

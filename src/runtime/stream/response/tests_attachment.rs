@@ -345,8 +345,8 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
             .expect("fill initial output priority queue");
     }
     let blocked = binding.publish_max_data(stream_id, established_max_offset);
-    assert_eq!(blocked.published_offset, None);
-    assert!(blocked.pending);
+    assert_eq!(blocked.max_data.published_offset, None);
+    assert!(blocked.max_data.pending);
 
     let alternate = alternate_key(UnderlayProtocol::Udp);
     let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(8);
@@ -362,11 +362,12 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
 
     let replay = binding.retry_pending_max_data(stream_id);
     let published = replay
+        .max_data
         .published_offset
         .expect("available output publishes retained target-established credit");
     assert_eq!(published, established_max_offset);
     assert!(
-        replay.pending,
+        replay.max_data.pending,
         "the blocked opening attachment still needs the retained grant"
     );
     assert!(matches!(
@@ -390,8 +391,11 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
         ));
     }
     let retry = binding.retry_pending_max_data(stream_id);
-    assert_eq!(retry.published_offset, Some(established_max_offset));
-    assert!(!retry.pending);
+    assert_eq!(
+        retry.max_data.published_offset,
+        Some(established_max_offset)
+    );
+    assert!(!retry.max_data.pending);
     assert!(
         matches!(
             try_recv_reliable_path_priority_command(&mut initial_receivers),
@@ -407,8 +411,8 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
         "an already-published output must not receive an unchanged duplicate"
     );
     let settled = binding.retry_pending_max_data(stream_id);
-    assert_eq!(settled.published_offset, None);
-    assert!(!settled.pending);
+    assert_eq!(settled.max_data.published_offset, None);
+    assert!(!settled.max_data.pending);
 }
 
 #[test]
@@ -461,9 +465,9 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
         scope_start: Some(0),
         ranges: vec![OffsetRange { start: 0, end: 8 }],
     }];
-    let first = binding.publish_ack(1, &initial_snapshot, &initial_snapshot);
-    assert!(first.published);
-    assert!(!first.pending);
+    let first = binding.publish_ack(1, &initial_snapshot, initial_snapshot.clone());
+    assert!(first.ack.published);
+    assert!(!first.ack.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut initial_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
@@ -497,9 +501,9 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
             OffsetRange { start: 16, end: 24 },
         ],
     }];
-    let second = binding.publish_ack(2, &update, &cumulative);
-    assert!(second.published);
-    assert!(!second.pending);
+    let second = binding.publish_ack(2, &update, cumulative);
+    assert!(second.ack.published);
+    assert!(!second.ack.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut initial_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
@@ -543,18 +547,18 @@ fn retained_ack_retry_resumes_at_the_first_unaccepted_cumulative_chunk() {
             ranges: vec![OffsetRange { start: 16, end: 24 }],
         },
     ];
-    let first = binding.publish_ack(1, &cumulative, &cumulative);
-    assert!(!first.published);
-    assert!(first.pending);
+    let first = binding.publish_ack(1, &cumulative, cumulative.clone());
+    assert!(!first.ack.published);
+    assert!(first.ack.pending);
 
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 0 }))
     ));
-    let partial = binding.retry_pending_ack(1, &cumulative);
-    assert!(partial.accepted);
-    assert!(!partial.published);
-    assert!(partial.pending);
+    let partial = binding.retry_pending_ack(stream_id);
+    assert!(partial.ack.accepted);
+    assert!(!partial.ack.published);
+    assert!(partial.ack.pending);
     for nonce in 1..8 {
         assert!(matches!(
             try_recv_reliable_path_priority_command(&mut receivers),
@@ -568,19 +572,19 @@ fn retained_ack_retry_resumes_at_the_first_unaccepted_cumulative_chunk() {
             if ranges == vec![OffsetRange { start: 0, end: 8 }]
     ));
 
-    let complete = binding.retry_pending_ack(1, &cumulative);
-    assert!(complete.accepted);
-    assert!(complete.published);
-    assert!(!complete.pending);
+    let complete = binding.retry_pending_ack(stream_id);
+    assert!(complete.ack.accepted);
+    assert!(complete.ack.published);
+    assert!(!complete.ack.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. }))
             if ranges == vec![OffsetRange { start: 16, end: 24 }]
     ));
-    let fenced = binding.retry_pending_ack(1, &cumulative);
-    assert!(!fenced.accepted);
-    assert!(fenced.published);
-    assert!(!fenced.pending);
+    let fenced = binding.retry_pending_ack(stream_id);
+    assert!(!fenced.ack.accepted);
+    assert!(fenced.ack.published);
+    assert!(!fenced.ack.pending);
 }
 
 #[test]
@@ -660,8 +664,8 @@ fn retained_response_ack_catchup_services_newer_max_data_under_generation_churn(
     // in this fixture relies on manufactured/unlimited sole-path credit.
     let initial_max = limits.max_stream_window_bytes;
     let initial = binding.publish_max_data(stream_id, initial_max);
-    assert_eq!(initial.published_offset, Some(initial_max));
-    assert!(!initial.pending);
+    assert_eq!(initial.max_data.published_offset, Some(initial_max));
+    assert!(!initial.max_data.pending);
     received.commit_max_data(initial_max);
     for receivers in [&mut a_receivers, &mut b_receivers] {
         let frame = take_frame(receivers);
@@ -689,15 +693,15 @@ fn retained_response_ack_catchup_services_newer_max_data_under_generation_churn(
     truthful_acks.extend(baseline.clone());
     let update = received.take_ack_update();
     truthful_acks.extend(update.clone());
-    let first = binding.publish_ack(progress.ack_generation(), &update, &baseline);
-    assert!(first.published && !first.pending);
+    let first = binding.publish_ack(progress.ack_generation(), &update, baseline);
+    assert!(first.ack.published && !first.ack.pending);
     for receivers in [&mut a_receivers, &mut b_receivers] {
         apply_feedback(&take_frame(receivers), &mut peer, &truthful_acks);
     }
     let baseline_max = received.max_data_offset();
     let first_credit = binding.publish_max_data(stream_id, baseline_max);
-    assert_eq!(first_credit.published_offset, Some(baseline_max));
-    assert!(!first_credit.pending);
+    assert_eq!(first_credit.max_data.published_offset, Some(baseline_max));
+    assert!(!first_credit.max_data.pending);
     received.commit_max_data(baseline_max);
     for receivers in [&mut a_receivers, &mut b_receivers] {
         apply_feedback(&take_frame(receivers), &mut peer, &truthful_acks);
@@ -755,16 +759,16 @@ fn retained_response_ack_catchup_services_newer_max_data_under_generation_churn(
         truthful_acks.extend(update.clone());
 
         // Match the real publisher and reconciliation order: ACK, then MAX.
-        let ack = binding.publish_ack(generation, &update, &cumulative);
+        let ack = binding.publish_ack(generation, &update, cumulative);
         assert!(
-            ack.published,
+            ack.ack.published,
             "unconstrained A publishes the current generation"
         );
         let desired_max = received.max_data_offset();
         let credit = binding.publish_max_data(stream_id, desired_max);
-        assert_eq!(credit.published_offset, Some(desired_max));
+        assert_eq!(credit.max_data.published_offset, Some(desired_max));
         received.commit_max_data(desired_max);
-        binding.retry_pending_ack(generation, &cumulative);
+        binding.retry_pending_ack(stream_id);
         binding.retry_pending_max_data(stream_id);
         for _ in 0..2 {
             apply_feedback(&take_frame(&mut a_receivers), &mut peer, &truthful_acks);
@@ -779,7 +783,7 @@ fn retained_response_ack_catchup_services_newer_max_data_under_generation_churn(
         if turn == 0 {
             assert_eq!(frame, Frame::Ping { nonce: 91 });
             assert!(
-                ack.pending && credit.pending,
+                ack.ack.pending && credit.max_data.pending,
                 "B retains both unsent obligations"
             );
         } else {
@@ -823,7 +827,12 @@ fn retained_ack_publication_status_excludes_a_detached_fence() {
         scope_start: Some(0),
         ranges: vec![OffsetRange { start: 0, end: 8 }],
     }];
-    assert!(binding.publish_ack(1, &cumulative, &cumulative).published);
+    assert!(
+        binding
+            .publish_ack(1, &cumulative, cumulative.clone())
+            .ack
+            .published
+    );
 
     let alternate = alternate_key(UnderlayProtocol::Udp);
     let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
@@ -841,16 +850,22 @@ fn retained_ack_publication_status_excludes_a_detached_fence() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    let mixed = binding.retry_pending_ack(1, &cumulative);
-    assert!(mixed.published, "the original live output remains fenced");
-    assert!(mixed.pending, "the new output still needs cumulative state");
+    let mixed = binding.retry_pending_ack(stream_id);
+    assert!(
+        mixed.ack.published,
+        "the original live output remains fenced"
+    );
+    assert!(
+        mixed.ack.pending,
+        "the new output still needs cumulative state"
+    );
 
     let initial_commands =
         with_output_entry_for_key(&binding, initial, |entry| entry.commands.clone());
     binding.detach(initial, &initial_commands);
-    let only_blocked_output = binding.retry_pending_ack(1, &cumulative);
-    assert!(!only_blocked_output.published);
-    assert!(only_blocked_output.pending);
+    let only_blocked_output = binding.retry_pending_ack(stream_id);
+    assert!(!only_blocked_output.ack.published);
+    assert!(only_blocked_output.ack.pending);
 }
 
 #[test]

@@ -727,3 +727,51 @@ Data ACK signaling; RFC9000 §13.2.3–4 discusses ACK-range retention and obtai
 ACK receipt evidence. MPP still needs its own exact logical-owner contract.
 Sources: https://www.rfc-editor.org/rfc/rfc8684.html#section-3.3.2 and
 https://www.rfc-editor.org/rfc/rfc9000.html#section-13.2.3.
+
+### Prerequisite outcome and next selection contract — 2026-09-10 09:37 +08
+
+Both real generation-churn REDs become GREEN, and220unique focused controls
+pass. The shared helper retains no tail allocation after immediate or completed
+service; old partial deltas keep exact ancestry, blocked retries do not move
+their cursor/turn, and missed generations use cumulative coverage. Real client
+and server controls exercise cross-kind credit and current terminal fences.
+Server admitted credit persists through advertising-output removal and is
+reconciled after complete ready-batch dequeue, before DATA validation. Source
+review confirms finite ready continuation, retained writes and tail teardown.
+Logs and disposition are in CURRENT_CLOSURE_PLAN. This is the intended local
+correction, not an ordinary throughput or RSS acceptance result.
+
+The next candidate discovers service without an opposite-direction quality
+guess: full fanout remains active during one discovery round, with at most one
+ordered Probe per exact eligible output. The first timely logical-owner Receipt
+selects its PROBED output, not its returning carrier. Other round tokens become
+obsolete. Selected rounds validate that output only. Missing proof or exact
+output loss restores full fanout and discovery; single-output and idle streams
+need no redundancy-reduction probe. First/terminal facts retain full fanout.
+This measures round-trip feedback/owner/reply service, not capacity or one-way
+quality. A timely selected output may remain selected when another gets faster;
+no optimal-choice claim is made. Single-copy same-attachment replies bound
+discovery to N probes plus N replies rather than N-squared fanout. Reply loss
+conservatively keeps or restores baseline publication.
+
+Captured ACK/MAX targets and membership never chase fresh DATA. The ordered
+marker receives the next admission opportunity after its captured exact-output
+fences are covered, before newer feedback consumes that slot. ACK/MAX fairness
+alone is insufficient on a continuously busy capacity-one queue. One retained
+marker per current round/output uses the existing ordinary feedback FIFO and
+capacity wake, not a higher-priority command lane or another queue.
+
+A proof covers its captured cut, not later facts. Keep the first-unproved
+successor time while an earlier marker is outstanding. Its deadline cannot
+restart when the older receipt arrives. At most the active round and oldest
+successor anchor are needed, not a generation journal. Expire first, including
+inside retained writes/flush, before accepting late receipts. Confirmation
+changes only publication policy, never receipt truth, credit authority or
+sample/progress clocks. Exact logical application and diverted client MAX
+reconciliation must precede reply; registry routing success is insufficient.
+
+Two required wire kinds need an explicit clean-break version change: codec
+version14 rejects unknown versions/kinds, and RFC already declares no downgrade
+mode. Do not silently extend version14 or invent a compatibility fallback.
+The existing performance forecast and adverse-timing stop conditions still
+govern this prototype; no new baseline run is needed before its mechanism tests.

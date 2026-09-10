@@ -63,6 +63,7 @@ use crate::runtime::sender::{
     reliable_relay_can_read_product_source, reliable_relay_sender_queue_limit,
     reliable_relay_sender_queue_read_budget,
 };
+use crate::runtime::stream::StreamFeedbackPublication;
 use crate::runtime::stream::{
     OpenedRemoteStream, ReliablePathStreamOutput, ReliableRelayOpenedStartup,
     ReliableRelayRemoteFrame, ReliableRelayRemoteSet, ReliableRelayReturnPlan,
@@ -280,14 +281,18 @@ where
 fn retry_stream_ack_and_commit_ready_fin<'a, S>(
     local: &'a mut S,
     state: &'a mut ClientRelayState,
-    recv_stream: &'a ReliableRecvStream,
+    recv_stream: &'a mut ReliableRecvStream,
     remotes: &mut ReliableRelayRemoteSet,
 ) -> impl Future<Output = Result<(), RuntimeError>> + use<'a, S>
 where
     S: AsyncWrite + Unpin,
 {
     let publication = remotes.retry_pending_stream_ack();
-    let feedback_published = if publication.published
+    if let Some(published_offset) = publication.max_data.published_offset {
+        recv_stream.commit_max_data(published_offset);
+    }
+    state.record_recv_progress_sent(publication);
+    let feedback_published = if publication.ack.published
         && pending_stream_fin_ready(recv_stream, state.endpoint.pending_remote_fin_offset)
     {
         state.progress.sender_retry_at = None;
@@ -441,14 +446,13 @@ pub(in crate::runtime) async fn resolve_client_relay_path_error_for_test(
 
 fn record_final_recv_progress_enqueue(
     state: &mut ClientRelayState,
-    sent: bool,
+    publication: StreamFeedbackPublication,
     path: Option<crate::scheduler::PathSnapshot>,
 ) {
-    state.record_recv_progress_sent(sent);
-    if !sent {
-        // Forced final feedback always has work. A false result means every
-        // carrier control queue was full, so keep FIN pending and retry on
-        // writer capacity or the bounded sender retry timer.
+    state.record_recv_progress_sent(publication);
+    if !publication.ack.published {
+        // Admitting MAX or an older ACK tail does not publish this final ACK.
+        // Keep FIN pending until an output accepts the complete latest ACK.
         state.progress.sender_retry_at =
             Some(tokio::time::Instant::now() + sender_service_retry_delay(path));
     }
@@ -777,6 +781,7 @@ where
     let mut request_requalification_capacity_wait = None;
     let mut accepted_copy_wake_at = None::<Instant>;
     let mut observed_stream_ack_generation = remotes.stream_ack_generation();
+    let mut observed_feedback_max_offset = remotes.feedback_max_data_offset();
     let mut stream_ack_capacity_wait = None;
     let stream_id = remotes.stream_id();
     let telemetry_flow = context.telemetry.open_reliable_flow(
@@ -1026,7 +1031,7 @@ where
                         {
                             Ok(sent) => {
                                 record_final_recv_progress_enqueue(&mut state, sent, path_snapshot);
-                                sent
+                                sent.ack.published
                             }
                             Err(err) if reliable_path_error_is_migratable(&err) => false,
                             Err(err) => break Err(err),
@@ -1166,11 +1171,15 @@ where
                 request_recovery_dirty = true;
             }
             let stream_ack_generation = remotes.stream_ack_generation();
-            if request_membership_changed || stream_ack_generation != observed_stream_ack_generation
+            let feedback_max_offset = remotes.feedback_max_data_offset();
+            if request_membership_changed
+                || stream_ack_generation != observed_stream_ack_generation
+                || feedback_max_offset != observed_feedback_max_offset
             {
                 observed_stream_ack_generation = stream_ack_generation;
+                observed_feedback_max_offset = feedback_max_offset;
                 // The old wait does not cover a replacement attachment or a
-                // newly retained cumulative generation.
+                // newly retained ACK/MAX state on a previously caught-up output.
                 stream_ack_capacity_wait = None;
             }
             let accepted_copy_observation =
@@ -1861,17 +1870,16 @@ where
                     &recv_stream,
                     state.endpoint.pending_remote_fin_offset,
                 );
-                let pending_local_shutdown = if !remotes.has_pending_stream_ack_publication() {
+                let pending_local_shutdown = if !remotes.has_pending_feedback_publication() {
                     stream_ack_capacity_wait = None;
                     None
                 } else if stream_ack_capacity_wait.is_none() {
-                    let capacity_wait = arm_carrier_capacity_notifies(
-                        remotes.pending_stream_ack_capacity_notifies(),
-                    );
+                    let capacity_wait =
+                        arm_carrier_capacity_notifies(remotes.pending_feedback_capacity_notifies());
                     let local_shutdown = retry_stream_ack_and_commit_ready_fin(
                         &mut local,
                         &mut state,
-                        &recv_stream,
+                        &mut recv_stream,
                         remotes,
                     );
                     Some((capacity_wait, local_shutdown))
@@ -1919,7 +1927,7 @@ where
                     break Err(err);
                 }
                 let product = request_product.lock();
-                if product.remotes.has_pending_stream_ack_publication() {
+                if product.remotes.has_pending_feedback_publication() {
                     stream_ack_capacity_wait = capacity_wait;
                 }
             }
@@ -1964,9 +1972,6 @@ where
             requalification_ack_capacity_wait,
             requalification_ack_blocked,
             has_requalification_ack_capacity_wait,
-            max_data_capacity_wait,
-            max_data_publication_blocked,
-            has_max_data_capacity_wait,
             return_plan_final_capacity_wait,
             return_plan_final_blocked,
             has_return_plan_final_capacity_wait,
@@ -1992,7 +1997,7 @@ where
                 &mut product.send_stream,
                 &mut product.remotes,
             );
-            let stream_ack_publication_blocked = remotes.has_pending_stream_ack_publication();
+            let stream_ack_publication_blocked = remotes.has_pending_feedback_publication();
             let has_stream_ack_capacity_wait = stream_ack_capacity_wait.is_some();
             let requalification_ack_pending = remotes.has_pending_requalification_ack();
             let requalification_ack_capacity_wait = requalification_ack_pending
@@ -2011,19 +2016,6 @@ where
             }
             let requalification_ack_blocked = remotes.has_pending_requalification_ack();
             let has_requalification_ack_capacity_wait = requalification_ack_capacity_wait.is_some();
-            let max_data_publication_pending = remotes.has_pending_max_data_publication();
-            let max_data_capacity_wait = max_data_publication_pending
-                .then(|| {
-                    arm_carrier_capacity_notifies(remotes.pending_max_data_capacity_notifies())
-                })
-                .flatten();
-            if max_data_publication_pending
-                && let Some(published_offset) = remotes.retry_pending_max_data().published_offset
-            {
-                recv_stream.commit_max_data(published_offset);
-            }
-            let max_data_publication_blocked = remotes.has_pending_max_data_publication();
-            let has_max_data_capacity_wait = max_data_capacity_wait.is_some();
             let return_plan_final_pending = remotes.has_pending_return_plan_final_publication();
             let return_plan_final_capacity_wait = return_plan_final_pending
                 .then(|| {
@@ -2167,9 +2159,6 @@ where
                 requalification_ack_capacity_wait,
                 requalification_ack_blocked,
                 has_requalification_ack_capacity_wait,
-                max_data_capacity_wait,
-                max_data_publication_blocked,
-                has_max_data_capacity_wait,
                 return_plan_final_capacity_wait,
                 return_plan_final_blocked,
                 has_return_plan_final_capacity_wait,
@@ -2317,7 +2306,7 @@ where
                             sent,
                             response_path_snapshot,
                         );
-                        sent
+                        sent.ack.published
                     }
                     Err(err) if reliable_path_error_is_migratable(&err) => {
                         state.progress.sender_retry_at = None;
@@ -2649,7 +2638,7 @@ where
                 )
                 {
                     Ok(sent) => {
-                        if sent {
+                        if sent.ack.published || sent.max_data.published_offset.is_some() {
                             state.progress.last_stream_at = Instant::now();
                         }
                         state.progress.last_recv_progress_sent_at = Instant::now();
@@ -2885,13 +2874,6 @@ where
                     wait.await;
                 }
             }, if requalification_ack_blocked && has_requalification_ack_capacity_wait => {
-                continue;
-            }
-            _ = async move {
-                if let Some(wait) = max_data_capacity_wait {
-                    wait.await;
-                }
-            }, if max_data_publication_blocked && has_max_data_capacity_wait => {
                 continue;
             }
             _ = async move {
@@ -3573,20 +3555,23 @@ where
                                         }
 
                                         let stream_ack_pending =
-                                            remotes.has_pending_stream_ack_publication();
+                                            remotes.has_pending_feedback_publication();
                                         let stream_ack_capacity_wait = stream_ack_pending
                                             .then(|| {
                                                 arm_carrier_capacity_notifies(
-                                                    remotes.pending_stream_ack_capacity_notifies(),
+                                                    remotes.pending_feedback_capacity_notifies(),
                                                 )
                                             })
                                             .flatten();
                                         if stream_ack_pending {
                                             let publication = remotes.retry_pending_stream_ack();
-                                            state.record_recv_progress_sent(publication.published);
+                                            if let Some(published_offset) = publication.max_data.published_offset {
+                                                recv_stream.commit_max_data(published_offset);
+                                            }
+                                            state.record_recv_progress_sent(publication);
                                         }
                                         let stream_ack_blocked =
-                                            remotes.has_pending_stream_ack_publication();
+                                            remotes.has_pending_feedback_publication();
                                         let has_stream_ack_capacity_wait =
                                             stream_ack_capacity_wait.is_some();
 
@@ -3847,7 +3832,7 @@ where
                                                 sent,
                                                 current_response_path_snapshot,
                                             );
-                                            sent
+                                            sent.ack.published
                                         }
                                         Err(err) if reliable_path_error_is_migratable(&err) => false,
                                         Err(err) => break Err(err),
@@ -4050,7 +4035,7 @@ where
                                                 sent,
                                                 response_path_snapshot,
                                             );
-                                            sent
+                                            sent.ack.published
                                         }
                                         Err(err) if reliable_path_error_is_migratable(&err) => false,
                                         Err(err) => break Err(err),

@@ -694,7 +694,8 @@ fn newer_switchable_product_rate_changes_scalar_ranking_without_rewriting_author
         entries: vec![entry],
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
-        desired_max_data_offset: 0,
+        feedback: Default::default(),
+        admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
         next_requalification_candidate_index: 0,
     };
@@ -1679,7 +1680,8 @@ fn sole_quic_output_retains_native_exploration_after_rate_expiry_without_shrinki
         entries: vec![entry],
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
-        desired_max_data_offset: 0,
+        feedback: Default::default(),
+        admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
         next_requalification_candidate_index: 0,
     };
@@ -1755,7 +1757,8 @@ fn partial_udp_product_epoch_survives_for_diagnostics_without_becoming_completio
         entries: vec![entry],
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
-        desired_max_data_offset: 0,
+        feedback: Default::default(),
+        admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
         next_requalification_candidate_index: 0,
     };
@@ -2038,7 +2041,8 @@ fn best_live_path_uses_completion_score_including_command_queue() {
         entries: vec![queued, clear],
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
-        desired_max_data_offset: 0,
+        feedback: Default::default(),
+        admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
         next_requalification_candidate_index: 0,
     };
@@ -2078,7 +2082,8 @@ fn best_live_path_uses_peer_available_before_faster_backup() {
         entries: vec![backup, available],
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
-        desired_max_data_offset: 0,
+        feedback: Default::default(),
+        admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
         next_requalification_candidate_index: 0,
     };
@@ -2148,7 +2153,8 @@ fn response_source_admission_sums_only_the_exact_preferred_output_tier() {
         entries,
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
-        desired_max_data_offset: 0,
+        feedback: Default::default(),
+        admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
         next_requalification_candidate_index: 0,
     };
@@ -2233,7 +2239,8 @@ fn closed_and_draining_outputs_are_excluded_from_new_product_selection() {
         entries: vec![closed, draining, live],
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
-        desired_max_data_offset: 0,
+        feedback: Default::default(),
+        admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
         next_requalification_candidate_index: 0,
     };

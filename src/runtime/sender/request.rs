@@ -57,6 +57,7 @@ use crate::runtime::relay::io::{
 };
 #[cfg(test)]
 use crate::runtime::stream::ReliablePathStreamHandle;
+use crate::runtime::stream::StreamFeedbackPublication;
 use crate::runtime::stream::{
     ReliablePathStreamOutput, ReliableRecvProgress, ReliableRelayRemoteSet, RequalificationAttempt,
 };
@@ -1446,15 +1447,15 @@ impl RequestSenderService {
         recv_stream: &mut ReliableRecvStream,
         progress: &mut ReliableRecvProgress,
         request: RelayRecvProgressSend,
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<StreamFeedbackPublication, RuntimeError> {
         if !remotes.has_receive_feedback_output() {
             // Closed command admission is not attachment-removal authority.
             // Preserve cumulative feedback until the ordered carrier terminal
             // event removes this exact attachment or a successor accepts it.
-            return Ok(false);
+            return Ok(StreamFeedbackPublication::default());
         }
 
-        let mut sent_any = false;
+        let mut emitted = StreamFeedbackPublication::default();
         let ack_generation_before = progress.ack_generation();
         if progress.should_send_ack(
             recv_stream,
@@ -1507,7 +1508,10 @@ impl RequestSenderService {
                 }
                 remotes.publish_stream_ack(generation, update_frames, ack_frames)
             };
-            sent_any |= publication.published;
+            if let Some(published_offset) = publication.max_data.published_offset {
+                recv_stream.commit_max_data(published_offset);
+            }
+            emitted.merge(publication);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "recv_progress_ack_emit",
@@ -1517,8 +1521,8 @@ impl RequestSenderService {
                     "recv_progress",
                     generation,
                     generation != ack_generation_before,
-                    publication.published,
-                    publication.pending,
+                    publication.ack.published,
+                    publication.ack.pending,
                 ),
             );
         }
@@ -1538,12 +1542,15 @@ impl RequestSenderService {
             );
             let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
             let publication = remotes.publish_max_data(max_offset);
-            if let Some(published_offset) = publication.published_offset {
+            if let Some(published_offset) = publication.max_data.published_offset {
                 recv_stream.commit_max_data(published_offset);
-                sent_any = true;
             }
+            emitted.merge(publication);
         }
-        Ok(sent_any)
+        // A later service pass may clear debt reported by the earlier one.
+        emitted.ack.pending = remotes.has_pending_stream_ack_publication();
+        emitted.max_data.pending = remotes.has_pending_max_data_publication();
+        Ok(emitted)
     }
 
     pub(in crate::runtime) fn enqueue_tail_reinjection(

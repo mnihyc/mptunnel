@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 00:52 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 09:37 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,23 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+Prerequisite result: both generation-churn REDs now pass (95s compilation,
+0.01s execution); all220unique focused stream/sender/client/server checks pass.
+Evidence: `./.tmp/reflection/feedback-service-prerequisite-green-0910.log`
+and `./.tmp/reflection/feedback-service-focused-0910.log`. Independent helper,
+client and server reviews found no remaining concrete counterexample within
+this contract. MAX-only service cannot complete terminal ACK; old-tail
+completion cannot publish a newer generation. Server registry catch-up retains
+actual admitted credit across detach and reconciles after ready-batch dequeue,
+before DATA validation. Closed/retiring outputs discard their unsent tails;
+the immediate path retains no additional tail allocation.
+
+Disposition: exact prerequisite fixed, combined practical trial pending. No
+ordinary speed benefit is claimed, no controller/cadence/pool change, no new
+release comparator. Its stated retention cost is unchanged. Next is the one
+confirmed-return candidate described below, with full-fanout discovery rather
+than an arbitrarily preferred carrier. Old rejected trials remain rejected.
 
 00:52 prerequisite outcome: both real producer/queue tests fail at their
 intended assertions before runtime changes. The request backup repeats chunk

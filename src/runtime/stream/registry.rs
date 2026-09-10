@@ -1573,8 +1573,11 @@ impl ServerReliableStreamRegistry {
             // Attachment acceptance remains zero-credit and carrier-local.
             // If the target is already established, immediately replay the
             // retained logical grant on this newly attached output as a later
-            // cumulative update. The carrier actor writes its direct zero ACK
-            // before polling this ordered command queue.
+            // cumulative update. Fair service may also complete retained ACK
+            // work. The binding preserves admitted credit and ACK fences for
+            // actor reconciliation before DATA validation or finalization.
+            // The carrier actor writes its direct zero ACK before polling
+            // this ordered command queue.
             entry.binding.retry_pending_max_data(stream_id);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(

@@ -24,7 +24,7 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::proof::PathProofObservation;
 use crate::runtime::stream::feedback::{
-    StreamAckPublication, StreamAckPublicationCursor, StreamMaxDataPublication,
+    StreamFeedbackPublication, StreamFeedbackPublicationCursor, StreamFeedbackState,
 };
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use crate::transport::RateHint;
@@ -189,8 +189,8 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) original_data_acked_bytes: u64,
     /// Greatest shared receive grant accepted by this attachment's queue.
     pub(super) published_max_data_offset: u64,
-    /// Latest cumulative Data ACK generation accepted by this attachment.
-    pub(super) ack_publication: StreamAckPublicationCursor,
+    /// Exact ACK catch-up and fair ACK/MAX service owned by this attachment.
+    pub(super) ack_publication: StreamFeedbackPublicationCursor,
     pub(super) local_path_metrics: Option<ServerPathMetricsEntry>,
     pub(super) peer_path_metrics: Option<ServerPathMetricsEntry>,
     /// Complete endpoint-local NativeMode decision/shape for this exact QUIC
@@ -218,116 +218,71 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
     /// Offset-free sender-service staging belongs to the response stream, not
     /// to any carrier output.
     pub(super) data_level_queue_bytes: u64,
-    /// Retained idempotent receive grant shared by every attachment.
-    pub(super) desired_max_data_offset: u64,
+    /// Sole materialized latest ACK and receive-grant owner, shared by outputs.
+    pub(super) feedback: StreamFeedbackState,
+    /// Greatest grant actually admitted, including an output later detached.
+    /// Registry attachment replay can advertise credit outside the relay actor.
+    pub(super) admitted_max_data_offset: u64,
     pub(super) next_requalification_probe_id: Option<u64>,
     /// Fair round-robin start for the next stale requalification attempt.
     /// Output order remains stable for every other scheduling decision.
     pub(super) next_requalification_candidate_index: usize,
 }
 
-fn publish_pending_max_data(
+fn service_feedback(
     outputs: &mut ResponseStreamOutputs,
     stream_id: StreamId,
-) -> StreamMaxDataPublication {
-    let desired = outputs.desired_max_data_offset;
-    let mut publication = StreamMaxDataPublication::default();
-    for entry in &mut outputs.entries {
-        if entry.commands.control_frame_admission_is_closed()
-            || entry.published_max_data_offset >= desired
-        {
-            continue;
-        }
-        if entry
-            .commands
-            .try_enqueue_admitted_frame(
-                Frame::StreamMaxData {
-                    stream_id,
-                    max_offset: desired,
-                },
-                TrafficClass::Control,
-            )
-            .is_ok()
-        {
-            entry.published_max_data_offset = desired;
-            publication.published_offset = Some(desired);
-        }
-    }
-    publication.pending = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_admission_is_closed()
-            && entry.published_max_data_offset < desired
-    });
-    publication
-}
-
-fn publish_ack_update(
-    outputs: &mut ResponseStreamOutputs,
-    generation: u64,
-    update_frames: &[Frame],
-    cumulative_frames: &[Frame],
-) -> StreamAckPublication {
-    let mut publication = StreamAckPublication::default();
+    update_frames: Option<&[Frame]>,
+) -> StreamFeedbackPublication {
+    let mut publication = StreamFeedbackPublication {
+        ack_generation: outputs.feedback.ack_generation,
+        ..Default::default()
+    };
     for entry in &mut outputs.entries {
         if entry.commands.control_frame_admission_is_closed() {
+            // Closed control admission never reopens on this exact command
+            // queue. Keep lifecycle/flight ownership, not an unserviceable tail.
+            entry.ack_publication = StreamFeedbackPublicationCursor::default();
             continue;
         }
         let commands = &entry.commands;
-        let attachment = entry.ack_publication.publish_update(
-            generation,
+        let attachment = entry.ack_publication.service(
+            &outputs.feedback,
             update_frames,
-            cumulative_frames,
+            stream_id,
+            &mut entry.published_max_data_offset,
             |frame| {
                 commands
                     .try_enqueue_admitted_frame(frame, TrafficClass::Control)
                     .is_ok()
             },
         );
-        publication.accepted |= attachment.accepted;
-        publication.published |= attachment.published;
+        if let Some(offset) = attachment.max_data.published_offset {
+            outputs.admitted_max_data_offset = outputs.admitted_max_data_offset.max(offset);
+        }
+        publication.merge(attachment);
     }
-    publication.published = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_admission_is_closed()
-            && !entry.ack_publication.is_pending(generation)
-    });
-    publication.pending = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_admission_is_closed()
-            && entry.ack_publication.is_pending(generation)
-    });
     publication
 }
 
-fn retry_pending_ack(
-    outputs: &mut ResponseStreamOutputs,
-    generation: u64,
-    cumulative_frames: &[Frame],
-) -> StreamAckPublication {
-    let mut publication = StreamAckPublication::default();
-    for entry in &mut outputs.entries {
-        if entry.commands.control_frame_admission_is_closed()
-            || !entry.ack_publication.is_pending(generation)
-        {
+fn feedback_status(outputs: &ResponseStreamOutputs) -> StreamFeedbackPublication {
+    let generation = outputs.feedback.ack_generation;
+    let mut publication = StreamFeedbackPublication {
+        ack_generation: generation,
+        ..Default::default()
+    };
+    publication.max_data.published_offset =
+        (outputs.admitted_max_data_offset > 0).then_some(outputs.admitted_max_data_offset);
+    for entry in &outputs.entries {
+        if entry.commands.control_frame_admission_is_closed() {
             continue;
         }
-        let commands = &entry.commands;
-        let attachment =
-            entry
-                .ack_publication
-                .retry_cumulative(generation, cumulative_frames, |frame| {
-                    commands
-                        .try_enqueue_admitted_frame(frame, TrafficClass::Control)
-                        .is_ok()
-                });
-        publication.accepted |= attachment.accepted;
-        publication.published |= attachment.published;
+        let ack_pending = entry.ack_publication.is_pending(generation);
+        publication.ack.pending |= ack_pending;
+        publication.ack.published |= generation != 0 && !ack_pending;
+        publication.max_data.pending |=
+            entry.published_max_data_offset < outputs.feedback.max_data_offset;
     }
-    publication.published = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_admission_is_closed()
-            && !entry.ack_publication.is_pending(generation)
-    });
-    publication.pending = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_admission_is_closed()
-            && entry.ack_publication.is_pending(generation)
-    });
     publication
 }
 
@@ -388,25 +343,41 @@ impl ResponseStreamBinding {
         &self,
         generation: u64,
         update_frames: &[Frame],
-        cumulative_frames: &[Frame],
-    ) -> StreamAckPublication {
+        cumulative_frames: Vec<Frame>,
+    ) -> StreamFeedbackPublication {
+        let Some(Frame::StreamAck { stream_id, .. }) = cumulative_frames.first() else {
+            unreachable!("ACK publication requires cumulative StreamAck frames");
+        };
+        let stream_id = *stream_id;
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        publish_ack_update(&mut outputs, generation, update_frames, cumulative_frames)
+        outputs.feedback.ack_generation = generation;
+        outputs.feedback.cumulative_ack_frames = cumulative_frames;
+        service_feedback(&mut outputs, stream_id, Some(update_frames))
     }
 
     pub(in crate::runtime) fn retry_pending_ack(
         &self,
-        generation: u64,
-        cumulative_frames: &[Frame],
-    ) -> StreamAckPublication {
+        stream_id: StreamId,
+    ) -> StreamFeedbackPublication {
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        retry_pending_ack(&mut outputs, generation, cumulative_frames)
+        service_feedback(&mut outputs, stream_id, None)
+    }
+
+    /// Observe durable admitted credit and current exact-recipient ACK fences.
+    /// Unlike a service result, this does not describe a new queue admission.
+    pub(in crate::runtime) fn feedback_status(&self) -> StreamFeedbackPublication {
+        feedback_status(
+            &self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock"),
+        )
     }
 
     pub(in crate::runtime) fn pending_ack_capacity_notifies(
@@ -437,24 +408,24 @@ impl ResponseStreamBinding {
         &self,
         stream_id: StreamId,
         max_offset: u64,
-    ) -> StreamMaxDataPublication {
+    ) -> StreamFeedbackPublication {
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        outputs.desired_max_data_offset = outputs.desired_max_data_offset.max(max_offset);
-        publish_pending_max_data(&mut outputs, stream_id)
+        outputs.feedback.max_data_offset = outputs.feedback.max_data_offset.max(max_offset);
+        service_feedback(&mut outputs, stream_id, None)
     }
 
     pub(in crate::runtime) fn retry_pending_max_data(
         &self,
         stream_id: StreamId,
-    ) -> StreamMaxDataPublication {
+    ) -> StreamFeedbackPublication {
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        publish_pending_max_data(&mut outputs, stream_id)
+        service_feedback(&mut outputs, stream_id, None)
     }
 
     pub(in crate::runtime) fn has_pending_max_data_publication(&self) -> bool {
@@ -464,7 +435,7 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         outputs.entries.iter().any(|entry| {
             !entry.commands.control_frame_admission_is_closed()
-                && entry.published_max_data_offset < outputs.desired_max_data_offset
+                && entry.published_max_data_offset < outputs.feedback.max_data_offset
         })
     }
 
@@ -480,7 +451,7 @@ impl ResponseStreamBinding {
             .iter()
             .filter(|entry| {
                 !entry.commands.control_frame_admission_is_closed()
-                    && entry.published_max_data_offset < outputs.desired_max_data_offset
+                    && entry.published_max_data_offset < outputs.feedback.max_data_offset
             })
             .map(|entry| entry.commands.capacity_notify())
             .collect()
@@ -689,7 +660,7 @@ impl ResponseStreamBinding {
                 entry.delivery_samples = 0;
                 entry.original_data_acked_bytes = 0;
                 entry.published_max_data_offset = 0;
-                entry.ack_publication = StreamAckPublicationCursor::default();
+                entry.ack_publication = StreamFeedbackPublicationCursor::default();
                 entry.local_path_metrics = None;
                 entry.peer_path_metrics = None;
                 entry.native_scheduling_shape = None;
@@ -740,7 +711,7 @@ impl ResponseStreamBinding {
                 delivery_samples: 0,
                 original_data_acked_bytes: 0,
                 published_max_data_offset: 0,
-                ack_publication: StreamAckPublicationCursor::default(),
+                ack_publication: StreamFeedbackPublicationCursor::default(),
                 local_path_metrics: None,
                 peer_path_metrics: None,
                 native_scheduling_shape: None,
@@ -834,6 +805,10 @@ impl ResponseStreamBinding {
         entry.load_registration.deactivate();
         let mut entry = entry;
         entry.product_qualification.revoke();
+        // Ordered flight cleanup retains this entry, but a withdrawn output
+        // cannot service its unsent feedback job. The shared latest state
+        // remains available to every live successor.
+        entry.ack_publication = StreamFeedbackPublicationCursor::default();
         let output_incarnation = entry.incarnation;
         outputs.detaching.push(entry);
         self.clear_request_feedback_ingress_if(key, path_instance_id);

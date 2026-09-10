@@ -1484,12 +1484,12 @@ Forced publication of unchanged state reuses the current generation. Queue
 acceptance advances only that exact attachment incarnation's publication
 fence; a blocked attachment remains pending and retries on carrier-capacity or
 attachment-membership wakes. A newly accepted attachment starts without a
-fence and receives the retained latest state. Latest-state replacement and the
-chunk cursor keep pending publication bounded. This rule adds no receive
+fence and receives the retained latest state. One latest logical state and one
+finite unfinished publication job per output bound pending work. This adds no receive
 window, congestion signal, stop-and-wait dependency, or carrier-delivery
 attribution.
 
-The logical receive range ledger remains the sole cumulative range owner.
+The logical receive range ledger remains the sole authority for receipt facts.
 For an incremental publication it MUST retain every newly admitted positive
 fact since the preceding materialization; a truthful positive superset is
 permitted. If H0 was the preceding materialization's highest received offset,
@@ -1511,14 +1511,25 @@ merged across an unknown interval. Ready-only coalescing preserves the union
 of positive coverage and of actual scoped omission evidence.
 
 An exact attachment that accepted the immediately preceding generation may
-receive the incremental update. A new, replaced, missed-generation or partially
-published attachment receives cumulative catch-up. It advances its generation
-fence only after all required chunks are accepted. A newer generation MAY
-supersede the unqueued tail of an older generation; already accepted frames
-remain independently valid and idempotent. Each attachment retains only its
-exact-incarnation generation and next-chunk cursor. This reduces repeated
-history without delaying feedback, selecting a preferred ACK carrier, or
-depending on a mutable cross-frame compression dictionary.
+receive the incremental update. A new, replaced or missed-generation output
+receives cumulative catch-up. It advances its generation fence only after all
+required chunks are accepted. If publication blocks, the output MUST retain
+only that job's immutable unsent tail and finish it despite newer generations;
+otherwise repeated first chunks can starve older higher receipt facts. An
+incremental tail retains its already established preceding-generation ancestry.
+After completing the job, the output bridges to the current desired state,
+using cumulative catch-up when intervening generations were missed. Completing
+an older job MUST NOT be reported as publication of the newer generation.
+
+Admitted prefix frames MUST release their retained range storage. Immediate
+publication requires no additional retained snapshot. At most one unsent job
+per exact output is retained, bounded by the configured receive-range count;
+there is no per-generation journal. Retiring an output drops its publication
+tail even if unrelated sender flights await cleanup. This explicit memory cost
+is distinct from the one shared latest projection and queued native frames;
+it is not a whole-process memory bound. Frames remain independently valid and
+idempotent. This service rule adds neither a preferred carrier nor a feedback
+timer or mutable cross-frame decoding dictionary.
 
 ### 8.4 Shared flow control
 
@@ -1541,6 +1552,18 @@ consuming the publication. A newly attached carrier MUST receive the retained
 latest value after its credit-neutral attachment acceptance. Carrier-capacity
 notifications retry pending publication; this rule adds no independent timer,
 window, or congestion control.
+
+ACK chunks and the latest MAX share each exact output's feedback service.
+When both are pending, successful admissions alternate between those kinds;
+failed admission advances neither kind's turn. New ACK generations or MAX
+revisions MUST NOT starve the other kind. Service continues while admission
+is available, rather than parking on a capacity wake after voluntarily leaving
+ready work. This is a service-opportunity bound, not a network timing promise.
+Every service entrypoint MUST reconcile both ACK completion and actual granted
+MAX credit, regardless of which kind triggered it. Shared admitted credit
+survives output detach; publication outside the receive actor MUST remain
+observable before that actor validates subsequent DATA. MAX-only admission
+cannot satisfy a terminal ACK fence.
 
 Let `a_r` be the greatest contiguous receive offset whose bytes have left the
 MPP reorder/receive buffer for the target or local application. Subject to the

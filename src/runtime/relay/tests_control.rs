@@ -1503,7 +1503,7 @@ async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted(
         .try_enqueue_admitted_frame(Frame::Ping { nonce: 1 }, TrafficClass::Control)
         .expect("occupy the exact control admission slot");
 
-    let recv_stream = ReliableRecvStream::new(stream_id, limits);
+    let mut recv_stream = ReliableRecvStream::new(stream_id, limits);
     let mut state = ClientRelayState::new();
     assert!(
         receive_stream_fin(
@@ -1526,8 +1526,8 @@ async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted(
             ranges: Vec::new(),
         }],
     );
-    assert!(!publication.published);
-    assert!(publication.pending);
+    assert!(!publication.ack.published);
+    assert!(publication.ack.pending);
     assert!(state.endpoint.remote_open);
 
     assert!(matches!(
@@ -1538,7 +1538,7 @@ async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted(
     let local_shutdown = retry_stream_ack_and_commit_ready_fin(
         &mut relay_side,
         &mut state,
-        &recv_stream,
+        &mut recv_stream,
         &mut remotes,
     );
     local_shutdown
@@ -1553,6 +1553,128 @@ async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted(
         application.read(&mut byte).await.expect("read half-close"),
         0
     );
+}
+
+#[tokio::test]
+async fn final_ack_retry_commits_cross_kind_credit_without_releasing_fin_on_max_only() {
+    let stream_id = StreamId(616);
+    let limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: limits.max_stream_window_bytes,
+            lane: TrafficClass::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands.clone(),
+                limits,
+            ),
+            frames: frames_rx.into(),
+        },
+        0,
+    );
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
+    while try_recv_reliable_path_priority_command(&mut receivers).is_some() {}
+    let mut recv_stream = ReliableRecvStream::new_with_initial_max_offset(stream_id, limits, 2);
+    recv_stream
+        .receive_data(0, Bytes::from_static(b"a"))
+        .unwrap();
+    let first =
+        remotes.publish_stream_ack(1, recv_stream.take_ack_update(), recv_stream.ack_frames());
+    assert!(first.ack.published && !first.ack.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. }))
+            if ranges == vec![OffsetRange { start: 0, end: 1 }]
+    ));
+
+    commands
+        .try_enqueue_admitted_frame(Frame::Ping { nonce: 1 }, TrafficClass::Control)
+        .expect("block the one feedback slot after an actual ACK admission");
+    let blocked_max = remotes.publish_max_data(128);
+    assert!(blocked_max.max_data.pending);
+    assert_eq!(blocked_max.max_data.published_offset, None);
+    recv_stream
+        .receive_data(1, Bytes::from_static(b"b"))
+        .unwrap();
+    let final_ack =
+        remotes.publish_stream_ack(2, recv_stream.take_ack_update(), recv_stream.ack_frames());
+    assert_eq!(final_ack.ack_generation, 2);
+    assert!(!final_ack.ack.published && final_ack.ack.pending);
+    assert_eq!(recv_stream.published_max_offset(), 2);
+
+    let mut state = ClientRelayState::new();
+    assert!(
+        receive_stream_fin(
+            &recv_stream,
+            &mut state.endpoint.pending_remote_fin_offset,
+            2,
+        )
+        .unwrap()
+    );
+    let (mut application, mut relay_side) = duplex(64);
+    relay_side.write_all(b"ab").await.unwrap();
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 1 }))
+    ));
+    retry_stream_ack_and_commit_ready_fin(
+        &mut relay_side,
+        &mut state,
+        &mut recv_stream,
+        &mut remotes,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        recv_stream.published_max_offset(),
+        128,
+        "ACK-triggered service commits actual MAX admission"
+    );
+    assert!(
+        state.endpoint.remote_open,
+        "MAX alone cannot publish the final ACK generation"
+    );
+    assert_eq!(state.endpoint.pending_remote_fin_offset, Some(2));
+    assert!(remotes.has_pending_stream_ack_publication());
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+            max_offset: 128,
+            ..
+        }))
+    ));
+
+    let completed_from_max_retry = remotes.retry_pending_max_data();
+    assert_eq!(completed_from_max_retry.ack_generation, 2);
+    assert!(completed_from_max_retry.ack.published && !completed_from_max_retry.ack.pending);
+    assert_eq!(completed_from_max_retry.max_data.published_offset, None);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. }))
+            if ranges == vec![OffsetRange { start: 0, end: 2 }]
+    ));
+    // The FIN owner re-reads current publication status, even though another
+    // trigger already completed the retained ACK job without publishing MAX.
+    retry_stream_ack_and_commit_ready_fin(
+        &mut relay_side,
+        &mut state,
+        &mut recv_stream,
+        &mut remotes,
+    )
+    .await
+    .unwrap();
+    assert!(!state.endpoint.remote_open);
+    assert_eq!(state.endpoint.pending_remote_fin_offset, None);
+    let mut delivered = Vec::new();
+    application.read_to_end(&mut delivered).await.unwrap();
+    assert_eq!(delivered, b"ab");
 }
 
 #[tokio::test]
@@ -1608,8 +1730,8 @@ async fn client_completion_retains_ack_until_every_live_attachment_accepts_it() 
             ranges: Vec::new(),
         }],
     );
-    assert!(publication.published);
-    assert!(publication.pending);
+    assert!(publication.ack.published);
+    assert!(publication.ack.pending);
 
     let mut state = ClientRelayState::new();
     state.record_local_eof();
@@ -1632,8 +1754,8 @@ async fn client_completion_retains_ack_until_every_live_attachment_accepts_it() 
         Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 1 }))
     ));
     let publication = remotes.retry_pending_stream_ack();
-    assert!(publication.published);
-    assert!(!publication.pending);
+    assert!(publication.ack.published);
+    assert!(!publication.ack.pending);
     assert!(client_relay_finished(
         &state,
         &send_stream,

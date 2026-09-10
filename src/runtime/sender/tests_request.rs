@@ -3534,15 +3534,18 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
         )
         .expect("recv progress backpressure should not close the product stream");
 
-    assert!(!sent, "blocked advisory progress must report no frame sent");
+    assert!(
+        !sent.ack.accepted && sent.max_data.published_offset.is_none(),
+        "blocked advisory progress must report no frame sent"
+    );
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
     ));
 
     let retried = remotes.retry_pending_stream_ack();
-    assert!(retried.published);
-    assert!(!retried.pending);
+    assert!(retried.ack.published);
+    assert!(!retried.ack.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
@@ -3552,8 +3555,8 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
     remotes.attach(opened_test_relay_stream(stream_id, 1, replacement_commands));
     consume_client_path_proof_for_test(&mut replacement_rx);
     let replacement = remotes.retry_pending_stream_ack();
-    assert!(replacement.published);
-    assert!(!replacement.pending);
+    assert!(replacement.ack.published);
+    assert!(!replacement.ack.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut replacement_rx),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
@@ -3590,8 +3593,8 @@ async fn client_stream_ack_publication_resumes_at_the_exact_cumulative_chunk() {
     ];
 
     let blocked = remotes.publish_stream_ack(1, chunks.clone(), chunks);
-    assert!(!blocked.published);
-    assert!(blocked.pending);
+    assert!(!blocked.ack.published);
+    assert!(blocked.ack.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
@@ -3601,9 +3604,9 @@ async fn client_stream_ack_publication_resumes_at_the_exact_cumulative_chunk() {
     ));
 
     let first = remotes.retry_pending_stream_ack();
-    assert!(first.accepted);
-    assert!(!first.published);
-    assert!(first.pending);
+    assert!(first.ack.accepted);
+    assert!(!first.ack.published);
+    assert!(first.ack.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
@@ -3613,9 +3616,9 @@ async fn client_stream_ack_publication_resumes_at_the_exact_cumulative_chunk() {
     ));
 
     let second = remotes.retry_pending_stream_ack();
-    assert!(second.accepted);
-    assert!(second.published);
-    assert!(!second.pending);
+    assert!(second.ack.accepted);
+    assert!(second.ack.published);
+    assert!(!second.ack.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
@@ -3674,8 +3677,11 @@ async fn scoped_ack_actual_two_attachment_publication_preserves_catchup_and_repl
                 RelayRecvProgressSend::ack_only(None, TrafficClass::Throughput),
             )
             .unwrap()
+            .ack
+            .published
     );
     assert_eq!(progress.ack_generation(), 1);
+    let initial_cumulative = recv_stream.ack_frames();
     for expected in recv_stream.ack_frames() {
         assert_eq!(take_ack(&mut available_rx), expected);
     }
@@ -3697,6 +3703,8 @@ async fn scoped_ack_actual_two_attachment_publication_preserves_catchup_and_repl
                 RelayRecvProgressSend::ack_only(None, TrafficClass::Throughput),
             )
             .unwrap()
+            .ack
+            .published
     );
     assert_eq!(progress.ack_generation(), 2);
     for (start, scope) in [(30, 21), (40, 31)] {
@@ -3726,12 +3734,12 @@ async fn scoped_ack_actual_two_attachment_publication_preserves_catchup_and_repl
         }
     );
     let partial = remotes.retry_pending_stream_ack();
-    assert!(partial.accepted && partial.pending);
+    assert!(partial.ack.accepted && partial.ack.pending);
     assert_eq!(take_ack(&mut blocked_rx), recv_stream.ack_frames()[0]);
 
-    // A newer generation supersedes a partially queued catch-up. The partial
-    // predecessor is already immutable; the successor must restart its full
-    // truthful catch-up, rather than assuming that all older chunks arrived.
+    // New desired state cannot restart the immutable unfinished generation.
+    // Finish its exact tail before bridging the missed generations with the
+    // current cumulative state; no intervening delta ancestry is borrowed.
     recv_stream
         .receive_data(50, Bytes::from_static(b"x"))
         .unwrap();
@@ -3745,6 +3753,8 @@ async fn scoped_ack_actual_two_attachment_publication_preserves_catchup_and_repl
                 RelayRecvProgressSend::ack_only(None, TrafficClass::Throughput),
             )
             .unwrap()
+            .ack
+            .published
     );
     assert_eq!(progress.ack_generation(), 3);
     assert_eq!(
@@ -3756,10 +3766,13 @@ async fn scoped_ack_actual_two_attachment_publication_preserves_catchup_and_repl
         }
     );
     let cumulative = recv_stream.ack_frames();
-    assert_eq!(take_ack(&mut blocked_rx), cumulative[0]);
-    for expected in cumulative.iter().skip(1) {
+    assert_eq!(take_ack(&mut blocked_rx), initial_cumulative[1]);
+    let old_tail = remotes.retry_pending_stream_ack();
+    assert!(old_tail.ack.accepted && old_tail.ack.pending);
+    assert_eq!(take_ack(&mut blocked_rx), initial_cumulative[2]);
+    for expected in &cumulative {
         let retry = remotes.retry_pending_stream_ack();
-        assert!(retry.accepted);
+        assert!(retry.ack.accepted);
         assert_eq!(&take_ack(&mut blocked_rx), expected);
         assert!(try_recv_reliable_path_priority_command(&mut available_rx).is_none());
     }
@@ -3771,7 +3784,7 @@ async fn scoped_ack_actual_two_attachment_publication_preserves_catchup_and_repl
     remotes.attach(opened_test_relay_stream(stream_id, 1, replacement_commands));
     consume_client_path_proof_for_test(&mut replacement_rx);
     let replacement = remotes.retry_pending_stream_ack();
-    assert!(replacement.published && !replacement.pending);
+    assert!(replacement.ack.published && !replacement.ack.pending);
     for expected in cumulative {
         assert_eq!(take_ack(&mut replacement_rx), expected);
     }
@@ -3817,7 +3830,7 @@ async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
         )
         .expect("blocked MAX_DATA publication is retryable");
 
-    assert!(!sent);
+    assert!(!sent.ack.accepted && sent.max_data.published_offset.is_none());
     assert_eq!(
         recv_stream.published_max_offset(),
         0,
@@ -3838,10 +3851,11 @@ async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
     );
     let publication = remotes.retry_pending_max_data();
     let published_offset = publication
+        .max_data
         .published_offset
         .expect("replacement must replay retained MAX_DATA through the actor");
     recv_stream.commit_max_data(published_offset);
-    assert!(!publication.pending);
+    assert!(!publication.max_data.pending);
     let Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
         stream_id: published_stream_id,
         max_offset,
@@ -3893,6 +3907,9 @@ async fn client_max_data_retries_only_the_blocked_attachment() {
                 RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
             )
             .expect("one live attachment publishes shared credit")
+            .max_data
+            .published_offset
+            .is_some()
     );
     let Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
         max_offset: published,
@@ -3909,8 +3926,8 @@ async fn client_max_data_retries_only_the_blocked_attachment() {
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
     ));
     let retry = remotes.retry_pending_max_data();
-    assert_eq!(retry.published_offset, Some(published));
-    assert!(!retry.pending);
+    assert_eq!(retry.max_data.published_offset, Some(published));
+    assert!(!retry.max_data.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut blocked_rx),
         Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
@@ -3931,8 +3948,11 @@ async fn client_max_data_retries_only_the_blocked_attachment() {
         "attachment itself cannot publish credit outside the receive owner"
     );
     let replacement_publication = remotes.retry_pending_max_data();
-    assert_eq!(replacement_publication.published_offset, Some(published));
-    assert!(!replacement_publication.pending);
+    assert_eq!(
+        replacement_publication.max_data.published_offset,
+        Some(published)
+    );
+    assert!(!replacement_publication.max_data.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut replacement_rx),
         Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
@@ -3990,7 +4010,7 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
         )
         .expect("available alternate control queue should accept recv progress");
 
-    assert!(sent);
+    assert!(sent.ack.published);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut first_rx),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))

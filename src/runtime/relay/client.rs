@@ -29,6 +29,7 @@ use crate::protocol::{OffsetRange, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::runtime::sender::{RelaySendCause, ReliableRelaySenderQueue, RequestSenderService};
+use crate::runtime::stream::StreamFeedbackPublication;
 use crate::runtime::stream::{ReliableRecvProgress, ReliableRelayRemoteSet};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
@@ -290,8 +291,8 @@ impl ClientRelayState {
         self.progress.last_delivery_at = Instant::now();
     }
 
-    pub(super) fn record_recv_progress_sent(&mut self, sent: bool) {
-        if sent {
+    pub(super) fn record_recv_progress_sent(&mut self, publication: StreamFeedbackPublication) {
+        if publication.ack.published || publication.max_data.published_offset.is_some() {
             self.progress.last_recv_progress_sent_at = Instant::now();
         }
     }

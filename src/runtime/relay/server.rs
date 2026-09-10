@@ -78,7 +78,7 @@ use crate::runtime::stream::response::ResponseDataAckRecoveryCandidate;
 use crate::runtime::stream::{
     AcceptedServerReliableStream, AcceptedServerReliableStreamRetirement, ReliablePathStream,
     ReliablePathStreamOutput, ReliableRecvProgress, RequalificationAttempt,
-    ServerReliableStreamRegistry, arm_carrier_capacity_notifies,
+    ServerReliableStreamRegistry, StreamFeedbackPublication, arm_carrier_capacity_notifies,
     reliable_relay_recv_progress_resend_active, reliable_stream_recv_progress_interval,
     wait_for_carrier_capacity_notifies,
 };
@@ -661,7 +661,6 @@ struct ServerAckPublicationState {
     generation: u64,
     published_generation: u64,
     pending: bool,
-    cumulative_frames: Vec<Frame>,
 }
 
 impl ServerAckPublicationState {
@@ -671,15 +670,19 @@ impl ServerAckPublicationState {
         self.published_generation = if published { generation } else { 0 };
     }
 
-    fn record_generation(
+    fn record_feedback(
         &mut self,
-        generation: u64,
-        published: bool,
-        pending: bool,
-        cumulative_frames: Vec<Frame>,
+        publication: StreamFeedbackPublication,
+        recv_stream: &mut ReliableRecvStream,
     ) {
-        self.record_status(generation, published, pending);
-        self.cumulative_frames = cumulative_frames;
+        self.record_status(
+            publication.ack_generation,
+            publication.ack.published,
+            publication.ack.pending,
+        );
+        if let Some(offset) = publication.max_data.published_offset {
+            recv_stream.commit_max_data(offset);
+        }
     }
 
     fn current_generation_is_fully_published(&self) -> bool {
@@ -704,14 +707,10 @@ fn enqueue_tcp_recv_progress(
     let previous_ack_generation = progress.ack_generation();
     if progress.should_send_ack(recv_stream, path, lane, mux_limits, force_ack) {
         let generation = progress.ack_generation();
-        if generation == previous_ack_generation
-            && generation == ack_publication.generation
-            && !ack_publication.cumulative_frames.is_empty()
-        {
-            let publication =
-                path_stream.retry_pending_ack(generation, &ack_publication.cumulative_frames);
-            ack_publication.record_status(generation, publication.published, publication.pending);
-            sent_any |= publication.published;
+        if generation == previous_ack_generation && generation == ack_publication.generation {
+            let publication = path_stream.retry_pending_ack();
+            sent_any |= publication.ack.published;
+            ack_publication.record_feedback(publication, recv_stream);
         } else {
             #[cfg(feature = "lab-diagnostics")]
             let ack_started = Instant::now();
@@ -726,14 +725,9 @@ fn enqueue_tcp_recv_progress(
                 cumulative_ack_frame_count,
             );
             let publication =
-                path_stream.publish_ack(generation, &ack_frames, &cumulative_ack_frames);
-            ack_publication.record_generation(
-                generation,
-                publication.published,
-                publication.pending,
-                cumulative_ack_frames,
-            );
-            sent_any |= publication.published;
+                path_stream.publish_ack(generation, &ack_frames, cumulative_ack_frames);
+            sent_any |= publication.ack.published;
+            ack_publication.record_feedback(publication, recv_stream);
         }
     }
     if publish_max_data
@@ -742,10 +736,10 @@ fn enqueue_tcp_recv_progress(
         let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
         let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
         let publication = path_stream.publish_max_data(max_offset);
-        if let Some(published_offset) = publication.published_offset {
-            recv_stream.commit_max_data(published_offset);
+        if publication.max_data.published_offset.is_some() {
             sent_any = true;
         }
+        ack_publication.record_feedback(publication, recv_stream);
     }
     sent_any
 }
@@ -2634,6 +2628,10 @@ where
                 retained_frontier_candidate,
             )
         };
+        // Attachment replay can service feedback outside this actor. Observe
+        // its durable advertised credit and current exact-recipient fences;
+        // this is reconciliation, not a new send/progress event.
+        request_ack_publication.record_feedback(path_stream.feedback_status(), &mut recv_stream);
         let request_ack_generation = recv_progress.ack_generation();
         if output_membership_changed
             || request_ack_capacity_wait_generation != request_ack_generation
@@ -2653,16 +2651,8 @@ where
                 path_stream.pending_ack_capacity_notifies(request_ack_generation),
             );
             debug_assert_eq!(request_ack_publication.generation, request_ack_generation);
-            debug_assert!(!request_ack_publication.cumulative_frames.is_empty());
-            let publication = path_stream.retry_pending_ack(
-                request_ack_generation,
-                &request_ack_publication.cumulative_frames,
-            );
-            request_ack_publication.record_status(
-                request_ack_generation,
-                publication.published,
-                publication.pending,
-            );
+            let publication = path_stream.retry_pending_ack();
+            request_ack_publication.record_feedback(publication, &mut recv_stream);
             if request_ack_publication.pending {
                 request_ack_capacity_wait = capacity_wait;
                 request_ack_capacity_wait_generation = request_ack_generation;
@@ -2706,10 +2696,12 @@ where
         if request_requalification_ack_pending {
             let _ = path_stream.retry_pending_request_requalification_ack()?;
         }
-        if max_data_publication_pending
-            && let Some(published_offset) = path_stream.retry_pending_max_data().published_offset
-        {
-            recv_stream.commit_max_data(published_offset);
+        if max_data_publication_pending {
+            let publication = path_stream.retry_pending_max_data();
+            request_ack_publication.record_feedback(publication, &mut recv_stream);
+            if !request_ack_publication.pending {
+                request_ack_capacity_wait = None;
+            }
         }
         let request_feedback_path_snapshot =
             path_stream.request_feedback_path_snapshot(request_lane);
@@ -3103,6 +3095,10 @@ where
             // Membership and pending control publication can become reconciled in
             // this turn without producing another wake. Reconsider completion only
             // after that work, while retaining every exact-recipient obligation.
+            if !local_open && !remote_open {
+                request_ack_publication
+                    .record_feedback(path_stream.feedback_status(), &mut recv_stream);
+            }
             if !local_open
                 && !remote_open
                 && send_stream.reinjection_bytes() == 0
@@ -3341,6 +3337,12 @@ where
                     );
                     debug_assert!(deferred_path_frame.is_none());
                     deferred_path_frame = deferred;
+                    // Reconcile after dequeueing the complete ready batch:
+                    // registry-side MAX replay can race its collection. The
+                    // binding retains actually advertised credit even when
+                    // its advertising attachment has already been removed.
+                    request_ack_publication
+                        .record_feedback(path_stream.feedback_status(), &mut recv_stream);
                     apply_and_write_ready_stream_data_batch(
                         &mut local,
                         &mut recv_stream,

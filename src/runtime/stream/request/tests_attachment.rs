@@ -175,7 +175,7 @@ async fn skipped_ack_backup_completes_old_sparse_facts_under_generation_churn() 
         assert_eq!(baseline.len(), 1);
         let publication =
             remotes.publish_stream_ack(1, received.take_ack_update(), baseline.clone());
-        assert!(publication.published && !publication.pending);
+        assert!(publication.ack.published && !publication.ack.pending);
         for (commands, peer) in [
             (&mut a_commands, &mut a_peer),
             (&mut b_commands, &mut b_peer),
@@ -213,7 +213,7 @@ async fn skipped_ack_backup_completes_old_sparse_facts_under_generation_churn() 
                 update.clone(),
                 received.ack_frames(),
             );
-            assert!(publication.published && !publication.pending);
+            assert!(publication.ack.published && !publication.ack.pending);
             let frame = take_frame(&mut a_commands);
             assert_eq!(frame, update[0]);
             apply_truthful_ack(&frame, &received, &mut a_peer);
@@ -262,7 +262,7 @@ async fn skipped_ack_backup_completes_old_sparse_facts_under_generation_churn() 
                 received.ack_frames(),
             );
             assert!(
-                publication.accepted,
+                publication.ack.accepted,
                 "B admits real work on every generation"
             );
             let frame = take_frame(&mut b_commands);
@@ -399,8 +399,8 @@ impl ReadyMaxDataInput {
     fn publish(&mut self, max_offset: u64) -> [Frame; 2] {
         let stream_id = self.remotes.stream_id();
         let publication = self.publisher.publish_max_data(stream_id, max_offset);
-        assert_eq!(publication.published_offset, Some(max_offset));
-        assert!(!publication.pending);
+        assert_eq!(publication.max_data.published_offset, Some(max_offset));
+        assert!(!publication.max_data.pending);
         self.publication_commands.each_mut().map(|commands| {
             let command = try_recv_reliable_path_command(commands).expect("real MAX publication");
             let charged = reliable_path_command_pending_bytes(&command);

@@ -1,4 +1,4 @@
-use super::feedback::{StreamAckPublication, StreamMaxDataPublication};
+use super::feedback::StreamFeedbackPublication;
 use super::response::{
     CarrierPathFlight, ResponseDataAckRecoveryCandidate, ResponseDataAckRelease,
     ResponseStreamBinding, product_flights_have_recent_reinjection_overlap,
@@ -503,26 +503,29 @@ impl ReliablePathStream {
         &self,
         generation: u64,
         update_frames: &[Frame],
-        cumulative_frames: &[Frame],
-    ) -> StreamAckPublication {
+        cumulative_frames: Vec<Frame>,
+    ) -> StreamFeedbackPublication {
         match &self.output {
             ReliablePathStreamOutput::Switchable(binding) => {
                 binding.publish_ack(generation, update_frames, cumulative_frames)
             }
-            ReliablePathStreamOutput::Fixed(_) => StreamAckPublication::default(),
+            ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
         }
     }
 
-    pub(in crate::runtime) fn retry_pending_ack(
-        &self,
-        generation: u64,
-        cumulative_frames: &[Frame],
-    ) -> StreamAckPublication {
+    pub(in crate::runtime) fn retry_pending_ack(&self) -> StreamFeedbackPublication {
         match &self.output {
             ReliablePathStreamOutput::Switchable(binding) => {
-                binding.retry_pending_ack(generation, cumulative_frames)
+                binding.retry_pending_ack(self.stream_id)
             }
-            ReliablePathStreamOutput::Fixed(_) => StreamAckPublication::default(),
+            ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
+        }
+    }
+
+    pub(in crate::runtime) fn feedback_status(&self) -> StreamFeedbackPublication {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => binding.feedback_status(),
+            ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
         }
     }
 
@@ -538,21 +541,24 @@ impl ReliablePathStream {
         }
     }
 
-    pub(in crate::runtime) fn publish_max_data(&self, max_offset: u64) -> StreamMaxDataPublication {
+    pub(in crate::runtime) fn publish_max_data(
+        &self,
+        max_offset: u64,
+    ) -> StreamFeedbackPublication {
         match &self.output {
             ReliablePathStreamOutput::Switchable(binding) => {
                 binding.publish_max_data(self.stream_id, max_offset)
             }
-            ReliablePathStreamOutput::Fixed(_) => StreamMaxDataPublication::default(),
+            ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
         }
     }
 
-    pub(in crate::runtime) fn retry_pending_max_data(&self) -> StreamMaxDataPublication {
+    pub(in crate::runtime) fn retry_pending_max_data(&self) -> StreamFeedbackPublication {
         match &self.output {
             ReliablePathStreamOutput::Switchable(binding) => {
                 binding.retry_pending_max_data(self.stream_id)
             }
-            ReliablePathStreamOutput::Fixed(_) => StreamMaxDataPublication::default(),
+            ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
         }
     }
 

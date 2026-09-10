@@ -488,3 +488,228 @@ nearly unchanged whole goodput. It stops promotion, not authorized diagnosis.
 Existing snapshots establish native service pauses but cannot choose the
 causal owner. Retain this pair while one attribution capture joins proof and
 DATA/native timelines; no controller or timeout adjustment rescues the result.
+
+## Same-profile ordinary QUIC/Hysteria2/raw classification
+
+Parent ran the fixed sequence MPP QUIC-only364d417, existing Hysteria2, then
+raw TCP using the unchanged outage-only recipe. All runners returned0, without
+a build or policy change. The existing mixed candidate above is reused, not
+rerun or replaced by a favorable sample. Inputs are
+`./.tmp/reflection/results/{quic,h2,raw}-combined-down-return-round-outage-baselines-0910/`.
+The root-created, tar-listed
+[baseline archive](RETURN_ROUND_OUTAGE_BASELINES_20260910.raw.tar.gz) contains
+13files: five per proxy and three for raw; all body/echo histories and service
+samples are retained, without configs/keys.
+
+The exposure is deliberately unequal: QUIC-only/H2 lose their sole data and
+echo carrier; mixed retains TCP; raw TCP is unaffected by UDP filters and is
+an unexposed negative control, not an equal-failure competitor. H2 retains
+explicit500Mbps up/down bandwidth priors; MPP retains unconfigured discovery.
+Removing TCP also changes native-controller competition, membership and repair
+alternatives, not only feedback selection. These limits forbid ranking all
+systems by the largest outage gap alone.
+
+### Complete outcomes and censoring
+
+All three bulk transfers return HTTP200 and retain the same request through
+the event: one duration-stopped partial8GiB object, zero completed full objects,
+empty stderr. Q/H2 overall status is **`loss`**, despite bulk status `ok` and
+runner exit0. Each has61successful echoes, one `io_error` timeout and13subsequent
+`unavailable_after_disconnect` records, not14independent network failures.
+The existing worker closes its timed-out echo socket and does not reconnect.
+Thus restored echo latency is unavailable, not healthy or zero.
+
+| Metric | MPP QUIC-only | Hysteria2 | Raw TCP, unexposed |
+|---|---:|---:|---:|
+| Body bytes / elapsed s | 1,913,742,378 /40.000040 | 2,124,107,956 /40.000086 | 2,269,181,072 /40.000636 |
+| Whole Mbps | 382.748 | 424.821 | 453.829 |
+| First body, s | 0.408305 | 0.407322 | 0.403454 |
+| Maximum body gap, s | 4.288327 | 3.587679 | 0.100170 |
+| Gap interval, s | 30.167590–34.455917 | 30.248776–33.836455 | 29.038362–29.138532 |
+| Gap byte endpoints | 1,615,806,986–1,615,818,986 | 1,759,835,956–1,759,839,156 | 1,629,978,848–1,629,984,640 |
+| Echo successes / real I/O errors / unavailable records | 61 /1 /13 | 61 /1 /13 | 80 /0 /0 |
+| Successful-only echo p50 / p95 / max, ms | 105.693 /168.524 /271.276 | 111.096 /112.511 /115.317 | 103.045 /122.086 /295.060 |
+
+Qecho61times out30.511736–33.514853s; H2echo61times out30.506076–33.506931s.
+Both have their last success around30.11s. Neither provides any successful
+restored echo measurement. Mixed's73successes and absence of an echo disconnect
+are meaningful availability, while its1.098s later gap still remains adverse.
+
+| Nominal phase | Q body Mbps; successes/errors/unavailable | H2 body Mbps; successes/errors/unavailable | Raw body Mbps; successes/errors/unavailable |
+|---|---|---|---|
+| 0–5s | 346.598;10/0/0 | 433.619;10/0/0 | 352.045;10/0/0 |
+| 5–30s | 444.813;50/0/0 | 471.796;50/0/0 | 465.616;50/0/0 |
+| 30–33s | 24.377;1/1/0 | 38.561;1/1/0 | 475.774;6/0/0 |
+| 33–40s | 340.484;0/0/13 | 416.304;0/0/13 | 475.007;14/0/0 |
+
+Before outage, Qecho p95is138.699ms, H2112.240ms, raw121.358ms, versus mixed
+373.730ms in its ordinary candidate. Pre-outage Qbody trails H2by5.72% and
+rawby4.47%. During35–40s Q/H2/raw body means are453.763/470.592/475.111Mbps:
+this Qcapture shows recovery lag, not a persistent low-rate ceiling. Its body
+resumes at34.455917s versus H233.836455s, but the sampled restoration loops
+also differ byabout106ms. Independent clocks/serial firewall commands preclude
+assigning the619ms resumption difference entirely to one native mechanism.
+
+### Profile, costs and fresh native-counter verification
+
+All sampled profiles retain500/500Mbps,30/70ms, zero configured random loss/
+jitter/QoS, the same HTB/netem settings and UDP flags on rows30–32only. First
+true/false loop timestamps are Q30.003239/33.110893s, H230.004850/33.005162s,
+raw30.003477/33.003853s. They precede serial firewall changes, as above. Every
+class/qdisc drop delta is0, excluding intentional firewall drops. Qhas40service
+rows ending39.111456s; H2/raw have41ending40.006113/40.004609s. Do not equate
+their unequal whole cost windows or extrapolate the missing Qtail sample.
+
+| Common row0→39 cost window | Q | H2 | Raw |
+|---|---:|---:|---:|
+| End elapsed, s | 39.111456 | 39.006013 | 39.004494 |
+| DOWN class bytes | 2,016,367,278 | 2,193,664,954 | 2,318,962,028 |
+| UP class bytes | 32,497,505 | 14,480,532 | 2,594,963 |
+| Peak DOWN / UP backlog, B | 6,957,558 /95,233 | 2,822,558 /32,550 | 13,898,650 /5,874 |
+| Client tunnel RSS peak / final, KiB | 36,392 /36,392 | 42,424 /30,140 | Not applicable |
+| Server tunnel RSS peak / final, KiB | 323,020 /313,504 | 44,932 /44,932 | Not applicable |
+| Client tunnel CPU peak / final, % | 97 /87.8 | 91.2 /83.9 | Not applicable |
+| Server tunnel CPU peak / final, % | 152 /138 | 81.9 /75.3 | Not applicable |
+
+Resource rows use each complete available process sample series (H2includes
+row40), not byte-window-normalized task time. Raw has no tunnel process; this
+is not zero total CPU. MPPalso receives management/native socket polling that
+the baselines do not expose. Costs alone do not locate a critical byte's delay.
+
+The earlier server-native plateaus are verified at the **producer**, not merely
+against repeated management retrieval. `NativeDeliveryTracker::observe` in
+`src/runtime/path/traffic.rs` recomputes `sampled_at_us` on each supplied
+observation even when ACKbytes do not change. QUIC `tx_metrics` polls current
+congestion metrics; `observe_native` supplies `Instant::now()` and
+`run_server_quic_path_metrics` records native delivery independently of rate
+publication. Same-epoch server producer times advance across each plateau:
+
+| Capture / sampled rows | Producer time span, s | Constant ACKbytes |
+|---|---|---:|
+| Mixed ordinary control31–35 | 31.699162–35.714467 | 747,150,701 |
+| Mixed ordinary candidate31–35 | 31.768312–35.704607 | 798,970,889 |
+| Mixed observer31–35 | 31.724641–35.776970 | 786,245,562 |
+| Ordinary Q-only31–34 | 31.767134–34.796358 | 1,660,748,017 |
+
+Every server stamp inside those ranges strictly advances. Q-only first rises
+at producer35.753959s to1,667,240,857B, on sample35. Observer **client** samples
+33/34repeat the same producer timestamp; no claim of independent fresh polls
+at both client rows is made. Producer clocks are local diagnostic epochs, not
+probe clocks. Fresh native polling establishes stalled native ACKprogress
+without mixed carriers; it does not identify native PTO, network service or
+Product critical-prefix causality. No native gains/timeouts follow from it.
+
+All120raw body bins, untrimmed (Mbps):
+
+```text
+second quic h2 raw
+ 0    9.604  280.231    5.711
+ 1  382.110  469.086  358.119
+ 2  456.847  474.903  472.094
+ 3  447.269  472.976  464.391
+ 4  437.160  470.901  459.908
+ 5  457.659  468.553  467.310
+ 6  452.852  473.855  469.511
+ 7  459.182  472.383  475.060
+ 8  452.969  473.581  470.890
+ 9  456.898  472.804  463.534
+10  384.253  470.971  468.747
+11  448.855  471.129  471.110
+12  440.622  472.851  472.303
+13  450.728  474.117  463.812
+14  447.417  473.066  476.797
+15  438.510  471.163  474.539
+16  454.672  472.076  475.581
+17  455.770  472.338  478.477
+18  448.008  473.536  474.886
+19  461.803  471.549  473.554
+20  456.660  473.376  477.782
+21  451.272  471.028  472.859
+22  453.740  470.174  475.639
+23  391.655  470.081  473.438
+24  441.794  468.463  478.245
+25  449.209  470.743  477.782
+26  453.965  472.643  475.604
+27  420.414  468.979  474.434
+28  433.019  473.384  397.667
+29  458.408  472.065  360.830
+30   73.132  115.684  475.465
+31    0.000    0.000  475.465
+32    0.000    0.000  476.392
+33    0.000   89.679  472.152
+34  114.571  471.493  477.342
+35  452.308  466.878  474.770
+36  457.829  470.754  473.786
+37  465.154  471.174  476.450
+38  446.368  472.181  475.581
+39  447.157  471.972  474.967
+```
+
+This comparison confirms single-carrier native recovery lag as well as mixed
+availability and separate mixed tail costs. It does not show that every mixed
+gap is inevitable, that H2restored echo is healthy, or that MPPis accepted.
+The fixed comparison is complete; next decisions remain evidence-scoped.
+
+## Predeclared reverse-order outage discriminator
+
+Parent ran one unchanged CANDIDATE364d417→CONTROL0cab2b5 outage pair; no further
+repeat is planned. This is a second retained pair, not replacement of the
+first or a best-of result. The
+[reverse-pair raw archive](RETURN_ROUND_OUTAGE_REVERSE_20260910.raw.tar.gz)
+lists exactly10files, both five-file cells under
+`results/mixed-combined-down-return-round-outage-reverse-{candidate,control}-0910/`.
+It preserves all80raw body bins and153echo attempts with exact timing.
+
+**Maximum body-gap and whole echo-p95 ordering repeat adversely; promotion
+remains held.** Worst-echo ordering reverses, and both medians/success spacing
+improve. More restored goodput does not erase its worse latency distribution.
+The pair is not proof that proof-round handling alone caused those intervals.
+
+| Pair; actual execution order | Whole Mbps, control→candidate | Max body gap, s | Echo p95, ms | Echo max, ms |
+|---|---|---|---|---|
+| First; control→candidate | 384.128→383.408 | 0.777480→1.097872 | 697.271→881.787 | 1,534.222→1,641.343 |
+| Reverse; candidate→control | 358.091→376.650 | 0.647854→0.947738 | 650.642→705.587 | 1,372.285→827.366 |
+
+Reverse control/candidate body totals are1,790,471,012/1,883,399,411B in
+40.000332/40.003150s, first body0.577603/0.628052s. Both are successful
+HTTP200 duration-partial responses;76/77echoes succeed, none fails, stderr is
+empty. Whole echo medians326.293→312.006ms and maximum success spacing
+1.372303→1.198936s improve. Last candidate echo finishes40.522849s and remains
+counted. Control's largest body gap36.092310–36.740164s spans
+1,699,048,292→1,699,113,775B; candidate's35.324803–36.272542s spans
+1,663,001,568→1,663,016,168B. The largest echo is control33.070831–34.443115s,
+candidate39.695483–40.522849s, so it is not the same critical interval.
+
+| Reverse-pair nominal phase | Control body Mbps; echo n / p50 / p95 / max ms | Candidate body Mbps; echo n / p50 / p95 / max ms |
+|---|---|---|
+| 0–5s | 248.202;10 /172.120 /399.309 /399.309 | 264.166;10 /227.930 /561.628 /561.628 |
+| 5–30s | 431.337;50 /332.376 /530.767 /610.857 | 415.815;49 /309.793 /552.933 /743.966 |
+| 30–33s | 113.098;4 /729.430 /873.945 /873.945 | 226.698;6 /428.455 /627.540 /627.540 |
+| 33–40s | 279.932;12 /323.930 /650.642 /1,372.285 | 381.482;12 /530.378 /799.387 /827.366 |
+
+Candidate restored33–39body bins are9.304,766.816,131.596,536.988,537.105,
+0.117,688.450Mbps, versus control384.566,571.474,240.124,250.085,185.598,
+228.065,99.615. Both have uneven late service; the higher candidate average
+includes near-empty bins. After35s its body mean378.851versus200.697Mbps
+coexists with echo p95827.366versus394.382ms. This is more useful work with
+adverse loaded timing, not a simple universal throughput regression.
+
+All service profiles retain500/500Mbps,30/70ms, zero configured randomloss/
+jitter/QoS, with UDP flags only rows30–32. Control/candidate loop first true/
+false are30.006088/33.163120s and30.009429/33.242507s; serial firewall timing
+and independent clocks remain limits. Class/qdisc drops are0, excluding filter
+drops. Control has40rows ending39.348299s; candidate41ending40.402460s. At the
+common row39endpoint (39.348299/39.402352s), DOWN class bytes are
+2,274,228,947/2,297,273,398 and UP54,058,935/33,409,222. Full sampled peak
+DOWN backlogs30,208,907/19,142,160B and UP284,428/81,862B do not explain away
+the candidate's longer critical body gap.
+
+Both server QUIC producers remain same-epoch with advancing timestamps:
+control ACKbytes821,182,532stay flat from31.629083through34.511202s;
+candidate655,058,571from31.722026through34.764203s. Both advance at sample35,
+to821,200,400/656,483,931B respectively. Candidate recovery is therefore not
+simply a later first native-ACK restart. Some client management rows repeat a
+producer stamp; those are not independent native observations. Selected proof,
+critical DATA ownership and precise native service remain absent from this
+ordinary pair. The repeated tail harm warrants the existing promotion hold,
+not another repeat, a timer adjustment or a new causal claim from scalar state.

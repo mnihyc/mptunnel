@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 12:24 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 12:33 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,79 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+12:33 +08 reverse-order outcome: candidate376.650Mbps versuscontrol358.091;
+candidate maxbodygap.947738s versus.647854s and echo p95705.587versus650.642ms
+repeat the adverse ordering. Worst echo827.366versus1372.285ms and median
+312versus326ms improve;77/76echoes all succeed. Do not choose the favorable
+metrics or call the pair non-regression. Both ordinary pairs remain; no third
+repeat. Trial promotion stays held. Neither the same mean nor the observer's
+already-active fallback attributes the repeated~.3s extra worst read gap.
+
+Next information-only gate is the existing current-binary all-mode healthy
+panel, NOT promotion or a new fix stack: TCP,QUIC,mixed,raw,Xray,H2; both
+directions; shared500/500Mbps, fixedDOWN30/UP70ms (mirror1 for both directions),
+40s existing probes, no randomloss/jitter/QoS/blackhole. Reuse the existing
+runner's combined mode with all impairments disabled, not25s versus40s
+comparison. Old records are context; rerun the six-mode panel once for a
+current matched cohort. This broader existing gate classifies practical
+shortfall/settlement before another timer/native observer or small isolated
+recovery optimization. No source/build changes. All echo attempts, exact UP
+confirmation and drain, first service, full bins and costs remain. Stop this
+panel at a critical failed completion to attribute its existing owner; no
+favorable repetition, profile change or automatic redesign. Less severe
+multidimensional tradeoffs remain documented for the final practical decision.
+Fresh healthy baselines do not erase outage exposure/failures above or satisfy
+loss/aggregation/Cloudflare/global gates. Candidate is still unpromoted.
+
+12:31 +08 fixed baseline classifier completes. QUIC-only pre-outage444.813Mbps
+versusH2471.796; restored35–39s roughly454versus471Mbps. Body service resumes
+at34.456s versus33.836s after nominal33s restoration; differing runner/probe
+clocks and~106ms differing sampled restoration preclude subtracting619ms as
+pure native overhead. Qproducer timestamps advance while ACK totals stall;
+its restoration is delayed but sustained high service returns without restart.
+Both sole-carrier echo probes have one3s timeout followed by13unavailable slots,
+so neither provides restored echo latency. Raw is unexposed,453.829Mbps and
+80/80echo, maxbodygap.100s. Mixed's73/73echo success is a real resilience benefit,
+alongside its later1.098s gap. Full baseline histories have a13-file raw archive.
+No precise post-admission code defect was found in independent TCP source
+review: ordinary priority precedes newbulk/repair at each arbitration, while
+already-written bytes and one retained native write are nonpreemptive.
+
+Next bounded noise decision, not another tuning attempt: one predeclared
+reverse-order ordinary outage pair CANDIDATE364d417 then CONTROL0cab2b5, identical
+40s profile/workload. The original adverse ordinary pair, lack of recurrence
+in the observer and similar native delay across models establish timing-history
+ambiguity; diagnostic instrumentation cannot serve as its repeat. Information
+forecast: determine whether the adverse recovery ordering repeats under reversed
+execution order before selecting a new model owner. Retain BOTH pairs and all
+failures/tails, not a best-of result. At most this one declared pair; no more
+favorable-repeat search. Repeated material harm keeps the fixed-round trial
+unpromoted and requires causal attribution. Reversed/overlapping outcome means
+causal harm is not established, NOT proof of universal non-regression; retain
+the supported return-cut correction provisionally and advance the existing
+current-binary all-mode/high-capacity gates. Do not retune native recovery for
+the modest single-Q gap difference ahead of mixed service/unfinished settlement.
+
+Next predeclared transaction: reuse the existing ordinary mixed outage pair;
+run frozen364d417 QUIC-only, existing Hysteria2, then raw TCP in the exact same
+40s outage-only DOWN case (500/500Mbps,30/70ms delay, no randomloss/jitter/QoS,
+UDP30–33s). No build, new instrumentation or runtime change. Information
+forecast: classify the material post-admission/restoration delay before another
+MPP-only observer. All series, echoes including failures, first service,
+restored intervals and cost remain. H2 retains its explicit500/500Mbps priors;
+MPP remains unconfigured discovery. Raw TCP is an unexposed negative control,
+NOT an equal-failure competitor. Single Q/H2 lose their only carrier, unlike
+mixed; retain the unchanged3s echo guard and any censoring, not an artificial
+max-gap competition across unequal failure exposure.
+
+Decision: delayed Q-only recovery with prompt H2 selects the existing single-
+carrier native/post-admission boundary. Prompt single-carrier restoration with
+poor mixed selects its existing allocation/recovery/shared-queue owner. Similar
+baseline delays weaken MPP-specific attribution, not prove inevitability.
+Independent review supports this discriminator over another observer build.
+Stop this fixed comparison when complete and make its causal decision; do not
+repeat until favorable or conclude the authorized global task at that point.
 
 12:24 +08 observer outcome: no source change. The ordinary1.098s gap does not
 recur; diagnostic maximum is.475828s near restoration. Exact body/DSN alignment

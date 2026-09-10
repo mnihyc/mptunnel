@@ -1104,3 +1104,216 @@ reuse caused the later tail or quantify how much serialized work it removed.
 It falsifies sufficient-service improvement from this isolated correction;
 neither another parameter adjustment nor the unrelated deployed loss/CPU
 report is justified as its attribution or acceptance waiver.
+
+## Preselect partition diagnostic: long holds move to dispatch, not stale-only queries
+
+This is an information result, not a performance correction or acceptance.
+The unchanged `d44ca8e` runtime plus a temporary feature-only observation
+overlay reproduces a 17.859206s confirmation gap despite eventual exact
+settlement. Whole-run preselect time is dominated by authoritative-gap work,
+but the longest local reply holds coincide principally with the separate
+dispatch owner. The proposed stable-absent query pruning is therefore deferred:
+its measured scope is too small to explain or remove the dominant held service.
+
+The optimized diagnostic build takes 3m38s with only the existing unused
+`apply_and_write_ready_stream_data_batch` warning. The complete 17-source-file
+overlay is frozen in the saved patch and reversed before traffic; the frozen
+`preselect-owner-profile-20260910` executable is used through its wrapper with
+periodic performance summaries enabled and samples disabled. This includes
+the preceding selected reply-stage and owner-guard observations, not a new
+ordinary runtime policy. The [verified raw archive](PRESELECT_OWNER_PROFILE_20260910.raw.tar.gz)
+contains 11 regular files: five results, build/driver logs, the complete patch,
+wrapper, `run.py` and `shape.sh`. It is 818,226B; gzip integrity, tar comparison
+and every decompressed member/source byte comparison pass. No binary, config,
+link or directory entry is included.
+
+### Own outcome and complete confirmation history
+
+Runner89074 exits0 after 77.008481s. The probe confirms exactly 378,339,328B
+accepted, one complete stream, no errors and no censoring, over 76.528672s
+(39.550Mbps). First write/confirmation are .105781/.411549s; maximum
+write/confirmation gaps are 11.889302/17.859206s. There is no echo workload.
+Eventual settlement does not make these multi-second service failures acceptable,
+nor does this instrumented run replace either preceding ordinary control.
+
+All 77 raw confirmation bins follow, including 49 zeros. Values are Mbps;
+the final bin is partial. The trimmed array must not substitute for this
+wall-clock history.
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 8.214,179.436,73.024,0,87.12,0,66.393,49.999,102.62,30.645
+10: 216.625,4.084,68.89,0,55.242,84.263,147.14,132.322,16.733,126.064
+20: 0,0,0,150.995,0,0,0,0,0,0
+30: 0,0,293.27,0,0,343.354,36.176,0,0,0
+40: 0,311.268,0,0,0,0,0,0,0,0
+50: 0,0,4.55,0,0,.908,0,0,0,0
+60: 0,0,0,0,0,0,0,0,0,0
+70: 0,0,0,28.755,67.083,170.784,170.758
+```
+
+| Raw phase | Mean Mbps | Zero bins |
+|---|---:|---:|
+| 0–5s | 69.559 | 1/5 |
+| 5–15s, before cut | 59.450 | 2/10 |
+| 15–25s | 65.752 | 4/10 |
+| Interior16–24 inclusive | 63.695 | 4/9 |
+| 25–40s, restored | 44.853 | 12/15 |
+| 40–77s, last partial | 20.381 | 30/37 |
+
+### Reconciled cost scopes and the forecast boundary
+
+All interval count/byte/time deltas reconcile to cumulative totals in all
+4,075 client and 960 server performance rows, with one PID per role. The four
+preselect phases each record 82,296 evaluations. They partition the synchronous
+preselect body, not lock acquisition, later dispatch or asynchronous waiting.
+
+| Nonoverlapping preselect phase | Cumulative elapsed, s | Largest phase evaluation, ms |
+|---|---:|---:|
+| Authoritative-gap service | 22.346425 | 9.736 |
+| Source geometry | .543246 | 3.155 |
+| Retained cleanup | .494605 | 3.807 |
+| Residual/deadline | .115695 | 1.526 |
+| Phase sum | 23.499971 | Not additive |
+
+Authoritative-gap service is 95.09% of this partition. It includes setup,
+coverage/queued-union subtraction, ownership-view construction, scored prefixes,
+cache/target models, clocks and observation overhead. Its full residual has
+not been isolated by the following narrower query timers.
+
+| Owner-mask plus uniform-frontier query result | Queries | Cumulative timed query work, s | Nonempty class emissions |
+|---|---:|---:|---:|
+| Owner present under current dynamic eligibility | 1,788,439 | 1.489723 | 36,798 |
+| Absent also under stable attached non-stale set | 2,699,580 | 1.231554 | 29,730 |
+| Absent dynamically but owner present under stable set | 0 observed | 0 observed | No component emitted |
+
+For these three components the generic byte fields are **query counts**, not
+traffic; record counts are nonempty per-evaluation class batches. Their maximum
+times are batch sums, not individual-query maxima. Production query timing
+stops before the stable-set classifier. Separately recorded observer work is
+.169392s over 56,517 emissions; it covers stable-set construction/classification,
+not all logging overhead. It and the query timers are nested within enclosing
+work and must not be added to the phase total. Stable-absent work is 60.15% of
+queries but only 5.51% of the complete gap-service elapsed time. Even eliminating
+all that measured query work would not by itself remove the dominant cost;
+classification counts do not establish a safe pruning rule or total savings.
+
+All client actor guards total 72.850840s of exclusive elapsed hold over 556,153
+acquisitions; acquisition wait totals 1.178401s. Writer guards total .915945s
+hold and .046504s successful-try-lock time over 46,372 acquisitions. Instrumented
+`control.rs:1567` preselect holds 23.579505s; `:3095` dispatch holds 44.081456s;
+`:4017` ACK application holds 1.887422s. These line numbers refer to the archived
+instrumented source, not the current source tree. The dispatch guard contains
+both direct structural recovery and, if appropriate, queued repair dispatch;
+44.081456s cannot be assigned to queued copies alone. Initial recovery collection
+is in an earlier guard. Largest actor hold is 47.377ms, so these totals represent
+repeated ownership, not one continuous 44s call. Timings measure elapsed lock
+ownership, including possible descheduling, not CPU execution. Every emitted
+duration is floored to 1us; nested timers and thread/owner totals are not additive.
+
+### Exact reply ownership during the held intervals
+
+All following times use Unix milliseconds, with millisecond resolution; neither
+role's `t_mono` origin nor the probe clock is substituted. Session
+14082984577445849136/stream0 has 334 Product receipt events and 92 advancing
+receipts. Exact offset/length and carrier joins distinguish Original and copy;
+cross-role attachment/incarnation numbers are not assumed interchangeable.
+
+The longest advancing gap is 1789050916241→1789050934101 (17.860s), agreeing
+with the probe maximum within timestamp resolution. Its final missing interval
+is [1106,1120), a unique Q1 Original on the healthy47 link. Previous Product
+advance reaches 1106; this receipt advances to 1120. Its server Original and
+normal QUIC write-begin/end are all 1789050902383. The same Q1 frame is decoded
+at 1789050913483 and accepted by the reader queue at 1789050913739. Normal
+carrier handling starts only at 1789050927926, enqueues at 1789050928059,
+and the attachment receives it at 1789050933068. Shared Product queue admission
+succeeds at 1789050933132 with recorded depth131; dequeue occurs at
+1789050934100, then input selection, preapply-lock completion and Product
+application at 1789050934101. No Q1 copy overlaps this extent; other-carrier
+copies do not make this Original join ambiguous.
+
+Thus its write-end→decode is 11.100s, reader-queue→carrier handling 14.187s,
+carrier enqueue→attachment 5.009s and shared-queue→dequeue .968s. The whole
+31.718s write-end→Product residence overlaps earlier frontier advances and is
+**not** the 17.860s critical gap or an additive delay budget for it. In particular,
+the already-decoded local delays are directly observed; the separate predecode
+delay is not assigned to the physical network from these events alone.
+
+A second critical winner, Q0 repair [1078,1092), ends an 11.701s advancing
+gap at 1789050913952. Repair decode/enqueue occur at 1789050902922/2943;
+attachment delivery is 1789050909613, and accepted shared-queue admission is
+1789050909828 at depth131. Product dequeue/application is 1789050913952:
+6.670s repair-reader→attachment and 4.124s admitted shared-FIFO residence.
+There is no Q0 Original for this extent. These are actual local service holds,
+not a failed queue-send attempt or a later duplicate chosen as the winner.
+
+Counter joins use first and last **complete periodic flushes wholly inside**
+each stated held interval, carry inactive cumulative components forward, and
+difference states only after each entire flush. Completed calls can cross the
+chosen boundaries; these are interval aggregates, not per-call CPU traces.
+
+| Held interval and interior full-flush endpoints, Unix ms | Interior wall, s | Actor hold, s | Dispatch hold, s | Preselect hold, s | Stable-absent query work |
+|---|---:|---:|---:|---:|---:|
+| Maximum frontier gap; 1789050916324→1789050933488 | 17.164 | 17.034518 | 16.487691 /1,086 calls | .208979 | 78,636 queries /.056172s |
+| Q0 shared-FIFO wait; 1789050910246→1789050913277 | 3.031 | 3.010913 | 2.888610 /101 calls | .085612 | 50,593 queries /.046558s |
+| Q1 reader hold; 1789050914298→1789050927438 | 13.140 | 13.042140 | 12.623933 /620 calls | .209116 | 101,882 queries /.076649s |
+
+These intervals overlap and must not be summed. In the maximum-gap interior,
+authoritative-gap phase time is only .148319s, actor acquisition wait .036080s
+and writer hold .018205s. This localizes the dominant repeated ownership to
+dispatch during that hold, without splitting direct structural recovery from
+queued work or claiming every millisecond would disappear under a correction.
+It specifically weakens the stale-only-query proposal as a material remedy.
+
+### Target, physical and resource context
+
+The client reads all upload bytes by sample42. Target-socket acceptance continues
+from 323,496,620B at40 to 369,557,241B at56 and all 378,339,328B at66
+(Unix1789050926965). The server has read all 1,945 reply bytes by67, while
+client local reply delivery remains at1,106 through73, then1,120/1,134/1,204
+at74/75/76. Therefore the maximum reply hold spans continuing forward work
+and a later period after all target writes; it is not wholly an upload-debt
+plateau. These management counters are not final sink-confirmed accounting.
+Closure records receive frontier1945, reorder0 and empty sender queues.
+
+Across samples56→73 all eight native outputs on each role retain the same
+epochs, advance their producer sampling stamps and increase ACK counters.
+This proves ongoing carrier-level progress, not delivery of the critical reply
+byte. It does not make management cache timestamps exact critical-frame clocks.
+
+All 77 physical samples verify the declared two independent200Mbps links,
+only46UP10Mbps during rows15–24, DOWN30ms/UP70ms, zero loss/jitter/outage,
+65536B bursts and netem limit8192. Restriction/restoration rows are at
+15.001659/25.002734s. All class/netem drop deltas are0. Client eth0/eth1 are
+46/47; server eth1/eth0 are46/47. Cost accounting spans76.008329s, distinct
+from probe settlement and performance flush windows.
+
+| Sampled class service | UP46 /47, Mbps |
+|---|---:|
+| 0→15s | 130.040 /108.277 |
+| Strict16→24s | 10.146 /116.428 |
+| 25→40s | 44.248 /35.580 |
+| 55→73s | 23.361 /11.781 |
+
+| Whole sampled cost | Value |
+|---|---:|
+| UP46 /47 bytes | 508,075,265 /553,865,687 |
+| DOWN46 /47 bytes | 6,063,693 /7,964,900 |
+| Summed UP backlog peak / final, B | 28,153,280 /1,345,268 |
+| Summed DOWN backlog peak / final, B | 46,573 /2,064 |
+| Client RSS peak / final, KiB | 309,540 /257,448 |
+| Server RSS peak / final, KiB | 111,576 /111,576 |
+| Client lifetime CPU peak / final, % | 122 /112 |
+| Server lifetime CPU peak / final, % | 57.3 /19.4 |
+
+CPU here is the existing process-lifetime `ps` percentage, not the separate
+20%loss task-tick measurement. Logs contain 8,811 lines/3,140,973B; observation
+overhead is not fully measured by the .169392s classifier timer. The noisy
+stale-output event is disabled. Probe stderr is empty; two server H3_NO_ERROR
+closure warnings occur at teardown, not independent failed probe attempts.
+
+**Information disposition:** preserve the observed local FIFO/owner deficit and
+the ordinary rejection. This capture supports splitting the remaining complete
+gap and dispatch cost scopes before selecting a work-model correction; it does
+not support a stale-only pruning patch, native timer adjustment, an unavoidable
+physical-stall explanation or a new performance claim.

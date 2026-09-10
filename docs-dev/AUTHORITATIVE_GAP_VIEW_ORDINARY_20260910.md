@@ -2419,3 +2419,183 @@ others; queued work and mutex acquisition are small there. Exact per-reply
 causality, a safe work correction and ordinary practical acceptance remain
 separate obligations. No runtime change or performance promotion follows from
 these nested totals alone.
+
+## Ordinary recovery-attached observation: practical gate fails
+
+The six-file candidate atop `a16b404` removes unused global Original-admission
+projection from the fresh lower recovery observation. It introduces internal
+Attached/Recovery/BulkAdmission scopes: Recovery preserves the old bulk scope's
+health maintenance, measured attachment evidence and proof qualification without
+building global candidates or latency pressure. Existing boolean callers keep
+their previous mapping; only the lower recovery model changes scope, including
+its completion-tail consumer. No clock, rate, recovery geometry, native policy
+or public knob changes. The final source patch is preserved with the capture.
+
+Forecast: remove genuinely unused work, but do not equate the earlier model
+timer with removable time or promise a throughput gain. The sole ordinary
+comparator is the preserved `a16` run23406, not any diagnostic capture. This
+chronological same-profile comparison is not packet-identical or equal-work.
+**Reject performance promotion:** exact completion survives, but delivered work,
+settlement, pre-cut/cut/restored service and both maximum gaps are materially
+adverse. Startup confirmation improves; it does not clear these failures.
+This result does not establish that deleting the projection caused every stall.
+
+### Source proof and reproducibility
+
+The initial actual-producer RED compiles in1m11s and reaches the intended final
+assertion: first/successor global builds `(1,1)`, expected `(0,0)`, after the
+semantic and ordinary-positive controls. The first GREEN compilation takes
+2m16s; all12client checks pass, but an added equivalence fixture fails before
+scope comparison because its attachment retained proof generation0 after the
+physical install advanced health generation1. The fixture is corrected through
+real proof retry/admission/ACK, with mismatch-to-match checks, not weaker runtime
+evidence. Retry compilation takes27.86s; remaining checks pass. There are28
+distinct focused passes, not an additional count for the repeated negative test.
+
+Ordinary build47114 completes in3m31s with the existing unused batch-helper
+warning. The frozen executable is `bin/recovery-attached-observation-20260911/mptunnel`;
+there are no diagnostic flags or compiler overlap. Runner44791 exits0 in
+75.009488s. The [verified raw archive](RECOVERY_ATTACHED_OBSERVATION_ORDINARY_20260911.raw.tar.gz)
+contains15regular files/467,166B: five results, RED/initial GREEN/retry/build/driver
+logs, RED/initial/final patches, `run.py` and `shape.sh`. Final patch has six
+source files. Gzip, tar comparison and every decompressed member's bytes pass;
+runner and shape match the ordinary `a16` archive byte-for-byte. No configs,
+credentials, binaries, symlinks or directory entries are included.
+
+### Complete outcome and all raw confirmation bins
+
+| Outcome | Ordinary `a16`, run23406 | Recovery-attached candidate |
+|---|---:|---:|
+| Accepted = confirmed bytes | 526,385,152 | 298,516,480 |
+| Exact completed streams / errors | 1/1 /0 | 1/1 /0 |
+| Elapsed, s | 45.465808 | 74.611477 |
+| Whole confirmed Mbps | 92.621 | 32.008 |
+| First write / confirmation, s | .105228 /.408993 | .105916 /.409137 |
+| Maximum write gap, s | 7.235997 | **26.570694** |
+| Maximum confirmation gap, s | 4.145083 | **22.436904** |
+| Nominal40s endpoint to final settlement, s | 5.465808 | 34.611477 |
+| Raw bins / zero bins | 46 /11 | 75 /55 |
+
+The candidate completes43.29% fewer bytes in64.10% more time; whole goodput
+falls65.44%. Write/confirmation maxima grow3.67/5.41times. Both probes are exact,
+status `ok`, without censoring or echo workload. Status and eventual completion
+are not practical acceptance. Source backpressure can extend the last local
+acceptance beyond the nominal40s offered duration.
+
+| Raw confirmation phase | `a16`, Mbps | Candidate, Mbps | Candidate zeros |
+|---|---:|---:|---:|
+| 0–5s | 65.683 | 114.204 | 0/5 |
+| 5–15s, pre-cut | 96.384 | 21.158 | 8/10 |
+| 15–25s | 98.764 | **0** | 10/10 |
+| Interior16–24 inclusive | 104.288 | **0** | 9/9 |
+| 25–40s, restored | 83.343 | 52.364 | 9/15 |
+| Own post40 bins, last partial | 113.510 over40–46 | 23.431 over40–75 | 28/35 |
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 8.693,206.333,269.741,58.623,27.628,163.053,48.523,0,0,0
+10: 0,0,0,0,0,0,0,0,0,0
+20: 0,0,0,0,0,0,0,0,5.095,0
+30: 0,14.003,0,12.692,179.76,546.456,27.455,0,0,0
+40: 0,0,41.419,17.796,0,0,0,0,0,0
+50: 0,0,0,0,0,0,0,0,0,0.096
+60: 0,0,0,0,0,0,55.979,0,0,0
+70: 0,481.468,12.085,0,211.235
+```
+
+The untrimmed history preserves the long pre-cut-to-restored confirmation
+silence. Large later confirmation bursts include buffered service; they are not
+instantaneous physical link rates or evidence that intervening zeros are benign.
+
+### Own source, target and reply plateaus
+
+Management counters below mean client source-read, successful server target-
+socket write, server sink-reply read and client local-reply write respectively.
+They are not interchangeable receiver frontiers. The ordinary probe saves gap
+magnitudes without endpoints, so no sampled plateau is asserted to be the exact
+26.570694s write or22.436904s confirmation interval.
+
+| Sample | Source, B | Target write, B | Server reply read, B | Client reply write, B |
+|---|---:|---:|---:|---:|
+| 7 | 165,558,006 | 98,843,342 | 317 | 304 |
+| 15 | 165,558,006 | 163,598,390 | 498 | 304 |
+| 28 | 165,558,006 | 164,873,110 | 792 | 304 |
+| 29 | 165,558,006 | 164,926,646 | 806 | 317 |
+| 44 | 270,526,540 | 270,526,540 | 1,184 | 1,100 |
+| 59 | 270,526,540 | 270,526,540 | 1,184 | 1,100 |
+| 64 | 270,526,540 | 270,526,540 | 1,184 | 1,114 |
+| 71 | 282,753,494 | 270,526,540 | 1,184 | 1,128 |
+| 72 | 298,516,480 | 271,784,382 | 1,198 | 1,198 |
+| 73–74 | 298,516,480 | 298,516,480 | 1,267 | 1,212 |
+
+The first source/reply plateau starts by sample7, before the15s physical cut.
+Client reply304B persists from Unix1789060611178 through1789060632178 (21s),
+although target writes and already-read replies advance. Source stays unchanged
+through sample29. During44–64, source equals target writes, while already-read
+reply bytes still lag locally; target remains fixed through71. Client Unix
+1789060648179→1789060668179 bounds that20s source plateau. This distinguishes
+return service from unfinished then-accepted target writes, but does not locate
+the exact reply in a server writer, native carrier, reader or Product actor.
+At73–74 all target writes are sampled, but local replies remain short; only the
+final probe proves exact settlement after the last management observation.
+
+In44→64, native forward ACK counters add11,862,090TCP/120,562QUIC bytes;
+reverse ACK counters add2,652TCP/3,163QUIC bytes. Used producer timestamps
+advance with stable epochs; idle TCP stamps can remain old. Client Product
+flight declines37,750,916→25,741,410B, including QUIC46/47 debt
+18,879,214/18,857,102→17,183,014/8,543,796B. Both QUIC native flights are0 at
+the endpoints; their flight limits remain about8.48→8.60MB and5.64MB. TCP47
+adds11,729,636native ACK bytes while its reported Original Product flight is0.
+These domains do not identify critical copies or justify a useful/wasteful-copy
+claim. At66–71 sampled native flight and total queue are0 while Product flight
+remains23,376,520→14,722,192B; zero aggregate queue is not command-slot readiness,
+available recovery authority or proof of continuous native idleness.
+
+### Matched shape, phase service and costs
+
+All75samples verify independent200+200Mbps, DOWN30ms/UP70ms, zero configured
+loss/jitter/outage, netem limit8192 and65536BHTB burst/cburst. Client eth0/eth1
+are46/47; server eth1/eth0 are46/47. Only46UP is10Mbps from the sample at
+15.001726s through restoration at25.002850s;47 stays200. Rates equal ceilings,
+all class/qdisc drop deltas are0. One session10840567746103731421 retains eight
+active physical outputs, no suspect/failed state; native epochs remain stable
+once all eight are initialized at sample10.
+
+| Actual management target-write phase | `a16`, Mbps | Candidate, Mbps | Candidate UP46 /47 class Mbps |
+|---|---:|---:|---:|
+| 0→5s | 155.060 | 140.131 | 142.175 /125.016 |
+| 5→15s | 75.944 | 60.813 | 66.802 /73.934 |
+| Strict16→24s | 119.326 | **.840** | **1.604 /1.866** |
+| 25→40s | 68.915 | 56.483 | 71.881 /50.867 |
+| Own post40 sample window | 110.547 over40→45 | 6.589 over40→74 | 8.333 /15.221 |
+
+Target rates use their own producer timestamps, class rates the collector
+window. Their mismatch with raw confirmation is retained. During the cut even
+unrestricted47 is largely unused; neither its configured capacity nor subsequent
+bursts explain away zero ordered confirmation. The ordinary capture lacks
+owner timers and exact frame events, so it cannot prove removal reduced actual
+work or assign the remaining failure to a particular synchronous caller.
+
+| Whole sampled cost | Ordinary `a16` | Candidate |
+|---|---:|---:|
+| Sample window, s | 45.006732 | 74.009282 |
+| UP46 /47 class bytes | 467,368,412 /749,700,687 | 344,644,516 /332,909,957 |
+| DOWN46 /47 class bytes | 7,015,954 /8,612,499 | 5,055,643 /4,818,249 |
+| Summed UP backlog peak / final, B | 28,677,318 /12,763,272 | 24,305,824 /922,448 |
+| Summed DOWN backlog peak / final, B | 46,620 /13,425 | 49,564 /330 |
+| Client RSS peak / final, KiB | 355,388 /342,712 | 338,900 /332,632 |
+| Server RSS peak / final, KiB | 75,776 /75,776 | 102,180 /102,180 |
+| Client lifetime CPU peak / final, % | 126 /123 | 127 /108 |
+| Server lifetime CPU peak / final, % | 66.2 /37.8 | 58.7 /14.1 |
+
+Lower bytes and some lower sampled costs accompany much less useful work and a
+longer observation, not improved efficiency. Client lifetime CPU declines112→108%
+over44–64; it is not interval CPU or measured lock occupancy. Final RSS/backlog
+are not matched settled-state or post-teardown retention measurements. Client
+log and probe stderr are empty; the366Bserver log contains two `H3_NO_ERROR`
+remote-close warnings during teardown after completion, not autonomous failures.
+
+The semantic/work proof passes its targeted checks, but the ordinary practical
+forecast is not met. Preserve the adverse result and exact trial independently;
+no performance promotion, profile rescue or causal claim from diagnostic timings
+is justified. Source retention/removal is the parent's separate disposition.

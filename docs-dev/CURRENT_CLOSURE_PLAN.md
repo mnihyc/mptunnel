@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 00:40 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 01:32 +08:00. Authoritative repository: ./.
 **MPP is NOT performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -12,9 +12,12 @@ does not waive any failure or reactivate any rejected candidate.
 
 ## Active transaction: current late-stall owner and inner work
 
-Runtime is a16b404 (docs checkpoint6239ba6). Diagnostic build28234 completed0
+Runtime is a16b404 (docs checkpointc11d266). Diagnostic build28234 completed0
 in3m36s. Its exact seven-file overlay was frozen and FULLY REVERSED before
-traffic;90510 is now running the unchanged cell. Ordinary source is clean.
+traffic;90510 completed and its evidence is committed. The subsequent six-file
+recovery-attached observation trial FAILED ordinary44791 and is FULLY REMOVED.
+No build or lab is running; target/release and that trial's frozen binary are
+REJECTED candidates, not current source. Use the named a16 comparator below.
 Diagnostic61411 completed; its three-file classifier was fully reversed.
 Its result changes the next decision: **do not implement a queue-readiness filter**.
 
@@ -107,7 +110,7 @@ service owner and retained model/capacity/deadline wakes; the current structural
 dirty contract does not cover them. Do not implement an incomplete gate or
 reopen the rejected full-observation cache.
 
-Selected next experiment: remove unused GLOBAL Original-admission projection
+Now REJECTED experiment: remove unused GLOBAL Original-admission projection
 inside the existing per-region repair observation, without changing its fresh
 attached evidence. dc4853d correctly paired owner and alternate in one coherent
 observation, but reused9c5a125's full admission capture. The lower gap model
@@ -135,6 +138,127 @@ against the existing a16 comparator. Preserve complete timing/costs/adverse
 phases. No material benefit or a new practical regression stops promotion and
 returns to attribution; no knob/profile tuning or untested second candidate.
 No RFC semantic change is warranted by deletion of an unused pure projection.
+
+Pre-change transitive audit also finds the same lower model serves completion-
+tail fallback. Its consumers likewise never read globals; explicitly include
+existing tail/native/RegularBackup checks. Internal scope has three legal cases:
+legacy Attached(oldfalse), BulkAdmission(oldtrue), Recovery(same maintenance/
+attached evidence as true, no global projection). Existing callsite booleans
+retain their original mapping; only the common lower recovery model changes.
+Native inputs are captured before the one health lock, and maintenance still
+visits ALL configured records before attached evidence, preserving generation
+effects. No new invalid parameter combinations or public knob.
+
+Actual RED72806 compiles1m11s and fails only the intended final assertion after
+all real sparse receipt/copy/expiry/second dispatch/ordinary-positive controls:
+first/successor recovery builds(1,1)global candidate projections, expected(0,0).
+The fully covered evaluator builds0, and two-attached ordinary Original send
+builds>0. This proves unused work in the production evaluator, not a speed gain.
+Scoped implementation and attached-evidence equivalence review now proceed;
+root owns the next focused checks and ordinary build/run, no concurrent lab.
+
+Current execution17:07UTC: six-file candidate and tests frozen as
+./.tmp/reflection/recovery-attached-observation-0911.patch. Independent actual-
+diff audit passes; only the common lower model selects Recovery, with old
+bool callers mapped equivalently. Test36777 is running the focused client,
+detached Native receipt, persistent gap, completion tail, coherent target and
+path-selection checks. RED patch/log use recovery-attached-observation-red-0911;
+GREEN log uses recovery-attached-observation-green-0911.log. No lab/build overlap.
+If green, root builds ordinary release once, freezes unique
+bin/recovery-attached-observation-20260911/mptunnel and runs SAME cell/tag
+recovery-attached-observation-0911. No runtime commit or promotion yet.
+
+36777closed101 after2m16s compile: all12client tests pass, including actual
+global-build RED now0/0. Added mixed equivalence fixture fails BEFORE comparing
+scopes on its expected-positive fresh proof. Existing changed-attachment test
+passes. Exact fixture cause: it attaches with generation0, then first physical
+install advances health proof generation to1. Recording a proof ACK in health
+does not update the attachment's stored generation. Backup usage is not the
+cause. Corrected fixture through real retry_pending_path_proofs/new commands/
+proof ACK, with explicit mismatch→match controls; no runtime change or relaxed
+evidence assertion. Initial failed log/patch retained; retry24647 uses
+recovery-attached-observation-green-retry-0911.log (only remaining filters).
+
+Retry24647closed0,27.86s compile;2Native receipt+3persistent gap+5completion
+tail+1coherent target+5selection checks pass. Along with12client checks this
+is28distinct focused tests (do not double-count the earlier native negative).
+Independent fixture-correction review passes. Final six-file source is frozen
+as recovery-attached-observation-final-0911.patch; only test producer setup
+differs from the initial candidate. Ordinary release build is now active;
+freeze the final binary then unchanged same-cell run. No candidate commit yet.
+
+Ordinary build47114closed0 in3m31s; frozen final candidate at
+bin/recovery-attached-observation-20260911/mptunnel.44791closed0 but FAILED
+the practical gate: exact298516480B/74.611477s=32.008Mbps versus a16ordinary
+92.621Mbps. Maximum write26.570694s versus7.235997; confirmation22.436904s
+versus4.145083.55of75rawbins are zero, including ALL15–25cut bins; startup
+improvement114.204versus65.683Mbps does not compensate. A pre-cut source/reply
+hold starts at7s. Later source=target270526540B stays flat44–64 while reply
+bytes already read at server lag locally; Native ACKs continue. These ordinary
+counters do not locate each blocked frame or prove the trial caused every
+adverse interval. The practical forecast nevertheless failed: root reversed
+ALL six source files and tests, no favorable rerun or parameter rescue.
+The full179line appendix and RECOVERY_ATTACHED_OBSERVATION_ORDINARY_20260911
+raw archive preserve15regular files/467166B, all bins, costs, final/initial/RED
+patches and failed fixture log. Source identities and runner/shape match checked.
+
+### Selected next model: pending ACK-gap service, not unconditional scanning
+
+Issue remains the SAME material actor-work owner. Repeated enumeration runs
+before every fair class selection AND synchronously inside every novel ACK
+Apply. Exact replay suppression a16 only prevents structural invalidation;
+it cannot quiesce that preselect work. Restored90510's5.024s window contains
+4.355900s gap work and4.960852s total actor ownership. Moving a pure projection
+did not clear ordinary service; no more local projection/cache trials.
+
+Contract to prove before implementation: validated ACKs immediately retain
+their release, exact pruning, authoritative evidence, staleness and lifecycle
+effects, then mark an actor-owned gap job pending. Only a selected existing
+Dispatch turn performs fresh gap enumeration. A completed blocked/no-action
+scan clears pending but retains prearmed capacity/model and future-deadline
+wakes; unrelated DATA and exactly subsumed ACKs do not rescan unchanged work.
+Admission leaves successor work pending. Keep no target/range/queue snapshot
+across turns. Novel facts, Original commit, queue/copy change or expiry,
+membership/lane/qualification, model publication, capacity and deadline events
+invalidate the result. A dynamic lack of alternatives cannot disable future
+publication wakes. Consume due timers once; due-but-blocked is not always-ready.
+Retain the exact capacity future armed BEFORE observation across selection,
+so a release between the failed scan and next poll cannot disappear.
+
+Origin/intention: unconditional evaluation covered independent recovery wakes
+and kept ACK evidence and queued work together; it also did unowned potentially
+large discovery ahead of the RFC10.4 fair service boundary. The correction is
+an explicit event-driven work owner, not a lower timeout/rate or suppression of
+valid recovery. Lazy first timing observation moves to selected service, while
+assignment anchors/minima remain fixed. Shared transient load intentionally
+does not publish model changes, so do not claim timing-identical relocation:
+only observed invalidations trigger reconsideration, with retained deadlines.
+
+Forecast: true frozen-state quiescence removes ALL redundant gap evaluations
+on unchanged Input turns, and selected service removes that work from ACK Apply.
+This can materially improve FIFO input service during the proven expensive
+period, but4.356s nested elapsed is NOT removable critical delay or a Mbps
+prediction. Real publications/novel ACKs may remain frequent; one scan and
+direct structural dispatch remain expensive. No material ordinary benefit is a
+falsifier, not reason to change the link or restore a rejected micro-optimization.
+
+Smallest producer RED uses existing actual relay actor/prepared Original native
+claims and additional-attachment test ingress: establish a real sparse ACK gap
+with a full alternate repair lane, then replay ACKs/reverse DATA without changing
+model/queue facts. Evaluator count must remain unchanged after one blocked
+evaluation while reverse DATA reaches the local sink. Releasing an actual slot
+between failed observation and next wait poll must awaken exact admission;
+independently due successors and immediate ACK release remain controls. Only
+cfg(test) ingress/counter additions are authorized before RED. No new harness.
+Root owns builds; independent agents audit actual producer invalidations.
+
+Direct-dispatch attempt cursor is NOT in this patch. Counting failed regions
+against an existing item quantum is attractive, but cyclic continuation can
+skip a newly serviceable lower range/Regular after a yield; resetting every
+publication can starve later work. Exact fresh Apply alone does not revalidate
+global priority. Its benefit is shorter indivisible Dispatch, not quiescence or
+the dominant restored preselect work. Preserve that countercase, do not add a
+generic generation system or silently weaken RFC15 to bundle another change.
 
 ## Just-completed correction: exact subsumed ACK invalidation
 
@@ -280,7 +404,7 @@ User's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md stays untouched/unstaged.
 Exact intermediary commits; docs-dev requires exact force-add. PROGRESS is
 ignored continuity, AGENTS.md immutable.
 
-Telegram measured partial-result update sent16:17UTC; next nonurgent after17:18.
+Telegram rejected-trial update sent17:19UTC; next nonurgent after18:20UTC.
 Commentary within60s; verification polling by minutes. Before compaction record
 active session, next decision, source/binary identities and adverse/open outcomes.
 Continue useful execution; do not conclude because one checkpoint closes.

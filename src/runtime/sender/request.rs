@@ -60,6 +60,7 @@ use crate::runtime::relay::io::{
 #[cfg(test)]
 use crate::runtime::stream::ReliablePathStreamHandle;
 use crate::runtime::stream::StreamFeedbackPublication;
+use crate::runtime::stream::request::RequestRecoveryOwnershipView;
 use crate::runtime::stream::{
     ReliablePathStreamOutput, ReliableRecvProgress, ReliableRelayRemoteSet, RequalificationAttempt,
 };
@@ -727,6 +728,7 @@ impl RequestSenderService {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(in crate::runtime) fn data_ack_gap_reinjection_model(
         &self,
         context: &ClientPathContext,
@@ -737,13 +739,40 @@ impl RequestSenderService {
         preview_limit: usize,
         lane: TrafficClass,
     ) -> RequestDataAckGapObservation {
+        let ownership = self
+            .multipath
+            .recovery_ownership_view(normalized_ranges.last().map_or(0, |range| range.end));
+        self.data_ack_gap_reinjection_model_from_view(
+            context,
+            remotes,
+            send_stream,
+            sender_queue,
+            normalized_ranges,
+            preview_limit,
+            lane,
+            &ownership,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn data_ack_gap_reinjection_model_from_view(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        sender_queue: &ReliableRelaySenderQueue,
+        normalized_ranges: &[OffsetRange],
+        preview_limit: usize,
+        lane: TrafficClass,
+        ownership: &RequestRecoveryOwnershipView,
+    ) -> RequestDataAckGapObservation {
         let Some((frontier, horizon)) = first_proven_ack_gap(normalized_ranges) else {
             return RequestDataAckGapObservation::default();
         };
         let live_instances = self
             .multipath
             .owner_capable_instances(context, remotes, lane);
-        let Some(uniform_frontier) = self.multipath.live_owner_uniform_frontier(
+        let Some(uniform_frontier) = ownership.uniform_frontier(
             OffsetRange {
                 start: frontier,
                 end: horizon,
@@ -773,7 +802,13 @@ impl RequestSenderService {
         };
         if scoring_frontier.range != scoring_range
             || scoring_frontier.owners != uniform_frontier.owners
-            || scoring_frontier.avoid != uniform_frontier.avoid
+            // The horizon view supplies coverage sets, not a ranking order.
+            // Preserve the scored query's exact ordering for every consumer.
+            || scoring_frontier.avoid.len() != uniform_frontier.avoid.len()
+            || !scoring_frontier
+                .avoid
+                .iter()
+                .all(|instance| uniform_frontier.avoid.contains(instance))
         {
             return RequestDataAckGapObservation::default();
         }
@@ -850,11 +885,19 @@ impl RequestSenderService {
         covered.extend(sender_queue.queued_reinjection_ranges());
         let covered = normalize_offset_ranges(covered);
         let ranges = offset_ranges_not_covered(gaps, &covered);
-        let boundaries = self.multipath.recovery_service_boundaries(gaps);
         let mut service = RequestDataAckGapService {
             next_deadline: copy_deadline,
             ..RequestDataAckGapService::default()
         };
+        if ranges.is_empty() {
+            return service;
+        }
+        let boundaries = self.multipath.recovery_service_boundaries(gaps);
+        // Product ownership cannot mutate during this synchronous evaluation.
+        // Native eligibility and target service are still observed per action.
+        let ownership = self
+            .multipath
+            .recovery_ownership_view(gaps.last().map_or(0, |range| range.end));
         let mut observation_deadline = None::<Instant>;
         for range in ranges {
             let mut cursor = range.start;
@@ -869,7 +912,7 @@ impl RequestSenderService {
                 // that case retries the shorter real assignment boundary.
                 let mut candidate_end = range.end;
                 loop {
-                    let mut model = self.data_ack_gap_reinjection_model(
+                    let mut model = self.data_ack_gap_reinjection_model_from_view(
                         context,
                         remotes,
                         send_stream,
@@ -880,6 +923,7 @@ impl RequestSenderService {
                         }],
                         preview_limit,
                         lane,
+                        &ownership,
                     );
                     let extent = preview_limit.min(model.uniform_frontier_extent_bytes);
                     if !model.has_live_original_path || extent == 0 {

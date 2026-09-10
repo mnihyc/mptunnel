@@ -65,7 +65,8 @@ use crate::runtime::path::{
     ClientPathContext, ReliableRequestNativeShape, ReliableRequestPathBatchObservation,
 };
 use crate::runtime::stream::request::{
-    RequestAckClockOperation, RequestFlightLedger, RequestPathRelease, RequestStreamState,
+    RequestAckClockOperation, RequestFlightLedger, RequestPathRelease,
+    RequestRecoveryOwnershipView, RequestStreamState,
 };
 use crate::runtime::stream::{
     ReliablePathStreamOutput, ReliableRelayRemotePath, ReliableRelayRemoteSet,
@@ -1536,6 +1537,10 @@ impl RequestMultipathController {
 
     pub(super) fn recovery_service_boundaries(&self, gaps: &[OffsetRange]) -> Vec<u64> {
         self.request.flights.recovery_service_boundaries(gaps)
+    }
+
+    pub(super) fn recovery_ownership_view(&self, horizon: u64) -> RequestRecoveryOwnershipView {
+        self.request.flights.recovery_ownership_view(horizon)
     }
 
     pub(super) fn observe_original_recovery_timing_for_range(

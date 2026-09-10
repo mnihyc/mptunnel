@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 17:56 +08:00. Authoritative repository: `./`.
+Updated: 2026-09-10 18:28 +08:00. Authoritative repository: `./`.
 **MPP is not performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; do not conclude at an intermediary commit.
 
@@ -10,13 +10,31 @@ growing inventory. Complete preceding chronology and adverse outcomes remain at
 `git show 79ddb41:docs-dev/CURRENT_CLOSURE_PLAN.md`, earlier49143f2, and the
 linked reports/archives. Condensation discards no experiment.
 
-## Active transaction: remove demonstrated repeated ownership-query work
+## Active transaction: attribute remaining request-pilot service failure
 
 **Ordinary request pilot79ddb41 failed. Work RED79277 is confirmed.**
 Actual evaluator takes5,290 sweep visits versus2,442 after blocked-capacity and
 released-capacity semantic controls pass (.22s runtime). View implementation
-is now in progress; root integration complete, oracle tests/independent review
-are finishing. Root owns cargo/labs; no compiler or lab is running.
+is complete;101focused checks PASS in1.25s, including the real work RED and
+five view-oracle checks. Independent integration review found no counterexample.
+Ordinary release build76575 CLOSED successfully (84s), frozen as
+authoritative-gap-view-20260910. Session10116 CLOSED with exact323,158,016B
+settlement in56.678s, but practical acceptance FAILS: pre-cut7.336Mbps,
+restored35.519Mbps, confirmation gap7.471s and local-write gap14.916s.
+[Full result](AUTHORITATIVE_GAP_VIEW_ORDINARY_20260910.md) retains all57bins,
+35zeros, unchanged profiles and costs. Root owns cargo/labs; no promotion.
+
+Next information question: does repeated synchronous recovery work still
+dominate the new view's stalls, and which remaining query stage? Existing
+ordinary native progress cannot answer this. Reuse the prior small periodic
+observer on this exact candidate, separately timing owner eligibility, scored
+ledger/cache query, lower target/native model and assignment clocks within
+the outer evaluation. No per-query log flood or scheduling intervention.
+Same topology/profile; freeze diagnostic separately and reverse overlay before
+traffic. If model work remains dominant, use its actual stage to propose an
+equivalent-work correction; if not, stop that line and trace the exact held
+prefix/repair service. This is information-only, not a promised speed gain or
+a favorable rerun. Do not advance healthy/baseline gates on component GREEN.
 
 The original independent-link failure is real: on two200Mbps links, only46
 slows200→10→200 during15–25s while47 stays healthy. Existingb0 upload averages

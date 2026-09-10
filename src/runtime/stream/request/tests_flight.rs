@@ -1,4 +1,4 @@
-use super::RequestFlightLedger;
+use super::{RequestFlightLedger, RequestRecoveryOwnershipView};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::model::work::CarrierWorkKind;
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
@@ -20,6 +20,235 @@ fn path(underlay: UnderlayProtocol, index: usize, id: u64) -> RelayPathInstance 
         path_instance_id: CarrierPathInstanceId::from_raw(id.max(1)),
         attachment_id: id,
     }
+}
+
+fn assert_recovery_ownership_view_matches_oracle(
+    ledger: &RequestFlightLedger,
+    view: &RequestRecoveryOwnershipView,
+    range: OffsetRange,
+    instances: &[RelayPathInstance],
+) {
+    let actual = view.uniform_frontier(range, instances);
+    let expected = ledger.live_owner_uniform_frontier(range, instances);
+    match (actual, expected) {
+        (None, None) => {}
+        (Some(actual), Some(expected)) => {
+            assert_eq!(
+                actual.range, expected.range,
+                "query {range:?}, {instances:?}"
+            );
+            assert_eq!(actual.owners.len(), expected.owners.len());
+            assert!(
+                actual
+                    .owners
+                    .iter()
+                    .all(|owner| expected.owners.contains(owner))
+            );
+            assert_eq!(actual.avoid.len(), expected.avoid.len());
+            assert!(
+                actual
+                    .avoid
+                    .iter()
+                    .all(|owner| expected.avoid.contains(owner))
+            );
+        }
+        (actual, expected) => {
+            panic!("query {range:?}, {instances:?}: actual {actual:?}, expected {expected:?}")
+        }
+    }
+}
+
+#[test]
+fn recovery_ownership_view_matches_crossing_spans_and_current_masks() {
+    let a = path(UnderlayProtocol::Tcp, 0, 301);
+    let b = path(UnderlayProtocol::Udp, 1, 302);
+    let c = path(UnderlayProtocol::Tcp, 2, 303);
+    let replacement = path(UnderlayProtocol::Tcp, 0, 304);
+    let instances = [a, b, c, replacement];
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(a, &data_frame(0, 8));
+    ledger.record_original_frame_instance(a, &data_frame(8, 8));
+    ledger.record_original_frame_instance(b, &data_frame(16, 8));
+    ledger.record_original_frame_instance(replacement, &data_frame(26, 6));
+    ledger.record_reinjection_frame_instance(c, &data_frame(2, 10));
+    ledger.record_reinjection_frame_instance(c, &data_frame(10, 10));
+    ledger.record_reinjection_frame_instance(b, &data_frame(6, 4));
+    ledger.record_reinjection_frame_instance(replacement, &data_frame(12, 6));
+    let view = ledger.recovery_ownership_view(32);
+
+    // The same immutable view accepts a different exact eligibility mask on
+    // every query. Starts inside older copy spans must retain their avoidance.
+    for mask in 0..(1usize << instances.len()) {
+        let live = instances
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instance)| (mask & (1 << index) != 0).then_some(*instance))
+            .collect::<Vec<_>>();
+        for start in 0..=32 {
+            for end in start..=32 {
+                assert_recovery_ownership_view_matches_oracle(
+                    &ledger,
+                    &view,
+                    OffsetRange { start, end },
+                    &live,
+                );
+            }
+        }
+    }
+    assert!(
+        ledger
+            .flights
+            .values()
+            .flatten()
+            .all(|flight| flight.original_recovery_timing.is_none()),
+        "view construction and queries cannot initialize assignment clocks"
+    );
+}
+
+#[test]
+fn recovery_ownership_view_merges_storage_boundaries_but_keeps_membership_changes() {
+    let owner = path(UnderlayProtocol::Udp, 0, 305);
+    let copy = path(UnderlayProtocol::Tcp, 1, 306);
+    let mut ledger = RequestFlightLedger::default();
+    for start in (0..24).step_by(4) {
+        ledger.record_original_frame_instance(owner, &data_frame(start, 4));
+    }
+    ledger.record_reinjection_frame_instance(copy, &data_frame(2, 6));
+    ledger.record_reinjection_frame_instance(copy, &data_frame(6, 6));
+    ledger.record_reinjection_frame_instance(copy, &data_frame(12, 4));
+    let view = ledger.recovery_ownership_view(24);
+    let frontier = view
+        .uniform_frontier(OffsetRange { start: 5, end: 24 }, &[owner, copy])
+        .expect("crossing copies cover this Original prefix");
+    assert_eq!(frontier.range, OffsetRange { start: 5, end: 16 });
+    assert_eq!(frontier.owners, vec![owner]);
+    assert_eq!(frontier.avoid.len(), 2);
+    assert_recovery_ownership_view_matches_oracle(
+        &ledger,
+        &view,
+        OffsetRange { start: 5, end: 24 },
+        &[owner, copy],
+    );
+    assert_eq!(
+        view.uniform_frontier(OffsetRange { start: 5, end: 24 }, &[owner])
+            .expect("current mask excludes the copy")
+            .range,
+        OffsetRange { start: 5, end: 24 },
+    );
+    assert_eq!(
+        view.uniform_frontier(OffsetRange { start: 5, end: 24 }, &[copy]),
+        None,
+        "accepted copies cannot manufacture an Original owner"
+    );
+}
+
+#[test]
+fn recovery_ownership_view_rebuilds_after_ack_and_keeps_expired_copy_ownership() {
+    let owner = path(UnderlayProtocol::Udp, 0, 307);
+    let copy = path(UnderlayProtocol::Tcp, 1, 308);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 20));
+    let (_, deadline) = ledger.record_reinjection_frame_instance_with_suppression_interval(
+        copy,
+        &data_frame(2, 14),
+        Duration::ZERO,
+    );
+    let deadline = deadline.expect("accepted copy has its immutable deadline");
+    assert_eq!(
+        ledger.live_copy_coverage(&[owner, copy], deadline),
+        (vec![], None)
+    );
+    let before = ledger.recovery_ownership_view(20);
+    assert!(
+        before
+            .uniform_frontier(OffsetRange { start: 3, end: 20 }, &[owner, copy])
+            .expect("expired copy is still retained")
+            .avoid
+            .contains(&copy)
+    );
+    let timing = ledger
+        .observe_original_recovery_timing_for_range(OffsetRange { start: 0, end: 2 }, |_| {
+            Some(recovery_timing_snapshot(owner, 100.0))
+        })
+        .expect("actual Original timing");
+    ledger.release_normalized_acked_ranges(&[OffsetRange { start: 6, end: 10 }]);
+    // A view has only this transaction's lifetime; ACK mutation requires a new
+    // view, rather than treating an old snapshot as current receipt authority.
+    let after = ledger.recovery_ownership_view(20);
+    for start in 0..20 {
+        assert_recovery_ownership_view_matches_oracle(
+            &ledger,
+            &after,
+            OffsetRange { start, end: 20 },
+            &[owner, copy],
+        );
+    }
+    assert_eq!(
+        after.uniform_frontier(OffsetRange { start: 6, end: 20 }, &[owner, copy]),
+        None,
+        "positive ACK holes cannot remain as ownership coverage"
+    );
+    for flight in ledger.flights.values().flatten() {
+        if flight.kind.is_original_transmission() {
+            assert_eq!(flight.original_recovery_timing, Some(timing));
+        } else {
+            assert_eq!(flight.reinjection_suppression_deadline, Some(deadline));
+            assert_eq!(flight.original_recovery_timing, None);
+        }
+    }
+}
+
+#[test]
+fn recovery_ownership_view_avoidance_order_is_not_ranking_order() {
+    let copy = path(UnderlayProtocol::Tcp, 0, 309);
+    let owner = path(UnderlayProtocol::Udp, 1, 310);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_reinjection_frame_instance(copy, &data_frame(0, 2));
+    ledger.record_original_frame_instance(owner, &data_frame(2, 8));
+    ledger.record_reinjection_frame_instance(copy, &data_frame(4, 6));
+    let range = OffsetRange { start: 5, end: 10 };
+    let view = ledger.recovery_ownership_view(10);
+    let actual = view.uniform_frontier(range, &[owner, copy]).unwrap();
+    let oracle = ledger
+        .live_owner_uniform_frontier(range, &[owner, copy])
+        .unwrap();
+    assert_eq!(actual.owners, oracle.owners);
+    assert_eq!(actual.avoid, vec![copy, owner]);
+    assert_eq!(oracle.avoid, vec![owner, copy]);
+    assert_recovery_ownership_view_matches_oracle(&ledger, &view, range, &[owner, copy]);
+}
+
+#[test]
+fn recovery_ownership_view_is_bounded_by_its_captured_horizon() {
+    let owner = path(UnderlayProtocol::Tcp, 0, 311);
+    let replacement = path(UnderlayProtocol::Tcp, 0, 312);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 20));
+    let view = ledger.recovery_ownership_view(12);
+    assert_recovery_ownership_view_matches_oracle(
+        &ledger,
+        &view,
+        OffsetRange { start: 8, end: 12 },
+        &[owner],
+    );
+    assert_eq!(
+        view.uniform_frontier(OffsetRange { start: 8, end: 13 }, &[owner]),
+        None
+    );
+    assert_eq!(
+        view.uniform_frontier(OffsetRange { start: 12, end: 12 }, &[owner]),
+        None
+    );
+    assert_eq!(
+        view.uniform_frontier(OffsetRange { start: 8, end: 12 }, &[replacement]),
+        None
+    );
+    assert_eq!(
+        ledger
+            .recovery_ownership_view(0)
+            .uniform_frontier(OffsetRange { start: 0, end: 1 }, &[owner]),
+        None,
+    );
 }
 
 fn assert_original_data_cache(

@@ -418,6 +418,239 @@ async fn authoritative_request_gap_serves_distinct_successor_before_head_copy_ac
     );
 }
 
+#[tokio::test]
+async fn authoritative_request_gap_evaluation_does_not_repeat_full_horizon_sweeps() {
+    use crate::model::work::observe_frontier_span_visits_for_test;
+    use crate::protocol::frame::reliable_stream_frame_extent;
+    use crate::runtime::path::commands::{
+        reliable_path_command_pending_bytes, try_recv_reliable_path_command,
+    };
+    use crate::runtime::relay::io::begin_reliable_stream_ack;
+
+    let stream_id = StreamId(420);
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:11421?initial-srtt-s=0.02",
+            "tcp://127.0.0.1:11422?initial-srtt-s=0.02",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("configured carrier"))
+        .collect(),
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let limits = context.mux_limits;
+    let lane = TrafficClass::Throughput;
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let (mut remotes, _input) =
+        ReliableRelayRemoteSet::new(opened_request_path(stream_id, 0, owner_commands), 8);
+    consume_path_proof(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(owner);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), lane);
+
+    // Many assignment boundaries, but less than one ordinary startup window.
+    // Storage chunk size must not become the ranked recovery quantum.
+    let assignment_bytes = 1024usize;
+    let missing_assignments = 32usize;
+    let mut receiver = ReliableRecvStream::new(stream_id, limits);
+    let mut send_stream = ReliableSendStream::new_with_initial_max_offset(stream_id, limits, 0);
+    let Frame::StreamMaxData { max_offset, .. } = receiver.max_data_frame() else {
+        panic!("receiver credit");
+    };
+    send_stream.update_max_offset(max_offset);
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut originals = Vec::new();
+    for _ in 0..missing_assignments + 2 {
+        let frame = send_stream
+            .send_data(Bytes::from(vec![0x62; assignment_bytes]))
+            .expect("real credited cache admission");
+        // This wrapper uses ordinary Original planning and the attachment's
+        // Throughput lane, just as the preceding publication regression does.
+        sender
+            .send_control_frame(
+                &context,
+                &mut remotes,
+                frame.clone(),
+                RelaySendCause::StreamData,
+            )
+            .expect("actual Original reservation and ownership commit");
+        loop {
+            let command = try_recv_reliable_path_command(&mut owner_receivers)
+                .expect("committed Original command");
+            owner_receivers
+                .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+            match command {
+                ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => continue,
+                ReliablePathCommand::SendFrame(ref actual) if actual == &frame => break,
+                _ => panic!("unexpected Original command"),
+            }
+        }
+        originals.push(frame);
+    }
+    for index in [0, missing_assignments + 1] {
+        let Frame::StreamData {
+            offset, payload, ..
+        } = &originals[index]
+        else {
+            panic!("OriginalData");
+        };
+        receiver.receive_data(*offset, payload.clone()).unwrap();
+    }
+    let frames = receiver.ack_frames();
+    assert_eq!(frames.len(), 1);
+    let Frame::StreamAck {
+        scope_start,
+        ranges,
+        ..
+    } = frames.into_iter().next().unwrap()
+    else {
+        panic!("actual receiver ACK");
+    };
+    let ack = begin_reliable_stream_ack(&send_stream, scope_start, ranges).unwrap();
+    let applied = sender
+        .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
+        .unwrap();
+    assert_eq!(applied.mux.released_bytes, 2 * assignment_bytes);
+    let mut last_send_ack = AuthoritativeStreamAckSnapshot::default();
+    update_reinjection_authoritative_ack_snapshot(&mut last_send_ack, &ack, &send_stream);
+    let gap = OffsetRange {
+        start: assignment_bytes as u64,
+        end: ((missing_assignments + 1) * assignment_bytes) as u64,
+    };
+    assert_eq!(last_send_ack.gaps(), &[gap]);
+    assert_eq!(
+        send_stream.reinjection_bytes(),
+        missing_assignments * assignment_bytes
+    );
+
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(1);
+    remotes.attach_candidate(opened_request_path(stream_id, 1, target_commands.clone()));
+    consume_path_proof(&mut target_receivers);
+    let target = remotes.paths[1].instance();
+    context.install_relay_path_instance_for_test(target);
+    context.mark_tcp_path_open_success(1, Duration::from_millis(20), lane);
+    context.mark_relay_path_rate_sample_for_test(
+        target.key,
+        PathRateSample::new(64 * 1024, Duration::from_millis(20)).unwrap(),
+    );
+    assert!(context.relay_path_instance_has_bulk_model_evidence(target));
+    let path = context.reliable_path_snapshot_for_instance(owner);
+    let q = adaptive_reliable_relay_reinjection_bytes(path, lane, limits);
+    assert_eq!(q, 14_600);
+    assert!(q > assignment_bytes && q < missing_assignments * assignment_bytes);
+    let mut queue = ReliableRelaySenderQueue::default();
+    let last_assignment = OffsetRange {
+        start: (missing_assignments * assignment_bytes) as u64,
+        end: gap.end,
+    };
+    let last_model = sender.data_ack_gap_reinjection_model(
+        &context,
+        &remotes,
+        &send_stream,
+        &queue,
+        &[last_assignment],
+        q,
+        lane,
+    );
+    assert!(last_model.has_live_original_path && !last_model.target_service_exhausted);
+    assert_eq!(
+        last_model
+            .reinjection_target
+            .map(|(path, _)| path.instance()),
+        Some(target)
+    );
+    let due_at = last_model.owner_recovery_timing.unwrap().fallback_at;
+    tokio::time::sleep_until(tokio::time::Instant::from_std(due_at)).await;
+    assert!(Instant::now() >= due_at);
+
+    // Fill the actual target repair queue with unrelated work. This neither
+    // creates a copy of this stream nor changes any Original assignment clock.
+    let filler = Frame::StreamData {
+        stream_id: StreamId(999),
+        offset: 0,
+        payload: Bytes::from_static(b"occupied"),
+    };
+    target_commands
+        .try_enqueue_reinjection_frame(filler.clone(), lane)
+        .unwrap();
+    assert!(!target_commands.can_enqueue_reinjection_frame_now(&originals[1]));
+    let mut state = ClientRelayState::new();
+    let (blocked, visits) = observe_frontier_span_visits_for_test(|| {
+        evaluate_client_data_ack_reinjection(
+            &mut state,
+            &last_send_ack,
+            &mut sender,
+            &mut queue,
+            &context,
+            &remotes,
+            &send_stream,
+            path,
+            lane,
+            stream_id,
+        )
+    });
+    assert!(blocked.has_multipath_alternative && blocked.due_recovery_work);
+    assert!(blocked.target_service_exhausted && !blocked.persistent_ready);
+    assert_eq!(blocked.frame_count, 0);
+    assert_eq!(queue.reinjection_bytes(), 0);
+    assert_eq!(send_stream.data_ack_frontier(), gap.start);
+    assert!(
+        visits > 0,
+        "the actual evaluator must inspect retained ownership"
+    );
+
+    // Opposite control: restoring that same target's queue slot admits exactly
+    // the first existing quantum across assignment/storage boundaries.
+    let command = try_recv_reliable_path_command(&mut target_receivers).unwrap();
+    target_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    assert!(matches!(command, ReliablePathCommand::SendFrame(ref frame) if frame == &filler));
+    assert!(target_commands.can_enqueue_reinjection_frame_now(&originals[1]));
+    let ready = evaluate_client_data_ack_reinjection(
+        &mut state,
+        &last_send_ack,
+        &mut sender,
+        &mut queue,
+        &context,
+        &remotes,
+        &send_stream,
+        path,
+        lane,
+        stream_id,
+    );
+    assert!(ready.persistent_ready && ready.has_measured_target);
+    assert_eq!(queue.reinjection_bytes(), q);
+    let mut admitted_until = gap.start;
+    while let Some((_, work)) = queue.pop_front() {
+        let ReliableRelayQueuedWorkKind::Reinjection { frame, .. } = work.kind else {
+            panic!("only exact missing repair data");
+        };
+        let (start, end, _) = reliable_stream_frame_extent(&frame).unwrap();
+        assert_eq!(start, admitted_until);
+        assert!(start >= gap.start && end <= gap.end);
+        admitted_until = end;
+    }
+    assert_eq!(admitted_until, gap.start + q as u64);
+    assert_eq!(send_stream.data_ack_frontier(), gap.start);
+    assert!(remotes.contains_path_instance(owner) && remotes.contains_path_instance(target));
+
+    // Existing counter domain: shared frontier-model span/endpoint visits, not
+    // all ledger prefix reads or native scoring work. Allow one full ownership
+    // sweep plus one scored-prefix sweep per examined assignment. A span costs
+    // at most six visits: filter, endpoint build, two boundary and two history
+    // visits. A separate once-built ownership view may avoid the first sweep;
+    // this counter alone does not measure that view's construction cost.
+    let scoring_spans = (1..=missing_assignments)
+        .map(|remaining| remaining.min(q.div_ceil(assignment_bytes)))
+        .sum::<usize>();
+    let bounded_frontier_visits = 6 * (missing_assignments + scoring_spans);
+    assert!(
+        visits <= bounded_frontier_visits,
+        "one actual evaluator must not rebuild every remaining horizon: visits={visits}, one-view-plus-scored-prefix bound={bounded_frontier_visits}",
+    );
+}
+
 #[test]
 fn response_delivery_accounting_is_logical_not_sender_path_evidence() {
     let delivered = [

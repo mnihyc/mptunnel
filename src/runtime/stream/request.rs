@@ -18,7 +18,9 @@ pub(in crate::runtime) use attachment::{
 };
 // Keep inferred result/state types nameable without exposing child modules.
 #[allow(unused_imports)]
-pub(in crate::runtime) use flight::{RequestFlightLedger, RequestPathRelease};
+pub(in crate::runtime) use flight::{
+    RequestFlightLedger, RequestPathRelease, RequestRecoveryOwnershipView,
+};
 #[allow(unused_imports)]
 pub(in crate::runtime) use state::{
     RequestAckClockOperation, RequestPathState, RequestPathStates, RequestStreamState,

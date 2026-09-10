@@ -68,6 +68,104 @@ pub(in crate::runtime) struct RequestFlightLedger {
     reinjected_data_in_flight_bytes_by_instance: HashMap<RelayPathInstance, u64>,
 }
 
+/// Immutable ownership only, scoped to one serialized request evaluation.
+///
+/// Eligibility is supplied afresh to each query. Neither assignment clocks nor
+/// native/service observations are captured here; callers must discard the view
+/// before an append, ACK release, or ownership drain can change the ledger.
+#[derive(Debug)]
+pub(in crate::runtime) struct RequestRecoveryOwnershipView {
+    horizon: u64,
+    paths: Vec<RequestRecoveryPathCoverage>,
+}
+
+#[derive(Debug)]
+struct RequestRecoveryPathCoverage {
+    instance: RelayPathInstance,
+    originals: Vec<OffsetRange>,
+    all_flights: Vec<OffsetRange>,
+}
+
+/// Constant ownership/avoidance sets, without assignment metadata.
+///
+/// Vector order is deterministic first-ledger-occurrence order, not the old
+/// sweep's first-active-span order. The request caller requires exactly one
+/// Original owner and consumes avoidance only as a set, never as target rank.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::runtime) struct RequestRecoveryUniformFrontier {
+    pub(in crate::runtime) range: OffsetRange,
+    pub(in crate::runtime) owners: Vec<RelayPathInstance>,
+    pub(in crate::runtime) avoid: Vec<RelayPathInstance>,
+}
+
+impl RequestRecoveryOwnershipView {
+    pub(in crate::runtime) fn uniform_frontier(
+        &self,
+        range: OffsetRange,
+        actor_attached_instances: &[RelayPathInstance],
+    ) -> Option<RequestRecoveryUniformFrontier> {
+        if range.is_empty() || range.end > self.horizon {
+            return None;
+        }
+        let mut end = range.end;
+        let mut owners = Vec::new();
+        let mut avoid = Vec::new();
+        for path in &self.paths {
+            if !actor_attached_instances.contains(&path.instance) {
+                continue;
+            }
+            let (original, original_boundary) =
+                recovery_coverage_membership(&path.originals, range.start);
+            let (accepted, accepted_boundary) =
+                recovery_coverage_membership(&path.all_flights, range.start);
+            if original {
+                owners.push(path.instance);
+            }
+            if accepted {
+                avoid.push(path.instance);
+            }
+            if let Some(boundary) = original_boundary {
+                end = end.min(boundary);
+            }
+            if let Some(boundary) = accepted_boundary {
+                end = end.min(boundary);
+            }
+        }
+        (!owners.is_empty()).then_some(RequestRecoveryUniformFrontier {
+            range: OffsetRange {
+                start: range.start,
+                end,
+            },
+            owners,
+            avoid,
+        })
+    }
+}
+
+/// Membership and its first later change in a normalized coverage union.
+fn recovery_coverage_membership(ranges: &[OffsetRange], offset: u64) -> (bool, Option<u64>) {
+    let Some(range) = ranges.get(ranges.partition_point(|range| range.end <= offset)) else {
+        return (false, None);
+    };
+    if range.start <= offset {
+        (true, Some(range.end))
+    } else {
+        (false, Some(range.start))
+    }
+}
+
+/// Ledger iteration already supplies nondecreasing starts for every instance.
+fn append_recovery_coverage(ranges: &mut Vec<OffsetRange>, range: OffsetRange) {
+    if let Some(previous) = ranges.last_mut() {
+        debug_assert!(previous.start <= range.start);
+        if previous.end >= range.start {
+            previous.end = previous.end.max(range.end);
+            return;
+        }
+    }
+    ranges.push(range);
+}
+
 impl RequestFlightLedger {
     #[cfg(test)]
     pub(in crate::runtime) fn take_reinjection_debt_query_work_for_test() -> (usize, usize) {
@@ -77,6 +175,43 @@ impl RequestFlightLedger {
     #[cfg(test)]
     fn take_ack_release_flight_visits_for_test() -> usize {
         ACK_RELEASE_FLIGHT_VISITS.with(|work| work.replace(0))
+    }
+
+    /// Builds coverage once instead of sweeping the remaining horizon at every
+    /// candidate boundary. The prefix scan includes flights crossing a query's
+    /// start. Ordered append/merge needs no per-query endpoint sort or scan.
+    pub(in crate::runtime) fn recovery_ownership_view(
+        &self,
+        horizon: u64,
+    ) -> RequestRecoveryOwnershipView {
+        let mut paths = Vec::<RequestRecoveryPathCoverage>::new();
+        let mut positions = HashMap::<RelayPathInstance, usize>::new();
+        for (start, flights) in self.flights.range(..horizon) {
+            for flight in flights {
+                let range = OffsetRange {
+                    start: *start,
+                    end: flight.end.min(horizon),
+                };
+                if range.is_empty() {
+                    continue;
+                }
+                let position = *positions.entry(flight.instance).or_insert_with(|| {
+                    let position = paths.len();
+                    paths.push(RequestRecoveryPathCoverage {
+                        instance: flight.instance,
+                        originals: Vec::new(),
+                        all_flights: Vec::new(),
+                    });
+                    position
+                });
+                let coverage = &mut paths[position];
+                append_recovery_coverage(&mut coverage.all_flights, range);
+                if flight.kind.is_original_transmission() {
+                    append_recovery_coverage(&mut coverage.originals, range);
+                }
+            }
+        }
+        RequestRecoveryOwnershipView { horizon, paths }
     }
 
     /// Immutable accepted-copy coverage for one serialized recovery batch.

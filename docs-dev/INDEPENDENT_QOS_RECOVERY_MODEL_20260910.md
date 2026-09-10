@@ -355,3 +355,21 @@ than a wall-time threshold. GREEN includes view/oracle range+membership checks,
 old95controls and the identical ordinary QoS upload. Reject promotion again
 if it still fails completion or materially regresses healthy/restored service;
 do not tune the quantum, clocks, reserve or profile to rescue it.
+
+2026-09-10 18:13 +08:00 verification: actual work RED fails only its final
+count assertion,5,290visits versus2,442 after all semantic controls. The view
+candidate passes101unique focused checks (1.25s runtime/98s compilation),
+including five oracle tests and the existing request/response opposite controls.
+Independent integration review confirms first-horizon replacement only,
+per-query fresh masks and unchanged scored clock/ranking/Apply paths.
+Ordinary build76575 closed successfully; next was the same affected upload.
+
+2026-09-10 18:28 +08:00 disposition: ordinary10116 settles323,158,016B/56.678s
+but remains severely adverse. Pre-cut7.336/restored35.519Mbps and maximum
+write gap14.916s disprove practical acceptance of this view candidate. Its
+cut confirmation64.911Mbps is not contemporaneous target service12.133Mbps.
+Both forward target and reverse confirmation holds remain despite native
+progress. Do not promote reduced sweep visits or smaller exact completion.
+Reuse the small periodic timing observation to separate remaining eligibility,
+scored-ledger/cache, lower target/native and clock work in this exact candidate.
+No new scheduling rule or threshold is justified before that attribution.

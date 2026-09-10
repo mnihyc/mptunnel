@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 06:51 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 07:13 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -9,7 +9,11 @@ Continue the authorized closure loop; an intermediary commit is not completion.
 - Trialf8b8cac is REJECTED from active source after ordinary9690: mean flat,
   shorter confirmation gap but a3s target plateau and late4.194Mbps forward phase.
   Source restored exactly to011b724; four→zero work/73checks did not establish
-  net service gain. No live lab/compiler. User's seven-line edit is untouched.
+  net service gain. User's seven-line edit is untouched.
+- Diagnostic69779 CLOSED0 isolates a1.390s ordered-prefix stall: first covering
+  repair admission follows1.288s of that interval; other work continues. A
+  clipped-range/exact-key avoidance mismatch is the next bounded discriminator,
+  not an accepted cause or permission for a timer/controller change.
 - The finite client Input correction materially improves upload, including
   QoS+QUIC outage: exact-confirmed56.280→186.629Mbps; settlement79.379→43.147s.
   However,6.382s confirmation gap remains. Trace THIS return prefix now.
@@ -870,6 +874,100 @@ repair eligibility, blocked alternate, or queued logical input. Without that
 join, another feedback-boundary or congestion adjustment would repeat the
 failure of forecasting user gain from local work counts. Do not end here:
 continue this existing material stall attribution; all global gates remain.
+
+06:57+08 next discriminator selected after independent source review: reuse
+the already-frozen011 quic-feedback-attachment feature binary, with its added
+decode/attachment hooks DISABLED. One unchanged200+200QoS/outage UP capture,
+events sender_service_decision,server_receive_hole,server_receive_delivery_stall,
+stream_ack_received,request_retained_frontier_reinjection,data_ack_loss_timer.
+No new observer/build, no broad per-loop snapshots/perf stream, no parameter
+or topology change. Standard hooks do not all filter by selected stream, so use
+the existing one-stream workload and verify actual stream identities afterward.
+Tag ordered-prefix-outage-diagnostic-0911; management/target sampling retained.
+
+Exact information question is smaller than a full pipeline claim: is the
+target-flat episode accompanied by an actual ordered-receive gap, what prefix
+R_before=R_after-delivered_bytes finally releases, and which actually admitted
+repair extents overlap it? If receive progress already precedes target service,
+select local write/service; if an open hole and delayed repair precede release,
+select that exact retained/assignment owner next. If no material stall repeats,
+no causal conclusion, not a favourable comparison or automatic extra run.
+
+Limits known BEFORE capture: prepared Originals bypass sender_service_decision;
+it is an accepted repair extent, not full Original cover/native transmission.
+Server receive events occur before local write, omit winner identity and do not
+log every head movement; their gap can include previous pending target writes.
+Client ACK events omit full ranges/contiguous frontier and subsumed transactions;
+largest_end is not F. Target management counts actual socket-write acceptance,
+not remote application consumption. No new proof of Original age, fallback
+maturity or winner follows without its missing owner evidence. Feature-only
+observation can perturb scheduling; ordinary failures remain acceptance evidence.
+
+Source review rules out two tempting guesses: blocked source admission does not
+disable ACK-gap/retained-frontier recovery, and native ACK progress alone cannot
+release Product retention or reset logical-staleness persistence. Same-assignment
+fallback only tightens, while native RTT/ETA still affects early eligibility and
+target choice. Source−target=64MiB cannot distinguish assigned retention from
+unassigned queue or prove peer MAX exhaustion. Do not implement those disproven
+shortcuts or suppress recovery because one carrier's native counters advance.
+
+### Exact prefix closure and next range-identity discriminator
+
+07:13+08 closed69779: exact1031536640B/44.582429s=185.102Mbps, allaccepted
+confirmed/noerrors. Diagnosticmaxwrite/confirmation1.692278/1.522445s,45bins,
+onezero24;21.406MB logs. Not ordinary improvement or trialf8 acceptance.
+Server ordered prefix630414428 waits1.390101s from23.776636→25.166737.
+Exhaustive40282acceptedDATArepair ranges show exactly one covering admission,
+Q1[630414428,630429028) at25.064737,102ms before release. Three later pieces
+[630429028,630465364) were admitted399ms earlier. During the pre-admission
+wait189otherrepairs/2.517MB and471novelACKapplications occur. ActualtargetT
+and bothreplytotals stay630414428/1373 over sampled24.008→25.007s, sourceT+
+64MiB; targetloopbacks empty, stableQ47nativeACK+25.364MB. This excludes prior
+localtargetwrite parking for that interior, not identifies Original or winner.
+Of57releasegaps, firstcoveringrepair is during37,before18,after1,absent1:
+do not apply one attribution to every gap. Full report/archive closes separately.
+
+Next exact transaction: inspect clipped request-repair avoidance before adding
+broader owner/deadline instrumentation. Source finds lower target selection
+uses sent_instances_for_frame's exact-offset map lookup (f4206d0b, retained
+through exact-instance migration), but actual scoring can start inside a retained
+Original/copy extent. The outer uniform-frontier guard (53d9ab59) correctly
+refuses selecting an already-owning incarnation, yet returns a default model
+without selecting the real alternate. If reached, this can skip a serviceable
+region while later regions proceed. This is a reachable candidate, not yet a
+proven cause of69779: actual Original boundaries/ACK ranges were not recorded.
+The current repair FIFO cannot let a continuously queued older head be overtaken;
+positive-only/narrower ACK scope cannot erase an already-known retained gap.
+
+Information forecast: one cfg-only event at that EXISTING guard records the
+actual refused scored extent, complete already-computed avoidance/owner set,
+chosen exact instance and assignment observation. No new query/state/await,
+timer, queue, selection or authority. Reuse existing admitted-repair and server
+ordered-release events; one unchanged200+200QoS/outage UP capture. A material
+stall-prefix overlap selects this wrong-range lookup for correction; absent or
+noncritical mismatch stops its promotion as the stall remedy. Simultaneously
+prepare one test-only real-producer clipped-gap counterexample; failure before
+its intended assertion is a fixture failure, not Product RED. Root solebuild/lab.
+Benefit magnitude is unknown before overlap: one1.288s boundary is not a promised
+whole-run gain. A correction could restore timely alternate eligibility without
+new traffic authority; opposite risks are changed target order/copy cost and
+broader helper semantics. Audit all callers before choosing a range-aware helper
+versus passing existing proven geometry. No runtimefix/RFC change yet selected.
+Tag ordered-prefix-avoidance-diagnostic-0911; freeze/reverse observer beforelab.
+
+07:15+08 execution: observerbuild28999 CLOSED0 in1m22, existing unused-wrapper
+warning only. Independent review PASS;19feature-only lines, no new model query.
+observed_timing is a pure first-observation aggregate, NOT retainedD or proof
+the refused target was yet due. Exactpatch comparison passes; binary frozen at
+./.tmp/reflection/bin/gap-avoidance-20260911/mptunnel. All observer source reversed
+before solelab83561; no compiler overlap. target/release is this diagnostic, not
+an ordinary comparator. One diagnostic if-statement differs from rustfmt style;
+it is not a runtime fix and was removed intact, not edited during compilation.
+Root read complete109line69779 appendix and verified9member archive integrity/
+manifest; independent raw byte comparisons pass. Known-gap erasure hypothesis
+is rejected by source: only actual covering positives remove retained G; exact
+duplicate elimination does not hide new scoped omissions. Initial unknown
+scope remains distinct. No additional ACK-publication fix or full-range log.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

@@ -5789,3 +5789,113 @@ Sixteen regular files: candidate six raw files, driver, exact patch, RED log,
 four GREEN logs, build log, run.py/shape.sh;504,912B compressed /2,797,977B members.
 Every member byte-compares equal; control remains in its existing ordinary archive.
 Restored patch trailing context passes apply-check; no built/tested source changed and no binary/config is archived.
+
+## 2026-09-11: existing-event prefix diagnostic69779 — first covering admission isolated
+
+Information result, not a performance comparison or fix acceptance. Active runtime
+remains011b724, not rejectedf8b8cac. This reused the frozen011 attachment-observer
+binary with its additional decode/attachment hooks disabled; only six existing
+event names were enabled. No source, parameter, topology or build change occurred.
+
+| Own capture outcome | Result |
+|---|---:|
+| Accepted = target-confirmed; complete / failed |1,031,536,640B;1 /0|
+| Probe elapsed / whole goodput; driver elapsed |44.582429s /185.102Mbps;45.488294s|
+| First write / confirmation |.107106 /.410444s|
+| Maximum write / confirmation gap |1.692278 /1.522445s|
+| Offered load / raw bins / zero bins |40s /45 /1|
+| Probe accounting / errors |exact sink ACK /none|
+
+All45 service rows preserve independent200+200Mbps, UP70/DOWN30ms, no random
+loss/jitter and zero sampled netem drops. Only46UP changes200→10→200 at runner
+15.048168/25.049246s; UDP blackhole state changes30.049777/33.305269s.
+These timestamps precede sequential commands, not atomic physical cut instants;
+explicit UDP DROP rules are not counted by netem drops. Other link47 stays200Mbps.
+All raw confirmation Mbps bins, ten consecutive bins per line from0,10,20,30,40:
+```text
+13.942,207.382,249.561,227.445,267.237,126.446,300.490,271.704,208.387,253.149
+253.360,238.310,272.614,282.295,261.905,195.635,136.591,114.532,253.235,98.738
+31.458,438.242,140.259,140.202,0,509.564,77.444,91.215,361.064,186.192
+99.158,6.291,194.594,21.842,0.234,57.139,24.688,581.264,82.414,257.213
+62.411,333.354,135.599,163.004,24.492
+```
+Means:0–15=228.948,5–15=246.866,15–25=154.889,strict16–25=150.362,
+25–30=245.096,30–33=100.014,33–40=146.399,40–45=143.772Mbps.
+The last phase includes a partial bin; confirmation bursts are not link capacity.
+
+The21,405,735B logs contain complete client1..59204/server1..355 sequences,
+with no Unix timestamp regression. Client has40,282 admitted DATA repairs
+(559,240,856B attempt payload, not unique bytes), two FIN decisions,17,477 novel
+ACK applications,285 retained-frontier events and1,158 loss-timer events.
+Server has57 receive-release gaps≥100ms,88 hole transitions,163 reverse ACK
+applications and47 sender decisions. No complete Original or native-wire accounting follows.
+
+The largest release gap isolates request byte630,414,428. Server line223 reports
+R_after630,426,428 minus12,000 newly ordered bytes, hence R_before630,414,428;
+its1.390101s duration places the previous release at23.776636s.
+
+| Exact chronology, relative to probe.started | Time | Log line |
+|---|---:|---:|
+| Q1 preceding repair `[630399828,630414428)` admitted |23.624737s|client33638|
+| Previous ordered release ends at blocked byte |23.776636s|derived from server223|
+| Q1 later suffix `[630429028,630465364)` admitted in three pieces |24.665737s|client34314–34316|
+| First covering Q1 repair `[630414428,630429028)` admitted |25.064737s|client34518|
+| Receive prefix advances to630,426,428;39,596,656B still reordered |25.166737s|server223|
+
+Searching every admitted DATA extent finds exactly one covering that byte.
+The recorded first-cover boundary is1.288s into the gap,102ms before release.
+Meanwhile189 other admitted repairs/2,516,568B and471 novel ACK applications
+occur between previous release and that covering event: the client is progressing.
+Later suffix service does NOT prove that the head was already queued or mature.
+All these covering/suffix repairs have cause persistent_ack_gap_reinjection;
+client Q1 maps to healthy quic-47, physical instance1, with a stable native epoch.
+
+Server target writes630,414,428B/reply-read1373B are flat24.007737–25.006737s;
+client source697,523,292B/reply-write1373B are flat24.003737–25.003737s.
+The source-minus-target difference is64MiB, not an exact assigned/unassigned split.
+Both target socket queues are0 at runner23.049/24.049/25.049s. Thus the sampled
+interior supports a real ordered-prefix obstruction, not earlier target-write
+parking or merely held reverse accounting. Q47 fresh native ACK bytes increase
+518,109,206→543,472,742; Q46 also advances1,655,280B. Neither identifies the head.
+
+| Other receive gap, probe-relative seconds | Blocked byte | Covering repair chronology |
+|---|---:|---|
+| Early5.686–5.847 |136,501,628|Only logged repair113ms AFTER release|
+| Restricted19.310–20.331 |532,993,508|First Q1 repair72ms before release|
+| Restored26.421–27.551 |700,009,700|First Q1 repair70ms before release|
+| Outage30.392–30.735 |788,454,756|Q1 repair509ms before; TCP1 repair70ms before|
+| Recovery34.826–35.937 |823,467,220|First TCP1 repair71ms before release|
+| Late40.447–41.109 |952,822,924|First Q1 repair629ms before release|
+
+Across57 gaps, first recorded covering repair is during37, before18, after
+release1, absent throughout1. No universal pre-admission or transport owner is proved.
+Prepared Originals bypass this event; server release omits triggering frame/path,
+so admission-to-release is not winning-copy proof. Unix admission stamps follow
+successful send, not native transmission. Probe wall anchor1789081141.247263432s
+and millisecond log stamps support these joins; process monotonic origins differ.
+Release-gap duration can include preceding target I/O outside the sampled interior.
+Client ACK logs omit full ranges/F; largest_end is not the contiguous frontier.
+
+| Sampled cost / retained state | Result |
+|---|---:|
+| UP46 /47 class-byte deltas |746,495,889 /947,892,855B|
+| Total UP /DOWN; per confirmed byte |1,694,388,744 /24,160,496B;1.642587 /.023422|
+| Client /server peak RSS; final RSS,KiB |340,596 /103,460;328,912 /103,460|
+| Client /server maximum lifetime CPU; final |166 /78.7%;154 /63.5%|
+| UP46 /47 peak HTB backlog; simultaneous sum peak |14,626,622 /23,766,626B;36,170,304B|
+| Client native /Product flight peak; client /server carrier-queue peak |36,913,933 /60,502,164B;205,256 /12,027B|
+
+ps is process-lifetime, not interval CPU; role samples/settlement endpoints differ.
+All eight native identities per role retain epochs without ACK regression. SinkPID25
+does not restart or add major faults; historical swap stays672,492KiB. Two server
+H3_NO_ERROR warnings follow probe completion. Logging overhead is not an ordinary cost comparison.
+
+Disposition: the next bounded discriminator is exact-head eligibility/queue state
+BEFORE covering admission—absent/immature authority versus already queued work.
+Missing timer/retained events do not prove missing wakes; this trace supplies no
+assignment deadline, queue-entry time or safe policy correction. Active011 remains;
+no fix, whole-gate acceptance or claim that all repair traffic is unnecessary follows.
+
+Archive: [ORDERED_PREFIX_OUTAGE_DIAGNOSTIC_20260911.raw.tar.gz](ORDERED_PREFIX_OUTAGE_DIAGNOSTIC_20260911.raw.tar.gz).
+Nine regular members: six raw result files, driver, run.py and shape.sh; no config
+or binary.1,610,425B compressed /24,298,353B members; every member byte-compares equal.

@@ -676,13 +676,13 @@ pub(super) struct RelayAdditionalPathOpenTask {
     handle: tokio::task::JoinHandle<()>,
 }
 
-/// Test-only ingress seam: deliver one real additional-open result after the
-/// caller has blocked Product output, without setting up another encrypted
-/// carrier. It changes no receive/settlement branch in the relay actor.
+/// Test-only ingress seam for an ordinary successful attachment or RESET,
+/// without setting up another encrypted carrier. Settlement is unchanged.
 #[cfg(test)]
 pub(super) struct BlockedWriteOpenTestIngress {
     pub(super) key: RelayPathKey,
     pub(super) obsolete_generation: bool,
+    pub(super) opened: Option<OpenedRemoteStream>,
     pub(super) release: Arc<tokio::sync::Notify>,
     pub(super) consumed: tokio::sync::oneshot::Sender<()>,
 }
@@ -709,12 +709,12 @@ impl BlockedWriteOpenTestIngress {
                 mode: ReliableRelayAttachMode::Recovery,
                 startup_ordinal: None,
                 startup_expected_instance: None,
-                result: Err(RuntimeError::RemoteReset(
+                result: self.opened.ok_or(RuntimeError::RemoteReset(
                     crate::protocol::ResetReason::RemoteClosed,
                 )),
             })
             .await
-            .expect("test reset delivered");
+            .expect("test open result delivered");
             // Reserving every slot proves the actor consumed our result.
             // Closure is also a valid result if terminal handling exits.
             let _ = tx.reserve_many(tx.max_capacity()).await;

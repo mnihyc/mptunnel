@@ -26,6 +26,217 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, duplex};
 use tokio::sync::{Notify, mpsc};
 
+fn ready_feedback_item(frame: Result<Frame, RuntimeError>) -> ReliableRelayRemoteFrame {
+    ReliableRelayRemoteFrame {
+        instance: crate::model::path::RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 7,
+            },
+            path_instance_id: crate::model::path::CarrierPathInstanceId::from_raw(19),
+            attachment_id: 23,
+        },
+        frame,
+    }
+}
+
+#[test]
+fn ready_client_feedback_preserves_each_ack_and_max_in_order() {
+    let stream_id = StreamId(741);
+    let sparse = Frame::StreamAck {
+        stream_id,
+        scope_start: Some(0),
+        ranges: vec![OffsetRange { start: 4, end: 8 }],
+    };
+    let complete = Frame::StreamAck {
+        stream_id,
+        scope_start: None,
+        ranges: vec![OffsetRange { start: 0, end: 8 }],
+    };
+    let expected = vec![
+        sparse.clone(),
+        Frame::StreamMaxData {
+            stream_id,
+            max_offset: 32,
+        },
+        complete.clone(),
+        complete,
+    ];
+    let mut pending = expected[1..]
+        .iter()
+        .cloned()
+        .map(|frame| ready_feedback_item(Ok(frame)))
+        .collect::<VecDeque<_>>();
+    let mut applied = Vec::new();
+    let deferred = apply_ready_client_feedback(
+        sparse,
+        stream_id,
+        pending.len(),
+        || pending.pop_front(),
+        |frame| {
+            applied.push(frame);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(deferred.is_none());
+    assert!(pending.is_empty());
+    assert_eq!(
+        applied, expected,
+        "replay and both ACK scopes remain separate transactions"
+    );
+}
+
+#[test]
+fn ready_client_feedback_retains_first_barrier_and_its_exact_instance() {
+    let stream_id = StreamId(742);
+    let ack = Frame::StreamAck {
+        stream_id,
+        scope_start: None,
+        ranges: Vec::new(),
+    };
+    let barriers = vec![
+        Ok(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: Bytes::from_static(b"x"),
+        }),
+        Ok(Frame::StreamFin {
+            stream_id,
+            final_offset: 1,
+        }),
+        Ok(Frame::StreamReset {
+            stream_id,
+            reason: crate::protocol::ResetReason::RemoteClosed,
+        }),
+        Ok(Frame::StreamFeedbackProbe {
+            stream_id,
+            token: 5,
+            max_offset: 32,
+        }),
+        Ok(Frame::StreamFeedbackReceipt {
+            stream_id,
+            token: 5,
+        }),
+        Ok(Frame::StreamMaxData {
+            stream_id: StreamId(743),
+            max_offset: 32,
+        }),
+        Ok(Frame::StreamAck {
+            stream_id: StreamId(743),
+            scope_start: None,
+            ranges: Vec::new(),
+        }),
+        Err(RuntimeError::Protocol("ordered barrier")),
+    ];
+    for barrier in barriers {
+        let expected_frame = barrier.as_ref().ok().cloned();
+        let barrier = ready_feedback_item(barrier);
+        let expected_instance = barrier.instance;
+        let mut pending = VecDeque::from([barrier, ready_feedback_item(Ok(ack.clone()))]);
+        let mut applied = Vec::new();
+        let deferred = apply_ready_client_feedback(
+            ack.clone(),
+            stream_id,
+            pending.len(),
+            || pending.pop_front(),
+            |frame| {
+                applied.push(frame);
+                Ok(())
+            },
+        )
+        .unwrap()
+        .expect("the non-feedback head must be retained");
+        assert_eq!(deferred.instance, expected_instance);
+        match expected_frame {
+            Some(expected) => assert_eq!(deferred.frame.unwrap(), expected),
+            None => assert!(matches!(
+                deferred.frame,
+                Err(RuntimeError::Protocol("ordered barrier"))
+            )),
+        }
+        assert_eq!(applied, [ack.clone()]);
+        assert_eq!(
+            pending.len(),
+            1,
+            "the ACK behind a barrier must not be inspected"
+        );
+        assert_eq!(pending.pop_front().unwrap().frame.unwrap(), ack);
+    }
+}
+
+#[test]
+fn ready_client_feedback_bounds_replenished_input_and_stops_on_apply_error() {
+    let stream_id = StreamId(744);
+    let ack = Frame::StreamAck {
+        stream_id,
+        scope_start: None,
+        ranges: Vec::new(),
+    };
+    for ready_items in [0, 3] {
+        let mut polls = 0;
+        let mut applied = 0;
+        let deferred = apply_ready_client_feedback(
+            ack.clone(),
+            stream_id,
+            ready_items,
+            || {
+                polls += 1;
+                Some(ready_feedback_item(Ok(ack.clone())))
+            },
+            |_| {
+                applied += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(deferred.is_none());
+        assert_eq!(
+            polls, ready_items,
+            "new arrivals cannot enlarge the entry snapshot"
+        );
+        assert_eq!(applied, 1 + ready_items);
+    }
+    let rejected = Frame::StreamAck {
+        stream_id,
+        scope_start: None,
+        ranges: vec![OffsetRange { start: 0, end: 9 }],
+    };
+    let mut pending = VecDeque::from([
+        ready_feedback_item(Ok(rejected.clone())),
+        ready_feedback_item(Ok(ack.clone())),
+    ]);
+    let mut applied = Vec::new();
+    let result = apply_ready_client_feedback(
+        ack.clone(),
+        stream_id,
+        pending.len(),
+        || pending.pop_front(),
+        |frame| {
+            if frame == rejected {
+                return Err(RuntimeError::Protocol("apply rejected"));
+            }
+            applied.push(frame);
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(RuntimeError::Protocol("apply rejected"))
+    ));
+    assert_eq!(
+        applied,
+        [ack.clone()],
+        "accepted prefix is not replayed or discarded"
+    );
+    assert_eq!(
+        pending.len(),
+        1,
+        "no successor is consumed after Apply fails"
+    );
+    assert_eq!(pending.pop_front().unwrap().frame.unwrap(), ack);
+}
+
 #[test]
 fn request_live_tail_uses_the_immutable_shared_epoch_as_its_actor_wake() {
     let observed_at = Instant::now();
@@ -370,6 +581,7 @@ async fn restart_reset_during_blocked_product_write(obsolete_generation: bool) {
     let (consumed_tx, consumed_rx) = tokio::sync::oneshot::channel();
     let ingress = super::super::lifecycle::BlockedWriteOpenTestIngress {
         obsolete_generation,
+        opened: None,
         key: RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -1189,7 +1401,6 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
             remotes: &mut remotes,
             send_stream: &mut send_stream,
             last_send_ack: &mut last_send_ack,
-            path_snapshot: None,
             relay_lane: TrafficClass::Throughput,
         },
         stream_id,
@@ -1223,7 +1434,6 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
             remotes: &mut remotes,
             send_stream: &mut send_stream,
             last_send_ack: &mut last_send_ack,
-            path_snapshot: None,
             relay_lane: TrafficClass::Throughput,
         },
         stream_id,
@@ -2036,6 +2246,285 @@ async fn client_feedback_probe_requires_logical_delivery_and_actual_max_in_write
         relay.abort();
         let _ = relay.await;
     }
+}
+
+#[tokio::test]
+async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
+    use super::super::client::ReadyFeedbackObserver;
+    use crate::model::capacity::PathRateSample;
+    use crate::model::path::RelayPathInstance;
+    use crate::mux::stream::ReliableRecvStream;
+    use crate::runtime::path::commands::reliable_path_command_pending_bytes;
+    use crate::runtime::sender::PreparedOriginalClaim;
+
+    let stream_id = StreamId(723);
+    // Long real initial RTT keeps setup away from due recovery. Actual source
+    // claims and receiver-generated ACKs, not fabricated flight/cache state,
+    // create and then discharge the interior omission.
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:9?initial-srtt-s=10&initial-rate-mbps=100",
+            "tcp://127.0.0.1:10?initial-srtt-s=10&initial-rate-mbps=100",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().unwrap())
+        .collect(),
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    let limits = context.mux_limits;
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(32);
+    let (owner_frames, owner_input) = mpsc::channel(8);
+    let mut initial = test_opened_remote_stream(stream_id, 0, owner_commands, owner_input);
+    initial.stream_mut().lane = TrafficClass::Throughput;
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+    let (_target_frames, target_input) = mpsc::channel(8);
+    let mut target = test_opened_remote_stream(stream_id, 1, target_commands, target_input);
+    target.stream_mut().lane = TrafficClass::Throughput;
+    for (index, opened) in [(0, &initial), (1, &target)] {
+        let instance = RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index,
+            },
+            path_instance_id: opened.path_instance_id(),
+            attachment_id: index as u64,
+        };
+        context.install_relay_path_instance_for_test(instance);
+        context.mark_tcp_path_open_success(
+            index,
+            Duration::from_secs(10),
+            TrafficClass::Throughput,
+        );
+        context.mark_relay_path_rate_sample_for_test(
+            instance.key,
+            PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(20)).unwrap(),
+        );
+        assert!(context.relay_path_instance_has_bulk_model_evidence(instance));
+    }
+    let release_attach = Arc::new(Notify::new());
+    let (attached_tx, attached_rx) = tokio::sync::oneshot::channel();
+    let ingress = super::super::lifecycle::BlockedWriteOpenTestIngress {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        },
+        obsolete_generation: false,
+        opened: Some(target),
+        release: release_attach.clone(),
+        consumed: attached_tx,
+    };
+    let source = Bytes::from(vec![0x61; 3 * reliable_relay_buffer_len(limits)]);
+    let (local, mut peer) = duplex(source.len());
+    peer.write_all(&source).await.unwrap();
+    peer.shutdown().await.unwrap();
+    let observer = Arc::new(ReadyFeedbackObserver::default());
+    let relay_observer = observer.clone();
+    let relay_context = context.clone();
+    let relay = tokio::spawn(async move {
+        relay_observer
+            .run(
+                stream_id,
+                relay_migrating_tcp_stream_active(
+                    local,
+                    &relay_context,
+                    MppPerformanceConfig::default(),
+                    ReliableRelayOpenSpec::new(
+                        TargetAddr::Ip("127.0.0.1:9".parse().unwrap()),
+                        TrafficClass::Throughput,
+                    ),
+                    initial,
+                    None,
+                    Some(ingress),
+                ),
+            )
+            .await
+    });
+    let mut originals = Vec::new();
+    let mut claimed_bytes = 0usize;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let command = recv_reliable_path_command(&mut owner_receivers)
+                .await
+                .unwrap();
+            let pending = reliable_path_command_pending_bytes(&command);
+            match command {
+                ReliablePathCommand::PreparedOriginal(work) => {
+                    let ready = owner_receivers
+                        .writer_ready_boundary(work.path_instance_id())
+                        .expect("actual native writer opportunity");
+                    match work.try_claim(ready) {
+                        PreparedOriginalClaim::Claimed(frame) => {
+                            let charged = owner_receivers.register_claimed_writer_frame(&frame);
+                            let Frame::StreamData {
+                                stream_id: actual,
+                                offset,
+                                payload,
+                            } = &frame
+                            else {
+                                panic!("an actual Original claim contains DATA");
+                            };
+                            assert_eq!(*actual, stream_id);
+                            assert_eq!(*offset, claimed_bytes as u64);
+                            assert_eq!(
+                                payload.as_ref(),
+                                &source[claimed_bytes..claimed_bytes + payload.len()]
+                            );
+                            claimed_bytes += payload.len();
+                            originals.push(frame);
+                            owner_receivers.release_pending_command_bytes(charged);
+                            work.requeue();
+                        }
+                        PreparedOriginalClaim::Empty => {}
+                        PreparedOriginalClaim::Busy(_) | PreparedOriginalClaim::Blocked(_) => {
+                            panic!("sole healthy ready writer must claim finite source");
+                        }
+                    }
+                }
+                ReliablePathCommand::SendFrame(Frame::StreamFin { final_offset, .. }) => {
+                    owner_receivers.withdraw_writer_ready();
+                    owner_receivers.release_pending_command_bytes(pending);
+                    assert_eq!(final_offset, source.len() as u64);
+                    break;
+                }
+                ReliablePathCommand::SendFrame(Frame::StreamData { .. }) => {
+                    panic!("actor may not bypass actual native Original claims");
+                }
+                ReliablePathCommand::SendFrame(_) => owner_receivers.withdraw_writer_ready(),
+                _ => panic!("unexpected source lifecycle command"),
+            }
+            owner_receivers.release_pending_command_bytes(pending);
+        }
+    })
+    .await
+    .expect("actual actor claims all source before FIN");
+    assert_eq!(claimed_bytes, source.len());
+    assert!(originals.len() >= 3);
+    release_attach.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), attached_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    // The real successful attachment first replays the fixed FIN, then issues
+    // its ordinary path proof; neither command manufactures copied ownership.
+    let fin = try_recv_reliable_path_priority_command(&mut target_receivers).unwrap();
+    assert!(
+        matches!(&fin, ReliablePathCommand::SendFrame(Frame::StreamFin { stream_id: actual, final_offset })
+        if *actual == stream_id && *final_offset == source.len() as u64)
+    );
+    target_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&fin));
+    let proof = try_recv_reliable_path_priority_command(&mut target_receivers).unwrap();
+    assert!(matches!(
+        &proof,
+        ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
+    ));
+    target_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+
+    let mut receiver = ReliableRecvStream::new(stream_id, limits);
+    for frame in [&originals[0], originals.last().unwrap()] {
+        let Frame::StreamData {
+            offset, payload, ..
+        } = frame
+        else {
+            unreachable!()
+        };
+        receiver.receive_data(*offset, payload.clone()).unwrap();
+    }
+    let mut sparse = receiver.ack_frames();
+    assert_eq!(sparse.len(), 1);
+    let ack1 = sparse.pop().unwrap();
+    let Frame::StreamAck {
+        scope_start: scope1,
+        ranges: ranges1,
+        ..
+    } = &ack1
+    else {
+        unreachable!()
+    };
+    assert_eq!(*scope1, Some(0));
+    assert_eq!(ranges1.len(), 2);
+    let expected_gap = OffsetRange {
+        start: ranges1[0].end,
+        end: ranges1[1].start,
+    };
+    assert!(expected_gap.start < expected_gap.end);
+    for frame in &originals[1..originals.len() - 1] {
+        let Frame::StreamData {
+            offset, payload, ..
+        } = frame
+        else {
+            unreachable!()
+        };
+        receiver.receive_data(*offset, payload.clone()).unwrap();
+    }
+    assert_eq!(receiver.next_offset(), source.len() as u64);
+    let mut complete = receiver.ack_frames();
+    assert_eq!(complete.len(), 1);
+    let ack2 = complete.pop().unwrap();
+    let Frame::StreamAck {
+        scope_start: scope2,
+        ranges: ranges2,
+        ..
+    } = &ack2
+    else {
+        unreachable!()
+    };
+    // The receiver now has one full positive prefix. scoped_ack_frames omits
+    // an empty negative-authority header (last_range.start == high_water == 0);
+    // positive-only ACK2 still discharges ACK1's retained omission.
+    assert_eq!(*scope2, None);
+    assert_eq!(
+        ranges2,
+        &[OffsetRange {
+            start: 0,
+            end: source.len() as u64
+        }]
+    );
+    let signatures = [(*scope1, ranges1.clone()), (*scope2, ranges2.clone())];
+    owner_frames.send(Ok(ack1)).await.unwrap();
+    owner_frames.send(Ok(ack2)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), observer.wait_for_applied(2))
+        .await
+        .expect("both actual ordered ACK transactions apply");
+    let before = observer.before.lock().unwrap().clone();
+    let after = observer.after.lock().unwrap().clone();
+    relay.abort();
+    let _ = relay.await;
+
+    assert_eq!(
+        observer.ready_after_first_selection.load(Ordering::Acquire),
+        1,
+        "ACK2 alone is already ready in the shared input before ACK1 Apply"
+    );
+    assert_eq!(before.len(), 2);
+    assert_eq!(after.len(), 2);
+    for (index, (scope, ranges)) in signatures.iter().enumerate() {
+        assert_eq!(
+            (before[index].scope_start, &before[index].ranges),
+            (*scope, ranges)
+        );
+        assert_eq!(
+            (after[index].scope_start, &after[index].ranges),
+            (*scope, ranges)
+        );
+        assert_eq!(before[index].assigned, source.len() as u64);
+    }
+    assert_eq!(before[0].retained, source.len());
+    assert_eq!(after[0].gaps, vec![expected_gap]);
+    assert_eq!(before[1].gaps, after[0].gaps);
+    assert_eq!(after[0].frontier, expected_gap.start);
+    assert_eq!(
+        after[0].retained as u64,
+        expected_gap.end - expected_gap.start
+    );
+    assert!(after[1].gaps.is_empty());
+    assert_eq!(after[1].frontier, source.len() as u64);
+    assert_eq!(after[1].retained, 0);
+    assert_eq!(
+        before[1].calls, before[0].calls,
+        "already-ready ACK2 must fill ACK1's real gap before intermediate recovery discovery"
+    );
 }
 
 #[tokio::test]

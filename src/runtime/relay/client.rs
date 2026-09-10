@@ -426,7 +426,6 @@ pub(super) struct ClientStreamAckContext<'a> {
     pub(super) remotes: &'a mut ReliableRelayRemoteSet,
     pub(super) send_stream: &'a mut ReliableSendStream,
     pub(super) last_send_ack: &'a mut AuthoritativeStreamAckSnapshot,
-    pub(super) path_snapshot: Option<PathSnapshot>,
     pub(super) relay_lane: TrafficClass,
 }
 
@@ -512,6 +511,133 @@ fn request_target_reinjection_service_limit(
     )
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static READY_FEEDBACK_OBSERVER: (StreamId, std::sync::Arc<ReadyFeedbackObserver>);
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(super) struct ReadyFeedbackAckBoundary {
+    pub(super) scope_start: Option<u64>,
+    pub(super) ranges: Vec<OffsetRange>,
+    pub(super) calls: usize,
+    pub(super) assigned: u64,
+    pub(super) frontier: u64,
+    pub(super) retained: usize,
+    pub(super) gaps: Vec<OffsetRange>,
+}
+
+/// Task/stream-scoped actual-actor evidence; no production state or retry clock.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct ReadyFeedbackObserver {
+    calls: std::sync::atomic::AtomicUsize,
+    gated: std::sync::atomic::AtomicBool,
+    pub(super) ready_after_first_selection: std::sync::atomic::AtomicUsize,
+    pub(super) before: std::sync::Mutex<Vec<ReadyFeedbackAckBoundary>>,
+    pub(super) after: std::sync::Mutex<Vec<ReadyFeedbackAckBoundary>>,
+    changed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ReadyFeedbackObserver {
+    pub(super) async fn run<F: std::future::Future>(
+        self: std::sync::Arc<Self>,
+        stream_id: StreamId,
+        future: F,
+    ) -> F::Output {
+        READY_FEEDBACK_OBSERVER
+            .scope((stream_id, self), future)
+            .await
+    }
+
+    pub(super) async fn wait_for_applied(&self, count: usize) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.after.lock().unwrap().len() >= count {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+/// Gate only the first selected ACK, outside Product ownership. The fixture
+/// supplies only ACK2 behind it, so actual shared-input readiness proves the
+/// successor was available before ACK1 Apply. No attachment-mailbox shortcut.
+#[cfg(test)]
+pub(super) async fn gate_ready_feedback_test_input(
+    stream_id: StreamId,
+    frame: &crate::protocol::Frame,
+    input: &mut crate::runtime::stream::ReliableRelayRemoteInput,
+) {
+    if !matches!(frame, crate::protocol::Frame::StreamAck { stream_id: actual, .. } if *actual == stream_id)
+    {
+        return;
+    }
+    let observer = READY_FEEDBACK_OBSERVER
+        .try_with(|(selected, observer)| (*selected == stream_id).then(|| observer.clone()))
+        .ok()
+        .flatten();
+    let Some(observer) = observer else {
+        return;
+    };
+    if observer
+        .gated
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while input.ready_frame_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ACK2 reaches the actual shared input while ACK1 is selected");
+    observer.ready_after_first_selection.store(
+        input.ready_frame_count(),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+#[cfg(test)]
+fn record_ready_feedback_ack_boundary(
+    stream_id: StreamId,
+    scope_start: Option<u64>,
+    ranges: &[OffsetRange],
+    send_stream: &ReliableSendStream,
+    last_send_ack: &AuthoritativeStreamAckSnapshot,
+    after: bool,
+) {
+    let _ = READY_FEEDBACK_OBSERVER.try_with(|(selected, observer)| {
+        if *selected != stream_id {
+            return;
+        }
+        let boundary = ReadyFeedbackAckBoundary {
+            scope_start,
+            ranges: ranges.to_vec(),
+            calls: observer.calls.load(std::sync::atomic::Ordering::Acquire),
+            assigned: send_stream.next_offset(),
+            frontier: send_stream.data_ack_frontier(),
+            retained: send_stream.reinjection_bytes(),
+            gaps: last_send_ack.gaps().to_vec(),
+        };
+        if after {
+            &observer.after
+        } else {
+            &observer.before
+        }
+        .lock()
+        .unwrap()
+        .push(boundary);
+        observer.changed.notify_waiters();
+    });
+}
+
 /// Evaluates retained authoritative Data ACK evidence against the exact
 /// original-flight assignment and one measured alternative.
 #[allow(clippy::too_many_arguments)]
@@ -552,6 +678,14 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         };
     }
     let observed_at = Instant::now();
+    #[cfg(test)]
+    let _ = READY_FEEDBACK_OBSERVER.try_with(|(selected, observer)| {
+        if *selected == stream_id {
+            observer
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    });
     let service = sender.data_ack_gap_reinjection_service(
         context,
         remotes,
@@ -733,14 +867,24 @@ pub(super) struct ClientStreamAckOutcome {
     pub(super) has_new_facts: bool,
 }
 
-/// Commits one peer ACK and derives reinjection work in the same ownership step, so
-/// ACK evidence and queued recovery cannot diverge across select iterations.
+/// Commits every fact and per-ACK effect of one peer ACK. The caller retains
+/// Product ownership through the finite feedback quantum's final fresh recovery
+/// discovery and queue-dependent postactions.
 pub(super) fn apply_client_stream_ack(
     ack_context: ClientStreamAckContext<'_>,
     stream_id: StreamId,
     scope_start: Option<u64>,
     ranges: Vec<OffsetRange>,
 ) -> Result<ClientStreamAckOutcome, StreamError> {
+    #[cfg(test)]
+    record_ready_feedback_ack_boundary(
+        stream_id,
+        scope_start,
+        &ranges,
+        ack_context.send_stream,
+        ack_context.last_send_ack,
+        false,
+    );
     // Capture one immutable send-assignment extent before touching any ACK-owned
     // cache, flight, queue, reservation, or recovery evidence.
     let validated_ack = begin_reliable_stream_ack(ack_context.send_stream, scope_start, ranges)?;
@@ -764,7 +908,6 @@ pub(super) fn apply_client_stream_ack(
         remotes,
         send_stream,
         last_send_ack,
-        path_snapshot,
         relay_lane,
     } = ack_context;
     let normalized_ranges = validated_ack.ranges();
@@ -794,25 +937,11 @@ pub(super) fn apply_client_stream_ack(
         relay_lane,
         stream_id,
     );
-    let reinjection = evaluate_client_data_ack_reinjection(
-        state,
-        last_send_ack,
-        sender,
-        sender_queue,
-        context,
-        remotes,
-        send_stream,
-        path_snapshot,
-        relay_lane,
-        stream_id,
-    );
-    #[cfg(not(feature = "lab-diagnostics"))]
-    let _ = reinjection;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "stream_ack_received",
         format_args!(
-            "stream_id={} scope_start={:?} ranges={} largest_end={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={}",
+            "stream_id={} scope_start={:?} ranges={} largest_end={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={}",
             stream_id.0,
             scope_start,
             normalized_ranges.len(),
@@ -824,14 +953,18 @@ pub(super) fn apply_client_stream_ack(
             ack.released_bytes,
             previous_reinjection_bytes,
             ack.remaining_reinjection_bytes,
-            reinjection.frame_count,
-            "ack_gap",
-            path_snapshot.map(|snapshot| snapshot.underlay),
-            reinjection.has_multipath_alternative,
-            reinjection.persistent_ready,
         ),
     );
     state.progress.last_stream_at = Instant::now();
+    #[cfg(test)]
+    record_ready_feedback_ack_boundary(
+        stream_id,
+        scope_start,
+        normalized_ranges,
+        send_stream,
+        last_send_ack,
+        true,
+    );
     Ok(ClientStreamAckOutcome {
         released_bytes: ack.released_bytes,
         has_new_facts: true,

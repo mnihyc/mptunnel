@@ -81,6 +81,52 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+/// Apply a finite Input quantum without changing ACK transaction or credit order.
+/// The caller retains Product ownership through its final fresh recovery and
+/// queue-dependent postactions. The first item was selected as valid feedback;
+/// all later non-feedback/error items are returned intact for normal handling.
+fn apply_ready_client_feedback(
+    first: Frame,
+    stream_id: crate::protocol::StreamId,
+    ready_items: usize,
+    mut try_next: impl FnMut() -> Option<ReliableRelayRemoteFrame>,
+    mut apply: impl FnMut(Frame) -> Result<(), RuntimeError>,
+) -> Result<Option<ReliableRelayRemoteFrame>, RuntimeError> {
+    let mut frame = first;
+    let mut remaining = ready_items;
+    loop {
+        apply(frame)?;
+        if remaining == 0 {
+            return Ok(None);
+        }
+        remaining -= 1;
+        let Some(item) = try_next() else {
+            return Ok(None);
+        };
+        match item {
+            ReliableRelayRemoteFrame {
+                frame:
+                    Ok(
+                        next @ Frame::StreamAck {
+                            stream_id: next_id, ..
+                        },
+                    ),
+                ..
+            }
+            | ReliableRelayRemoteFrame {
+                frame:
+                    Ok(
+                        next @ Frame::StreamMaxData {
+                            stream_id: next_id, ..
+                        },
+                    ),
+                ..
+            } if next_id == stream_id => frame = next,
+            barrier => return Ok(Some(barrier)),
+        }
+    }
+}
+
 async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -3362,6 +3408,8 @@ where
                             }
                             Err(err) => break Err(err),
                         };
+                        #[cfg(test)]
+                        super::client::gate_ready_feedback_test_input(stream_id, &frame, &mut remote_input).await;
                         state.progress.sender_retry_at = None;
                         match frame {
                             Frame::StreamFeedbackProbe {
@@ -3930,48 +3978,98 @@ where
                                     }
                                 }
                             }
-                            Frame::StreamAck {
-                                stream_id: ack_stream_id,
-                                scope_start,
-                                ranges,
-                            } if ack_stream_id == stream_id => {
+                            feedback @ Frame::StreamAck { stream_id: feedback_stream_id, .. }
+                            | feedback @ Frame::StreamMaxData { stream_id: feedback_stream_id, .. }
+                                if feedback_stream_id == stream_id => {
+                                // Freeze only the attempt count. Actual coalesced credit can
+                                // advance concurrently; try_recv_frame retains its own order.
+                                let ready_items = remote_input.ready_frame_count();
                                 let pending_attach = {
                                 let mut product_guard = request_product.lock();
-                                let product = &mut *product_guard;
-                                let (sender_queue, sender, send_stream, last_send_ack, remotes) = (
-                                    &mut product.sender_queue, &mut product.sender, &mut product.send_stream,
-                                    &mut product.last_send_ack, &mut product.remotes,
-                                );
+                                let previous_queue_bytes = product_guard.sender_queue.bytes();
                                 let mut pending_attach = None;
-                                let previous_had_ack_gaps = last_send_ack.has_gaps();
-                                let previous_ack_frontier = send_stream.data_ack_frontier();
-                                let previous_queue_bytes = sender_queue.bytes();
-                                let ack_outcome = match apply_client_stream_ack(
-                                    ClientStreamAckContext {
-                                        state: &mut state,
-                                        sender: sender,
-                                        sender_queue: sender_queue,
-                                        context,
-                                        remotes: remotes,
-                                        send_stream: send_stream,
-                                        last_send_ack,
-                                        path_snapshot,
-                                        relay_lane: request_lane,
-                                    },
+                                let mut received_ack = false;
+                                let mut ack_facts_changed = false;
+                                let mut claim_inputs_changed = false;
+                                let deferred = match apply_ready_client_feedback(
+                                    feedback,
                                     stream_id,
-                                    scope_start,
-                                    ranges,
+                                    ready_items,
+                                    || remote_input.try_recv_frame(),
+                                    |feedback| {
+                                        state.progress.sender_retry_at = None;
+                                        match feedback {
+                                            Frame::StreamAck { scope_start, ranges, .. } => {
+                                                received_ack = true;
+                                                let product = &mut *product_guard;
+                                                let previous_had_ack_gaps = product.last_send_ack.has_gaps();
+                                                let previous_ack_frontier = product.send_stream.data_ack_frontier();
+                                                let previous_queue_bytes = product.sender_queue.bytes();
+                                                let ack_outcome = apply_client_stream_ack(
+                                                    ClientStreamAckContext {
+                                                        state: &mut state,
+                                                        sender: &mut product.sender,
+                                                        sender_queue: &mut product.sender_queue,
+                                                        context,
+                                                        remotes: &mut product.remotes,
+                                                        send_stream: &mut product.send_stream,
+                                                        last_send_ack: &mut product.last_send_ack,
+                                                        relay_lane: request_lane,
+                                                    },
+                                                    stream_id,
+                                                    scope_start,
+                                                    ranges,
+                                                )?;
+                                                send_buffer_reservation.release(ack_outcome.released_bytes);
+                                                request_recovery_dirty |= ack_outcome.has_new_facts;
+                                                ack_facts_changed |= ack_outcome.has_new_facts;
+                                                claim_inputs_changed |= ack_outcome.released_bytes > 0
+                                                    || previous_had_ack_gaps != product.last_send_ack.has_gaps()
+                                                    || previous_ack_frontier != product.send_stream.data_ack_frontier()
+                                                    || previous_queue_bytes != product.sender_queue.bytes();
+                                            }
+                                            Frame::StreamMaxData { max_offset, .. } => {
+                                                claim_inputs_changed |= apply_client_peer_max_data(
+                                                    &mut product_guard, max_offset,
+                                                );
+                                                stream_ack_capacity_wait = None;
+                                                state.progress.last_stream_at = Instant::now();
+                                            }
+                                            _ => unreachable!("the Input quantum contains only this stream's ACK/MAX"),
+                                        }
+                                        Ok(())
+                                    },
                                 ) {
-                                    Ok(outcome) => outcome,
-                                    Err(err) => break Err(err.into()),
+                                    Ok(deferred) => deferred,
+                                    Err(err) => {
+                                        // Earlier valid feedback is committed, but the
+                                        // stream now terminates without recovery discovery.
+                                        // Revoke old writer notices before this unlock.
+                                        product_guard.prepared.claims_active = false;
+                                        break Err(err);
+                                    }
                                 };
-                                let released_bytes = ack_outcome.released_bytes;
-                                send_buffer_reservation.release(released_bytes);
-                                request_recovery_dirty |= ack_outcome.has_new_facts;
-                                let claim_inputs_changed = released_bytes > 0
-                                    || previous_had_ack_gaps != last_send_ack.has_gaps()
-                                    || previous_ack_frontier != send_stream.data_ack_frontier()
-                                    || previous_queue_bytes != sender_queue.bytes();
+                                debug_assert!(deferred_remote_frame.is_none());
+                                deferred_remote_frame = deferred;
+                                // Existing prepared registrations can claim upon unlock.
+                                // Refresh recovery first, not at a later actor iteration.
+                                if ack_facts_changed {
+                                    let product = &mut *product_guard;
+                                    evaluate_client_data_ack_reinjection(
+                                        &mut state,
+                                        &product.last_send_ack,
+                                        &mut product.sender,
+                                        &mut product.sender_queue,
+                                        context,
+                                        &mut product.remotes,
+                                        &mut product.send_stream,
+                                        path_snapshot,
+                                        request_lane,
+                                        stream_id,
+                                    );
+                                }
+                                claim_inputs_changed |=
+                                    previous_queue_bytes != product_guard.sender_queue.bytes();
                                 publish_prepared_request_work(
                                     &mut product_guard,
                                     &request_product,
@@ -3985,7 +4083,7 @@ where
                                     (&mut product.sender_queue, &mut product.sender,
                                      &mut product.send_stream, &mut product.remotes)
                                 };
-                                if reliable_relay_can_send_pending_fin(
+                                if received_ack && reliable_relay_can_send_pending_fin(
                                     state.endpoint.pending_local_fin,
                                     sender_queue.is_empty(),
                                 ) {
@@ -4043,15 +4141,6 @@ where
                                         Err(error) => break Err(error),
                                     }
                                 }
-                            }
-                            Frame::StreamMaxData {
-                                stream_id: max_stream_id,
-                                max_offset,
-                            } if max_stream_id == stream_id => {
-                                let mut product_guard = request_product.lock();
-                                prepared_work_changed |= apply_client_peer_max_data(&mut product_guard, max_offset);
-                                stream_ack_capacity_wait = None;
-                                state.progress.last_stream_at = Instant::now();
                             }
                             Frame::StreamFin {
                                 stream_id: fin_stream_id,

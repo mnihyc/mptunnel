@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 03:15 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 03:42 +08:00. Authoritative repository: ./.
 **MPP is NOT performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -10,7 +10,24 @@ Earlier detailed forecasts, counterexamples and adverse outcomes remain in
 git show a16b404:docs-dev/CURRENT_CLOSURE_PLAN.md and linked reports. Condensation
 does not waive any failure or reactivate any rejected candidate.
 
-## Active transaction: current late-stall owner and inner work
+## Current decision: retain ordered-feedback mechanism checkpoint
+
+The finite ordered ACK/MAX Input correction has52focused GREEN checks and
+independent actual-source review. Ordinary same-QoS service improves92.621→
+204.614Mbps; worst write7.236→1.162s and confirmation4.145→1.543s. Every phase
+improves; observed wire per confirmed byte falls. Increased absolute CPU and
+server peak RSS, retained reverse native RTT and remaining gaps stay disclosed.
+Full179-line report and15-member249942B archive were read/integrity checked by
+root. Retain this isolated runtime/RFC checkpoint; no release acceptance.
+
+Healthy pair has closed with100.850→220.837Mbps and confirmation4.587→.533s,
+but its full cost/profile evidence review is still next. No build/lab active.
+Reader will preserve that separate pair, then proceed to affected shared500Mbps
+and both-direction timing/loaded-latency gates. CPU20incident remains separate
+and unattributed. Do not resurrect rejected trials or treat the historical
+a16 source statements below as current source identity after this checkpoint.
+
+## Closed attribution history: late-stall owner and inner work
 
 Runtime is a16b404 (docs checkpointc11d266). Diagnostic build28234 completed0
 in3m36s. Its exact seven-file overlay was frozen and FULLY REVERSED before
@@ -582,6 +599,134 @@ ready ACK1 exposes a gap that already-ready ACK2 fills. Full feedback truth and
 barrier/half-close controls precede ONE unchanged ordinary a16 comparison.
 Adverse or absent material benefit stops promotion, not the global task.
 
+Pre-implementation audit refines the boundary: use ONE Product guard for the
+finite ACK/MAX quantum, then fresh gap discovery before prepared publication,
+pending FIN and unlock. Next-preselect-only discovery is insufficient: existing
+native prepared registrations can claim source as soon as the guard drops,
+before queued repair priority is restored. No await while held. Each feedback
+fact retains exact returned order; the changed interleaving excludes native
+commits between items within this finite Input transaction. First clock
+observation and sample timestamps are not guaranteed identical. Existing
+preselect discovery and all independent wakes remain unchanged. The tradeoff
+is a larger finite synchronous Input quantum, not drain-to-empty; barrier and
+executor controls must remain. Origin: ccfe817 centralized ACK/state coherence;
+faee89db retained inline recovery, and79ddb41 expanded its enumeration. Preserve
+the coherent decision boundary, remove intermediate decisions invalidated by
+already-ready positive evidence. Do not infer speed from call counts alone.
+
+Real-actor RED is now building: ordered-feedback-red-0911.log. Test-only
+task-scoped first-ACK gate waits outside Product for the actual shared-input
+successor, not attachment mailbox emptiness. Real native Original claims and
+receiver-generated sparse/cumulative ACKs prove both facts in order, exact
+intermediate gap, final full release and no assignment fabrication. Observer
+counts actual heavy evaluator after its guards. Root has read full fixture;
+four source files contain cfg-only test changes, no runtime implementation yet.
+
+RED44817 CLOSED101 after1m39s compile, SETUP failure before intended assertion:
+fixture expected ACK2 scopeSome(0), while the actual cumulative encoder omits
+empty negative authority: its full[0,A) positive prefix has last.start=0 and
+high_water=0. This is NOT dependence on ACK1 or incremental publication state.
+Do not manufacture another scope. Reader corrects only the encoder-
+contract expectation and retains exact receipt/gap/full-release checks. Initial
+ordered-feedback-red-0911.patch/log frozen. No ProductRED or runtime fix yet.
+
+Retry19106 CLOSED101 after38.21s compile, actual intended RED in.03s: three
+heavy recovery passes occur between already-ready ACK1 and ACK2 versus zero
+expected. Actual readiness=1, native claimed offsets/payloads, ordered ACK
+signatures, intermediate real gap and final full positive release all pass
+before the final count assertion. Root now implements the agreed finite
+single-guard feedback quantum. No rate/queue/clock parameter changes; failed
+fixture and corrected RED retained separately. One ordinary comparison follows
+focused tests and independent actual-diff review, not this call-count result.
+
+Implementation audit closes the terminal branch too: a novel ACK can expose
+due repair and a following invalid ACK terminates before final discovery.
+Existing writer registrations could otherwise claim at the intervening unlock.
+The fatal batch path therefore revokes the EXISTING claims_active authority
+while still holding Product; ordinary cleanup retains all other ownership.
+No recovery is planned for a dying stream. Per-ACK receipt diagnostic fields
+no longer pretend to describe a recovery decision performed later.
+
+Fairness risk is explicit: one cooperative Input charge now covers a finite
+ready-count quantum, not one ACK. No lost yield exists at the unchanged class
+selector, but full ledger/pruning/staleness work multiplied by queue depth can
+hold the guard longer. Existing DATA batching is a model precedent, not proof
+of equal cost. No arbitrary quota or new execution framework is selected;
+focused cooperation controls and ordinary full timing/CPU decide acceptability.
+Independent61091counts show32novel+95replayACKs in the12.121s FIFO-wait window;
+allACK handling including inline recovery is.585652s, versus11.276617s preselect.
+That supports an amortization opportunity, not a measured speed multiplier.
+
+Candidate implemented and independently actual-diff reviewed. Exact six-file
+runtime/RFC/test patch frozen as ordered-feedback-candidate-0911.patch. Focused
+GREEN batch now runs control (real-actor RED, three feedback helper controls,
+half-close and prearmed wake), client ACK/gap controls, service cooperation,
+and exact split-ACK/copy-reserve controls. Log ordered-feedback-green-0911.log.
+No compiler/lab overlap. If green, one ordinary release build and unique frozen
+bin/ordered-feedback-20260911/mptunnel precede SAME200+200QoSUP comparison to
+a16ordinary23406. No diagnostic binary comparison or public promotion.
+Telegram actual local-delay milestone sent19:21UTC; next nonurgent>=20:21UTC.
+
+GREEN27151 CLOSED0. Control33, client12, service5, split-ACK1 and copy-reserve1
+pass (52 distinct). Real-actor three intermediate heavy passes become zero;
+readiness, both actual ACK facts, real gap then full release remain checked.
+Helper order/barrier/budget/error, existing half-close, prearmed capacity and
+executor-yield controls pass. Independent final source review passes, including
+terminal claim fence. Ordinary release build is now active, no diagnostics;
+no source changes or concurrent lab. Component GREEN is not practical closure.
+
+Ordinary build61255 CLOSED0 in1m04s, existing unused-wrapper warning only.
+Exact candidate diff verified; frozen bin/ordered-feedback-20260911/mptunnel.
+Root started unchanged ordinary aggregate combined UP tagordered-feedback-0911
+at19:33UTC, diagnostics explicitly unset. No compiler overlap. Runtime source
+remains this uncommitted candidate until full closed outcome decides disposition.
+
+Ordinary95903 CLOSED0, driver43.007028s. Exact1091108864B/42.660189s=
+204.614Mbps versus a1692.621; 1/1complete,0errors. Worst write7.235997→1.162112s,
+confirmation4.145083→1.542599s. Firstwrite.105882/confirm.409412s essentially
+unchanged.43rawbins contain1zero versus11/46; full series still swings and
+1.54s gap is not fluent-service closure. Reader now checks all phases, exact
+profile, native/service and wire/CPU/RSS before practical disposition and small
+archive. This supports the targeted forecast provisionally, not global release
+or CPU20incident resolution. No further lab until cost/phase review completes.
+
+Independent phase/profile/cost review now complete: raw pre-cut/strictcut/
+restored means96.384/104.288/83.343→225.303/184.959/205.211Mbps; every adjacent
+candidate target-write sample advances, versus prior5s plateau. UPclass bytes
+1.217→1.769GB for2.073xcompletedwork: less wire per useful byte, not more.
+Absolute lifetime CPU rises (clientfinal123→174%,server37.8→68.7% ofonecore),
+serverRSSpeak75776→126644KiB.
+Do not call more work at higher absolute CPU an efficiency regression or infer
+exact CPU time from lifetime ps. Higher server peak remains a disclosed cost,
+not a leak diagnosis. Full archive/report completion and root read precede
+source checkpoint; no release acceptance from this one improving cell.
+
+Next bounded acceptance question: does the larger Input quantum regress healthy
+independent-link service when the loss/QoS-induced feedback backlog is absent?
+Run ONE predeclared pair: frozen ordinary a16 then frozen candidate on SAME
+aggregate combined UP cell, changing only NO_QOS=1 (no other impairment), unique
+tags ordered-feedback-healthy-control-0911 / ordered-feedback-healthy-candidate-0911.
+Both binaries already exist; no rebuild, new observer or profile adjustment.
+Forecast: preserve healthy startup/series/gaps while reducing avoidable queued
+feedback work where present; no promised gain if no meaningful backlog. New
+material timing/settlement/resource regression blocks promotion and triggers
+one attribution question, not favorable reruns or a compensating quota.
+
+Healthy pair execution: control7360 CLOSED0; candidate now running under the
+predeclared unchanged NO_QOS=1 cell/tag. Both reuse frozen ordinary binaries;
+no rebuild or source edit. Compare only after both close; no selective partial
+rate interpretation. First QoS capture's full appendix/archive still being saved.
+
+Healthy candidate91118 CLOSED0 (43.005078s driver). Exact526188544B/41.740160s
+control100.850Mbps →1180565504B/42.766993s candidate220.837Mbps. Both1/1complete,
+0errors. Worst write2.002279→.722869s; confirmation4.587237→.532616s. First
+write.108411→.107294s, confirmation.411490→.410305s. Candidate43rawbins0zeros.
+Thus material stall/throughput improvement also occurs with NO impairment,
+not only the QoS cell. Full pairedcost/profile review still follows. The mean
+remains below the combined400Mbps nominal capacity, so do not claim optimal
+aggregation or universal fluency. No active lab/build; sourcecheckpoint pending
+final evidence read, not a new runtime correction or additional tune.
+
 ## Just-completed correction: exact subsumed ACK invalidation
 
 a16b404 is an INTERMEDIARY mechanism checkpoint, not performance promotion.
@@ -649,7 +794,8 @@ Q20 echo has one actual timeout plus33later unavailable records, not34timeouts.
 
 Loss runs DO show startup process peaks101.2/138.1%of one core, alongside
 substantial transferred work. Late server CPU3.87/7.11% rules out sustained
-CPU starvation as THIS late collapse's cause, not the deployed random burst.
+MPP CPU saturation as THIS late collapse's cause, not the deployed random burst
+or external scheduling delay.
 Role/version/platform remain unanswered; do not block the main stall.
 Native ACKs progress while window/pacing contract. Default10%allowance plus
 2%residual permits response above11.8%;20%is outside it. Authorized backoff

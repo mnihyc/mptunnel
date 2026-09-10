@@ -2380,6 +2380,34 @@ existing ownership and recovery obligations. Product actor service is distinct
 from the final carrier writer's dependency and class priority below: control
 priority there is not a blanket veto on the other Product direction here.
 
+A selected Input turn MAY service an ordered sequence of that stream's
+`STREAM_ACK` and `STREAM_MAX_DATA` under one synchronous Product ownership
+guard. Additional dequeue attempts MUST be bounded by one ready-item count
+captured at entry, without waiting or replenishing that budget. This freezes
+the count, not the contents of independently updated credit state; the existing
+input service order still applies. Every ACK remains a separate fully validated
+transaction, including receipt release, copy attribution and qualification,
+sampling, scoped gap evidence, pruning and progress. MAX applies only actual
+received credit. No ACK is merged or omitted. Any other frame, stream mismatch
+or error ends the sequence without overtaking or losing that boundary; an
+invalid ACK changes none of its state and does not undo preceding valid
+transactions. On a fatal feedback error, terminal cleanup MUST revoke new
+prepared claims before the guard is released; no final recovery discovery is
+required for that terminating owner.
+
+On successful completion of such a quantum, required fresh ACK-gap recovery
+discovery MUST follow its feedback applications before queue-dependent
+prepared-source publication, FIN eligibility decisions, or release of the
+Product guard. Existing writer notices can act upon unlock, so postponing
+publication alone is not that fence.
+No guard spans an await, and no selected partial write is preempted to collect
+feedback. Subsequent service retains fair class and executor boundaries and
+independent capacity, model, membership and deadline wakes. No target authority
+is retained across turns or native precommit validation bypassed. The finite
+critical section may change sampling times and ACK/commit interleaving; it
+preserves individual transactions, not their former timing, and establishes no
+wall-clock service bound.
+
 All MPP-owned scheduling, retention, reinjection, measurement, queue, and
 diagnostic allocations MUST have byte and item bounds plus one exact
 cancellation or terminal owner. A time bound is REQUIRED only where this RFC

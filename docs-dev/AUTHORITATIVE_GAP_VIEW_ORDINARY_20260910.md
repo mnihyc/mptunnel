@@ -3340,3 +3340,183 @@ material time; separately, decoded knowledge waits materially in local service.
 The coupled backpressure interpretation remains necessary. Preserve this run's
 12.064s gap and weak restored service; no ordinary performance promotion,
 independent-native-fault claim, or new algorithm selection follows from it.
+
+## Ordinary ordered feedback: material service gain, broader acceptance pending
+
+Run95903 tests one finite, ordered ACK/MAX Input transaction on ordinary a16,
+not an observer or a restored rejected trial. Every ACK still applies its own
+validation, scope, positive release, qualification, sampling and pruning in
+order. One Product guard covers the fixed ready-feedback quantum; one fresh gap
+evaluation follows its novel ACK facts before prepared publication/FIN/unlock.
+Other frames are exact barriers. Independent preselect discovery and its wakes
+remain. Fatal input revokes existing claim authority before unlock. There is
+no ACK merge, retained target view, new timer/limit, controller change or
+drain-to-empty loop. A longer finite synchronous Input transaction and changed
+first timing observations/interleaving are explicit risks, not claimed neutral.
+
+The actual-actor fixture initially fails setup44817 after1m39s: full positive
+ACK2 correctly encodes scopeNone, notSome(0). Correcting only that expectation
+gives intended RED19106 after38.21s compilation:3heavy discoveries between
+already-ready ACK1/ACK2 versus0expected, with actual native claims, shared-input
+readiness, exact intermediate gap and final release all checked first. GREEN
+27151 gives0 and passes52distinct checks:33control,12client,5service,1split-ACK,
+1copy-reserve. These include order/barrier/error, half-close, prearmed capacity
+and cooperative service controls. They prove the mechanism, not its speed.
+
+Ordinary release61255 succeeds in1m04s with the pre-existing unused batch-write
+helper warning. The six-file patch comprises RFC plus five source/test files;
+frozen binary is `./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel`.
+No diagnostics or compiler overlap occur in this run. Driver exits0 in
+43.007028s. [Exact ordinary evidence](ORDERED_FEEDBACK_ORDINARY_20260911.raw.tar.gz)
+is249,942B/15regular files: five results, driver/build/initial-RED/retry/GREEN
+logs, initial/final RED patches, candidate patch, run.py and shape.sh. Gzip,
+tar comparison and every decompressed member's bytes pass; no configs/binaries.
+
+The only performance comparator here is preserved ordinary a16run23406,
+`aggregate-combined-up-ack-recovery-invalidation-0910`; its
+[raw archive](ACK_RECOVERY_INVALIDATION_ORDINARY_20260911.raw.tar.gz) and full
+46-bin series remain above. Diagnostic61091 is causal context, not a speed
+baseline. These are chronological, same-profile realizations, not equal-work
+or simultaneous paired trials; this result cannot assign all differences to
+the one changed scheduling boundary.
+
+### Full delivery, phases and remaining weak intervals
+
+| Outcome | Ordinary a16 | Ordered-feedback candidate |
+|---|---:|---:|
+| Local accepted = target confirmed,B | 526,385,152 | 1,091,108,864 |
+| Exact completed streams / failures | 1 /0 | 1 /0 |
+| Elapsed,s | 45.465808 | 42.660189 |
+| Whole confirmed Mbps | 92.621 | 204.614 |
+| First write / confirmation,s | .105228 /.408993 | .105882 /.409412 |
+| Maximum write gap,s | 7.235997 | 1.162112 |
+| Maximum confirmation gap,s | 4.145083 | 1.542599 |
+| Settlement beyond nominal40s,s | 5.465808 | 2.660189 |
+| Raw bins / zeros | 46 /11 | 43 /1 |
+
+Completed work rises107.28%, whole rate120.92%, and elapsed falls6.17%; maximum
+write/confirmation gaps fall83.94%/62.78%. First service is slightly later
+(write+.654ms, confirmation+.419ms), not a claimed startup improvement. Both
+complete exactly with statusok, no probe errors/censoring. This UP workload has
+no echo attempts and cannot establish loaded echo latency or DOWN behaviour.
+
+| Raw confirmation phase | a16,Mbps | Candidate,Mbps | Candidate zeros |
+|---|---:|---:|---:|
+| 0–5s | 65.683 | 174.452 | 0/5 |
+| 5–15s, pre-cut | 96.384 | 225.303 | 0/10 |
+| 15–25s | 98.764 | 184.725 | 1/10 |
+| Interior16–24 inclusive | 104.288 | 184.959 | 1/9 |
+| 25–40s, restored | 83.343 | 205.211 | 0/15 |
+| Own post40s raw bins,last partial | 113.510 over6bins | 226.056 over3bins | 0/3 |
+
+All43candidate raw target-confirmation bins follow. Do not substitute trimmed
+bins or treat the partial final bin as a whole elapsed second.
+
+| Raw seconds | Mbps,in chronological order |
+|---|---|
+| 0–9 | 15.179,194.607,242.263,233.615,186.597,150.525,150.001,98.581,262.043,213.873 |
+| 10–19 | 423.616,148.802,271.223,241.487,292.879,182.619,193.214,207.836,0,166.696 |
+| 20–29 | 188.997,58.675,141.348,192.932,514.932,55.452,231.708,247.752,122.031,140.287 |
+| 30–39 | 342.681,68.733,207.289,264.453,312.524,240.286,252.893,194.022,140.170,257.881 |
+| 40–42 | 263.001,243.478,171.690 |
+
+Weak service is not erased: bin18is zero; bins21/25/31give58.675/55.452/68.733Mbps,
+and the1.543s confirmation gap remains. There is no configured blackout here;
+an outage-like visual dip is not evidence of path failure. The514.932Mbps
+confirmation burst can release accumulated prior service, not violate the
+two200Mbps physical cuts. The probe retains maximum gap magnitudes but no exact
+endpoints, so the ordinary management rows below are not called their exact cause.
+
+### Source, target and reply service in this realization
+
+All42adjacent target-write samples advance, unlike a16's5s target plateau at
+34–39s. In the restored25→40band, every source-read, target-write, server-reply
+read and client-reply write adjacency advances. Their respective total gains
+are380,911,976B,380,751,368B,883B and883B. The minimum one-adjacency target
+gain is2,295,776B, not a claim of continuous subsecond service.
+
+| Actual target-socket producer window | a16,Mbps | Candidate,Mbps |
+|---|---:|---:|
+| 0→5 | 155.060 | 174.452 |
+| 5→15 | 75.944 | 228.340 |
+| Strict16→24 | 119.326 | 141.014 |
+| 25→40 | 68.915 | 203.054 |
+
+The cut target gain is smaller than the raw-confirmation gain: these are
+different producer clocks and byte boundaries, with buffered confirmation.
+Candidate sample18→19 records target462,624,814→467,137,278B and client reply
+1079→1093B, while raw bin18is zero. Without the probe's wall anchor and exact
+ACK stages, neither measurement invalidates the other or localizes the1.543s gap.
+
+| Candidate sample | Source read,B | Target write,B | Server /client reply,B |
+|---|---:|---:|---:|
+| 16 | 481,192,174 | 416,459,830 | 981 /981 |
+| 24 | 624,309,918 | 557,474,166 | 1247 /1247 |
+| 25 | 693,154,086 | 626,205,830 | 1303 /1303 |
+| 34 | 899,729,182 | 833,237,758 | 1807 /1807 |
+| 39 | 1,043,661,174 | 976,552,310 | 2115 /2115 |
+| 40 | 1,074,066,062 | 1,006,957,198 | 2186 /2186 |
+| 42,last sampled | 1,091,108,864 | 1,076,557,070 | 2321 /2321 |
+
+Last client/server management generations are1789068870161/1789068870151ms.
+The target's final14,551,794B fall after its last sample; full settlement comes
+from the exact probe, not synchronized final management conservation.
+
+### Physical/native context and cost, including higher absolute resource use
+
+All43candidate rows match the46-row comparator's direct200+200 topology,
+DOWN30ms/UP70ms, zero configured loss/jitter/outage, netem limit8192 and HTB
+burst/cburst65536; rates equal ceilings. Only client eth0/link46 changes to
+10Mbps at15.003411s and returns200 at25.004516s (a16:15.001773/25.002925).
+Link47 remains200; server eth1/eth0 map46/47. All class/qdisc drop deltas are0.
+Session13062760317167047878 and PIDs491998/497005 remain stable. Startup grows
+the path set; all eight native epochs per role are initialized/stable from
+sample9, with no observed suspect/failed state.
+
+| UP class service, Mbps | a16 link46 /47 | Candidate link46 /47 |
+|---|---:|---:|
+| 0→15 | 89.136 /146.906 | 177.719 /189.980 |
+| Strict16→24 | 10.023 /195.684 | 9.938 /194.429 |
+| 25→40 | 112.396 /91.589 | 194.233 /192.061 |
+
+During restored25→40, client native ACKs add84,561,146TCP/618,236,941QUIC B,
+versus177,696,181/193,611,011in a16. This suggests materially changed carried
+work, not an exact Original-allocation or useful-copy attribution. Candidate
+Product flight falls59,192,520→15,477,672B. At40, client QUIC46/47 RTT is
+116.811/211.848ms, with3,346,860/5,643,924B native flight. Reverse server QUIC
+path_id1 retains296.466ms RTT versus100.570ms in a16; no uniform native-latency
+improvement or echo claim follows. Native observations/ACK progress do not
+identify a critical Product byte. Observed client queue peak143,412B in25–40
+coexists with32NULL path-queue values; command-slot occupancy is not exported.
+
+| Whole sampled cost | a16 | Candidate |
+|---|---:|---:|
+| Sample window,s | 45.006732 | 42.006780 |
+| UP46 /47 class bytes | 467,368,412 /749,700,687 | 763,417,301 /1,005,665,982 |
+| DOWN46 /47 class bytes | 7,015,954 /8,612,499 | 10,318,970 /15,185,763 |
+| Summed UP backlog peak /final,B | 28,677,318 /12,763,272 | 26,617,192 /2,899,956 |
+| Summed DOWN backlog peak /final,B | 46,620 /13,425 | 47,099 /47,099 |
+| Client RSS peak /final,KiB | 355,388 /342,712 | 350,600 /330,044 |
+| Server RSS peak /final,KiB | 75,776 /75,776 | 126,644 /93,716 |
+| Client lifetime CPU peak /final,% | 126 /123 | 174 /174 |
+| Server lifetime CPU peak /final,% | 66.2 /37.8 | 68.7 /68.7 |
+
+Completed work is2.073×, sampled UP traffic1.454× and DOWN1.632×. As an observed
+cost proxy, UP class bytes/exact confirmed bytes fall2.312→1.621(−29.88%),
+DOWN .029690→.023375(−21.27%). These differing sampled windows end before full
+settlement; the ratios are not exact lifetime retransmission/copy amplification.
+Higher absolute CPU/server peak RSS are real headroom tradeoffs, not demonstrated
+per-byte efficiency regressions. `ps` reports rounded process-lifetime averages;
+there are no CPU ticks here, and multiplying by probe duration would omit the
+process's startup/lifetime boundary. No exact CPU-per-byte conclusion is made.
+Finite-VPS CPU/memory pressure remains an acceptance concern; final queues/RSS
+are not post-teardown retention. Client log and probe stderr are empty; two
+server H3_NO_ERROR warnings occur at normal teardown.
+
+Disposition: the forecast receives material practical support in this one
+ordinary heterogeneous-UP realization—more completed work, shorter settlement,
+better all-phase service and substantially smaller worst gaps. Retaining an
+isolated mechanism checkpoint is supported; universal optimality, full stall
+closure and performance/release acceptance are not. Preserve the residual gaps,
+absolute resource cost and reverse RTT tradeoff, then use the declared healthy
+and affected-direction gates rather than diagnostic speed or a favourable rerun.

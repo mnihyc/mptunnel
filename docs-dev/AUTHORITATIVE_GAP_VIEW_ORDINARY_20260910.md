@@ -5399,3 +5399,99 @@ its source. No executable/config/secret, hash or new harness is included.
 Result directories are ./.tmp/reflection/results/aggregate-combined-up-
 ordered-feedback-outage-{control,candidate}-0911/. Frozen executable paths
 are references above; no diagnostic result is part of this ordinary archive.
+
+## 2026-09-11: bounded outage-return causal capture58328
+
+Category: diagnostic attribution, not an ordinary performance comparison.
+Existing frozen repair-deadline-20260911 binary is011b724 plus the archived
+one-file scalar observer; source was reversed before traffic. Same independent
+200+200Mbps UP cell,46UP10Mbps at15–25s and all-QUIC outage30–33s, no random
+loss/jitter. CLOSED0: exact1,093,926,912B in43.391260s,201.686Mbps, maximum
+confirmation/write gaps3.774884/2.797807s. The132,243,691B of enabled logs can
+perturb timing. These results do not replace the ordinary6.382488s candidate
+gap, establish an improvement, or waive the healthy mixed-DOWN latency gate.
+
+One session8132195584306260556, logical stream0. Times below are Unix producer
+milliseconds minus probe.started1789077498.612026215; independent process
+t_mono origins are not joined. Millisecond events do not provide submillisecond
+ordering across processes. Exact output mapping from paired proof tokens:
+server Q0/inc3→client Qindex0/attachment2/physical1 (link46);
+Q1/inc4→Qindex1/attachment3/physical8 (link47);
+TCP1/inc1→TCPindex0/attachment0/physical6 (link46);
+TCP4/inc2→TCPindex1/attachment1/physical4 (link47).
+Later attachments exist; these four exact lifetimes are not interchanged.
+
+### Largest return hold precedes the outage and first repair admission
+
+The client releases[1011,1025) at21.645s, advancing its ordered return frontier
+to1067, then releases[1067,1081) at25.419s and advances to1151. The3.774s
+event interval and raw confirmation zero bins22–24 identify the diagnostic's
+largest gap. These are tiny sink-reply stream offsets, not upload source DSNs;
+receive_hole_release means ordered Product receive, before local socket write.
+The probe does not export the exact timestamps of its maximum-gap endpoints.
+
+Server ACK Apply already exposes omission[1067,1081) at21.073s, while1011
+remains the lowest hole; stored frontier becomes1067 at21.718s. It remains
+there until25.497s. The2096 server_output_update events in that state have
+maximum adjacent spacing279ms: this is not one wholly parked3.77s actor.
+First actual repair admission for[1067,1081) is25.403s, Q1/inc4, with same-ms
+sender dispatch and queue_delay_ms=0. Client's25.419s releasing frame is Q0,
+so that Q1 repair is not the winner. No earlier accepted copy covers this range
+in the capture. Prepared Original/native-read stages are not fully logged.
+
+The25.403s decision identifies Original Q0/inc3, age4,744,225us, and targetQ1
+ETA82,660us versus owner projection7,815,451us. Decision-to-log is5us. Its
+retained loss boundary is approximately24.774s and fallback28.476s; fallback
+is still3,073,251us away. The exact one-frame assignment is approximately
+20.659s, independently consistent with the first sent_offset1081 update.
+The owner timing includes an inflated native RTT, not a clean-link promise.
+Do not substitute the cached management Q0RTT206.9ms for the actual decision
+snapshot: it remains unchanged through24.951s, then reports3658.332ms.
+
+This establishes a long pre-admission interval, not its precise refusal cause.
+Structural now_has_reinjection_alternative is not measured target admission;
+ack_gap_reinjection_ready=false conflates timing, eligibility and service.
+The separate per-Original retained-tail fallback can be frozen while another
+range is head (response/delivery.rs:1803). Its unlogged value could precede
+the eventual ACK-gap loss boundary. Neither628,601us decision lateness nor
+the earlier healthy Q1 suffixes prove that a due admissible repair was ignored.
+
+### Actual TCP recovery and the remaining Q0 boundary
+
+| Missing return range | Earlier Q1 copy | TCP copy admitted | TCP ordered release |
+|---|---:|---:|---:|
+| [1515,1529) |32.236s|32.647s,TCP4/inc2|32.677s|
+| [1529,1543) |32.981s|33.391s,TCP4/inc2|33.424s|
+| [1599,1613) |33.988s|34.398s,TCP1/inc1|34.429s|
+
+Accepted-copy deadline expiry precedes each TCP successor. Matching TCP
+admission-to-release is30/33/31ms; the middle range's Original is explicitly
+Q0/inc3. TCP is actually serviceable, including before QUIC restoration;
+the entire outage is not an unavoidable three-second no-alternative interval.
+Later server positive frontier follows these releases by304/271/274ms.
+The capture contains53 actual response repairs,739 payload bytes total:
+this question concerns critical tiny-prefix timing, not bulk copy volume.
+
+Q0 proof157 is admitted16.987s but reaches client logical Input25.186s;
+proof169 takes18.835→25.294s, and173 takes22.910→26.519s. Immediately following
+same-output completed writer drains report pending_bytes_after=0, respectively
+same-ms/2items97B/62us, same-ms/3items619B/161us, and+1ms/1item34B/81us.
+Command accounting survives dequeue and is released after write/flush; these
+are strong prompt-handoff witnesses, not exact per-token native-write events.
+Q0 native ACK bytes advance325,547→379,568 over16.950→23.951s in one epoch,
+but native ACK progress does not identify receipt of the missing stream bytes.
+Required credit is independently applied by17.033/18.879/22.942s. Moreover,
+owner_received logs before probe validation, so a deferred MAX fence does not
+explain these owner-arrival endpoints. The remaining boundary includes native
+ordered service, reader backpressure, carrier/attachment FIFO and Product Input.
+
+Disposition: no timer, native or Input correction is selected from this capture.
+The missing discriminator is the existing QUIC reader's read-completion versus
+frames_tx.send/backpressure and downstream Input boundary; late decode alone
+could inherit a prior blocked reader send. Do not infer native-only delay,
+continuously ready targets, a forced losing-copy winner or a missing wake.
+
+Archive: [ORDERED_FEEDBACK_OUTAGE_RETURN_DIAGNOSTIC_20260911.raw.tar.gz](ORDERED_FEEDBACK_OUTAGE_RETURN_DIAGNOSTIC_20260911.raw.tar.gz).
+Ten regular files: six closed capture files, driver, used observer patch and
+existing run.py/shape.sh;6,349,052B compressed,135,002,911B member bytes.
+Archive comparison against every source passes; no binary/config/new harness.

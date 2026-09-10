@@ -35,7 +35,7 @@ Condensation waives no failure and reactivates no rejected candidate.
 
 Runtime checkpoint **011b724**, finite ordered ACK/MAX Input service, is retained.
 Frozen ordinary binary: ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
-target/release/mptunnel is the frozen server-ACK-admission diagnostic, NOT ordinary.
+target/release/mptunnel is the frozen QUIC-feedback-decode diagnostic, NOT ordinary.
 Use the explicit ordinary path above. All observer runtime edits are reversed.
 Only the user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md is unrelated
 dirty source; never edit/stage it. The temporary two-file ACK-admission observer
@@ -645,6 +645,85 @@ contract before any correction; no timer change or new observer is selected.
 Root read all223 ordinary-outage appendix lines and checked the16file gzip
 integrity/manifest; independent byte-for-byte checks passed. Archive preserves
 adverse outage-phase confirmation, wire/resource costs and all raw bins.
+
+06:11+08 next information transaction: existing Q0 proof157 is admitted at
+16.987s, followed by a completed same-output writer drain with zero pending
+charge in the same millisecond, but reaches the client logical owner25.186s.
+No per-frame write stamp exists, so retain that accounting-based handoff bound.
+Native snapshots, not Product RTT, supply the observed3.658sSRTT and corresponding
+4.116s ACK-gap threshold. Independent retained-tail fallback has its own earlier
+per-flight observation; its value/target refusals are absent. Neither timer is
+proven wrong. Server actor output updates continue throughout the critical hold.
+
+Question: is that delayed proof already decoded but waiting for Product/attachment
+service, or late at the raw framed reader? Add one cfg-only read boundary event
+in udp_path_read_frame for StreamFeedbackProbe/Receipt only: exact stream/token,
+read duration and successful decoded timestamp before returning to routing.
+No payload clone, await, sample threshold, queue, batching or runtime policy change.
+Existing proof publication/receipt and writer-drain events complete the join;
+only role/stream/token-unique transactions are attributable. A late decode does
+not distinguish network/native buffering from earlier reader backpressure or
+executor service; the read duration only bounds that particular invocation.
+Information forecast: timely decode plus multi-second logical-owner wait selects
+the local postdecode boundary; prompt postdecode service rejects it as the
+dominant stage and selects native/framed-reader residence, not a proven native
+bug. No material hold means no causal conclusion, not a favourable rerun.
+Same independent200+200 QoS/outage UP cell, exact current011 source and existing
+runner; one-file observer built/frozen/reversed, no other overlays. Keep current
+ordinary6.382s failure as acceptance evidence. No performance gain is promised
+from this observation and no further timer/controller adjustment is selected.
+
+Build21654 CLOSED0 in1m24, existing unused-wrapper warning only. Independent
+actual-diff review passes: successful read before routing, borrowed token/stream,
+event and explicit selected-stream gating; cancellation/errors emit no success.
+The event exports read_elapsed_us, not rawread_started. Timing includes
+suspension/descheduling; no packet-arrival or continuous-reader claim.
+Frozen ./.tmp/reflection/bin/quic-feedback-decode-20260911/mptunnel is current011
+plus only ./.tmp/reflection/quic-feedback-decode-observer-0911.patch. All runtime
+source reversed and verified clean before solelab81095 started. No compiler
+runs with traffic. Tag ordered-feedback-outage-quic-decode-0911 uses selected
+stream0 and only the declared decode/proof/drain/return/dispatch/repair events;
+no bulk ACK or every-output-update stream, no other observer overlay.
+
+81095 CLOSED0: exact940507136B/47.313948s=159.024Mbps, worstconfirmation
+2.066601s/write2.765480s; allaccepted=confirmed,1/1complete,no errors.
+77unique QUIC proof triples independently joined. Q0token167 spends7197ms
+beforedecode and0msafter,162 spends5888msbefore/1msafter; read_elapsed0us
+does NOT show continuous native waiting. Conversely tokens60/61 decode30ms
+afterserveradmission then wait1144/1277ms toclientowner. RequiredMAXalready
+applied6.041s,12msafterdecode, so it does not explain most of that interval.
+Actualreplydelivery also fallsbehind at6–8s; this is material local service,
+not just an irrelevant losing proof. Capture still has77582669B logs and
+different throughput; neither smallermaximumgap nor mean is an acceptance gain.
+ActualQoS15.187–25.215/outage30.215–33.515, allclasses200except46UP10Mbps,
+UP70/DOWN30ms,no randomloss/jitter/netemdrops. UP/DOWNwire1.814713GB/17.374MB;
+client/serverRSSpeaks343860/116768KiB, lifetimeCPUpeaks148/72% (notintervalCPU).
+
+Next focused information transaction: add only selectedproof timestamps to the
+existing exact-attachment forwarder, alongside the same rawdecode observer.
+Its receive timestamp and successful shared-logical-FIFO admission divide the
+proven decoder→owner local hold into preattachment service, forwarder backpressure,
+or sharedFIFO/Product service. Preserve failed sends, MAXcoalescing and ordering;
+no payloadclone, extraawait, parameter, reorderedinput or changedquantum.
+Existing queues are pernative-reader, perexactattachment, then sharedlogicalFIFO;
+ordinary andrepair inputs use the same attachmentforwarder. The owner timestamp
+is after Product lock, not just selection. Read elapsed includes scheduling;
+tokenuniqueness is valid only within the selectedone-sessiondirection/stream.
+Benefit forecast is information, not speed: a concentrated multi-second local
+stage selects that actualowner; no material repeat stops localattribution, not
+revives a timerfix. No newProductfixselected. Same exactoutagecell once, current011,
+freeze/reverse bothobserverfiles beforetraffic. Drop high-volume writerdrain and
+senderdispatch logging in this stage-onlycapture; neither supplies the missing
+local boundary. Keep proof/decode/attachment and tinyreturnhole/repair events.
+
+06:20+08: root reviewed the actual two-file observer: previous35line decode
+hook plus51line attachment hook, no new await/clone/ordinary state. Source
+author's formatting/diff checks pass; root solebuild20039 is active, fourjobs,
+no laboverlap. Compositepatch frozen at ./.tmp/reflection/quic-feedback-
+attachment-observer-0911.patch. Freeze executable in bin/quic-feedback-
+attachment-20260911, reverse bothfiles, then one tag ordered-feedback-outage-
+quic-attachment-0911. Capture deliberately omits high-volume writerdrain/
+senderdispatch logs; no claimed timing comparability of diagnostic averages.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

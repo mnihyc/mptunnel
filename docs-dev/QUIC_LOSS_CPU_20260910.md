@@ -618,3 +618,37 @@ Every member was compared byte-for-byte with its source, without hashes.
 No executable/config/secret or new harness is included. Result tags are
 quic-combined-down-loss-clear-quic-0911 and h2-combined-down-loss-clear-h2-0911
 under `./.tmp/reflection/results/`; the ordinary binary path is stated above.
+
+### Bounded source/phase audit of loss-clear reopening
+
+Read-only audit against retained011b724 source; no new test, capture or fix.
+Server rows21–23 retain bandwidth69,004,400bps and pacing68,314,360bps
+(ratio.99), window229,108B and flight228,000B. Rows24–26 have pacing/bandwidth
+ratio1.2375 (the1.25 ProbeUP gain times the.99 pacing margin), with window
+301,714→2,513,251→9,409,651B; row27 returns to ratio.99. Management retains
+sampled rate/pacing together but does not expose an exact phase-entry clock.
+These ratios support a non-probing low-flight interval followed by native
+ProbeUP growth, not an exact decomposition of the entire~6s reopening.
+Native epoch is unchanged; ACKs and delivery samples advance (167,995 atrow20,
+175,348 at24,209,969 at26), with current app_limited=false. This excludes
+ACK silence, not incorrect send-time sample/packet-round classification.
+
+The current BBR3 owner in crates/quinn-proto/src/congestion/bbr3/mod.rs picks
+a randomized2–3s ProbeBW wait, with a Reno-coexistence round alternative.
+Commit d5a7413 introduced that maintained native probing/coexistence model.
+Refill resets short-term bounds; ProbeUP grows the long-term flight bound on
+genuine cwnd-limited packet rounds. Independently, e4ad373 introduced an exact
+pending max-bandwidth epoch: a completed probe must consume its first normal
+non-app-limited feedback round before another Refill can overwrite its evidence.
+That gate preserves recovery provenance; its actual state in this run is unknown.
+Existing native rediscovery/epoch tests cover these mechanisms, not this exact
+20%→0 episode. No concrete protocol/model failure follows from the phase ratios.
+
+Existing feature event quic_carrier_ack_poll exports ACK/sample volumes,
+app-limited state, bandwidth, pacing, window and flight. Neither it nor ordinary
+management exports BBR phase, packet-round progression, pending epoch or probe
+deadline. The runner's MPTUNNEL_NATIVE_RECOVERY_TRACE environment flag has no
+current production consumer. Exact phase/round/gate evidence would distinguish
+scheduled waiting from delayed eligibility; the full~6s remains unattributed
+between those mechanisms. No faster gain, shorter wait or controller change is
+selected. Existing archived raw inputs and source history suffice for this note.

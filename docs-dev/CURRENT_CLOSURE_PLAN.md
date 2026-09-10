@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 14:44 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 14:58 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,37 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+14:58 +08 copy-volume attribution completes. Same-feature control/candidate
+accepted copies 188.687→294.627MB and duplicate receipt 185.753→291.826MB,
+while Originals 2.114→2.000GB and TCP Original share 65.9→27.2%. Persistent
+TCP gap repair dominates the increase; no structural/requalification substitution.
+All interval/cumulative counters reconcile, with closing/encoded-versus-written
+limits retained in NATIVE_REFILL_COPY_ATTRIBUTION_20260910. This establishes
+extra repair service, not unnecessary copies or its exact winning-byte cause.
+Diagnostic echo tails improve, so it does not reproduce every ordinary timing
+effect. No more observer/tuning for this small tradeoff; prior unsafe blanket
+hedge suppression stays rejected. Temporary five-file overlay is fully removed,
+frozen diagnostic executable retained; ordinary b0baca2 is restored.
+
+Disposition: retain b0baca2 as the WORKING candidate, not performance acceptance.
+Restoring the proved ~1s TCP FIFO delay to erase a 2–5% mixed cost is not justified.
+The TCP useful-service and latency benefit, mixed costs and unsupported-platform
+structural fallback are explicit. No further runtime correction is justified
+from copy volume alone. Both independent reviews support moving to the larger
+existing return/failure gate rather than more minor healthy attribution.
+
+NEXT fixed ordinary pair: ba56290 CONTROL then b0baca2 CANDIDATE, same 40s mixed
+DOWN with echo, DOWN500Mbps/30ms and return UP500→10→500Mbps/70ms at 15–25s;
+zero configured loss/jitter/blackhole, normal management only. Refill may reduce
+TCP unsent residence ahead of feedback/fallback, but cannot remove the return
+cut or guarantee gain. Extra repairs/changed placement can instead hurt feedback
+and recovery. Retain full first/restricted/restored service, all echoes, gaps,
+native progress and wire/CPU/RSS costs. A critical incomplete/stalled result
+selects that owner before advancing; no reserve, deadline or profile retune.
+Then assess the already existing whole-UDP 30–33s outage ablation with QoS off;
+the purpose is material restart-free fallback/recovery, not another good average.
+Global gates remain unsatisfied; no public README/release change.
 
 14:44 +08 reverse mixed DOWN completes: control 405.132 versus candidate
 397.269Mbps (-1.94%); p95 echo 459.753→417.421ms and max 1084.704→526.756ms,

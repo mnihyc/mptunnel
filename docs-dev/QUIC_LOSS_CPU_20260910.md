@@ -1,0 +1,227 @@
+# Fixed QUIC-loss CPU discriminator: late collapse is not sustained CPU saturation
+
+Recorded2026-09-10. **Diagnostic only; no performance acceptance or deployed
+incident attribution.** At20%configured DOWN loss, both tested MPP modes lose
+sustained useful service. Their late process CPU is low, not continuously
+saturated. The loss runs nevertheless have server startup intervals around
+101%/138%of one core; a user reporting total-process “one core” must not be
+dismissed because no individual sampled thread reaches100%.
+
+## Question, fixed intervention and evidence
+
+The reported random CPU incident lacks confirmed role/version/platform here.
+The information forecast is to distinguish loss-associated sustained CPU
+amplification from lower useful service without high process execution, and
+mixed-specific context from QUIC-only behavior. This observation does not name
+the native/controller, recovery, crypto or wake-loop cause. It is separate from
+the no-loss independent-link request-pilot service failure.
+
+All four runs use the same frozen ordinary executable
+`./.tmp/reflection/bin/recovery-target-observation-20260910/mptunnel`, runtime
+source subsequently checkpointed as `d44ca8e`. Its existing ordinary build is
+5669,3m32s; no feature observer, native tracing or role-specific binary override
+is used. The runtime work correction remains unaccepted.
+
+Execution order is QUIC0,QUIC20,mixed0,mixed20. The temporary `loss20_cpu.py`
+imports unchanged `run.py`, fixes logical DOWN loss to0or20%and UP loss to0,
+and adds one tagged `/proc` observation to each existing tc/ps command. No
+second polling loop or runtime policy is added. All cases are40s DOWN bulk
+plus64B TCP echo every500ms,3s echo timeout,500Mbps both directions,
+70msDOWN/30msUPdelay, zero jitter/QoS/blackhole and no mirror/router. This is
+one used physical link47, not aggregation: endpoint addresses and actual class
+traffic establish it despite historical configured labels ending`-46`.
+Mixed uses three TCP carriers plus one QUIC on that shared cut; configured
+loss affects TCP too, not only QUIC. Native/allocation histories and random
+realizations differ; these are not packet-identical or equal-work controls.
+
+Result directories under `./.tmp/reflection/results/` are
+`{quic,mixed}-combined-down-loss-cpu-{zero,twenty}-{quic,mixed}-0910`, with matching
+system names. All four runner return codes are0, elapsed41.004641,41.004346,
+41.006792and41.005822s respectively. Runner success is not all-probe success.
+
+[Verified raw evidence](QUIC_LOSS_CPU_20260910.raw.tar.gz) contains27regular
+files: five results per case, four driver logs, the exact CPU wrapper, runner
+and shaping script. Size633,721B; gzip integrity, tar comparison and every
+decompressed member's byte comparison pass. No configs, private credentials,
+binaries, links or directory members are included. Runner/shape bytes equal
+the preceding ordinary-reuse archive. All311echo attempt records and full
+native/queue/CPU histories remain in these raw files.
+
+## User service and full timing history
+
+Q0/Q20 mean QUIC-only with0/20%loss; M0/M20 mean mixed with0/20%loss.
+Each bulk request receivesHTTP200 and is intentionally duration-partial, not
+an8GiB completed download. The loss cases' final reads extend slightly beyond
+40s; whole goodput uses actual elapsed, not40s or the trimmed-bin mean.
+
+| Outcome | Q0 | Q20 | M0 | M20 |
+|---|---:|---:|---:|---:|
+| Body bytes | 2,152,792,229 | 242,706,592 | 1,927,915,484 | 307,686,102 |
+| Body elapsed, s | 40.000084 | 40.232674 | 40.000245 | 40.306659 |
+| Whole Mbps | 430.558 | 48.261 | 385.581 | 61.069 |
+| First body, s | .490238 | .738950 | .587005 | 1.158503 |
+| Max read gap, s | .100763 | .456200 | .330792 | .968167 |
+| Gap interval, s | .691459–.792222 | 7.008827–7.465027 | 38.253641–38.584433 | 38.477165–39.445331 |
+| Echo success / failed records | 80/0 | 38/34 | 80/0 | 79/0 |
+| Successful echo p50/p95/max, ms | 105.874/172.576/291.744 | 215.328/708.349/1420.055 | 232.009/332.105/755.283 | 273.792/519.371/889.592 |
+| Max spacing between successful echoes, s | .674887 | 1.630925 | 1.038981 | 1.187188 |
+| Overall probe status | ok | loss | ok | ok |
+
+Q20has one actual timed-out echo attempt20.979419→23.982181s, followed by
+33`unavailable_after_disconnect` records, not34independent network failures.
+Its last success is20.479326→20.581195s; subsequent echo service is censored
+by the disconnected test socket. Successful-only p95 excludes that timeout
+and cannot represent restored/late echo service. Slowest successful Q20echo
+is12.758238→14.178293s; M20is33.953463→34.843055s. The other two cases'
+slowest successes are2.002508→2.294253s(Q0) and10.502638→11.257921s(M0).
+Quantiles reproduce the probe's sorted index`round((n−1)*p)`.
+
+| Raw body phase, Mbps | Q0 | Q20 | M0 | M20 |
+|---|---:|---:|---:|---:|
+| 0–5s | 340.382 | 184.956 | 285.847 | 153.781 |
+| 5–15s | 447.146 | 81.084 | 422.622 | 151.692 |
+| 15–25s | 443.283 | 15.961 | 404.526 | 13.431 |
+| 25–40s | 441.069 | 3.073 | 381.501 | 2.749 |
+| 30–40s | 441.397 | 1.906 | 371.853 | 3.021 |
+
+These are sustained-loss phases, not QoS/outage transitions. Late30–40s echo
+attempts are20successes(Q0),20unavailable(Q20),20successes(M0),19successes(M20).
+Available late p95/max are135.450/145.140, no measured successfulQ20value,
+331.867/332.105and454.504/889.592ms. Mixed keeps this sparse echo socket alive
+while its bulk service collapses; `status=ok` does not make it competitive.
+
+All160raw body bins follow. Each row starts at its zero-based second; no
+trimmed series is substituted and the one M20startup zero is preserved.
+
+```text
+Q0
+ 0: 7.177,351.835,461.978,434.923,445.995,471.545,446.854,440.408,453.957,433.451
+10: 436.93,445.128,452.33,440.345,450.513,378.452,436.748,458.093,457.659,435.614
+20: 448.839,464.416,453.63,436.902,462.477,385.04,449.155,452.961,465.523,449.394
+30: 441.755,461.412,451.962,442.334,389.056,442.717,437.956,466.414,437.021,443.342
+Q20
+ 0: 1.145,43.539,451.744,260.002,168.349,186.786,155.573,98.611,91.234,82.271
+10: 44.267,48.803,26.694,39.698,36.899,25.402,34.673,21.754,13.682,15.261
+20: 15.391,9.29,7.148,11.099,5.914,7.148,7.115,4.29,2.426,6.055
+30: 2.717,2.717,2.089,2.097,1.758,1.049,2.339,1.427,1.381,1.482
+M0
+ 0: 2.62,142.487,358.613,585.489,340.027,509.195,331.199,516.847,372.597,438.369
+10: 350.245,508.419,221.639,599.121,378.589,451.223,405.912,314.263,456.789,421.004
+20: 362.623,472.912,417.056,379.915,363.561,429.258,464.021,462.389,347.782,300.534
+30: 323.271,365.172,394.58,353.371,379.774,302.591,343.998,468.92,418.398,368.456
+M20
+ 0: 0,5.86,58.269,259.759,445.017,334.555,127.102,167.665,358.056,59.348
+10: 215.468,78.748,91.65,25.402,58.922,28.451,16.772,26.663,6.328,29.249
+20: 9.437,3.146,8.209,3.534,2.525,3.242,1.241,3.377,1.545,1.622
+30: 1.788,6.146,5.339,.857,4.194,10.486,1.049,.117,.117,.117
+```
+
+## Actual interval CPU, not process-lifetime ps percentages
+
+All328tagged observations contain exactly one process, stable boot/PID/process
+start-time identity and no collector error. `CLK_TCK=100`. Match task identities
+by TID+starttime within that process; initial6/final5threads mean fixed thread
+membership must not be assumed. For each stat, its timestamp is the midpoint
+of its own monotonic read brackets. Adjacent CPU is
+`100 × Δ(utime+stime) / (CLK_TCK × Δseconds)`; whole/late means use total CPU
+seconds divided by actual total measured seconds. Waited-child ticks are not
+included. Threads are the same work, not added to the process total.
+
+| Case/role | CPU seconds / observed seconds | Whole mean / max, % | Sample30→40 mean / max, % | Largest single-thread interval, % |
+|---|---:|---:|---:|---:|
+| Q0client | 38.80 /39.821856 | 97.434 /111.095 | 98.343 /111.095 | 30.348 |
+| Q0server | 64.19 /39.864091 | 161.022 /180.328 | 166.241 /175.235 | 49.074 |
+| Q20client | 2.63 /39.860086 | 6.598 /35.941 | 1.732 /3.636 | 12.628 |
+| Q20server | 6.15 /39.867172 | 15.426 /101.198 | 3.867 /7.273 | 31.061 |
+| M0client | 34.49 /39.878298 | 86.488 /125.752 | 93.753 /103.721 | 34.864 |
+| M0server | 81.80 /39.883848 | 205.096 /235.222 | 218.469 /235.222 | 61.073 |
+| M20client | 5.48 /39.819216 | 13.762 /72.388 | 8.347 /50.029 | 41.007 |
+| M20server | 11.41 /39.832866 | 28.645 /138.050 | 7.106 /8.985 | 35.982 |
+
+The largest thread column is a maximum one-interval sample, not a thread's
+whole-run average or Rust async-task identity. Disappearing short-lived threads
+limit thread-level coverage; process ticks remain the aggregate measurement.
+Sample30→40is approximately those runner seconds, not exact probe-clock CPU
+attribution. The largest individual stat read bracket is2.731398ms and ticks
+have10ms granularity. No inference about subsecond transient peaks follows.
+
+Q20process peaks occur around runner2–3s, M20around4–5s. These are also large
+work intervals: body bins2/4are451.744/445.017Mbps. Sampled server native ACK
+progress adds51,627,245B(Q20) and62,976,425B(M20TCP+QUIC) in those respective
+bands. Different counter/timestamp domains make this contextual coexistence,
+not per-byte CPU attribution or proof that all startup cost is necessary.
+
+Thus the high-loss captures DO include approximately one-core or greater
+total-process startup work. But late collapse to1.906/3.021Mbps occurs with
+mean server CPU3.867/7.106%and client1.732/8.347%, not sustained MPP CPU
+exhaustion. That falsifies continuously CPU-saturated MPP as the explanation
+of this current late collapse; it does not identify its native/MPP cause or
+disprove another deployed burst, external scheduling delay or shorter event.
+
+Collector begin→end maxima are8.624ms across all roles/cases, with per-role
+41-invocation totals131–163ms. This excludes Python startup, Docker execution,
+tc/ps and other collection impact; it is not total observer overhead. MPP CPU
+does not include the collector process. No runtime owner timers or samples run.
+
+## Physical drops, resource cost and limits
+
+All41rows per case verify500Mbps rate=ceil,65536Bbursts,8192netem limit,
+70/30ms delays and zero jitter; only configured DOWN random loss differs.
+There is no QoS or blackhole. Active47is servereth0/clienteth1; the unused
+interface is not counted as another payload link. Costs below use sampled
+class deltas and include protocol/repair/native work, not just useful body.
+
+| Sampled cost | Q0 | Q20 | M0 | M20 |
+|---|---:|---:|---:|---:|
+| Window, s | 40.004445 | 40.004130 | 40.006586 | 40.005498 |
+| Active DOWN bytes | 2,275,450,434 | 259,009,796 | 2,384,844,645 | 384,954,872 |
+| Active UP bytes | 36,897,612 | 4,969,832 | 44,299,291 | 14,149,791 |
+| Active DOWN class drops | 0 | 11,045 | 0 | 14,960 |
+| Summed DOWN backlog peak, B | 15,479,334 | 9,261,594 | 25,494,664 | 13,246,957 |
+| Summed UP backlog peak, B | 39,861 | 40,795 | 55,663 | 99,396 |
+| Client RSS peak / final, KiB | 36,684 /36,684 | 81,936 /78,808 | 76,612 /76,612 | 117,908 /109,712 |
+| Server RSS peak / final, KiB | 313,508 /301,744 | 255,396 /255,396 | 370,668 /369,348 | 235,108 /235,108 |
+| Active DOWN30→40 class Mbps | 458.913 | 1.956 | 478.652 | 5.134 |
+
+UPdrop deltas are0throughout. The inactive server interface adds2drops inM20
+(348B/6dequeued packets), none in the other cases; active/inactive counts
+must not be conflated. Native packet/offload and class-dequeue accounting
+domains differ: configured20%loss is NOT computed as class drops divided by
+dequeued packet counters. Larger client RSS with far less useful work is
+retained, but these finite in-load samples cannot establish a leak or prove
+post-load reclamation. Lower CPU/wire volume with collapsing work is not an
+efficiency win.
+
+Probe stderr is empty. Client broken-pipe/reset and server remote-close/
+graceful QUIC-close warnings occur near duration-stop/cleanup, not at the
+Q20echo timeout around21–24s. They are retained in raw logs, not counted as
+additional independently observed mid-run failures. This experiment supplies
+no matched raw/Hysteria2/Xray loss comparator and no native-policy ablation;
+physical inevitability, a deliberate controller tradeoff and a Product defect
+cannot be selected from these four means alone.
+
+### Existing native policy boundary, not permission to retune it
+
+The [existing RFC](../RFC.md) uses preferred loss allowance`p0=.10` and native
+residual objective`q=.02`, giving`theta=1−(1−p0)(1−q)=.118`. At constant
+volume, its documented envelope can authorize another native response after
+approximately four operating rounds at sustained20%loss. Thus20%is outside
+the intended10%allowance; this observation does not silently enlarge it.
+
+Q20server native ACK bytes advance every sampled second in one unchanged
+epoch. Its exported native inflight limit falls17,237,434B at sample2to854,652
+at10,58,667at30and20,000at40; native pacing falls1467.013→67.401→4.640→1.772Mbps.
+Displayed RTT is approximately100ms from sample10onward. Mixed QUIC ends at
+7,331B and.527Mbps. This directly supports native contraction as part of the
+observed declining service, not a CPU-frozen controller. Management does not
+record envelope balance, exact phase transitions or raw-authority decisions,
+so it cannot attribute every contraction to one branch or prove near-zero
+goodput is inevitable or correctly calibrated. No allowance/controller knob,
+policy change or fix follows from this four-cell observation alone.
+
+**Disposition:** the information forecast separates current late collapse
+from sustained process CPU saturation. It does not resolve the deployed
+RAM/CPU report, justify a native or MPP policy change, or establish acceptable
+performance under loss. Any next correction needs the exact responsible
+state/decision and its own falsifier, not a throughput-only or CPU-threshold
+adjustment.

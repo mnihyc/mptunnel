@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 21:38 +08:00. Authoritative repository: `./`.
+Updated: 2026-09-10 22:26 +08:00. Authoritative repository: `./`.
 **MPP is not performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; do not conclude at an intermediary commit.
 
@@ -11,6 +11,78 @@ growing inventory. Complete preceding chronology and adverse outcomes remain at
 linked reports/archives. Condensation discards no experiment.
 
 ## Active transaction: attribute remaining request-pilot service failure
+
+### Next action: split preselect work before another runtime correction
+
+Current ordinary source is d44ca8e. Its exact observation-reuse correction has
+73 focused controls, but ordinary same-cell confirmation gap9.215s and poor
+restored service reject performance promotion. Report and raw archive are
+complete. No runtime observer or build is currently active.
+
+Issue/impact: the existing independent200+200 QoSUP pilot delays replies for
+seconds even after every source byte has reached the target. Previous exact
+FIFO-held intervals are almost entirely repeated exclusive Product work.
+Preselect caller1562 accounts for25.589s aggregate, but includes source
+admission, retained-frontier/tail maintenance and authoritative-gap selection.
+It is NOT25.589s of one known query. Earlier3.223M zero-owner queries are from
+a different capture and do not identify which eligibility predicate failed.
+
+Competing causes: repeated stale/detached-only region searches, dynamic native
+or Product admission exclusions, source/retained geometry work, or remaining
+dispatch work. The next question is which inner preselect phase owns material
+held service and what fraction of empty-owner searches has no actor-eligible
+Original owner even before dynamic admission is checked.
+
+Independent source proof supplies a safe possible scope, not a performance
+forecast: S is all exact attached instances except Product Stale/Requalifying;
+every current dynamic owner mask M(t) is a subset of S. S is actor-stable in
+this synchronous evaluation. Regions outside OriginalCoverage(S) return no
+model before clocks/scoring. Include Acquiring, Backup, native-unavailable and
+Product-admission-unavailable instances; do not use historic evidence_eligible.
+Preserve all-attached accepted-copy coverage/deadline even with empty candidate
+work. Structural recovery deliberately serves stale/detached ownership and is
+out of scope. No prune is authorized until its practical work share is known.
+
+Information forecast: one temporary periodic owner observer, with preselect
+subphase timers and an empty-owner stable-S classification, distinguishes a
+material removable stale-only search cost from other maintenance or dynamic
+exclusion cost. Existing aggregate timers cannot decide that. This experiment
+has no predicted Mbps gain and makes no runtime policy change. Classification
+overhead is explicit and separate from the measured production phase.
+Falsifier: a small stale-only fraction or dominant other phase defers pruning;
+do not rescue it with another operation-count test. A material identified
+inner phase selects ONE actual producer counterexample/correction, followed
+by the unchanged ordinary completion/timing/cost gate. Do not add thresholds,
+freeze dynamic eligibility, change quantum, or claim summed elapsed is CPU.
+
+Smallest action: reuse the archived owner/stage overlay on current source,
+add feature-only periodic subphase observations (no per-frame bulk logs), build
+one diagnostic executable, archive/reverse the whole overlay before traffic,
+and run the SAME200+200 QoSUP cell below. Root owns build/lab; independent
+review checks instrumentation semantics and the stable-scope classifier.
+Actual outcome: pending this single information transaction.
+
+### Completed loss-CPU discriminator; no CPU fix justified
+
+Four ordinary500Mbps DOWN controls complete on d44ca8e runtime: QUIC0/20loss,
+then mixed0/20loss; unchanged100ms RTT, no jitter/QoS/outage. Whole useful rates
+430.558/48.261/385.581/61.069Mbps; late30–40s rates441.397/1.906/371.853/3.021.
+QUIC20 loses the echo socket once and has33 later unavailable records; preserve
+that failure rather than reporting successful-only latency as recovered service.
+At20loss, server startup process peaks101.2/138.1% of one core, coinciding with
+substantial traffic. Late server means3.87/7.11% rule out sustained CPU starvation
+as the cause of THESE late collapses, not short bursts or the deployed incident.
+Thread peaks cannot refute the user's total-process one-core observation.
+
+Native ACKs progress while QUIC flight limits/pacing contract. Default10%loss
+allowance plus2%residual permits native congestion response above11.8%;20% is
+outside that allowance. This explains why backoff is authorized, NOT why
+near-zero service is necessary or correctly calibrated. Exact budget/BBR phase
+attribution is absent. No CPU/fairness or controller-threshold patch follows.
+Role/version/platform remain unanswered; do not block the main no-loss stall.
+[Full CPU/timing/policy report](QUIC_LOSS_CPU_20260910.md) and its27-file raw
+archive preserve all four runs. Information forecast met; deployed attribution
+and sustained high-loss service remain unresolved, not new speculative fixes.
 
 ### Current correction: one observation per recovery target decision
 
@@ -396,7 +468,7 @@ docs-dev/LIVE_OWNER_FRONTIER_WORK_BOUND.md remains untouched/unstaged.
 Use exact intermediary commits; docs-dev needs exact force-add. PROGRESS is an
 ignored continuity journal, not force-added. AGENTS.md is immutable.
 
-Telegram proven local-delay milestone sent13:00UTC; next nonurgent after14:01UTC.
+Telegram measured CPU/remaining-stall update sent14:10UTC; next nonurgent after15:15UTC.
 Meaningful measured milestones/blockers only; commentary within60s, minute
 lab/build polling. Before compaction preserve exact active session, next
 decision, source/binary identities and adverse/open outcomes. Continue, do not

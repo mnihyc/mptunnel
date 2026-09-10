@@ -11,6 +11,7 @@ pub mod quic;
 mod spec;
 pub mod tcp;
 pub(crate) mod tcp_telemetry;
+pub(crate) mod tcp_write_admission;
 pub mod udp;
 
 #[cfg(target_os = "linux")]

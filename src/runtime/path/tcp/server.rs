@@ -28,6 +28,7 @@ use crate::runtime::path::{
     fence_server_carrier_readiness,
 };
 use crate::transport::encrypted::{EncryptedFramedStream, ServerEncryptedStreamAdmission};
+use crate::transport::tcp_write_admission::TcpWriteAdmission;
 use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -92,6 +93,27 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         ));
     }
     let peer = tcp_carrier_peer(&stream)?;
+    let write_admission = match TcpWriteAdmission::capture(
+        &stream,
+        crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            // Acquisition is transactional: an error leaves the socket's
+            // previous policy intact. Optional capability loss is not a
+            // connection failure or a native capacity observation.
+            static WARNING: std::sync::Once = std::sync::Once::new();
+            WARNING.call_once(|| {
+                crate::observability::process_event!(
+                    Warn,
+                    "tcp",
+                    "write_admission_unavailable",
+                    "TCP native write admission unavailable; retaining structural readiness: {error}"
+                );
+            });
+            None
+        }
+    };
     let mut tcp_metrics = TcpMetricPublisher::capture(&stream);
     let tls = &context.tls;
     let authentication_deadline =
@@ -240,12 +262,14 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     let evidence =
         ServerTcpEvidenceState::new(tcp_metrics, Some(local_metrics), context.mux_limits);
     let peer_status = context.register_peer_status(&path_registration);
+    let mut writer = ServerTcpWriter::new(writer);
+    writer.set_write_admission(write_admission);
     ServerTcpPathSession::new(ServerTcpPathAdmission {
         context,
         session_id,
         path_id,
         path_registration,
-        writer: ServerTcpWriter::new(writer),
+        writer,
         path_frames,
         native_terminal: Some(native_terminal),
         commands_tx,

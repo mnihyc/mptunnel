@@ -334,6 +334,73 @@ async fn write_prepared_response(carrier: &mut ProtectedCarrier) -> Frame {
 }
 
 #[tokio::test]
+async fn prepared_response_native_blocked_writer_keeps_source_for_ready_alternate() {
+    let mut fixture = PreparedResponseFixture::new().await;
+    let payload = Bytes::from(vec![0x51; fixture.quantum]);
+    fixture.publish(payload.clone());
+    let a_instance = fixture.a.0.path_registration.path_instance_id();
+    let old_ready = fixture
+        .a
+        .0
+        .commands_rx
+        .writer_ready_boundary(a_instance)
+        .unwrap()
+        .receipt();
+    // This is an operational permission transition, not a native metric.
+    // The actual socket adapter separately proves blocked/readiness wakes.
+    fixture
+        .a
+        .0
+        .writer
+        .set_original_handoff_permission_for_test(false);
+    let command = try_recv_reliable_path_command(&mut fixture.a.0.commands_rx).unwrap();
+    assert!(matches!(&command, ReliablePathCommand::PreparedOriginal(_)));
+    fixture.a.0.drain_commands(command).await.unwrap();
+    {
+        let state = fixture.owner.lock();
+        assert_eq!(
+            state.send_stream.next_offset(),
+            0,
+            "an idle but native-blocked carrier must not assign the shared source"
+        );
+        assert_eq!(state.sender.data_bytes(), fixture.quantum);
+        assert_eq!(state.send_stream.reinjection_bytes(), 0);
+    }
+    assert!(!old_ready.is_current());
+    assert_eq!(fixture.a.2.pending_bytes(), 0);
+    assert_eq!(fixture.a.2.writer_pending_bytes(), 0);
+    assert!(try_recv_reliable_path_command(&mut fixture.a.0.commands_rx).is_none());
+
+    fixture.attach_b();
+    fixture.assert_source(fixture.quantum, 0, 0);
+    assert_eq!(
+        write_prepared_response(&mut fixture.b).await,
+        Frame::StreamData {
+            stream_id: fixture.path_stream.stream_id,
+            offset: 0,
+            payload,
+        }
+    );
+    fixture.assert_source(fixture.quantum, fixture.quantum, 0);
+    assert_eq!(fixture.original_bytes(PathId(0)), 0);
+
+    // Native admission restricts only fresh Original assignment. A control
+    // command still reaches the ordinary protected writer while it is false.
+    let ping = Frame::Ping { nonce: 323 };
+    fixture
+        .a
+        .2
+        .try_enqueue_admitted_frame(ping.clone(), TrafficClass::Control)
+        .unwrap();
+    let command = try_recv_reliable_path_command(&mut fixture.a.0.commands_rx).unwrap();
+    assert!(matches!(&command, ReliablePathCommand::SendFrame(frame) if frame == &ping));
+    fixture.a.0.drain_commands(command).await.unwrap();
+    assert_eq!(fixture.a.1.read_frame().await.unwrap(), ping);
+    assert_eq!(fixture.a.2.pending_bytes(), 0);
+    assert_eq!(fixture.a.2.writer_pending_bytes(), 0);
+}
+
+#[tokio::test]
 async fn prepared_response_ready_alternate_writes_lowest_unclaimed_prefix() {
     let mut fixture = PreparedResponseFixture::new().await;
     let first = Bytes::from(vec![0x51; fixture.quantum]);

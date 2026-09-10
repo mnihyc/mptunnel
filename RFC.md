@@ -2398,6 +2398,26 @@ stop-and-wait. Native-capacity release exposes pending higher-class work before
 another lower-class command is handed off. Priority MUST NOT overtake an
 earlier protocol prerequisite.
 
+For a multiplexed TCP writer with native unsent-buffer admission support,
+imminent Original ownership additionally requires a fresh native writable
+opportunity. Structural actor idleness alone MUST NOT authorize that claim.
+While unavailable, the source remains unclaimed and eligible on other writers;
+one exact-carrier native wake returns through normal class arbitration. Waiting
+for this opportunity MUST NOT park input, cancellation or lifecycle service, or
+retain a selected bulk notice ahead of newly ready higher-class work. Cached
+writable notifications may be spurious and MUST be revalidated without polling
+timers or busy retries. A writable opportunity is not a complete-frame
+reservation: the existing single partial protected transaction still completes
+or terminates without interleaving or replay.
+
+An unsent refill reserve is distinct from native congestion flight, total socket
+memory and shared Product credit. It MAY bound how much future service loses
+MPP arbitration, but MUST NOT become another congestion window, pacer or ACK
+stop-and-wait. Its refill/wake and packetization costs require practical
+validation; a smaller reserve is not intrinsically better. Unsupported native
+capability retains the structural-only handoff contract explicitly, not invented
+zero queue or measured native readiness.
+
 This priority cannot preempt bytes already accepted by a shared TCP socket,
 QUIC stream, kernel queue, or other native FIFO. No lower-class command still
 owned by MPP may be selected ahead of dependency-ready higher-class work, but

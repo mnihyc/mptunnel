@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 13:50 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 14:38 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -15,11 +15,116 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 
 ### Selected next model gate — confirmed return service with baseline fallback
 
+14:38 +08 native-refill's four ordinary UP cells settle every accepted byte.
+TCP control/candidate: 422.329/449.668 Mbps, first confirmation .408636/.408035s,
+maximum confirmation gap .514412/.617220s. Mixed: 414.049/410.817 Mbps, first
+confirmation .409412/.414631s, maximum gap .465272/.694198s. Preserve the worse
+confirmation tails: more bulk work is not a latency pass. Mixed return bytes
+rise 22.75%, peak shared UP backlog 18.50→33.98MB and client RSS/CPU rise.
+All eight cells, 328 bins, 280 DOWN echoes, four exact settlements and 332
+profile rows are independently audited in NATIVE_REFILL_ORDINARY_20260910.
+
+Source review finds no new admission/priority violation. ACK/control/repair
+bypass only the Original preclaim check, NOT the socket low-water policy;
+they retain exact ownership and the same partial protected transaction. Do not
+gate them as a compensating tweak. Changed native competition and repair versus
+Original service remain competing causes, not proven by native byte shares.
+
+NEXT information-only noise discriminator: ONE reverse-order mixed healthy
+DOWN pair, candidate then ba56290 control, identical frozen binaries and
+500/500Mbps, DOWN30/UP70ms, no impairments, normal management/probe, 40 seconds.
+The earlier all-phase -5.6% result and historical 389–417Mbps control range
+justify testing execution-order dependence before attributing harm to policy.
+Keep both pairs and all timings/costs. Repeated sustained harm retains an
+explicit throughput/latency tradeoff and stops default promotion; reversed
+ordering means causality is unresolved, not a non-regression waiver. No third
+favorable-repeat, observer, LOWAT tuning or new issue inventory. The large
+TCP latency correction remains an isolated trial; the next decision must
+continue the existing mixed/recovery closure task, not end at this checkpoint.
+
+14:27 +08 mixedDOWN ordinary result is NOT non-regression:417.539→394.076Mbps
+(-5.6%),firstbody.579448→.587630s, maxgap.345924→.370100s. Echo77/80all succeed,
+median289.487→270.309ms,p95678.431→410.124ms,max1174.209→532.697ms. Keep mean
+harm andbettertails; currenttrial remainsunpromoted. HistoricalsamehealthyMPP
+controls389–417Mbps also showrealization/historyvariation, not evidence to
+waivethispair or assigncausalharmfromoneaverage. Reportingwillinspectactual
+carrierbytes/phases/cost, not cachedrate. CompletealreadydeclaredTCP/mixedUP
+control/candidate classification for symmetry/settlement BEFOREdisposition;
+no retune, newmodel or favorable-repeat. This is notcompletingglobalacceptance.
+
+TCPcost also has a real tradeoff: nativeRTTmedian216.8→296.3ms and sharedDOWN
+backlogmedian9.05→14.07MB despite greatlybettertunnelecho. Medianunsent48.20MB
+falls.285MB, while nativeflightproxy12.78→17.62MB remainsindependent. Lifetime
+CPU/RSSdecrease, but no blanketnetworklatencyclaim; bypasslatency isnotmeasured
+in thispair. Preserve sharedqueuecost in finalpracticaldecision.
+
+14:24 +08 first ordinaryTCPDOWN pair supports the forecast:417.249→440.164Mbps,
+firstbody.586752→.583288s, maxreadgap.402695→.321440s; echo43/80all succeed,
+median937.902→299.562ms,p951269.087→322.754ms,max1328.312→507.695ms. Same500/500
+healthy40sprofile, nofeaturediagnostics, controlba56290 thennative-refilltrial.
+NoLchange. Fullbins/nativequeue/flight/CPU/RSS are under independentreporting;
+these stronguser-visible improvements justify the declared next mixedDOWN
+control/candidate pair, nowrunning. Notglobalacceptance or an optimalityclaim.
+Native/sharedpath residual~300ms mustremainvisible; do noterase it withbulkMbps.
+
+14:19 +08 bounded refill model controls complete. Actualserverwriter permission
+RED assigns65,536B despite explicitunavailablepermission, failingat intended
+next_offset0 assertion (69scompile). This is a caller-permission model test,
+not fabricated native telemetry; exactFIFOcapture proves practicalreachability,
+and5realadapter checks separately prove actualnegative/wake/cancel/terminal,
+exactoption scope and unchangedSO_SNDBUF. GREEN all81TCPchecks and35prepared
+checks pass;55.89s warning-free testcompile. Existingpartialwrite/class/source
+and lifecycle controls remain. Independent client/server/adapter review finds
+no reachablecounterexample. POLLERR/fullHUP wake witherror, not newOriginal
+permission; peerwrite-halfclose is not classified asfullHUP. NoSO_ERRORconsume.
+
+Currentpolicy remains trial/unpromoted. Ordinaryreleasebuild started; compare
+frozenba56290control thennewcandidateTCP healthyDOWN40s, unchanged500/500Mbps,
+DOWN30/UP70,noimpairments, normalmanagement/probe only (nofeature diagnostics).
+SameL=131,072 nativebytes frozen throughout; no tuning afterresults. If useful
+service holds whileechoimproves, next affected cells are mixedDOWN and TCP/mixed
+UP, retainingcompleteconfirmation/timing/cost. Any practicalharm mustbe kept
+and classified beforepromotion. Recordnativeflight andNOTSENT separately;
+smallnativeunsent alone isnot proof of sustainedperformance. NoREADME/release.
+
+13:58 +08 bounded native-refill prototype selected after exact causal proof;
+observer/report/archive committed e722c46, no production policy changed yet.
+The trial is native unsent backpressure AND preclaim readiness, not LOWAT alone.
+Use one exact socket writable owner per physical TCP carrier. Both outer
+publication and immediate Original claim require fresh native eligibility;
+blocked work stays a weak notice, using existing writer_change_wait/deferred
+machinery. One actor-native wake republishes the existing physical readiness
+boundary and re-enters normal class arbitration. No per-stream socket waiter,
+new heartbeat/poll timer, own cwnd/pacer, SO_SNDBUF or Product-ACK wait.
+
+Trial policy is L=2q native bytes, q=the existing maximum64KiB service quantum.
+Factor2 follows Linux's below-half-low-water write-space wake. The native-byte
+refill reserve is approximately q (1.049ms at500Mbps), NOT an exact complete
+protected-frame reservation: current64KiB NoiseDATA occupies65,602wire bytes.
+Framing/kernel packetization and the one retained partial record can overshoot;
+codec-valid larger records remain legal. No protocol-family preference or
+resource-limit shrink is introduced. This is a disclosed policy trial, not a
+symbolic guarantee of throughput under arbitrary CPU delays. Nativeflight may
+remain6.25MB at500Mbps/100ms or larger; L constrains unsent admission, not flight.
+Unsupported native capability retains the existing structural-only contract
+explicitly; never report unknown as observed zero/ready capacity.
+
+Forecast: remove much of the demonstrated0.5–1.35s unnecessary unsent residence,
+not TCP propagation/retransmission/receiver delay; no promised mean-speed gain.
+Cost risk: extra native wakes/syscalls and refill starvation on busy/high-rate
+hosts. Falsifier: meaningful healthy goodput/startup/CPU or recovery regression,
+lost wake, claimed blocked source, partialwrite replay or stalled cleanup.
+Build targeted real native-wake and actual writer preclaim controls first;
+retain RED against ungated claim when reachable in existing fixtures. Then ONE
+ordinary control/candidate TCP healthyDOWN pair, followed by affected mixed/
+UP and existing impairment gates only if supported. Preserve every bin/gap/
+echo/settlement/cost; do not enlarge L until a favorable number appears.
+
 13:50 +08 exact native-FIFO discriminator succeeds. Feature TCP healthy DOWN
 419.462Mbps,46/46echoes,median893.015/p951253.589/max1497.461ms; not performance
 promotion. Worst echo index38/range[2432,2496) first authenticates on path2.
-Its exact protected interval[600083336,600083448) is still below native initial
-send frontier1352.786ms after acceptance, crosses by1354.336ms, authenticates
+The native initial-send frontier is still below its exact protected interval
+end600083448 at1352.786ms after acceptance, crosses by1354.336ms, authenticates
 70ms later. The conservative unsent lower bound alone is90.34%of the same
 request's elapsed, not aggregateQ/C or a losing-copy attribution. Client event
 is pre-mailbox authentication, not an asserted Product winner. Reporter retains

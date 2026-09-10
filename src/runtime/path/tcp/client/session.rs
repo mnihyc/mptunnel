@@ -4,7 +4,9 @@
 //! lifetime coupling between one TCP carrier and all attached product streams.
 
 use super::super::group::{ClientTcpCarrierGroups, ClientTcpCarrierReservation};
-use super::connection::{ClientTcpCarrierConnect, connect_client_tcp_carrier};
+use super::connection::{
+    ClientTcpCarrierConnect, ClientTcpCarrierConnection, connect_client_tcp_carrier,
+};
 use super::datagram::ClientTcpDatagramState;
 use super::receive::handle_client_tcp_path_frame;
 use super::state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
@@ -395,7 +397,35 @@ async fn run_client_tcp_path_session_active(
             .connection
             .as_mut()
             .expect("checked connected TCP path session");
-        if !draining && command_may_recv {
+        let may_publish_original = !draining && command_may_recv;
+        let native_handoff_allowed = if may_publish_original {
+            match connection.carrier.allows_original_handoff() {
+                Ok(allowed) => allowed,
+                Err(err) => {
+                    commands.withdraw_writer_ready();
+                    fail_client_tcp_products(
+                        &mut state.streams,
+                        &mut state.datagrams,
+                        &err,
+                        runtime,
+                    );
+                    crate::observability::process_event!(
+                        Warn,
+                        "tcp",
+                        "write_admission_failed",
+                        "TCP native write admission failed: path_index={} path_instance_id={} error={err}",
+                        runtime.path_index,
+                        connection.path_instance_id.as_u64(),
+                    );
+                    retire_failed_client_tcp_connection(runtime, state, carrier_readiness);
+                    actor_terminal.finish();
+                    return;
+                }
+            }
+        } else {
+            false
+        };
+        if may_publish_original && native_handoff_allowed {
             let _ = commands.writer_ready_boundary(connection.path_instance_id);
         } else {
             commands.withdraw_writer_ready();
@@ -710,6 +740,30 @@ async fn run_client_tcp_path_session_active(
                         "tcp",
                         "heartbeat_failed",
                         "TCP path heartbeat failed: path_index={} path_instance_id={} error={err}",
+                        runtime.path_index,
+                        connection.path_instance_id.as_u64(),
+                    );
+                    drop_connection = true;
+                }
+            }
+            result = ClientTcpCarrierConnection::native_writable(
+                &connection.carrier.write_admission,
+            ), if may_publish_original && !native_handoff_allowed => {
+                // A socket wake is not a bulk reservation. The next iteration
+                // rechecks readiness and arbitrates normal input/command lanes.
+                if let Err(err) = result {
+                    commands.withdraw_writer_ready();
+                    fail_client_tcp_products(
+                        &mut state.streams,
+                        &mut state.datagrams,
+                        &err,
+                        runtime,
+                    );
+                    crate::observability::process_event!(
+                        Warn,
+                        "tcp",
+                        "write_admission_failed",
+                        "TCP native write admission failed: path_index={} path_instance_id={} error={err}",
                         runtime.path_index,
                         connection.path_instance_id.as_u64(),
                     );

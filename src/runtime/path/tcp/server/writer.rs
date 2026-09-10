@@ -8,10 +8,14 @@ use super::super::io::{EncryptedTcpWriter, encrypted_framed_peer_closed};
 use super::evidence::ServerTcpEvidenceState;
 use crate::protocol::Frame;
 use crate::runtime::error::RuntimeError;
+use crate::transport::tcp_write_admission::TcpWriteAdmission;
 
 pub(in crate::runtime::path::tcp) struct ServerTcpWriter {
     pending_frames: Vec<Frame>,
     framed: EncryptedTcpWriter,
+    write_admission: Option<TcpWriteAdmission>,
+    #[cfg(test)]
+    original_handoff_permission: Option<bool>,
 }
 
 impl ServerTcpWriter {
@@ -24,6 +28,40 @@ impl ServerTcpWriter {
         Self {
             pending_frames: Vec::new(),
             framed,
+            write_admission: None,
+            #[cfg(test)]
+            original_handoff_permission: None,
+        }
+    }
+
+    pub(super) fn set_write_admission(&mut self, admission: Option<TcpWriteAdmission>) {
+        self.write_admission = admission;
+    }
+
+    /// Unsupported adapters preserve structural-only writer readiness; this
+    /// fallback is not a measured native capacity observation.
+    pub(super) fn allows_original_handoff(&self) -> Result<bool, RuntimeError> {
+        #[cfg(test)]
+        if let Some(permission) = self.original_handoff_permission {
+            return Ok(permission);
+        }
+        self.write_admission
+            .as_ref()
+            .map_or(Ok(true), TcpWriteAdmission::is_ready)
+            .map_err(RuntimeError::Io)
+    }
+
+    /// Model permission only: native socket negative/wake behavior is tested
+    /// separately by the actual socket adapter, never by invented telemetry.
+    #[cfg(test)]
+    pub(super) fn set_original_handoff_permission_for_test(&mut self, permission: bool) {
+        self.original_handoff_permission = Some(permission);
+    }
+
+    pub(super) async fn native_writable(&self) -> Result<(), RuntimeError> {
+        match &self.write_admission {
+            Some(admission) => admission.writable().await.map_err(RuntimeError::Io),
+            None => std::future::pending().await,
         }
     }
 

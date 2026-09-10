@@ -203,16 +203,29 @@ impl ServerTcpPathSession {
                 self.commands_rx.withdraw_writer_ready();
                 Some(ServerTcpPathEvent::Frame(frame))
             } else {
-                let _ = self
-                    .commands_rx
-                    .writer_ready_boundary(self.path_registration.path_instance_id());
-                recv_server_tcp_path_event(
-                    &mut self.path_frames,
-                    &mut self.commands_rx,
-                    &mut self.peer_status,
-                    self.evidence.next_sender_observation_at(),
-                )
-                .await?
+                let may_handoff = self.writer.allows_original_handoff()?;
+                if may_handoff {
+                    let _ = self
+                        .commands_rx
+                        .writer_ready_boundary(self.path_registration.path_instance_id());
+                } else {
+                    self.commands_rx.withdraw_writer_ready();
+                }
+                tokio::select! {
+                    biased;
+                    event = recv_server_tcp_path_event(
+                        &mut self.path_frames,
+                        &mut self.commands_rx,
+                        &mut self.peer_status,
+                        self.evidence.next_sender_observation_at(),
+                    ) => event?,
+                    result = self.writer.native_writable(), if !may_handoff => {
+                        result?;
+                        // One carrier wake, not a claimed stream's wait.
+                        // Recheck and republish before ordinary arbitration.
+                        continue;
+                    }
+                }
             };
             let Some(event) = event else {
                 return Ok(());
@@ -815,6 +828,20 @@ impl ServerTcpPathSession {
                         || work.path_instance_id() != instance
                     {
                         break;
+                    }
+                    if !self.writer.allows_original_handoff()? {
+                        // Withdraw before arming so our own invalidation does
+                        // not immediately wake this otherwise blocked notice.
+                        self.commands_rx.withdraw_writer_ready();
+                        let Some(wait) = work.writer_change_wait() else {
+                            break;
+                        };
+                        // Arm before the fresh check: a recovered socket must
+                        // not be stranded waiting for an already-passed wake.
+                        if !self.writer.allows_original_handoff()? {
+                            self.commands_rx.defer_prepared_work(work, wait);
+                            break;
+                        }
                     }
                     let Some(ready) = self.commands_rx.writer_ready_boundary(instance) else {
                         break;

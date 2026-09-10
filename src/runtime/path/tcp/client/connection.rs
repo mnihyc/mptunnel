@@ -19,6 +19,7 @@ use crate::transport::encrypted::{
     EncryptedFramedStream, EncryptedFramedTransportError, TcpClientTlsConfig,
 };
 use crate::transport::tcp::{self as tcp_transport, TcpConnectOptions};
+use crate::transport::tcp_write_admission::TcpWriteAdmission;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -34,6 +35,7 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
     next_heartbeat_at: tokio::time::Instant,
     pending_heartbeat: Option<(u64, tokio::time::Instant)>,
     pub(in crate::runtime) tcp_metrics: Option<TcpMetricPublisher>,
+    pub(super) write_admission: Option<TcpWriteAdmission>,
     pub(in crate::runtime) peer_usage_sequence: u64,
     pub(in crate::runtime) peer_usage: PathUsage,
     /// One authenticated readiness exchange, excluding TCP connection setup.
@@ -59,6 +61,26 @@ pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
 }
 
 impl ClientTcpCarrierConnection {
+    /// None preserves the legacy structural permission without claiming a
+    /// measured native capacity. Only the exact supported socket can block it.
+    pub(super) fn allows_original_handoff(&self) -> Result<bool, RuntimeError> {
+        self.write_admission
+            .as_ref()
+            .map_or(Ok(true), TcpWriteAdmission::is_ready)
+            .map_err(RuntimeError::Io)
+    }
+
+    /// Borrow only the capability so the actor can keep receiving frames and
+    /// servicing lifecycle work while this exact socket is not writable.
+    pub(super) async fn native_writable(
+        admission: &Option<TcpWriteAdmission>,
+    ) -> Result<(), RuntimeError> {
+        match admission {
+            Some(admission) => admission.writable().await.map_err(RuntimeError::Io),
+            None => std::future::pending().await,
+        }
+    }
+
     pub(in crate::runtime) fn heartbeat_deadline(&self) -> tokio::time::Instant {
         self.pending_heartbeat
             .as_ref()
@@ -161,6 +183,25 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         .await?;
         #[cfg(feature = "lab-diagnostics")]
         let lab_local_addr = tcp_stream.local_addr().ok();
+        let write_admission = match TcpWriteAdmission::capture(
+            &tcp_stream,
+            crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                // Failed optional acquisition leaves native policy unchanged.
+                static WARNING: std::sync::Once = std::sync::Once::new();
+                WARNING.call_once(|| {
+                    crate::observability::process_event!(
+                        Warn,
+                        "tcp",
+                        "write_admission_unavailable",
+                        "TCP native write admission unavailable; retaining structural readiness: {error}"
+                    );
+                });
+                None
+            }
+        };
         let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);
         let mut framed = EncryptedFramedStream::connect(tcp_stream, tls, codec_limits).await?;
         let transport_binding = framed.tcp_admission_binding()?;
@@ -272,6 +313,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             next_heartbeat_at: now + heartbeat_delay,
             pending_heartbeat: None,
             tcp_metrics,
+            write_admission,
             peer_usage_sequence: 0,
             peer_usage: peer_usage.expect("path usage checked before carrier creation"),
             readiness_rtt,

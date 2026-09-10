@@ -117,6 +117,20 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 {
                     break;
                 }
+                if !connection.carrier.allows_original_handoff()? {
+                    // Withdraw before arming: our own boundary change must not
+                    // immediately wake this unchanged weak source notice.
+                    commands.withdraw_writer_ready();
+                    let wait = work.writer_change_wait();
+                    // Arm before the fresh native check so recovery cannot be
+                    // lost between deciding to defer and parking the notice.
+                    if !connection.carrier.allows_original_handoff()? {
+                        if let Some(wait) = wait {
+                            commands.defer_prepared_work(work, wait);
+                        }
+                        break;
+                    }
+                }
                 let Some(ready) = commands.writer_ready_boundary(connection.path_instance_id)
                 else {
                     break;

@@ -1541,3 +1541,176 @@ as material owners, while successful commit/native-stale replan and queued
 dispatch are small in the decisive interval. The next correction requires a
 reachable invariant in that measured planning scope; neither a new parameter
 nor another isolated minor query optimization follows from these totals.
+
+## Ordinary lazy bound-repair observation: rejected for performance promotion
+
+The minimal chooser-level reuse does not pass the ordinary gate. Run51554
+reaches the unchanged85s settlement guard with141,370,950B confirmed of
+201,261,056B locally accepted: **59,890,106B remain unconfirmed**. The maximum
+confirmation gap is19.827287s. This practical failure is retained despite the
+actual work counterexample and74focused checks passing. It does not establish
+that the small source change caused every difference from the earlier runs.
+
+The candidate is ordinary `d44ca8e` plus one lazy authority-only observation
+inside the existing repair chooser, shared across its target/tier passes.
+Measured-evidence predicates, live cause-specific admission, the separate outer
+eligibility capture and fresh final Apply remain unchanged. This is neither
+cross-region caching nor a new timing/quantum/controller policy. The declared
+ceiling was the affected portion of the diagnostic2.086s critical/11.123s
+whole bound-plan work, not a promised cure for the remaining gap-model work.
+
+The real bound-plan test first passes its semantic assertions, then fails its
+capture-count assertion with(6,3,7,3,10,6) instead of(2,2,2,2,2,2). RED43266
+compiles in1m11s and fails at the intended assertion. Focused43172 subsequently
+passes74tests in.24s. Ordinary release build10700 completes in3m33s with the
+existing unused batch-write helper warning; no diagnostic flags are used in
+the run. The [verified raw archive](BOUND_REPAIR_OBSERVATION_ORDINARY_20260910.raw.tar.gz)
+contains12regular files: five results, RED/focused/build/driver logs, the exact
+two-file source/test patch, `run.py` and `shape.sh`. It is569,392B; gzip integrity,
+tar comparison and every decompressed member/source-byte comparison pass.
+Runner/profile match the preceding archive. No configs, binaries, links or
+directory entries are included. The patch records source identity, not acceptance.
+
+### Exact versus censored accounting, with every preceding ordinary result kept
+
+These are chronological single realizations with different completed/offered
+work, not a newly paired or packet-identical causal comparison. `b0` is the
+original native-refill independent-cut result, `view` is ordinary10116, and
+`d44` is ordinary22211. Their complete raw histories remain in their preceding
+reports/archives; no favorable control or diagnostic replaces them.
+
+| Outcome | `b0` | View | `d44` | Lazy bound chooser |
+|---|---:|---:|---:|---:|
+| Locally accepted B | 1,294,925,824 | 323,158,016 | 419,954,688 | 201,261,056 |
+| Confirmed B | 1,294,925,824 | 323,158,016 | 419,954,688 | 141,370,950 lower bound |
+| Exact completion | 1/1 | 1/1 | 1/1 | 0/1; censored |
+| Observed elapsed, s | 41.538802 | 56.678022 | 64.942209 | 85.422621, cutoff |
+| Completed whole Mbps | 249.391 | 45.613 | 51.733 | Not a completed rate |
+| First write / confirmation, s | .105451 /.409741 | .108528 /.412616 | .105864 /.408088 | .105454 /.410085 |
+| Maximum write gap, s | .545897 | 14.915527 | 5.172138 | 11.731949 |
+| Maximum confirmation gap, s | .634001 | 7.470709 | 9.215061 | 19.827287 |
+| Raw confirmation bins / zeros | 42 /0 | 57 /35 | 65 /32 | Not emitted |
+
+Root runner exits1 with `probe failed to settle`. Runner cleanup closes the
+client first; the probe's final “sink closed before terminal acknowledgement”
+is a **guard-triggered censored ending**, not evidence of autonomous Product
+shutdown. Probe JSON reports status`loss`, incomplete/lower-bound accounting,
+one failed stream and no valid terminal ACK. Its13.240Mbps confirmed and
+18.849Mbps accepted rates are cutoff summaries, not exact completed goodput.
+There is no echo workload. The incomplete-result schema emits empty raw and
+trimmed arrays: no confirmation series or gap endpoints are reconstructed
+from target counters, native bytes or selected management samples.
+
+| Preserved raw confirmation phase, Mbps | `b0` | View | `d44` | Candidate |
+|---|---:|---:|---:|---:|
+| 5–15s | 308.068 | 7.336 | 87.670 | Unavailable |
+| Interior16–24 inclusive | 16.203 | 64.911 | 61.552 | Unavailable |
+| 25–40s | 328.092 | 35.519 | 41.114 | Unavailable |
+
+### Ordinary failure localization: growing source debt and joint target/reply plateaus
+
+Management supplies a separate target-socket write history, not missing
+confirmation bins. The failure is not confined to the physical restriction:
+at sample10 client reply delivery is309B and remains309B through sample15,
+while target writes advance135,096,552→172,737,766B. This pre-cut hold is not
+proof of postdecode delay because this ordinary capture has no exact reply
+stages. During and long after the restriction, forward target service also
+collapses; restored physical capacity does not restore useful ordered service.
+
+| Successful target-socket phase, Mbps | `b0` | View | `d44` | Candidate |
+|---|---:|---:|---:|---:|
+| 0→5s | 273.573 | 206.916 | 87.037 | 148.761 |
+| 5→15s | 321.800 | 17.783 | 94.412 | 63.791 |
+| Strict16→24s | 17.028 | 12.133 | 59.496 | .317 |
+| 25→40s | 340.910 | 37.919 | 62.647 | .140 |
+
+In samples47→55, target writes stay173,775,270B, server-read reply729B and
+client-written reply337B, while source read grows187,019,078→191,147,846B.
+Another joint-flat band is samples60→67, with client producer timestamps
+Unix1789053193380→1789053200380: target173,775,270B, server reply729B and
+client reply365B are unchanged, while source195,669,830→198,291,270B grows
+2,621,440B. The increasing source/target difference is outstanding logical
+work, not a measured count of accepted repair copies. These sampled plateaus
+are not assigned as the exact19.827287s probe gap, whose endpoints are absent.
+
+Native traffic is small but not universally frozen in that latter band.
+ClientQ0 ACKs advance192,530B with a6.931086s producer-stamp advance; Q1 adds
+66B with7.028526s. The two bulk-used TCP outputs have unchanged ACKed bytes
+but producer stamps advance about6.916/6.941s. Other TCP outputs add36B each.
+Server return native counters also add small amounts. These control-sized
+increments are not bulk progress or identification of the missing reply byte.
+Some inactive carrier stamps remain unchanged in other bands, so a management
+row alone is not treated as a fresh native poll for every output.
+
+At sample85, source read is201,261,056B, target writes174,294,164B, server
+reply read799B and client reply delivery435B. The target still accepts173,678B
+over80→85s (.278Mbps), so the final state is severely slow and incomplete,
+not a proved fully dead actor. Both target debt and unread replies remain;
+this is not solely the earlier “all target bytes done, replies held” case.
+
+### What the ordinary CPU and queue state can—and cannot—distinguish
+
+Client process-lifetime `ps` CPU at samples60–67 is103,103,103,103,103,103,
+102,102%; server falls9.2→8.3%. Client RSS grows309,812→310,280KiB; server
+stays61,040KiB. Sustaining that lifetime percentage does not resemble a
+long completely idle client, but it is not interval CPU, per-call cost or
+proof of a particular synchronous owner. No observer timers are present.
+
+Client summary `queue_bytes` is0 at these eight samples; reported native flight
+is0 except15,010B at62. Product `data_level_bytes_in_flight` falls39,107,916→
+35,864,516B. At60/67, Q47's Product flight is35,697,444/33,124,004B while its
+native flight is0 and reported native window is about5.45MB; Q46's Product
+flight is2,891,720/2,221,760B with native flight0 and window about5.10MB.
+The two bulk-used TCP Product-flight values remain453,216/65,536B, versus
+native flight0 and windows about7.36/7.33MB. These fields do not expose exact
+queued-repair ownership, accepted-copy debt, command-lane occupancy, retained
+intervals or the cause-specific eligibility predicate. Zero summary queue
+does not prove no pending Product work; a native window is not recovery authority.
+
+Independent `ss` samples60/67 show the two used client TCP sockets with unread
+Recv-Q129,592→126,800B and127,392→124,204B, while their Send-Q and NOTSENT
+are0. Their native ACKed counters stay fixed, advertised send windows are
+25,164,800B and cwnds5,085/5,059segments. These are pending local incoming
+bytes and available native context, not proof that they contain the critical
+response prefix or that Product can currently admit a new repair. The evidence
+does not yet separate repeated local work from cause-specific recovery debt/
+authority blocking, and does not justify declaring either unavoidable.
+
+### Matched physical conditions and complete cost context
+
+All86candidate samples verify two independent200Mbps links, only46UP10Mbps
+during rows15–24, DOWN30ms/UP70ms, zero loss/jitter/outage,65536Bbursts and
+limit8192. Actual restriction/restoration rows are15.002121/25.003275s.
+All class/netem drop deltas are0. The same checks pass for all three controls.
+Client eth0/eth1 remain46/47; server eth1/eth0 remain46/47. Candidate cost
+accounting spans85.009736s, not the probe's85.422621s or a flush interval.
+
+| UP class service, Mbps | `b0`46 /47 | View46 /47 | `d44`46 /47 | Candidate46 /47 |
+|---|---:|---:|---:|---:|
+| 0→15s | 185.977 /187.386 | 68.051 /68.743 | 100.203 /145.756 | 73.358 /109.263 |
+| Strict16→24s | 9.991 /31.016 | 10.058 /96.718 | 10.019 /137.332 | 3.184 /2.383 |
+| 25→40s | 185.632 /193.366 | 57.456 /28.490 | 72.552 /94.617 | .414 /.284 |
+
+| Whole sampled cost | `b0` | View | `d44` | Candidate |
+|---|---:|---:|---:|---:|
+| UP46 /47B | 745,256,344 /801,341,232 | 336,022,023 /400,620,890 | 423,938,161 /705,498,359 | 144,486,456 /209,833,695 |
+| DOWN46 /47B | 15,482,120 /15,889,276 | 5,258,507 /5,264,669 | 6,673,253 /8,278,284 | 2,447,475 /2,682,143 |
+| Summed UP backlog peak / final, B | 15,059,114 /5,554,524 | 27,190,388 /6,831,910 | 31,303,275 /424,756 | 22,541,694 /0 |
+| Summed DOWN backlog peak / final, B | 53,045 /47,115 | 47,353 /990 | 38,033 /810 | 39,847 /0 |
+| Client RSS peak / final, KiB | 391,104 /385,112 | 380,736 /380,736 | 410,640 /410,640 | 310,500 /310,500 |
+| Server RSS peak / final, KiB | 125,516 /125,516 | 106,724 /106,724 | 123,852 /123,852 | 61,040 /61,040 |
+| Client lifetime CPU peak / final, % | 188 /162 | 135 /112 | 124 /116 | 112 /102 |
+| Server lifetime CPU peak / final, % | 90.4 /77.8 | 69.3 /19.4 | 45.9 /26.8 | 50.6 /6.7 |
+
+Lower traffic, queues or RSS under far less completed work and a longer
+censored interval are not efficiency improvements. Candidate client/server
+logs and probe stderr are empty; the runner's guard traceback and existing
+HTB notices are preserved. No lab parameter is changed to suppress them.
+
+**Disposition: reject performance promotion.** The local work invariant is
+corrected, but this ordinary capture supplies no practical benefit and exposes
+severe incomplete healthy/restored service. Retaining a source checkpoint for
+exact diagnosis does not upgrade it to acceptance. The next decision must
+distinguish the remaining actual work/authority boundary using this ordinary
+state; neither the earlier diagnostic timer reduction nor component GREEN
+waives failed settlement or authorizes another tuning adjustment.

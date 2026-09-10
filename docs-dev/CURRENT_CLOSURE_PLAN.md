@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 22:26 +08:00. Authoritative repository: `./`.
+Updated: 2026-09-10 23:06 +08:00. Authoritative repository: `./`.
 **MPP is not performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; do not conclude at an intermediary commit.
 
@@ -10,174 +10,104 @@ growing inventory. Complete preceding chronology and adverse outcomes remain at
 `git show 79ddb41:docs-dev/CURRENT_CLOSURE_PLAN.md`, earlier49143f2, and the
 linked reports/archives. Condensation discards no experiment.
 
-## Active transaction: attribute remaining request-pilot service failure
+## Active transaction: one observation for one finite gap-service decision
 
-### Next action: split preselect work before another runtime correction
+### Completed discriminator and rejected candidate
 
-Current ordinary source is d44ca8e. Its exact observation-reuse correction has
-73 focused controls, but ordinary same-cell confirmation gap9.215s and poor
-restored service reject performance promotion. Report and raw archive are
-complete. No runtime observer or build is currently active.
+Runtime source is back to d44ca8e; no build/lab/observer is active. The attempted
+bound-chooser reuse and its test are removed, with exact patch, executable,
+RED/focused/build logs and ordinary results retained. It is not a dependency
+of the next candidate. Reports and archives:
+[complete work/stage/ordinary evidence](AUTHORITATIVE_GAP_VIEW_ORDINARY_20260910.md).
 
-Issue/impact: the existing independent200+200 QoSUP pilot delays replies for
-seconds even after every source byte has reached the target. Previous exact
-FIFO-held intervals are almost entirely repeated exclusive Product work.
-Preselect caller1562 accounts for25.589s aggregate, but includes source
-admission, retained-frontier/tail maintenance and authoritative-gap selection.
-It is NOT25.589s of one known query. Earlier3.223M zero-owner queries are from
-a different capture and do not identify which eligibility predicate failed.
+- Preselect89074 locates22.346s gap work and44.081s dispatch work. Stable-absent
+  owner queries are only1.232s/5.51%of gap time: defer their pruning. In its
+  own17.164s stalled interior, dispatch owns16.488s, not the small query.
+- Dispatch-inner16610 locates13.410s direct versus.218s queued dispatch.
+  Bound planning11.123s/472,741calls dominates;459,573sends block and12,558commit.
+  Native-stale retry is absent, successful Product commit only.072s: no index/
+  retry fix. Its exact winning repair is decoded8.381s before Product delivery.
+  In8.033s stalled interior, preselect4.638s and dispatch2.498s both matter.
+  Across ALL gap-service callers, lower owner/target model13.746s over1,768,251
+  calls;27,699nonempty service evaluations. This63.84ratio is an average, not
+  a source upper bound or a path count. Nested/different-scope timers cannot
+  be summed/subtracted as exclusive preselect CPU.
+- The bound-chooser candidate proves capture-count RED(6,3,7,3,10,6)versus2,
+  after all exact target/queue/measured controls.74focused tests pass. But
+  ordinary51554 reaches85s guard:141,370,950confirmed/201,261,056acceptedB,
+  maxconfirmation19.827287s/write11.731949s. No rawbins/exact completed rate.
+  Guard teardown causes terminal-ACK absence; it is not spontaneous shutdown.
+  Practical benefit forecast FAILS; the candidate is removed, not promoted.
+  This single realization does not prove its small change caused every decline.
 
-Competing causes: repeated stale/detached-only region searches, dynamic native
-or Product admission exclusions, source/retained geometry work, or remaining
-dispatch work. The next question is which inner preselect phase owns material
-held service and what fraction of empty-owner searches has no actor-eligible
-Original owner even before dynamic admission is checked.
+The last ordinary failure starts beforeQoS: client reply309B at10–15s while
+target135.10→172.74MB. Restored25→40s target service is.140Mbps. At60→67s,
+source adds2.62MB while target173,775,270B and server/client reply729/365B
+stayflat. Client lifetime CPU remains102–103%, with two TCP Recv-Qs~127–130KB,
+empty native send queues and large native windows. Some small native ACKs
+continue; that is not bulk progress. These ordinary counters do not expose the
+critical bytes or exact repair/command authority. No BBR/QoS explanation or
+new CPU/fairness threshold is justified by this state.
 
-Independent source proof supplies a safe possible scope, not a performance
-forecast: S is all exact attached instances except Product Stale/Requalifying;
-every current dynamic owner mask M(t) is a subset of S. S is actor-stable in
-this synchronous evaluation. Regions outside OriginalCoverage(S) return no
-model before clocks/scoring. Include Acquiring, Backup, native-unavailable and
-Product-admission-unavailable instances; do not use historic evidence_eligible.
-Preserve all-attached accepted-copy coverage/deadline even with empty candidate
-work. Structural recovery deliberately serves stale/detached ownership and is
-out of scope. No prune is authorized until its practical work share is known.
+### Next bounded model question, before implementation
 
-Information forecast: one temporary periodic owner observer, with preselect
-subphase timers and an empty-owner stable-S classification, distinguishes a
-material removable stale-only search cost from other maintenance or dynamic
-exclusion cost. Existing aggregate timers cannot decide that. This experiment
-has no predicted Mbps gain and makes no runtime policy change. Classification
-overhead is explicit and separate from the measured production phase.
-Falsifier: a small stale-only fraction or dominant other phase defers pruning;
-do not rescue it with another operation-count test. A material identified
-inner phase selects ONE actual producer counterexample/correction, followed
-by the unchanged ordinary completion/timing/cost gate. Do not add thresholds,
-freeze dynamic eligibility, change quantum, or claim summed elapsed is CPU.
+Issue/impact: recovery enumeration introduced by79ddb41 multiplied expensive
+lower model work and preceded multi-second local reply holds. d44's narrower
+selector reuse has not restored practical service. The model must make one
+finite decision affordable, not merely reduce one helper count.
 
-Smallest action: reuse the archived owner/stage overlay on current source,
-add feature-only periodic subphase observations (no per-frame bulk logs), build
-one diagnostic executable, archive/reverse the whole overlay before traffic,
-and run the SAME200+200 QoSUP cell below. Root owns build/lab; independent
-review checks instrumentation semantics and the stable-scope classifier.
-Actual execution: independent instrumentation review passes; feature build55050
-completes in3m38s. Complete17-source-file observer patch is saved at
-./.tmp/reflection/preselect-owner-profile-0910.patch, frozen in
-bin/preselect-owner-profile-20260910, and fully reversed before traffic.
-Session89074 runs the same cell, periodic PERF/no per-call samples, selected
-stream0 reply stages only. New owner-query counters accumulate per evaluation;
-their `bytes` field means QUERY COUNT, not traffic. Classification cost is
-separate, while enclosing gap/owner includes it and emission overhead.
-Actual89074 completes378,339,328B/76.528672s, with17.859206s confirmation and
-11.889302s write gaps. This is diagnostic, not an ordinary slowdown claim.
-Preselect partition: gap22.346425s, source.543246s, retained.494605s, residual
-.115695s. Query counts/times: present1,788,439/1.489723s; stable-absent
-2,699,580/1.231554s; no dynamic-absent component. Classification.169392s.
-Stable-absent is only5.51% of gap time: **defer pruning**. The forecast succeeds
-at preventing an unsupported minor correction, not at improving service.
-Dispatch guard now44.081456s, preselect23.579505s, full ACK1.887422s. Dispatch
-includes direct structural recovery AND queued repair; do not label all44s
-queued planning. Full own held-window joins/raw preservation are in progress.
-Own critical-window join: in17.164s of the17.859s reply hold, complete periodic
-flushes record17.034518s actor hold, dispatch16.487691s/1,086calls, preselect
-only.208979s. Another3.031s FIFO interior has2.888610s dispatch/101calls.
-By sample66 all target bytes are written; by67 all1945reply bytes are read,
-but client remains at1106 through73. These exact phase/interval observations
-make repeated dispatch the priority; aggregate gap work is secondary. The
-scoped helper/candidate absence is not presumed to own every failed dispatch.
+Competing causes: repeated native/health capture for each region, pure Product
+projection/owner-ledger work, and repeated service invalidation without changed
+facts. Source audit identifies all three but only the first has the following
+whole-decision reuse argument. Subsumed ACKs concretely re-dirty structural
+recovery despite no new positive/negative facts; however their frequency is
+not captured, so that is NOT a selected second fix. There is no unconditional
+dispatch spin: exhausted scans clear dirty state and retain prearmed wakes.
+Round-robin service order alone does not bound a whole failed scan's cost.
 
-Next bounded information question: locate the remaining material costs across
-BOTH complete owners, rather than another isolated helper. In gap service,
-separate coverage/boundary/view construction, scored metadata frontier, exact
-cache preview, owner/target model and assignment-clock work. In dispatch,
-separate direct structural scan from queued repair; inside direct selection
-and shared bound send, separate candidate preparation, target observation,
-plan/eligibility, reservation/fenced Apply and successful flight recording.
-Accumulate timings and success/blocked/region counts locally; no per-candidate
-logs or telemetry lock. Nested elapsed is not additive/CPU, emitter costs stay
-explicit. Keep existing reply-stage/owner observations to bind material phases
-to the actual delayed interval, not merely whole-run sums.
+Exact proposed correction: ONE lazy full native/health observation across
+data_ack_gap_reinjection_service's synchronous finite region evaluation.
+First force it at the existing lower-model capture point AFTER the same owner/
+uniform-geometry/exact-cache checks. Preserve inputs None/Throughput/
+PATH_OPEN_SCORE_BYTES/true and full measured/native-proof provenance. Preserve
+live cause-specific command checks, per-exact-range clocks, owner eligibility,
+source quantum, distinct-target semantics and fresh final plan/reservation/Apply.
+No across-call/dispatch cache, queue shortcut, new flag/configuration or threshold.
 
-Source correction: direct preview and sent_instances_for_frame use keyed
-lookups, not whole-ledger scans; debt totals are cached. Successful flight
-recording, scored metadata and assignment clocks do have prefix queries.
-Target selection/plan also repeats native/health observations. Source shape
-does not yet choose among them. Information forecast: distinguish unavoidable
-current native/target wait, repeated failed selection, and retained-history
-work that could be scoped without changing scheduling authority. A small
-measured component is deferred even with an operation-count counterexample.
-Smallest action: one extension of the same temporary observer on d44ca8e,
-same physical QoSUP cell. No runtime correction until dominant exact owner and
-reachable producer invariant are established; no repeated favorable cell or
-new tuning follows. The global acceptance order below remains unchanged.
-Execution: dispatch-inner-profile build8383 is active on the frozen d44 runtime
-plus observer. A stack per-dispatch accumulator separates direct/queued and
-records all failed-region/send/native-stamp retries without per-attempt log or
-telemetry lock; it emits after the exact Product guard drops. Gap subphases
-are locally accumulated too. Build/patch/wrapper use dispatch-inner-profile-
-0910 names. Root owns build/lab; independent complete observer review passes,
-and source diff equals saved patch during build. The new unused ordinary-entry
-warnings are feature-wrapper artifacts, not runtime/platform failures.
-Potential reuse constraint (not a selected fix): failed bound sends can
-reconcile/remove attachments without a commit. Fresh bound planning and Apply
-do not themselves rerank a cached Backup against a newly available Regular:
-the target is already pinned. Apply DOES check the fresh plan's full eligibility
-set; it does not revalidate the earlier outer discovery's tier choice.
-Do not call a no-commit span immutable or broad reuse equivalent without
-resolving those actual mutation/tier boundaries. No such reuse is implemented.
-Build8383 closes0/3m35s. Complete18-source-file overlay saved at
-./.tmp/reflection/dispatch-inner-profile-0910.patch and frozen in
-bin/dispatch-inner-profile-20260910, then fully reversed before run16610.
-Same cell/profile/selected events; no source runtime changes. Capture active.
-Actual16610 closes0:480,378,880B/48.576457s, confirmation9.000672s/write
-1.872985s. Diagnostic only. Direct dispatch13.409747s versus queued.218317s;
-bound plan11.122946s/472,741calls dominates send11.460190s.459,573blocked,
-610other errors,12,558commits/450,316,407B; native-stale counter absent.
-Successful Productcommit.072298s and fencedApply.119824s are not the dominant
-cost, so do NOT select a flight-insertion index or stale-stamp retry fix.
-Across ALL gap-service callers (preselect and ACK handling), owner/target model
-records13.746046s; metadata2.625237s, clocks1.905566s/cache1.162965s remain.
-Preselect's enclosing gap phase is23.313297s, NOT an exact exclusive parent of
-all these inner calls. Do not subtract/sum differently scoped nested timers.
+Origin/model: dc4853d intentionally froze owner and alternate within each lower
+model.79ddb41 later enumerated independently due omitted regions, multiplying
+that capture. a747bda shares immutable ownership geometry but not path evidence.
+RFC10.1's immutable observation/finite action order suggests a single Observe
+for this pre-enqueue evaluation; structural dispatch is different because failed
+sends can reconcile/detach. Between these gap regions only exact assignment
+clock init/min-tightening and local result/deadline accumulators mutate; no
+ownership/debt/cache/queue/epoch/qualification/membership mutation or await occurs.
+Those clock fields do not feed Product snapshot projection. Independent source
+challenge is active before code. Health maintenance/native updates would be
+seen at the next evaluation: disclose this temporal boundary, not bit-identical
+replay. Current generation-backed publication/capacity wake and final Apply
+must preserve newly relevant authority.
 
-Own longest9s gap is won by Q1 repair[1708,1722): server acceptance→decode30ms,
-but decode→Product8.381s. Complete8.033s interior records7.931464s actor hold:
-preselect4.638369s and dispatch2.497864s. Bound plan alone2.086050s/88,727calls
-(88,071blocked/656commits), whereas selected gap owner/target model1.718160s.
-Unlike the preceding capture, BOTH owners materially occupy this interval.
-The next source question is one repair-ranking observation, not cross-region
-caching: non-Original ranking recaptures all paths repeatedly per target/pass.
-Do NOT blindly reuse the outer plan view: its include_bulk_admission=false
-also exports has_bulk_model_evidence=false, whereas legacy bound persistent
-repair separately checks actual measured evidence. Treating that partial view
-as full recovery evidence would regress legitimate persistent repairs.
+Forecast: if N scored regions would each capture all P paths, capture work goes
+from N*C_capture(P) to C_capture(P), while region geometry/projection/ranking/
+clock work remains. The diagnostic averageN=63.84 suggests materially more
+avoidable collection than the failed chooser-only change, but capture's share
+of13.746swhole/1.718scritical model time is not isolated. Those enclosing times
+are ceilings, not predicted removable delay or a Mbps claim. No gain/regression
+is possible if another stage dominates or the changed observation boundary
+hurts service. The hypothesis is worth one actual producer RED and the unchanged
+ordinary cell, not another broad profiler/harness or numeric tuning.
 
-Selected bounded proposal, pending real RED: inside the existing chooser,
-share ONE lazy authority-only capture with EXACT old arguments across target/
-tier passes when no full recovery observation was supplied. Keep measured-
-evidence predicate unchanged (live when currently live, captured when supplied
-by full recovery model); keep live cause-specific command admission and fresh
-final Apply. The separate outer plan eligibility/fence capture remains intact.
-No new caller-mode flags, namespace/state, cross-region cache or thresholds.
-This targets the actually expensive chooser left outside d44's earlier narrow
-selector reuse, not a second arbitrary capture API cleanup.
-Forecast ceiling: at most the affected portion of2.086s critical/11.123s whole
-plan elapsed; remaining gap work prevents a claim of complete cure. Avoid
-new tier/queue predicates or unchanged-role assumptions. Actual removable
-fraction still depends on source equivalence and targeted work proof; no
-runtime patch is authorized just by the attempt count. Actual producer RED
-must exercise bound planning with a real full command lane, then positive
-Regular/Backup/exact-target/measured persistent controls BEFORE capture count.
-Forecast: for an exhausted exact target, repeated authority captures across
-rank/capacity/error-classification passes fall to one; outer eligibility
-capture stays. A material fraction of measured bound-plan work may disappear,
-but projection/ranking cost and other gap work persist. A semantic failure
-rejects the change; ordinary same-cell failed completion, material adverse
-timing/cost or no practical benefit prevents promotion. No tuning rescue.
-Targeted semantic/work checks will use the existing default unoptimized test
-profile/cache: no Mbps conclusion depends on unit-test optimization, and the
-preceding release-unit builds consumed7m each for subsecond assertions. This
-changes no Product/lab setting; ordinary affected runs remain optimized release.
+Smallest action: independent mutation/wake audit plus ONE test-only actual
+multi-region gap-service counterexample with semantic candidate/clock/coverage
+controls before capture count; no synthetic snapshot-only test. Empty/no-owner
+paths retain zero captures. Implement only after intended RED and audit. Targeted
+affected checks, then same ordinary200+200QoSUP; no compiler overlap.
+Acceptance/stop: wrong target/clock/eligibility or failed wake rejects; same-cell
+incomplete service, material adverse timing/cost or no useful gain stops
+promotion. No favorable reruns, threshold rescue or stacking the removed
+chooser candidate. Actual result must be recorded against this forecast.
+Global gates below remain intact; no new unseen model obligation is added.
 
 ### Completed loss-CPU discriminator; no CPU fix justified
 
@@ -339,7 +269,7 @@ docs-dev/LIVE_OWNER_FRONTIER_WORK_BOUND.md remains untouched/unstaged.
 Use exact intermediary commits; docs-dev needs exact force-add. PROGRESS is an
 ignored continuity journal, not force-added. AGENTS.md is immutable.
 
-Telegram measured CPU/remaining-stall update sent14:10UTC; next nonurgent after15:15UTC.
+Telegram failed ordinary/CPU attribution update sent15:17UTC; next nonurgent after16:17UTC.
 Meaningful measured milestones/blockers only; commentary within60s, minute
 lab/build polling. Before compaction preserve exact active session, next
 decision, source/binary identities and adverse/open outcomes. Continue, do not

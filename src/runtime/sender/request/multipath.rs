@@ -1257,6 +1257,30 @@ impl RequestMultipathController {
     }
 
     #[cfg(test)]
+    fn recovery_scoring_avoid_for_test(
+        &self,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        scoring_payload_bytes: usize,
+    ) -> Vec<RelayPathInstance> {
+        let Some((start, _, _)) = reliable_stream_frame_extent(frame) else {
+            return Vec::new();
+        };
+        let range = OffsetRange {
+            start,
+            end: start.saturating_add(scoring_payload_bytes as u64),
+        };
+        self.live_owner_uniform_frontier(range, &remotes.path_instances())
+            .map_or_else(Vec::new, |frontier| {
+                assert_eq!(
+                    frontier.range, range,
+                    "test model requires uniform scored ownership"
+                );
+                frontier.avoid
+            })
+    }
+
+    #[cfg(test)]
     pub(super) fn data_ack_gap_reinjection_model(
         &self,
         context: &ClientPathContext,
@@ -1271,6 +1295,11 @@ impl RequestMultipathController {
             lane,
             reliable_stream_frame_accounted_bytes(preview),
             None,
+            &self.recovery_scoring_avoid_for_test(
+                remotes,
+                preview,
+                reliable_stream_frame_accounted_bytes(preview),
+            ),
         )
     }
 
@@ -1293,6 +1322,11 @@ impl RequestMultipathController {
             lane,
             reliable_stream_frame_accounted_bytes(preview),
             Some((sender_queue, reinjection_debt_bytes, mux_limits)),
+            &self.recovery_scoring_avoid_for_test(
+                remotes,
+                preview,
+                reliable_stream_frame_accounted_bytes(preview),
+            ),
         )
     }
 
@@ -1307,6 +1341,7 @@ impl RequestMultipathController {
         reinjection_debt_bytes: usize,
         mux_limits: MuxLimits,
         scoring_payload_bytes: usize,
+        scoring_avoid: &[RelayPathInstance],
     ) -> RequestDataAckGapObservation {
         self.data_ack_gap_reinjection_model_with_service(
             context,
@@ -1315,9 +1350,11 @@ impl RequestMultipathController {
             lane,
             scoring_payload_bytes,
             Some((sender_queue, reinjection_debt_bytes, mux_limits)),
+            scoring_avoid,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn data_ack_gap_reinjection_model_with_service(
         &self,
         context: &ClientPathContext,
@@ -1326,6 +1363,7 @@ impl RequestMultipathController {
         lane: TrafficClass,
         scoring_payload_bytes: usize,
         service: Option<(&ReliableRelaySenderQueue, usize, MuxLimits)>,
+        scoring_avoid: &[RelayPathInstance],
     ) -> RequestDataAckGapObservation {
         let original_flight = self
             .request
@@ -1367,6 +1405,15 @@ impl RequestMultipathController {
         let live_instances = remotes.path_instances();
         let mut avoid_instances = self.request.flights.sent_instances_for_frame(preview);
         avoid_instances.retain(|instance| live_instances.contains(instance));
+        // The preview may start inside an Original/copy ledger entry or cover
+        // less than the ranked extent. Carry the caller's exact scored-range
+        // ownership into ranking rather than discovering a forbidden winner
+        // only at its final guard. Preserve all attached exact-key history too.
+        for instance in scoring_avoid {
+            if !avoid_instances.contains(instance) {
+                avoid_instances.push(*instance);
+            }
+        }
         let target_model_pending = remotes.paths.iter().any(|path| {
             let instance = path.instance();
             !avoid_instances.contains(&instance)
@@ -1649,6 +1696,7 @@ impl RequestMultipathController {
             lane,
             scoring_payload_bytes,
             Some((sender_queue, reinjection_debt_bytes, mux_limits)),
+            &self.recovery_scoring_avoid_for_test(remotes, frame, scoring_payload_bytes),
         );
         let (identity, snapshot) = self.tail_reinjection_earlier_completion_target_from_model(
             context,
@@ -1680,6 +1728,7 @@ impl RequestMultipathController {
         reinjection_debt_bytes: usize,
         mux_limits: MuxLimits,
         scoring_payload_bytes: usize,
+        scoring_avoid: &[RelayPathInstance],
     ) -> RequestCompletionTailTargetObservation {
         let model = self.data_ack_gap_reinjection_model_with_service(
             context,
@@ -1688,6 +1737,7 @@ impl RequestMultipathController {
             lane,
             scoring_payload_bytes,
             Some((sender_queue, reinjection_debt_bytes, mux_limits)),
+            scoring_avoid,
         );
         let target_service_exhausted = model.target_service_exhausted;
         let reinjection_target_flight_bytes = model.reinjection_target_flight_bytes;

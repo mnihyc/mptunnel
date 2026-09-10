@@ -104,6 +104,337 @@ fn disconnected_retries_never_extend_the_absolute_retention_deadline() {
 }
 
 #[tokio::test]
+async fn authoritative_request_gap_clipped_successor_keeps_original_owner_excluded() {
+    use crate::protocol::frame::reliable_stream_frame_extent;
+    use crate::runtime::path::commands::{
+        reliable_path_command_pending_bytes, try_recv_reliable_path_command,
+    };
+    use crate::runtime::relay::control::publish_prepared_request_work;
+    use crate::runtime::sender::{
+        PreparedOriginalClaim, RequestPreparedSource, RequestProductState, SharedRequestProduct,
+    };
+
+    let stream_id = StreamId(420);
+    let lane = TrafficClass::Throughput;
+    let context = ClientPathContext::new(
+        // Declare the actual ranking regime through typed configured priors.
+        // Shared Product-rate seeds below establish measured eligibility, not
+        // this stream's completion rate or its startup RTT. Equal 200 Mbps
+        // links with 20/100 ms RTT keep A faster despite its two-quanta debt.
+        [
+            "tcp://127.0.0.1:11421?initial-srtt-s=0.02&initial-rate-mbps=200",
+            "tcp://127.0.0.1:11422?initial-srtt-s=0.1&initial-rate-mbps=200",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().unwrap())
+        .collect(),
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    let limits = context.mux_limits;
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let (remotes, _input) =
+        ReliableRelayRemoteSet::new(opened_request_path(stream_id, 0, owner_commands), 8);
+    consume_path_proof(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    let seed_path = |instance: RelayPathInstance, rtt| {
+        context.install_relay_path_instance_for_test(instance);
+        context.mark_tcp_path_open_success(instance.key.index, rtt, lane);
+        context.mark_relay_path_rate_sample_for_test(
+            instance.key,
+            PathRateSample::new(4 * 1024 * 1024, rtt).unwrap(),
+        );
+    };
+    seed_path(owner, Duration::from_millis(20));
+    let mut receiver = ReliableRecvStream::new(stream_id, limits);
+    let Frame::StreamMaxData { max_offset, .. } = receiver.max_data_frame() else {
+        panic!("actual receiver credit");
+    };
+    let mut send_stream = ReliableSendStream::new_with_initial_max_offset(stream_id, limits, 0);
+    send_stream.update_max_offset(max_offset);
+    let quantum = MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
+    let mut source = ReliableRelaySenderQueue::default();
+    source.push_data(Bytes::from(vec![0x61; quantum]));
+    let shared = SharedRequestProduct::new(RequestProductState {
+        sender: RequestSenderService::new(stream_id),
+        send_stream,
+        sender_queue: source,
+        last_send_ack: Default::default(),
+        remotes,
+        prepared: RequestPreparedSource::new(lane, quantum),
+    });
+    let _actor_lifetime = shared.actor_lifetime();
+    publish_prepared_request_work(&mut shared.lock(), &shared, &context, lane, quantum, true);
+    let work = loop {
+        let command = try_recv_reliable_path_command(&mut owner_receivers).unwrap();
+        match command {
+            ReliablePathCommand::PreparedOriginal(work) => break work,
+            command @ ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => {
+                owner_receivers
+                    .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+            }
+            _ => panic!("only an actual prepared notice can claim source"),
+        }
+    };
+    let ready = owner_receivers
+        .writer_ready_boundary(owner.path_instance_id)
+        .unwrap();
+    let PreparedOriginalClaim::Claimed(original) = work.try_claim(ready) else {
+        panic!("sole writer must claim the real queued Original");
+    };
+    let written = owner_receivers.register_claimed_writer_frame(&original);
+    owner_receivers.release_pending_command_bytes(written);
+    assert_eq!(
+        reliable_stream_frame_extent(&original),
+        Some((0, quantum as u64, quantum))
+    );
+
+    let q = adaptive_reliable_relay_reinjection_bytes(
+        context.reliable_path_snapshot_for_instance(owner),
+        lane,
+        limits,
+    );
+    assert_eq!(q, 14_600);
+    assert!(2 * q < quantum);
+    let Frame::StreamData { payload, .. } = &original else {
+        unreachable!()
+    };
+    receiver
+        .receive_data((2 * q) as u64, payload.slice(2 * q..))
+        .unwrap();
+    let Frame::StreamAck {
+        scope_start,
+        ranges,
+        ..
+    } = receiver.ack_frames().remove(0)
+    else {
+        panic!("receiver-produced authoritative omission");
+    };
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+    let mut relay_state = ClientRelayState::new();
+    let (target, fallback_at, owner_snapshot, target_snapshot) = {
+        let mut product = shared.lock();
+        let RequestProductState {
+            sender,
+            send_stream,
+            sender_queue,
+            last_send_ack,
+            remotes,
+            ..
+        } = &mut *product;
+        let outcome = apply_client_stream_ack(
+            ClientStreamAckContext {
+                state: &mut relay_state,
+                sender,
+                sender_queue,
+                context: &context,
+                remotes,
+                send_stream,
+                last_send_ack,
+                relay_lane: lane,
+            },
+            stream_id,
+            scope_start,
+            ranges,
+        )
+        .unwrap();
+        assert!(outcome.has_new_facts);
+        assert_eq!(outcome.released_bytes, quantum - 2 * q);
+        assert_eq!(
+            last_send_ack.gaps(),
+            &[OffsetRange {
+                start: 0,
+                end: (2 * q) as u64
+            }]
+        );
+        assert_eq!(send_stream.data_ack_frontier(), 0);
+        assert_eq!(send_stream.reinjection_bytes(), 2 * q);
+        assert!(sender_queue.is_empty());
+        remotes.attach_candidate(opened_request_path(stream_id, 1, target_commands.clone()));
+        consume_path_proof(&mut target_receivers);
+        let target = remotes.paths[1].instance();
+        seed_path(target, Duration::from_millis(100));
+        assert!(context.relay_path_instance_has_bulk_model_evidence(owner));
+        assert!(context.relay_path_instance_has_bulk_model_evidence(target));
+        let first = sender.data_ack_gap_reinjection_model(
+            &context,
+            remotes,
+            send_stream,
+            sender_queue,
+            last_send_ack.gaps(),
+            q,
+            lane,
+        );
+        assert_eq!(
+            first.reinjection_target.map(|(path, _)| path.instance()),
+            Some(target)
+        );
+        (
+            target,
+            first.owner_recovery_timing.unwrap().fallback_at,
+            first.original_path_timing.unwrap(),
+            first.reinjection_target.unwrap().1,
+        )
+    };
+    assert_eq!(
+        owner_snapshot.rate_scope,
+        crate::scheduler::PathRateScope::PathCapacity
+    );
+    assert_eq!(
+        target_snapshot.rate_scope,
+        crate::scheduler::PathRateScope::PathCapacity
+    );
+    assert_eq!(owner_snapshot.delivery_rate_bps, 200_000_000.0);
+    assert_eq!(target_snapshot.delivery_rate_bps, 200_000_000.0);
+    assert_eq!(owner_snapshot.srtt_ms, 20.0);
+    assert_eq!(target_snapshot.srtt_ms, 100.0);
+    let owner_score = crate::scheduler::score_path(owner_snapshot, lane, q).unwrap();
+    let target_score = crate::scheduler::score_path(target_snapshot, lane, q).unwrap();
+    // Keep a failing reachability predicate outside Product ownership so test
+    // teardown cannot hide its useful evidence behind a poisoned-owner abort.
+    assert!(
+        owner_score.eta_ms < target_score.eta_ms,
+        "the Original would win an incorrectly unexcluded target ranking: owner={owner_snapshot:?} owner_score={owner_score:?} target={target_snapshot:?} target_score={target_score:?}"
+    );
+    // Wait the actual accepted assignment's derived fallback; no aging or
+    // synthetic ledger entry creates the recovery authority.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(fallback_at)).await;
+    let mut product = shared.lock();
+    let RequestProductState {
+        sender,
+        send_stream,
+        sender_queue,
+        last_send_ack,
+        remotes,
+        ..
+    } = &mut *product;
+    let path = context.reliable_path_snapshot_for_instance(owner);
+    let first = evaluate_client_data_ack_reinjection(
+        &mut relay_state,
+        last_send_ack,
+        sender,
+        sender_queue,
+        &context,
+        remotes,
+        send_stream,
+        path,
+        lane,
+        stream_id,
+    );
+    assert!(first.persistent_ready);
+    let ClientQueuedDispatch::Reinjection {
+        payload_bytes,
+        accepted_copy_deadline,
+    } = sender
+        .dispatch_client_repair_work(&context, lane, remotes, sender_queue)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("first exact repair must commit")
+    };
+    assert_eq!(payload_bytes, q);
+    let first_copy = loop {
+        let command = try_recv_reliable_path_command(&mut target_receivers).unwrap();
+        target_receivers
+            .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        match command {
+            ReliablePathCommand::SendFrame(frame @ Frame::StreamData { .. }) => break frame,
+            ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => continue,
+            _ => panic!("unexpected repair output"),
+        }
+    };
+    assert_eq!(
+        reliable_stream_frame_extent(&first_copy),
+        Some((0, q as u64, q))
+    );
+    assert!(accepted_copy_deadline > Instant::now());
+    assert!(sender_queue.is_empty());
+    let successor_range = OffsetRange {
+        start: q as u64,
+        end: (2 * q) as u64,
+    };
+    let successor = send_stream
+        .first_retransmission_frame_for_range(successor_range, q)
+        .unwrap();
+    assert_eq!(
+        reliable_stream_frame_extent(&successor),
+        Some((q as u64, (2 * q) as u64, q))
+    );
+    assert_eq!(
+        send_stream
+            .first_retransmission_frame_for_range(
+                OffsetRange {
+                    start: 0,
+                    end: (2 * q) as u64
+                },
+                2 * q,
+            )
+            .as_ref()
+            .and_then(reliable_stream_frame_extent),
+        Some((0, (2 * q) as u64, 2 * q)),
+        "the clipped successor is inside the same retained Original, not an assignment key"
+    );
+    assert!(
+        sender
+            .reinjection_suppression_deadline_for_frame(&successor, remotes)
+            .is_none()
+    );
+    assert_eq!(sender.accepted_reinjected_data_bytes_for_test(target), q);
+    assert!(target_commands.can_enqueue_reinjection_frame_now(&successor));
+    let target_snapshot = sender
+        .request_reinjection_target_snapshot_for_test(&context, remotes, target)
+        .unwrap();
+    assert!(
+        request_target_reinjection_service_limit(
+            target,
+            target_snapshot,
+            sender_queue,
+            q,
+            send_stream.reinjection_bytes(),
+            limits,
+        ) >= q
+    );
+    assert!(Instant::now() >= fallback_at);
+    assert_eq!(
+        last_send_ack.gaps(),
+        &[OffsetRange {
+            start: 0,
+            end: (2 * q) as u64
+        }]
+    );
+    assert_eq!(send_stream.reinjection_bytes(), 2 * q);
+    assert_eq!(
+        send_stream.data_ack_frontier(),
+        0,
+        "no first-copy ACK was applied"
+    );
+    let next = evaluate_client_data_ack_reinjection(
+        &mut relay_state,
+        last_send_ack,
+        sender,
+        sender_queue,
+        &context,
+        remotes,
+        send_stream,
+        path,
+        lane,
+        stream_id,
+    );
+    let queued_bytes = sender_queue.reinjection_bytes();
+    let queued_successor = sender_queue.has_queued_reinjection_overlap(&successor);
+    let queued_first_copy = sender_queue.has_queued_reinjection_overlap(&first_copy);
+    drop(product);
+    assert_eq!(
+        queued_bytes, q,
+        "clipped successor must exclude its still-owning Original: ready={} measured={} exhausted={}",
+        next.persistent_ready, next.has_measured_target, next.target_service_exhausted
+    );
+    assert!(queued_successor);
+    assert!(!queued_first_copy);
+}
+
+#[tokio::test]
 async fn authoritative_request_gap_serves_distinct_successor_before_head_copy_ack() {
     use crate::protocol::frame::reliable_stream_frame_extent;
     use crate::runtime::path::commands::{

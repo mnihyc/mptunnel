@@ -3611,6 +3611,13 @@ captured payload `M_s`; after selection, Apply may shrink the ranked frontier
 only to exact `F_t^r`. For a live owner, Apply MUST NOT extend total service
 beyond `F_t^r`; `L(s,r,t)` remains a capacity bound, not authority to append an
 unranked suffix.
+These ownership sets describe byte ranges, not stored frame-start keys: a
+repair slice may start inside an earlier assignment. Current actor-attached
+holders remain in the exclusion set even when temporarily ineligible for new
+OriginalData; eligibility filtering does not release their accepted ranges.
+Initial target ranking MUST consume the exact ranked extent's exclusion set.
+Rejecting a selected current holder at final validation does not substitute
+for considering another eligible distinct target at that same frontier.
 The first committed repair frame has the same lowest offset, normalized
 frontier identity, output incarnation, and writer-capacity generation used by
 the current owner's frozen advisory target order, and its payload MUST NOT

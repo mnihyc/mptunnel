@@ -2896,6 +2896,122 @@ async fn ack_gap_avoidance_does_not_exclude_a_same_key_replacement() {
 }
 
 #[tokio::test]
+async fn clipped_gap_keeps_expired_ineligible_copy_boundary() {
+    use super::super::RequestSenderService;
+
+    // Lower-layer mask control; the separate relay fixture owns the actual
+    // PreparedOriginal/receiver-ACK/accepted-copy production RED.
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10421?initial-srtt-s=0.02&initial-rate-mbps=200",
+        "tcp://127.0.0.1:10422?initial-srtt-s=0.01&initial-rate-mbps=200",
+        "tcp://127.0.0.1:10423?initial-srtt-s=0.1&initial-rate-mbps=200",
+    ]);
+    let stream_id = StreamId(421);
+    let lane = TrafficClass::Throughput;
+    let (a_commands, mut a_receivers) = reliable_path_command_channels(8);
+    let (mut remotes, _input) =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, a_commands), 8);
+    let (b_commands, mut b_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, b_commands));
+    let (c_commands, mut c_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, c_commands));
+    for receivers in [&mut a_receivers, &mut b_receivers, &mut c_receivers] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    let [owner, copy, alternate] = remotes.path_instances().try_into().unwrap();
+    for instance in [owner, copy, alternate] {
+        context.install_relay_path_instance_for_test(instance);
+        seed_client_bulk_evidence_for_test(&context, instance);
+    }
+    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let original = send_stream
+        .send_data(Bytes::from(vec![0x61; 4096]))
+        .unwrap();
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &original);
+    let copied = data_frame(stream_id, 0, 2048);
+    let (_, deadline) = sender
+        .multipath
+        .request
+        .flights
+        .record_reinjection_frame_instance_with_suppression_interval(copy, &copied, Duration::ZERO);
+    assert!(deadline.is_some_and(|deadline| deadline <= Instant::now()));
+    assert!(sender.multipath.mark_path_stale(copy));
+    assert!(remotes.contains_path_instance(copy));
+    let capable = sender
+        .multipath
+        .owner_capable_instances(&context, &remotes, lane);
+    assert!(capable.contains(&owner) && capable.contains(&alternate));
+    assert!(!capable.contains(&copy));
+    let gap = OffsetRange {
+        start: 1024,
+        end: 4096,
+    };
+    let preview = send_stream
+        .first_retransmission_frame_for_range(gap, 3072)
+        .unwrap();
+    assert!(
+        sender
+            .reinjection_suppression_deadline_for_frame(&preview, &remotes)
+            .is_none()
+    );
+    assert!(
+        sender
+            .multipath
+            .request
+            .flights
+            .sent_instances_for_frame(&preview)
+            .is_empty()
+    );
+    let queue = ReliableRelaySenderQueue::default();
+    let model = sender.data_ack_gap_reinjection_model(
+        &context,
+        &remotes,
+        &send_stream,
+        &queue,
+        &[gap],
+        3072,
+        lane,
+    );
+    assert_eq!(
+        model.reinjection_target.map(|(target, _)| target.instance),
+        Some(alternate)
+    );
+    assert_eq!(
+        model.uniform_frontier_extent_bytes, 1024,
+        "an attached expired copy still ends the uniform scored prefix at offset 2048"
+    );
+    assert_eq!(sender.accepted_reinjected_data_bytes_for_test(copy), 2048);
+    assert!(queue.is_empty());
+
+    drop(remotes.remove_path_instance(copy));
+    let detached = sender.data_ack_gap_reinjection_model(
+        &context,
+        &remotes,
+        &send_stream,
+        &queue,
+        &[gap],
+        3072,
+        lane,
+    );
+    assert_eq!(
+        detached
+            .reinjection_target
+            .map(|(target, _)| target.instance),
+        Some(alternate)
+    );
+    assert_eq!(
+        detached.uniform_frontier_extent_bytes, 3072,
+        "only removal of that exact attachment removes its ownership boundary"
+    );
+    assert_eq!(
+        sender.accepted_reinjected_data_bytes_for_test(copy),
+        2048,
+        "detachment and suppression expiry are not positive byte receipt"
+    );
+}
+
+#[tokio::test]
 async fn ack_gap_repair_history_remains_avoided_until_data_ack() {
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
@@ -6300,6 +6416,7 @@ async fn retained_completion_tail_after_positive_ack(aligned_horizon: bool) {
             send_stream.reinjection_bytes(),
             limits,
             unit,
+            &[owner],
         )
         .target
         .expect("owner-independent alternate qualification and service are already valid");
@@ -6498,6 +6615,7 @@ async fn active_request_retained_hole_recovers_after_partial_ack_beyond_horizon(
             send_stream.reinjection_bytes(),
             limits,
             unit,
+            &[owner],
         )
         .target
         .expect("target qualification and exact service are not the rejection cause");

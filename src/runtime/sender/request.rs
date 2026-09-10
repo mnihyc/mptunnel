@@ -769,19 +769,24 @@ impl RequestSenderService {
         let Some((frontier, horizon)) = first_proven_ack_gap(normalized_ranges) else {
             return RequestDataAckGapObservation::default();
         };
-        let live_instances = self
+        let owner_capable_instances = self
             .multipath
             .owner_capable_instances(context, remotes, lane);
+        // Ownership survives loss of scheduling eligibility. In particular,
+        // an attached copy keeps its exact byte slot after suppression expires.
+        let attached_instances = remotes.path_instances();
         let Some(uniform_frontier) = ownership.uniform_frontier(
             OffsetRange {
                 start: frontier,
                 end: horizon,
             },
-            &live_instances,
+            &attached_instances,
         ) else {
             return RequestDataAckGapObservation::default();
         };
-        if uniform_frontier.owners.len() != 1 {
+        if uniform_frontier.owners.len() != 1
+            || !owner_capable_instances.contains(&uniform_frontier.owners[0])
+        {
             return RequestDataAckGapObservation::default();
         }
         let uniform_frontier_extent_bytes =
@@ -796,7 +801,7 @@ impl RequestSenderService {
         };
         let Some(scoring_frontier) = self
             .multipath
-            .live_owner_uniform_frontier(scoring_range, &live_instances)
+            .live_owner_uniform_frontier(scoring_range, &attached_instances)
         else {
             return RequestDataAckGapObservation::default();
         };
@@ -831,6 +836,7 @@ impl RequestSenderService {
                 send_stream.reinjection_bytes(),
                 context.mux_limits,
                 scoring_payload_bytes,
+                &scoring_frontier.avoid,
             );
         let exact_owner = uniform_frontier.owners[0];
         let owner_snapshot = model.original_path_timing;
@@ -1973,13 +1979,16 @@ impl RequestSenderService {
                 .min(send_stream.next_offset())
                 .min(frontier.saturating_add(selection_limit as u64)),
         };
+        let attached_instances = remotes.path_instances();
         let Some(scoring_frontier) = self
             .multipath
-            .live_owner_uniform_frontier(range, live_instances)
+            .live_owner_uniform_frontier(range, &attached_instances)
         else {
             return RequestCompletionTailEnqueueOutcome::default();
         };
-        if scoring_frontier.owners.len() != 1 {
+        if scoring_frontier.owners.len() != 1
+            || !live_instances.contains(&scoring_frontier.owners[0])
+        {
             return RequestCompletionTailEnqueueOutcome::default();
         }
         // An earlier owner/copy boundary supplies a shorter valid frontier;
@@ -2048,6 +2057,7 @@ impl RequestSenderService {
                 send_stream.reinjection_bytes(),
                 context.mux_limits,
                 scoring_extent,
+                &scoring_frontier.avoid,
             );
         let Some(target) = target_observation.target else {
             return RequestCompletionTailEnqueueOutcome {

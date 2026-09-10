@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 07:28 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 07:38 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -10,10 +10,10 @@ Continue the authorized closure loop; an intermediary commit is not completion.
   shorter confirmation gap but a3s target plateau and late4.194Mbps forward phase.
   Source restored exactly to011b724; four→zero work/73checks did not establish
   net service gain. User's seven-line edit is untouched.
-- Diagnostic69779 CLOSED0 isolates a1.390s ordered-prefix stall: first covering
-  repair admission follows1.288s of that interval; other work continues. A
-  clipped-range/exact-key avoidance mismatch is the next bounded discriminator,
-  not an accepted cause or permission for a timer/controller change.
+- Diagnostic83561 exposes clipped-range owner-target refusals on real blocked
+  prefixes; true producer RED46767 fails0vs14600B after its reachability checks.
+  The bounded exact-range exclusion correction is under targeted GREEN79627
+  after independent review. No practical gain or timer/controller change claimed.
 - The finite client Input correction materially improves upload, including
   QoS+QUIC outage: exact-confirmed56.280→186.629Mbps; settlement79.379→43.147s.
   However,6.382s confirmation gap remains. Trace THIS return prefix now.
@@ -40,13 +40,16 @@ Condensation waives no failure and reactivates no rejected candidate.
 
 ## Current source and proven correction
 
-Active runtime is restored exactly to **011b724**, finite ordered ACK/MAX Input
-service, with ordinary binary ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
+Ordinary comparator runtime is **011b724**, finite ordered ACK/MAX Input
+service, with binary ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
+Current uncommitted candidate adds only the two-file clipped repair-range
+correction described below, plus its focused tests and RFC clarification.
 Rejected **f8b8cac** remains a tracking checkpoint; its frozen ordinary binary
 ./.tmp/reflection/bin/logical-feedback-20260911/mptunnel is NOT active design.
-target/release/mptunnel still matches the rejected trial; do not use it by default.
-Use explicit binary paths. All observer and rejected-trial runtime edits are reversed.
-Only the user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md is unrelated
+target/release/mptunnel is the frozen gap-avoidance DIAGNOSTIC, not ordinary
+source or the current candidate; do not use it by default. Use explicit binary
+paths. All observer and rejected-trial runtime edits are reversed.
+The user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md is unrelated
 dirty source; never edit/stage it. The temporary two-file ACK-admission observer
 is fully reversed; build44306 and lab80295 both CLOSED0. No runtime
 other policy changes are implemented. The bounded candidate below is not
@@ -1028,6 +1031,28 @@ manifest; independent bytecomparisons pass. Telegrammilestone sent23:27:19UTC,
 nextnonurgent>=00:27:19UTC; no CPU-resolution/performancevictory claimed. RFC's
 existing range-based exclusion contract is clarified beside its ranked-frontier
 rule; codecorrection is underindependentmaskreview, notacceptedfromcomponentRED.
+
+07:38+08 execution: production/RFC independent review PASS; required full scored
+range exclusions reach both production adapters, union existing attached history,
+and leave final guards, per-query native/policy eligibility and clocks intact.
+The test-only wrapper now asserts that its entire scored extent is uniform,
+instead of silently forwarding a first-prefix mask for a larger score. Added
+one lower-layer opposite control: an expired, temporarily ineligible but attached
+copy still ends the uniform extent; exact detachment removes that boundary but
+does not acknowledge its bytes. It is not mislabeled as the real producer RED.
+Root read the entire actual patch and starts sole GREEN79627, four compile jobs.
+No ordinary lab until tests close; no controller/queue/hint/profile change.
+
+07:40+08 GREEN: root79627 passes13client checks including the actual producer
+0→14600B counterexample. All74multipath and58request checks pass, including
+the clipped expired-copy control, retained fallback, same-key replacement,
+fresh Regular/Backup, exact reserve, ranked extent/Apply and copy suppression.
+Six assignment-clock checks plus one end-only epoch churn control also pass:
+152distinct focused tests. All three independent actual-source reviewers PASS.
+No semantic edits after GREEN. The model correction is proven at that scope,
+not accepted as a speed improvement. Exact five-file patch is frozen at
+./.tmp/reflection/clipped-range-candidate-0911.patch. Next ordinary build with
+four jobs, no diagnostics; then the one predeclared outage UP comparison.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

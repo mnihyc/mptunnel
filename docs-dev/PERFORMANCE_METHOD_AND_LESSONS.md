@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-10 12:08 +08:00. Category: requested global retrospective and
+Updated: 2026-09-10 15:13 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -252,6 +252,17 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- Native handoff correction can change allocation without changing congestion
+  control. The09-10 exact W−Q observation locates1.353s of a1.497s echo inside
+  TCP unsent FIFO; native refill reduces ordinary TCP p95 from1269→323ms and
+  improves useful speed. Yet both mixed execution orders lose~5% late speed,
+  and actual accepted copies grow189→295MB as TCP Original share falls.
+  A smaller unsent queue and unchanged native cwnd do not imply unchanged
+  offered work, shared queueing or recovery. Preserve that composition cost;
+  do not tune the reserve or suppress copies from aggregates. An outage then
+  exposes1.21s ordered read gap despite progressing native ACKs: native progress
+  is not ordered Product progress. Trace the exact blocking prefix before
+  calling it a frozen controller, missing wake or new timer defect.
 - A fixed deadline can be impossible even when each individual exchange is
   timely. The09-10 confirmed-return capture proves two~100ms proof exchanges
   serialized behind one~175ms successor budget: the second starts with only

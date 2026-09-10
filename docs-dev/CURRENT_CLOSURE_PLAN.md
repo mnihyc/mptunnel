@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 02:07 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 02:44 +08:00. Authoritative repository: ./.
 **MPP is NOT performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -347,6 +347,148 @@ deferred cyclic cursor. One concrete producer countercase and a discriminator
 must precede a new model change. CPU20% addition remains separately unresolved;
 no language/controller blame or threshold change follows from a core peak.
 
+### Next discriminator: join the actual blocked request prefix
+
+Independent audits find NO unconditional direct no-progress self-loop on a16:
+an exhausted finite batch clears dirty and retains its prearmed wait; an expired
+deadline can cause one recollection, then is removed. Broad carrier notifications
+can trigger irrelevant repair retries, but that is the already identified early
+61411class, absent from its late plateau. Do not create another owner/filter.
+
+Observed failure: candidate3923 target/source remain206461992/273570856B during
+21–25s while Product flight shrinks9186112→136608B and healthy47 NativeACK
+advances86.9MB. The67,108,864B difference equals64MiB but is NOT automatically
+all remote reorder or local unassigned data. Existing counters omit the exact
+assigned horizon/retained prefix. Prior owner totals locate expensive work but
+have repeatedly failed to predict a useful optimization. Stop inferring the
+critical missing byte's cause from those totals alone.
+
+Exact question/competing causes: during the current target plateau, is the
+required prefix unassigned behind local source service, assigned but absent at
+the receiver despite live repair/native work, already received but blocked at
+the target writer, or delivered while return feedback/reply is delayed? A single
+new capture must join sender next assigned offset, queued unassigned bytes,
+ACK frontier/first authoritative gap/retained bytes with receiver next ordered
+offset/reorder and target-write service. Same-domain frontiers and existing
+management source/target/reply timestamps, not cross-domain byte subtraction.
+
+Information forecast: this can select the exact withholding boundary, or show
+the available observation remains insufficient. It promises no speed gain.
+Smallest action is a feature-only, one-second passive prefix snapshot at existing
+serialized client/server service points, plus existing hole/stall events and
+the previous owner timing overlay if needed for the same interval. No background
+polling task, Product clock/queue/selector change or per-packet trace. A missing
+snapshot while an actor is blocked is silence, not fabricated unchanged state.
+If prefix states do not distinguish the causes, do not implement a guessed fix.
+Freeze exact observer/binary, reverse source before one unchanged diagnostic
+cell. Ordinary a16 remains comparator; diagnostic timings cannot be promoted.
+
+Implementation scope refined BEFORE build: reuse only existing owner wait/hold
+instrumentation from late-owner-profile (lab_diagnostics and request/owner), not
+its per-plan/region/flight inner observers. Combined with client/server snapshots
+this is four files. The question is exact prefix placement first; previous
+inner-work totals remain context, not repeated proof or required telemetry.
+Root briefly applied the seven-file overlay during preparation then reversed
+its five inner-control/sender/flight files, retaining the new client snapshot.
+No build or traffic ran with that broader overlay. Both roles select stream0
+explicitly; actual reliable-ID allocation starts0 in a fresh one-upload process.
+Snapshot intervals are diagnostic sampling only and add no Product timers.
+
+Initial featurebuild18663closed101: new diagnostic formatted SessionId with
+Display, which the wrapper type does not implement. Root corrected only
+context.session_id→context.session_id.0; this is observer compilation failure,
+not ProductRED/platformfailure. Initial patch/log retained; corrected exact
+four-file patch is prefix-owner-trace-final-0911.patch and retry38240 is ACTIVE,
+log prefix-owner-trace-build-retry-0911.log. Independent snapshot audit finds
+no semantic blocker; same pinnedwrite and error flow remain. Completed-prefix
+watermark counts only fully successful write/flush batches, unlike management
+partial poll_write counts. Sampling can miss a long write that starts during
+the one-second suppression; absent intervals cannot disprove target parking.
+
+Retry38240closed0 in3m33s. Frozen bin/prefix-owner-trace-20260911/mptunnel;
+all four source edits reversed before run29636 started18:25UTC, SAMEcell with
+selectedstream0/prefix+hole events and PERF1/PERF_SAMPLES0. Initial saved patch
+lost its final blank context line during trimEnd (cmpreportedEOF); root restored
+that line and verified saved finalpatch byte-identical to the complete frozen
+source diff. No runtime/source difference, no repeatbuild/traffic. Initial
+compilefailed patch/log remain retained. Both actual role snapshots confirmed
+selectedstream0 emits. Analyze only complete capture; no partial speed claims.
+
+### Closed29636: stale ACK knowledge accompanies actual unassigned-source holds
+
+29636closed0, driver56.007191s. Exact316866560B/55.345273s=45.802Mbps,
+confirmation6.855796s/write3.495988s gaps,56rawbins. This is diagnostic evidence,
+not an ordinary speed comparison. Root and independent reader join the same
+session/stream with Unix timestamps (process monotonic origins differ).
+Early clientA210985050 stays fixed for~7s while serverR=completedT=A andreorder0;
+U26.131→30.768MB waits unassigned andclientF168.311→173.599MB lags real receipt.
+Restored A275833874 likewise already received/written whileclientF228→233MB.
+Late A277499786 remains unassigned-source boundary with U28.197→34.328MB and
+serverR=T=A. C+U often equals64MiB; this is occupiedclientretention, not allremote
+reorder. Raising the limit would hide the missing timely feedback, not fix it.
+
+Complete ownerflush windows corroborate shared ownership: early6.021s actor
+hold5.945063 (dispatch2.913078/preselect2.575655/ACK.300855); restored3.016s
+actor3.001772 (preselect2.748347/ACK.236403); late7.036s actor7.002995
+(preselect6.310004/ACK.657467). These are elapsed—not CPU or exact criticalACK
+wait. All28sampled targetwrite transactions succeed,maximum1380us; sampling
+can miss unsampled parking, but aligned exactR=T=A stillrulesout a missing
+forwardprefix or target-held assignedbytes in the specified plateaus.
+The directretry/no-progressowner hypothesis stays rejected; costlypreselect
+coexists with staleACK knowledge but cannot locate the ACK transit stage.
+
+Next bounded question: where does positive[0,A) stop advancing—server current
+ACK materialization, actual commandadmission, client attachmentarrival/shared
+FIFO, rawdequeue, or actualpositiveACKApply before heavyrecovery? Existing
+stream_ack_received occurs AFTER recovery and cannot date arrival. No new
+runtimefix until this join. Server holds latestdesiredstate plus one finite
+immutabletail, not an established unboundedgenerationbacklog. OrdinaryFIFO
+and clientretainedresponsewrite can delay facts; neither is causal merely from
+reachability. Explicit[0,x) witnesses must not use largest_end as contiguous
+receipt; absence of such a witness is unknown, not proofnootherpositivecoverage.
+Prior readyreceipt/ACKcadence trials remain rejected; no implicit revival from
+client/server batching asymmetry. Full185line report appendix is independently
+read and13member/464662B archive integrity/list verified by root; reader verified
+every decompressed member against its input. All56bins include27zeros.
+
+### Active ACK-stage discriminator (temporary observation only)
+
+Information forecast: one unchanged cell joins the exact positive prefix at
+six boundaries: desired cumulative ACK installation, successful command enqueue,
+client common attachment forwarder entry, successful shared FIFO enqueue, actual
+actor ACK handling entry, and validated positive Apply before expensive recovery.
+If desired/admitted prefix already reaches A but client ingress does not, follow
+the carrier/reader interval; if ingress is timely but actor/Apply lags, locate
+retained FIFO/actor service; if generation itself lags R, follow publication.
+No lag or an unjoinable prefix falsifies this observer's useful discrimination;
+do not infer a fix from counts or refresh a rejected ACK packaging candidate.
+
+Implement only cfg(feature=lab-diagnostics) hooks and six fixed scalar slots for
+the first explicitly selected session/stream0. Retain greatest explicit positive
+[0,x), first producer stamp attaining it, last-any-ACK stamp and count. No frame,
+range history, background task, new wake, Product timer or selection change.
+Equal replay cannot renew prefix freshness; a periodic <=1/s report does not
+renew producer evidence. Independent producer audit confirms RangeSet merging
+marks the FULL advancing prefix dirty and scoped encoding does not clip it;
+an incremental disjoint island may legitimately have no explicit prefix.
+
+Common forwarder is AFTER per-attachment mailbox receive, not raw socket decode.
+Actor hook is after actual selected/retained ACK extraction, so shared FIFO to
+actor includes pending-frame/deferred-frame service. Command admission is not
+native write. Existing credit owner carries cfg-only OnceLock session metadata
+set immediately after RemoteSet::new; a racing earliest ACK can be unobserved,
+never attributed to a guessed session. This startup censor does not fabricate
+late progress. Applied includes validated exact-subsumption no-ops with actual
+arrival, not a claim that they introduce new receipt authority.
+
+Freeze all seven temporary source files into ack-prefix-stage-0911.patch and
+bin/ack-prefix-stage-20260911/mptunnel, reverse them before traffic. Reuse previous
+prefix/owner snapshot with ack_prefix_stage event added, PERF1/PERF_SAMPLES0;
+same200+200QoSUP cell, profile and existing guards. Root alone builds/runs; no
+ordinary performance promotion, test-only threshold or speculative model fix.
+Stop this capture on closed result, analyze complete timing/frontier/stage/costs,
+then select only a proven boundary. Global task continues even if inconclusive.
+
 ## Just-completed correction: exact subsumed ACK invalidation
 
 a16b404 is an INTERMEDIARY mechanism checkpoint, not performance promotion.
@@ -491,7 +633,7 @@ User's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md stays untouched/unstaged.
 Exact intermediary commits; docs-dev requires exact force-add. PROGRESS is
 ignored continuity, AGENTS.md immutable.
 
-Telegram rejected-trial update sent17:19UTC; next nonurgent after18:20UTC.
+Telegram rejected-trial update sent18:21UTC; next nonurgent after19:21UTC.
 Commentary within60s; verification polling by minutes. Before compaction record
 active session, next decision, source/binary identities and adverse/open outcomes.
 Continue useful execution; do not conclude because one checkpoint closes.

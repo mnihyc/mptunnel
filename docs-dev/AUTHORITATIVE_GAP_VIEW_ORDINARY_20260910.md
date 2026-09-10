@@ -2788,3 +2788,189 @@ The parent rejected practical promotion and reversed all five candidate
 runtime/RFC/test files using the exact saved patch: source is back at `a16b404`.
 `target/release/mptunnel` remains the frozen rejected executable, not a rebuilt
 ordinary baseline; the archived trial and mechanism proof remain evidence only.
+
+## Passive prefix/owner diagnostic: assigned data already delivered, knowledge lags
+
+Run29636 answers the next information question on ordinary `a16b404` plus a
+temporary four-file observer, not the rejected pending-service candidate.
+Repeated target plateaus have **assigned horizon = receiver ordered frontier =
+completed target prefix**, with no receiver reorder, while unassigned source
+remains at the client and its positive ACK frontier is far behind. These
+bracketed plateaus are neither an outstanding assigned receiver hole nor a
+target-write stall. They locate withheld new assignment alongside delayed
+positive knowledge; they do not yet locate the delayed ACK's publication,
+native, decode or logical-Input stage. No further gap algorithm or performance
+promotion follows from this diagnostic.
+
+### Scope, provenance and completeness
+
+Client `request_prefix_state` samples at an existing Product-locked loop head,
+after claim reconciliation. Assigned offset, unassigned raw queue, retained
+unique unACKed bytes, positive frontier, authoritative gaps, peer MAX and queue
+accounting are coherent there; response receive/reorder cursors belong to the
+same actor. Nondata queue accounting includes control charges, not just repair
+payload. Server snapshots follow successful receive Apply, before the batch's
+target write. Its completed-target watermark advances only by successful
+returned batch bytes, including unlogged batches, not by the receive cursor.
+Management target bytes instead count successful socket `poll_write` bytes:
+partial writes/pending flushes can separate these two target domains.
+
+Both new snapshots select session13273794050165890851/stream0 and emit at most
+once per second at existing service points. Sampled positive target writes have
+paired begin/end events. No background observer or Product clock/queue change.
+The two reused files provide caller-keyed owner wait/hold only, not the prior
+inner-plan/gap timers. The selected existing receive-hole events remain enabled;
+PERF=1/PERF_SAMPLES=0 produces no per-call sample records.
+
+Initial build18663 fails because SessionId lacks Display; the `.0` formatting
+correction changes no decision. Retry completes in3m33s, with the existing unused
+batch-helper warning. The final four-file overlay is frozen and fully reversed
+before traffic; executable `bin/prefix-owner-trace-20260911/mptunnel` is explicit.
+Runner exits0 in56.007191s. The
+[verified archive](PREFIX_OWNER_TRACE_20260911.raw.tar.gz) is464,662B/13safe
+regular files: five results; failed-build/retry/driver logs; initial/final
+four-file patches; wrapper; `run.py`; `shape.sh`. Gzip integrity, tar comparison
+and every decompressed member's byte comparison pass. No configs or binaries.
+
+There are56client snapshots,44server prefix snapshots and28unique successful
+target-write begin/end pairs, no unmatched pairs. All sampled completed byte
+counts equal their exact range lengths; largest elapsed is1,380us, then589us.
+This is a sampled transaction population, not an unbiased all-write percentile.
+A long write starting inside the suppression interval can be unlogged. Missing
+actor snapshots are silence, not unchanged state. `await_us` includes retained
+write/flush, feedback servicing and scheduling, not exclusive socket wait.
+
+### Exact prefix joins and the remaining return-stage question
+
+All times below are Unix milliseconds minus1789064729000, expressed in seconds;
+this convenient shared wall anchor is **not** probe start or a shared `t_mono`
+origin. A=client assigned horizon, U=unassigned raw source, F=client positive ACK
+frontier, R=server receive cursor, T=fully completed target prefix. Client and
+server snapshots bracket each other rather than being simultaneous. Monotonic
+unchanged A and an observed R=T=A bound later progress through that prefix.
+
+| Plateau | Client A constant | Server evidence R=T=A, reorder0 | U at client endpoints | F at client endpoints |
+|---|---|---|---:|---:|
+| Early/cut | 210,985,050 at14.414–21.422 | 14.606–21.672 snapshots | 26,131,184→30,768,464 | 168,311,170→173,598,970 |
+| Restored | 275,833,874 at28.457–34.481 | 31.294; next positive write34.863 | 20,868,132→25,140,292 | 228,017,594→233,525,842 |
+| Late drain | 277,499,786 at42.521–50.553 | 42.069,43.076,44.116; next write51.275 | 28,196,772→34,328,040 | 238,237,834→241,160,434 |
+
+Management independently keeps target bytes at those exact values in samples
+14–21,28–34 and42–51. For the latter two intervals source reads continue while
+new assignment is mostly or entirely withheld. Client-authoritative gaps below
+the already completed server prefix are delayed sender knowledge, not evidence
+that those bytes are still missing at the receiver. Retained cache and Product
+flight alone could not distinguish this; the new exact frontiers do.
+
+True receiver gaps also occur outside those plateaus. At24.677, for example,
+server R=T=241,189,634 with5,416,674B reorder and first gap
+[241,189,634,259,661,170); client A was275,112,978 at24.451. By27.824 the server
+has R=T=275,637,266 with reorder0. Do not generalize the no-hole classification
+to the entire capture or call all recovery copies unnecessary.
+
+An independent application-return hold overlaps restored service: client
+response receive cursor remains802/reorder0 at34.481–40.511. Management samples
+34→40 show target275,833,874→276,573,454 and sink reply-read1,012→1,138B, while
+local reply-write stays802B. This shows missing progress before logical response
+receipt, not whether the reply or ACK was already decoded/queued. There is no
+exact feedback publication/admission/decode/Input trace in this capture.
+
+### Owner time inside these same prefix plateaus
+
+All2,939client and648server perf rows reconcile interval count/bytes/time deltas
+with cumulative totals. Client has57flush groups; each takes at most4ms to print,
+with at least1,000ms between periodic groups. The following use complete flush
+groups contained inside the joined plateau, not adjacent individual row stamps
+from one flush. Completed-call attribution retains boundary uncertainty up to
+the contributing call duration; it is not exact instantaneous lock occupancy.
+
+| Full-flush wall interval | Span,s | Actor hold,s | Preselect guard,s | Direct/queued dispatch guard,s | ACK-Apply guard,s | Actor wait,s |
+|---|---:|---:|---:|---:|---:|---:|
+| 15.336–21.357 | 6.021 | 5.945063 | 2.575655 | 2.913078 | .300855 | .027582 |
+| 31.415–34.431 | 3.016 | 3.001772 | 2.748347 | .000502 | .236403 | .002464 |
+| 43.482–50.518 | 7.036 | 7.002995 | 6.310004 | .001859 | .657467 | .006553 |
+
+Instrumented control sites1612/3082/3989 identify those three guards in the
+saved patch; ordinary source line numbers differ. Preselect includes source
+admission, recovery and other preparations, not a separately timed gap function.
+Dispatch includes direct structural and queued work, not queued repairs alone.
+The late window has999preselect holds(max14,132us),204dispatch holds and406ACK
+holds. Writer hold totals in these three windows are.010337/.000275/.000320s.
+
+Whole client actor hold is52.141697s, writer hold.991322s; actor/writer waits
+1.006519/.047497s. Dominant actor sites total37.293526s preselect,9.717496s
+dispatch and3.601212s ACK Apply. Largest single actor hold is25,779us(dispatch),
+not a multi-second individual call. Every event has the existing1us floor.
+Hold includes scheduler descheduling and observation inside ownership; waits
+are successful acquisition measurements, writer wait excludes earlier Busy
+retries, and none is CPU. Do not sum parent stages with their guard or claim
+all this elapsed time is removable. Substantial owner work coexists with stale
+positive knowledge, but this alone does not locate the critical ACK boundary.
+
+### Own delivery, all56raw bins and physical/resource context
+
+Exact316,866,560B accepted=confirmed,1/1completed,0errors, statusok in55.345273s:
+45.802Mbps. First write/confirmation .106532/.413887s; maximum write gap3.495988s
+and confirmation gap6.855796s. Settlement extends15.345273s past nominal40s.
+No UP echo workload or censoring. Raw bins contain27zeros; the last is partial.
+Probe does not save exact max-gap endpoints or a wall origin, so the sampled
+plateaus are not asserted to be the exact6.855796s confirmation interval.
+
+| Raw confirmation phase | Mbps | Zero bins |
+|---|---:|---:|
+| 0–5s | 72.537 | 0/5 |
+| 5–15s | 100.448 | 2/10 |
+| 15–25s | 42.604 | 4/10 |
+| Interior16–24 inclusive | 47.338 | 3/9 |
+| 25–40s | 5.993 | 12/15 |
+| 40–56s, final partial | 40.739 | 9/16 |
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 8.736,157.769,133.852,33.728,28.6,51.38,177.017,212.337,221.509,212.837
+10: 54.255,0,28.591,0,46.554,0,0,21.022,0,0
+20: 2.824,293.497,61.081,33.224,14.396,0,0,0,28.221,0
+30: 0,19.737,0,41.94,0,0,0,0,0,0
+40: 20.578,0,0,0,0,25.717,0,0,0,0.806
+50: 0,0,2.001,305.381,136.994,160.351
+```
+
+All56management/shaper rows verify independent200+200Mbps, DOWN30ms/UP70ms,
+zero configured jitter/loss/blackhole, netem limit8192,65536BHTB bursts and equal
+rates/ceilings. Only46UP falls to10Mbps at15.001685s and returns200at25.002747s;
+47 remains200. All class/qdisc drop deltas are0. Eight active physical outputs
+per role persist without suspect/failed states; native epochs are initialized
+and unchanged from sample10. Management/collector/probe clocks remain distinct.
+
+Restored samples28→34 send only5,956B across both DOWN classes (~7.94kbps), with
+server native ACK deltas1,338TCP/1,170QUIC B. Late42→50 sends17,229DOWN bytes
+(~17.22kbps), native ACK deltas2,428TCP/3,111QUIC B. All server path queue-byte
+samples in those bands are0; sampled QUIC RTT is~100–102ms with~11–12KBflight
+and advancing producer stamps. Idle TCP producer stamps can lag substantially.
+These are small return-context totals, not the exact positive ACK frame or
+proof of its application. Neither native progress nor zero sampled queues
+proves continuous timely service; no measured bulk return-wire congestion is
+identified here.
+
+| Whole sampled cost (55.006951s) | Value |
+|---|---:|
+| UP46 /47 class bytes | 331,271,154 /393,868,419 |
+| DOWN46 /47 class bytes | 4,681,451 /5,634,859 |
+| Summed UP backlog peak / final,B | 18,768,638 /3,742,131 |
+| Summed DOWN backlog peak / final,B | 48,492 /25,949 |
+| Client RSS peak / final,KiB | 321,064 /279,040 |
+| Server RSS peak / final,KiB | 77,240 /77,240 |
+| Client lifetime CPU peak / final,% | 131 /113 |
+| Server lifetime CPU peak / final,% | 51.3 /20.3 |
+
+Lifetime `ps` CPU is not interval CPU; sampled final memory/queues are not
+post-teardown retention. Logs are1,302,109client +331,724server bytes, an explicit
+observation cost. Probe stderr is empty; two server H3_NO_ERROR close warnings
+follow completion. No ordinary-vs-diagnostic speed claim is warranted.
+
+Information forecast outcome: the joined prefixes distinguish real receiver
+holes from several material stalls after all currently assigned data reached
+the target. Delayed positive knowledge and unassigned source are demonstrated;
+the exact withholding point along feedback publication→native→decode→Input is
+still unresolved. The next decision belongs to that existing feedback-service
+boundary, not another guessed gap-work correction or a waived practical gate.

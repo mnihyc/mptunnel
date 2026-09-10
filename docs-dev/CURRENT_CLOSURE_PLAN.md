@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 20:57 +08:00. Authoritative repository: `./`.
+Updated: 2026-09-10 21:38 +08:00. Authoritative repository: `./`.
 **MPP is not performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; do not conclude at an intermediary commit.
 
@@ -11,6 +11,65 @@ growing inventory. Complete preceding chronology and adverse outcomes remain at
 linked reports/archives. Condensation discards no experiment.
 
 ## Active transaction: attribute remaining request-pilot service failure
+
+### Current correction: one observation per recovery target decision
+
+Owner-profile17084 completes456,720,384B/47.794866s (76.447Mbps), but still
+has4.051s confirmation and8.651s write gaps. Diagnostic, not promotion.
+Static caller totals identify25.589s preselect planning and11.886s recovery
+dispatch; full ACK handling is2.915s. In one exact winning-reply FIFO hold,
+the2.007s complete-flush interior contains1.982s exclusive Product hold and
+only.003s acquisition wait; planning/dispatch account for1.083/.797s.
+Another3.010s interval contains2.987s hold. These are repeated short serialized
+work, not one long lock or measured CPU. Full report retains uncertainty.
+
+Observed impact: severe upload/confirmation stalls with busy serialized recovery
+work even without configured packet loss. Competing subcosts are repeated
+all-path observations, exact debt/geometry queries and repeated failed-region
+search. The first selected question is whether reinjection_path_snapshot
+unnecessarily captures every attached path separately for every target/pass.
+History3a6d0ea introduced the request-local Product authority projection to
+avoid mistaking shared carrier telemetry for stream/direction/incarnation P.
+That intention remains valid; per-target whole-list capture is not required.
+RFC10.4 fair service and Observe/Decide/Apply remain authoritative.
+
+Smallest correction: share ONE existing include_bulk_admission=false observation
+within this selector invocation; project each target with the unchanged helper.
+Preserve Regular/Backup priority, exact copy debt, eligibility, tie order and
+fresh native-fenced Apply. No caching across region searches/Apply/await, no
+measured-evidence predicate change, no new timing or capacity parameter.
+Counterexample: actual installed three-path selector gives repeated captures
+despite unchanged serialized membership. Test-only RED first checks Regular,
+independent Backup and exact-reserve exhaustion, then checks capture count.
+
+Benefit forecast: remove O(P) repeated whole-path captures from this decision
+(capture component O(P²) becomes O(P)); projection/ledger costs remain. This is
+part of the measured11.886s dispatch owner, not a claim that all of that time
+or25.589s planning disappears. Exact removable time is unknown; multi-second
+FIFO stalls and repeated all-path native/health sampling make a cheap ordinary
+comparison worthwhile. P=1 need not gain; observing paths when all are excluded
+must not add work. A lazy single observation is acceptable for that boundary.
+Falsifier/stop: semantic-control failure rejects implementation; no material
+ordinary improvement or material healthy/restored/tail/cost harm rejects speed
+promotion. Use the SAME200+200 QoSUP cell; keep prior adverse controls. No
+favorable rerun or controller/quantum/queue adjustment follows a failure.
+Actual RED82013: selection/debt controls pass, final expected(1,1,1) fails
+with(2,4,4), .03s test runtime. Compilation7m47s. Independent review confirms
+lazy observation preserves zero-candidate no-work and existing Apply. Implement
+only that reuse plus zero-candidate control, then focused/ordinary checks.
+Native scheduler shape reads use cached stamp-validated scalar shapes, not
+controller clones; do not attribute transport deep-clone cost to this selector.
+
+### Newly reported condition: approximately20% QUIC-loss CPU burst
+
+User reports apparent random one-core CPU saturation during~20% QUIC loss.
+Affected role/version/platform requested; no answer yet. This is NOT confirmed
+fixed and is not attributed to Rust or assumed identical to current no-loss
+serialized work. After this bounded correction, compare QUIC-only and mixed
+under the reported loss with process CPU and useful progress, separating
+MPP recovery planning, native retransmission/crypto and repeated-ready wake
+work. Preserve the existing global gates; this is an added focused CPU case,
+not a replacement final link profile or authority to change congestion knobs.
 
 ### Current decision: split the proven local reply residence
 

@@ -816,3 +816,141 @@ backpressure; it rejects an exclusive carrier-priority or measured pre-apply
 lookup explanation. The next bounded question is which intervening owner work
 limits FIFO service, using exact callsite timing rather than a larger queue,
 new timer or presumed speed gain. Ordinary promotion remains stopped.
+
+## Separate owner-profile capture: repeated serialized work dominates held intervals
+
+This diagnostic retains selected-reply stages and measures completed request
+Product guard acquisition/hold durations by static instrumented caller. Source
+policy remains ordinary `a747bda`; the complete temporary overlay is
+`./.tmp/reflection/authoritative-gap-view-owner-profile-0910.patch`. Build47244
+completes in3m39s, then the frozen `authoritative-gap-view-owner-profile-20260910`
+executable runs after overlay reversal. PERF uses periodic aggregation without
+samples. The previously noisy `server_stale_output_recovery` event is disabled
+in the observer filter, not in runtime behavior. No threshold, native controller
+or physical profile changes.
+
+[Verified raw evidence](AUTHORITATIVE_GAP_VIEW_OWNER_PROFILE_20260910.raw.tar.gz)
+contains11regular files: five result files, build/driver logs, the complete
+observer patch, its text wrapper, and unchanged `run.py`/`shape.sh`. The archive
+is457,326B; gzip integrity, tar comparison and every decompressed file's byte
+comparison pass. No configs, credentials, binaries, symlinks or directory
+members are included. The runner/profile match the preceding local-stage
+archive byte-for-byte.
+
+### Own outcome, not an ordinary improvement comparison
+
+Runner17084 exits0 after48.005502s. All456,720,384B locally accepted are exactly
+confirmed in47.794866s (76.447Mbps), one complete stream and no probe errors.
+First write/confirmation is.105929/.409460s; maximum local-write/confirmation
+gaps are8.650791/4.050847s. Thus eventual settlement does not make this trial
+fluent or replace the previous censored result. All48raw bins are retained,
+including18zeros; there is no echo workload. Raw means5–15,16–24inclusive,
+25–40 and40–48 are36.123,8.212,112.656 and90.913Mbps.
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 8.556,191.173,300.085,156.762,0,0,0,26.391,0,0
+10: 59.260,0,58.624,98.041,118.918,144.893,36.466,0,17.855,0
+20: 14.539,0,5.051,0,0,0,1.240,13.632,69.317,467.413
+30: 143.273,0,0,367.835,27.413,0,2.019,548.044,10.141,39.519
+40: 21.623,69.748,245.860,0,0,0,29.349,360.720
+```
+
+### Measurement truth and dominant source callers
+
+2076owner rows cover32static callsites,64wait/hold components. Every component's
+count, byte and elapsed deltas reconcile with its cumulative totals; paired
+wait/hold counts match. Owner byte fields are all0, not traffic. There are
+513,800completed actor guard observations and54,451successful writer guards.
+Actor hold/wait totals are43.688533/1.524999s; writer hold/wait1.297782/.054467s.
+Successful writer `try_lock` time excludes all prior Busy results and retries.
+No inference of low writer retry residence follows its small measured wait.
+
+The hold clock starts after acquisition and is read immediately after actual
+mutex release; recording occurs after unlock and notification. It is an elapsed
+critical-section estimate with descheduling/timestamp-boundary uncertainty,
+not measured CPU. Wait can overlap another guard's hold and is not added to it.
+Only completed guards appear; final inactive sites retain their last recorded
+totals rather than manufacturing a simultaneous end-of-run sample. Existing
+inner timers are not added to these enclosing holds. Each event has a1us floor.
+
+Caller lines below are reconstructed in memory from the complete frozen patch
+and checked against its base hunks, **not** read from reverted ordinary line
+numbers. A caller spans its entire guard scope, not just the first function.
+
+| Instrumented caller | Observations | Total hold | Largest hold | Scope |
+|---|---:|---:|---:|---|
+| `control.rs:1562` | 76,491 | 25.589383s | 27.207ms | Preselect source admission, retained-frontier maintenance, authoritative-gap evaluation and service/deadline geometry |
+| `control.rs:3032` | 29,479 | 11.886316s | 13.765ms | Request recovery/repair dispatch and resulting attachment decisions |
+| `control.rs:3954` | 26,477 | 2.914869s | 19.341ms | Full received-ACK application, release and path/queue consequences |
+| `control.rs:3013` | 29,479 | 1.582490s | 3.632ms | Recovery-batch collection and service-wait arming |
+| `control.rs:1114` | 76,491 | 1.405470s | 3.417ms | Preselect topology/recovery observation |
+| `prepared.rs:231` (writer) | 17,989 | .666278s | 4.328ms | Successful prepared writer claim scope |
+
+The25.589s scope includes `reliable_stream_source_admission`, retained-tail
+selection/discard and `evaluate_client_data_ack_reinjection`; this capture does
+not isolate their individual contributions. The11.886s scope includes
+`dispatch_next_request_path_recovery` and `dispatch_client_repair_work`.
+It is not justified to rename either entire caller as one specific inner query
+or assume all its work is unnecessary. The next correction needs that source
+work counterexample, not merely a large elapsed total.
+
+### Same-capture critical windows, with complete flush boundaries
+
+Session2060930880107225816/stream0 has a clear local winner[201,214) on QUIC0.
+It decodes/enqueues at1789046468971, reaches ordinary carrier handling/enqueue
+6468976 and attachment receive/shared-send6469271/6469278, then Product
+dequeue/selected/pre-apply/receipt6472675. Its3,397ms AFTER shared admission
+lies inside a3,861ms advancing-frontier gap. As before, it is not explained by
+a late carrier read or one slow selected-frame pre-apply operation. Abbreviated
+timestamps in this paragraph have the common178904prefix.
+
+The maximum completed gap[689,703) lasts4050ms in event timestamps:
+1789046487563→1789046491613. Its winning QUIC0repair is decoded at6490080,
+carrier-enqueued6490213, attachment-received6491458, shared-enqueued6491463
+and dequeued/applied6491613. The decode→receipt local contribution is1533ms;
+the earlier part of this user gap is not silently relabelled local service.
+
+Each periodic flush emits rows over several milliseconds. The analysis groups
+the complete sorted-component flush, carries unchanged counters forward and
+subtracts snapshots only after the full group. Selecting individual timestamps
+mid-flush would incorrectly include a preceding interval for later-listed sites.
+The following bands are strictly inside the stated held intervals; their Unix
+times are complete flush-end timestamps. Largest completed calls can straddle
+a band edge, so these are aligned cumulative observations, not per-call start
+and stop traces.
+
+| Held interval | Interior flush band (Unix ms) | Band | All hold estimates | Actor/writer wait (separate) | Main hold contributions |
+|---|---|---:|---:|---:|---|
+| [201,214) shared-input wait | 1789046470072→1789046472079 | 2.007s | 1.981563s | .002975s | 1562:1.083387s/354calls;3032:.797347s/94;ACK:.062347s/75 |
+| [689,703) maximum frontier gap | 1789046488128→1789046491138 | 3.010s | 2.986625s | .007754s | 1562:2.315304s/905;3032:.346946s/378;ACK:.235723s/375 |
+| [1781,1795) repair decoded→receipt | 1789046509203→1789046511210 | 2.007s | 1.981229s | .016903s | 1562:1.087692s/1354;3032:.652437s/518;ACK:.142174s/517 |
+
+The bands contain2975/6161/9127completed hold observations. Their maximum1us
+floor contributions are therefore2.975/6.161/9.127ms, not the approximately
+1.98/2.99/1.98seconds measured. The repeated serialized work is material in
+these actual stalled windows; there is no single multi-second guard, and
+writer contention is not their dominant measured cost. These sums still are
+not CPU utilization or promised removable delay. They justify investigating
+the dominant preselect/dispatch work before a queue-capacity or carrier-only
+scheduling change. The full FIFO's intervening ACK/control contents and exact
+inner-call costs are not reconstructed from reply-only events.
+
+### Physical and resource context
+
+All48profiles match two200Mbps links,46UP10Mbps only15–25s,30/70ms delays,
+zero loss/jitter/outage, burst/cburst65536B and netem8192. First restriction/
+restoration reports are15.001738/25.002787s; every class/netem drop counter
+remains0. The accounting window is47.005359s. UP46/47class deltas are
+334,726,118/591,726,317B; DOWN46/47 are6,190,689/7,662,486B. Summed UP/DOWN
+backlog peaks20,524,093/32,762B. Client RSS peak/final is321,288/314,576KiB with
+lifetime CPU124/121%; server112,988/112,988KiB with64.4/32.6%. These are not
+per-call CPU or leak measurements.
+
+Logs contain7207lines/2,446,272B, no samples, no noisy server-stale-output
+events, and no runtime WARN/ERROR or probe-stderr output. Observation has its
+own aggregation/formatting cost after guard release; it is not performance-
+equivalent to an ordinary build. The information forecast succeeds: repeated
+actor work dominates the observed serialized service, with concrete caller
+ownership and small acquisition waits. It does not yet prove which inner
+algorithm should change or waive any ordinary practical failure.

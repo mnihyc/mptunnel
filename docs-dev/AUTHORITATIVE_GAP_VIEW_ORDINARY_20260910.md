@@ -2974,3 +2974,200 @@ the target. Delayed positive knowledge and unassigned source are demonstrated;
 the exact withholding point along feedback publication→native→decode→Input is
 still unresolved. The next decision belongs to that existing feedback-service
 boundary, not another guessed gap-work correction or a waived practical gate.
+
+## ACK-prefix stage diagnostic: earliest lag precedes common attachment arrival
+
+Run79321 materially narrows the existing feedback-service question. A positive
+ACK covering an already completed427,743,428B request prefix is generated and
+command-admitted, yet no equal-or-greater explicit positive prefix reaches the
+client's common attachment forwarder for **at least about24.0s**. The earliest
+withholding boundary is after server command admission and before that client
+hook, not delayed desired generation or only the final actor Apply. This scope
+still includes server command/writer service, native transport, client decoding
+and per-attachment mailbox service; it does not prove a purely native failure.
+A separate multi-second shared-FIFO/actor service delay is also observed.
+
+### Observer meaning and reproducibility
+
+Runtime is `a16b404` plus seven temporary feature-only files. Six fixed scalar
+slots bind the first selected session848173939728819236/stream0 per process;
+they retain stage count, latest-any-ACK time and greatest explicit positive
+[0,x) with its first producer time. Equal replay cannot renew that first time.
+No frame history, per-output identity, retained range list or new wake exists.
+The repeated <=1/s report does not refresh producer evidence.
+
+| Stage | Actual boundary |
+|---|---|
+| generated | Desired cumulative ACK installed at server binding |
+| command_admitted | Successful frame enqueue to an output command lane |
+| attachment_arrival | Client common forwarder, after per-attachment mailbox receive |
+| shared_fifo_admitted | Successful shared FIFO send; timestamp after send returns |
+| actor_dequeued | Actual selected/retained ACK enters actor handling |
+| applied | Validated positive application, including validated subsumed replay, before expensive recovery |
+
+Admission is not native write; attachment arrival is not raw decode. Post-send
+stamping may trail a concurrent consumer. Attachment arrival, FIFO admission
+and actor entry are not ACK validation. Witnesses are explicit [0,x), not largest
+range end or inferred union coverage. Counts differ with fanout, replay and
+chunking; they are not six equal conservation totals. Startup frames racing the
+cfg-only session initialization can be unobserved rather than misattributed.
+
+Build3718 succeeds in3m35s with the existing unused batch-helper warning. Root
+freezes `bin/ack-prefix-stage-20260911/mptunnel` and the exact seven-file patch,
+then reverses all source edits before traffic. The wrapper enables PERF=1 and
+PERF_SAMPLES=0 alongside the selected prefix/stage/hole events; no inner-plan
+observer or per-call samples. Runner exits0 in55.009476s. The
+[verified raw archive](ACK_PREFIX_STAGE_20260911.raw.tar.gz) is488,198B/11safe
+regular files: five results, build/driver logs, exact patch, wrapper, `run.py`
+and `shape.sh`. Gzip/tar and every decompressed member's bytes pass; no configs
+or binaries. This diagnostic is not an ordinary performance comparator.
+
+### Decisive retained-witness joins
+
+Times below are Unix milliseconds minus1789066034000, shown in seconds. This
+shared wall anchor is not probe start or a common monotonic origin. Producer
+times are distinct from later periodic report times.
+
+| Observation | Explicit prefix,B | Producer time | Report / supporting state |
+|---|---:|---:|---|
+| Server generated and command-admitted | 427,743,428 | 30.100 both | Report30.240; R=completedT=427,743,428,reorder0 |
+| Client attachment greatest shortly before | 361,346,060 | 29.705 | Report30.030; client A427,743,428,U711,496,F360,625,164 |
+| Client attachment greatest still below that prefix | 392,821,476 | 54.129 | Report54.135; actor/Applied only390,691,588 |
+| First later retained attachment witness above it | 441,065,700 | 54.866 | Report55.137; actor/Applied441,065,700 at54.867 |
+
+Because the greatest witness never decreases, the new below-threshold witness
+at54.129 supplies a conservative24.029s producer-time lower bound after known
+command admission. The later larger witness only upper-brackets threshold
+crossing; it is not the same ACK frame or proof that exact427,743,428 spent
+24.766s in a particular queue. Client F remains below that already delivered
+prefix through54.135. Later assignment grows slowly, rather than A remaining
+constant for the whole interval: A440,797,092/U5,240,924 at54.135. Receiver and
+target frontiers remain above the completed427,743,428 prefix throughout.
+
+The delay is not universal startup behavior. Four retained exact-value
+command→attachment matches (193,039,166;218,920,198;230,117,230;254,982,404)
+take30–85ms. All47retained generated/admitted value matches have identical
+millisecond producer times. These are sparse matching witnesses, not unbiased
+all-ACK latency distributions or per-frame identities.
+
+The client has additional local service delay:
+
+| Explicit prefix,B | Earlier hook/time | Later hook/time | Prefix-attainment separation |
+|---|---|---|---:|
+| 363,377,676 | Shared FIFO37.979 | Actor42.088 | 4.109s |
+| 362,984,460 | Attachment33.980 | Actor/Applied39.036 | 5.056s |
+
+The51retained actor/Applied value matches differ0–2ms. Late reports have
+arrival−FIFO count differences3–4 and FIFO−actor122–131; actor−Applied is0.
+This shows persistent work between those hooks, including pending/deferred
+actor frames. It is not an exported exact command-slot occupancy or a proof
+that every delay belongs to the shared FIFO. Backpressure can couple that
+local backlog to the earlier unobserved mailbox/reader span.
+
+Final passive reports are not synchronized: server54.835 records7,391generated
+and21,716admitted ACKs, greatest440,952,164; client55.137 records22,512arrival,
+22,508FIFO and22,382actor/Applied, greatest441,065,700. The later client count
+exceeding the earlier server report is not evidence of duplication beyond
+normal fanout or a conservation failure. Unused role-specific slots remain
+None/count0; no final stage flush is invented.
+
+### Own prefix, reply and owner context
+
+Unlike the preceding capture, much of this run has slow advancing frontiers
+rather than one long constant A. Real cut-phase holes occur: server R218,920,198
+is fixed at19.217–21.223 while reorder grows14,425,982→50,917,638B; client A
+reaches286,029,062/U0 at20.998. Do not erase that forward hole when diagnosing
+the later already completed prefix. At30.240 R=T427,743,428/reorder0, and
+restored snapshots after32.254 have no reorder through52.543.
+
+Client response cursor854/reorder0 stays fixed at30.030–37.091, then868/reorder0
+at38.093–44.118. Management30→36 target427,743,428→430,073,188 and sink reply
+read1,036→1,176B while local reply-write854 stays fixed. Thus application return
+service also lags actual target writes; the stage helper observes request ACKs,
+not the exact application reply. No exact max-confirmation-gap endpoints or
+probe wall origin are saved, so these windows are not asserted to be its exact
+7.815789s gap.
+
+All2,993client and758server perf rows reconcile interval/cumulative count,
+bytes and time. Complete owner-flush groups inside the missing-prefix interval
+30.996–54.134 cover23.138s: actor hold22.766675s, including preselect10.664234s,
+direct/queued dispatch10.126003s and ACK Apply.899790s; actor wait.136389s.
+Inside the response854 hold,30.996–37.055 covers6.059s with5.984263s actor hold
+(3.857630dispatch,1.868585preselect). Response868 interior39.063–44.105 covers
+5.042s with4.993191s actor hold (2.605894dispatch,2.125444preselect).
+
+Whole actor hold47.969329s/writer1.271652s; actor/writer waits1.247609/.057444s.
+Dominant instrumented control sites1621/3091/4008 total26.912217s preselect,
+15.145923s dispatch and3.355703s ACK Apply. Largest single actor hold38,309us
+is not one multi-second call. These are completed-call elapsed ownership times,
+with the1us floor and boundary/descheduling/observer effects, not CPU. Preselect
+and dispatch are broad guards, not isolated gap or queued-plan timers. Their
+large overlap with delayed ACK service does not locate the missing upstream
+ACK frame or establish that removing all measured time is possible.
+
+### Own delivery, complete series and cost
+
+Exact446,038,016B accepted=confirmed,1/1completed,0errors, statusok in54.301541s
+=65.713Mbps. First write/confirmation .105487/.409609s; maximum write gap2.553686s,
+confirmation gap7.815789s. Settlement extends14.301541s beyond nominal40s. No UP
+echo workload or censoring. All55raw bins below include26zeros and a partial
+final bin; no trimmed mean substitutes for wall-clock delivery.
+
+| Raw confirmation phase | Mbps | Zero bins |
+|---|---:|---:|
+| 0–5s | 119.725 | 0/5 |
+| 5–15s | 62.807 | 5/10 |
+| 15–25s | 89.020 | 4/10 |
+| Interior16–24 inclusive | 68.037 | 4/9 |
+| 25–40s | 53.659 | 11/15 |
+| 40–55s, final partial | 43.102 | 6/15 |
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 8.077,142.253,140.413,120.913,186.97,0,242.715,29.412,0,0
+10: 60.096,0,227.264,0,68.586,277.864,0,0,40.274,0
+20: 0,226.893,97.371,170.853,76.943,706.6,33.074,0,27.647,0
+30: 0,0,0,0,0,0,37.557,0,0,0
+40: 0,0,0,37.845,0,0,193.628,87.652,0,116.942
+50: 64.103,6.771,10.914,86.936,41.735
+```
+
+The706.6Mbps confirmation bin reflects released confirmation of prior target
+work, not a measured instantaneous400Mbps-link-capacity violation.
+All55shape rows validate direct200+200Mbps, DOWN30ms/UP70ms, zero configured
+loss/jitter/blackhole,8192netem limit and65536BHTB bursts. Only46UP is10Mbps
+from15.003894 until25.004999s;47 stays200. All class/qdisc drop deltas are0.
+Eight native output epochs per role remain unchanged from sample10.
+
+Management30→54 records702,533DOWN class bytes (~234kbps), server native ACK
+deltas66,044TCP/101,760QUIC B. Server carrier queue-byte samples are0 throughout
+this band. QUIC1 RTT175.306ms and25,870Bflight persist with advancing producer
+stamps; idle TCP samples may be older. Forward native ACKs still add69,552,384TCP
+and105,114,221QUIC B, not necessarily useful new originals. Neither direction's
+native byte counter identifies the critical ACK. Management `queue_bytes` is
+observed carrier byte state, not command-lane occupancy; client has50unobserved
+path-queue values in these25rows, not measured zeros.
+
+| Whole sampled cost (54.009263s) | Value |
+|---|---:|
+| UP46 /47 class bytes | 348,838,649 /567,667,770 |
+| DOWN46 /47 class bytes | 5,166,400 /6,778,718 |
+| Summed UP backlog peak / final,B | 27,152,908 /313,959 |
+| Summed DOWN backlog peak / final,B | 43,083 /0 |
+| Client RSS peak / final,KiB | 279,736 /276,088 |
+| Server RSS peak / final,KiB | 135,720 /135,720 |
+| Client lifetime CPU peak / final,% | 122 /113 |
+| Server lifetime CPU peak / final,% | 53.2 /25.4 |
+
+CPU is lifetime `ps`, not interval ownership or collector-adjusted CPU. Final
+memory/queues are not post-teardown retention. Logs contain1,467,933client and
+530,207server bytes, including55/54six-slot reports and55/54prefix snapshots.
+All43sampled target-write pairs succeed, largest225us, with no unmatched pairs;
+unsampled writes retain the earlier censoring caveat. Probe stderr is empty;
+two server H3_NO_ERROR warnings follow completion.
+
+Information forecast succeeds: desired installation/admission is timely for
+the critical completed prefix; its earliest material lag is before common
+attachment arrival, with secondary local FIFO/actor delay. Exact writer/native/
+decode/mailbox attribution remains open. Preserve the7.816s practical gap and
+do not turn this diagnostic into a performance win or select another gap tweak.

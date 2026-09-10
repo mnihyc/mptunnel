@@ -489,6 +489,46 @@ ordinary performance promotion, test-only threshold or speculative model fix.
 Stop this capture on closed result, analyze complete timing/frontier/stage/costs,
 then select only a proven boundary. Global task continues even if inconclusive.
 
+Build3718closed0 in3m35s, existingunusedhelperwarningonly. Exact35488Bpatch
+matches savedsource byte-for-byte. Frozen bin/ack-prefix-stage-20260911/mptunnel;
+root reversedALLseven sourcefiles beforerun79321 at18:47UTC. Sourcecleanexcept
+userdoc; no compiler/laboverlap. Unique results aggregate-combined-up-ack-prefix-
+stage-0911; driverack-prefix-stage-0911.log. Analyze after CLOSED only. Actual
+enqueue commit can precede returning producer record on anotherworker; tiny
+timestampinversions are permitted, countsnotconservedacrossfanout/generation.
+
+79321closed0, driver55.009476s; exact446038016B/54.301541s=65.713Mbps,
+maxconfirmation7.815789s/write2.553686s. Not an ordinary speedcomparator.
+Decisive result: desired AND successfully command-admitted prefix427743428 at
+Unix1789066064100;serverR=Tthere/reorder0at6064240. Client attachment witness
+is STILL only392821476attainedat6088129 (reported6088135), at least24.029s
+later. Actor witness390691588
+lags slightly further. Thus late generation/admission is NOT this prefix's
+owner. Another exact witness362984460 arrives at commonforwarder6067980,
+then actor/Applied6073036 (~5.056s); sharedFIFO minusactor counts~130and
+arrivalminusFIFO~4 repeatedly. Missing newer prefix precedes that FIFO and
+includes serverwriter/native/clientdecoder/perattachmentmailbox. No external
+QoS or specific queue blame yet. Currentreader completes fullappendix/archive.
+
+Next same-owner discriminator adds ONLY successful carrier-write and fully
+decoded frame boundaries to the existing fixed witness helper (eight slots).
+Information forecast: ifwrite lags, inspect servercommandwriter; ifwrite is
+timely butdecode lags, inspect native/readbackpressure; ifdecode is timely yet
+attachmententrylags, exactclientmailbox/service owns that interval. Existing
+nativeACK counters do not identify this particular MPPACK, so cannotreplace
+the two observations. Tiny successfulsend-return timestampinversions remain.
+No throughputgainforecast or Productfix before this exactsplit.
+
+Smallest implementation: existing TCPauthenticated observer has exactsession;
+TCPserver successful ordinarytransaction already retainsoneframe throughflush.
+QUICcfg-only send/recv metadata binds actualsession atcurrentknowncontext;
+generic frame read/write(success) captures scalarwithoutretain/newtask/newawait.
+Everyframe path uses the same helper; repairchannelsrejectACK. No synthetic
+scope, changed nativeadmission or control scheduling. Preserve oldseven-file
+observer; unique ack-carrier-prefix-0911 binary/patch/tag. Same200+200cell and
+fullcompletion/series/costs; removeALLtemporarysource beforetraffic. Inconclusive
+result stops guessedpromotion, not globalclosure. No compiler/laboverlap.
+
 ## Just-completed correction: exact subsumed ACK invalidation
 
 a16b404 is an INTERMEDIARY mechanism checkpoint, not performance promotion.

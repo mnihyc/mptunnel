@@ -2599,3 +2599,192 @@ The semantic/work proof passes its targeted checks, but the ordinary practical
 forecast is not met. Preserve the adverse result and exact trial independently;
 no performance promotion, profile rescue or causal claim from diagnostic timings
 is justified. Source retention/removal is the parent's separate disposition.
+
+## Ordinary ACK-gap pending service: mechanism proof, mixed practical outcome
+
+This separate trial starts from `a16b404`, not the rejected projection-removal
+candidate. Request ACK validation, release, authoritative gaps, queue pruning
+and staleness still apply immediately. Heavy gap enumeration moves from every
+preselect/novel ACK into a selected fair Dispatch turn, with pending ownership,
+retained prearmed model/capacity futures and the existing absolute deadline.
+The job retains no target/range/native/queue snapshot. Actual claim, queue/copy,
+membership/qualification, model/capacity and deadline changes invalidate it;
+exact replay and unrelated input do not independently rescan frozen work.
+
+The final guard preserves the old queued-send retry predicate: pending gap
+discovery can select Dispatch, but a no-action evaluation cannot retry an
+otherwise blocked queue early. Per-region fresh ranking/proof/Apply and EOF
+ownership remain unchanged. This is not timing-identical relocation: first lazy
+observation moves to selected service, and transient shared load deliberately
+has no model publication. Frequent real invalidations, one large scan and direct
+structural dispatch can still consume service. No new clock/rate/profile knob.
+
+**No performance promotion:** the actual frozen-state work defect is corrected
+in its actor control, but this ordinary comparison delivers fewer bytes more
+slowly, worsens maximum confirmation gap and loses pre-cut/cut service. Restored
+target service, maximum write gap and client peak RSS improve. Preserve both
+sides rather than treating either the mean or one tail as the sole outcome.
+The only performance comparator is ordinary `a16` run23406; neither the rejected
+projection trial nor any diagnostic run is a speed baseline. One chronological
+realization does not establish causal effect sizes for each difference.
+
+### Proof sequence and exact artifacts
+
+Initial RED30086 compiles1m43s but fails fixture setup: after source EOF the new
+attachment legitimately receives FIN before PathProofData. Corrected82855 then
+fails compilation on Debug-formatting a non-Debug command. Neither is the
+intended Product failure. After preserving the exact command assertions and
+removing those interpolations, retry42394 compiles1m00s and reaches RED in.04s:
+heavy enumeration count rises3→9 across exact replay ACKs/reverse DATA, expected
+unchanged3. Counts are sampled at actual DATA Apply frontiers1/4; all bytes reach
+the sink, model generation stays fixed, alternate repair lane stays full and
+the minimum observed gap deadline remains future. This is an actor work proof,
+not an isolated capacity-release causality test; prearmed-wait tests remain
+separate controls.
+
+Initial GREEN76852 passes33control tests after1m42s compilation. Independent
+review then catches the premature queued-drain retry described above. After
+that correction, final60243 compiles53s and passes33control,12client and2actual
+path-model-publication tests: **47distinct passes**, not48 and not an extra33
+for the earlier run. Ordinary build33957 takes3m35s with the existing unused
+batch-helper warning. The frozen ordinary executable is
+`bin/ack-gap-pending-service-20260911/mptunnel`; no diagnostics, source changes
+or compiler overlap occur during runner3923, which exits0 in48.011265s.
+
+The [verified raw archive](ACK_GAP_PENDING_SERVICE_ORDINARY_20260911.raw.tar.gz)
+is298,051B/19regular files: five results; seven logs (setup RED, compile-failed
+RED, final RED retry, initial/final GREEN, build, driver); five patches (initial/
+corrected/final RED and initial/final candidate); `run.py` and `shape.sh`.
+Final patch contains four source files plus RFC. Gzip integrity, tar comparison
+and each decompressed member's bytes pass; runner/shape match the ordinary
+`a16` archive byte-for-byte. No configs, credentials, binaries or links.
+
+### Exact delivery and all48raw bins
+
+| Outcome | Ordinary `a16` | Pending-service candidate |
+|---|---:|---:|
+| Accepted = confirmed bytes | 526,385,152 | 488,636,416 |
+| Exact completed streams / errors | 1/1 /0 | 1/1 /0 |
+| Elapsed, s | 45.465808 | 47.180088 |
+| Whole confirmed Mbps | 92.621 | 82.855 |
+| First write / confirmation, s | .105228 /.408993 | .106295 /.409787 |
+| Maximum write gap, s | 7.235997 | 5.519041 |
+| Maximum confirmation gap, s | 4.145083 | **4.514583** |
+| Nominal40s endpoint to settlement, s | 5.465808 | 7.180088 |
+| Raw bins / zeros | 46 /11 | 48 /16 |
+
+Completed bytes fall7.17%, elapsed rises3.77%, whole rate falls10.54%; maximum
+write gap improves23.73% while confirmation gap worsens8.91%. Both probes are
+status `ok`, exact, without errors or censoring. There is no UP echo workload.
+Source backpressure can extend local acceptance past40s; the last bin is partial.
+
+| Raw confirmation phase | `a16`, Mbps | Candidate, Mbps | Candidate zeros |
+|---|---:|---:|---:|
+| 0–5s | 65.683 | 78.352 | 1/5 |
+| 5–15s, pre-cut | 96.384 | 61.285 | 4/10 |
+| 15–25s | 98.764 | 64.600 | 4/10 |
+| Interior16–24 inclusive | 104.288 | 62.573 | 4/9 |
+| 25–40s, restored | 83.343 | 95.116 | 5/15 |
+| Own post40 bins, final partial | 113.510 over40–46 | 103.968 over40–48 | 2/8 |
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 7.164,211.01,114.435,59.149,0,0,39.846,0,0,8.485
+10: 15.108,0,21.88,117.6,409.93,82.838,167.981,25.81,107.407,100.267
+20: 161.695,0,0,0,0,565.385,158.955,64.391,33.938,0
+30: 0,179.831,0,136.839,0,0,69.686,37.077,129.691,50.952
+40: 14.348,0,4.479,77.498,0,452.284,14.737,268.396
+```
+
+The restored improvement includes a large release after four zero bins; it
+does not demonstrate continuous service. Trimmed bins and burst rates are not
+substitutes for elapsed delivery or physical capacity.
+
+### Own target/reply chronology and native limits
+
+Management source-read, successful target-socket write, sink-reply read and
+local-reply write are separate counters. The probe has no saved exact maximum-
+gap endpoints or wall-clock origin, so the following plateaus are not asserted
+to be the exact4.514583s confirmation or5.519041s write intervals.
+
+| Sample band | Source read, B | Target write, B | Server reply read, B | Client reply write, B |
+|---|---:|---:|---:|---:|
+| 5→14, pre-cut | 117,973,546→142,420,834 | 117,240,650→118,628,906 | 266→434 | 122→213 |
+| 21→25 | 273,570,856 unchanged | 206,461,992 unchanged | 756 unchanged | 756 unchanged |
+| 29→31 | 379,151,538→385,353,458 | 346,359,538→373,729,586 | 1,022→1,092 | 910 unchanged |
+| 34→36 | 455,072,322 unchanged | 387,978,058→442,079,586 | 1,218→1,344 | 1,036 unchanged |
+| 43→47 | 488,636,416 unchanged | 466,995,074→488,636,416 | 1,624→1,791 | 1,204→1,400 |
+
+Thus slow service already occurs before the cut; later reply holds also coexist
+with substantial target progress. The21→25 target/reply plateau is exactly
+server Unix1789063215200→1789063219200. The29→31 and34→36 reply-flat boundaries
+are client Unix1789063223201→1789063225201 and1789063228202→1789063230202.
+At last sample47 all target writes are observed, but local replies are short;
+only the final probe proves settlement after that sample.
+
+During21→25, healthy47 native ACK counters add23,662,844TCP and63,200,972QUIC
+bytes while target writes remain fixed. QUIC46 ACKs are flat with advancing
+producer stamps21,089,279→25,702,752us and about6.55MBnative flight. TCP46 adds
+262,892ACKed bytes, but its stamp advances only20,951,286→21,621,379us across
+the4s management band: it is not a fresh per-second poll throughout. Its last
+sampled5.69s RTT is therefore cached evidence, not exact interval attribution.
+Native epochs are unchanged. Client Product flight shrinks9,186,112→136,608B
+while source minus target remains67,108,864B. The unclaimed source queue and
+assigned DSN frontier are not exported here; subtracting these domains cannot
+prove all outstanding source bytes reached the receiver or identify a hole.
+
+In29→31 and34→36, native forward ACK deltas are respectively
+28,429,104TCP/56,107,693QUIC and20,500,258TCP/45,127,247QUIC bytes. That carrier
+progress does not locate the delayed reply prefix. Ordinary logs contain no
+gap-call counters, owner timers or per-frame joins, so neither removal of actual
+work during these intervals nor an actor/native root cause is established.
+
+### Shape and complete sampled costs
+
+All48samples preserve independent200+200Mbps, DOWN30ms/UP70ms, zero configured
+loss/jitter/outage, netem limit8192,65536BHTB bursts and equal rates/ceilings.
+Only46UP is10Mbps at15.004991s, restored at25.006093s;47 stays200. Client
+eth0/eth1 are46/47, server eth1/eth0 are46/47. All class/qdisc drop deltas are0.
+Session13210812091047262669 retains eight active physical identities without
+suspect/failed states; all native epochs are initialized and stable from10.
+
+| Actual target-write phase | `a16`, Mbps | Candidate, Mbps | Candidate UP46 /47 class Mbps |
+|---|---:|---:|---:|
+| 0→5s | 155.060 | 187.585 | 155.430 /116.831 |
+| 5→15s | 75.944 | **14.396** | 63.555 /28.578 |
+| Strict16→24s | 119.326 | **50.273** | 9.918 /142.642 |
+| 25→40s | 68.915 | **135.925** | 123.591 /131.877 |
+| Own post40 sample window | 110.547 over40→45 | 31.216 over40→47 | 19.305 /180.438 |
+
+Target rates use actual producer times; class rates use their collector window.
+The restored target gain is real in this capture, while earlier target service
+is worse. Different stage timing prevents equating these with confirmation-bin
+means or inferring useful-copy efficiency from class bytes.
+
+| Whole sampled cost | Ordinary `a16` | Candidate |
+|---|---:|---:|
+| Sample window, s | 45.006732 | 47.011064 |
+| UP46 /47 class bytes | 467,368,412 /749,700,687 | 449,416,941 /682,444,780 |
+| DOWN46 /47 class bytes | 7,015,954 /8,612,499 | 7,374,429 /11,718,616 |
+| Summed UP backlog peak / final, B | 28,677,318 /12,763,272 | 27,630,042 /11,059,663 |
+| Summed DOWN backlog peak / final, B | 46,620 /13,425 | 51,434 /2,442 |
+| Client RSS peak / final, KiB | 355,388 /342,712 | 325,136 /256,572 |
+| Server RSS peak / final, KiB | 75,776 /75,776 | 138,828 /138,828 |
+| Client lifetime CPU peak / final, % | 126 /123 | 121 /120 |
+| Server lifetime CPU peak / final, % | 66.2 /37.8 | 61.4 /43.7 |
+
+Client RSS improves, server RSS rises; lower UP traffic accompanies fewer
+completed bytes, while DOWN traffic increases. Process CPU is lifetime `ps`,
+not interval CPU or saved owner cost. Final queue/RSS samples are not matched
+post-teardown measurements. Client log and stderr are empty; the366Bserver log
+has two normal `H3_NO_ERROR` close warnings after completion, no probe errors.
+
+Disposition: targeted frozen-state quiescence is proved, but the broader
+ordinary practical forecast is not cleared. Retain improved restored service
+and write-gap evidence alongside worse pre-cut/cut delivery, confirmation tail,
+whole throughput and server memory. No accepted stall correction, performance
+promotion, tuned rescue or attribution of every difference to the new owner.
+The parent rejected practical promotion and reversed all five candidate
+runtime/RFC/test files using the exact saved patch: source is back at `a16b404`.
+`target/release/mptunnel` remains the frozen rejected executable, not a rebuilt
+ordinary baseline; the archived trial and mechanism proof remain evidence only.

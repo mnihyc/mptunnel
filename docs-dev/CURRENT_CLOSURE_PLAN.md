@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 01:32 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 02:07 +08:00. Authoritative repository: ./.
 **MPP is NOT performance-accepted. No release, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -16,8 +16,11 @@ Runtime is a16b404 (docs checkpointc11d266). Diagnostic build28234 completed0
 in3m36s. Its exact seven-file overlay was frozen and FULLY REVERSED before
 traffic;90510 completed and its evidence is committed. The subsequent six-file
 recovery-attached observation trial FAILED ordinary44791 and is FULLY REMOVED.
-No build or lab is running; target/release and that trial's frozen binary are
-REJECTED candidates, not current source. Use the named a16 comparator below.
+The subsequent pending-service candidate FAILED practical promotion in3923;
+root FULLY REVERSED its five runtime/RFC/test files. Runtime is again a16b404.
+Ordinary build33957 and run3923 both completed; their frozen binary is REJECTED.
+The earlier recovery-attached frozen executable remains REJECTED. The ordinary
+a16run23406 remains the comparator; no runtime promotion has occurred.
 Diagnostic61411 completed; its three-file classifier was fully reversed.
 Its result changes the next decision: **do not implement a queue-readiness filter**.
 
@@ -252,6 +255,61 @@ independently due successors and immediate ACK release remain controls. Only
 cfg(test) ingress/counter additions are authorized before RED. No new harness.
 Root owns builds; independent agents audit actual producer invalidations.
 
+RED30086closed101 after1m43scompile; this is SETUP failure, not Product RED:
+after finite source EOF, lifecycle391 replays FIN before attaching the new
+output, so its first priority command need not be PathProofData. Correct the
+fixture's exact expected command sequence, preserving successful proof checks.
+Independent audit also separates evaluator-entry counts from a settled actor
+boundary; release→entry alone does not prove capacity caused the wake. Keep
+the existing real prearmed-wait proof separate rather than overclaim causality.
+No runtime implementation has begun. Failed log and initial test patch retained.
+
+Corrected82855 failed compilation only because the test's error messages tried
+to Debug-format a non-Debug command; root removed those interpolations, keeping
+the exact command guards. Retry42394 compiles1m00s and reaches the intended RED
+in.04s: actual heavy enumeration count3→9 across three exact-replay ACKs and
+three reverse-DATA Input boundaries, versus expected unchanged3. Actual model
+generation stays fixed, alternate queue stays full, every observed gap deadline
+is still future, all reverse bytes reach the sink. The observer now samples
+at actual DATA Apply frontiers1and4; no post-write task-scheduling ambiguity.
+This proves unnecessary actual-actor work, not capacity-wake causality or Mbps.
+Final test patch uses ack-gap-pending-service-red-final-0911.patch. The original
+setup failure and compile failure remain saved, not Product failures.
+Root now implements control pending ownership; scoped agent owns only immediate
+ACK Apply separation and RFC10.4 clarification. No rate/clock/range-ranking
+change or direct-dispatch cursor. Independent actual diff review/focused checks
+then ONE ordinary unchanged a16comparison; no untested candidate stack.
+
+First candidate76852closed0 after1m42scompile:33control tests pass, including
+the real-actor RED. Independent review found a bounded scope issue before
+promotion: gap-only Dispatch readiness also entered the old queued drain while
+its retry gate was still closed. Root restored the old queued_send_ready predicate;
+only class selection ORs pending. After gap evaluation, the queued/direct drain
+runs only if it was already ready or a real gap enqueue supplied new work and
+cleared its retry. Fresh no-action discovery cannot force an unrelated retry.
+Final focused batch repeats33control plus12client and path-model-publication
+checks; initial candidate patch and GREEN log retained. Pending ownership is
+three fields (bit + retained model/capacity futures) and the existing deadline;
+no retained range, target, queue or model snapshot and no added timer/threshold.
+
+Final60243closed0:53scompile,33control+.47scompile12client+.14scompile2
+publication tests pass (47distinct, not48; prior33 are repeated). Independent
+full diff audit confirms original queued retry gating after the correction,
+retained future lifetimes, no-alt model wake, actual direct-copy invalidation,
+unchanged fresh per-region ranking/Apply and EOF ownership. Ordinary release
+build33957 is active, no diagnostics; exact five-file source/RFC trial frozen as
+ack-gap-pending-service-final-0911.patch. Next unique frozen executable
+bin/ack-gap-pending-service-20260911/mptunnel, SAME aggregate combined up cell
+and tag ack-gap-pending-service-0911. Compare ordinary a16run23406, not rejected
+trial44791 or instrumented90510. No candidate commit or performance promotion.
+
+Build33957closed0 in3m35s. Root verified exact diff equals the final frozen
+patch, copied ordinary target/release to the unique executable above, then
+started run3923 with the unchanged cell at17:59UTC. No compiler overlap or
+source changes while it runs. Analyze only after CLOSED, then activate reader
+with followup_task for full series/completion/cost/archive; no optimistic peak
+or partial-byte report. Root continues authorized closure after disposition.
+
 Direct-dispatch attempt cursor is NOT in this patch. Counting failed regions
 against an existing item quantum is attractive, but cyclic continuation can
 skip a newly serviceable lower range/Regular after a yield; resetting every
@@ -259,6 +317,35 @@ publication can starve later work. Exact fresh Apply alone does not revalidate
 global priority. Its benefit is shorter indivisible Dispatch, not quiescence or
 the dominant restored preselect work. Preserve that countercase, do not add a
 generic generation system or silently weaken RFC15 to bundle another change.
+
+### Closed3923 outcome — pending-service candidate rejected
+
+Exact488636416B settle in47.180088s (82.855Mbps),1/1complete,0errors; no echo
+workload. Against a16ordinary23406, whole service falls10.5%; worst write gap
+improves7.235997→5.519041s but confirmation worsens4.145083→4.514583s.
+All48raw bins include16zeros. Pre-cut5–15 declines96.384→61.285Mbps, cut15–25
+98.764→64.600, strict16–24inclusive104.288→62.573; restored25–40 improves
+83.343→95.116. This is not acceptance from the better write gap/restored mean.
+Actual target-write5→15 declines75.944→14.396Mbps and16→24 declines119.326→
+50.273. Target/reply plateaus remain; native ACKs on healthy47 continue. These
+observations do not assign every held frame to a patch-introduced defect.
+
+The forecast of material composed service improvement is not supported despite
+the real3→9 redundant-work RED and47focused GREEN checks. Root reversed ALL
+five source/RFC/test files without a favorable rerun, rate/clock adjustment,
+or second candidate stack. Full report/archive preserve exact source, failed
+fixture setup/compilation, final tests, all bins/phases, CPU/RSS and native data.
+The final candidate executable/target-release remain rejected artifacts, not
+the current a16source identity. Source reverse verified by clean runtime diff.
+
+Next decision is attribution within the SAME material request service owner,
+not another pure projection optimization. Independent read-only audits inspect
+whether failed direct recovery remains ready without changed authoritative
+inputs, and whether its retry/publication ownership can quiesce without changing
+range/tier priority. They do not authorize implementation or resurrect the
+deferred cyclic cursor. One concrete producer countercase and a discriminator
+must precede a new model change. CPU20% addition remains separately unresolved;
+no language/controller blame or threshold change follows from a core peak.
 
 ## Just-completed correction: exact subsumed ACK invalidation
 

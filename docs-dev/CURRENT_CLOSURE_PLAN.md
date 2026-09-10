@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 13:34 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 13:50 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,46 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+13:50 +08 exact native-FIFO discriminator succeeds. Feature TCP healthy DOWN
+419.462Mbps,46/46echoes,median893.015/p951253.589/max1497.461ms; not performance
+promotion. Worst echo index38/range[2432,2496) first authenticates on path2.
+Its exact protected interval[600083336,600083448) is still below native initial
+send frontier1352.786ms after acceptance, crosses by1354.336ms, authenticates
+70ms later. The conservative unsent lower bound alone is90.34%of the same
+request's elapsed, not aggregateQ/C or a losing-copy attribution. Client event
+is pre-mailbox authentication, not an asserted Product winner. Reporter retains
+all46requests and75tracked copies; only35first-authcopies have tracked intervals.
+
+Root cause at this boundary: one-frame MPP priority arbitration remains correct,
+but repeated successful writes transfer bulk into a shared nonpreemptive native
+FIFO. Native socket memory acceptance is not prompt transmission eligibility.
+Prior prepared-source/one-frame fixes addressed MPP ownership, not this native
+handoff depth; do not remove their exact readiness/partialwrite invariants.
+Next bounded model decision is native-backed refill admission BEFORE Original
+claim, with actual capacity wakes and unchanged native congestion flight. A
+socket option alone can merely move HOL into the one already-claimed write.
+Reserve must cover real wake/refill service; Linux wakes below HALF its unsent
+low-water threshold. No numeric threshold or production candidate selected yet.
+Expected removable delay is the demonstrated~1.35s unsent part of this request,
+not all TCP RTT/retransmission/shared-cut delay or a guaranteed Mbps gain.
+One coherent prototype and affected ordinary controls must falsify throughput,
+CPU, wake/lifecycle and fast-alternative regressions before any promotion.
+
+13:45 +08 TCP observer preparation: independent counter audit validates signed
+W−Q for the exact Noise writer/socket lifetime, including presplit handshake
+debt. TLS is excluded because read-side protocol writes break exclusive writer
+accounting. Existing native observation turns only; no new polling. Retain the
+last below-end syscall bracket: a late first crossing alone is only an upper
+bound and cannot prove late transmission if actor service was delayed.
+Explicit diagnostic stream selector MPTUNNEL_LAB_STREAM_ID=0 has no default;
+the existing workload waits for its first successful echo before opening bulk.
+One nonempty≤64B, single-frame protected interval per physical carrier may be
+pending; never replace an unfinished interval. Client observation is immediately
+after authenticated decode, before the reader's bounded actor queue. This is
+feature-only attribution, not a new production rate/queue/lifecycle model.
+Next remains the ONE declared TCP healthy DOWN capture; retain any selection,
+sampling or nonrecurrence limitation rather than infer a policy from it.
 
 13:34 +08 disposition: retain ba56290's demonstrated receipt-liveness
 correction, NOT performance acceptance or the original5sincident's cause.

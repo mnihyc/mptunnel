@@ -159,6 +159,8 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             carrier_network,
         )
         .await?;
+        #[cfg(feature = "lab-diagnostics")]
+        let lab_local_addr = tcp_stream.local_addr().ok();
         let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);
         let mut framed = EncryptedFramedStream::connect(tcp_stream, tls, codec_limits).await?;
         let transport_binding = framed.tcp_admission_binding()?;
@@ -226,6 +228,31 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             reader,
             reliable_path_writer_frame_queue(mux_limits),
             move |frame| {
+                #[cfg(feature = "lab-diagnostics")]
+                if let Frame::StreamData {
+                    stream_id,
+                    offset,
+                    payload,
+                    ..
+                } = frame
+                    && crate::lab_diagnostics::lab_selected_stream_id() == Some(stream_id.0)
+                    && !payload.is_empty()
+                    && payload.len() <= 64
+                {
+                    crate::lab_diagnostics::lab_diagnostic(
+                        "tcp_echo_authenticated",
+                        format_args!(
+                            "session_id={} path_namespace=wire path_id={} local_addr={:?} remote_port={} stream_id={} offset={} payload_bytes={}",
+                            session_id.0,
+                            path_id.0,
+                            lab_local_addr,
+                            remote_port,
+                            stream_id.0,
+                            offset,
+                            payload.len(),
+                        ),
+                    );
+                }
                 if let Frame::SessionClose { reason } = frame {
                     observed_lifecycle.retire(*reason);
                 }

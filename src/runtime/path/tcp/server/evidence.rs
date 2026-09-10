@@ -35,6 +35,32 @@ pub(in crate::runtime::path::tcp) struct ServerTcpEvidenceState {
     sender_refresh_pending: bool,
     path_proofs: PathProofTracker,
     request_capacity_receive: CapacityReceiveTracker,
+    #[cfg(feature = "lab-diagnostics")]
+    lab_wire_frontier: Option<LabTcpWireFrontier>,
+}
+
+#[cfg(feature = "lab-diagnostics")]
+struct LabTcpWireFrontier {
+    identity: (u64, u64, u64),
+    written: u64,
+    pending: Option<LabTcpWireInterval>,
+}
+
+#[cfg(feature = "lab-diagnostics")]
+struct LabTcpWireInterval {
+    stream_id: u64,
+    offset: u64,
+    end: u64,
+    wire_start: u64,
+    wire_end: u64,
+    write_started: Instant,
+    admitted: Instant,
+    started: bool,
+    // The syscall occurs inside this bracket. A late first above-end sample
+    // alone does not establish late transmission: a subsequent write may have
+    // prevented the actor's ordinary observation turns from running.
+    last_below: Option<(Instant, Instant, i128)>,
+    unknown_samples: u64,
 }
 
 impl ServerTcpEvidenceState {
@@ -57,6 +83,143 @@ impl ServerTcpEvidenceState {
             request_capacity_receive: CapacityReceiveTracker::new(
                 reliable_capacity_measurement_session_limit_bytes(mux_limits),
             ),
+            #[cfg(feature = "lab-diagnostics")]
+            lab_wire_frontier: None,
+        }
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) fn lab_enable_wire_frontier(&mut self, identity: (u64, u64, u64)) {
+        if crate::lab_diagnostics::lab_diagnostic_event_enabled("tcp_echo_wire_frontier") {
+            self.lab_wire_frontier = Some(LabTcpWireFrontier {
+                identity,
+                written: 0,
+                pending: None,
+            });
+        }
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) fn lab_can_track_wire_frame(&self, frame: &Frame) -> bool {
+        // Explicit diagnostic selection, not a production traffic classifier.
+        // A pending interval is never replaced, so slow/censored samples are
+        // not selected away. The size bound is the declared echo workload.
+        self.lab_wire_frontier
+            .as_ref()
+            .is_some_and(|state| state.pending.is_none())
+            && matches!(frame, Frame::StreamData { stream_id, payload, .. }
+                if Some(stream_id.0) == crate::lab_diagnostics::lab_selected_stream_id()
+                    && !payload.is_empty() && payload.len() <= 64)
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) fn lab_track_wire_frame(
+        &mut self,
+        frame: &Frame,
+        wire_start: u64,
+        wire_end: u64,
+        write_started: Instant,
+    ) {
+        let Some(state) = self.lab_wire_frontier.as_mut() else {
+            return;
+        };
+        let Frame::StreamData {
+            stream_id,
+            offset,
+            payload,
+        } = frame
+        else {
+            return;
+        };
+        let Some(end) = offset.checked_add(payload.len() as u64) else {
+            return;
+        };
+        if state.pending.is_some() || wire_end <= wire_start {
+            return;
+        }
+        state.pending = Some(LabTcpWireInterval {
+            stream_id: stream_id.0,
+            offset: *offset,
+            end,
+            wire_start,
+            wire_end,
+            write_started,
+            admitted: Instant::now(),
+            started: false,
+            last_below: None,
+            unknown_samples: 0,
+        });
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) fn lab_set_wire_written(&mut self, written: impl FnOnce() -> u64) {
+        if let Some(state) = &mut self.lab_wire_frontier
+            && state.pending.is_some()
+        {
+            state.written = written();
+        }
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    fn lab_observe_wire_frontier(&mut self, queue: Option<u64>, sample_begin: Instant) {
+        let Some(state) = &mut self.lab_wire_frontier else {
+            return;
+        };
+        let Some(sample) = &mut state.pending else {
+            return;
+        };
+        let sample_end = Instant::now();
+        // W counts every successful protected socket write since the split.
+        // Q includes any older handshake debt, hence subtraction is signed.
+        // Only Noise is enabled: its reader cannot concurrently write bytes.
+        let frontier = queue.map(|queue| i128::from(state.written) - i128::from(queue));
+        if frontier.is_none() {
+            sample.unknown_samples = sample.unknown_samples.saturating_add(1);
+        }
+        let crossed = frontier.is_some_and(|frontier| frontier >= i128::from(sample.wire_end));
+        if !sample.started || crossed {
+            lab_diagnostic(
+                "tcp_echo_wire_frontier",
+                format_args!(
+                    "phase={} session_id={} path_namespace=wire path_id={} path_instance_id={} stream_id={} offset={} end={} wire_start={} wire_end={} written={} notsent={:?} initial_send_frontier={:?} write_us={} sample_begin_after_admit_us={} sample_end_after_admit_us={} last_below_begin_after_admit_us={:?} last_below_end_after_admit_us={:?} last_below_frontier={:?} unknown_samples={}",
+                    if crossed { "cross" } else { "start" },
+                    state.identity.0,
+                    state.identity.1,
+                    state.identity.2,
+                    sample.stream_id,
+                    sample.offset,
+                    sample.end,
+                    sample.wire_start,
+                    sample.wire_end,
+                    state.written,
+                    queue,
+                    frontier,
+                    sample
+                        .admitted
+                        .saturating_duration_since(sample.write_started)
+                        .as_micros(),
+                    sample_begin
+                        .saturating_duration_since(sample.admitted)
+                        .as_micros(),
+                    sample_end
+                        .saturating_duration_since(sample.admitted)
+                        .as_micros(),
+                    sample.last_below.map(|(begin, _, _)| begin
+                        .saturating_duration_since(sample.admitted)
+                        .as_micros()),
+                    sample.last_below.map(|(_, end, _)| end
+                        .saturating_duration_since(sample.admitted)
+                        .as_micros()),
+                    sample.last_below.map(|(_, _, frontier)| frontier),
+                    sample.unknown_samples,
+                ),
+            );
+            sample.started = true;
+        }
+        if crossed {
+            state.pending = None;
+        } else if let Some(frontier) = frontier {
+            sample.last_below = Some((sample_begin, sample_end, frontier));
         }
     }
 
@@ -100,9 +263,25 @@ impl ServerTcpEvidenceState {
         path_id: PathId,
         force: bool,
     ) {
-        let Some(observation) = self.tcp_metrics.as_mut().and_then(|publisher| {
+        #[cfg(feature = "lab-diagnostics")]
+        let lab_sample_begin = self
+            .lab_wire_frontier
+            .as_ref()
+            .and_then(|state| state.pending.as_ref())
+            .map(|_| Instant::now());
+        let observation = self.tcp_metrics.as_mut().and_then(|publisher| {
             publisher.maybe_observe(path_id, PathMetricDirection::ServerToClient, force)
-        }) else {
+        });
+        #[cfg(feature = "lab-diagnostics")]
+        if (force || observation.is_some())
+            && let Some(sample_begin) = lab_sample_begin
+        {
+            self.lab_observe_wire_frontier(
+                observation.and_then(|sample| sample.queue_bytes()),
+                sample_begin,
+            );
+        }
+        let Some(observation) = observation else {
             return;
         };
         context

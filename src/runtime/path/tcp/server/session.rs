@@ -106,6 +106,20 @@ pub(in crate::runtime::path::tcp) struct ServerTcpPathSession {
 impl ServerTcpPathSession {
     pub(in crate::runtime::path::tcp) fn new(admission: ServerTcpPathAdmission) -> Self {
         let max_udp_flows_per_session = admission.context.max_udp_flows_per_session;
+        #[cfg(feature = "lab-diagnostics")]
+        let admission = {
+            let mut admission = admission;
+            // Noise read halves never emit native writes; TLS read-side
+            // protocol output would invalidate this exclusive-writer bracket.
+            if admission.context.tls.shared_transport_secret_configured() {
+                admission.evidence.lab_enable_wire_frontier((
+                    admission.session_id.0,
+                    u64::from(admission.path_id.0),
+                    admission.path_registration.path_instance_id().as_u64(),
+                ));
+            }
+            admission
+        };
         Self {
             session_id: admission.session_id,
             path_id: admission.path_id,
@@ -209,6 +223,9 @@ impl ServerTcpPathSession {
             ) {
                 self.commands_rx.withdraw_writer_ready();
             }
+            #[cfg(feature = "lab-diagnostics")]
+            self.evidence
+                .lab_set_wire_written(|| self.writer.lab_wire_bytes_written());
             self.evidence
                 .observe_periodic(&self.context, &self.path_registration, self.path_id);
             match event {
@@ -1022,6 +1039,9 @@ impl ServerTcpPathSession {
         }
         let wrote = self.writer.commit_transaction(&mut self.evidence).await?;
         if wrote && *writer_pending_bytes > 0 {
+            #[cfg(feature = "lab-diagnostics")]
+            self.evidence
+                .lab_set_wire_written(|| self.writer.lab_wire_bytes_written());
             self.evidence
                 .observe_after_write(&self.context, &self.path_registration, self.path_id);
         }
@@ -1106,6 +1126,9 @@ impl ServerTcpPathSession {
         };
         if write_result {
             if *writer_pending_bytes > 0 {
+                #[cfg(feature = "lab-diagnostics")]
+                self.evidence
+                    .lab_set_wire_written(|| self.writer.lab_wire_bytes_written());
                 self.evidence.observe_after_write(
                     &self.context,
                     &self.path_registration,

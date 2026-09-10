@@ -15,6 +15,11 @@ pub(in crate::runtime::path::tcp) struct ServerTcpWriter {
 }
 
 impl ServerTcpWriter {
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) fn lab_wire_bytes_written(&self) -> u64 {
+        self.framed.wire_bytes_written()
+    }
+
     pub(in crate::runtime::path::tcp) fn new(framed: EncryptedTcpWriter) -> Self {
         Self {
             pending_frames: Vec::new(),
@@ -57,6 +62,14 @@ impl ServerTcpWriter {
         if self.pending_frames.is_empty() {
             return Ok(true);
         }
+        #[cfg(feature = "lab-diagnostics")]
+        let lab_wire_start = self
+            .pending_frames
+            .first()
+            .filter(|frame| {
+                self.pending_frames.len() == 1 && evidence.lab_can_track_wire_frame(frame)
+            })
+            .map(|_| (self.framed.wire_bytes_written(), std::time::Instant::now()));
         let commit = async {
             self.framed.write_frames(&self.pending_frames).await?;
             self.framed.flush().await
@@ -64,6 +77,15 @@ impl ServerTcpWriter {
         .await;
         match commit {
             Ok(()) => {
+                #[cfg(feature = "lab-diagnostics")]
+                if let Some((wire_start, started)) = lab_wire_start {
+                    evidence.lab_track_wire_frame(
+                        &self.pending_frames[0],
+                        wire_start,
+                        self.framed.wire_bytes_written(),
+                        started,
+                    );
+                }
                 for frame in &self.pending_frames {
                     evidence.record_sent_frame(frame);
                 }

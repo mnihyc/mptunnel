@@ -26,6 +26,13 @@ pub(crate) fn lab_diagnostic_event_enabled(event: &str) -> bool {
     lab_diagnostic_event_filter().is_none_or(|filter| filter.contains(event))
 }
 
+/// Explicit stream selection for bounded, workload-scoped observations.
+/// Omission or an invalid value disables selection; stream zero is not a default.
+pub(crate) fn lab_selected_stream_id() -> Option<u64> {
+    static SELECTED: OnceLock<Option<u64>> = OnceLock::new();
+    *SELECTED.get_or_init(|| std::env::var("MPTUNNEL_LAB_STREAM_ID").ok()?.parse().ok())
+}
+
 #[cfg(not(test))]
 fn lab_diagnostics_requested() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

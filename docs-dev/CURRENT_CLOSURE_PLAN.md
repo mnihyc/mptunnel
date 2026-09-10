@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-10 15:32 +08:00. Authoritative repository is `./`.
+Updated: 2026-09-10 15:55 +08:00. Authoritative repository is `./`.
 **MPP is not performance-accepted. No release, push, public README update or
 ideality claim. Continue the authorized closure task, not just this checkpoint.**
 
@@ -13,10 +13,71 @@ exact joins, source overlays, tests and archives. Condensation deletes no eviden
 
 ## Decision and active transaction
 
-**Active now:** ordinary current mixed combined DOWN/UP have both completed
-(312.384Mbps DOWN with66/66echoes;62.511Mbps UP exact352845824B settlement).
-The predeclared currentQUIC/H2/raw UP control sequence is running, session74372,
-to classify the low UP rate under the actual10Mbps restriction/changing loss.
+**Current next transaction: independent200Mbps links.** All12combined stress
+cells are captured and61rawfiles archived before any topology/driver change.
+See NATIVE_REFILL_COMBINED_20260910: currentDOWN TCP/Q/mixed/raw/Xray/H2
+404.684/311.418/312.384/363.575/299.315/144.912Mbps. Loaded latency remains
+adverse, soleUDP echo disconnects are explicit, and TCP/H2/XrayUP have distinct
+censored/terminal-closure outcomes. This is practical evidence, not full closure.
+No new runtime correction is selected from native-loss-limited drain alone.
+
+Question/forecast: one mixed link200 versus two independent mixed links200each,
+both DOWN and UP, ordinaryb0,40s,30/70ms, no randomloss/jitter/QoS/outage first.
+Does useful ordered service consume both independent cuts and materially exceed
+the single-cut service without failed completion/large new gaps? The physical
+sum is400Mbps before overhead, not a promisedgoodput. Aggregate capacity is not
+proved merely by configured paths, summed stale rates or controller count.
+Inspect both actual class counters, source/routes and fulltiming/cost. A failed
+owner or materially missing aggregation selects that cause before impairment
+expansion; no reserve/hint/controller adjustment to force a pass.
+
+Reuse currentownedcontainers and targetPIDs13/19/25. After verifiedquiescence,
+remove ONLY exact client47/24via46.30 and server46/24via47.30 routed routes,
+attach client47.10 to existing_b and server46.20 to_a. Check all4destination
+routes direct, no gateway. Router staysidle. No host shaping/recreation/sudo.
+OlddefaultBBR and4CPU endpoint limits remain. BothTCP+QUIC share each200cut;
+two bridges are independent shaped cuts, not independentphysicalhosts.
+
+Minimal driver-input preparation only: optional REFLECTION_LINK_RATE selects
+one uniform per-link base rate at init AND scheduledrestoration; aggregate's
+old300/200and60/40 defaults remain untouched when unset. Explicit rate200
+therefore avoids the oldrunner overwriting requested200. Reject an aggregate
+with routed topology because its twointerfaces are opposite directions, not
+parallel cuts. Dry-run command routing before live use; no Product source edit.
+REFLECTION_MIRROR_IMPAIRMENT=1 retains DOWN30/UP70 even for directtopology;
+REFLECTION_ROUTED must be absent. Tag native-refill-independent-200-0910.
+After this gate, restore exact routednetworkstate and remove only gate-installed
+endpoint HTB roots before routed reuse, or explicitlyrecord directstatecontinuity.
+
+The chronological combined classification below is CLOSED, not a rerun queue.
+
+**Active now:** combined mixedDOWN/UP and QUIC/H2/rawUP controls are complete.
+MPPmixedUP62.511 and QUP96.986Mbps settle exactly; rawUP7.293Mbps settles
+in63.979s. H2UP is censored at85s,39.120/60.097MBconfirmed/accepted, and must
+not be assigned a completed goodput. Current5–15s mixed/Q/raw UP means are
+40.461/171.935/8.237Mbps;35–40s142.408/100.547/3.781. The physical restriction
+and observed coexistence tradeoff do not support a new arbitrary model fix.
+
+NEXT complete the already-required same-profile six-system directional matrix
+before changing topology: currentQDOWN,TCPDOWN,TCPUP, then raw/Xray/H2DOWN
+and XrayUP, each previously unrun in this current cohort. Same500Mbps pinned
+combined asymmetric schedule, ordinary binaries, no observer/compiler. Prior
+failed H2UP is retained, not repeated. Expected information is practical
+availability, timing and cost versus matched baselines in everymode/direction,
+not a targetMbps in a poor phase. A new criticalMPPcompletion/recovery failure
+stops expansion for attribution; native-loss-limited means alone do not.
+Tag native-refill-combined-matrix-0910, lognative-refill-combined-matrix-0910.log.
+QDOWN311.418Mbps loses its sole-UDP echo at the outage; TCPDOWN404.684Mbps
+keeps all56echoes but p95is1191ms. TCPUP hits85s guard with126339020of152436736B
+confirmed. Read-only final80→85s snapshots show every-second target and native
+TCP ACK progress (+9.175MB target,14.680Mbps), stable identities;26.1MB remains
+unconfirmed. This is an incomplete, steadily draining observation, not a proven
+deadlock or successful full settlement. Do not fix native-loss-limited drain to
+meet a lab guard. Source reset/closure occurs at runner shutdown.
+The planned sequence stops there automatically; continue ONLY still-unrun
+raw/Xray/H2DOWN andXrayUP, no repeat/candidate/guard change. Then existing
+independent200Mbps aggregation, not more healthy5% microtrials.
+
 No new runtime fix is supported by the preceding recovery attribution; it
 located post-admission delay, not a late timer/priority wake. The active next
 decision is matched directional service, not more per-byte instrumentation.
@@ -142,6 +203,15 @@ confirmed settlement, firstservice/confirmationgaps and native/resource context.
 Do not rank terminal-ACK-censored baseline means as exact completions. One
 predeclared control sequence, not repeats until good numbers. Tag
 native-refill-combined-controls-0910, lognative-refill-combined-controls-0910.log.
+CurrentQUIC UP settles exactly564789248B/46.587072s,96.986Mbps, maxconfirmation
+gap5.160s. Pre-restriction5–15s171.935Mbps versus mixed40.461; restored35–40s
+100.547 versus mixed142.408. No universal mixed or QUIC advantage follows.
+H2 reaches the existing85s runner observation guard:39120373of60096512locally
+accepted bytes confirmed, then runner shutdown resets the connection. Its
+3.668Mbps summary is censored, NOT exact completion or an independent H2 reset.
+No full raw bins remain in its incomplete-probe output. The driver stopped the
+sequence there; run only the still-unrun rawUPcell with identical settings.
+Do not repeat H2 or change its guard/profile to obtain a favorable comparator.
 
 Completed outage-only CONTROL→CANDIDATE parameters, retained: same
 40s mixed DOWN/echo with500/500Mbps, DOWN30/UP70ms, wholeUDP outage30–33s,

@@ -2134,3 +2134,137 @@ remaining4.145s confirmation gap, worsened7.236s write gap and poor restored
 service prevent performance promotion. Preserve this result and the narrow
 correctness checkpoint separately; no threshold rescue, diagnostic-as-baseline
 comparison or favorable rerun is justified by this one outcome.
+
+## Repair-plan refusal diagnostic: early queue-negative work, absent late bound-plan activity
+
+This small diagnostic resolves the actual refusal branch but **does not select
+a queue-readiness filter**. Of 308,051 recorded bound plans, 299,219 (97.133%)
+fail in the chooser after existing enqueue checks observe false and never true;
+8,832 succeed and reach authority. Yet 93.217% of those refusals have accumulated
+by about20.1s, while a strictly contained4.042s interval in the later target
+plateau contains **no recorded bound-plan attempt**. Early count dominance
+cannot be assigned to that late stall or turned into removable CPU time.
+
+Source is ordinary `a16b404` plus a temporary three-file count-only overlay;
+parent freezes it and fully restores ordinary source before traffic. Build takes
+3m35s with the existing unused-helper warning. There is no full owner-timing or
+per-reply-stage overlay. Runner61411 exits0 in75.010718s. The [verified raw archive](REPAIR_PLAN_REFUSAL_PROFILE_20260911.raw.tar.gz)
+contains11regular files/595,627B: five results, build/driver, exact patch, wrapper,
+`run.py` and `shape.sh`. Gzip, tar and every decompressed member's bytes pass;
+runner/profile match the preceding ordinary archive. No configs/binaries/links
+are included. The wrapper enables PERF and literally sets `MPTUNNEL_LAB_SAMPLES=0`;
+source recognizes `MPTUNNEL_LAB_PERF_SAMPLES`, not that variable. No sample records
+actually occur, so the capture is periodic-only without attributing that fact
+to the misspelled variable.
+
+### Exact partition and its temporal falsifier
+
+Count `total_bytes`/`interval_bytes` as **attempts**, not payload. `total_count`
+counts emitted batches; synthetic1us per record is not measured plan cost.
+Scope is bound `ClientStalePathReinjection`/`ClientPathFailureReinjection` inside
+the synchronous dispatch guard, not every recovery path. TLS accumulation emits
+after Product unlock without rereading the original predicates.
+
+| Flushed outcome | Attempts | Emitted batches |
+|---|---:|---:|
+| `chooser_blocked_queue_false` | 299,219 | 5,366 |
+| `success` | 8,832 | 2,211 |
+| `authority_reached`, subset of success | 8,832 | 2,211 |
+
+The other ten exclusive plan exits and three post-plan refusals have no emitted
+component, including unclassified, captured eligibility and target/proof/load
+refusal. Thus the twelve-way plan partition is308,051, and success equals
+post-target + post-proof + post-load + authority-reached at the final observed
+counters. Queue-negative means at least one evaluated enqueue predicate was
+false and none true in that failed attempt; it does not distinguish full permits
+from closed/inactive output, continuous fullness, or exact free slot count.
+
+All interval count/byte/time deltas and sums reconcile for1,046client and914server
+performance rows. Per-component recording/flush is not atomic: one group at
+Unix1789057441388–1389 has success5,183 versus authority5,049, then the next
+group at7442389–2390 reconciles8,814each. Do not interpret that transient134
+split as a missing authority outcome. Client logs have periodic reasons only:
+last bound counters are at7443393, with subsequent periodic activity through
+7446397 and no newer bound values, not a separately recorded close flush.
+
+By Unix1789057391731 (20.109s after first management timestamp),278,923 refusals
+have accumulated; by7396811,280,555 (93.762%). The following differences use
+cumulative states at complete periodic-group ends strictly inside each coarse
+management band; boundary groups are excluded, so rows do not sum to the whole.
+Completed scopes can straddle a flush; counts supply no exclusive time partition.
+
+| Management band | Actual full-flush span, s | Queue-negative / success | Target-write increase across management band, B |
+|---|---:|---:|---:|
+| 5–15s | 9.029 | 110,787 /1,908 | 193,365,032 |
+| 16–24s | 7.043 | 100,288 /1,743 | 18,917,936 |
+| 25–40s | 14.197 | 3,071 /146 | 56,067,224 |
+| 40–74s | 33.370 | 15,409 /4,468 | 28,449,256 |
+
+Own reply delivery stays1115B at samples37–45 while target writes increase
+362,834,384→365,312,768B. Its7.094s full-flush interior contains966negative/
+94successful plans. Later, local replies stay1157B at53–61: the7.076s interior
+contains only29negative/10successful plans. Most decisively, target writes stay
+367,459,576B at57–62 while source grows375,701,312→384,290,876B. The fully
+contained Unix1789057429233→1789057433275 interval spans4.042s and contains0
+plans of any recorded kind. This counterevidence blocks treating a filter for
+these plans as the immediate late-stall correction. Other unobserved work,
+unavailable recovery authority and return service are not distinguished here.
+There are no exact reply-frame stages or saved probe gap endpoints to import
+from the prior capture.
+
+### Own complete service and costs, not an ordinary performance comparison
+
+All392,364,032B settle exactly in74.605760s,42.073Mbps,1/1complete, no probe errors.
+First write/confirmation are .105813/.412161s; maxima are5.791800/9.391853s.
+No echo workload is present. All75raw confirmation bins below contain42zeros;
+last bin is partial. Settlement extends34.605760s beyond nominal40s offering,
+and actual source acceptance reaches its final value only by sample65.
+
+```text
+raw bin start (s): receiver-confirmed Mbps
+ 0: 13.317,143.419,327.156,48.234,0,129.359,87.543,89.378,216.103,79.455
+10: 274.439,117.81,195.75,39.545,0,0,45.959,295.599,150.652,78.058
+20: 2.112,0,4.075,0,2.352,0,0,0,2.193,0
+30: 2.591,0,0,0,0,0,40.533,0,0,0
+40: 0,0,0,0,0,44.835,0,0,0,0
+50: 0,0,32.41,0,0,0,0,0,0,0
+60: 0,5.863,0,0,0,0,37.845,37.623,241.289,168.664
+70: 0,.62,52.359,0,131.773
+```
+
+Raw means for0–5 /5–15 /15–25 /16–24inclusive /25–40 /40–75 are
+106.425 /122.938 /57.881 /64.312 /3.021 /21.522Mbps. The restored25–40
+interval has12/15zero bins. Actual target-write rates over its own5→15,
+16→24,25→40 and40→65 sample intervals are154.677/18.916/29.903/1.218Mbps.
+They are not the raw confirmation clock or evidence that earlier queued bytes
+were useful. By sample71 all target bytes and2150reply bytes exist; client
+delivery remains2095B at71,2109B at72 and2137B at73–74 before final settlement.
+
+In the target-flat57–62 band, client total queue is0 at every sample; Product
+flight remains52,819,916→50,539,708B, including QUIC46 debt44,059,172→43,326,276B
+despite its native flight0 and fresh native stamps with no new native ACK bytes.
+QUIC47 adds45,030native ACK bytes and the two used TCP outputs add58,668/14,692B:
+small progress is not ordered bulk service. Idle TCP stamps sometimes do not
+advance. Client lifetime CPU stays112%, RSS328,776→326,408KiB; these are not
+interval CPU or held-lock measurements. No command-slot or exact critical-copy
+ownership is exported, so zero total queue is not proof of admission readiness.
+
+All75profiles verify the unchanged two200Mbps links, DOWN30ms/UP70ms, zero
+configured loss/jitter/outage, burst/cburst65536 and netem limit8192. Only46UP
+is observed at10Mbps from runner15.004350s, restored at25.005402s;47 stays200.
+Class/qdisc drops remain0. Eight physical outputs remain stable; all native
+epochs are initialized and stable from sample10. Cost window is74.010520s:
+
+| Sampled cost | Client / UP | Server / DOWN |
+|---|---:|---:|
+| Link46 /47 class bytes | 345,119,213 /404,303,713 | 6,380,915 /5,872,876 |
+| Summed class backlog peak / final, B | 25,782,577 /300 | 37,954 /0 |
+| RSS peak / final, KiB | 328,776 /321,156 | 69,868 /69,868 |
+| Lifetime process CPU peak / final, % | 132 /111 | 53.2 /17.9 |
+
+Logs contain only periodic/counter output:435,733client/383,021server bytes;
+probe stderr is empty. Observation overhead is not measured away, and these
+results do not replace the ordinary ACK-correction capture. Information outcome:
+the refusal branch is identified, but its timing contradicts attributing the
+largest late stalls to continued execution of those plans. No queue-filter
+implementation or performance promotion is selected by this result.

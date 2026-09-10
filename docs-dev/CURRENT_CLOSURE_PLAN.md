@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated:2026-09-10 11:46 +08:00. Authoritative source is `./`.
+Updated:2026-09-10 12:24 +08:00. Authoritative source is `./`.
 **MPP is not performance-accepted. No release, push, or ideality claim.**
 
 Read [the mandatory method](PERFORMANCE_METHOD_AND_LESSONS.md) before every
@@ -14,6 +14,74 @@ retain exact ranges, raw timing bins, costs, RED/GREEN logs and observer patches
 ## Active transaction: user-requested mixed-mode architectural redesign
 
 ### Selected next model gate — confirmed return service with baseline fallback
+
+12:24 +08 observer outcome: no source change. The ordinary1.098s gap does not
+recur; diagnostic maximum is.475828s near restoration. Exact body/DSN alignment
+identifies a TCP-owned missing prefix. Full fanout was already active1.105s
+before the hold; sender admits its exact14,600B repair70ms after the preceding
+frontier, and that carrier releases it406ms later. This rules out delayed
+feedback fallback for THIS observed gap, not the earlier ordinary gap. Echo's
+worst1,686ms exchange also has prompt proof/credit processing, followed by
+1,616ms from server reply queue admission to client logical receipt. Both
+echo outputs are TCP; whole-QUIC outage does not test its selected return loss.
+No precise writer/native/network/actor split or avoidable timer hold is proved.
+
+The independent bulk/echo report RETURN_ROUND_OUTAGE_OBSERVER_20260910 retains
+the exact identities, accepted-versus-queued distinction and evidence limits.
+Root created/listed its six-file raw archive including64s feature build. This
+32.85MB log capture is causal observation, never an ordinary speed control.
+The ordinary DOWN/UP/outage reports and37-file archive preserve all adverse
+phases and successful exact UP settlement; promotion stays held. Next decision
+is bounded source-boundary review versus same-profile native baseline/mode
+classification, not another timer or new issue inventory. A slow admitted
+copy alone is not proof of an avoidable MPP hold or of physical inevitability.
+
+12:04 +08 outage result stops promotion: whole384.128→383.408Mbps is nearly
+unchanged, but maxbodygap.777480→1.097872s (36.845–37.622→36.937–38.035s),
+echo p95697.271→881.787ms and max1534.222→1641.343ms worsen.76→73echo successes,
+no failures/restarts. Restored body375.064→425.334Mbps cannot erase the gaps.
+Both server QUIC ACK-byte counters stay flat across sampled31–35s despite
+UDP restoration near33.1s; native progress resumes36s. This is not evidence
+that the return-proof policy alone caused the adverse user interval.
+
+Next information-only discriminator on unchanged364d417: one feature build,
+same outage-only DOWN cell, existing filtered events
+feedback_return,receive_hole_reinjection_signal,receive_hole_release,
+server_data_ack_recovery,server_repair_carrier_accept,
+server_stale_output_recovery,server_response_recovery_wake. No new observer,
+DATA payload/per-ACK dump or harness. Omit receive_hole: its byte-changing key
+logs near each buffered frame. Existing release events can still be numerous;
+use them only to reconstruct the exact ordered frontier, not as speed evidence.
+
+Competing causes are delayed proof/fanout activation versus native/retained
+DATA-prefix recovery, or application service after a released prefix. Join
+actual proof transitions, persistent-hole timer, exact release frontier and
+accepted repair extent, retaining queued-versus-accepted distinction. These
+events cannot prove copy winner or physical queue position; receiver events
+require verification of a single session/stable incarnation mapping. The
+capture must pick a material owner or leave attribution unresolved, not blame
+a scalar rate/Active label or adjust any timer. Ordinary tradeoffs stay held;
+one diagnosed candidate stop does not end the authorized task/global gates.
+
+11:55 +08 ordinary round-trial outcomes: DOWN whole333.025→388.945Mbps;
+restricted202.095→384.810, maxreadgap.574399→.322268s, echo p95602.299→422.633ms,
+79→80successes, no failures. Return class bytes fall24.46%, actualdrops0 both.
+Preserve adverse whole maxecho701.524→726.535ms and restored echo p95
+347.933→400.385ms; healthy/restored body means improve. UP completes exactly
+397.631→409.247Mbps; restricted340.206→416.408, maxconfirmation/write gaps
+.483374/.443350→.473387/.411651s. UP healthy437.461→411.338 and restored
+429.498→412.126Mbps are adverse phases, not omitted. Candidate is materially
+supported for return-cut service, not accepted across failure/competition.
+
+Next fixed comparison: same ordinary CONTROL0cab2b5 then CANDIDATE364d417,
+existing mixed combined DOWN,500/500,30/70ms, no configured randomloss/jitter/
+QoS; whole QUIC outage30–33s,40s bulk+echo. The new model deliberately permits
+one additional proof interval, so retained same-request recovery and worst
+gaps/echo/settlement are the question. No expected throughput gain is promised.
+Stop promotion on material recovery harm and trace its owner, not a smaller
+timer. This is whole-QUIC failure coverage; without actual selected identity
+it does not alone prove loss of the selected feedback output. That narrower
+coverage remains explicit, not waived. No broader new inventory or harness.
 
 11:46 +08 route-round trial: the actual policy test failed at its intended
 second100ms receipt assertion (six old controls passed), then passes after
@@ -3038,18 +3106,19 @@ raw274.677Mbps is not a substitute; no redundant rerun just to obtain wins.
   `./.tmp/reflection/bin/ack-cadence-20260909/mptunnel`. Its123s trial build and unused
   helper warning are historical; reversing the trial removes that warning's
   cause. No trial cleanup or associated tests remain implementation obligations.
-  Current ordinary trial0cab2b5 is frozen at
-  `./.tmp/reflection/bin/confirmed-return-20260910/mptunnel`; target/release
-  currently contains that ordinary trial until the feature-only observer build.
-  Its64s build has one now test-only compatibility helper warning. No cleanup
-  changed the eight ordinary cells. Do not confuse upcoming diagnostic binary
-  with either frozen ordinary executable. Protocol trial is wire15; use matched
+  Prior ordinary trial0cab2b5 is frozen at
+  `./.tmp/reflection/bin/confirmed-return-20260910/mptunnel`; current364d417
+  ordinary is `./.tmp/reflection/bin/return-round-20260910/mptunnel`.
+  `target/release/mptunnel` currently contains the feature outage observer,
+  also frozen in `./.tmp/reflection/bin/return-round-outage-observer-20260910/`.
+  No cleanup or source change occurred between the six new ordinary cells.
+  Do not confuse diagnostic and frozen ordinary executables. Protocol trial is wire15; use matched
   binaries at both endpoints, no mixed-version compatibility assumption.
 - Exact intermediate commits only; preserve raw evidence before scoped cleanup.
   No deletion in this condensation. User's seven-line
   LIVE_OWNER_FRONTIER_WORK_BOUND.md edit must remain untouched and unstaged.
-- Telegram latest three-pair report sent approximately2026-09-10 03:02UTC;
-  next nonurgent not before04:03UTC. Respect hourly minimum/soft-frequency advice; no component-only
+- Telegram latest measured return-round/outage report sent approximately2026-09-10 04:06UTC;
+  next nonurgent not before05:07UTC. Respect hourly minimum/soft-frequency advice; no component-only
   success notification or unfinished completion claim.
 - Method reflection: symbolic conservation justified exact work removal but
   did not predict every timing phase. Follow the same winning-prefix evidence,

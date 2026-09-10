@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-09 14:05 +08:00. Category: requested global retrospective and
+Updated: 2026-09-10 12:08 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -252,6 +252,17 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- A fixed deadline can be impossible even when each individual exchange is
+  timely. The09-10 confirmed-return capture proves two~100ms proof exchanges
+  serialized behind one~175ms successor budget: the second starts with only
+ 80msleft. Safety/frozen-timer tests preserved the old rule but missed this
+  healthy-service counterexample. Write the timing dependency inequalities
+  before code; distinguish per-fact authority from route-liveness policy.
+  Removing successor state improves restricted DOWN202→385Mbps and UP340→416,
+  but the ordinary outage gap worsens.777→1.098s; do not infer full acceptance.
+  A simpler proof-round model must explicitly disclose its additional possible
+  failure interval, while fresh native/owner/reply delay remains separately
+  attributed. Never rescue impossible sequencing with a larger timer.
 - A nonrenewing ACK deadline is not a latency-neutral deadline. The09-09
   logical-cadence trial passes634checks and improves restricted152→196Mbps,
   but echo p95/max656/757→1472/1957ms and body gap.563→.755s worsen. Less

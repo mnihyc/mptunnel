@@ -1,6 +1,6 @@
 # v0.4.9 release closure plan
 
-Updated: 2026-09-11 09:34 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 11:13 +08:00. Authoritative repository: ./.
 Category: user-directed release convergence. No release acceptance yet.
 
 ## Active amendment: challenge claims, prioritize severe user impact
@@ -310,6 +310,65 @@ observer, never the comparator. Ordinary adverse evidence is archived as
 RESPONSE_UNCOVERED_PREFIX_ORDINARY_20260911.raw.tar.gz (9files/235057B), with
 full timing/cost and copied-feedback attribution limits in the report appendix.
 
+Diagnostic outcome CLOSED: the rejected trial plus exact-G observer delivers
+182.224Mbps, healthy5--15=187.601 and QoS15--25=182.704. It reproduces the low
+healthy useful service and high wire/useful(1.711), NOT the ordinary3.3008s body
+gap (this capture max.9522s). All65 attempted echoes succeed; p95=1381ms and
+five consecutive echoes exceed1s. Observer timing does not replace the adverse
+ordinary acceptance result.
+
+Independent event replay reconstructs all21,335 bulk canonical-G updates from
+positive receipts and explicit scopes exactly. All15,221 bulk repair admissions
+classify:567,283,320 accepted payload bytes,485,543,876 inside immediately
+preceding G and81,739,444 outside. None overlaps an already-applied positive
+receipt. In the conservative healthy interior94.00% of all repair bytes and
+93.63% of tail-copy bytes are already inside G. Only3.20% of healthy tail bytes
+are provably below an earlier client ordered frontier. Unknown receiver state
+must not be called an already-delivered duplicate. G is admission/log-order
+evidence, not a reconstruction of the earlier queue-time decision.
+
+Decision: the next proposed G-only restriction lacks its forecast premise and
+is NOT implemented. It would not reject most observed healthy copy volume on
+the tested membership predicate. The QoS interior also changes recovery cause:
+TCP carries stale-owner recovery while tail copies go toQUIC; do not attribute
+the entire gain to faster live-tail service alone. No candidate2 exists.
+
+Last bounded read-only question, using current source/history and this SAME
+capture: are fallback epochs incorrectly aged in local source staging, or do
+copies follow actual receiver omission while their Originals still have normal
+native service? Production source inspection places Original sent_at after the
+exact writer-ready claim, not before source staging. Claim still precedes actual
+native completion; that distinction alone is not a wrong-epoch defect. Inspect
+only observable range receipt/repair ordering and record its limits. Forecast:
+a concrete wrong timestamp/coverage owner could support a bounded correction;
+intended timing plus insufficient causal trace ends this model trial without
+another timer, rate, reserve, or protocol-preference change. No new traffic or
+observer is planned. Root owns the final disposition after independent review.
+
+Read-only timing challenge CLOSED: production sent_at follows consumption of
+the exact writer-ready claim (0449b9f), while physical transport completion is
+later. No source-staging epoch defect is present. The full-ledger minimum clock
+update is also intentional (953a54f), so extra/earlier calls can alter maturity
+without changing a formula; the capture does not isolate that effect. One
+healthy8,352B suffix is known already reordered before its ordered release and
+is copied again150ms afterward while the sender still reports it missing.
+Its earlier copy's immutable suppression period has elapsed. This proves that
+stale receipt knowledge can permit an unnecessary copy; it does NOT justify
+extending suppression or explain most healthy copying. Other first-arrival
+and Original/native timing facts are not in this capture.
+
+Final disposition of this bounded challenge: independent DOWN aggregation is
+proved, a blanket shared-bottleneck explanation is falsified, and severe
+split-link recovery remains a release blocker. The failed pipeline and the
+unsupported G-filter/timestamp remedies are not accepted fixes. Local range,
+credit and clock correctness did not establish useful composed service.
+No runtime change survives this transaction; no public performance update or
+release is permitted from these results. The existing finite-plan stop rule
+applies: resolving the remaining recovery tradeoff requires a new, explicitly
+scoped timing/service model decision, not stacking another unproved patch.
+Preserve this concrete blocker and its exact observations for that decision;
+do not silently expand into congestion-control or bottleneck inference work.
+
 ## Decision: freeze scope, finish a release
 
 The user's latest instruction stops further broad exploration and prioritizes
@@ -339,8 +398,8 @@ Do not republish an existing version or tag before the gates pass.
   or run. Other previously rejected trials remain removed. Do not restore them.
 - Current ordinary candidate executable:
   ./.tmp/reflection/bin/clipped-range-20260911/mptunnel.
-  target/release/mptunnel is now the retained-reply-gate observer executable,
-  also frozen at ./.tmp/reflection/bin/retained-reply-gate-20260911/mptunnel,
+  target/release/mptunnel is now the rejected-trial exact-G observer executable,
+  frozen at ./.tmp/reflection/bin/response-uncovered-proof-20260911/mptunnel,
   NOT the ordinary candidate. bin/ordered-credit-head-20260911/mptunnel
   remains the REJECTED trial executable. Always use explicit paths.
 - Version/package/docs changes may follow the gates. A runtime change requires
@@ -464,11 +523,13 @@ review, and is not part of the candidate.
 21 regular files; independent input-byte verification, root complete171-line
 appendix review and gzip/manifest checks done. No observer follow-up exists.
 
-Root is preparing the next selected regression test build; no laboratory run
-is active.
+No build or laboratory run is active. Independent capture/timing reviews are
+closed; the final eight-file diagnostic archive is51,090,323B raw/2,786,019B
+compressed, with full replay and receipt-timing limits in the evidence appendix.
+Runtime/RFC/manifests are restored exactly to dbed0c5/current04f.
 Root alone runs builds/labs, without overlap. Existing project Docker only;
 no sudo, outside-root work or /mnt/storage use. Preserve the unrelated user
 seven-line edit in LIVE_OWNER_FRONTIER_WORK_BOUND.md; AGENTS.md is immutable.
-Next nonurgent Telegram notification no earlier than02:50 UTC.
+Next nonurgent Telegram notification no earlier than03:53 UTC.
 Commentary stays timely; no release notification
 before an actual milestone.

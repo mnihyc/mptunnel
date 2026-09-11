@@ -118,3 +118,38 @@ stability, inevitable mixed penalties, deployed-incident closure and current-
 release nonregression claims. The topology comparison addresses a missing
 premise, not an invitation to revive rejected timer/queue models.
 Only severe observed failure selects its smallest causal check or correction.
+
+## Closed current-source challenge, 2026-09-11
+
+The planned protocol-isolation cells and selected controls are now complete;
+the earlier pending statements above record their original question, not a
+current absence of results. See the complete
+[isolated-link record](ISOLATED_LINK_STABILITY_20260911.md), including invalid
+attempts, ordinary comparisons and separately labelled diagnostics.
+
+- **Independent download aggregation is real, within the measured envelope.**
+  Current04f on two200Mbps cuts gives TCP46=179.278, QUIC47=178.857 and
+  TCP46+QUIC47=309.377Mbps. All three have80/80 echoes and maximum body gaps
+  below.401s. The split is72.57% above the better singleton, not a promise of
+  their summed capacity. Upload completes exactly in all three cases but the
+  split182.160Mbps has no material gain over181.284Mbps QUIC alone. Do not call
+  both directions equally aggregating or open a small-gain tuning task.
+- **Shared contention is not the whole mixed-mode explanation.** With TCP47
+  unchanged at200Mbps and QUIC46 temporarily10Mbps, split DOWN QoS service is
+  13.381Mbps while TCP47 alone delivers183.595Mbps in the matching phase.
+  Split UP has a5.699s confirmation gap; target and native TCP progress during
+  that hold prove it is not wholly a forward-service freeze. Publishedv0.4.8
+  also suffers in the split controls, so this is not solely a new04f defect.
+  The failure is material under the user's triage and remains unresolved.
+- **The proposed recovery correction is not accepted.** Actual-producer RED
+  and170 focused GREEN checks support its local nonserialized copy mechanism;
+  ordinary healthy throughput drops40.37% and a3.3008s body gap appears despite
+  much better QoS throughput. Trialec8cd2f is fully withdrawn by843a63f. The
+  exact-G follow-up also falsifies the easy next filtering hypothesis. No
+  controller gain, deadline, reserve or protocol preference is changed.
+- **Lifecycle and CPU conclusions retain their limited scope.** These
+  protocol-isolation results neither undo the documented exact reclamation
+  evidence nor close the deployed RAM/CPU report. No new profiling result or
+  permission exists. General platform/browser/restart acceptance is not inferred
+  from bulk+echo tests. The release remains blocked by severe recovery service,
+  not by a requirement to eliminate every small performance difference.

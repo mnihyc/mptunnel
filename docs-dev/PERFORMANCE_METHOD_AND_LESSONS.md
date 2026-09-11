@@ -1,6 +1,6 @@
 # Performance method and lessons
 
-Updated: 2026-09-10 23:36 +08:00. Category: requested global retrospective and
+Updated: 2026-09-11 11:18 +08:00. Category: requested global retrospective and
 execution method. No runtime change, new experiment or release acceptance.
 CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
@@ -261,6 +261,20 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- Removing recovery serialization is not free useful capacity. The09-11
+  response coverage trial passes170 focused checks and raises split-link QoS
+  service13.381→153.633Mbps, but healthy service falls324.202→193.307Mbps and
+  a3.3008s body gap appears. It is withdrawn. A separate exact-range diagnostic
+  finds94% of healthy repair bytes already inside receiver-reported omissions;
+  therefore a simple omission-membership filter is not a supported remedy.
+  Such omissions describe an earlier receiver state, not proven native loss or
+  the current whereabouts of the Original. Preserve assignment, admission,
+  native service, receipt and ACK-application times separately. A helper that
+  min-tightens every retained assignment's deadline also makes invocation
+  frequency and timing semantically relevant, even when no timer formula is
+  edited. Neither that reachable effect nor extra wire bytes alone identifies
+  a particular measured stall. Stop the adverse approach rather than attach a
+  new threshold or unproved restriction to rescue its selected-phase gain.
 - Product-lock immutability does not freeze independently published structural
   policy. The09-10 whole-gap observation proposal was rejected before runtime:
   region1 can capture B/C as Backup while copies exclude both; an independently

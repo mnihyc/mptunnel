@@ -647,3 +647,148 @@ It contains the candidate's five raw files plus build log and three test logs:
 170component tests passing, NOT ordinary acceptance. Baseline and runner are
 already archived in ISOLATED_LINK_ADVERSE; exact trial source is checkpoint
 ec8cd2f. No binary, credentials, invalid run or unrelated test log is included.
+
+## Rejected-trial proof diagnostic: simple outside-G explanation falsified
+
+Recorded2026-09-11. CLOSED session3148 exit0, raw directory
+`./.tmp/reflection/results/aggregate-combined-down-isolated-tcp47-quic46-uncovered-proof-0911/`.
+This runs rejected `ec8cd2f` plus an observation-only extension of the existing
+server ACK event with exact `received_ranges` and `stored_gaps`. The feature
+build took1m23s. It is NOT a second runtime candidate or acceptance rerun;
+the ordinary3.300801s failure and adverse disposition above remain unchanged.
+No model/parameter change is recommended from this diagnostic.
+
+The proposed easy explanation was that the new tail-copy volume principally
+escaped authoritative omissions G, so restricting it to G would remove the
+healthy cost. The exact observed decisions falsify that explanation:
+93.6343% of strict-healthy tail-copy bytes are INSIDE G. An outside-G-only
+filter would leave the dominant directly observed volume. This does not prove
+inside-G copies necessary, every tail admission harmful, or all indirect
+effects of a hypothetical policy; it selects no candidate2.
+
+### Service, topology and measurement cost
+
+HTTP200,911136574B over40.000664s,182.224Mbps; one duration-partial8GiB
+object, not full-object completion. First body.577406s. Maximum body gap is
+.952238s at25.413582086–26.365820398s, body567617048→567631648B: the
+ordinary3.300801s bulk gap did NOT reproduce. All65actual echoes succeed,
+not65successes plus15failures. Echo p50/p95/max109.563/1381.361/2440.730ms;
+11exceed500ms, five exceed1s and two exceed2s. The five consecutive long
+echoes span16.410269–25.416515s; worst21.594403–24.035133s. There is no
+disconnect or unavailable-attempt tail. Smaller bulk gaps do not erase this
+diagnostic's loaded-echo disturbance or replace ordinary performance evidence.
+
+| Raw phase,Mbps |Rejected ordinary|Proof diagnostic|
+|---|---:|---:|
+|0–5|151.587|151.495|
+|5–15|193.307|187.601|
+|15–25|153.633|182.704|
+|16–25|153.222|184.825|
+|25–30|232.120|203.268|
+|30–33|160.703|144.328|
+|33–40|198.762|196.973|
+
+Complete40diagnostic body bins,Mbps; no zeros or trimming:
+
+```text
+00: 2.621 174.801 196.276 193.729 190.050 189.364 194.047 185.774 174.182 160.087
+10: 193.811 194.172 189.450 186.802 208.318 163.622 200.554 200.002 188.076 193.050
+20: 191.253 190.430 120.061 187.746 192.250 80.408 230.714 266.002 222.233 216.982
+30: 158.645 160.350 113.990 176.956 201.967 195.695 189.694 227.413 222.544 164.543
+```
+
+All40physical rows retain3TCP47+1QUIC46, fixed identities,4active/0suspect/
+0failed. DOWN70/UP30ms, zero random loss/jitter;47stays200Mbps.46DOWN10Mbps
+new-state rows15.104087→25.105099s, UDP blackout30.105604→33.302738s.
+Class/netem drops0 do not negate the separate INPUT-drop rules. Loop stamps
+precede command completion. Client/server management each repeat two stamps.
+Native paths retain one epoch and nondecreasing sample times/ACK totals.
+
+Sampled DOWN QUIC46/TCP47 bytes629648008/929662283, return22173080B;
+wire/useful1.711390. DOWN backlog peaks12773403B, server native flight33721494B,
+server queue543578B. Client/server RSS peaks60744/350960KiB, lifetime CPU
+59.7/101%. Healthy own-clock rows5→15 show454652761B native ACK advancement
+but233311888B logical delivery. These are useful/carrier cost observations,
+not exact repair-byte estimates, exclusive CPU ownership or a leak diagnosis.
+The separately observed long-lived upload sink has1CPU tick/0major faults,
+unchanged157468KiB RSS/716464KiB historical swap; it is not an HTTP/echo trace.
+
+Client/server logs are22120961/27090879B, combined49211840B. All117481
+diagnostic records parse and files end with newlines: client80850records
+(45330hole,35454release,66ACK), server36631(21400ACK,15231actual repair).
+The three non-diagnostic warning lines accompany terminal closure; probe
+stderr is empty. Exact sequence domains are complete, but physical log order
+reverses six times client/four server. Sort sequence, not file order. This is
+syntactic/selected-event completeness, not proof all uninstrumented work is
+visible. Heavy logging keeps this capture outside ordinary performance claims.
+
+### Exact applied-positive/G replay and actual admitted-copy classification
+
+Server PID572892, bulk stream1, sole copy session528831491406641683; echo
+stream0 is excluded. In numeric server sequence order, independently replay
+all21335bulk ACKs: accumulate positive union P, remove each ACK's positives
+from old G, then add `[scope_start,last_received_end) minus P` ONLY for an
+explicit Some scope. Normalize exact half-open intervals. Reconstructed G
+matches every logged stored set, zero mismatches. Both independent analysts
+reproduced the classification. Each copy uses its immediately preceding G;
+all15221admissions have such a set, no crossing/unknown copy, and none overlaps
+previously applied positive bytes. Formed/queued work is not counted as accepted.
+
+| Actual bulk cause |Records|Bytes|Inside G bytes|Outside G bytes|
+|---|---:|---:|---:|---:|
+| tail_reinjection |13308|466558710|412069230|54489480|
+| stale_path_reinjection |1881|100242344|72992380|27249964|
+| persistent_ack_gap_reinjection |30|416730|416730|0|
+| ack_gap_reinjection |2|65536|65536|0|
+| Total |15221|567283320|485543876|81739444|
+
+Strict healthy management-wall band is half-open
+[1789095437839,1789095445841)ms, approximately6–14s, NOT exact probe phases:
+5767copies/175485104B,164958704inside G(94.0015%). Tail alone is5579copies/
+165361472B,154835072inside(93.6343%),10526400outside. Strict QoS band
+[1789095447839,1789095455840)ms, approximately16–24s:1024copies/53173712B,
+36545584inside(68.7287%). Of these, stale46823984B and persistent102200B
+target TCP; tail6247528B all targets QUIC. This distinguishes causes/targets
+without assuming every queued tail decision has the same effect. No DOWN
+started-file wall anchor makes these exact load-probe phase boundaries.
+
+Receiver-prefix corroboration is deliberately weaker than full receipt.
+Use stream1 hole `next_offset` and release `frontier_after`, cumulative max,
+with client timestamps STRICTLY earlier than each copy; exclude same-ms ties.
+Strict-healthy tail bytes5297656/165361472=3.203682% are already below that
+ordered frontier, all also inside server G.163whole records are covered;
+first-cover lead median/p95/max150/181/189ms. Whole-copy lower bound is
+48495975B(8.548810%). Out-of-order receipt and unlogged contiguous progress
+are omitted, so the remainder is NOT proven unreceived, necessary or useful.
+
+Exact example: tail seq9944[195241012,195249364), TCP2/incarnation2,
+at1789095441363ms. Earlier ACK seq9900 at1278ms in the same1789095440000ms
+base contains G[194013332,199894068); client first full-prefix cover is1213ms,
+and its earlier latest F is198835316. Inside-G work can already be received
+while positive feedback is returning; this is not a sender applied-ACK breach.
+
+That suffix first enters server G at1789095440225ms(seq8655); TCP1/incarnation1
+copies its1888+6464B pieces at0981ms(seq9618/9619), with316533us remaining
+suppression. At1213ms client seq27721 receives EARLIER frame
+[194980756,195001108) and releases F194980756→195634228. The selected suffix
+lies beyond incoming.end, so it was already in reorder before release. This
+is a lower-bound/example, not first-arrival time or Original/copy provenance.
+The later TCP2copy follows known release150ms and the earlier suppression
+interval; no D-tuning recommendation follows. The event is conditional on
+buffered reorder/frontier advance, so absence never proves absence of arrival.
+Root's separate actual-writer-claim epoch audit found no wrong source-staging
+timestamp; that negative finding chooses no second candidate or clock change.
+
+### Reproducibility and archive
+
+`./.tmp/reflection/response-uncovered-proof-reproduction-0911.md` records exact
+parse/order rules, interval replay and intersection snippet, all count/byte
+targets, strict/approximate wall bands and receiver-prefix lower-bound steps.
+Archive `./docs-dev/RESPONSE_UNCOVERED_PROOF_DIAGNOSTIC_20260911.raw.tar.gz`
+contains8regular files: five raw results, exact
+`response-uncovered-proof-observer-0911.patch`,
+`response-uncovered-proof-observer-build-0911.log`, and that reproduction note.
+All source bytes verified:51090323B raw /2786019B compressed. No credentials,
+binary, unrelated result, runtime fix or invented driver wrapper is included.
+Runner/shape and rejected runtime provenance remain in the earlier archives
+and ec8cd2f checkpoint. CURRENT/method/source were untouched by this task.

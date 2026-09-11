@@ -3458,9 +3458,8 @@ length of the maximal retained contiguous prefix from the lowest uncovered
 byte on which `O_s(x)` is the same non-empty singleton and `A_s(x)` is
 unchanged. A cache or application-write boundary alone does not end `I_s`; a
 retained-data hole, ambiguous owner, non-live owner, or exact identity-set
-change does. Let `H_s` be the byte length of the first contiguous retained
-range not covered by queued repair or a current accepted copy with an unexpired
-suppression deadline, let `Q_s^r` be the direction's common
+change does. Let `H_s` be the byte length of the uncovered portion of the exact
+lowest retained Product frontier, let `Q_s^r` be the direction's common
 immutable repair quantum captured for target ranking, and let
 `M_s = min(Q_s^r, H_s, I_s)`.
 
@@ -3533,17 +3532,8 @@ failure prefix without skipping ahead. All accepted bytes remain in
 directional Product recovery-work accounting.
 
 Retained-frontier fallback applies during active sending as well as final
-drain. Its recovery frontier is the lowest retained byte not already covered
-by queued repair or a current accepted copy with an unexpired suppression
-deadline, refined to exact cached OriginalData ownership and the ranked prefix
-above. Such coverage is NOT receipt: it neither releases retained debt nor
-advances the positive Data-ACK/cache frontier. Subsequent evaluations may service
-the next uncovered prefix without waiting for an ACK of the preceding copy;
-each evaluation still ranks and admits at most its own quantum. Skip only
-positive-ACK cache holes and exact queued/live-copy coverage, never an uncovered
-immature, ambiguous, non-live or presently unserviceable owner. Accepted-copy
-expiry removes suppression, not exact publication ownership. Keep copy-expiry
-and queued-work capacity/retry wakes even when all retained bytes are covered.
+drain. Its frontier is the sender's current positive Data-ACK/cache frontier,
+refined to exact cached OriginalData ownership and the ranked prefix above.
 Source EOF, empty source staging and scope of historical ACK evidence
 are not prerequisites. Suffix receipt or source activity MUST NOT postpone the
 original owner's immutable fallback deadline. This local retained obligation
@@ -3551,8 +3541,6 @@ does not extend negative ACK scope or declare omitted/native data lost;
 speculative authoritative-gap recovery retains its separate proven-omission
 requirement. Existing accepted-copy suppression and exact target/native service
 admission apply before another copy, including a copy to a third carrier.
-An authoritative-gap evaluation that produces candidate frames but queues none
-MUST NOT suppress this independently due retained fallback.
 
 For this retained fallback, an immature adjacent assignment MUST NOT make an
 already mature lowest prefix wait. Limit the identity-uniform candidate to

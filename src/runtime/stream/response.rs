@@ -458,5 +458,3 @@ mod tests;
 #[cfg(test)]
 #[path = "response/tests_test_support.rs"]
 mod test_support;
-#[cfg(test)]
-pub(in crate::runtime) use test_support::native_response_binding_fixture;

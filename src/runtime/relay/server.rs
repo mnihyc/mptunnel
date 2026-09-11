@@ -377,11 +377,18 @@ fn response_retained_frontier_candidate(
     if frontier >= send_stream.next_offset() || send_stream.reinjection_bytes() == 0 {
         return false;
     }
-    // Arm capacity before exact selection. A copy of F must not suppress an
-    // uncovered successor, possibly with a different Original owner. Likewise
-    // the retained owner need not remain eligible for new payload.
-    matches!(&path_stream.output, ReliablePathStreamOutput::Switchable(binding)
-        if binding.has_live_owner_recovery_alternative())
+    // This is structural eligibility only. Queue fullness must not prevent
+    // the actor from arming capacity before the exact helper observes it.
+    send_stream
+        .retransmission_frames_for_ranges(
+            &[OffsetRange {
+                start: frontier,
+                end: send_stream.next_offset(),
+            }],
+            1,
+        )
+        .first()
+        .is_some_and(|frame| path_stream.has_reinjection_path_for_frame(frame))
 }
 
 // Response reinjection deadlines
@@ -1134,15 +1141,8 @@ fn enqueue_live_response_retained_frontier_reinjection(
     {
         return LiveResponseRetainedFrontierEnqueueOutcome::default();
     }
-    let Some(uncovered) =
-        response_sender.retained_recovery_frontier(path_stream, send_stream, observed_at)
-    else {
-        // The actor's accepted-copy expiry and queued-work capacity/retry wakes
-        // remain independent of whether this evaluation finds uncovered work.
-        return LiveResponseRetainedFrontierEnqueueOutcome::default();
-    };
-    let frontier = uncovered.start;
-    let frontier_end = uncovered.end;
+    let frontier = send_stream.data_ack_frontier();
+    let frontier_end = send_stream.next_offset();
     let base_reinjection_limit = match phase {
         ResponseRetainedFrontierPhase::Active => {
             let lane = path_stream.current_lane();
@@ -2965,7 +2965,7 @@ where
             // credit. ACK-gap and exact failed/unknown-owner recovery retain their
             // separate authority; historical ACK completeness does not gate F.
             let retained_frontier_outcome =
-                if !failed_original_tail_reinjection_ready && ack_gap_recovery.queued == 0 {
+                if !failed_original_tail_reinjection_ready && ack_gap_recovery.frame_count == 0 {
                     enqueue_live_response_retained_frontier_reinjection(
                         response_sender,
                         path_stream,
@@ -3654,7 +3654,7 @@ where
                     // Apply positive ACK release before observing the exact
                     // retained owner, then queue recovery before this branch's
                     // sender drain regardless of source EOF.
-                    let retained_frontier_outcome = if reinjection.queued == 0
+                    let retained_frontier_outcome = if reinjection.frame_count == 0
                         && !failed_original_tail_reinjection_ready
                     {
                         enqueue_live_response_retained_frontier_reinjection(

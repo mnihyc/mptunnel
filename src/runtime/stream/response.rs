@@ -458,7 +458,3 @@ mod tests;
 #[cfg(test)]
 #[path = "response/tests_test_support.rs"]
 mod test_support;
-
-#[cfg(test)]
-#[path = "response/tests_prepared_repair.rs"]
-mod tests_prepared_repair;

@@ -2,7 +2,7 @@
 
 use crate::model::path::CarrierPathInstanceId;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::Notify;
@@ -15,13 +15,6 @@ pub(in crate::runtime) struct ReliableWriterBoundary {
     generation: AtomicU64,
     instance: AtomicU64,
     changed: Arc<Notify>,
-    // Serializes foreground publication with an opportunistic claim's final
-    // consume. This counts ownership, not byte capacity or native idleness.
-    foreground: Mutex<usize>,
-    // Foreground arbitration becoming clear is not a physical Ready change.
-    // Only repair work subscribes; Original refusals must not wake siblings
-    // merely by dropping their payload-free queue/notification ownership.
-    foreground_released: Arc<Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,13 +29,6 @@ pub(in crate::runtime) struct ReliableWriterReadyReceipt {
 #[derive(Debug)]
 pub(in crate::runtime) struct ReliableWriterReadyGuard {
     receipt: ReliableWriterReadyReceipt,
-    background: bool,
-    loan: bool,
-}
-
-#[derive(Debug)]
-pub(in crate::runtime::path) struct ReliableWriterForegroundGuard {
-    boundary: Arc<ReliableWriterBoundary>,
 }
 
 impl ReliableWriterBoundary {
@@ -70,27 +56,7 @@ impl ReliableWriterBoundary {
                 generation: ready,
                 instance,
             },
-            background: false,
-            loan: false,
         })
-    }
-
-    pub(in crate::runtime::path) fn register_foreground(
-        self: &Arc<Self>,
-    ) -> ReliableWriterForegroundGuard {
-        let mut pending = self.foreground.lock().expect("writer foreground lock");
-        *pending = pending.checked_add(1).expect("writer foreground overflow");
-        ReliableWriterForegroundGuard {
-            boundary: self.clone(),
-        }
-    }
-
-    pub(in crate::runtime::path) fn has_foreground(&self) -> bool {
-        *self.foreground.lock().expect("writer foreground lock") != 0
-    }
-
-    pub(in crate::runtime::path) fn foreground_release_notify(&self) -> Arc<Notify> {
-        self.foreground_released.clone()
     }
 
     pub(in crate::runtime) fn snapshot(self: &Arc<Self>) -> Option<ReliableWriterReadyReceipt> {
@@ -151,34 +117,9 @@ impl ReliableWriterReadyGuard {
         self.receipt.clone()
     }
 
-    /// The ordinary writer retains revocation authority while the separate
-    /// QUIC repair writer holds this payload-free handoff. Either occupation
-    /// ends the epoch; foreground publication defeats background consume.
-    pub(in crate::runtime::path) fn background_handoff(&self) -> Self {
-        Self {
-            receipt: self.receipt.clone(),
-            background: true,
-            loan: true,
-        }
-    }
-
-    pub(in crate::runtime::path) fn set_background(&mut self, background: bool) {
-        self.background = background;
-    }
-
     /// Only the actual writer consumes its epoch, immediately before the
     /// synchronous claim transaction. This grants no Product/Native authority.
     pub(in crate::runtime) fn try_consume(&self) -> bool {
-        let foreground = self.background.then(|| {
-            self.receipt
-                .boundary
-                .foreground
-                .lock()
-                .expect("writer foreground lock")
-        });
-        if foreground.as_ref().is_some_and(|pending| **pending != 0) {
-            return false;
-        }
         let consumed = self
             .receipt
             .boundary
@@ -199,30 +140,7 @@ impl ReliableWriterReadyGuard {
 
 impl Drop for ReliableWriterReadyGuard {
     fn drop(&mut self) {
-        if self.loan {
-            // Metadata refusal did not occupy either writer. The ordinary
-            // owner still holds, and may revoke, this idle epoch.
-            return;
-        }
-        // Revocation is unconditional even when foreground prevents a claim.
-        self.background = false;
         self.try_consume();
-    }
-}
-
-impl Drop for ReliableWriterForegroundGuard {
-    fn drop(&mut self) {
-        let mut pending = self
-            .boundary
-            .foreground
-            .lock()
-            .expect("writer foreground lock");
-        *pending = pending.checked_sub(1).expect("writer foreground underflow");
-        let released = *pending == 0;
-        drop(pending);
-        if released {
-            self.boundary.foreground_released.notify_waiters();
-        }
     }
 }
 
@@ -269,92 +187,5 @@ mod tests {
             .publish(CarrierPathInstanceId::from_raw(1))
             .unwrap();
         assert!(futures::poll!(&mut changed).is_ready());
-    }
-
-    #[test]
-    fn background_handoff_yields_to_foreground_and_keeps_original_authority() {
-        let boundary = Arc::new(ReliableWriterBoundary::default());
-        let ordinary = boundary
-            .publish(CarrierPathInstanceId::from_raw(1))
-            .unwrap();
-        let offered = ordinary.background_handoff();
-        let foreground = boundary.register_foreground();
-        assert!(
-            !offered.try_consume(),
-            "publication wins before background admission"
-        );
-        assert!(
-            ordinary.receipt().is_current(),
-            "refusal does not occupy the writer"
-        );
-        assert!(
-            ordinary.try_consume(),
-            "foreground keeps its ordinary authority"
-        );
-        drop(foreground);
-        assert!(
-            !offered.try_consume(),
-            "the old offer cannot follow foreground occupation"
-        );
-    }
-
-    #[test]
-    fn dropping_blocked_background_handoff_preserves_ordinary_idle_epoch() {
-        let boundary = Arc::new(ReliableWriterBoundary::default());
-        let ordinary = boundary
-            .publish(CarrierPathInstanceId::from_raw(1))
-            .unwrap();
-        let offered = ordinary.background_handoff();
-        let foreground = boundary.register_foreground();
-        drop(offered);
-        assert!(ordinary.receipt().is_current());
-        drop(foreground);
-        assert!(ordinary.try_consume());
-        let successor = boundary
-            .publish(CarrierPathInstanceId::from_raw(1))
-            .unwrap();
-        drop(ordinary);
-        assert!(successor.receipt().is_current());
-        assert!(successor.background_handoff().try_consume());
-    }
-
-    #[tokio::test]
-    async fn foreground_release_and_ready_lifetime_are_distinct_events() {
-        let boundary = Arc::new(ReliableWriterBoundary::default());
-        let ordinary = boundary
-            .publish(CarrierPathInstanceId::from_raw(1))
-            .unwrap();
-        let mut ready_changed = Box::pin(boundary.change_notify().notified_owned());
-        ready_changed.as_mut().enable();
-        let mut foreground_released =
-            Box::pin(boundary.foreground_release_notify().notified_owned());
-        foreground_released.as_mut().enable();
-        let first = boundary.register_foreground();
-        let second = boundary.register_foreground();
-        drop(first);
-        assert!(futures::poll!(&mut foreground_released).is_pending());
-        drop(second);
-        assert!(futures::poll!(&mut foreground_released).is_ready());
-        assert!(
-            futures::poll!(&mut ready_changed).is_pending(),
-            "weak foreground release cannot invent a sibling Original writer transition"
-        );
-        assert!(ordinary.receipt().is_current());
-
-        let mut foreground_released =
-            Box::pin(boundary.foreground_release_notify().notified_owned());
-        foreground_released.as_mut().enable();
-        drop(ordinary.background_handoff());
-        assert!(
-            ordinary.receipt().is_current(),
-            "QUIC loan refusal preserves Ready"
-        );
-        assert!(futures::poll!(&mut foreground_released).is_pending());
-        drop(ordinary);
-        assert!(futures::poll!(&mut ready_changed).is_ready());
-        assert!(
-            futures::poll!(&mut foreground_released).is_pending(),
-            "TCP Ready revocation cannot regenerate a refused repair notice"
-        );
     }
 }

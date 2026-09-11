@@ -28,7 +28,6 @@ use crate::protocol::{ConfiguredMemberSlot, Frame, OffsetRange, UnderlayProtocol
 use crate::runtime::RuntimeError;
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::commands::ReliablePathCommandSender;
-use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use smallvec::SmallVec;
@@ -1287,64 +1286,6 @@ impl ResponseStreamBinding {
         bound_expires_at: Option<Instant>,
         after_reserve: impl FnOnce(),
     ) -> Result<Instant, RuntimeError> {
-        self.commit_reinjected_frame_for_target(
-            target,
-            frame,
-            lane,
-            queued_reinjection_bytes,
-            reinjection_debt_bytes,
-            bound_expires_at,
-            None,
-            None,
-            None,
-            after_reserve,
-        )
-    }
-
-    /// The actual writer supplies revocable authority; no payload is queued.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::runtime) fn claim_reinjected_frame_for_target(
-        &self,
-        target: &ResponseDispatchTarget,
-        frame: &Frame,
-        lane: TrafficClass,
-        queued_reinjection_bytes: usize,
-        reinjection_debt_bytes: usize,
-        ready: &ReliableWriterReadyGuard,
-        native_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
-        expected_model_generation: u64,
-    ) -> Result<Instant, RuntimeError> {
-        if ready.receipt().instance() != target.path_instance_id {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-        self.commit_reinjected_frame_for_target(
-            target,
-            frame,
-            lane,
-            queued_reinjection_bytes,
-            reinjection_debt_bytes,
-            None,
-            Some(ready),
-            native_shape,
-            Some(expected_model_generation),
-            || {},
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn commit_reinjected_frame_for_target(
-        &self,
-        target: &ResponseDispatchTarget,
-        frame: &Frame,
-        lane: TrafficClass,
-        queued_reinjection_bytes: usize,
-        reinjection_debt_bytes: usize,
-        bound_expires_at: Option<Instant>,
-        writer_ready: Option<&ReliableWriterReadyGuard>,
-        direct_native_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
-        expected_model_generation: Option<u64>,
-        after_reserve: impl FnOnce(),
-    ) -> Result<Instant, RuntimeError> {
         if !self.response_stream_open.load(Ordering::Acquire) {
             return Err(RuntimeError::SenderServiceBlocked);
         }
@@ -1368,11 +1309,7 @@ impl ResponseStreamBinding {
                 .map(|entry| entry.commands.clone())
                 .ok_or(RuntimeError::SenderServiceBlocked)?
         };
-        let command = if writer_ready.is_none() {
-            Some(commands.try_reserve_reinjection_frame(frame.clone(), lane)?)
-        } else {
-            None
-        };
+        let command = commands.try_reserve_reinjection_frame(frame.clone(), lane)?;
         after_reserve();
         let native_authority = commands.native_rate_authority().cloned();
         let expected_native_stamp = target.native_authority_stamp;
@@ -1447,21 +1384,12 @@ impl ResponseStreamBinding {
                 CarrierWorkKind::ReinjectedData,
                 Some((accepted_at, suppression_interval)),
                 true,
-                writer_ready,
-                expected_model_generation,
             )?;
-            if let Some(command) = command {
-                command.commit();
-            }
+            command.commit();
             Ok(accepted_at
                 .checked_add(suppression_interval)
                 .unwrap_or(accepted_at))
         };
-        // Direct claims enter under the caller's Native -> Product fence,
-        // exactly as prepared Originals do. Never reacquire Native under Product.
-        if writer_ready.is_some() {
-            return commit(direct_native_shape);
-        }
         match (native_authority, expected_native_stamp) {
             (Some(authority), Some(stamp)) => authority
                 .commit_with_current_scheduling_shape(stamp, |shape| commit(Some(shape)))
@@ -1580,8 +1508,6 @@ impl ResponseStreamBinding {
             kind,
             reinjection_suppression,
             false,
-            None,
-            None,
         )
     }
 
@@ -1596,8 +1522,6 @@ impl ResponseStreamBinding {
         kind: CarrierWorkKind,
         reinjection_suppression: Option<(Instant, Duration)>,
         enforce_stable_slot_vacancy: bool,
-        writer_ready: Option<&ReliableWriterReadyGuard>,
-        expected_model_generation: Option<u64>,
     ) -> Result<(), RuntimeError> {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return Err(RuntimeError::SenderServiceBlocked);
@@ -1635,19 +1559,6 @@ impl ResponseStreamBinding {
                 configured_slot,
                 &current_slot_outputs,
             )
-        {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-        // All recoverable checks precede consuming writer authority. Product
-        // ownership, output membership and the range ledger remain serialized
-        // through the mutation below; a rejected guard creates no copy or slot.
-        if expected_model_generation.is_some_and(|expected| {
-            self.response_model_generation.load(Ordering::Acquire) != expected
-        }) {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-        if writer_ready
-            .is_some_and(|ready| kind != CarrierWorkKind::ReinjectedData || !ready.try_consume())
         {
             return Err(RuntimeError::SenderServiceBlocked);
         }
@@ -1885,86 +1796,6 @@ impl ResponseStreamBinding {
         frontier
     }
 
-    pub(in crate::runtime) fn has_current_copy_debt(&self) -> bool {
-        self.outputs
-            .lock()
-            .expect("server reliable stream binding lock")
-            .entries
-            .iter()
-            .any(|entry| entry.bytes_in_flight > entry.original_data_in_flight_bytes)
-    }
-
-    /// Accepted current copies remain coverage for opportunistic successors even
-    /// after D expires. Critical recovery alone decides whether to repeat them.
-    pub(in crate::runtime) fn current_reinjected_ranges(&self) -> Vec<OffsetRange> {
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let flights = self
-            .flights
-            .lock()
-            .expect("server reliable stream flight lock");
-        flights
-            .iter()
-            .flat_map(|(&start, entries)| {
-                entries.iter().filter_map(move |flight| {
-                    (flight.kind == CarrierWorkKind::ReinjectedData).then_some((start, flight))
-                })
-            })
-            .filter(|(_, flight)| {
-                outputs.entries.iter().any(|entry| {
-                    entry.key == flight.key && entry.incarnation == flight.output_incarnation
-                })
-            })
-            .map(|(start, flight)| OffsetRange {
-                start,
-                end: flight.end,
-            })
-            .collect()
-    }
-
-    /// A prepared claim has already resolved Native outside Product. Validate
-    /// membership and use only those captured owner observations for its clocks.
-    pub(in crate::runtime) fn observe_prepared_live_owner_frontier(
-        &self,
-        range: OffsetRange,
-        targets: &[super::ResponseSenderPathTarget],
-        observed_at: Instant,
-    ) -> Option<ResponseRetainedOwnerFrontier> {
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        if outputs.entries.len() != targets.len()
-            || !outputs.entries.iter().all(|entry| {
-                targets.iter().any(|target| {
-                    target.observation.key == entry.key
-                        && target.observation.incarnation == entry.incarnation
-                        && target.observation.path_instance_id == entry.path_instance_id
-                })
-            })
-        {
-            return None;
-        }
-        let intervals = targets
-            .iter()
-            .map(|target| {
-                (
-                    ServerReinjectionOutputIdentity {
-                        key: target.observation.key,
-                        incarnation: target.observation.incarnation,
-                    },
-                    reliable_data_retransmission_interval(
-                        Some(target.observation.key.underlay),
-                        Some(target.observation.snapshot),
-                    ),
-                )
-            })
-            .collect::<SmallVec<[_; 4]>>();
-        self.observe_live_owner_frontier_with_intervals(range, observed_at, &intervals)
-    }
-
     /// Observes assignment clocks independently of an appendable scoring range.
     /// Every current OriginalData fragment sees the same owner snapshot, even
     /// if ACK splitting preceded this first observation. Subsequent splits copy
@@ -2002,15 +1833,6 @@ impl ResponseStreamBinding {
                 )
             })
             .collect::<SmallVec<[_; 4]>>();
-        self.observe_live_owner_frontier_with_intervals(range, observed_at, &owner_intervals)
-    }
-
-    fn observe_live_owner_frontier_with_intervals(
-        &self,
-        range: OffsetRange,
-        observed_at: Instant,
-        owner_intervals: &[(ServerReinjectionOutputIdentity, Duration)],
-    ) -> Option<ResponseRetainedOwnerFrontier> {
         let mut flights = self
             .flights
             .lock()
@@ -2063,6 +1885,7 @@ impl ResponseStreamBinding {
             }
         }
         drop(flights);
+        drop(outputs);
         let uniform = reliable_live_owner_uniform_frontier(range, spans.iter().copied())?;
         if uniform.owners.len() != 1 {
             return None;

@@ -2,11 +2,8 @@ use super::authority::NativeCarrierRateAuthorityHandle;
 use super::commands::ReliablePathCommand;
 #[cfg(test)]
 use super::commands::{RequestTcpCapacityProbeRequest, TcpCapacityProbeCommand};
-use super::prepared::{PreparedOriginalClaim, PreparedOriginalWait, PreparedOriginalWork};
-use super::writer_boundary::{
-    ReliableWriterBoundary, ReliableWriterForegroundGuard, ReliableWriterReadyGuard,
-    ReliableWriterReadyReceipt,
-};
+use super::prepared::{PreparedOriginalWait, PreparedOriginalWork};
+use super::writer_boundary::{ReliableWriterBoundary, ReliableWriterReadyGuard};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
@@ -44,8 +41,7 @@ const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [TrafficClass; 3] = [
 #[derive(Clone)]
 pub(in crate::runtime) struct ReliablePathCommandSender {
     prepared_waits: mpsc::UnboundedSender<PreparedOriginalWait>,
-    repair_offers: mpsc::UnboundedSender<PreparedOriginalWork>,
-    retirement: mpsc::UnboundedSender<QueuedReliablePathRetirementCommand>,
+    retirement: mpsc::UnboundedSender<ReliablePathRetirementCommand>,
     control: mpsc::Sender<QueuedReliablePathCommand>,
     priority: mpsc::Sender<QueuedReliablePathCommand>,
     reinjection: mpsc::Sender<QueuedReliablePathCommand>,
@@ -59,13 +55,10 @@ pub(in crate::runtime) struct ReliablePathCommandReceivers {
     // writer helpers retain &mut Self, not a shared receiver across await.
     prepared_waits: mpsc::UnboundedReceiver<PreparedOriginalWait>,
     deferred_prepared: FuturesUnordered<PreparedOriginalWait>,
-    repair_offers: mpsc::UnboundedReceiver<PreparedOriginalWork>,
-    repair_handoff: Option<mpsc::UnboundedSender<PreparedRepairHandoff>>,
-    repair_readiness: Option<Arc<RepairWriterReadiness>>,
     // One capability belongs to this physical writer, not a metadata claim
     // or logical stream. Refused claims leave the same idle epoch current.
     writer_ready: Option<ReliableWriterReadyGuard>,
-    retirement: mpsc::UnboundedReceiver<QueuedReliablePathRetirementCommand>,
+    retirement: mpsc::UnboundedReceiver<ReliablePathRetirementCommand>,
     pending_retirement_close: Option<StreamId>,
     control: mpsc::Receiver<QueuedReliablePathCommand>,
     priority: mpsc::Receiver<QueuedReliablePathCommand>,
@@ -224,11 +217,6 @@ enum ReliablePathRetirementCommand {
     },
 }
 
-struct QueuedReliablePathRetirementCommand {
-    command: ReliablePathRetirementCommand,
-    _foreground: ReliableWriterForegroundGuard,
-}
-
 /// Per-flow admission fence shared by queue reservations and the authoritative
 /// server-side retirement command. The registry retains only weak entries, so
 /// its size is bounded by outstanding queue reservations and retirement work.
@@ -265,7 +253,6 @@ pub(in crate::runtime) struct ReliablePathFrameReservation<'a> {
     datagram_retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
     accounted_bytes: Option<usize>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
-    foreground: Option<ReliableWriterForegroundGuard>,
     #[cfg(feature = "lab-diagnostics")]
     lane: TrafficClass,
     #[cfg(feature = "lab-diagnostics")]
@@ -299,7 +286,6 @@ impl ReliablePathFrameReservation<'_> {
                     accounted_bytes,
                     self.metrics.clone(),
                 )
-                .with_foreground(self.foreground.take())
                 .with_datagram_retirement(self.datagram_retirement.take()),
             );
         #[cfg(feature = "lab-diagnostics")]
@@ -331,7 +317,6 @@ struct ReliablePathCommandQueueMetrics {
     pending_bytes: AtomicU64,
     writer_pending_bytes: AtomicU64,
     writer_boundary: Arc<ReliableWriterBoundary>,
-    repair_readiness: Arc<RepairWriterReadiness>,
     /// Upper/lower 32 bits hold total and latency-sensitive live flows.
     flow_counts: AtomicU64,
     capacity_released: Arc<Notify>,
@@ -579,7 +564,6 @@ struct QueuedReliablePathCommand {
     accounted_bytes: usize,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     datagram_retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
-    foreground: Option<ReliableWriterForegroundGuard>,
 }
 
 impl QueuedReliablePathCommand {
@@ -589,7 +573,6 @@ impl QueuedReliablePathCommand {
         metrics: Arc<ReliablePathCommandQueueMetrics>,
     ) -> Self {
         Self {
-            foreground: Some(metrics.writer_boundary.register_foreground()),
             command: Some(command),
             accounted_bytes,
             metrics,
@@ -602,13 +585,6 @@ impl QueuedReliablePathCommand {
         retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
     ) -> Self {
         self.datagram_retirement = retirement;
-        self
-    }
-
-    fn with_foreground(mut self, foreground: Option<ReliableWriterForegroundGuard>) -> Self {
-        if foreground.is_some() {
-            self.foreground = foreground;
-        }
         self
     }
 
@@ -821,19 +797,11 @@ impl ReliablePathCommandReceivers {
     ) -> ReliablePathRepairReceiver {
         let receiver = self.reinjection.take().expect("repair queue split once");
         let (closed, lifetime) = tokio::sync::watch::channel(false);
-        let (handoff_tx, handoffs) = mpsc::unbounded_channel();
-        let readiness = self.metrics.repair_readiness.clone();
-        readiness.split.store(true, Ordering::Release);
-        self.repair_handoff = Some(handoff_tx);
-        self.repair_readiness = Some(readiness.clone());
         self.repair_owner = Some((stream_id, closed));
         ReliablePathRepairReceiver {
             receiver,
             stream_id,
             lifetime,
-            handoffs,
-            readiness,
-            metrics: self.metrics.clone(),
         }
     }
 
@@ -861,8 +829,6 @@ impl ReliablePathCommandReceivers {
         self.metrics.lifecycle.begin_drain();
         self.withdraw_writer_ready();
         self.prepared_waits.close();
-        self.repair_offers.close();
-        while self.repair_offers.try_recv().is_ok() {}
         self.deferred_prepared.clear();
         while self.prepared_waits.try_recv().is_ok() {}
         self.retirement.close();
@@ -913,73 +879,6 @@ impl ReliablePathCommandReceivers {
     /// does not: another stream may still claim at this same idle boundary.
     pub(in crate::runtime) fn withdraw_writer_ready(&mut self) {
         drop(self.writer_ready.take());
-    }
-
-    pub(in crate::runtime) fn prepared_writer_ready_boundary(
-        &mut self,
-        instance: CarrierPathInstanceId,
-        repair: bool,
-    ) -> Option<&ReliableWriterReadyGuard> {
-        self.writer_ready_boundary(instance)?;
-        let ready = self.writer_ready.as_mut()?;
-        ready.set_background(repair);
-        Some(ready)
-    }
-
-    /// The ordinary QUIC writer lends its current arbitration epoch, never a
-    /// payload. Only an idle repair writer may accept this single handoff.
-    pub(in crate::runtime::path) fn handoff_prepared_repair(
-        &mut self,
-        work: PreparedOriginalWork,
-        instance: CarrierPathInstanceId,
-    ) {
-        let Some(readiness) = self.repair_readiness.clone() else {
-            return;
-        };
-        let Some(ready) = self.writer_ready_boundary(instance) else {
-            return;
-        };
-        let ready = ready.background_handoff();
-        if readiness
-            .ready
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            work.requeue();
-            return;
-        }
-        if let Some(handoff) = &self.repair_handoff {
-            let _ = handoff.send(PreparedRepairHandoff { work, ready });
-        }
-    }
-
-    fn may_acquire_repair_offer(&self) -> bool {
-        // An already staged zero-byte control frame also occupies the writer;
-        // byte accounting alone cannot establish this boundary.
-        self.writer_ready
-            .as_ref()
-            .is_some_and(|ready| ready.receipt().is_current())
-            && !self.metrics.writer_boundary.has_foreground()
-            && self
-                .repair_readiness
-                .as_ref()
-                .is_none_or(|state| state.ready.load(Ordering::Acquire))
-    }
-
-    fn reconcile_repair_handoff_epoch(&mut self) {
-        if self
-            .metrics
-            .repair_readiness
-            .ordinary_epoch_used
-            .swap(false, Ordering::AcqRel)
-            && let Some(ready) = self.writer_ready.as_ref()
-            && !ready.receipt().is_current()
-        {
-            // Only this ordinary writer renews its own idle publication. A
-            // real foreground transaction has already removed writer_ready.
-            let instance = ready.receipt().instance();
-            let _ = self.writer_ready_boundary(instance);
-        }
     }
 
     fn take_queued_command(&self, command: QueuedReliablePathCommand) -> ReliablePathCommand {
@@ -1072,22 +971,6 @@ impl ReliablePathCommandReceivers {
         self.deferred_prepared.push(work.after_wait(Box::pin(wait)));
     }
 
-    /// A lock refusal is unknown foreground availability, unlike a validated
-    /// Blocked result. Keep it ahead of repair until re-evaluation is runnable.
-    pub(in crate::runtime::path) fn defer_prepared_busy(
-        &mut self,
-        work: PreparedOriginalWork,
-        wait: impl std::future::Future<Output = ()> + Send + 'static,
-    ) {
-        let foreground =
-            (!work.is_repair()).then(|| self.metrics.writer_boundary.register_foreground());
-        let deferred = work.after_wait(Box::pin(wait));
-        self.deferred_prepared.push(Box::pin(async move {
-            deferred.await;
-            drop(foreground);
-        }));
-    }
-
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) fn pending_bytes(&self) -> u64 {
         self.metrics.pending_bytes()
@@ -1100,29 +983,12 @@ pub(in crate::runtime) struct ReliablePathRepairReceiver {
     receiver: mpsc::Receiver<QueuedReliablePathCommand>,
     stream_id: StreamId,
     lifetime: tokio::sync::watch::Receiver<bool>,
-    handoffs: mpsc::UnboundedReceiver<PreparedRepairHandoff>,
-    readiness: Arc<RepairWriterReadiness>,
-    metrics: Arc<ReliablePathCommandQueueMetrics>,
-}
-
-#[derive(Debug, Default)]
-struct RepairWriterReadiness {
-    split: AtomicBool,
-    ready: AtomicBool,
-    ordinary_epoch_used: AtomicBool,
-    changed: Notify,
-}
-
-struct PreparedRepairHandoff {
-    work: PreparedOriginalWork,
-    ready: ReliableWriterReadyGuard,
 }
 
 pub(in crate::runtime) struct ReliablePathRepairWork {
     frame: Frame,
     bytes: usize,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
-    _foreground: Option<ReliableWriterForegroundGuard>,
 }
 
 impl ReliablePathRepairWork {
@@ -1142,21 +1008,11 @@ impl ReliablePathRepairReceiver {
     pub(in crate::runtime) async fn recv(
         &mut self,
     ) -> Result<Option<ReliablePathRepairWork>, RuntimeError> {
-        enum NextRepair {
-            Critical(QueuedReliablePathCommand),
-            Offered(PreparedRepairHandoff),
-        }
         loop {
             if *self.lifetime.borrow() || self.lifetime.has_changed().is_err() {
                 return Ok(None);
             }
-            // The previous native write has completed before recv is called.
-            // This is one physical repair-writer opportunity, not queue space.
-            if self.handoffs.is_empty() {
-                self.readiness.ready.store(true, Ordering::Release);
-                self.readiness.changed.notify_one();
-            }
-            let next = tokio::select! {
+            let queued = tokio::select! {
                 biased;
                 changed = self.lifetime.changed() => {
                     if changed.is_err() || *self.lifetime.borrow() {
@@ -1165,50 +1021,9 @@ impl ReliablePathRepairReceiver {
                     continue;
                 }
                 queued = self.receiver.recv() => match queued {
-                    Some(queued) => NextRepair::Critical(queued),
+                    Some(queued) => queued,
                     None => return Ok(None),
                 },
-                offered = self.handoffs.recv() => match offered {
-                    Some(offered) => NextRepair::Offered(offered),
-                    None => return Ok(None),
-                },
-            };
-            self.readiness.ready.store(false, Ordering::Release);
-            let mut queued = match next {
-                NextRepair::Critical(queued) => queued,
-                NextRepair::Offered(PreparedRepairHandoff { work, ready }) => {
-                    if work.stream_id() != self.stream_id
-                        || !work.is_repair()
-                        || !self.metrics.lifecycle.is_active()
-                    {
-                        continue;
-                    }
-                    let claim = work.try_claim(&ready);
-                    if !ready.receipt().is_current() {
-                        self.readiness
-                            .ordinary_epoch_used
-                            .store(true, Ordering::Release);
-                        self.readiness.changed.notify_one();
-                    }
-                    match claim {
-                        PreparedOriginalClaim::Claimed(frame) => {
-                            let bytes = reliable_path_frame_pacing_bytes(&frame);
-                            self.metrics.add_pending_bytes(bytes);
-                            self.metrics.add_writer_pending_bytes(bytes as u64);
-                            work.requeue();
-                            return Ok(Some(ReliablePathRepairWork {
-                                frame,
-                                bytes,
-                                metrics: self.metrics.clone(),
-                                _foreground: None,
-                            }));
-                        }
-                        PreparedOriginalClaim::Busy(wait) => work.defer(wait),
-                        PreparedOriginalClaim::Blocked(wait) => work.defer(wait),
-                        PreparedOriginalClaim::Empty => {}
-                    }
-                    continue;
-                }
             };
             match queued.command() {
                 ReliablePathCommand::SendFrame(
@@ -1218,7 +1033,6 @@ impl ReliablePathRepairReceiver {
                 _ => return Err(RuntimeError::Protocol("repair queue attachment mismatch")),
             }
             let metrics = queued.metrics.clone();
-            let foreground = queued.foreground.take();
             let (command, bytes) = queued.into_parts();
             let ReliablePathCommand::SendFrame(frame) = command else {
                 unreachable!("validated repair command")
@@ -1228,16 +1042,8 @@ impl ReliablePathRepairReceiver {
                 frame,
                 bytes,
                 metrics,
-                _foreground: foreground,
             }));
         }
-    }
-}
-
-impl Drop for ReliablePathRepairReceiver {
-    fn drop(&mut self) {
-        self.readiness.ready.store(false, Ordering::Release);
-        self.readiness.changed.notify_one();
     }
 }
 
@@ -1254,37 +1060,10 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
-    /// Read-only opportunity for ranking another exact target. The invoking
-    /// writer still supplies and consumes its own final arbitration guard.
-    pub(in crate::runtime) fn background_repair_ready(&self) -> Option<ReliableWriterReadyReceipt> {
-        if !self.metrics.lifecycle.is_active()
-            || self.metrics.writer_boundary.has_foreground()
-            || (self.metrics.repair_readiness.split.load(Ordering::Acquire)
-                && !self.metrics.repair_readiness.ready.load(Ordering::Acquire))
-        {
-            return None;
-        }
-        self.metrics.writer_boundary.snapshot()
-    }
-    fn send_retirement(&self, command: ReliablePathRetirementCommand) -> Result<(), RuntimeError> {
-        self.retirement
-            .send(QueuedReliablePathRetirementCommand {
-                command,
-                _foreground: self.metrics.writer_boundary.register_foreground(),
-            })
-            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
-    }
-    pub(in crate::runtime::path) fn enqueue_prepared_wait(&self, wait: PreparedOriginalWait) {
-        let _ = self.prepared_waits.send(wait);
-    }
     /// Preserves the existing Original lane and queue capacity. A full queue
     /// owns only one weak registration wait, never a reserved source payload.
     pub(in crate::runtime::path) fn enqueue_prepared_work(&self, work: PreparedOriginalWork) {
         if !self.metrics.lifecycle.admits_new_command(true) {
-            return;
-        }
-        if work.is_repair() {
-            let _ = self.repair_offers.send(work);
             return;
         }
         let queue = if reliable_path_frame_uses_priority_queue(work.lane()) {
@@ -1484,9 +1263,11 @@ impl ReliablePathCommandSender {
         stream_id: StreamId,
     ) -> Result<(), RuntimeError> {
         self.ensure_new_command_admitted(false)?;
-        self.send_retirement(ReliablePathRetirementCommand::RetireAcceptedStream(
-            stream_id,
-        ))
+        self.retirement
+            .send(ReliablePathRetirementCommand::RetireAcceptedStream(
+                stream_id,
+            ))
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
     }
 
     /// Transfers an accepted stream's terminal reset to the carrier-owned
@@ -1497,10 +1278,9 @@ impl ReliablePathCommandSender {
         reason: ResetReason,
     ) -> Result<(), RuntimeError> {
         self.ensure_new_command_admitted(false)?;
-        self.send_retirement(ReliablePathRetirementCommand::ResetAcceptedStream {
-            stream_id,
-            reason,
-        })
+        self.retirement
+            .send(ReliablePathRetirementCommand::ResetAcceptedStream { stream_id, reason })
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
     }
 
     pub(in crate::runtime) fn retire_datagram_attachment(
@@ -1508,9 +1288,11 @@ impl ReliablePathCommandSender {
         attachment_id: u64,
     ) -> Result<(), RuntimeError> {
         self.ensure_new_command_admitted(false)?;
-        self.send_retirement(ReliablePathRetirementCommand::RetireDatagramAttachment(
-            attachment_id,
-        ))
+        self.retirement
+            .send(ReliablePathRetirementCommand::RetireDatagramAttachment(
+                attachment_id,
+            ))
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
     }
 
     pub(in crate::runtime) fn retire_server_datagram_flow(
@@ -1519,10 +1301,12 @@ impl ReliablePathCommandSender {
     ) -> Result<(), RuntimeError> {
         self.ensure_new_command_admitted(false)?;
         let retirement = self.metrics.retire_datagram_flow(flow_id);
-        self.send_retirement(ReliablePathRetirementCommand::RetireServerDatagramFlow {
-            flow_id,
-            _fence: retirement,
-        })
+        self.retirement
+            .send(ReliablePathRetirementCommand::RetireServerDatagramFlow {
+                flow_id,
+                _fence: retirement,
+            })
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
     }
 
     pub(in crate::runtime) async fn send_control(
@@ -1972,7 +1756,6 @@ impl ReliablePathCommandSender {
         };
         self.metrics.add_pending_bytes(bytes);
         Ok(ReliablePathFrameReservation {
-            foreground: Some(self.metrics.writer_boundary.register_foreground()),
             permit: Some(permit),
             frame: Some(frame),
             datagram_retirement,
@@ -2167,12 +1950,10 @@ pub(in crate::runtime) fn reliable_path_command_channels(
     let (reinjection_tx, reinjection_rx) = mpsc::channel(reinjection_queue);
     let (data_tx, data_rx) = mpsc::channel(queue);
     let (prepared_waits_tx, prepared_waits_rx) = mpsc::unbounded_channel();
-    let (repair_offers_tx, repair_offers_rx) = mpsc::unbounded_channel();
     let metrics = Arc::new(ReliablePathCommandQueueMetrics::default());
     (
         ReliablePathCommandSender {
             prepared_waits: prepared_waits_tx,
-            repair_offers: repair_offers_tx,
             retirement: retirement_tx,
             control: control_tx,
             priority: priority_tx,
@@ -2184,9 +1965,6 @@ pub(in crate::runtime) fn reliable_path_command_channels(
         ReliablePathCommandReceivers {
             prepared_waits: prepared_waits_rx,
             deferred_prepared: FuturesUnordered::new(),
-            repair_offers: repair_offers_rx,
-            repair_handoff: None,
-            repair_readiness: None,
             writer_ready: None,
             retirement: retirement_rx,
             pending_retirement_close: None,
@@ -2234,7 +2012,6 @@ fn poll_prepared_waits(
 }
 
 fn poll_ready_prepared_waits(receivers: &mut ReliablePathCommandReceivers) {
-    receivers.reconcile_repair_handoff_epoch();
     let mut cx = Context::from_waker(std::task::Waker::noop());
     let _ = poll_prepared_waits(
         &mut receivers.prepared_waits,
@@ -2278,14 +2055,12 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
     enum ReceivedCommand {
-        Retirement(Option<QueuedReliablePathRetirementCommand>),
+        Retirement(Option<ReliablePathRetirementCommand>),
         Queued(Option<QueuedReliablePathCommand>),
-        RepairOffer(Option<PreparedOriginalWork>),
         PreparedWake,
     }
 
     loop {
-        receivers.reconcile_repair_handoff_epoch();
         std::future::poll_fn(|cx| {
             let _ = poll_prepared_waits(
                 &mut receivers.prepared_waits,
@@ -2311,17 +2086,6 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
         let prepared_may_recv = !receivers.prepared_waits.is_closed()
             || !receivers.prepared_waits.is_empty()
             || !receivers.deferred_prepared.is_empty();
-        let mut foreground_released = Box::pin(
-            receivers
-                .metrics
-                .writer_boundary
-                .foreground_release_notify()
-                .notified_owned(),
-        );
-        foreground_released.as_mut().enable();
-        let repair_offer_may_recv = receivers.may_acquire_repair_offer()
-            && retirement_receiver_may_recv(&receivers.repair_offers);
-        let repair_readiness = receivers.repair_readiness.clone();
         let received = tokio::select! {
             biased;
             command = receivers.retirement.recv(), if retirement_may_recv => {
@@ -2342,16 +2106,6 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
             () = std::future::poll_fn(|cx| poll_prepared_waits(
                 &mut receivers.prepared_waits, &mut receivers.deferred_prepared, cx,
             )), if prepared_may_recv => ReceivedCommand::PreparedWake,
-            () = &mut foreground_released => ReceivedCommand::PreparedWake,
-            () = async {
-                match repair_readiness.as_ref() {
-                    Some(state) => state.changed.notified().await,
-                    None => std::future::pending().await,
-                }
-            } => ReceivedCommand::PreparedWake,
-            work = receivers.repair_offers.recv(), if repair_offer_may_recv => {
-                ReceivedCommand::RepairOffer(work)
-            }
             else => return None,
         };
         match received {
@@ -2363,16 +2117,8 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
                     return Some(command);
                 }
             }
-            ReceivedCommand::RepairOffer(Some(work)) => {
-                if receivers.metrics.lifecycle.is_active()
-                    && !receivers.closed_streams.contains(&work.stream_id())
-                {
-                    return Some(ReliablePathCommand::PreparedOriginal(work));
-                }
-            }
             ReceivedCommand::Retirement(None)
             | ReceivedCommand::Queued(None)
-            | ReceivedCommand::RepairOffer(None)
             | ReceivedCommand::PreparedWake => {}
         }
     }
@@ -2458,19 +2204,7 @@ pub(in crate::runtime) fn try_recv_reliable_path_command(
         if let Some(command) = recv_ready_priority_command(receivers) {
             return Some(command);
         }
-        let queued = match receivers.data.try_recv() {
-            Ok(queued) => queued,
-            Err(_) if receivers.may_acquire_repair_offer() => {
-                let work = receivers.repair_offers.try_recv().ok()?;
-                if receivers.metrics.lifecycle.is_active()
-                    && !receivers.closed_streams.contains(&work.stream_id())
-                {
-                    return Some(ReliablePathCommand::PreparedOriginal(work));
-                }
-                continue;
-            }
-            Err(_) => return None,
-        };
+        let queued = receivers.data.try_recv().ok()?;
         if let Some(command) = receivers.take_live_queued_command(queued) {
             return Some(command);
         }
@@ -2650,9 +2384,9 @@ fn recv_ready_priority_command(
 
 fn begin_reliable_path_retirement(
     receivers: &mut ReliablePathCommandReceivers,
-    command: QueuedReliablePathRetirementCommand,
+    command: ReliablePathRetirementCommand,
 ) -> ReliablePathCommand {
-    let command = match command.command {
+    let command = match command {
         ReliablePathRetirementCommand::RetireAcceptedStream(stream_id) => {
             debug_assert!(receivers.pending_retirement_close.is_none());
             receivers.pending_retirement_close = Some(stream_id);
@@ -2775,7 +2509,6 @@ fn reliable_path_frame_stream_id(frame: &Frame) -> Option<StreamId> {
 #[cfg(feature = "lab-diagnostics")]
 fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
     match command {
-        ReliablePathCommand::PreparedOriginal(work) if work.is_repair() => "prepared_repair",
         ReliablePathCommand::PreparedOriginal(_) => "prepared_original",
         ReliablePathCommand::PrepareConnection { .. } => "prepare_connection",
         ReliablePathCommand::OpenStream { .. } => "open_stream",

@@ -96,9 +96,7 @@ mod owner;
 mod prepared;
 mod scheduling;
 pub(in crate::runtime) use owner::{SharedRequestProduct, WeakSharedRequestProduct};
-pub(in crate::runtime) use prepared::{
-    RequestPreparedSource, claim_prepared_request_data, claim_prepared_request_repair,
-};
+pub(in crate::runtime) use prepared::{RequestPreparedSource, claim_prepared_request_data};
 #[cfg(test)]
 mod tcp_capacity;
 #[cfg(test)]
@@ -403,20 +401,6 @@ impl RequestSenderService {
 
     pub(in crate::runtime) fn completion_tail_owner_fallback_deadline(&self) -> Option<Instant> {
         self.completion_tail_owner_fallback.deadline()
-    }
-
-    /// Extra successor work requires an existing copy to cover the critical
-    /// head. This cheap necessary condition avoids publishing idle repair
-    /// notices for ordinary retained data; the claim proves exact coverage.
-    pub(in crate::runtime) fn has_current_repair_copy(
-        &self,
-        remotes: &ReliableRelayRemoteSet,
-    ) -> bool {
-        remotes.paths.iter().any(|path| {
-            self.multipath
-                .accepted_reinjected_data_bytes(path.instance())
-                > 0
-        })
     }
 
     pub(in crate::runtime) fn fail_client_path_instance(

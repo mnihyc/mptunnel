@@ -1365,41 +1365,6 @@ impl RequestMultipathController {
         service: Option<(&ReliableRelaySenderQueue, usize, MuxLimits)>,
         scoring_avoid: &[RelayPathInstance],
     ) -> RequestDataAckGapObservation {
-        let recovery_observation = observe_request_relay_scheduling(
-            context,
-            self.stream_id,
-            remotes.membership_generation(),
-            &remotes.paths,
-            None,
-            TrafficClass::Throughput,
-            PATH_OPEN_SCORE_BYTES,
-            true,
-            &self.request.requalification,
-        );
-        self.data_ack_gap_reinjection_model_from_observation(
-            context,
-            remotes,
-            preview,
-            lane,
-            scoring_payload_bytes,
-            service,
-            scoring_avoid,
-            &recovery_observation,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn data_ack_gap_reinjection_model_from_observation(
-        &self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        preview: &Frame,
-        lane: TrafficClass,
-        scoring_payload_bytes: usize,
-        service: Option<(&ReliableRelaySenderQueue, usize, MuxLimits)>,
-        scoring_avoid: &[RelayPathInstance],
-        recovery_observation: &RequestRelaySchedulingObservation,
-    ) -> RequestDataAckGapObservation {
         let original_flight = self
             .request
             .flights
@@ -1411,6 +1376,17 @@ impl RequestMultipathController {
             .request
             .flights
             .original_transmission_underlay_for_frame(preview);
+        let recovery_observation = observe_request_relay_scheduling(
+            context,
+            self.stream_id,
+            remotes.membership_generation(),
+            &remotes.paths,
+            None,
+            TrafficClass::Throughput,
+            PATH_OPEN_SCORE_BYTES,
+            true,
+            &self.request.requalification,
+        );
         // A replacement carrier with the same numeric path key must not lend
         // its RTT or congestion evidence to an older attachment's flight. The
         // owner and alternate below are both projected from this one immutable
@@ -1418,7 +1394,7 @@ impl RequestMultipathController {
         // OriginalData debt, so only the alternate is charged the new copy.
         let original_path_timing = original_path.and_then(|instance| {
             self.request_reinjection_target_snapshot_from_observation(
-                recovery_observation,
+                &recovery_observation,
                 instance,
             )
         });
@@ -1466,7 +1442,7 @@ impl RequestMultipathController {
                 RelaySendCause::PersistentAckGapReinjection,
                 &avoid_instances,
                 scoring_payload_bytes,
-                Some(recovery_observation),
+                Some(&recovery_observation),
             ) {
                 Ok(position) => position,
                 Err(RequestMultipathPlanError::ServiceBlocked) => {
@@ -1488,7 +1464,7 @@ impl RequestMultipathController {
                 break None;
             }
             let Some(snapshot) = self.request_reinjection_target_snapshot_from_observation(
-                recovery_observation,
+                &recovery_observation,
                 instance,
             ) else {
                 break None;
@@ -1543,76 +1519,6 @@ impl RequestMultipathController {
             uniform_frontier_extent_bytes: 0,
             owner_recovery_timing: None,
         }
-    }
-
-    /// Rank one exact extra-repair quantum using detached Native observations.
-    /// No payload queue or Product publication is created here. Only currently
-    /// ready writers participate; final Apply repeats this same range decision
-    /// under the selected writer's current Native shape.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn repair_claim_plan_from_inputs(
-        &self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        frame: &Frame,
-        lane: TrafficClass,
-        sender_queue: &ReliableRelaySenderQueue,
-        retained_bytes: usize,
-        scoring_payload_bytes: usize,
-        avoid: &[RelayPathInstance],
-        ready_instances: &[RelayPathInstance],
-        native_inputs: RequestRelayNativeInputs,
-    ) -> Option<(RequestMultipathPlan, RequestCompletionTailTarget)> {
-        let observation = observe_request_relay_scheduling_from_native_inputs(
-            context,
-            self.stream_id,
-            remotes.membership_generation(),
-            &remotes.paths,
-            None,
-            TrafficClass::Throughput,
-            PATH_OPEN_SCORE_BYTES,
-            true,
-            &self.request.requalification,
-            native_inputs,
-        )?;
-        let mut excluded = avoid.to_vec();
-        excluded.extend(
-            remotes
-                .path_instances()
-                .into_iter()
-                .filter(|instance| !ready_instances.contains(instance)),
-        );
-        let model = self.data_ack_gap_reinjection_model_from_observation(
-            context,
-            remotes,
-            frame,
-            lane,
-            scoring_payload_bytes,
-            Some((sender_queue, retained_bytes, context.mux_limits)),
-            &excluded,
-            &observation,
-        );
-        let (identity, snapshot) = model.reinjection_target?;
-        let target = self
-            .completion_tail_target_observation(
-                identity,
-                snapshot,
-                model.reinjection_target_flight_bytes,
-                sender_queue,
-                retained_bytes,
-                context.mux_limits,
-            )
-            .target?;
-        let plan = RequestMultipathPlan::new(
-            RequestMultipathTarget {
-                membership_generation: remotes.membership_generation(),
-                instance: identity.instance,
-            },
-            RequestProductSendMutation::None,
-        )
-        .with_eligibility_expectation(&observation, lane, None)
-        .ok()?;
-        Some((plan, target))
     }
 
     pub(super) fn reinjection_avoid_instances(

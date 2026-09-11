@@ -261,6 +261,16 @@ does not authorize latent topology inference or a universal Internet model.
 
 ## Known failure patterns become rejection conditions
 
+- An empty API-write counter is not an empty native send buffer. The09-11
+  exact Quinn inventory observes healthy median33.974MB never packetized while
+  the API counter is usually zero and native flight is about2.478MB. This
+  locates material pre-packet work, not a congestion-controller defect or an
+  individual byte's full residence. Distinguish memory/flow-control permission,
+  writer reservation, packetization and native flight before applying an RTT
+  clock to assignment age. Do not fix it by shrinking a configured memory cap
+  or double-counting existing Product debt; an admission correction must prove
+  shared-writer ownership, control/repair progress and exact wakes, then useful
+  ordinary service. Observers do not become production getters by default.
 - Removing recovery serialization is not free useful capacity. The09-11
   response coverage trial passes170 focused checks and raises split-link QoS
   service13.381→153.633Mbps, but healthy service falls324.202→193.307Mbps and

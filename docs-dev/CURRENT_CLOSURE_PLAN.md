@@ -1,9 +1,141 @@
 # v0.4.9 release closure plan
 
-Updated: 2026-09-11 11:13 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 12:08 +08:00. Authoritative repository: ./.
 Category: user-directed release convergence. No release acceptance yet.
 
+Current outcome: efed8ec commits the two20% defaults with47focused checks.
+Recovery remains04f and blocked by the reproduced split-link slowdown. The
+latest closed discriminator directly finds tens of MB of native QUIC stream
+data not yet packetized; the next bounded owner is Original handoff/native
+service readiness, not controller tuning. No observation code remains in src.
+
 ## Active amendment: challenge claims, prioritize severe user impact
+
+### Resumed work: resolve the demonstrated recovery blocker
+
+User instruction2026-09-11: continue while fixes are incomplete; release only
+when actually ready. The failed trial stays withdrawn. The earlier stop after
+reporting the tradeoff is superseded for this same recovery owner, not for
+broad controller, bottleneck-inference or gain tuning. The user's20%/3s impact
+triage and all existing correctness/experience gates remain unchanged.
+
+Unselected hypothesis, now stopped: can structural Original-data blockage distinguish the
+needed repair pipeline from healthy speculative copying? Old04f cut evidence
+repeatedly fills64MiB of A−F while the independent TCP cut is underused. The
+rejected trial copies heavily during healthy service; G alone did not distinguish
+the cases. Investigate whether exact positive peer MAX exhaustion (A==MAX),
+together with a retained authoritative prefix gap, can identify a period in
+which new OriginalData is forbidden and useful service requires repairing the
+missing prefix. Do NOT equate A−F with actual peer MAX or native window.
+
+Information forecast: existing traces/producer state either establish this
+structural distinction or leave it unobserved. Independent source review must
+challenge small windows, receiver application backpressure, EOF, currently
+prepared but unassigned data, and missing/stale ownership. This is NOT a timer
+urgency change or permission to enlarge credit; ordinary head fallback retains
+its clocks when assignment remains possible. No implementation is selected
+until the distinction and expected healthy/QoS effect are supported. Conditional
+benefit remains draining the observed33--41MB obstruction using available TCP
+service; a healthy blocked window or ineffective cut recovery can falsify it.
+
+Ownership challenge, 2026-09-11: no credit gate is selected. Existing A−F
+observations do NOT establish A==peer MAX. A healthy receiver application or
+delayed MAX can also exhaust permission; that fact alone cannot classify native
+loss or authorize broader copies. TCP47 remains healthy; later bytes of the
+SAME ordered stream wait behind old QUIC prefixes, while independent echoes
+continue. The current evidence proves ordered-stream coupling, not one native
+carrier taking down another or cross-flow ownership corruption.
+
+Timing correction: range[579050494,579062494) takes5.692s from Original
+assignment to QUIC receipt, but becomes the receiver's blocking head only13ms
+before that receipt. Do not describe the5.692s as a continuous head stall or
+removable critical delay. The sustained13.381Mbps ordinary cut collapse remains
+real. Next read-only action is the QoS onset chronology and actual first-gap
+repair selection, using the existing D trace/source; no new timer, controller,
+credit restriction, or traffic run. Information forecast: distinguish stale
+feedback selection from insufficient offered recovery; a missing fact remains
+unassigned instead of selecting a fix from throughput alone.
+
+Separate user-requested policy transaction: both existing default percentages
+become20; default-valued shipped/reference entries stay commented. Optional
+reinjection remains accounting only; QUIC compensation changes local-sender
+evidence policy, not residual q=2%, gains, clocks, or byte limits. Verify omission,
+explicit overrides/zero, config inheritance and native construction with focused
+tests. No speed improvement is inferred. All existing captures use10%; future
+model comparisons must use matching explicit settings or a labelled20% control.
+Auxiliary review tasks hit their service quota; continue locally, without
+retrying the restriction or claiming their incomplete reviews passed.
+
+Default-policy outcome,2026-09-11 11:49+08:47 distinct focused checks pass:
+38 CLI, five loss parsing/native-construction/config validation, and four
+shipped-schema/inheritance/default assertions. Native default ppm=200000;
+explicit per-path settings and zero remain valid. Format/diff checks pass.
+RFC equations now give theta=21.6% with unchanged q=2%; at actual independent
+20% erasure, ideal native payload retransmission is25%, or50% combined only
+if Product copies also equal20% of useful bytes. These are conditional estimates,
+not caps or a performance acceptance claim. No recovery logic changed.
+
+Next bounded stage discriminator,2026-09-11 11:58+08: old D's healthy QUIC
+Original-to-repair ages are1.081--1.941s (median1.392s), while native RTT stays
+near100ms. Source shows `pending_bytes` counts only the currently awaited H3
+send_data call; it drops when Quinn accepts the buffer, not when native packets
+leave. The native send buffer is separately permitted up to the configured
+send_window. Neither fact alone locates the missing byte's delay.
+Question: does a large never-transmitted QUIC stream backlog persist behind
+completed API writes, or is the large residence instead later in the pipeline?
+Use ONE observation-only native unsent/unacked/flight snapshot during the same
+D schedule. The getter is diagnostic only, never consumed by admission/rank.
+Keep control policy10 explicitly in the frozen observer build; restore the
+committed20 source before traffic. No controller/credit/queue limit changes.
+Forecast is information only: a large exact native unsent backlog identifies
+pre-packet residence that a native-RTT-only repair clock does not measure;
+little backlog rejects that stage explanation. This is not evidence to shrink
+send_window or to revive the adverse repair pipeline. Preserve full ordinary
+comparators; stop this diagnostic after one completed run. No new harness.
+
+Observer build closed1m33s after correcting a diagnostic getter's private-field
+access (not a Product defect). Frozen binary:
+./.tmp/reflection/bin/native-stream-backlog-20260911/mptunnel.
+The exact seven-file observer/10% matching-policy patch is removed from source;
+src/crates/RFC/manifests match efed8ec, including the committed20% defaults.
+One aggregate DOWN run is active; no build overlaps it. Only the periodic
+quic_stream_backlog event is enabled. Complete getter/recipe/scope notes are in
+./.tmp/reflection/native-stream-backlog-reproduction-0911.md.
+Telegram blocker/defaults update sent about03:53UTC; next nonurgent>=04:53UTC.
+
+Run CLOSED,2026-09-11 12:04+08: exact native unsent storage is substantial:
+healthy median33.974MB (142samples,134API-write-zero), QoS median31.197MB
+(five snapshots, allAPI-write-zero), late peak55.991MB. Healthy native flight
+median2.478MB and RTT~100ms are different stages. All805native observations
+satisfy unsent<=unacked. Whole215.689Mbps/HTTP200, QoS21.414Mbps, bodygap.345s;
+72/72attempted echoes succeed, but p95/max.826/2.234s. Observer results are not
+ordinary acceptance. Both200Mbps cuts and configured3TCP47+1QUIC46 verified.
+
+Next selected owner is QUIC Original handoff, not cross-link teardown: source
+and direct inventory prove that completed API writes can leave tens of MB
+never packetized. Existing large send_window is allocation permission, not
+native service opportunity. Forecast: avoiding newly accumulated pre-packet
+debt can materially reduce the amount stranded by a sudden cut; it cannot
+remove already transmitted queueing or promise immediate optimal failover.
+Before implementation, define a connection-owned native service/reservation
+boundary that handles concurrent writers, controller activation, partial writes,
+control/repair bypass and exact wake/refund/close. Do not add a second pacer,
+reduce memory ceilings, double-count Product debt in ranking, or change timers.
+Use the real writer to prove excess handoff and the proposed boundary cheaply;
+then matched20% ordinary control/candidate healthy and QoS phases decide whether
+it materially helps without regressing service. No candidate is selected yet.
+The prior per-gap pipeline remains rejected; the UP hold remains separately
+unattributed. No build/lab is active; root alone ran this closed capture.
+
+Other resumed read-only results: aggregate owner ETA includes later Original
+debt and cannot supply exact remaining service for the missing head; simply
+reusing it as a post-fallback gate is unsupported. The old exact D frontier
+reaches the server report31--33ms after receiver progress, consistent with the
+configured30ms return; that does not explain its multi-second Original wait.
+Server input already coalesces ready ACK/MAX before data/lifecycle boundaries,
+so missing batching is not an established defect. The rejected capture's
+224--268ms receipt-to-report interval is not attributable to input starvation:
+its report occurs after recovery work and no ingress/publication stamps exist.
 
 The user now explicitly requests proving/challenging the preceding conclusions,
 including TCP on link 1 and QUIC on link 2, and correcting demonstrated severe
@@ -150,8 +282,9 @@ TCP Original assignment; assigned-minus-positive-frontier repeatedly fills
 64MiB while received reorder grows25.955→34.238MB. No newQUIC Originals there.
 TCP native flight~.21MB versus~7MB windows and physicalcut200 remain underused.
 395 acceptedTCP repairs total5,041,220B,98.55% already below an earlier recorded
-client release frontier; every repair START is1--31ms late. Exact head579050494
-takes5.692s fromQOriginal toQreceipt, its firstTCPcopy follows18ms afterward.
+client release frontier; every repair START is1--31ms late. Range579050494
+takes5.692s fromQOriginal toQreceipt, but resides at the receiver head for13ms;
+its firstTCPcopy follows18ms after receipt.
 All4,305 retained-helper outcomes are skipped defaults because ACK-gap exposes
 one/two frames, not proof that the retained fallback itself was evaluated.
 This selects oldQdebt/ordered-credit/recovery service, not newQallocation or a
@@ -384,8 +517,10 @@ Do not republish an existing version or tag before the gates pass.
 
 ## Frozen candidate and exclusions
 
-- Candidate runtime is **04f1e56**, also the runtime at evidence checkpoint
-  e2375e9 and current reversal checkpoint **0453a40**.
+- Recovery candidate runtime is **04f1e56**, also the runtime at evidence
+  checkpoint e2375e9 and reversal checkpoint **0453a40**. Current **efed8ec**
+  separately applies the requested20% defaults; old10% binaries are not a
+  matching-policy comparator for a new20% candidate.
 - Retain the existing exact correctness/lifecycle/telemetry corrections and
   finite client ACK/MAX Input correction. The clipped repair-range correction
   preserves an existing exact-owner exclusion contract, with real producer and
@@ -398,8 +533,9 @@ Do not republish an existing version or tag before the gates pass.
   or run. Other previously rejected trials remain removed. Do not restore them.
 - Current ordinary candidate executable:
   ./.tmp/reflection/bin/clipped-range-20260911/mptunnel.
-  target/release/mptunnel is now the rejected-trial exact-G observer executable,
-  frozen at ./.tmp/reflection/bin/response-uncovered-proof-20260911/mptunnel,
+  target/release/mptunnel is now the current04f native-backlog observer with
+  matching10% policy, frozen at
+  ./.tmp/reflection/bin/native-stream-backlog-20260911/mptunnel,
   NOT the ordinary candidate. bin/ordered-credit-head-20260911/mptunnel
   remains the REJECTED trial executable. Always use explicit paths.
 - Version/package/docs changes may follow the gates. A runtime change requires
@@ -523,13 +659,15 @@ review, and is not part of the candidate.
 21 regular files; independent input-byte verification, root complete171-line
 appendix review and gzip/manifest checks done. No observer follow-up exists.
 
-No build or laboratory run is active. Independent capture/timing reviews are
+The separate20% default-policy focused tests are complete; no build or laboratory
+run is active. Previously completed independent capture/timing reviews are
 closed; the final eight-file diagnostic archive is51,090,323B raw/2,786,019B
 compressed, with full replay and receipt-timing limits in the evidence appendix.
-Runtime/RFC/manifests are restored exactly to dbed0c5/current04f.
+Recovery runtime remains dbed0c5/current04f; only the requested default-policy
+constants and related docs/assertions change in this transaction.
 Root alone runs builds/labs, without overlap. Existing project Docker only;
 no sudo, outside-root work or /mnt/storage use. Preserve the unrelated user
 seven-line edit in LIVE_OWNER_FRONTIER_WORK_BOUND.md; AGENTS.md is immutable.
-Next nonurgent Telegram notification no earlier than03:53 UTC.
+Next nonurgent Telegram notification no earlier than04:53 UTC.
 Commentary stays timely; no release notification
 before an actual milestone.

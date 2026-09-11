@@ -487,6 +487,10 @@ been released1–31ms earlier(median19,p9526). No QUIC copy overlaps the entire
 head span[573465074,586014578). Example head579050494 has exact QUIC Original
 assignment1789092791412ms, QUIC release1789092797104ms(+5.692s), and its
 first/only overlapping TCP copy at1789092797122ms,18ms after release.
+Clarification,2026-09-11: the receiver frontier reaches579050494 at7091ms,
+so this range occupies the blocking head for13ms, NOT5.692s. Assignment-to-
+receipt residence includes time behind older prefixes. Nor does A−F=64MiB
+alone establish actual peer MAX exhaustion; that permission was not logged.
 These are receiver-versus-sender-knowledge comparisons, not ACK authority
 violations or proof that every byte/copy is unnecessary.
 
@@ -792,3 +796,109 @@ All source bytes verified:51090323B raw /2786019B compressed. No credentials,
 binary, unrelated result, runtime fix or invented driver wrapper is included.
 Runner/shape and rejected runtime provenance remain in the earlier archives
 and ec8cd2f checkpoint. CURRENT/method/source were untouched by this task.
+
+## Resumed ownership/timing challenge — 2026-09-11 12:00+08
+
+Root replay of the existing D capture preserves the13.381Mbps ordinary failure
+and separates it from physical TCP failure. The same logical response owns
+the ordered receive frontier and retained Product debt; each native carrier
+has independent transport ownership. All80 independent echoes still succeed.
+This supports stream-order coupling, not an all-stream or TCP-transport takedown.
+
+The example[579050494,579062494) enters the receiver head at1789092797091ms
+(client seq63647), arrives on QUIC at7104ms(seq63650), and is first copied on
+TCP at7122ms, when server seq54082 first reports F579050494. Server seq54093
+reports F579062494 at7137ms. The13ms head residence is shorter than the31--33ms
+receipt-to-server-report lag. Its5.692s Original-to-arrival age is NOT a5.692s
+head stall. The first ten accepted TCP repairs in the earlier seven-second
+collapse interior similarly start behind a strictly earlier receiver frontier.
+No positive Data ACK already applied on the server is violated by that fact.
+
+Actual live-head repair selection starts at the first canonical receiver gap;
+an accepted overlapping copy does not advance that selection. A14,600B copy
+cannot automatically beat a head advancing about1.25MB/s across a100ms round
+trip (about125,000B advancement). This is an illustrative timing calculation,
+not a measured deadline or authority to multiply the repair quantum. The
+withdrawn pipeline removed serialization but lost healthy useful service;
+its exact-G replay already falsifies a simple omission-membership remedy.
+
+Additional stage question from the SAME capture: in the healthy wall band
+[1789092786082,1789092790082),1,209accepted QUIC-to-TCP repairs have Original
+ages min/median/p95/max1081/1392/1882/1941ms. Native QUIC RTT meanwhile stays
+about100ms in the periodic records. These clocks observe different stages.
+`write_reliable_frame_bytes` drops the API-write backlog after H3 send_data
+completes; Quinn's write completion only inserts bytes into SendBuffer and is
+bounded by flow control/send_window, not immediate packet transmission.
+Thus pending_bytes=0 does not establish an empty native unsent stream buffer.
+A new observation-only capture measures that buffer directly; it does not
+reduce any limit, add another pacer, or select a runtime correction.
+
+### Native unsent-buffer discriminator: closed
+
+Capture `aggregate-combined-down-isolated-tcp47-quic46-native-backlog-0911`
+uses current04f recovery, explicit matching10% defaults, and only the periodic
+quic_stream_backlog observer. Its source is fully removed afterward; committed
+product source remains efed8ec with20% defaults. The same3TCP47+1QUIC46 remain
+active in all40service rows. Both cuts are200Mbps; QUIC46 DOWN changes to10Mbps
+at15.073s and returns at25.077s. UDP block/restoration is30.149/33.462s. There
+is no deliberate loss/jitter; the native getter changes no controller state.
+
+The duration-partial HTTP200 download delivers1,078,459,087B in40.000554s:
+215.689Mbps whole, healthy5--15s338.992Mbps, QoS15--25s21.414Mbps, and
+17--24s19.518Mbps. Body first-byte/maxgap are.584410/.344532s. All72 attempted
+echoes succeed (not80attempts); p95/max825.869/2234.464ms. These observer timings
+are not an ordinary performance acceptance or replacement for previous results.
+The637.946Mbps post-restoration one-second application bin releases reordered
+data as well as fresh input; it is not a637.946Mbps physical400Mbps service claim.
+Exit/teardown completes normally. Three warning lines occur at duration-stop:
+Broken pipe, RemoteClosed and H3_NO_ERROR. No earlier runtime warning is logged.
+
+Direct native observations are connection-scoped and separately timestamped
+from periodic management. Bands below use the first management timestamp minus
+its elapsed offset as an approximate wall anchor; they are conservative phase
+interiors, not exact per-byte timing joins. Values are decimal bytes.
+
+| Server band | Samples | Native never-packetized min / median / max | Native packet-flight median | API-write-zero samples |
+|---|---:|---:|---:|---:|
+| Healthy5--14s |142|25,248,521 /33,973,758 /44,038,740|2,477,838|134|
+| QoS16--24s |5|30,463,617 /31,197,120 /32,950,719|4,901,952|5|
+| Restored26--29s |38|14,903,537 /24,198,892 /34,541,229|2,640,462|36|
+
+Server488and client317snapshots all satisfy unsent<=unacked; each endpoint
+retains one connection identity. The sparse five QoS samples establish their
+observed backlogs, not uninterrupted sampling or a lower bound at every instant.
+Client healthy/QoS unsent samples are all zero. Server peak unsent55,990,611B
+occurs late in the run with native flight2,262,216B and API-write count0.
+Snapshots sum actual SendBuffer.offset−unsent for non-reset native streams;
+retransmission requests are excluded. This is exact buffer inventory, not
+Product minus native-byte subtraction or an estimated queue.
+
+Decision: the large pre-packet queue hypothesis is confirmed. Successful H3
+write completion and zero active API-write backlog do not establish native
+transmission readiness. At constant200Mbps,34MB alone needs about1.36s of
+service; at10Mbps,31MB needs about24.8s. Those are inventory/service calculations,
+not residence measurements for an individual blocking byte or a promised gain.
+The source deliberately uses a large memory/flow-control send_window; Quinn's
+write acceptance correctly obeys it. This is not a demonstrated upstream
+packet-recovery defect. The MPP integration must distinguish that allocation
+permission from native service opportunity before claiming its current writer
+boundary prevents large queued Original debt. Product debt already appears in
+rank, so merely adding the same bytes again to a score is not a justified fix.
+
+Next bounded model work is QUIC Original handoff and exact native queue
+ownership, in both directions. Do not change BBR, shrink the configured memory
+ceiling, pick a protocol, or shorten cause clocks to hide this queue. Any
+candidate must retain native pacing/CC, coordinate writers sharing one QUIC
+connection, leave control/repair progress available, and use real capacity
+release wakes rather than polling. First prove those ownership/liveness
+conditions and the current real-writer backlog counterexample; only then
+implement and compare matched-policy healthy and cut phases. The withdrawn
+pipeline remains withdrawn. Complete per-byte attribution of the older severe
+UP confirmation hold is not supplied by this DOWN connection inventory.
+
+Archive `./docs-dev/NATIVE_STREAM_BACKLOG_DIAGNOSTIC_20260911.raw.tar.gz`
+contains seven regular files: the exact observation/matching-policy patch,
+reproduction note, and five raw result files. Manifest and gzip checks pass;
+compressed size257,810B. It contains no binary or credential config. The prior
+archives retain unchanged run.py/shape.sh. No observer source, changed buffer
+limit, packet controller or recovery policy is accepted by this archive.

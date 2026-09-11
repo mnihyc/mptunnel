@@ -1132,10 +1132,10 @@ where
                     }
                     local_shutdown
                     };
-                    if let Some(local_shutdown) = local_shutdown {
-                        if let Err(error) = local_shutdown.await {
-                            break Err(error);
-                        }
+                    if let Some(local_shutdown) = local_shutdown
+                        && let Err(error) = local_shutdown.await
+                    {
+                        break Err(error);
                     }
                     continue;
                 }
@@ -1913,16 +1913,16 @@ where
                 }
                 #[cfg(not(feature = "lab-diagnostics"))]
                 let _ = data_ack_reinjection;
-                if accepted_copy_due {
-                    if sender.enqueue_tail_reinjection(
+                if accepted_copy_due
+                    && sender.enqueue_tail_reinjection(
                         sender_queue,
                         context,
                         remotes,
                         send_stream,
                         request_lane,
-                    ) {
-                        state.progress.sender_retry_at = None;
-                    }
+                    )
+                {
+                    state.progress.sender_retry_at = None;
                 }
                 let data_ack_path_model_wait_active =
                     reliable_relay_client_ack_gap_path_model_wait_active(
@@ -3977,10 +3977,10 @@ where
                                     None
                                 }
                                 };
-                                if let Some(local_shutdown) = local_shutdown {
-                                    if let Err(err) = local_shutdown.await {
-                                        break Err(err);
-                                    }
+                                if let Some(local_shutdown) = local_shutdown
+                                    && let Err(err) = local_shutdown.await
+                                {
+                                    break Err(err);
                                 }
                             }
                             feedback @ Frame::StreamAck { stream_id: feedback_stream_id, .. }
@@ -4066,8 +4066,8 @@ where
                                         &mut product.sender,
                                         &mut product.sender_queue,
                                         context,
-                                        &mut product.remotes,
-                                        &mut product.send_stream,
+                                        &product.remotes,
+                                        &product.send_stream,
                                         path_snapshot,
                                         request_lane,
                                         stream_id,
@@ -4221,10 +4221,10 @@ where
                                     None
                                 }
                                 };
-                                if let Some(local_shutdown) = local_shutdown {
-                                    if let Err(err) = local_shutdown.await {
-                                        break Err(err);
-                                    }
+                                if let Some(local_shutdown) = local_shutdown
+                                    && let Err(err) = local_shutdown.await
+                                {
+                                    break Err(err);
                                 }
                             }
                             Frame::StreamReset {

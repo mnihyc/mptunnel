@@ -524,22 +524,20 @@ impl ResponseStreamBinding {
         if let Some(entry) = outputs.entries.iter_mut().find(|entry| {
             feedback_output_identity(entry) == output
                 && !entry.commands.control_frame_admission_is_closed()
-        }) {
-            if entry
-                .pending_feedback_receipt
-                .is_none_or(|(previous, _)| token >= previous)
-            {
-                #[cfg(feature = "lab-diagnostics")]
-                super::super::feedback_route::lab_feedback_return(
-                    diagnostic_scope,
-                    "reply_bound",
-                    format_args!(
-                        "output={:?} token={} required_max_offset={}",
-                        output, token, required_max_offset,
-                    ),
-                );
-                entry.pending_feedback_receipt = Some((token, required_max_offset));
-            }
+        }) && entry
+            .pending_feedback_receipt
+            .is_none_or(|(previous, _)| token >= previous)
+        {
+            #[cfg(feature = "lab-diagnostics")]
+            super::super::feedback_route::lab_feedback_return(
+                diagnostic_scope,
+                "reply_bound",
+                format_args!(
+                    "output={:?} token={} required_max_offset={}",
+                    output, token, required_max_offset,
+                ),
+            );
+            entry.pending_feedback_receipt = Some((token, required_max_offset));
         }
     }
 

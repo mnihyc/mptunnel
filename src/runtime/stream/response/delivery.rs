@@ -1758,10 +1758,10 @@ impl ResponseStreamBinding {
         // All exact raw-copy and slot refusals precede Ready consumption.
         // Prepared admission records only copies, whose mutation below cannot
         // fail; Original qualification callers do not carry a Ready receipt.
-        if let Some(ready) = ready {
-            if kind != CarrierWorkKind::ReinjectedData || !ready.try_consume() {
-                return Err(RuntimeError::SenderServiceBlocked);
-            }
+        if let Some(ready) = ready
+            && (kind != CarrierWorkKind::ReinjectedData || !ready.try_consume())
+        {
+            return Err(RuntimeError::SenderServiceBlocked);
         }
         let mut qualification_receipt = None;
         let (recorded_incarnation, evidence_eligible) = {

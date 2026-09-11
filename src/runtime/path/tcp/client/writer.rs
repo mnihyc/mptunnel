@@ -111,9 +111,9 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 // writer, after higher lanes have arbitrated, may claim it.
                 if work.request_instance().is_none()
                     || work.path_instance_id() != connection.path_instance_id
-                    || !streams
+                    || streams
                         .get(&work.stream_id())
-                        .is_some_and(|stream| stream.pending_open.is_none())
+                        .is_none_or(|stream| stream.pending_open.is_some())
                 {
                     break;
                 }

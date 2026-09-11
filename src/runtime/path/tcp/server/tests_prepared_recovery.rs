@@ -523,7 +523,7 @@ async fn prepared_tcp_latency_completion_reaches_peer_before_owner_fallback() {
             .unwrap()
             .delivered
             .as_slice(),
-        &[expected_payload.clone()]
+        std::slice::from_ref(expected_payload)
     );
     fixture.assert_source(payload.len(), payload.len(), 0);
     assert_eq!(

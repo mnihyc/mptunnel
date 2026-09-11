@@ -155,7 +155,7 @@ fn ready_client_feedback_retains_first_barrier_and_its_exact_instance() {
                 Err(RuntimeError::Protocol("ordered barrier"))
             )),
         }
-        assert_eq!(applied, [ack.clone()]);
+        assert_eq!(applied.as_slice(), std::slice::from_ref(&ack));
         assert_eq!(
             pending.len(),
             1,
@@ -225,8 +225,8 @@ fn ready_client_feedback_bounds_replenished_input_and_stops_on_apply_error() {
         Err(RuntimeError::Protocol("apply rejected"))
     ));
     assert_eq!(
-        applied,
-        [ack.clone()],
+        applied.as_slice(),
+        std::slice::from_ref(&ack),
         "accepted prefix is not replayed or discarded"
     );
     assert_eq!(

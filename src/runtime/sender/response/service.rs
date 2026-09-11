@@ -1426,6 +1426,7 @@ impl ServerResponseSenderService {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_next_attempt_with_data_ack_outstanding(
         &mut self,
         path_stream: &ReliablePathStream,

@@ -586,27 +586,23 @@ pub(in crate::runtime) fn claim_prepared_request_data(
                 }
             };
         }
-        let Some(observation) = state.sender.multipath.observe_original_claim_from_inputs(
+        let observation = state.sender.multipath.observe_original_claim_from_inputs(
             context,
             &state.remotes,
             &frame,
             lane,
             include_bulk,
             current_inputs.clone(),
-        ) else {
-            return None;
-        };
+        )?;
         let full_authority = if lane.is_bulk() && !include_bulk {
-            let Some(authority) = state.sender.multipath.observe_original_claim_from_inputs(
+            let authority = state.sender.multipath.observe_original_claim_from_inputs(
                 context,
                 &state.remotes,
                 &frame,
                 lane,
                 true,
                 current_inputs,
-            ) else {
-                return None;
-            };
+            )?;
             Some(authority)
         } else {
             None
@@ -644,21 +640,17 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         }
         let request_load_claim =
             if let Some((_, active, latency_sensitive)) = current_plan.load_expectation() {
-                let Some(claim) = context.try_reserve_relay_path_load_if_unchanged(
+                let claim = context.try_reserve_relay_path_load_if_unchanged(
                     instance,
                     lane,
                     active,
                     latency_sensitive,
-                ) else {
-                    return None;
-                };
+                )?;
                 Some(claim)
             } else {
                 None
             };
-        let Some(position) = current_plan.target_position_for_apply(&state.remotes, lane) else {
-            return None;
-        };
+        let position = current_plan.target_position_for_apply(&state.remotes, lane)?;
         if !current_plan.target_retains_exact_eligibility(context, lane) {
             return None;
         }

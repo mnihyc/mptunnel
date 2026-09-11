@@ -3847,15 +3847,15 @@ where
                     return Err(RuntimeError::Protocol("unexpected stream relay frame"));
                 }
             }
-            if response_product.lock().sender.queued_nondata_ready() {
-                if drain_shared_server_response_sender_ready(
-                &response_product, path_stream, response_lane, mux_limits,
-                sender_dispatch_byte_budget, sender_dispatch_item_budget, &mut tail_copy_wake_at, session_id,
-            )?
-                {
-                    response_sender_retry_at =
-                        Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
-                }
+            let queued_nondata_ready = response_product.lock().sender.queued_nondata_ready();
+            if queued_nondata_ready
+                && drain_shared_server_response_sender_ready(
+                    &response_product, path_stream, response_lane, mux_limits,
+                    sender_dispatch_byte_budget, sender_dispatch_item_budget, &mut tail_copy_wake_at, session_id,
+                )?
+            {
+                response_sender_retry_at =
+                    Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
             }
         }
         changed = async {
@@ -3959,15 +3959,15 @@ where
                     &mut product, &response_product, response_lane, adaptive_chunk, true,
                 );
             }
-            if response_product.lock().sender.queued_nondata_ready() {
-                if drain_shared_server_response_sender_ready(
-                &response_product, path_stream, response_lane, mux_limits,
-                sender_dispatch_byte_budget, sender_dispatch_item_budget, &mut tail_copy_wake_at, session_id,
-            )?
-                {
-                    response_sender_retry_at =
-                        Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
-                }
+            let queued_nondata_ready = response_product.lock().sender.queued_nondata_ready();
+            if queued_nondata_ready
+                && drain_shared_server_response_sender_ready(
+                    &response_product, path_stream, response_lane, mux_limits,
+                    sender_dispatch_byte_budget, sender_dispatch_item_budget, &mut tail_copy_wake_at, session_id,
+                )?
+            {
+                response_sender_retry_at =
+                    Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
             }
             continue;
         }
@@ -4049,15 +4049,15 @@ where
                 response_sender_retry_at = None;
                 last_recv_progress_sent_at = Instant::now();
             }
-            if response_product.lock().sender.queued_nondata_ready() {
-                if drain_shared_server_response_sender_ready(
-                &response_product, path_stream, response_lane, mux_limits,
-                sender_dispatch_byte_budget, sender_dispatch_item_budget, &mut tail_copy_wake_at, session_id,
-            )?
-                {
-                    response_sender_retry_at =
-                        Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
-                }
+            let queued_nondata_ready = response_product.lock().sender.queued_nondata_ready();
+            if queued_nondata_ready
+                && drain_shared_server_response_sender_ready(
+                    &response_product, path_stream, response_lane, mux_limits,
+                    sender_dispatch_byte_budget, sender_dispatch_item_budget, &mut tail_copy_wake_at, session_id,
+                )?
+            {
+                response_sender_retry_at =
+                    Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
             }
         }
         _ = std::future::ready(()), if can_send_pending_fin => {

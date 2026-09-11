@@ -224,7 +224,7 @@ async fn server_quic_prepared_original_waits_for_unacknowledged_native_bytes() {
                     .unwrap()
                     .delivered
                     .as_slice(),
-                &[prefix.clone()]
+                std::slice::from_ref(&prefix)
             );
             assert_eq!(
                 udp_path_read_frame(
@@ -255,7 +255,7 @@ async fn server_quic_prepared_original_waits_for_unacknowledged_native_bytes() {
                     .unwrap()
                     .delivered
                     .as_slice(),
-                &[payload.clone()]
+                std::slice::from_ref(&payload)
             );
         };
         tokio::pin!(metrics, service);

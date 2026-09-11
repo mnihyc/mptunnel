@@ -166,11 +166,10 @@ impl NativeCommitmentBarrier {
         self.native_end
     }
 
-    pub(in crate::runtime) fn wait_until_packetized(
+    pub(in crate::runtime) async fn wait_until_packetized(
         self,
-    ) -> impl Future<Output = Result<SendStreamProgress, NativeCommitmentError>> + Send + 'static
-    {
-        async move { checked_progress(self.observer.wait_until_packetized(self.native_end).await) }
+    ) -> Result<SendStreamProgress, NativeCommitmentError> {
+        checked_progress(self.observer.wait_until_packetized(self.native_end).await)
     }
 }
 

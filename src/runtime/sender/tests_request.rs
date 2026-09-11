@@ -1726,7 +1726,7 @@ async fn request_recovery_copy_debt_query_work(fragmented_suffix: bool) -> (usiz
     assert!(matches!(
         command,
         ReliablePathCommand::SendFrame(Frame::StreamData { stream_id: actual, offset: 0, payload })
-            if actual == stream_id && payload == Bytes::from(vec![0x73; q])
+            if actual == stream_id && payload == vec![0x73; q]
     ));
     assert!(try_recv_reliable_path_command(&mut target_receivers).is_none());
     assert!(try_recv_reliable_path_command(&mut owner_receivers).is_none());
@@ -3660,8 +3660,10 @@ async fn scoped_ack_actual_two_attachment_publication_preserves_catchup_and_repl
     // return selection and its markers have separate context-aware controls.
     remotes.finish_feedback_route();
     consume_client_path_proof_for_test(&mut available_rx);
-    let mut mux_limits = MuxLimits::default();
-    mux_limits.max_ack_ranges = 1;
+    let mux_limits = MuxLimits {
+        max_ack_ranges: 1,
+        ..MuxLimits::default()
+    };
     let mut recv_stream = ReliableRecvStream::new(stream_id, mux_limits);
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);

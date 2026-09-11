@@ -98,6 +98,7 @@ pub(super) fn select_response_data_path_with_payload(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn select_prepared_response_data_path(
     targets: &[ResponseSenderPathTarget],
     lane: TrafficClass,

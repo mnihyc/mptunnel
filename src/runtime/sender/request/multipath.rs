@@ -87,17 +87,18 @@ fn request_path_proof(path: &ReliableRelayRemotePath) -> Option<RelayPathProofEp
     })
 }
 
+/// One attachment's identity, proof epoch, and detached native authority handle.
+type RequestRelayNativePathCapture = (
+    RelayPathInstance,
+    Option<RelayPathProofEpoch>,
+    Option<Arc<NativeCarrierRateAuthorityHandle>>,
+);
+
 /// Detached read inputs, not admission authority. Constructing this capture
 /// only clones handles; resolve it after leaving Product ownership.
 pub(super) struct RequestRelayNativeCapture {
     membership_generation: u64,
-    paths: SmallVec<
-        [(
-            RelayPathInstance,
-            Option<RelayPathProofEpoch>,
-            Option<Arc<NativeCarrierRateAuthorityHandle>>,
-        ); 4],
-    >,
+    paths: SmallVec<[RequestRelayNativePathCapture; 4]>,
 }
 
 impl RequestRelayNativeCapture {

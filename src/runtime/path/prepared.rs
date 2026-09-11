@@ -159,6 +159,10 @@ pub(in crate::runtime) enum PreparedOriginalClaim {
     Empty,
 }
 
+// Stored once in an Arc registration; queued and waiting notices hold only Weak.
+// Keep the request context inline rather than adding a second allocation solely
+// to equalize variants. This does not enlarge each queued notice.
+#[allow(clippy::large_enum_variant)]
 enum PreparedOriginalSource {
     Request {
         product: WeakSharedRequestProduct,

@@ -874,22 +874,9 @@ impl ServerTcpPathSession {
                                 return Ok(ServerTcpSessionDisposition::Stop);
                             }
                         }
-                        PreparedOriginalClaim::RecoveryQueued => {
-                            work.requeue();
-                            if matches!(
-                                self.commit_transaction_respecting_deferred_input(
-                                    &mut writer_pending_bytes,
-                                )
-                                .await?,
-                                ServerTcpSessionDisposition::Stop
-                            ) {
-                                return Ok(ServerTcpSessionDisposition::Stop);
-                            }
-                        }
                         PreparedOriginalClaim::Busy(wait) => {
                             self.commands_rx.defer_prepared_work(work, wait)
                         }
-                        PreparedOriginalClaim::CarrierFailed(error) => return Err(error),
                         PreparedOriginalClaim::Blocked(wait) => {
                             self.commands_rx.defer_prepared_work(work, wait)
                         }

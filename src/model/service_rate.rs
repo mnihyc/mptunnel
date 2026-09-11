@@ -87,7 +87,7 @@ impl DirectionalServiceRateScope {
 
 /// Semantic source of the effective advisory service rate.
 ///
-/// There is intentionally no TCP native-operational variant: Core Profile 8
+/// There is intentionally no TCP native-operational variant: Core Profile 7
 /// names no such adapter. TCP telemetry remains diagnostic until another
 /// profile declares a complete adapter contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

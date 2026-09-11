@@ -5291,7 +5291,7 @@ fn failed_original_tail_scan_skips_an_overlapped_range_but_repairs_a_later_range
 }
 
 #[test]
-fn tail_reinjection_defers_live_inflight_reinjection_to_the_accepted_copy_wake() {
+fn tail_reinjection_skips_live_copy_and_preserves_its_accepted_copy_wake() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(127);
     let original_key = CarrierPathKey {
@@ -5374,8 +5374,8 @@ fn tail_reinjection_defers_live_inflight_reinjection_to_the_accepted_copy_wake()
     );
 
     assert_eq!(
-        outcome.queued, 0,
-        "live in-flight ReinjectedData for the same range must not be stacked"
+        outcome.queued, 1,
+        "the disjoint uncovered suffix remains eligible while the head copy is live"
     );
     assert!(
         !outcome.pending,
@@ -5387,7 +5387,18 @@ fn tail_reinjection_defers_live_inflight_reinjection_to_the_accepted_copy_wake()
             .is_some(),
         "the immutable accepted-copy wake owns reevaluation of this live repair",
     );
-    assert_eq!(response_sender.bytes(), 0);
+    assert!(!response_sender.has_queued_reinjection_overlap(&inflight_reinjection));
+    let (_, _, copy_bytes) = reliable_stream_frame_extent(&inflight_reinjection).unwrap();
+    assert_eq!(
+        response_sender.bytes(),
+        send_stream.reinjection_bytes() - copy_bytes
+    );
+    assert_eq!(
+        response_sender.retained_recovery_frontier(&path_stream, &send_stream, Instant::now()),
+        None,
+        "queued successor plus current head copy cover all remaining debt without ACKing it"
+    );
+    assert_eq!(send_stream.data_ack_frontier(), 1024);
 }
 
 #[test]
@@ -6281,7 +6292,7 @@ fn response_fin_keeps_its_exact_decide_target_across_metric_churn() {
 }
 
 #[test]
-fn response_live_fin_tail_stops_at_an_already_queued_frontier_copy() {
+fn response_live_fin_tail_pipelines_after_an_already_queued_frontier_copy() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(225);
     let original_key = CarrierPathKey {
@@ -6350,8 +6361,10 @@ fn response_live_fin_tail_stops_at_an_already_queued_frontier_copy() {
     path_stream.release_normalized_acked_ranges(&ack_ranges);
 
     let mut response_sender = ServerResponseSenderService::new(SessionId(225), stream_id);
-    response_sender
-        .enqueue_critical_reinjection_frame_with_cause(first_tail, RelaySendCause::TailReinjection);
+    response_sender.enqueue_critical_reinjection_frame_with_cause(
+        first_tail.clone(),
+        RelaySendCause::TailReinjection,
+    );
     let queued_before = response_sender.bytes();
     binding.age_original_flights_for_test(Duration::from_secs(1));
     let outcome = enqueue_live_response_retained_frontier_reinjection(
@@ -6363,12 +6376,31 @@ fn response_live_fin_tail_stops_at_an_already_queued_frontier_copy() {
         limits,
         Instant::now(),
     );
-    assert_eq!(outcome.queued, 0);
-    assert!(outcome.pending);
+    assert_eq!(outcome.queued, 1);
+    assert!(!outcome.pending);
     assert_eq!(
         response_sender.bytes(),
-        queued_before,
-        "an occupied lowest frontier must stop the FIN batch; later tail extents cannot consume the live-owner opportunity",
+        queued_before + 64,
+        "a provisional head copy leaves the disjoint mature FIN successor eligible",
+    );
+    assert!(response_sender.has_queued_reinjection_overlap(&first_tail));
+    assert!(response_sender.has_queued_reinjection_overlap(&later_tail));
+    let all_covered = enqueue_live_response_retained_frontier_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        128,
+        ResponseRetainedFrontierPhase::FinalDrain,
+        limits,
+        Instant::now(),
+    );
+    assert_eq!(all_covered.queued, 0);
+    assert_eq!(all_covered.owner_fallback_deadline, None);
+    assert_eq!(response_sender.bytes(), queued_before + 64);
+    assert_eq!(
+        send_stream.data_ack_frontier(),
+        64,
+        "queued copies are not receipt"
     );
 }
 
@@ -7523,6 +7555,374 @@ fn persistent_response_ack_gap_commits_only_the_ranked_frontier_quantum() {
             ..
         })) if offset == ack_frontier && payload.len() == scored_frontier_bytes
     ));
+}
+
+#[tokio::test]
+async fn response_recovery_services_uncovered_suffix_while_head_copy_is_live() {
+    use crate::protocol::PathUsage;
+    use crate::runtime::path::commands::ReliablePathCommandReceivers;
+
+    fn take_data(receivers: &mut ReliablePathCommandReceivers) -> Frame {
+        let command = try_recv_reliable_path_command(receivers).expect("actual carrier command");
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+        match command {
+            ReliablePathCommand::SendFrame(frame @ Frame::StreamData { .. }) => frame,
+            _ => panic!("expected actual DATA admission"),
+        }
+    }
+
+    fn apply_receiver_ack(
+        receiver: &ReliableRecvStream,
+        sender: &mut ServerResponseSenderService,
+        send: &mut ReliableSendStream,
+        path: &ReliablePathStream,
+        authoritative: &mut AuthoritativeStreamAckSnapshot,
+    ) {
+        for frame in receiver.ack_frames() {
+            let Frame::StreamAck {
+                scope_start,
+                ranges,
+                ..
+            } = frame
+            else {
+                unreachable!()
+            };
+            let ack = begin_reliable_stream_ack(send, scope_start, ranges)
+                .expect("receiver-produced ACK validates actual assigned bytes");
+            let release = send.apply_validated_ack(&ack).expect("apply real receipt");
+            sender.record_delivered_data(release.released_bytes);
+            path.release_normalized_acked_ranges(ack.ranges());
+            sender.release_normalized_acked_reinjections(ack.ranges());
+            update_reinjection_authoritative_ack_snapshot(authoritative, &ack, send);
+        }
+    }
+
+    let limits = MuxLimits::default();
+    let lane = TrafficClass::Throughput;
+    let native =
+        crate::runtime::stream::response::native_response_binding_fixture(8, Some(100_000_000));
+    let binding = native.binding;
+    let session_id = binding.session_id();
+    let stream_id = StreamId(719);
+    let quantum = MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
+    let tcp_keys = [PathId(0), PathId(1)].map(|path_id| CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id,
+    });
+    let quic_key = native.key;
+    let mut quic_receivers = native.receivers;
+    let quic_instance = binding.sender_path_targets(lane, 1)[0]
+        .observation
+        .path_instance_id;
+    assert!(
+        binding.update_peer_path_usage_for_test(quic_key, quic_instance, 1, PathUsage::Backup,)
+    );
+    let mut tcp_receivers = Vec::new();
+    let (_input_tx, input_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: input_rx.into(),
+    };
+    let mut sender = ServerResponseSenderService::new(session_id, stream_id);
+    let mut send = ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let mut receiver = ReliableRecvStream::new(stream_id, limits);
+    let mut authoritative = AuthoritativeStreamAckSnapshot::default();
+
+    // TCP ReceiptMode needs real Product delivery, not a native metric labelled
+    // measured. Qualify each alternate through ordinary dispatch and receiver
+    // ACKs. Backup usage only chooses the warmup owner; both become Available
+    // before the recovery transaction. No flight or assignment clock is seeded.
+    for (index, key) in tcp_keys.iter().copied().enumerate() {
+        let (commands, receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(key.underlay, key.path_id, commands, lane),
+            ResponseStreamAttachOutcome::Attached
+        );
+        tcp_receivers.push(receivers);
+        record_server_delivery_evidence_with_srtt(&binding, key, 100_000);
+        for _ in 0..4 {
+            sender.enqueue_data_for_lane(Bytes::from(vec![0x51; quantum]), lane);
+            let outstanding = send.reinjection_bytes();
+            let dispatch = sender
+                .dispatch_next_with_data_ack_outstanding(
+                    &path_stream,
+                    &mut send,
+                    lane,
+                    limits,
+                    outstanding,
+                )
+                .expect("ordinary TCP qualification dispatch");
+            assert_eq!(dispatch.selected_path, Some(key));
+            let Frame::StreamData {
+                offset, payload, ..
+            } = take_data(&mut tcp_receivers[index])
+            else {
+                unreachable!()
+            };
+            receiver
+                .receive_data(offset, payload)
+                .expect("receive TCP OriginalData");
+            apply_receiver_ack(
+                &receiver,
+                &mut sender,
+                &mut send,
+                &path_stream,
+                &mut authoritative,
+            );
+        }
+        let target = binding
+            .sender_path_targets(lane, 1)
+            .into_iter()
+            .find(|target| target.observation.key == key)
+            .expect("qualified TCP output");
+        assert!(target.observation.product_assignment_qualified);
+        assert!(target.observation.snapshot.has_durable_product_progress);
+        assert!(binding.update_peer_path_usage_for_test(
+            key,
+            target.observation.path_instance_id,
+            1,
+            PathUsage::Backup,
+        ));
+    }
+
+    // Existing activation-fenced NativeMode fixture supplies the declared
+    // current QUIC shape; actual admission supplies all retained geometry.
+    assert!(binding.update_peer_path_usage_for_test(
+        quic_key,
+        quic_instance,
+        2,
+        PathUsage::Available,
+    ));
+    let frontier = send.next_offset();
+    let mut originals = Vec::new();
+    for _ in 0..3 {
+        sender.enqueue_data_for_lane(Bytes::from(vec![0x62; quantum]), lane);
+        let outstanding = send.reinjection_bytes();
+        let dispatch = sender
+            .dispatch_next_with_data_ack_outstanding(
+                &path_stream,
+                &mut send,
+                lane,
+                limits,
+                outstanding,
+            )
+            .expect("actual QUIC OriginalData dispatch");
+        assert_eq!(dispatch.selected_path, Some(quic_key));
+        originals.push(take_data(&mut quic_receivers));
+    }
+    let Frame::StreamData {
+        offset, payload, ..
+    } = &originals[2]
+    else {
+        unreachable!()
+    };
+    receiver
+        .receive_data(*offset, payload.clone())
+        .expect("receive only the real suffix");
+    apply_receiver_ack(
+        &receiver,
+        &mut sender,
+        &mut send,
+        &path_stream,
+        &mut authoritative,
+    );
+    let gap = OffsetRange {
+        start: frontier,
+        end: frontier + (2 * quantum) as u64,
+    };
+    assert_eq!(authoritative.gaps(), &[gap]);
+    assert_eq!(send.data_ack_frontier(), frontier);
+    assert_eq!(send.reinjection_bytes(), 2 * quantum);
+    assert!(sender.is_empty());
+    for key in tcp_keys {
+        let target = binding
+            .sender_path_targets(lane, 1)
+            .into_iter()
+            .find(|target| target.observation.key == key)
+            .unwrap();
+        assert!(binding.update_peer_path_usage_for_test(
+            key,
+            target.observation.path_instance_id,
+            2,
+            PathUsage::Available,
+        ));
+    }
+    assert!(path_stream.stale_response_original_outputs().is_empty());
+    assert!(
+        path_stream
+            .failed_original_recovery_state()
+            .uncovered_ranges
+            .is_empty()
+    );
+    let owner = binding
+        .live_owner_uniform_frontier(gap)
+        .expect("one exact live QUIC owner");
+    assert_eq!(owner.owners.len(), 1);
+    assert_eq!(owner.owners[0].key, quic_key);
+    let owner_snapshot = path_stream.response_output_snapshot(owner.owners[0], lane);
+    let base_limit = adaptive_reliable_relay_reinjection_bytes(owner_snapshot, lane, limits);
+    assert!(base_limit > 0 && base_limit < 2 * quantum);
+    let observation = sender
+        .ack_gap_reinjection_path_snapshot(&path_stream, &send, authoritative.gaps(), base_limit)
+        .expect("actual measured distinct TCP candidate");
+    assert!(observation.target.is_some());
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        observation.owner_recovery_timing.fallback_at,
+    ))
+    .await;
+    assert!(Instant::now() >= observation.owner_recovery_timing.fallback_at);
+
+    let mut progress = ReliableAckGapReinjectionProgress::default();
+    let first = evaluate_server_data_ack_reinjection(
+        &mut sender,
+        &path_stream,
+        &send,
+        &mut progress,
+        &authoritative,
+        frontier,
+        owner_snapshot,
+        lane,
+        limits,
+        stream_id,
+    );
+    assert_eq!(
+        first.queued, 1,
+        "positive control: initial mature head queues"
+    );
+    let outstanding = send.reinjection_bytes();
+    let dispatch = sender
+        .dispatch_next_with_data_ack_outstanding(&path_stream, &mut send, lane, limits, outstanding)
+        .expect("first actual repair carrier admission");
+    let first_target = dispatch.selected_path.expect("exact TCP repair target");
+    let target_index = tcp_keys
+        .iter()
+        .position(|key| *key == first_target)
+        .unwrap();
+    let copy = take_data(&mut tcp_receivers[target_index]);
+    let (copy_start, copy_end, copy_bytes) = reliable_stream_frame_extent(&copy).unwrap();
+    assert_eq!(copy_start, frontier);
+    assert!(copy_bytes > 0 && copy_bytes <= base_limit && copy_end < gap.end);
+    let copy_deadline = binding
+        .reinjection_suppression_deadline(&copy)
+        .expect("actual accepted copy owns immutable unexpired D");
+    assert!(sender.is_empty());
+
+    // Do not acknowledge the first copy. Its ownership suppresses exactly its
+    // range, not the mature uncovered suffix. The same TCP still has vacant
+    // suffix ownership and current service, even with its first copy in flight.
+    let suffix = OffsetRange {
+        start: copy_end,
+        end: gap.end,
+    };
+    let suffix_owner = binding.live_owner_uniform_frontier(suffix).unwrap();
+    assert_eq!(suffix_owner.range, suffix);
+    assert_eq!(suffix_owner.owners, owner.owners);
+    assert_eq!(suffix_owner.avoid, owner.owners);
+    let suffix_timing =
+        reliable_data_ack_gap_timing_for_assignments(&suffix_owner.owner_assignments, |identity| {
+            (
+                identity.key.underlay,
+                path_stream.response_output_snapshot(identity, lane),
+            )
+        })
+        .unwrap();
+    assert!(suffix_timing.fallback_at <= Instant::now());
+    let suffix_frame = exact_contiguous_retransmission_frames(&send, suffix)
+        .unwrap()
+        .remove(0);
+    assert!(!path_stream.has_recent_reinjection_overlap(&suffix_frame));
+    let target = binding
+        .sender_path_targets(lane, quantum)
+        .into_iter()
+        .find(|target| target.observation.key == first_target)
+        .unwrap();
+    let identity = ServerReinjectionOutputIdentity {
+        key: first_target,
+        incarnation: target.observation.incarnation,
+    };
+    assert!(target.observation.product_assignment_qualified);
+    assert!(target.can_enqueue_reinjection_frame(&suffix_frame));
+    assert!(
+        sender.reinjection_service_limit_for_target(
+            &path_stream,
+            &send,
+            identity,
+            target.observation.snapshot,
+            false,
+            limits,
+        ) >= quantum
+    );
+    assert!(
+        !binding
+            .reinjection_avoid_outputs_for_frame(&suffix_frame)
+            .contains(&(first_target, identity.incarnation))
+    );
+
+    let second = evaluate_server_data_ack_reinjection(
+        &mut sender,
+        &path_stream,
+        &send,
+        &mut progress,
+        &authoritative,
+        frontier,
+        owner_snapshot,
+        lane,
+        limits,
+        stream_id,
+    );
+    assert!(
+        second.frame_count > 0,
+        "another TCP can rank, but cannot stack a live head copy"
+    );
+    assert_eq!(second.queued, 0);
+    // Exercise the real retained service separately after the ACK-gap refusal.
+    // The actor also needs to offer this service when queued==0: the positive
+    // frame_count above is not admission and must not suppress that caller.
+    let _ = enqueue_live_response_retained_frontier_reinjection(
+        &mut sender,
+        &path_stream,
+        &send,
+        second.base_limit,
+        ResponseRetainedFrontierPhase::Active,
+        limits,
+        Instant::now(),
+    );
+    assert_eq!(authoritative.gaps(), &[gap]);
+    assert_eq!(send.data_ack_frontier(), frontier);
+    assert_eq!(send.reinjection_bytes(), 2 * quantum);
+    assert!(path_stream.stale_response_original_outputs().is_empty());
+    assert!(
+        copy_deadline > Instant::now(),
+        "host preemption must not expire the protected copy"
+    );
+    assert!(!sender.has_queued_reinjection_overlap(&copy));
+    assert!(
+        sender.bytes() > 0,
+        "live head-copy coverage must not stop the next due uncovered response prefix"
+    );
+    let outstanding = send.reinjection_bytes();
+    let dispatch = sender
+        .dispatch_next_with_data_ack_outstanding(&path_stream, &mut send, lane, limits, outstanding)
+        .expect("successor must pass real final carrier admission");
+    let next_target = tcp_keys
+        .iter()
+        .position(|key| Some(*key) == dispatch.selected_path)
+        .expect("distinct TCP successor target");
+    let next_copy = take_data(&mut tcp_receivers[next_target]);
+    let (next_start, next_end, _) = reliable_stream_frame_extent(&next_copy).unwrap();
+    assert_eq!(next_start, copy_end);
+    assert!(next_end <= gap.end);
+    assert_eq!(send.data_ack_frontier(), frontier);
+    assert_eq!(send.reinjection_bytes(), outstanding);
+    assert_eq!(
+        binding.reinjection_suppression_deadline(&copy),
+        Some(copy_deadline)
+    );
 }
 
 #[test]

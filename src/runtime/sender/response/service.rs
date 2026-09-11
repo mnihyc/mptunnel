@@ -36,7 +36,9 @@ use crate::model::work::{
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::performance::MppPerformanceConfig;
-use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
+use crate::protocol::frame::{
+    normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_accounted_bytes,
+};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, SessionId, StreamId};
@@ -1009,6 +1011,31 @@ impl ServerResponseSenderService {
 
     pub(in crate::runtime) fn has_queued_reinjection_overlap(&self, frame: &Frame) -> bool {
         self.queue.has_queued_reinjection_overlap(frame)
+    }
+
+    /// Select one retained frontier not already queued or under current native
+    /// copy recovery. Coverage does not advance the positive Data-ACK frontier.
+    /// Only this first uncovered range may proceed to owner timing/ranking;
+    /// an unavailable or immature owner cannot be skipped to find easier work.
+    pub(in crate::runtime) fn retained_recovery_frontier(
+        &self,
+        path_stream: &ReliablePathStream,
+        send_stream: &ReliableSendStream,
+        observed_at: Instant,
+    ) -> Option<OffsetRange> {
+        let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
+            return None;
+        };
+        let mut covered = binding.live_reinjected_ranges_at(observed_at);
+        covered.extend(self.queue.queued_reinjection_ranges());
+        let covered = normalize_offset_ranges(covered);
+        let retained = send_stream.retained_ranges_in_scope(OffsetRange {
+            start: send_stream.data_ack_frontier(),
+            end: send_stream.next_offset(),
+        });
+        offset_ranges_not_covered(&retained, &covered)
+            .into_iter()
+            .next()
     }
 
     #[cfg(test)]

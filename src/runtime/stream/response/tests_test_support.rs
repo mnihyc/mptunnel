@@ -18,11 +18,11 @@ use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(super) struct NativeResponseBindingFixture {
-    pub(super) binding: Arc<ResponseStreamBinding>,
-    pub(super) key: CarrierPathKey,
+pub(in crate::runtime) struct NativeResponseBindingFixture {
+    pub(in crate::runtime) binding: Arc<ResponseStreamBinding>,
+    pub(in crate::runtime) key: CarrierPathKey,
     pub(super) commands: ReliablePathCommandSender,
-    pub(super) receivers: ReliablePathCommandReceivers,
+    pub(in crate::runtime) receivers: ReliablePathCommandReceivers,
     pub(super) authority: Arc<NativeCarrierRateAuthorityHandle>,
     pub(super) scope: CarrierRateAuthorityScope,
 }
@@ -49,7 +49,7 @@ pub(super) fn binding_for_underlay(
     (binding, key, receivers)
 }
 
-pub(super) fn native_response_binding_fixture(
+pub(in crate::runtime) fn native_response_binding_fixture(
     queue_capacity: usize,
     operational_rate_bps: Option<u128>,
 ) -> NativeResponseBindingFixture {

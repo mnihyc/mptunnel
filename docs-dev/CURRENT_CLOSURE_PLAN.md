@@ -217,6 +217,52 @@ RFC15.2 explicitly separates recovery coverage from affirmative receipt. This
 is a candidate model correction, not an accepted practical improvement; next
 are exact successor final admission and boundary checks, then ordinary DOWN B.
 
+Mechanism controls CLOSED:170 response/tail/expiry tests pass, including real
+second TCP writer admission with unchanged F/debt and unchanged first-copy D,
+positive-ACK clipping, exact detach/replacement, immutable assignment clocks,
+full target reserve and prearmed capacity release. Two old tests explicitly
+required stopping after a covered head despite a disjoint mature successor;
+they were migrated to successor/no-overlap/all-covered-wake controls, not waived.
+The ordinary no-feature candidate is building as response-uncovered-prefix;
+no diagnostic overlay or parameter change. Independent final diff review and
+the unchanged DOWN B full-series comparison still decide promotion.
+Specific competing explanation retained: native TCP flight/window headroom is
+not exact Product K. Retained TCP Originals may consume P and leave only the
+existing emergency quantum; if so, coverage pipelining alone may not remove
+the observed collapse. Do not enlarge reserves to rescue the experiment.
+
+Ordinary outcome CLOSED,2026-09-11: candidate DOWN B improves the selected
+QoS15--25s mean13.381→153.633Mbps but fails composed user service. Healthy5--15
+falls324.202→193.307Mbps(-40.37%); whole215.335→181.536; worst readgap.327493→
+3.300801s with zero bins18,19,21,22,23. HTTP200 and80/80echoes remain, echo
+p95 rises326.850→436.064ms (max654.008→541.064ms). Both200Mbps cuts stay busy;
+sampled DOWN wire/useful rises1.305826→1.718119. Exact bulk-only management
+plateaus match the body's blocking frontier; substantial TCP nativeACK progress
+continues. Native service is not ordered user service. No CPU-dominance claim
+or exact copy-byte attribution follows from aggregate wire counters.
+
+Disposition: do NOT promote. Retained-cache silence is not receiver omission;
+pipeline eligibility can turn many already-mature unknown-receipt suffixes into
+copies. The unchanged min-tightened clock observer also runs more/earlier when
+the old caller/gate no longer suppresses it. These are known composition risks,
+not a Rust safety defect or a reason to increase timeouts/reserves. Exact cause
+of each new plateau remains unassigned in the ordinary capture. Independent
+source review found no broken copy/credit/wake invariant; source correctness
+and170GREEN do not justify shipping the practical regression. Checkpoint this
+isolated trial and withdraw it before another model is considered.
+
+The competing Original-debt explanation was narrowed without another lab:
+default target P is64MiB, not the smaller native window. Existing D bounds
+TCP1 Original debt at24.27--32.24MB and the other TCP outputs<=1.10MB, ignoring
+sparse positive releases (conservative overestimates). O alone therefore does
+not exhaust P in that old collapse. Exact all-instant K remains unexported.
+The next permitted work is a theoretical evidence-type check, not candidate2:
+can explicit receiver-omission recovery pipeline while ACK-silence fallback
+retains its bounded head probe, without stale-proof amplification or renewing
+cause clocks when copy expiry moves the selection cursor backwards? If that
+requires a broader timing model, stop implementation and present the concrete
+tradeoff rather than stack another plausibly helpful correction.
+
 ## Decision: freeze scope, finish a release
 
 The user's latest instruction stops further broad exploration and prioritizes

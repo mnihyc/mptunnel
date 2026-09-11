@@ -400,6 +400,26 @@ impl ResponseStreamBinding {
             > 1
     }
 
+    /// Coarse wake eligibility only: a retained Original may no longer be
+    /// eligible for new payload while another current output can repair it.
+    /// Exact owner/copy exclusion is evaluated at the selected uncovered range.
+    pub(in crate::runtime) fn has_live_owner_recovery_alternative(&self) -> bool {
+        let lane = self.lane();
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs.entries.len() > 1
+            && outputs.entries.iter().any(|entry| {
+                server_output_payload_schedulable(
+                    entry,
+                    outputs.data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                ) && !entry.qualification.stale_for_original_data()
+            })
+    }
+
     pub(in crate::runtime) fn has_nonstale_reinjection_alternative(
         &self,
         candidate: ServerReinjectionOutputIdentity,
@@ -728,6 +748,44 @@ impl ResponseStreamBinding {
             now,
             |key, incarnation| current_outputs.contains(&(key, incarnation)),
         )
+    }
+
+    /// Exact coverage already under native recovery on current attachments.
+    /// This is suppression, not receipt: expiry leaves publication ownership
+    /// and Product debt intact. The actor separately owns the earliest-D wake.
+    pub(in crate::runtime) fn live_reinjected_ranges_at(
+        &self,
+        observed_at: Instant,
+    ) -> Vec<OffsetRange> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        flights
+            .iter()
+            .flat_map(|(&start, flights)| {
+                flights.iter().filter_map(move |flight| {
+                    (flight.kind == CarrierWorkKind::ReinjectedData
+                        && flight
+                            .reinjection_suppression_deadline
+                            .is_some_and(|deadline| deadline > observed_at))
+                    .then_some((start, flight))
+                })
+            })
+            .filter(|(_, flight)| {
+                outputs.entries.iter().any(|entry| {
+                    entry.key == flight.key && entry.incarnation == flight.output_incarnation
+                })
+            })
+            .map(|(start, flight)| OffsetRange {
+                start,
+                end: flight.end,
+            })
+            .collect()
     }
 
     /// Earliest immutable expiry of any ReinjectedData copy whose exact

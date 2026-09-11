@@ -3495,9 +3495,10 @@ F_t^r = min(L(s,r,t), A_t^r, M_s)
 ```
 
 Apply may therefore shrink the ranked frontier for exact target capacity but
-may never enlarge or skip it. When the exact OriginalData owner remains live,
-`F_t^r` is the complete accepted extent of this evaluation; target headroom up
-to `L(s,r,t)` grants no suffix beyond the ranked frontier quantum. Exact
+may never enlarge or skip it. For a queued critical evaluation whose exact OriginalData owner remains live,
+`F_t^r` is its complete accepted extent; target headroom up to `L(s,r,t)` grants
+no suffix within that evaluation. The separate direct writer-boundary successor
+service below may acquire another independently validated quantum. Exact
 terminal carrier failure is separate: because no live owner remains, it may
 service the complete cause-specific retained prefix up to `L(s,r,t)`, subject
 to every range, slot, Product-capacity, queue, and native bound below.
@@ -3522,8 +3523,9 @@ authority begins only after every byte in the ranked prefix has matured.
 No earlier than `loss_at` and before `fallback_at`, a permitted speculative
 authoritative-gap attempt uses the same `A(s,r,t)` and `L(s,r,t)` expressions.
 At or after `fallback_at`, the owner-completion comparison is no longer needed,
-but every other term remains unchanged. While the owner remains live, neither
-side of `fallback_at` permits an accepted suffix beyond `F_t^r`. Exact terminal
+but every other term remains unchanged. For queued critical recovery while the owner remains live, neither side of
+`fallback_at` permits an accepted suffix beyond `F_t^r`. Direct successor service
+below has its own acquisition opportunity and is permitted only after fallback. Exact terminal
 carrier failure uses its separate cause-bounded timing and full-service path;
 each slice up to `L(s,r,t)` MUST remain retained and unacknowledged, keep the
 same exact identity sets, exclude target `t`, and pass fresh exact Product and
@@ -3605,10 +3607,11 @@ measured distinct alternate are required for target-bound live-owner repair;
 otherwise ACK silence waits until the one-interval `fallback_at` rather than
 erasing that fallback.
 
-Recovery target ranking and commitment MUST refer to the same lowest-missing,
-identity-uniform frontier. Decide ranks candidate targets using the common
+Recovery target ranking and commitment MUST refer to the same lowest eligible,
+identity-uniform frontier. Queued critical recovery starts at the missing head;
+direct successor service uses the exact uncovered frontier defined below. Decide ranks candidate targets using the common
 captured payload `M_s`; after selection, Apply may shrink the ranked frontier
-only to exact `F_t^r`. For a live owner, Apply MUST NOT extend total service
+only to exact `F_t^r`. For a live owner, each Apply MUST NOT extend its total service
 beyond `F_t^r`; `L(s,r,t)` remains a capacity bound, not authority to append an
 unranked suffix.
 These ownership sets describe byte ranges, not stored frame-start keys: a
@@ -4032,12 +4035,68 @@ Exact terminal carrier failure, persistent live-owner gaps, and live tails use
 their respective cause clocks and the same structural Product authority, but
 not the same service extent. Exact terminal failure may use the full
 cause-specific extent `L(s,r,t)`; a persistent gap or tail whose OriginalData
-owner remains live is limited to its exact ranked frontier quantum `F_t^r`.
+owner remains live is limited to its exact ranked frontier quantum `F_t^r`
+per acquisition. Direct successor acquisition below is separate from a queued
+critical evaluation and cannot enlarge that evaluation's quantum.
 The directional accounting target cannot deadlock or reduce either bounded
 service. Every accepted recovery byte remains charged to exact Product
 recovery-work accounting. Exact retained ranges, configured-slot publication
 vacancy, queue, flight, distinct-output, target-capacity, and repeat-delay
 bounds continue to apply.
+
+#### Direct writer-boundary live successor service
+
+In both logical-stream directions, additional post-fallback recovery MAY use
+an observed writer opportunity after currently runnable control, critical
+recovery and OriginalData. This is a separate service policy, not a declaration
+that a native owner failed, that peer credit identifies impairment, or that a
+copy will arrive first. Existing critical head recovery retains its cause and
+publication rules above.
+
+An offer MUST contain only weak Product identity and wake metadata. It MUST NOT
+stage a recovery payload, record accepted-copy suppression, occupy a configured
+slot, consume Product recovery debt, or suppress otherwise permitted source
+reading before actual writer acquisition. An unresolved Product lock `Busy`
+MUST NOT be treated as absence of runnable Original work. New foreground
+publication MUST revoke an uncommitted background writer receipt, including a
+handoff to the separate QUIC repair writer. Cancellation and receipt refusal
+MUST leave no accepted copy or publication slot.
+
+The successor frontier is the first retained range after subtracting exact
+positive-ACK release, queued recovery coverage, and accepted ReinjectedData
+coverage on current attachments. Current accepted copies remain coverage here
+even after their suppression deadlines expire; existing critical recovery owns
+repeat decisions. An uncovered logical head MUST remain with critical recovery.
+An unavailable, immature, ambiguous or otherwise refused uncovered successor
+MUST NOT be skipped merely to find easier work. Copy coverage is not receipt:
+it neither advances the Data-ACK frontier nor releases retained ownership.
+
+The actual writer MAY acquire only one existing positive ranked quantum per
+transaction. Before recording the copy, it MUST revalidate retained coverage,
+identity-uniform live Original ownership, every assignment's existing immutable
+fallback maturity, a distinct currently eligible target, exact configured-slot
+vacancy and suppression, current `K_t`, configured resources and native authority.
+Target ranking uses current available writer opportunities; the invoking writer
+MUST be the selected target. The acquisition MUST use the same Native-before-
+Product fencing and exact physical identity as prepared Original acquisition.
+Refusal may wait for existing work/native/model changes or the already established
+future fallback deadline; this adds no recovery interval or renewed cause epoch.
+
+A completed native write may expose another service turn before the preceding
+copy's Product ACK. Each successor requires a fresh full acquisition transaction;
+no grant reserves an unranked suffix or bypasses aggregate accepted debt. Every
+accepted byte enters existing directional recovery-work accounting. Absolute
+Original assignment epochs, recovery interval formulas and monotone deadline
+semantics remain unchanged; additional observations can tighten an existing
+allowed deadline and do not prove additional receiver progress.
+
+The priority guarantee ends at native acceptance. TCP bytes already accepted
+consume ordered FIFO service. The existing QUIC repair class retains priority
+over bulk, including already native-buffered bulk, so extra work can alter that
+service after acceptance. Extra accepted debt can constrain later critical
+admission. This policy introduces no additional reserve or promise of future
+capacity. These effects, redundancy, shared bottlenecks, competing streams,
+startup and recovery must be evaluated as practical costs of the composition.
 
 ### 15.3 Datagram retry
 

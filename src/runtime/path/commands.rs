@@ -219,6 +219,8 @@ impl Drop for TcpCapacityProbeCommand {
 }
 
 pub(in crate::runtime) enum ReliablePathCommand {
+    // Payload-free prepared-source notice. `work.is_repair()` selects the
+    // independent background offer; only its writer callback may create data.
     PreparedOriginal(super::prepared::PreparedOriginalWork),
     PrepareConnection {
         open_deadline: tokio::time::Instant,

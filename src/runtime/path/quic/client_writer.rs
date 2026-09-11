@@ -109,6 +109,41 @@ pub(super) async fn drain_client_udp_stream_commands(
         }
         let should_close = match command {
             ReliablePathCommand::PreparedOriginal(work) => {
+                if work.is_repair() {
+                    // A refused follow-up Original may have republished Ready
+                    // while an earlier claim still owns this local batch.
+                    // Settle its native write and charge before every return.
+                    flush_client_udp_frame_batch(
+                        send,
+                        pending_frames,
+                        codec_limits,
+                        path_proofs,
+                        commands,
+                        &mut pending_frame_command_bytes,
+                        stream_id,
+                        carrier_frames,
+                        stream_frames,
+                        deferred_input,
+                        carrier_input_open,
+                    )
+                    .await?;
+                    if work.request_instance().is_some()
+                        && work.stream_id() == stream_id
+                        && work.path_instance_id() == path_instance_id
+                    {
+                        if deferred_input.is_some() {
+                            // Interlocked input still occupies the writer.
+                            // Revisit only at its next physical idle boundary.
+                            commands.withdraw_writer_ready();
+                            if let Some(wait) = work.writer_change_wait() {
+                                commands.defer_prepared_work(work, wait);
+                            }
+                        } else {
+                            commands.handoff_prepared_repair(work, path_instance_id);
+                        }
+                    }
+                    return Ok(false);
+                }
                 if work.request_instance().is_none()
                     || work.stream_id() != stream_id
                     || work.path_instance_id() != path_instance_id
@@ -136,7 +171,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                             work.requeue();
                         }
                         PreparedOriginalClaim::Busy(wait) => {
-                            commands.defer_prepared_work(work, wait);
+                            commands.defer_prepared_busy(work, wait);
                         }
                         PreparedOriginalClaim::Blocked(wait) => {
                             commands.defer_prepared_work(work, wait);

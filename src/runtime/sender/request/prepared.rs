@@ -6,9 +6,14 @@ use super::{
     RequestQueuedSourceCommit, SharedRequestProduct,
 };
 use crate::model::admission::ReliableDataAckFrontierState;
+use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
 use crate::model::path::RelayPathInstance;
+use crate::model::work::{flight_interval_bytes, reliable_live_frontier_reinjection_limit_bytes};
 use crate::mux::stream::StreamError;
-use crate::protocol::Frame;
+use crate::protocol::frame::{
+    normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_extent,
+};
+use crate::protocol::{Frame, OffsetRange};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::prepared::{PreparedOriginalClaim, PreparedOriginalRegistration};
@@ -161,6 +166,383 @@ fn current_ready_instances(state: &RequestProductState) -> Vec<RelayPathInstance
                 .map(|_| path.instance())
         })
         .collect()
+}
+
+struct PreparedRequestRepair {
+    frame: Frame,
+    selection_quantum: usize,
+    avoid: Vec<RelayPathInstance>,
+}
+
+enum PreparedRequestRepairCandidate {
+    Ready(PreparedRequestRepair),
+    Immature(Instant),
+    Empty,
+}
+
+/// Find only the first uncovered retained successor. Every accepted copy on a
+/// current attachment remains coverage after its repeat delay expires; the
+/// existing critical recovery producer alone owns same-range revisits.
+fn prepared_request_repair_candidate(
+    state: &mut RequestProductState,
+    context: &ClientPathContext,
+) -> PreparedRequestRepairCandidate {
+    let head = state.send_stream.data_ack_frontier();
+    let retained = state.send_stream.retained_ranges_in_scope(OffsetRange {
+        start: head,
+        end: state.send_stream.next_offset(),
+    });
+    let attached = state.remotes.path_instances();
+    let mut covered = state
+        .sender
+        .multipath
+        .recovery_copy_ranges()
+        .into_iter()
+        .filter(|(instance, _)| attached.contains(instance))
+        .flat_map(|(_, ranges)| ranges)
+        .collect::<Vec<_>>();
+    covered.extend(state.sender_queue.queued_reinjection_ranges());
+    let uncovered = offset_ranges_not_covered(&retained, &normalize_offset_ranges(covered));
+    let Some(range) = uncovered
+        .first()
+        .copied()
+        .filter(|range| range.start > head)
+    else {
+        // An uncovered logical head retains its critical publication authority.
+        return PreparedRequestRepairCandidate::Empty;
+    };
+    let lane = state.prepared.request_lane;
+    let live = state
+        .sender
+        .multipath
+        .owner_capable_instances(context, &state.remotes, lane);
+    let selection_quantum = live
+        .iter()
+        .map(|instance| {
+            adaptive_reliable_relay_reinjection_bytes(
+                context.reliable_path_snapshot_for_instance(*instance),
+                lane,
+                context.mux_limits,
+            )
+        })
+        .max()
+        .unwrap_or(0);
+    let limit = reliable_live_frontier_reinjection_limit_bytes(
+        selection_quantum,
+        selection_quantum,
+        flight_interval_bytes(range.start, range.end),
+        state.send_stream.reinjection_bytes(),
+        context.mux_limits,
+    );
+    let Some(uniform) = state.sender.multipath.live_owner_uniform_frontier(
+        OffsetRange {
+            start: range.start,
+            end: range.end.min(range.start.saturating_add(limit as u64)),
+        },
+        &attached,
+    ) else {
+        return PreparedRequestRepairCandidate::Empty;
+    };
+    if uniform.owners.len() != 1 || !live.contains(&uniform.owners[0]) {
+        return PreparedRequestRepairCandidate::Empty;
+    }
+    let Some(frame) = state
+        .send_stream
+        .first_retransmission_frame_for_range(uniform.range, limit)
+    else {
+        return PreparedRequestRepairCandidate::Empty;
+    };
+    let Some((start, end, _)) = reliable_stream_frame_extent(&frame) else {
+        return PreparedRequestRepairCandidate::Empty;
+    };
+    if start != range.start {
+        return PreparedRequestRepairCandidate::Empty;
+    }
+    let Some(timing) = state
+        .sender
+        .multipath
+        .observe_original_recovery_timing_for_range(OffsetRange { start, end }, |owner| {
+            context.reliable_path_snapshot_for_instance(owner)
+        })
+    else {
+        return PreparedRequestRepairCandidate::Empty;
+    };
+    if timing.fallback_at > Instant::now() {
+        return PreparedRequestRepairCandidate::Immature(timing.fallback_at);
+    }
+    if state
+        .sender
+        .reinjection_suppression_deadline_for_frame(&frame, &state.remotes)
+        .is_some()
+    {
+        return PreparedRequestRepairCandidate::Empty;
+    }
+    PreparedRequestRepairCandidate::Ready(PreparedRequestRepair {
+        frame,
+        selection_quantum,
+        avoid: uniform.avoid,
+    })
+}
+
+fn repair_maturity_wait(wake: RequestPreparedWake, deadline: Instant) -> RequestPreparedWake {
+    Box::pin(async move {
+        tokio::select! {
+            () = wake => {}
+            () = tokio::time::sleep_until(deadline.into()) => {}
+        }
+    })
+}
+
+fn same_repair_frame(left: &Frame, right: &Frame) -> bool {
+    matches!((left, right), (
+        Frame::StreamData { stream_id: left_stream, offset: left_offset, payload: left_payload },
+        Frame::StreamData { stream_id: right_stream, offset: right_offset, payload: right_payload },
+    ) if left_stream == right_stream && left_offset == right_offset
+        && left_payload.len() == right_payload.len() && left_payload.as_ptr() == right_payload.as_ptr())
+}
+
+fn repair_claim_plan(
+    state: &RequestProductState,
+    context: &ClientPathContext,
+    candidate: &PreparedRequestRepair,
+    invoking: RelayPathInstance,
+    inputs: super::multipath::RequestRelayNativeInputs,
+) -> Option<(
+    RequestMultipathPlan,
+    super::RequestCompletionTailTarget,
+    Frame,
+)> {
+    let (_, _, scoring_bytes) = reliable_stream_frame_extent(&candidate.frame)?;
+    let ready_instances = state
+        .remotes
+        .paths
+        .iter()
+        .filter_map(|path| {
+            let instance = path.instance();
+            if instance == invoking {
+                return Some(instance);
+            }
+            let ReliablePathStreamOutput::Fixed(output) = &path.stream.output else {
+                return None;
+            };
+            output
+                .commands()
+                .background_repair_ready()
+                .filter(|receipt| receipt.instance() == instance.path_instance_id)
+                .map(|_| instance)
+        })
+        .collect::<Vec<_>>();
+    let (plan, target) = state.sender.multipath.repair_claim_plan_from_inputs(
+        context,
+        &state.remotes,
+        &candidate.frame,
+        state.prepared.request_lane,
+        &state.sender_queue,
+        state.send_stream.reinjection_bytes(),
+        scoring_bytes,
+        &candidate.avoid,
+        &ready_instances,
+        inputs,
+    )?;
+    let quantum = adaptive_reliable_relay_reinjection_bytes(
+        Some(target.snapshot),
+        state.prepared.request_lane,
+        context.mux_limits,
+    );
+    let limit = reliable_live_frontier_reinjection_limit_bytes(
+        quantum,
+        candidate.selection_quantum,
+        scoring_bytes,
+        state.send_stream.reinjection_bytes(),
+        context.mux_limits,
+    )
+    .min(target.service_limit_bytes);
+    let Frame::StreamData {
+        stream_id,
+        offset,
+        payload,
+    } = &candidate.frame
+    else {
+        return None;
+    };
+    if limit == 0 {
+        return None;
+    }
+    let frame = Frame::StreamData {
+        stream_id: *stream_id,
+        offset: *offset,
+        payload: payload.slice(..limit.min(payload.len())),
+    };
+    Some((plan, target, frame))
+}
+
+/// Low-priority, direct recovery acquisition. A notice owns no payload, queue
+/// debt, range, or copy slot. Staged foreground is conservatively sufficient
+/// to refuse extra work; an unavailable Product lock is never evidence of idle
+/// service. The writer additionally fences carrier-wide foreground publication.
+pub(in crate::runtime) fn claim_prepared_request_repair(
+    owner: &SharedRequestProduct,
+    context: &ClientPathContext,
+    instance: RelayPathInstance,
+    ready: &ReliableWriterReadyGuard,
+    registration: &PreparedOriginalRegistration,
+) -> PreparedOriginalClaim {
+    if ready.receipt().instance() != instance.path_instance_id {
+        return PreparedOriginalClaim::Empty;
+    }
+    let state = match owner.arm_claim().try_lock() {
+        Ok(state) => state,
+        Err(wait) => return PreparedOriginalClaim::Busy(wait),
+    };
+    if !registration_is_current(&state, instance, registration) {
+        return PreparedOriginalClaim::Empty;
+    }
+    let wake = arm_work_change(&state, context, instance);
+    if !state.sender_queue.is_empty() {
+        return PreparedOriginalClaim::Blocked(wake);
+    }
+    let lane = state.prepared.request_lane;
+    let capture =
+        RequestRelayNativeCapture::new(state.remotes.membership_generation(), &state.remotes.paths);
+    drop(state);
+    #[cfg(test)]
+    owner.run_before_prepared_native_resolve_for_test();
+    let inputs = capture.resolve();
+    let mut state = match owner.arm_claim().try_lock() {
+        Ok(state) => state,
+        Err(wait) => return PreparedOriginalClaim::Busy(wait),
+    };
+    if !registration_is_current(&state, instance, registration) {
+        return PreparedOriginalClaim::Empty;
+    }
+    if !state.sender_queue.is_empty() || !ready.receipt().is_current() {
+        return PreparedOriginalClaim::Blocked(wake);
+    }
+    let candidate = match prepared_request_repair_candidate(&mut state, context) {
+        PreparedRequestRepairCandidate::Ready(candidate) => candidate,
+        PreparedRequestRepairCandidate::Immature(deadline) => {
+            return PreparedOriginalClaim::Blocked(repair_maturity_wait(wake, deadline));
+        }
+        PreparedRequestRepairCandidate::Empty => return PreparedOriginalClaim::Blocked(wake),
+    };
+    let Some((plan, _, frame)) =
+        repair_claim_plan(&state, context, &candidate, instance, inputs.clone())
+    else {
+        return PreparedOriginalClaim::Blocked(wake);
+    };
+    if plan.target().1 != instance {
+        let selected = state
+            .prepared
+            .registrations
+            .iter()
+            .find(|current| current.request_instance() == Some(plan.target().1))
+            .cloned();
+        drop(state);
+        if let Some(selected) = selected {
+            selected.notify_repair();
+        }
+        return PreparedOriginalClaim::Blocked(wake);
+    }
+    let Some(commands) = state.remotes.paths.iter().find_map(|path| {
+        if path.instance() != instance {
+            return None;
+        }
+        match &path.stream.output {
+            ReliablePathStreamOutput::Fixed(output) => Some(output.commands().clone()),
+            ReliablePathStreamOutput::Switchable(_) => None,
+        }
+    }) else {
+        return PreparedOriginalClaim::Blocked(wake);
+    };
+    drop(state);
+
+    let attempt = owner.arm_claim();
+    let mut other_selected = None;
+    let result = plan.commit_with_current_native_shape(&commands, |shape| {
+        let mut state = match attempt.try_lock() {
+            Ok(state) => state,
+            Err(wait) => return Some(PreparedOriginalClaim::Busy(wait)),
+        };
+        if !registration_is_current(&state, instance, registration) {
+            return Some(PreparedOriginalClaim::Empty);
+        }
+        if state.prepared.request_lane != lane
+            || !state.sender_queue.is_empty()
+            || !ready.receipt().is_current()
+        {
+            return None;
+        }
+        let PreparedRequestRepairCandidate::Ready(current) =
+            prepared_request_repair_candidate(&mut state, context)
+        else {
+            return None;
+        };
+        if !same_repair_frame(&candidate.frame, &current.frame)
+            || candidate.avoid.len() != current.avoid.len()
+            || !candidate
+                .avoid
+                .iter()
+                .all(|instance| current.avoid.contains(instance))
+        {
+            return None;
+        }
+        let current_inputs = shape.map_or(inputs.clone(), |shape| {
+            inputs.with_fenced_target(instance, shape)
+        });
+        let (current_plan, target, current_frame) =
+            repair_claim_plan(&state, context, &current, instance, current_inputs)?;
+        if current_plan.target().1 != instance {
+            other_selected = state
+                .prepared
+                .registrations
+                .iter()
+                .find(|current| current.request_instance() == Some(current_plan.target().1))
+                .cloned();
+            return None;
+        }
+        if !same_repair_frame(&frame, &current_frame)
+            || !current_plan.target_retains_exact_eligibility(context, lane)
+        {
+            return None;
+        }
+        let position = current_plan.target_position_for_apply(&state.remotes, lane)?;
+        // Final consumption also rejects foreground published after advisory
+        // ranking. No fallible payload admission precedes this exact commit.
+        if !ready.try_consume() {
+            return None;
+        }
+        let cause = RelaySendCause::CompletionTailReinjection(target.identity);
+        let RequestProductState {
+            sender, remotes, ..
+        } = &mut *state;
+        let path_count = remotes.paths.len();
+        let (bytes, _) = sender
+            .commit_fenced_frame_product(
+                context,
+                remotes,
+                RequestFrameProductCommit {
+                    plan: &current_plan,
+                    frame: &frame,
+                    cause,
+                    position,
+                    path_count,
+                    reinjection_target_snapshot: Some(target.snapshot),
+                    request_load_claim: None,
+                },
+                None,
+            )
+            .ok()?;
+        sender.optional_reinjection.record_reinjection(bytes);
+        sender.record_decision(instance.key, bytes, &frame, cause);
+        state.prepared.work_changed.notify_waiters();
+        Some(PreparedOriginalClaim::Claimed(frame))
+    });
+    if let Some(selected) = other_selected {
+        selected.notify_repair();
+    }
+    result
+        .flatten()
+        .unwrap_or(PreparedOriginalClaim::Blocked(wake))
 }
 
 /// Every owner acquisition is nonblocking so contention cannot park the native
@@ -465,3 +847,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         .flatten()
         .unwrap_or(PreparedOriginalClaim::Blocked(wake))
 }
+
+#[cfg(test)]
+#[path = "tests_prepared_repair.rs"]
+mod tests_repair;

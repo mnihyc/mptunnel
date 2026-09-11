@@ -843,7 +843,10 @@ impl ServerTcpPathSession {
                             break;
                         }
                     }
-                    let Some(ready) = self.commands_rx.writer_ready_boundary(instance) else {
+                    let Some(ready) = self
+                        .commands_rx
+                        .prepared_writer_ready_boundary(instance, work.is_repair())
+                    else {
                         break;
                     };
                     match work.try_claim(ready) {
@@ -875,7 +878,7 @@ impl ServerTcpPathSession {
                             }
                         }
                         PreparedOriginalClaim::Busy(wait) => {
-                            self.commands_rx.defer_prepared_work(work, wait)
+                            self.commands_rx.defer_prepared_busy(work, wait)
                         }
                         PreparedOriginalClaim::Blocked(wait) => {
                             self.commands_rx.defer_prepared_work(work, wait)

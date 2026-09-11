@@ -33,7 +33,6 @@ use crate::runtime::path::model::{default_path_srtt_ms, startup_rate_prediction_
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -92,7 +91,6 @@ impl ResponseStreamBinding {
             .collect()
     }
 
-    #[cfg(test)]
     pub(in crate::runtime) fn response_model_generation(&self) -> u64 {
         self.response_model_generation.load(Ordering::Acquire)
     }

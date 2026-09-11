@@ -20,13 +20,14 @@ pub(in crate::runtime) use queue::{
 pub(in crate::runtime) use request::{
     ClientQueuedDispatch, RelayRecvProgressSend, RequestPreparedSource, RequestProductState,
     RequestSenderService, SharedRequestProduct, WeakSharedRequestProduct,
-    claim_prepared_request_data,
+    claim_prepared_request_data, claim_prepared_request_repair,
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use response::{
     PreparedResponseSource, ResponsePreparedCommitError, ResponsePreparedSourceCommit,
     ResponseProductState, ServerResponseSenderService, SharedResponseProduct,
-    WeakSharedResponseProduct, claim_prepared_response_data, publish_prepared_response_work,
+    WeakSharedResponseProduct, claim_prepared_response_data, claim_prepared_response_repair,
+    publish_prepared_response_work,
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use work::{

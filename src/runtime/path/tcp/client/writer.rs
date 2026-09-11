@@ -131,7 +131,8 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                         break;
                     }
                 }
-                let Some(ready) = commands.writer_ready_boundary(connection.path_instance_id)
+                let Some(ready) = commands
+                    .prepared_writer_ready_boundary(connection.path_instance_id, work.is_repair())
                 else {
                     break;
                 };
@@ -167,7 +168,7 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                         .await?;
                     }
                     PreparedOriginalClaim::Busy(wait) => {
-                        commands.defer_prepared_work(work, wait);
+                        commands.defer_prepared_busy(work, wait);
                     }
                     PreparedOriginalClaim::Blocked(wait) => {
                         commands.defer_prepared_work(work, wait);

@@ -561,6 +561,15 @@ impl ServerUdpTerminalWriterFixture {
         command: ReliablePathCommand,
     ) -> Result<bool, RuntimeError> {
         let mut pending = Vec::new();
+        self.drain_normal_command_with_batch(command, &mut pending)
+            .await
+    }
+
+    async fn drain_normal_command_with_batch(
+        &mut self,
+        command: ReliablePathCommand,
+        pending: &mut Vec<Frame>,
+    ) -> Result<bool, RuntimeError> {
         let mut proofs = PathProofTracker::default();
         let (_input_tx, mut input_rx) = mpsc::channel(1);
         let mut deferred = None;
@@ -572,7 +581,7 @@ impl ServerUdpTerminalWriterFixture {
             self.stream_id,
             self.path_id,
             &self._path_registration,
-            &mut pending,
+            pending,
             &mut proofs,
             &mut input_rx,
             &mut deferred,
@@ -812,6 +821,424 @@ async fn server_quic_prepared_latency_busy_preserves_idle_writer_epoch() {
     assert_eq!(state.send_stream.next_offset(), payload.len() as u64);
     assert_eq!(fixture.commands_tx.pending_bytes(), 0);
     assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn server_quic_prepared_repair_successors_cross_split_writer_before_copy_ack() {
+    use crate::model::capacity::{
+        adaptive_reliable_relay_reinjection_bytes, reliable_path_startup_sample_limit_bytes,
+    };
+    use crate::model::path::CarrierPathKey;
+    use crate::model::timing::reliable_data_retransmission_interval;
+
+    let stream_id = StreamId(408);
+    let (mut fixture, _accepted_rx) =
+        ServerUdpTerminalWriterFixture::open_with_native_authority(stream_id, None, true).await;
+    fixture.drain_zero_credit_admission().await;
+    let mut product_stream = fixture.accepted.take_stream();
+    let ReliablePathStreamOutput::Switchable(binding) = &product_stream.output else {
+        panic!("shared response binding");
+    };
+    let binding = binding.clone();
+    let lane = TrafficClass::Throughput;
+    let limits = fixture.context.mux_limits;
+    let original_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (original_commands, _original_receiver) = reliable_path_command_channels(8);
+    binding.attach(
+        original_key.underlay,
+        original_key.path_id,
+        original_commands,
+        lane,
+    );
+    let targets = binding.sender_path_targets(lane, 1);
+    let repair_target = targets
+        .iter()
+        .find(|target| target.observation.key.underlay == UnderlayProtocol::Udp)
+        .unwrap();
+    let repair_identity = ServerReinjectionOutputIdentity {
+        key: repair_target.observation.key,
+        incarnation: repair_target.observation.incarnation,
+    };
+    // Three retained fixture frames fit one default startup sample. No rate,
+    // capacity, qualification receipt, or Native stamp is fabricated.
+    let payload_bytes = targets
+        .iter()
+        .map(|target| {
+            adaptive_reliable_relay_reinjection_bytes(
+                Some(target.observation.snapshot),
+                lane,
+                limits,
+            )
+        })
+        .min()
+        .unwrap()
+        .min(usize::try_from(reliable_path_startup_sample_limit_bytes(limits)).unwrap() / 3)
+        .min(udp_path_max_stream_payload_bytes(
+            fixture.context.codec_limits,
+            limits,
+        ));
+    assert!(payload_bytes > 0);
+    let original_interval = targets
+        .iter()
+        .find(|target| target.observation.key == original_key)
+        .map(|target| {
+            reliable_data_retransmission_interval(
+                Some(original_key.underlay),
+                Some(target.observation.snapshot),
+            )
+        })
+        .unwrap();
+    let mut send_stream = ReliableSendStream::new_with_initial_max_offset(stream_id, limits, 0);
+    fixture
+        .context
+        .reliable_streams
+        .route_frame(
+            &fixture._path_registration,
+            stream_id,
+            Frame::StreamMaxData {
+                stream_id,
+                max_offset: limits.max_stream_window_bytes,
+            },
+        )
+        .await
+        .unwrap();
+    let Frame::StreamMaxData { max_offset, .. } = product_stream.recv_frame().await.unwrap() else {
+        panic!("actual response receive credit");
+    };
+    send_stream.update_max_offset(max_offset);
+    let mut frames = Vec::new();
+    for index in 0..3 {
+        let frame = send_stream
+            .send_data(Bytes::from(vec![0x70 + index; payload_bytes]))
+            .unwrap();
+        binding.record_original_flight(original_key, &frame);
+        frames.push(frame);
+    }
+    binding.record_reinjected_flight(repair_identity.key, &frames[0]);
+    binding.age_original_flights_for_test(original_interval + original_interval);
+    let owner = SharedResponseProduct::new(
+        ResponseProductState {
+            sender: ServerResponseSenderService::new(fixture.session_id, stream_id),
+            send_stream,
+            last_send_ack: Default::default(),
+            prepared: PreparedResponseSource::new(lane, payload_bytes),
+        },
+        binding,
+    );
+    {
+        let mut state = owner.lock();
+        publish_prepared_response_work(&mut state, &owner, lane, payload_bytes, true);
+    }
+    let initial_credit = owner.lock().send_stream.send_credit_bytes();
+    let repair_commands = fixture
+        .commands_rx
+        .as_mut()
+        .unwrap()
+        .take_repair_receiver(stream_id);
+
+    // Reuse the real connection's second HTTP/3 stream for the existing repair
+    // writer. Consume its opening fixture frame before entering the repair loop.
+    let (mut peer_repair_send, mut peer_repair_recv) =
+        fixture._client_connection.open_bi().await.unwrap();
+    udp_path_write_frame(
+        &mut peer_repair_send,
+        &Frame::Ping { nonce: 408 },
+        fixture.context.codec_limits,
+    )
+    .await
+    .unwrap();
+    let (repair_send, mut repair_recv) = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture._server_connection.accept_bi(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        udp_path_read_frame(&mut repair_recv, fixture.context.codec_limits)
+            .await
+            .unwrap(),
+        Frame::Ping { nonce: 408 }
+    );
+    let codec_limits = fixture.context.codec_limits;
+    let repair = super::super::repair::run_repair_channel(
+        repair_send,
+        repair_recv,
+        repair_commands,
+        stream_id,
+        codec_limits,
+        |_| async { panic!("the peer sends no Product acknowledgement or repair data") },
+    );
+    let metrics = crate::runtime::path::quic::metrics::run_server_quic_path_metrics(
+        fixture.context.clone(),
+        fixture._path_registration.clone(),
+        fixture._server_connection.clone(),
+    );
+    let ordinary = async {
+        loop {
+            fixture
+                .commands_rx
+                .as_mut()
+                .unwrap()
+                .writer_ready_boundary(fixture._path_registration.path_instance_id());
+            let command = recv_reliable_path_command(fixture.commands_rx.as_mut().unwrap())
+                .await
+                .expect("ordinary writer remains owned");
+            assert!(!fixture.drain_normal_command(command).await.unwrap());
+        }
+    };
+    let received = async {
+        // Current Native service can split a retained frame into smaller
+        // writes. Verify its exact byte ranges without prescribing packet or
+        // Product frame size to the real writer.
+        let expected = frames[1..]
+            .iter()
+            .flat_map(|frame| {
+                let Frame::StreamData { payload, .. } = frame else {
+                    unreachable!("retained fixture data")
+                };
+                payload.iter().copied()
+            })
+            .collect::<Vec<_>>();
+        let mut received_bytes = 0;
+        let mut service_frames = 0;
+        while received_bytes < expected.len() {
+            let Frame::StreamData {
+                stream_id: received_stream,
+                offset,
+                payload,
+            } = udp_path_read_frame(&mut peer_repair_recv, codec_limits)
+                .await
+                .unwrap()
+            else {
+                panic!("repair writer must deliver retained data")
+            };
+            assert_eq!(received_stream, stream_id);
+            assert_eq!(offset, (payload_bytes + received_bytes) as u64);
+            assert!(!payload.is_empty());
+            let end = received_bytes + payload.len();
+            assert!(
+                end <= expected.len(),
+                "repair cannot exceed retained history"
+            );
+            assert!(
+                payload.as_ref() == &expected[received_bytes..end],
+                "repair payload must match the exact retained subrange"
+            );
+            received_bytes = end;
+            service_frames += 1;
+            assert_eq!(owner.lock().send_stream.data_ack_frontier(), 0);
+        }
+        assert!(service_frames >= 2);
+    };
+    tokio::pin!(repair, metrics, ordinary, received);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            () = &mut received => {}
+            result = &mut repair => panic!("repair writer ended before both frames: {result:?}"),
+            () = &mut metrics => panic!("Native metrics ended before both frames"),
+            () = &mut ordinary => unreachable!("ordinary writer loop remains owned"),
+        }
+    })
+    .await
+    .expect("existing completion guard includes both actual writer handoffs and peer reads");
+    let state = owner.lock();
+    assert_eq!(state.send_stream.data_ack_frontier(), 0);
+    assert_eq!(state.send_stream.next_offset(), (3 * payload_bytes) as u64);
+    assert_eq!(state.send_stream.send_credit_bytes(), initial_credit);
+    assert_eq!(state.send_stream.reinjection_bytes(), 3 * payload_bytes);
+    assert!(state.sender.is_empty());
+    assert_eq!(
+        owner
+            .binding()
+            .accepted_reinjected_data_in_flight_bytes_at(repair_identity),
+        3 * payload_bytes
+    );
+}
+
+#[tokio::test]
+async fn server_quic_prepared_original_batch_precedes_control_with_ready_repair_handoff() {
+    use crate::model::path::CarrierPathKey;
+    use futures::FutureExt;
+
+    // The only intervention is whether the real split receiver has reached
+    // its idle receive boundary. Native authority, source, limits and the
+    // protected writer route are otherwise the same in both cases.
+    for repair_ready in [false, true] {
+        let stream_id = StreamId(409);
+        let (mut fixture, _accepted_rx) =
+            ServerUdpTerminalWriterFixture::open_with_native_authority(stream_id, None, true).await;
+        fixture.drain_zero_credit_admission().await;
+        let fresh = Bytes::from_static(b"Original must precede sentinel");
+        let (owner, _product_stream) = fixture.publish_latency_source(fresh.clone()).await;
+        let original_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (original_commands, _original_receivers) = reliable_path_command_channels(8);
+        owner.binding().attach(
+            original_key.underlay,
+            original_key.path_id,
+            original_commands,
+            TrafficClass::Latency,
+        );
+        let repair_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: fixture.path_id,
+        };
+        // An existing one-byte Original and its copy supply a legitimate weak
+        // repair notice. They stay within the default startup sample and need
+        // no qualification/rate override. The new source still uses the real
+        // prepared producer and has not yet been assigned.
+        let offset = {
+            let mut state = owner.lock();
+            let head = state
+                .send_stream
+                .send_data(Bytes::from_static(b"h"))
+                .unwrap();
+            owner.binding().record_original_flight(original_key, &head);
+            owner.binding().record_reinjected_flight(repair_key, &head);
+            let quantum = state.prepared.data_quantum_bytes;
+            publish_prepared_response_work(
+                &mut state,
+                &owner,
+                TrafficClass::Latency,
+                quantum,
+                true,
+            );
+            state.send_stream.next_offset()
+        };
+        let end = offset + fresh.len() as u64;
+        let mut repair_commands = fixture
+            .commands_rx
+            .as_mut()
+            .unwrap()
+            .take_repair_receiver(stream_id);
+        if repair_ready {
+            // Poll the actual receiver, then leave it owned but unpolled.
+            // Handoff must preserve staged Originals even when the repair
+            // callback has not run and cannot have accepted a copy.
+            assert!(repair_commands.recv().now_or_never().is_none());
+        }
+        let metrics = crate::runtime::path::quic::metrics::run_server_quic_path_metrics(
+            fixture.context.clone(),
+            fixture._path_registration.clone(),
+            fixture._server_connection.clone(),
+        );
+        let service = async {
+            let mut pending = Vec::new();
+            while owner.lock().send_stream.next_offset() != end {
+                fixture
+                    .commands_rx
+                    .as_mut()
+                    .unwrap()
+                    .writer_ready_boundary(fixture._path_registration.path_instance_id());
+                let command = recv_reliable_path_command(fixture.commands_rx.as_mut().unwrap())
+                    .await
+                    .expect("existing Native cadence wakes a retryable source");
+                assert!(
+                    !fixture
+                        .drain_normal_command_with_batch(command, &mut pending)
+                        .await
+                        .unwrap()
+                );
+            }
+            let staged = pending
+                .iter()
+                .map(|frame| match frame {
+                    Frame::StreamData {
+                        offset, payload, ..
+                    } => (*offset, payload.len()),
+                    _ => panic!("only the accepted Original belongs to this batch"),
+                })
+                .collect::<Vec<_>>();
+            let pending_after_original = fixture.commands_tx.pending_bytes();
+            let writer_after_original = fixture.commands_tx.writer_pending_bytes();
+            assert_eq!(owner.lock().sender.data_bytes(), 0);
+            assert_eq!(owner.lock().send_stream.data_ack_frontier(), 0);
+
+            let sentinel = Frame::Ping { nonce: 409 };
+            fixture
+                .commands_tx
+                .try_enqueue_admitted_frame(sentinel.clone(), TrafficClass::Control)
+                .unwrap();
+            let command = recv_reliable_path_command(fixture.commands_rx.as_mut().unwrap())
+                .await
+                .expect("subsequent real control command");
+            assert!(
+                matches!(&command, ReliablePathCommand::SendFrame(frame) if *frame == sentinel)
+            );
+            assert!(
+                !fixture
+                    .drain_normal_command_with_batch(command, &mut pending)
+                    .await
+                    .unwrap()
+            );
+            let pending_after_sentinel = fixture.commands_tx.pending_bytes();
+            let writer_after_sentinel = fixture.commands_tx.writer_pending_bytes();
+            let mut received = Vec::new();
+            loop {
+                let frame = udp_path_read_frame(
+                    fixture.client_recv.as_mut().unwrap(),
+                    fixture.context.codec_limits,
+                )
+                .await
+                .expect("positive Native receipt before the existing completion guard");
+                if frame == sentinel {
+                    break;
+                }
+                let Frame::StreamData {
+                    stream_id: received_stream,
+                    offset: received_offset,
+                    payload,
+                } = frame
+                else {
+                    panic!("expected Original data or the control sentinel")
+                };
+                assert_eq!(received_stream, stream_id);
+                received.push((received_offset, payload));
+            }
+            let received_extents = received
+                .iter()
+                .map(|(offset, payload)| (*offset, payload.len()))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "quic_batch_ownership repair_ready={repair_ready} accepted=[{offset},{end}) staged_after_original={staged:?} pending_after_original={pending_after_original} writer_after_original={writer_after_original} received_before_ping={received_extents:?} pending_after_ping={pending_after_sentinel} writer_after_ping={writer_after_sentinel}"
+            );
+            (
+                received,
+                staged,
+                pending_after_original,
+                writer_after_original,
+                pending_after_sentinel,
+                writer_after_sentinel,
+            )
+        };
+        tokio::pin!(metrics, service);
+        let (received, staged, queued_before, writer_before, queued_after, writer_after) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    result = &mut service => result,
+                    () = &mut metrics => panic!("Native metrics ended before the control receipt"),
+                }
+            })
+            .await
+            .expect("existing completion guard includes actual source and control writes");
+        assert_eq!(
+            received,
+            vec![(offset, fresh)],
+            "accepted Original must reach Native before the subsequent Ping; repair_ready={repair_ready}"
+        );
+        assert!(
+            staged.is_empty(),
+            "returned drain must settle its owned batch"
+        );
+        assert_eq!((queued_before, writer_before), (0, 0));
+        assert_eq!((queued_after, writer_after), (0, 0));
+    }
 }
 
 #[tokio::test]

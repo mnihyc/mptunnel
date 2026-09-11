@@ -17,9 +17,9 @@ level = "info" # all levels are good
 # Optional startup-rate prior; path URI wins, QUIC qualifies native handoff.
 # initial_rate_mbps = 100
 # Directional accepted-recovery accounting/diagnostic target; never gates Product recovery.
-# optional_reinjection_budget_percent = 10
+# optional_reinjection_budget_percent = 20
 # Sender-side QUIC loss correction with a bounded 3-round burst envelope; path URI wins.
-# quic_loss_compensation_percent = 10
+# quic_loss_compensation_percent = 20
 
 [resources]
 # Per-QUIC-path loss metadata ceiling, not preallocated; exhaustion uses raw BBR3 loss decisions.
@@ -84,7 +84,7 @@ protocol = "mpp"
 # Replace server.example.com with the server's reachable name or address.
 # TCP and QUIC/UDP remain separate carriers under one logical MPP session.
 # QUIC loss compensation inherits performance/[flow]. A path URI overrides it:
-# append `?loss-compensation-percent=10` (or `=0` for draft BBR3 behavior).
+# append `?loss-compensation-percent=10` for a lower allowance (or `=0` for draft BBR3).
 # Per-path startup override: append `?initial-rate-mbps=100`; use
 # `?initial-rate=unknown` to suppress the `[flow]` prior on that path.
 paths = [

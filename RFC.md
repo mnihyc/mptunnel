@@ -3344,7 +3344,7 @@ TCP retains its configured physical connections and native FIFO semantics;
 the companion is not a reason to create an unconfigured TCP carrier.
 
 The compatibility-named `[flow].optional_reinjection_budget_percent` setting
-has a Product default of 10 percent. It sets a directional accepted-recovery
+has a Product default of 20 percent. It sets a directional accepted-recovery
 accounting and diagnostic target from the bounded startup allowance and unique
 bytes acknowledged by MPP Data ACK. A matching MPP inbound/outbound performance
 value overrides the local sender default; peers do not negotiate it. Changing
@@ -4417,7 +4417,7 @@ anchor**; `E` is the larger positive value supplied by that anchor. Thereafter
 only the preceding complete non-application-limited round's positive resolved
 volume may replace `E`. If no positive representable `E` exists, this epoch has no
 compensated decision and takes raw authority.  Three rounds is an explicit
-MPTUNNEL product risk policy: at `p0 = 10%`, it permits at most `0.3 * E` lost
+MPTUNNEL product risk policy: at the default `p0 = 20%`, it permits at most `0.6 * E` lost
 bytes to move across neighboring evidence rounds. It is not a BBR draft
 constant, an inferred path property, or a value selected by a benchmark.
 Integer implementations round `A`, `B`, and every credit addition down and
@@ -4599,8 +4599,8 @@ and sustained loss fraction `r > theta`, a full bucket crosses after:
 floor(B / ((r - theta) * E)) + 1 rounds
 ```
 
-With the preferred `p0 = 10%` and `theta = 11.8%`, sustained 20%, 14%, and 12%
-loss cross after approximately 4, 13, and 133 operating rounds respectively.
+With the preferred `p0 = 20%` and `theta = 21.6%`, sustained 30%, 24%, and 22%
+loss cross after approximately 6, 20, and 118 operating rounds respectively.
 The long delay close to `theta` is deliberate: loss-only observations cannot
 distinguish such a small excess from allowed placement or correlation.
 
@@ -4630,8 +4630,8 @@ loss boundary where the current controller state grants that decision
 authority, whereas `p0` repairs the delivery and inflight evidence that would
 otherwise ratchet downward under sustained post-service erasure. It does not
 override the Startup gate above. The preferred MPTUNNEL profile uses `p0 =
-10%` and retains the BBR draft's `q = 2%`, producing an aggregate boundary of
-11.8%. A sender may select `p0 = 0` for uncompensated loss behavior. ECN,
+20%` and retains the BBR draft's `q = 2%`, producing an aggregate boundary of
+21.6%. A sender may select `p0 = 0` for uncompensated loss behavior. ECN,
 persistent congestion, and unknown aggregate evidence continue to require the
 controller's ordinary congestion response; the allowance does not create a
 second MPP congestion controller.
@@ -4654,23 +4654,24 @@ direction; peers do not negotiate it and asymmetric values are valid.
 Overstating it can classify real drop-based congestion as authorized loss and
 can consume additional capacity. The preferred nonzero default is therefore
 an explicit performance/fairness tradeoff, not an inference that every path
-has 10% exogenous loss.
+has 20% exogenous loss.
 
 Product configuration names this sender policy
 `quic_loss_compensation_percent`. A matching MPP inbound/outbound performance
 value overrides `[flow]`; an explicit `loss-compensation-percent` on one QUIC
 path URI overrides both. The complete resolution order is path URI, node
-performance, `[flow]`, then the built-in preferred value of 10 percent.
+performance, `[flow]`, then the built-in preferred value of 20 percent.
 
 The compensation value itself injects no packet. For reliable traffic under
-an actual independent 10% post-service erasure rate, native retransmission
-expands traffic by approximately `1 / (1 - 0.10) - 1 = 11.1%` relative to
+an actual independent 20% post-service erasure rate, native retransmission
+expands traffic by approximately `1 / (1 - 0.20) - 1 = 25%` relative to
 delivered Product payload. If accepted MPP Product recovery work reaches its
-independent 10% accounting target, the rough combined offered-payload
+independent 20% accounting target, the rough combined offered-payload
 expansion is
-`(1 + 0.10) / (1 - 0.10) - 1 = 22.2%`. These are directional, workload- and
+`(1 + 0.20) / (1 - 0.20) - 1 = 50%`. These are directional, workload- and
 loss-dependent estimates; they exclude packet headers, control traffic, and
-the bounded startup floor.
+the bounded startup floor. Neither setting guarantees a wire-overhead ceiling:
+compensation is evidence policy, and the recovery target does not gate recovery.
 
 Feedback ordering remains a qualification limit for any future experimental
 operational-RTT policy. If the transport finalizes an ACK event before
@@ -4684,7 +4685,7 @@ The loss-compensation equations and replay rules establish bounded state,
 single accounting, conservative arithmetic, and exact reclassification; they
 do not prove that a nonzero allowance improves every network. In particular,
 loss-only evidence cannot distinguish authorized erasure from a drop-based
-shared bottleneck, so the built-in 10% policy is an explicit performance and
+shared bottleneck, so the built-in 20% policy is an explicit performance and
 fairness choice rather than an inferred fact. Before an allowance-enabled
 controller is accepted for release, time-series tests MUST separately cover
 cold and warm short transfers, sustained single- and multi-flow goodput,

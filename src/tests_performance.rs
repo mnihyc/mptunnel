@@ -18,10 +18,10 @@ fn defaults_preserve_the_deployed_resource_envelope() {
 }
 
 #[test]
-fn performance_default_preserves_the_deployed_overhead_hint() {
+fn performance_default_is_twenty_percent_accounting_target() {
     assert_eq!(
         MppPerformanceConfig::default().optional_reinjection_budget_percent,
-        10
+        20
     );
 }
 

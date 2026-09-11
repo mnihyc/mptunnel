@@ -14,7 +14,7 @@ use std::time::Duration;
 pub const DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 pub const MIN_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 1_000;
 pub const DEFAULT_TCP_CARRIER_MAX: u16 = 3;
-pub const DEFAULT_QUIC_LOSS_COMPENSATION_PERCENT: u32 = 10;
+pub const DEFAULT_QUIC_LOSS_COMPENSATION_PERCENT: u32 = 20;
 /// RFC 9002's initial RTT, used when a finite QUIC startup rate has no path RTT.
 const DEFAULT_QUIC_STARTUP_RTT_MS: u64 = 333;
 /// Largest integer that a native BBR `f64` pacing state represents exactly.

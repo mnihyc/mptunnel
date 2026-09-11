@@ -2339,7 +2339,7 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
         mpp_outbounds(&reference)[0]
             .performance
             .optional_reinjection_budget_percent,
-        10
+        20
     );
     assert!(
         mpp_outbounds(&reference)[0].paths[0]
@@ -2459,7 +2459,7 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
         mpp_outbounds(&client)[0]
             .performance
             .optional_reinjection_budget_percent,
-        10
+        20
     );
     assert!(
         mpp_outbounds(&client)[0].paths[0]
@@ -2582,7 +2582,7 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
         server.servers[0]
             .performance
             .optional_reinjection_budget_percent,
-        10
+        20
     );
     assert!(server.servers[0].tun_l3.is_none());
     assert_eq!(server.servers[0].paths.len(), 2);
@@ -2616,12 +2616,12 @@ fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
     let inherited = |document: &str| {
         document
             .replacen(
-                "# optional_reinjection_budget_percent = 10",
+                "# optional_reinjection_budget_percent = 20",
                 "optional_reinjection_budget_percent = 17",
                 1,
             )
             .replacen(
-                "# quic_loss_compensation_percent = 10",
+                "# quic_loss_compensation_percent = 20",
                 "quic_loss_compensation_percent = 12.3456",
                 1,
             )
@@ -2754,7 +2754,7 @@ fn quic_loss_compensation_file_percent_rejects_invalid_values_and_removed_name()
             .loss_compensation
             .expect("built-in QUIC loss policy resolved at load")
             .ppm(),
-        100_000
+        200_000
     );
 
     for value in ["-1", "100", "1.23456", "\"10\""] {

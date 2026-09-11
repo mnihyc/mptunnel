@@ -400,11 +400,11 @@ seconds, and validate the rebuilt file; do not mix it with an earlier schema.
   Finite QUIC targets remain the scheduling basis until exact post-
   authentication native evidence from two packet-timed rounds qualifies;
   omission does not enable that gate.
-- Omitted `[flow].optional_reinjection_budget_percent` is 10. This
+- Omitted `[flow].optional_reinjection_budget_percent` is 20. This
   compatibility-named value is a directional accepted-Product-recovery
   accounting and diagnostic target. It never gates Product recovery
   eligibility, wake time, extent, target reachability, or final admission.
-- Omitted `[flow].quic_loss_compensation_percent` is separately 10. It adjusts
+- Omitted `[flow].quic_loss_compensation_percent` is separately 20. It adjusts
   sender-local QUIC delivery/loss evidence without sending bytes or recording
   accepted Product recovery work. Ordinary compensated loss carries a
   deterministic three-operating-round burst envelope and is classified only
@@ -608,7 +608,7 @@ Configuration rejects a resolved finite QUIC pair unless
 silent rounding in native BBR pacing state and saturation of the startup
 window. The QUIC-native exactness bound does not restrict a TCP-only prior.
 
-Omission uses 10 for both `optional_reinjection_budget_percent` and
+Omission uses 20 for both `optional_reinjection_budget_percent` and
 `quic_loss_compensation_percent`. The former is a directional target for
 accepted Product recovery-work accounting and diagnostics. Stable configured
 slot/range publication, exact target Product headroom, queue/flight limits, and
@@ -622,8 +622,8 @@ response to sustained excess loss. A matching MPP inbound/outbound
 only, an explicit
 `loss-compensation-percent` path URI value has highest precedence. The complete
 loss-policy order is therefore path URI, node performance, `[flow]`, then the
-built-in 10; accepted-recovery accounting uses node performance, `[flow]`, then
-the built-in 10. Each endpoint resolves its local sending direction
+built-in 20; accepted-recovery accounting uses node performance, `[flow]`, then
+the built-in 20. Each endpoint resolves its local sending direction
 independently.
 
 Use `mptunnel --help` and subcommand help as the complete option and environment

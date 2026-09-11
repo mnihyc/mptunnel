@@ -149,12 +149,12 @@ retention_timeout_s = 300
 # initial_rate_mbps = 100
 # Compatibility-named directional accounting and diagnostic target for accepted
 # Product recovery work. Each MPP inbound/outbound performance table may
-# override it. In each sending direction, 10 sets a target equal to 10% of
-# uniquely Data-ACKed Product payload plus a bounded startup allowance. It never
+# override it. In each sending direction, the default 20 sets a target equal to
+# 20% of uniquely Data-ACKed Product payload plus a bounded startup allowance. It never
 # gates Product recovery eligibility, wake time, extent, target reachability, or
 # final admission; exact stable-slot/range publication, Product headroom,
 # queue/flight limits, and native admission remain authoritative.
-# optional_reinjection_budget_percent = 10 # accepted-recovery accounting target
+# optional_reinjection_budget_percent = 20 # accepted-recovery accounting target
 # Default sender-local QUIC delivery/loss correction. This is congestion-model
 # evidence policy, not an MPP reinjection or byte budget. Each MPP performance
 # table may override it; an explicit `loss-compensation-percent` on a QUIC path
@@ -166,7 +166,7 @@ retention_timeout_s = 300
 # bypass it immediately; the horizon is fixed and is not another config knob.
 # Client/outbound values govern C-to-S; server/inbound values govern S-to-C.
 # MPP-L3 inherits these `[flow]` defaults because it has no per-node table.
-# quic_loss_compensation_percent = 10
+# quic_loss_compensation_percent = 20
 
 [management]
 # The API is disabled while listen is empty. To enable it, replace listen with
@@ -608,7 +608,7 @@ paths = [
 # Transport and carrier-group controls:
 # - loss-compensation-percent=0..99.9999: sender-local QUIC policy that corrects
 #   aligned delivery/inflight evidence for that loss fraction; omission
-#   inherits the node performance value, then `[flow]`, then built-in 10%.
+#   inherits the node performance value, then `[flow]`, then built-in 20%.
 #   Its fixed three-round envelope tolerates bounded correlated placement;
 #   sustained excess loss still invokes native BBR3. Overstating it can hide
 #   congestion; use 0 for draft BBR3 behavior;
@@ -648,8 +648,8 @@ path_probe_timeout_s = 2
 # URI loss value wins over this table. Omit the table when the outbound is
 # selected by `tun-l3`; MPP-L3 inherits `[flow]` directly.
 # [outbounds.performance]
-# optional_reinjection_budget_percent = 10 # accepted-recovery accounting target
-# quic_loss_compensation_percent = 10
+# optional_reinjection_budget_percent = 20 # accepted-recovery accounting target
+# quic_loss_compensation_percent = 20
 
 [outbounds.security]
 credential_id = "home-client"
@@ -808,8 +808,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # path_probe_timeout_s = 2
 #
 # [outbounds.performance]
-# optional_reinjection_budget_percent = 10 # accepted-recovery accounting target
-# quic_loss_compensation_percent = 10
+# optional_reinjection_budget_percent = 20 # accepted-recovery accounting target
+# quic_loss_compensation_percent = 20
 #
 # [outbounds.security]
 # credential_id = "secondary-client"
@@ -837,8 +837,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # peer_diagnostics_principal_ids = ["home"]
 #
 # [inbounds.performance]
-# optional_reinjection_budget_percent = 10 # accepted-recovery accounting target
-# quic_loss_compensation_percent = 10
+# optional_reinjection_budget_percent = 20 # accepted-recovery accounting target
+# quic_loss_compensation_percent = 20
 #
 # [inbounds.security]
 # credential_ids = ["home-client"]

@@ -578,7 +578,7 @@ pub struct Bbr3 {
     /// equivalent to BBR.loss_in_round: flag set to true when loss occurs during the round
     loss_in_round: bool,
     /// Operator-authorized loss fraction corrected in aligned delivery and inflight evidence.
-    /// Zero restores the draft BBR3 model; the MPTUNNEL default is 10%.
+    /// Zero restores the draft BBR3 model; the MPTUNNEL default is 20%.
     loss_compensation_floor: f64,
     /// Immutable retained-journal allocation authority for this native path epoch.
     loss_journal_max_bytes: usize,

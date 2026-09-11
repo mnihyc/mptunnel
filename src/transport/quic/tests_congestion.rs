@@ -1189,12 +1189,12 @@ fn path_loss_compensation_and_startup_target_construct_initial_and_fresh_bbr3() 
     .into_any()
     .downcast::<InstrumentedController>()
     .expect("default instrumented controller");
-    assert_eq!(default_controller.loss_compensation.ppm(), 100_000);
+    assert_eq!(default_controller.loss_compensation.ppm(), 200_000);
     assert_eq!(
         default_controller.loss_journal_max_bytes,
         DEFAULT_MAX_QUIC_LOSS_JOURNAL_BYTES,
     );
-    assert_bbr3_loss_compensation(&default_controller, "loss_compensation_floor: 0.1");
+    assert_bbr3_loss_compensation(&default_controller, "loss_compensation_floor: 0.2");
     assert_eq!(default_controller.initial_window(), 1_040_625);
     assert_eq!(default_controller.metrics().pacing_rate, Some(3_125_000));
     assert_eq!(default_controller.metrics().bandwidth_estimate, None);

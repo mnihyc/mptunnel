@@ -34,7 +34,7 @@ pub const DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL: Duration =
     Duration::from_millis(DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS);
 pub const DEFAULT_QUIC_PATH_IDLE_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS);
-pub const DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT: u16 = 10;
+pub const DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT: u16 = 20;
 
 // QUIC variable integers are limited to 62 bits. Keeping the wire limit here
 // avoids coupling carrier-neutral resource policy to one QUIC implementation.
@@ -46,8 +46,8 @@ pub struct MppPerformanceConfig {
     /// recovery work, in percent. The field name is retained for configuration
     /// compatibility.
     ///
-    /// 10 sets the target to 10% of uniquely Data-ACKed Product payload plus a
-    /// bounded startup allowance. It never gates Product recovery eligibility,
+    /// The default 20 sets the target to 20% of uniquely Data-ACKed Product payload
+    /// plus a bounded startup allowance. It never gates Product recovery eligibility,
     /// wake time, extent, target reachability, or final admission. Exact
     /// stable-slot/range publication, Product headroom, queue/flight limits,
     /// and native admission remain authoritative.

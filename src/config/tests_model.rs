@@ -144,10 +144,10 @@ fn node_rejects_multiple_managed_tun_owners() {
 }
 
 #[test]
-fn optional_reinjection_hint_default_is_ten_percent() {
+fn optional_reinjection_hint_default_is_twenty_percent() {
     assert_eq!(
         MppPerformanceConfig::default().optional_reinjection_budget_percent,
-        10
+        20
     );
 }
 

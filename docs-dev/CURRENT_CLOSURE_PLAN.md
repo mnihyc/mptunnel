@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 07:54 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 07:59 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -15,7 +15,8 @@ Continue the authorized closure loop; an intermediary commit is not completion.
   The bounded exact-range exclusion correction04f1e56 passes152focused checks
   and independent review. Ordinary95178 completes, but shorter stalls accompany
   lower useful speed and higher wire/queue cost. Exact defect fixed; composition
-  UNACCEPTED. Next separate assigned/received/completed frontiers, not tune.
+  UNACCEPTED. Diagnostic77827 now proves a2.551s assigned receiver head gap,
+  not local target parking. Next exact owner/copy/deadline attribution, not tune.
 - The finite client Input correction materially improves upload, including
   QoS+QUIC outage: exact-confirmed56.280→186.629Mbps; settlement79.379→43.147s.
   However,6.382s confirmation gap remains. Trace THIS return prefix now.
@@ -1134,6 +1135,62 @@ corrected header parsing and empty source diff verified before launch. No Produc
 or measurement failure followed. No compiler/lab overlap. Root read all160lines
 of the95178 appendix and verified21-member archive integrity/manifest; independent
 raw byte checks pass. Main source04f1e56; only user's seven-line file unrelated.
+
+07:59+08 diagnostic77827 CLOSED0:862453760B/43.384432s=159.035Mbps; allaccepted
+confirmed/noerrors, maxconfirmation2.828028/write2.730630s. Only230lines/86123B
+logs, but still diagnostic, not ordinary acceptance or a speed regression claim.
+Critical prefix R484689200: client24.143640/25.343640s has A=peerMAX551798064,
+U=0,F484689200,G starts[484689200,484754736), retainedC7.383→2.252MB and repair
+queue0. Server24.329640/25.329640 has R=W484689200 with64.838→64.857MB reorder
+and matching first gap. Actual successful target writes plateau there too.
+Receive advances4026568B at25.945640 after2.551160s gap; its matched write
+completes in1719us. This episode is assigned receive HOL exhausting ordered
+credit, not withheld source assignment or a parked target write. Do not transfer
+that attribution to every episode or identify the Original from aggregate paths.
+
+Q46nativeACK stops advancing across fresh15.95–23.95s native producer samples,
+while Q47 progresses. Later Q46native sampled_at freezes, so later management
+timestamps are not fresh native observations. No timer/CC bug follows without
+the missing prefix's exact owner/copy admission and retained deadlines. The
+next source review is selecting that narrow discriminator; no new overlay or
+runtime fix selected yet. Complete independent archive/appendix closes shortly.
+
+Selected08:01+08 information transaction: extend the existing1Hz selected-stream
+prefix capture with exact first-byte F ownership and ACTUAL head-recovery outcome.
+One read-only ledger pass per prefix sample may expose retained records covering
+[F,F+1): exact incarnation/attached status, immutable assignment and current span,
+sent_at, retained Original loss/fallback Option, or accepted-copy suppression D.
+None means not yet observed, not mature. Do not call a timing observer/native
+snapshot/model only to manufacture complete diagnostics or mutate its clocks.
+
+Actual gap-service observation samples its head BEFORE queued/live-copy coverage
+is subtracted. Keep those two covering causes separate; if head survives, record
+only already-computed actual head model/retained deadline/target and pending or
+exhausted result. Report chosen later range separately. No later-region timing
+as proof about F; no fresh target eligibility claim when coverage skipped it.
+Expose no-frontier/capable-owner, missing-clock, future-clock, due-no-target and
+due-ready distinctly. Retain client F versus first authoritative G relationship.
+The prior two-file R/W/target capture remains the exact receiver correlation.
+Include existing evaluator pre-gates (no alternate/zero limits), post-selection
+service/extent limits and actual enqueue outcome: due-ready is not admission.
+Use signed offsets from the sample Instant for clocks; absent and expired differ.
+
+Question: is the observed missing head withheld by a still-live copy/queued
+repair, its Original clock, or evaluated target availability? These select actual
+native-copy service, timing-contract scrutiny, or target/wake scrutiny respectively.
+Existing77827 proves the stage but omits these facts; no additional broad audit
+or congestion change follows. Information forecast only; no promised speed gain.
+Keep all clock/queue/selection behavior unchanged, one bounded observer state,
+no generic framework/per-frame history. Once-per-second diagnostic ledger scans
+and formatting may perturb timing, so only ordinary95178 remains acceptance.
+One unchanged200+200QoS/outageUP capture; no favourable performance rerun.
+
+08:07+08 preparation checkpoint: root read the complete112-line77827 appendix
+and verified gzip integrity/all11regular archive members; independent input-byte
+checks pass. Author is implementing the declared observer, reviewer independently
+checks actual evaluator/ledger boundaries. Expected six feature-only files include
+the existing two prefix hooks and narrow sender/ledger bridges. No new runtime
+fix, compiler or lab is active; ordinary04f remains composition-unaccepted.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

@@ -6176,3 +6176,116 @@ byte-verified. Six result files, driver/build, five GREEN logs, true RED log/pat
 failed-fixture log/patch, projection-check log, exact five-file candidate patch,
 run.py/shape.sh; no configurations or executable. Existing comparator is in
 [ORDERED_FEEDBACK_OUTAGE_ORDINARY_20260911.raw.tar.gz](ORDERED_FEEDBACK_OUTAGE_ORDINARY_20260911.raw.tar.gz).
+
+## Clipped-range prefix diagnostic77827: received versus assigned work
+
+This separate information capture establishes an assigned missing-prefix episode,
+not an ordinary improvement or full attribution of every gap. Source04f1e56 plus
+the saved two-file prefix observer was frozen in `clipped-prefix-20260911`;
+build30981 completed in1m23, with the existing unused-wrapper warning. Both
+observer files were fully reversed before traffic. No owner/perf infrastructure,
+all-repair logs, native-policy changes or build overlap. Result directory is
+`aggregate-combined-up-clipped-range-prefix-diagnostic-0911`.
+
+| Own diagnostic upload outcome | Value |
+|---|---:|
+| Accepted = confirmed bytes; completion |862,453,760;1/1,0failed, no errors|
+| Probe elapsed / driver elapsed,s |43.384432 /44.430005|
+| Whole confirmed Mbps |159.035|
+| First write / confirmation,s |.105332 /.409372|
+| Maximum write / confirmation gap,s |2.730630 /2.828028|
+| Raw one-second bins / zero bins |44 /5 (indices16,18,24,30,31)|
+
+Untrimmed phase means,Mbps:0–5=155.400;5–15=229.792;15–25=72.924;
+strict16–25=77.335;25–30=225.023;30–33=8.364;33–40=178.472;
+40–44=173.991, including partial last bin. All44 raw bins follow; buffered
+confirmation bursts are not physical wire rates. No UP echo measurement exists.
+
+```text
+00–09: 7.457 157.909 156.433 326.115 129.087 244.785 330.439 198.526 198.308 203.385
+10–19: 208.909 229.571 254.854 253.647 175.497 33.222 0 217.703 0 49.203
+20–29: 44.409 30.029 259.777 94.896 0 80.099 684.882 83.362 13.246 263.524
+30–39: 0 0 25.091 58.325 13.772 255.138 251.420 376.247 188.277 106.125
+40–43: 183.304 85.757 221.049 205.853
+```
+
+Session12378993707837220538, stream0; probe.started1789084458.381360292s.
+Times below use log Unix stamps relative to that anchor, not role-local mono.
+Client A=assigned offset,U=unassigned source,F=applied positive ACK frontier;
+server R=ordered receive cursor,W=completed successful write/flush watermark.
+Public target T counts successful socket writes, including partial writes: it is
+neither pre-write R nor necessarily completed W. Client snapshots are coherent
+under the existing Product guard; cross-role rows are timestamp brackets, not
+simultaneous state. Missing samples do not prove unchanged state.
+
+The clean primary episode is the65,536B head[484689200,484754736):
+
+| Witness / own time,s | Actual state |
+|---|---|
+|Client seq25/26,24.143640 /25.343640|A=peerMAX551,798,064,U0,F484,689,200; same known head omission, queue-accounted bytes0|
+|Server seq115/116,24.329640 /25.329640|R=W484,689,200; reorder64,837,700→64,856,640B; same head omission|
+|Public target generation23.950640 /24.951640|T484,689,200 and reply1134B are unchanged|
+|Server seq117,25.945640|R advances4,026,568B after2.551160s without ordered delivery|
+|Matching sampled write end,25.947640|Success,1719us; completed watermark advances|
+
+This is A>R=W with actually received suffix bytes, not solely stale positive
+ACK knowledge, unassigned source or target-write parking. Both target-loopback
+endpoints show zero queues at sampled24.059186/25.059288 runner seconds;
+that corroborates the bracket, not continuous zero. Existing events do not
+identify the first head's Original/copy, eligibility deadline, command admission
+or winning carrier. They select missing-range service, not a timer/native fix.
+
+The largest receive-stall event136,2.722944s, has mixed stages. The preceding
+hole clears at30.058640. Client30.490640 has A=F619,280,800,U64MiB, no retained
+unacked source or known gap. By31.491640 A=peerMAX686,389,664,U0: that work is assigned.
+Server31.517640/32.669640 has R=W619,280,800 and actual suffix reorder
+65,536→780,896B; first ordered advancement is32.781640, sampled write58us.
+The later head obstruction lasts at least about1.264s from the first server
+witness. The entire2.723s cannot be called assignment starvation or receiver
+recovery. The probe's2.828028s maximum has no exact saved endpoints and is not
+silently equated to this receive interval. Earlier target plateaus388,648,932B
+at15.950640–16.950640 and419,378,680B at17.950640–18.950640 are also preserved.
+
+There are43 client prefix events; server42 prefix,34 write begin/34 end,
+59 receive-stall and16 hole events. Every sampled write pair completes
+successfully; median68us,max4511us includes feedback-wrapper scheduling and
+logging. W advances across unsampled successful batches too. This bounds only
+sampled transactions; it cannot rule out all unlogged long writes or actor work.
+Logs total230lines/86,123B, including two server close warnings after completion.
+No per-repair chronology or CPU occupancy is inferred from that small volume.
+
+| Own sampled resource / wire context | Value |
+|---|---:|
+| UP46 /47 class-byte deltas |809,338,154 /894,921,596B|
+| DOWN46 /47 class-byte deltas |7,643,630 /9,680,353B|
+| UP /DOWN bytes per confirmed byte |1.976059 /.020087|
+| UP46 /47 peak backlog; simultaneous sum peak |33,756,828 /12,905,343;42,035,270B|
+| Client native /Product flight peak; client /server queue peak |43,383,176 /66,329,568;381,088 /48,953B|
+| Client /server peak RSS; final RSS,KiB |371,256 /135,620;363,604 /128,972|
+| Client /server peak lifetime ps CPU; final,% of one core |160 /65.8;141 /49.8|
+
+These are sampled-window costs, not lifetime amplification or interval CPU.
+All eight native identities per role retain epochs without ACK regression;
+summary8active/0suspect/0failed is not Product qualification. Q46 native ACK
+247,920,884B is flat over client15.949640–23.949640 while its producer timestamp
+advances; Q47 grows274,936,861→406,661,035B. At24.950640 Q46 reports RTT9.702s,
+but its native producer stamp then repeats through management30.950640: those
+rows cannot prove continued native polling. Native counters do not name a DSN.
+SinkPID25/start71521824 persists;126 additional CPU ticks, no major-fault increase,
+peak RSS198,308KiB and constant historical swap672,492KiB do not establish a leak.
+
+The same direct200+200 profile is verified: UP70/DOWN30ms, zero jitter/random
+loss/netem drops;46UP10Mbps observed15.058238–25.059288 runner seconds,47 stays
+200Mbps; UDP blackhole30.059832–33.180338 (separate DROP accounting).
+Forty-four service rows span.000063–43.429828s, but only43 unique management
+stamps per role: client row31 and server row34 repeat. Final sampled target
+846,677,416B precedes exact settlement; the probe supplies final byte truth.
+Information forecast succeeds narrowly: the primary plateau is an assigned
+receiver hole; the largest interval contains both assignment and hole stages.
+Missing head ownership/timing is still unresolved. Ordinary95178 remains the
+performance evidence; no promotion or causal correction follows this observer.
+
+Archive: [CLIPPED_RANGE_PREFIX_DIAGNOSTIC_20260911.raw.tar.gz](CLIPPED_RANGE_PREFIX_DIAGNOSTIC_20260911.raw.tar.gz),
+11 safe regular members,362,034B compressed /2,919,024B uncompressed, every byte
+verified: six raw files, exact two-file patch, build/driver logs, run.py/shape.sh.
+No binary or configuration is included.

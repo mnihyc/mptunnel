@@ -399,8 +399,6 @@ async fn run_server_udp_reliable_stream_loop(
         mut commands_rx,
         mut path_proofs,
     } = stream_context;
-    let commitment = send.bind_product_commitment(stream_id)?;
-    commands_rx.bind_native_commitment(commitment)?;
     let carrier_frame_queue =
         udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits);
     let mut carrier_frames =

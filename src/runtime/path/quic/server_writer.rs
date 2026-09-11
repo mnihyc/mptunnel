@@ -234,31 +234,9 @@ pub(super) async fn drain_server_udp_reliable_commands(
                             has_prepared_claim = true;
                             work.requeue();
                         }
-                        PreparedOriginalClaim::RecoveryQueued => {
-                            work.requeue();
-                            // The independent repair stream may already run;
-                            // it never takes ownership of this staged batch.
-                            flush_server_udp_frame_batch(
-                                send,
-                                pending_frames,
-                                context.codec_limits,
-                                path_proofs,
-                                commands,
-                                &mut pending_frame_command_bytes,
-                                path_id,
-                                stream_id,
-                                context,
-                                path_registration,
-                                carrier_frames,
-                                deferred_input,
-                            )
-                            .await?;
-                            return Ok(false);
-                        }
                         PreparedOriginalClaim::Busy(wait) => {
                             commands.defer_prepared_work(work, wait)
                         }
-                        PreparedOriginalClaim::CarrierFailed(error) => return Err(error),
                         PreparedOriginalClaim::Blocked(wait) => {
                             commands.defer_prepared_work(work, wait)
                         }

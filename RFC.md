@@ -1138,7 +1138,7 @@ Section 7.3 and may leave a redundant member idle. Pool membership never
 forces payload duplication and introduces no group-specific pacing or
 congestion controller.
 
-Core Profile 7 does not define a cross-group configured-order coordinate for
+Core Profile 8 does not define a cross-group configured-order coordinate for
 otherwise equal evidence. The current placement owner retains its existing
 deterministic tie and retention behavior. A future sustained allocator may
 define a stable configured coordinate, but that coordinate would be neither
@@ -2020,7 +2020,7 @@ flow count, or relabelled as one exact physical backlog. Product ownership,
 bounded MPP queues, native flight, and native send capacity retain their own
 owners and terminal rules.
 
-This section defines a typed score for one exact action. Core Profile 7 does
+This section defines a typed score for one exact action. Core Profile 8 does
 not require the live candidate-order owner to consume this component, and this
 component alone is not a sustained allocator. An implementation or future
 profile that consumes it computes, at the Core millisecond service resolution:
@@ -2587,7 +2587,7 @@ carrier's authenticated `PathId`. One transaction may span multiple ordered
 receipt confirms it.
 
 The transaction is an optional diagnostic extension, not a Core Product
-acquisition phase. Core Profile 7 MUST NOT automatically initiate it as a
+acquisition phase. Core Profile 8 MUST NOT automatically initiate it as a
 prerequisite for ordinary placement, qualification, carrier readiness, or
 pool reconciliation. A receipt proves only ordered ingress of the declared
 measurement payload on that exact carrier and direction. It establishes no
@@ -2930,7 +2930,7 @@ carrier presentation defeats a source-aware classifier. Fixed private
 cleartext protocol markers are avoided, but authenticated tunneling—not
 traffic impersonation—is the security objective.
 
-## 15. MPTunnel Core Profile 7
+## 15. MPTunnel Core Profile 8
 
 This section specifies the transport-neutral Core policy used with the wire
 semantics above. It defines Core conformance, not peer interoperability.
@@ -2943,14 +2943,21 @@ native TCP, QUIC, MPTCP, or HTTP/3 timers.
 Within the regular or backup set selected by Section 7, ordinary original-data
 placement uses the implementation's existing advisory candidate order subject
 to shared receive credit, configured Product resources, current attachment/
-output lifecycle, reorder bounds, and an imminent exact writer claim. Core Profile 7
+output lifecycle, reorder bounds, and an imminent exact writer claim. Core Profile 8
 does not require that candidate order to consume the Section 10.2 action-score
 component. That component has no sustained allocation owner in this revision
 and therefore cannot replace the existing order merely by repeatedly selecting
-its static minimum. The existing order likewise cannot deny the only action
-whose authoritative owners admit the command. Profile 7 makes no fairness or
+its static minimum. The advisory order likewise cannot deny the only action
+whose authoritative owners admit the command, including the native commitment
+condition below. Profile 8 makes no fairness or
 aggregate-capacity conformance claim for a sustained sequence; a future profile
 making either claim must supply the allocation owner required by Section 10.2.
+
+Profile 8 adds independently due recovery service at the writer acquisition
+boundary and ties new Original opportunities to native first packetization. It retains
+Profile 7's configured Product resources, qualification, wire semantics and
+native congestion/reliability. These additions make no universal allocation or
+physical-optimality claim.
 
 The output carrying the contiguous frontier is governed by shared MPP credit
 and its native carrier. Before an additional output in either stream direction
@@ -3057,7 +3064,7 @@ cache and exact Original ownership before the native transaction can expose
 bytes. Failed revalidation changes no Product range or source frontier. Data ACK or
 terminal Product cleanup releases O and O_i exactly once; native ACK does not.
 
-Core Profile 7 ordinary placement retains the implementation's existing legacy
+Core Profile 8 ordinary placement retains the implementation's existing legacy
 projected-path rank. That rank may use sampled native queue, flight, loss,
 confidence, application-limited state, active-flow count, Suspect state, and a
 compatibility scalar rate; it remains advisory and neither shrinks nor enlarges
@@ -3121,6 +3128,71 @@ or invalidating evidence MUST NOT rewrite that native state, and peer telemetry
 MUST NOT supply it. Native admission participates symmetrically in both
 directions through exact writer reservation and native backpressure. There is
 no request-only QUIC tie-break.
+
+#### 15.1.1 Native Original opportunity
+
+API write acceptance is permission to retain native stream bytes, not evidence
+that they have been packetized. Product receipt can also release OriginalData
+debt while accepted native bytes remain unpacketized. These distinct obligations
+MUST NOT be declared retired by Product ACK, queue removal or a capacity estimate.
+
+An adapter MAY supply an exact established-FIFO capability consisting of a
+coherent accepted native end `E`, a monotonic first-unpacketized cursor `P`, and
+a targeted end-crossing or terminal notification. First packet construction is
+not socket emission, native ACK or ordered Product delivery. The capability is
+bound to one exact FIFO lifetime; an early-data rewind or replacement stream
+cannot inherit it. Unavailable capability MUST remain unavailable and MUST NOT
+be replaced with zero or an approximate cursor.
+
+For a FIFO with this capability, a new Original writer transaction is eligible
+only when `E == P`. When `E > P`, leave new Original source unclaimed, including
+when this is the sole Ready writer. Wait for the captured `E` to be packetized
+or for exact FIFO termination. A past crossing resolves immediately. Product
+ACK, elapsed policy time and exported capacity cannot clear this condition.
+
+The transaction remains the existing bounded writer drain/flush unit, possibly
+containing multiple frames. Claimed work retains its exact bytes, offsets and
+charges through that complete transaction, including partial API writes. Do not
+park a staged batch waiting for more source or first packetization of bytes that
+have not yet been submitted. Before another transaction can claim Originals,
+finish the existing write and capture its actual native boundary. The bound is
+one existing transaction awaiting first packetization on each supported FIFO;
+it is not one quantum per receiver ACK or a global concurrency restriction.
+
+Existing control and admitted recovery work remain serviceable through their
+ordinary priority and accounting. Other eligible Ready FIFOs remain able to
+claim shared source. The next Original also respects unpacketized control or
+recovery bytes already accepted on its own FIFO. Native transmission and loss
+recovery continue independently. No operation-to-Product settlement ledger or
+header geometry is needed to establish this native opportunity.
+
+Capture native progress outside Product ownership. The invoking exclusive
+writer's exact Ready epoch MUST still be current at final Original claim, so
+another writer cannot append bytes between the captured empty boundary and that
+claim. Other candidates likewise require their current Ready receipts. Within
+that lifetime, a captured busy boundary is conservative because `P` cannot
+rewind; arm its exact crossing wake rather than polling or manufacturing fresh
+permission. No ownership guard crosses native I/O.
+
+An observed send-half terminal state MUST reach that exact writer's ordinary
+retirement path even if its receive half remains open. A blocked prepared notice
+retains a terminal wake independently of a packetization target. Observed failure
+is not unavailable healthy capability; silently excluding that FIFO from
+placement cannot substitute for its lifecycle transition.
+
+Established Quinn streams supply this capability in both Product directions.
+TCP adapters lacking the exact event retain native backpressure and Product
+bounds, without an invented empty-FIFO receipt. This availability distinction
+neither prefers a protocol nor asserts an exact guarantee for every platform.
+QUIC FIFOs retain independent opportunities and share connection resources.
+
+This rule bounds new Original inventory before first packetization, not its
+residence time, packetized flight, qdisc queues or physical delivery. Native
+packet and stream inventories overlap and MUST NOT be summed as disjoint work.
+Control, recovery and concurrent FIFOs remain accounted through their existing
+owners. Empty/refill handoffs can reduce service or create native application-
+limited observations; those costs MUST remain visible. Practical acceptance must
+assess healthy and impaired service, continuity, latency and actual copy costs.
 
 Connection-wide source staging precedes stream-offset assignment and may
 contain bounded work for several independently admitted outputs. It is
@@ -3267,7 +3339,7 @@ Data ACK or terminal cleanup restores current E_i headroom.
 Every ordinary positive quantum freezes the current owner's implementation-
 defined finite candidate order. The owner tries candidates until one real
 writer reservation and every Product authority succeed, then ends after that
-one commitment. It does not allocate equal shares. Core Profile 7 does not
+one commitment. It does not allocate equal shares. Core Profile 8 does not
 claim the Section 10.2 canonical key, `Unrankable` order, or incumbent-
 uncertainty comparator as live placement behavior. A future T08b-style
 sustained allocator that consumes the component must define and prove those
@@ -3327,7 +3399,7 @@ planned changes follow Section 7.2.
 Core does not infer a common bottleneck from path membership or transient
 comparative throughput. It makes no claim that more carriers aggregate
 capacity, that two carriers are independent, or that one scalar group can model
-overlapping shared resources. Such inference is outside Core Profile 7.
+overlapping shared resources. Such inference is outside Core Profile 8.
 
 ### 15.2 Reinjection authority, accounting, and timing
 
@@ -3391,8 +3463,9 @@ absolute deadlines, as specified below. The thresholds are:
 
 For a candidate extent, let `loss_at` be the maximum applicable `loss_at_j`
 and `fallback_at` the maximum applicable `fallback_at_j`. If any participating
-span lacks `loss_at_j`, the aggregate `loss_at` is absent and pre-fallback
-speculation is disabled. No earlier than `loss_at` and before `fallback_at`,
+span lacks `loss_at_j`, the aggregate `loss_at` is absent and this proven-gap pre-fallback
+speculation is disabled. The separately bounded Latency completion authority in
+Section 15.2.2 does not declare an omission or change these clocks. No earlier than `loss_at` and before `fallback_at`,
 a sender MAY offer the exact frontier as
 bounded speculative repair on a currently measured, distinct alternate,
 subject to the exact publication, target, queue, flight, native, and
@@ -3453,13 +3526,16 @@ Those excluded categories do not contribute to `R_t`.
 For one logical-stream send direction `s` and byte `x`, let `O_s(x)` be the
 complete set of live exact OriginalData output incarnations covering it and let
 `A_s(x)` be the complete set of exact output incarnations with unresolved
-OriginalData or accepted ReinjectedData covering it. Let `I_s` be the byte
-length of the maximal retained contiguous prefix from the lowest uncovered
-byte on which `O_s(x)` is the same non-empty singleton and `A_s(x)` is
+OriginalData or accepted ReinjectedData covering it. The current query frontier
+is the first uncovered retained byte reached under Section 15.2.1. It is distinct
+from the positive Product ACK frontier `F`; crossing accepted recovery coverage
+advances only the query. Recompute `I_s`, `H_s`, and `M_s` for every query.
+Let `I_s` be the byte length of the maximal retained contiguous prefix from
+that query frontier on which `O_s(x)` is the same non-empty singleton and `A_s(x)` is
 unchanged. A cache or application-write boundary alone does not end `I_s`; a
 retained-data hole, ambiguous owner, non-live owner, or exact identity-set
-change does. Let `H_s` be the byte length of the uncovered portion of the exact
-lowest retained Product frontier, let `Q_s^r` be the direction's common
+change does. Let `H_s` be the byte length of the uncovered portion of the
+current query's retained frontier, let `Q_s^r` be the direction's common
 immutable repair quantum captured for target ranking, and let
 `M_s = min(Q_s^r, H_s, I_s)`.
 
@@ -3502,7 +3578,7 @@ terminal carrier failure is separate: because no live owner remains, it may
 service the complete cause-specific retained prefix up to `L(s,r,t)`, subject
 to every range, slot, Product-capacity, queue, and native bound below.
 Target-unbound repair has no independent Product-capacity grant. Before target
-binding, its queued extent is bounded by the retained lowest frontier, captured
+binding, its queued extent is bounded by the current query's retained frontier, captured
 common repair quantum, retained repair debt, and configured repair and
 path-flight envelopes. Queued target-unbound ReinjectedData `U_s` is
 conservatively included in `R_t` for every eligible target. At dispatch, after
@@ -3532,8 +3608,10 @@ failure prefix without skipping ahead. All accepted bytes remain in
 directional Product recovery-work accounting.
 
 Retained-frontier fallback applies during active sending as well as final
-drain. Its frontier is the sender's current positive Data-ACK/cache frontier,
-refined to exact cached OriginalData ownership and the ranked prefix above.
+drain. Its initial frontier is the sender's current positive Data-ACK/cache
+frontier, refined to exact cached OriginalData ownership and the ranked prefix
+above. A service traversal may continue as specified below; it never advances
+that actual Product ACK frontier.
 Source EOF, empty source staging and scope of historical ACK evidence
 are not prerequisites. Suffix receipt or source activity MUST NOT postpone the
 original owner's immutable fallback deadline. This local retained obligation
@@ -3602,10 +3680,12 @@ an assignment epoch or aggregate clock later. Alternate eligibility and the
 advisory action rank are evaluated from the current target; a departed target's
 rank MUST NOT be inherited by its replacement. Exact ownership and a live
 measured distinct alternate are required for target-bound live-owner repair;
-otherwise ACK silence waits until the one-interval `fallback_at` rather than
-erasing that fallback.
+otherwise ACK silence retains the one-interval `fallback_at`. Section 15.2.2
+allows one separately accounted speculative completion copy per byte for the
+current Latency demand objective; it does not erase or shorten this fallback.
 
-Recovery target ranking and commitment MUST refer to the same lowest-missing,
+Recovery target ranking and commitment MUST refer to the same first uncovered
+extent selected by that query, with an unchanged
 identity-uniform frontier. Decide ranks candidate targets using the common
 captured payload `M_s`; after selection, Apply may shrink the ranked frontier
 only to exact `F_t^r`. For a live owner, Apply MUST NOT extend total service
@@ -3622,12 +3702,118 @@ The first committed repair frame has the same lowest offset, normalized
 frontier identity, output incarnation, and writer-capacity generation used by
 the current owner's frozen advisory target order, and its payload MUST NOT
 exceed `M_s`.
-If that frame
-cannot be committed because it overlaps queued or recent
-repair work, the evaluation MUST stop without publishing later omitted ranges.
+If that frame cannot be committed, that quantum's Apply stops. A new service
+query may cross earlier accepted, currently suppressed coverage under the
+traversal below; provisional queue intent alone does not permit continuation.
 A larger coalesced batch or whole-window throughput estimate MUST NOT replace
 the exact frontier-quantum carrier rank or enlarge the resulting live-owner
 commit.
+
+#### 15.2.1 Recovery service at an imminent acquisition
+
+The actual contiguous Product ACK frontier moves only on positive Product
+receipt. A separate service query begins with exact retained outstanding
+coverage and may pass earlier coverage of accepted recovery copies whose
+suppression remains current. This admits a distinct independently due quantum
+without waiting for the preceding copy's ACK. Passing it neither declares
+receipt nor releases its native, configured-slot or Product debt.
+
+At the first uncovered retained extent, query that extent's own immutable
+assignment clocks, cause/evidence, exact ownership sets and eligible target.
+An immature or unauthorized uncovered extent stops traversal; no preceding
+head's age or authority can be borrowed, and no attractive later suffix can be
+skipped to. Provisional Product queue intent prevents duplicate proposal but
+does not grant accepted-service continuation. Expired suppression makes the
+older range eligible for reconsideration without vacating its occupied slot.
+ACK, cancellation and attachment retirement reconcile their existing exact
+coverage and debt, not a second persistent delivery ledger.
+
+Each next positive quantum is independently ranked and revalidated under the
+same `A(s,r,t)`, `K_t`, `M_s` and `F_t^r` bounds. Accepted coverage and occupancy
+are updated before querying another extent. One quantum does not authorize an
+unranked suffix or all younger assignments. Every publication counts against
+finite existing writer-turn work bounds.
+
+Before a prepared Original acquires a Ready target opportunity, the sender
+MUST consider due executable recovery or an authorized Section 15.2.2 completion
+copy for that opportunity. Keep higher
+traffic-class arbitration and already owned partial or staged writes intact.
+Use the existing normal repair reservation and atomic Product/copy/slot Apply,
+with supplied Native observations and the current selected Native fence. Do not
+resample Native while holding the final Product owner or nest another Native
+fence inside it.
+
+A recovery-queued acquisition result means the actual carrier repair command
+and accepted-copy ledger committed, not that provisional Product intent was
+queued or native packetization completed. It consumes that Ready epoch, leaves
+unnumbered source and Original offsets/debt unchanged, and returns the weak
+source notice through normal arbitration. A refused reservation changes none
+of those owners. Subsequent acquisitions reconsider due recovery before fresh
+Original commitment rather than waiting for a Product actor roundtrip or ACK.
+
+Preserve and finish any previously staged Original batch across that handoff,
+including deferred input and exact command charges. QUIC's separate repair
+worker may transmit before an ordinary batch finishes; no cross-stream ordering
+is promised. A policy requiring prior batch settlement must yield without
+publishing repair until that settlement is complete. It may not discard an
+owned batch to create apparent priority or queue vacancy.
+
+#### 15.2.2 Bounded Latency completion opportunity
+
+A quiet latency-oriented exchange may never produce later Data ACK evidence,
+and an impaired owner's RTT/variance can make its recovery interval much longer
+than useful interactive completion. Native recovery opportunity and duplicate
+control remain the purpose of the ordinary fallback. They do not establish a
+latency-completion budget. A sender therefore MAY spend one additional copy per
+retained Original byte under its existing current `Latency` demand objective,
+without waiting for `loss_at` or `fallback_at`. This is speculative completion,
+not evidence of application blocking, loss, or native failure. A healthy reply
+already delivered while its ACK returns can present the same local state.
+
+The query uses Section 15.2.1's first serviceable retained prefix, one exact live
+Original owner, and a distinct current Ready output. The completion output may
+use its ordinary admitted startup prior; bulk qualification is not a prerequisite
+for this bounded speculative opportunity. That prior remains unmeasured and MUST
+NOT be published as healthy capacity evidence. The ordinary proven-gap and
+matured-fallback target policy remains unchanged. If early completion is selected,
+rank its targets with completion authority from the same captured observations,
+including when the retained prefix also has proven-gap evidence. It retains
+ordinary target ranking, source arbitration, common-extent bounds, Product/native/queue/slot
+admission and all accounting. It MUST NOT skip an older unsuppressed obligation
+to find an uncopied later suffix. For early authority the candidate MUST be
+clipped before any overlapping previously accepted ReinjectedData byte. If such
+a copy covers the first byte, early authority is spent there; only the existing
+normal recovery rules can authorize another copy.
+
+All raw accepted copies consume this per-byte opportunity, regardless of cause,
+suppression expiry, output detach or replacement. Raw flight coverage remains
+until positive Product ACK removes the corresponding Original need. ACK splitting
+preserves exact surviving coverage. Final Apply MUST revalidate current Latency,
+retained Original identity, distinct current target, and absence of *any* raw
+accepted copy, atomically with normal flight publication. A queue refusal spends
+nothing; an accepted copy remains spent even if its native write later fails.
+No lane reset, timeout, fresh metric or path incarnation refills this authority.
+The response flight-lock transaction and serialized request Product owner enforce
+the same rule. No separate historical delivery ledger is required.
+
+For Latency Original bytes `L`, added early-copy bytes `E` satisfy `E <= L`.
+Overlapping copies also invalidate Original qualification uniqueness under the
+existing rules; a short stream can remain on its startup prior. Native
+retransmission and separately authorized normal recovery remain additional
+accounted work; this is not a two-times total-wire bound. Continuous Latency work
+may incur up to one full extra Product copy. Existing demand-episode admission
+and promotion bound startup work before Throughput classification. Established
+Throughput receives no new early authority. Current classification is a service
+objective, not an application-message parser or proof of independent bottlenecks.
+No payload size, port, protocol preference, new timer or concurrency cap selects
+this opportunity. Shared constraints and many demanded latency flows can reduce
+its benefit; ordinary comparative validation must include those traffic costs.
+
+This authority is used by prepared acquisition and represented as a completion
+copy, separately from the candidate's proven-gap or matured-fallback authority.
+It does not change Original ownership, native first-packetization admission,
+carrier congestion control, source offsets, native ACK meaning or the immutable
+owner fallback. Control and already-owned writer batches retain their lifecycle.
 
 Let `G_s` be the directional live-owner frontier-floor successor epoch. When a
 target-bound live-owner gap or speculative-tail repair batch is accepted into
@@ -4151,7 +4337,7 @@ A conforming implementation preserves all of the following:
     jointly bounded by shared receive credit, reorder, queue, native-transport,
     and ordinary recovery authority; no output owns a direction-global
     acquisition token.
-34. The PATH_CAPACITY transaction is diagnostic in Core Profile 7. It
+34. The PATH_CAPACITY transaction is diagnostic in Core Profile 8. It
     creates no Product, lifecycle, usage, health, congestion-control, or typed
     Section 10.2 scheduling-rate authority and cannot gate unrelated Product
     work. A qualified result may temporarily feed the historical legacy rank
@@ -4163,7 +4349,7 @@ A conforming implementation preserves all of the following:
     positive C uses `ceil(8000*(A_bytes+M_bytes)/C_bps)`; declared
     `UnlimitedStartup` contributes zero service duration. Both use checked
     arithmetic and never divide capacity by active-flow count. This does not
-    make the component Core Profile 7's live candidate order.
+    make the component Core Profile 8's live candidate order.
 36. Rank is not admission. Every current finite candidate order is revalidated
     against Product, lifecycle, queue, and native authorities. If a future
     owner consumes Section 10.2, an unrankable action sorts last but remains
@@ -4173,7 +4359,7 @@ A conforming implementation preserves all of the following:
     command-kind, and Product/command identity for equal-score and all-
     unrankable ties. Its incumbent hysteresis is one same-tier comparison
     against the base-best challenger, never a sort relation, and uses duration-
-    valued uncertainty separate from the score. Core Profile 7 does not claim
+    valued uncertainty separate from the score. Core Profile 8 does not claim
     these as current placement behavior. A percentage hint is not a hidden
     eligibility gate in either policy.
 38. Every active native PathData or controller installation and restoration is

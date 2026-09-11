@@ -11,7 +11,10 @@ use crate::mux::stream::StreamError;
 use crate::protocol::Frame;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
-use crate::runtime::path::prepared::{PreparedOriginalClaim, PreparedOriginalRegistration};
+use crate::runtime::path::prepared::{
+    PreparedNativeCommitmentInputs, PreparedOriginalClaim, PreparedOriginalRegistration,
+    prepared_wait_with_native_commitment, prepared_wait_with_recovery_deadline,
+};
 use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
 use crate::runtime::sender::queue::ReliableRelayQueuedWorkKind;
 use crate::runtime::sender::work::RelaySendCause;
@@ -186,46 +189,68 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     let wake = arm_work_change(&state, context, instance);
     let lane = state.prepared.request_lane;
     let quantum = state.prepared.data_quantum_bytes;
-    let Some((_, queued)) = state.sender_queue.front() else {
-        return PreparedOriginalClaim::Empty;
-    };
-    let ReliableRelayQueuedWorkKind::Data(payload) = &queued.kind else {
-        return PreparedOriginalClaim::Blocked(wake);
-    };
-    let payload = payload.slice(..quantum.min(payload.len()).max(1));
-    let frame = match state.send_stream.prepare_data(payload) {
-        Ok(frame) => frame,
-        Err(
+    let payload = state
+        .sender_queue
+        .front()
+        .and_then(|(_, queued)| match &queued.kind {
+            ReliableRelayQueuedWorkKind::Data(payload) => {
+                Some(payload.slice(..quantum.min(payload.len()).max(1)))
+            }
+            _ => None,
+        });
+    let frame = match payload.map(|payload| state.send_stream.prepare_data(payload)) {
+        Some(Ok(frame)) => Some(frame),
+        None
+        | Some(Err(
             StreamError::FlowControlBlocked { .. }
             | StreamError::ReinjectionCacheFull { .. }
             | StreamError::TooManyReinjectionCacheChunks { .. },
-        ) => return PreparedOriginalClaim::Blocked(wake),
-        Err(error) => {
+        )) => None,
+        Some(Err(error)) => {
             record_source_error(&mut state, RuntimeError::Stream(error));
             return PreparedOriginalClaim::Empty;
         }
     };
-    {
+    // Original preparation may publish proofs before Native sampling, but its
+    // detached-predecessor refusal must not suppress separate recovery service.
+    let original_prepared = frame.as_ref().is_some_and(|frame| {
         let RequestProductState {
             sender, remotes, ..
         } = &mut *state;
-        if sender
+        sender
             .multipath
-            .prepare_original_claim(context, remotes, &frame)
-            .is_err()
-        {
-            return PreparedOriginalClaim::Blocked(wake);
-        }
-    }
+            .prepare_original_claim(context, remotes, frame)
+            .is_ok()
+    });
     if !ready.receipt().is_current() {
         return PreparedOriginalClaim::Blocked(wake);
     }
     let capture =
         RequestRelayNativeCapture::new(state.remotes.membership_generation(), &state.remotes.paths);
+    let commitment_handles = state
+        .remotes
+        .paths
+        .iter()
+        .filter_map(|path| {
+            let ReliablePathStreamOutput::Fixed(output) = &path.stream.output else {
+                return None;
+            };
+            Some((path.instance(), output.commands().native_commitment()))
+        })
+        .collect::<Vec<_>>();
     drop(state);
     #[cfg(test)]
     owner.run_before_prepared_native_resolve_for_test();
     let inputs = capture.resolve();
+    let commitments = PreparedNativeCommitmentInputs::capture(commitment_handles);
+    let wake = prepared_wait_with_native_commitment(
+        wake,
+        commitments
+            .selected_terminal_wait(instance)
+            .into_iter()
+            .collect(),
+    );
+    let mut commitment_waits = Vec::new();
     // Arm anew after our earlier unlock; it is not a release credit for a
     // competing holder. Busy discards this advisory capture and retries fresh.
     let mut state = match owner.arm_claim().try_lock() {
@@ -235,7 +260,163 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     if !registration_is_current(&state, instance, registration) {
         return PreparedOriginalClaim::Empty;
     }
-    if !source_matches(&mut state, &frame, lane, quantum) || !ready.receipt().is_current() {
+    if state.prepared.request_lane != lane || !ready.receipt().is_current() {
+        return PreparedOriginalClaim::Blocked(wake);
+    }
+    if let Err(error) = commitments.check_selected(instance) {
+        return PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(std::io::Error::other(
+            error,
+        )));
+    }
+    let recovery_ready = current_ready_instances(&state);
+    let recovery = {
+        let RequestProductState {
+            sender,
+            remotes,
+            send_stream,
+            sender_queue,
+            last_send_ack,
+            ..
+        } = &mut *state;
+        sender.next_prepared_recovery(
+            context,
+            remotes,
+            send_stream,
+            sender_queue,
+            last_send_ack,
+            lane,
+            inputs.clone(),
+            &recovery_ready,
+            Instant::now(),
+        )
+    };
+    let wake = prepared_wait_with_recovery_deadline(wake, recovery.next_deadline);
+    if let Some(candidate) = recovery.candidate {
+        if candidate.target != instance {
+            let selected = state
+                .prepared
+                .registrations
+                .iter()
+                .find(|registration| registration.request_instance() == Some(candidate.target))
+                .cloned();
+            drop(state);
+            if let Some(selected) = selected {
+                selected.notify();
+            }
+            return PreparedOriginalClaim::Blocked(wake);
+        }
+        let Some(commands) = state.remotes.paths.iter().find_map(|path| {
+            if path.instance() != instance {
+                return None;
+            }
+            let ReliablePathStreamOutput::Fixed(output) = &path.stream.output else {
+                return None;
+            };
+            Some(output.commands().clone())
+        }) else {
+            return PreparedOriginalClaim::Blocked(wake);
+        };
+        drop(state);
+        let attempt = owner.arm_claim();
+        let mut other_selected = None;
+        let result = candidate
+            .commit_with_current_native_shape(&commands, |shape| {
+                let mut state = match attempt.try_lock() {
+                    Ok(state) => state,
+                    Err(wait) => return Some(PreparedOriginalClaim::Busy(wait)),
+                };
+                if !registration_is_current(&state, instance, registration) {
+                    return Some(PreparedOriginalClaim::Empty);
+                }
+                if state.prepared.request_lane != lane || !ready.receipt().is_current() {
+                    return None;
+                }
+                if let Err(error) = commitments.check_selected(instance) {
+                    return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(
+                        std::io::Error::other(error),
+                    )));
+                }
+                let current_inputs = match shape {
+                    Some(shape) => inputs.with_fenced_target(instance, shape),
+                    None => inputs,
+                };
+                let ready_instances = current_ready_instances(&state);
+                let RequestProductState {
+                    sender,
+                    remotes,
+                    send_stream,
+                    sender_queue,
+                    last_send_ack,
+                    ..
+                } = &mut *state;
+                let current = sender
+                    .next_prepared_recovery(
+                        context,
+                        remotes,
+                        send_stream,
+                        sender_queue,
+                        last_send_ack,
+                        lane,
+                        current_inputs,
+                        &ready_instances,
+                        Instant::now(),
+                    )
+                    .candidate?;
+                if current.target != candidate.target {
+                    other_selected = state
+                        .prepared
+                        .registrations
+                        .iter()
+                        .find(|registration| {
+                            registration.request_instance() == Some(current.target)
+                        })
+                        .cloned();
+                    return None;
+                }
+                // The fresh query re-proves authority. Its newly constructed
+                // batch validity deadline is not the identity of that authority;
+                // compare cause kind while retaining exact target/range checks.
+                if current.frame != candidate.frame
+                    || std::mem::discriminant(&current.cause)
+                        != std::mem::discriminant(&candidate.cause)
+                {
+                    return None;
+                }
+                match sender.commit_prepared_recovery(
+                    context,
+                    remotes,
+                    send_stream,
+                    sender_queue,
+                    &current,
+                    ready,
+                    shape,
+                ) {
+                    Ok(_) => {
+                        state.prepared.work_changed.notify_waiters();
+                        Some(PreparedOriginalClaim::RecoveryQueued)
+                    }
+                    Err(RuntimeError::SenderServiceBlocked) => None,
+                    Err(error) => {
+                        record_source_error(&mut state, error);
+                        Some(PreparedOriginalClaim::Empty)
+                    }
+                }
+            })
+            .flatten();
+        if let Some(selected) = other_selected {
+            selected.notify();
+        }
+        return result.unwrap_or(PreparedOriginalClaim::Blocked(wake));
+    }
+    let Some(frame) = frame else {
+        return if state.sender_queue.front().is_none() && state.send_stream.reinjection_bytes() == 0
+        {
+            PreparedOriginalClaim::Empty
+        } else {
+            PreparedOriginalClaim::Blocked(wake)
+        };
+    };
+    if !original_prepared || !source_matches(&mut state, &frame, lane, quantum) {
         return PreparedOriginalClaim::Blocked(wake);
     }
     let include_bulk = lane.is_bulk()
@@ -272,7 +453,8 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     } else {
         None
     };
-    let ready_instances = current_ready_instances(&state);
+    let ready_instances =
+        commitments.original_ready(current_ready_instances(&state), &mut commitment_waits);
     let plan = match state.sender.multipath.plan_original_claim_from_observation(
         context,
         &observation,
@@ -284,7 +466,12 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         &ready_instances,
     ) {
         Ok(plan) => plan,
-        Err(_) => return PreparedOriginalClaim::Blocked(wake),
+        Err(_) => {
+            return PreparedOriginalClaim::Blocked(prepared_wait_with_native_commitment(
+                wake,
+                commitment_waits,
+            ));
+        }
     };
     if plan.target().1 != instance {
         let selected = state
@@ -297,7 +484,10 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         if let Some(selected) = selected {
             selected.notify();
         }
-        return PreparedOriginalClaim::Blocked(wake);
+        return PreparedOriginalClaim::Blocked(prepared_wait_with_native_commitment(
+            wake,
+            commitment_waits,
+        ));
     }
     let Some(commands) = state.remotes.paths.iter().find_map(|path| {
         if path.instance() != instance {
@@ -325,6 +515,11 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         if !source_matches(&mut state, &frame, lane, quantum) || !ready.receipt().is_current() {
             return None;
         }
+        if let Err(error) = commitments.check_selected(instance) {
+            return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(
+                std::io::Error::other(error),
+            )));
+        }
         let current_inputs = match shape {
             Some(shape) => inputs.with_fenced_target(instance, shape),
             None => inputs,
@@ -332,6 +527,65 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         let include_bulk = lane.is_bulk()
             && (state.remotes.paths.len() > 1
                 || frontier(&state) == ReliableDataAckFrontierState::AuthoritativeGap);
+        let recovery_ready = current_ready_instances(&state);
+        let recovery = {
+            let RequestProductState {
+                sender,
+                remotes,
+                send_stream,
+                sender_queue,
+                last_send_ack,
+                ..
+            } = &mut *state;
+            sender.next_prepared_recovery(
+                context,
+                remotes,
+                send_stream,
+                sender_queue,
+                last_send_ack,
+                lane,
+                current_inputs.clone(),
+                &recovery_ready,
+                Instant::now(),
+            )
+        };
+        if let Some(candidate) = recovery.candidate {
+            if candidate.target != instance {
+                other_selected = state
+                    .prepared
+                    .registrations
+                    .iter()
+                    .find(|registration| registration.request_instance() == Some(candidate.target))
+                    .cloned();
+                return None;
+            }
+            let RequestProductState {
+                sender,
+                remotes,
+                send_stream,
+                sender_queue,
+                ..
+            } = &mut *state;
+            return match sender.commit_prepared_recovery(
+                context,
+                remotes,
+                send_stream,
+                sender_queue,
+                &candidate,
+                ready,
+                shape,
+            ) {
+                Ok(_) => {
+                    state.prepared.work_changed.notify_waiters();
+                    Some(PreparedOriginalClaim::RecoveryQueued)
+                }
+                Err(RuntimeError::SenderServiceBlocked) => None,
+                Err(error) => {
+                    record_source_error(&mut state, error);
+                    Some(PreparedOriginalClaim::Empty)
+                }
+            };
+        }
         let Some(observation) = state.sender.multipath.observe_original_claim_from_inputs(
             context,
             &state.remotes,
@@ -357,7 +611,8 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         } else {
             None
         };
-        let ready_instances = current_ready_instances(&state);
+        let ready_instances =
+            commitments.original_ready(current_ready_instances(&state), &mut commitment_waits);
         let current_plan: RequestMultipathPlan =
             match state.sender.multipath.plan_original_claim_from_observation(
                 context,
@@ -461,7 +716,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
     if let Some(selected) = other_selected {
         selected.notify();
     }
-    result
-        .flatten()
-        .unwrap_or(PreparedOriginalClaim::Blocked(wake))
+    result.flatten().unwrap_or_else(|| {
+        PreparedOriginalClaim::Blocked(prepared_wait_with_native_commitment(wake, commitment_waits))
+    })
 }

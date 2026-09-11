@@ -162,12 +162,14 @@ async fn send_stream_observer_targets_concurrency_cancellation_and_native_packet
 
     drop((main_wait, concurrent, middle, other_wait));
     drop((observer, second_observer, other_observer));
-    assert!(connection
-        .0
-        .state
-        .lock("observer_cleanup")
-        .packetization_observers
-        .is_empty());
+    assert!(
+        connection
+            .0
+            .state
+            .lock("observer_cleanup")
+            .packetization_observers
+            .is_empty()
+    );
     endpoint.close(0u32.into(), b"done");
 }
 
@@ -228,12 +230,14 @@ async fn send_stream_observer_reset_terminal_and_unaccepted_end() {
         idle_observer.snapshot(),
         Err(SendStreamObservationError::ConnectionLost(_))
     ));
-    assert!(connection
-        .0
-        .state
-        .lock("terminal_cleanup")
-        .packetization_observers
-        .is_empty());
+    assert!(
+        connection
+            .0
+            .state
+            .lock("terminal_cleanup")
+            .packetization_observers
+            .is_empty()
+    );
     endpoint.close(0u32.into(), b"done");
 }
 
@@ -248,6 +252,66 @@ async fn send_stream_observer_rejects_pre_handshake_scope() {
         early.observe_send_stream(StreamId::new(Side::Client, Dir::Uni, 0)),
         Err(SendStreamObservationError::NotEstablished)
     ));
+    endpoint.close(0u32.into(), b"done");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_stream_observer_idle_stop_only_wakes_exact_send_half() {
+    let (endpoint, connection, peer) = established().await;
+    let (mut sender, mut receiver) = connection.open_bi().await.unwrap();
+    sender.write_all(b"open").await.unwrap();
+    let (mut peer_sender, mut peer_receiver) = peer.accept_bi().await.unwrap();
+    let mut opening = [0; 4];
+    peer_receiver.read_exact(&mut opening).await.unwrap();
+    assert_eq!(&opening, b"open");
+    let observer = connection.observe_send_stream(sender.id()).unwrap();
+    let idle = observer.snapshot().unwrap();
+    assert_eq!(idle.accepted_end, idle.first_unpacketized);
+
+    let (mut sibling, _sibling_receiver) = connection.open_bi().await.unwrap();
+    let sibling_observer = connection.observe_send_stream(sibling.id()).unwrap();
+    assert_eq!(sibling_observer.snapshot().unwrap().accepted_end, 0);
+    let wakes = Arc::new(WakeCount::default());
+    let sibling_wakes = Arc::new(WakeCount::default());
+    let mut wait = Box::pin(observer.wait_until_terminated());
+    let mut sibling_wait = Box::pin(sibling_observer.wait_until_terminated());
+    assert!(poll(wait.as_mut(), &wakes).is_pending());
+    assert!(poll(sibling_wait.as_mut(), &sibling_wakes).is_pending());
+    {
+        let mut cancelled = Box::pin(observer.wait_until_terminated());
+        assert!(poll(cancelled.as_mut(), &wakes).is_pending());
+    }
+    // The pending wait owns its observer and needs neither new bytes nor an
+    // offset arm. Keep the opposite half and entire connection open at STOP.
+    drop(observer);
+    let stop_code = VarInt::from_u32(17);
+    peer_receiver.stop(stop_code).unwrap();
+    // A watchdog bounds a broken wake test; it is not a protocol timing input.
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("idle observer must receive the exact send-half STOP"),
+        SendStreamObservationError::Stopped(stop_code)
+    );
+    assert!(connection.close_reason().is_none());
+    assert!(peer.close_reason().is_none());
+    assert_eq!(sibling_wakes.0.load(Ordering::SeqCst), 0);
+    assert!(poll(sibling_wait.as_mut(), &sibling_wakes).is_pending());
+
+    peer_sender.write_all(b"opposite").await.unwrap();
+    let mut opposite = [0; 8];
+    receiver.read_exact(&mut opposite).await.unwrap();
+    assert_eq!(&opposite, b"opposite");
+    sibling.write_all(b"sibling").await.unwrap();
+    let (_peer_sibling_sender, mut peer_sibling_receiver) = peer.accept_bi().await.unwrap();
+    let mut sibling_payload = [0; 7];
+    peer_sibling_receiver
+        .read_exact(&mut sibling_payload)
+        .await
+        .unwrap();
+    assert_eq!(&sibling_payload, b"sibling");
+    assert!(poll(sibling_wait.as_mut(), &sibling_wakes).is_pending());
+    assert!(connection.close_reason().is_none());
     endpoint.close(0u32.into(), b"done");
 }
 
@@ -343,12 +407,14 @@ async fn send_stream_observer_fatal_socket_error_wakes_retained_waiter() {
             poll(waiter.as_mut(), &wakes),
             Poll::Ready(Err(SendStreamObservationError::ConnectionLost(_)))
         ));
-        assert!(connection
-            .0
-            .state
-            .lock("fatal_cleanup")
-            .packetization_observers
-            .is_empty());
+        assert!(
+            connection
+                .0
+                .state
+                .lock("fatal_cleanup")
+                .packetization_observers
+                .is_empty()
+        );
         endpoint.close(0u32.into(), b"done");
     }
 }

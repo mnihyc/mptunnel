@@ -120,8 +120,9 @@ async fn server_quic_prepared_original_waits_for_unacknowledged_native_bytes() {
     assert!(futures::poll!(&mut crossing).is_pending());
     drop(crossing);
 
-    // Actual normal carrier control remains executable while the fresh source
-    // is blocked. Its owned transaction must flush and release its charges.
+    // The existing one-command control escape remains executable while fresh
+    // source is blocked. Normal batching deliberately yields to coalesce, so it
+    // cannot be used to keep Quinn unpolled for this isolated crossing proof.
     let control = Frame::Ping { nonce: 409 };
     fixture
         .commands_tx
@@ -130,11 +131,21 @@ async fn server_quic_prepared_original_waits_for_unacknowledged_native_bytes() {
     let command = try_recv_reliable_path_priority_command(fixture.commands_rx.as_mut().unwrap())
         .expect("queued control bypasses the parked Original notice");
     assert!(matches!(&command, ReliablePathCommand::SendFrame(frame) if frame == &control));
-    let mut control_write = Box::pin(fixture.drain_normal_command(command));
-    assert!(matches!(
-        futures::poll!(&mut control_write),
-        Poll::Ready(Ok(false))
+    let mut control_proofs = PathProofTracker::default();
+    let mut control_write = Box::pin(drain_one_server_udp_command_while_input_deferred(
+        command,
+        fixture.commands_rx.as_mut().unwrap(),
+        fixture.server_send.as_mut().unwrap(),
+        &fixture.context,
+        stream_id,
+        &fixture._path_registration,
+        &mut control_proofs,
     ));
+    let control_poll = futures::poll!(&mut control_write);
+    assert!(
+        matches!(control_poll, Poll::Ready(Ok(false))),
+        "single-command control producer: {control_poll:?}"
+    );
     drop(control_write);
     assert_eq!(fixture.commands_tx.pending_bytes(), 0);
     assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);

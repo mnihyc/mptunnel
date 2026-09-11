@@ -898,12 +898,6 @@ impl RequestSenderService {
         if ranges.is_empty() {
             return service;
         }
-        // An authoritative missing head can exhaust all new ordered credit
-        // before its Original's loss clock matures. Rescue only that head;
-        // subtracting queued/live-copy coverage must not promote a successor.
-        let ordered_credit_head = (send_stream.next_offset() == send_stream.peer_max_offset())
-            .then(|| send_stream.data_ack_frontier())
-            .filter(|frontier| gaps.first().is_some_and(|gap| gap.start == *frontier));
         let boundaries = self.multipath.recovery_service_boundaries(gaps);
         // Product ownership cannot mutate during this synchronous evaluation.
         // Native eligibility and target service are still observed per action.
@@ -964,12 +958,11 @@ impl RequestSenderService {
                             observed_at,
                         )
                         .unwrap_or(timing.fallback_at);
-                    let clock_due = deadline <= observed_at;
-                    let due = clock_due || ordered_credit_head == Some(scored.start);
+                    let due = deadline <= observed_at;
                     service.has_measured_target |= model.reinjection_target.is_some();
                     service.due_recovery_work |= due;
                     service.target_service_exhausted |= due && model.target_service_exhausted;
-                    if !clock_due {
+                    if !due {
                         service.next_deadline = Some(
                             service
                                 .next_deadline
@@ -990,7 +983,7 @@ impl RequestSenderService {
                         service.ready = true;
                         return service;
                     }
-                    if !clock_due && boundary > cursor && boundary < scored.end {
+                    if !due && boundary > cursor && boundary < scored.end {
                         candidate_end = boundary;
                         continue;
                     }

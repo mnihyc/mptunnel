@@ -1360,6 +1360,95 @@ network result. No semantic edit after GREEN. Next freeze isolated candidate
 checkpoint/patch, sole ordinary four-job build, then the ONE declared comparison.
 There is still no practical promotion or CPU/whole-mixed resolution claim.
 
+Pilot checkpoint8596f30 preserves only request/RFC/tests and this ledger. Exact
+three-file patch is ordered-credit-head-candidate-0911.patch. Sole ordinary
+build97483 is active, four cargo jobs, no diagnostics/lab overlap. On completion,
+freeze bin/ordered-credit-head-20260911/mptunnel; next tag is
+ordered-credit-head-outage-candidate-0911. Existing04f ordinary remains comparator;
+do not use target/release as either comparator or diagnostic by assumption.
+
+08:45+08 ordinary build97483 CLOSED0 in1m20, pre-existing unused-wrapper
+warning only. Frozen patch matches8596f30; executable copied to the declared
+unique path, exact source unchanged. Sole ordinary candidate lab starts with
+the predeclared profile/defaults, management and actual target observations;
+no diagnostics, per-role overrides or compiler overlap. All comparisons wait
+for closed probe data, not live partial rates.
+
+08:46+08 ordinary55898 CLOSED0, driver45.101429s.988413952B/44.573108s=
+177.401Mbps versus04f176.241 (+0.66%);1/1complete,allacceptedconfirmed,noerrors.
+Firstwrite/confirmation .106518/.409409s essentially unchanged. Worstwrite
+1.865375→2.495271s and confirmation1.717023→4.357523s; rawzero bins1→4
+(22,23,24,32). No practical promotion or healthy-gate run. Own target553174768
+is flat at distinct22.922365/23.923365s and rises only29200B by24.922365,
+.1168Mbps over2s. Nearby clientsource is target+64MiB; this alone does NOT
+prove actual assignedA=MAX or that the new urgency predicate fired. Client
+reply1160 is flat21.917365→24.917365 while serverreply1202→1244 over nearby
+stamps, so confirmation also contains reverse holding. Exact maxgap endpoints
+are not saved; no invented full-gap cause. Late36–39raw improves2.447→175.986,
+but restored33–40 drops212.394→162.691Mbps and new late39–41 is slow.
+
+Forecast failed at composition: a reachable urgency opportunity plus153checks
+did not establish material net service gain. Do not tune its quantum/credit,
+extend it to responses, rerun for a favourable average, or mark the timing
+policy fixed. Full independent costs/profile/series are closing. Candidate8596
+is retained ONLY for explanation of this failure, not accepted release code.
+Next read-only question: can the already saved exact-head observer distinguish
+actual urgent eligibility from queued/live-copy suppression, A/F/G mismatch,
+unavailable target and actual insertion on this candidate? Its previous future-
+clock reason must not mislabel the new policy. An affirmative narrow observer
+may locate why the forecast failed; no further runtime policy is selected.
+
+08:49+08 selected information transaction: reuse the existing six-file1Hz
+exact-head/prefix/write observer on8596, with only the new actual urgency and
+ordinary clock_due labels plus same-entry A/MAX scalars. No new observer
+framework or per-frame stream. Existing final enqueue, queued/live-copy masks,
+exact Original/copy records and R/W/target markers retain their earlier limits.
+Future-clock means actual !due, not merely an immature original clock while
+urgency succeeds. Covered/no-model cases keep unknown rather than fabricated
+target observations. Freeze observer patch/binary and reverse ONLY the overlay
+before ONE unchanged200+200QoS/outageUP capture; ordinary55898 stays the adverse
+performance result. No new runtime fix, profile/threshold or response migration.
+
+Information forecast: if critical F never meets actual A=MAX/firstG, distinguish
+source/assignment or feedback state before blaming the urgency rule. If urgency
+enqueues but receiver F still waits, select actual copy coverage/deadline/native
+service rather than increasing urgency or quantum. If it is blocked by exact
+target/ownership, select that refusal; no observation means no causal claim.
+This capture exists to explain the failed forecast, not retry for acceptance.
+No material recurring prefix means stop this pilot's attribution; do not order
+automatic further logging. Practical promotion remains stopped either way.
+
+Conditional model limit to check in that capture: while all ordinary clocks
+remain future and Original delivery is absent, this deliberately head-only
+urgency cannot pipeline the next missing quantum until positive feedback moves
+F. A contiguous missing amount H then needs at least ceil(H/q) such head
+rounds (apart from the final round's return if measuring receiver completion).
+For sustained rounds of duration tau, recovery service is at most about q/tau;
+14.6KiB and100ms gives1.168Mbps. This is conditional, not measured throughput
+or permission to widen repair; an already-arrived suffix or an Original winner
+can remove many bytes at once. Preserve the anti-duplication benefit and this
+possible serialized-recovery cost when interpreting actual gaps and copied F.
+
+08:54+08 USER OVERRIDE: stop further broad exploration and converge on the
+next release. The08:49observer is CANCELED before any source overlay, build or
+lab; author confirms no changes. No further CPU/controller/scheduler proposal
+is selected. Reject8596f30's elective request urgency trial from active source:
+all THREE runtime/test/RFC files reversed with apply_patch and empty diff
+against e2375e9 verified. Ordinary55898 and its exact test/patch checkpoint are
+preserved. Rejection means no demonstrated net service benefit, not proof of
+clock corruption or that the trial caused every adverse interval. Sampled
+wire/useful actually improves1.876008→1.853830 while peak UPbacklog grows
+38.663→75.378MB and nativeflight61.235→95.677MB; do not call every cost worse.
+Only the already-closed evidence appendix/archive is being finished.
+
+Freeze release-candidate runtime at04f1e56 (same runtime as e2375e9), not a new
+assertion that all its composition is accepted. The next plan will contain
+fixed release checks against publishedv0.4.8 and no open-ended optimization
+matrix. Configured GitHub read confirmsv0.4.8 was published2026-09-04T22:26:57Z;
+next release target isv0.4.9. No push/tag/publication now. Persistent incidents
+and known limitations remain visible; only release-critical reproduced failures
+can reopen implementation. User's seven-line file remains untouched.
+
 ## Separate open issue: one-core burst near20%QUIC loss
 
 [Four ordinary500Mbps DOWN controls](QUIC_LOSS_CPU_20260910.md) on d44:

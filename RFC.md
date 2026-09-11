@@ -3331,10 +3331,10 @@ overlapping shared resources. Such inference is outside Core Profile 7.
 
 ### 15.2 Reinjection authority, accounting, and timing
 
-Reliable Product recovery is authorized by exact retained range, a recovery
-cause (clock, exact failure, or ordered-credit head urgency below), eligible
-target, configured-slot publication vacancy, target Product headroom, and final
-queue/native admission. It is not authorized by a cumulative byte percentage.
+Reliable Product recovery is authorized by exact retained range, cause clock,
+eligible target, configured-slot publication vacancy, target Product headroom,
+and final queue/native admission. It is not authorized by a cumulative byte
+percentage.
 
 For QUIC, accepted repair is handed to the attachment's companion ordering
 stream from Section6.2. This removes preceding ordinary stream bytes from its
@@ -3391,9 +3391,8 @@ absolute deadlines, as specified below. The thresholds are:
 
 For a candidate extent, let `loss_at` be the maximum applicable `loss_at_j`
 and `fallback_at` the maximum applicable `fallback_at_j`. If any participating
-span lacks `loss_at_j`, the aggregate `loss_at` is absent and ordinary
-pre-fallback speculation is disabled. Except for ordered-credit head rescue
-below, no earlier than `loss_at` and before `fallback_at`,
+span lacks `loss_at_j`, the aggregate `loss_at` is absent and pre-fallback
+speculation is disabled. No earlier than `loss_at` and before `fallback_at`,
 a sender MAY offer the exact frontier as
 bounded speculative repair on a currently measured, distinct alternate,
 subject to the exact publication, target, queue, flight, native, and
@@ -3412,31 +3411,6 @@ measured remaining residence. Exercising or declining this
 optional opportunity is local policy and grants no additional traffic
 authority. Without a current measured alternate there is no pre-fallback
 target-bound candidate; the independent owner fallback remains retained.
-
-Ordered-credit head rescue is a separate local urgency policy, not a native
-loss declaration. Let `F` be the positive Data-ACK frontier, `G` the retained
-authoritative omissions, `A` the assigned offset and `MAX` the actual peer
-credit. When `A = MAX` and the first interval in `G` starts exactly at `F`, a
-sender MAY offer one existing ranked repair quantum starting at `F` before
-the Original loss/fallback comparison matures. This still requires exact
-retained coverage, a capable Original owner and a currently measured distinct
-target, and preserves every publication, target, queue, flight and native bound.
-Queued or live-copy coverage MUST be subtracted first; a later surviving range
-MUST NOT inherit the head's urgency. Unknown omissions grant no such opportunity.
-Original clocks and their future wake obligations remain unchanged, including
-when the target is unavailable. The current request owner exercises this
-option; the response owner's existing clock policy is unchanged.
-
-This is one action per evaluation, not one attempt per lifetime frontier:
-after an accepted copy's immutable suppression interval expires, existing
-exact range/slot exclusions still govern any further distinct-target attempt.
-Credit exhaustion is a decision-time trigger, not a new revocable resource
-grant. Already queued bounded intent may survive later credit relief; positive
-receipt still prunes it and final admission remains fresh. Delayed feedback
-or healthy window-limited service can therefore cause an unnecessary copy.
-Neither exhausted credit nor an alternate estimate proves that the copy will
-win; implementations must evaluate this urgency policy's duplicate traffic,
-shared contention and latency costs as well as its ordered-service benefit.
 
 At or after `fallback_at`, an eligible measured distinct alternate may perform
 bounded repair without an owner-completion comparison. Crossing `fallback_at`
@@ -3492,10 +3466,7 @@ immutable repair quantum captured for target ranking, and let
 For a retained candidate range `r` and target `t`, define:
 
 - `M(s,r)`: `r` remains retained and missing at the Product layer;
-- `T(s,r)`: cause-specific timing eligibility: the immutable recovery clock
-  is due, exact carrier failure permits immediate recovery, or the ordered-credit
-  head rescue rule authorized this decision (including its retained bounded
-  queued intent). Urgency does not make an immature clock due;
+- `T(s,r)`: the cause-specific immutable recovery clock is due;
 - `E(s,r,t)`: `t` is live, policy-eligible, and distinct from every current
   owner of `r`;
 - `V(s,r,d(t))`: no current attachment publication overlaps `r` in target
@@ -3548,10 +3519,8 @@ immutable assignment time `a_j` and applicable owner recovery interval
 its corresponding absolute per-span deadlines. Therefore post-fallback
 authority begins only after every byte in the ranked prefix has matured.
 
-Outside the ordered-credit head exception, no earlier than `loss_at` and before
-`fallback_at`, a permitted speculative authoritative-gap attempt uses the same
-`A(s,r,t)` and `L(s,r,t)` expressions. The exception uses those expressions too,
-through its separate `T(s,r)` eligibility, without changing any other term.
+No earlier than `loss_at` and before `fallback_at`, a permitted speculative
+authoritative-gap attempt uses the same `A(s,r,t)` and `L(s,r,t)` expressions.
 At or after `fallback_at`, the owner-completion comparison is no longer needed,
 but every other term remains unchanged. While the owner remains live, neither
 side of `fallback_at` permits an accepted suffix beyond `F_t^r`. Exact terminal

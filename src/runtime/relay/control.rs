@@ -224,12 +224,7 @@ pub(in crate::runtime) fn publish_prepared_request_work(
     }
     if changed {
         prepared.work_changed.notify_waiters();
-        // Recovery also needs a notice on a newly attached writer after the
-        // source becomes quiet; the existing registration coalesces notices.
-        if prepared.claims_active
-            && (product.sender_queue.data_bytes() > 0
-                || product.send_stream.reinjection_bytes() > 0)
-        {
+        if prepared.claims_active && product.sender_queue.data_bytes() > 0 {
             for registration in &prepared.registrations {
                 registration.notify();
             }

@@ -62,14 +62,6 @@ impl SendStream {
         self.request_stream_id.into()
     }
 
-    /// Observe this established H3 request's actual native acceptance and packetization.
-    /// The observer includes adapter framing and does not grant write or Product credit.
-    pub fn native_progress_observer(
-        &self,
-    ) -> Result<quinn::SendStreamObserver, quinn::SendStreamObservationError> {
-        self.connection.observe_send_stream(self.request_stream_id)
-    }
-
     /// Apply Product/Core's traffic class to Quinn's native stream scheduler.
     ///
     /// H3 retains the concrete send stream, so the carrier addresses the same

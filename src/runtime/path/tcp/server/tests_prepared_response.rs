@@ -4,9 +4,6 @@
 //! advertised receive credit are real; no rate, flight, or Native capacity is
 //! injected. They prove ordered placement, not a wall-clock speed improvement.
 
-#[path = "tests_prepared_recovery.rs"]
-mod recovery;
-
 use super::*;
 use crate::model::capacity::{
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, reliable_path_startup_sample_limit_bytes,
@@ -43,16 +40,12 @@ struct PreparedResponseFixture {
     _accepted: AcceptedServerReliableStream,
     registry: Arc<ServerReliableStreamRegistry>,
     quantum: usize,
-    lane: TrafficClass,
 }
 
 impl PreparedResponseFixture {
     async fn new() -> Self {
-        Self::new_with_lane(TrafficClass::Throughput).await
-    }
-
-    async fn new_with_lane(lane: TrafficClass) -> Self {
         let limits = MuxLimits::default();
+        let lane = TrafficClass::Throughput;
         let session_id = SessionId(321);
         let stream_id = StreamId(321);
         let quantum = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
@@ -98,7 +91,7 @@ impl PreparedResponseFixture {
         // deterministic preference without a fabricated completion estimate.
         port.record_peer_path_usage(&a.0.path_registration, 1, PathUsage::Backup);
         let mut accepted = match registry
-            .open_or_attach(Self::open_request(&a, stream_id, false, lane))
+            .open_or_attach(Self::open_request(&a, stream_id, false))
             .expect("open response through its actual registered carrier")
         {
             ServerReliableStreamOpen::New(accepted, _) => *accepted,
@@ -151,7 +144,6 @@ impl PreparedResponseFixture {
             _accepted: accepted,
             registry,
             quantum,
-            lane,
         }
     }
 
@@ -159,17 +151,12 @@ impl PreparedResponseFixture {
         carrier: &ProtectedCarrier,
         stream_id: StreamId,
         existing: bool,
-        lane: TrafficClass,
     ) -> ServerStreamOpenRequest {
         ServerStreamOpenRequest {
             session_id: carrier.0.session_id,
             stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            initial_demand: if lane == TrafficClass::Latency {
-                StreamDemandHint::Latency
-            } else {
-                StreamDemandHint::Throughput
-            },
+            initial_demand: StreamDemandHint::Throughput,
             return_plan: if existing {
                 StreamReturnPlan {
                     phase: StreamAttachmentPhase::Ordinary,
@@ -189,8 +176,16 @@ impl PreparedResponseFixture {
 
     fn publish(&self, payload: Bytes) {
         let mut state = self.owner.lock();
-        state.sender.enqueue_data_for_lane(payload, self.lane);
-        publish_prepared_response_work(&mut state, &self.owner, self.lane, self.quantum, true);
+        state
+            .sender
+            .enqueue_data_for_lane(payload, TrafficClass::Throughput);
+        publish_prepared_response_work(
+            &mut state,
+            &self.owner,
+            TrafficClass::Throughput,
+            self.quantum,
+            true,
+        );
     }
 
     fn attach_b(&self) {
@@ -199,18 +194,23 @@ impl PreparedResponseFixture {
                 .open_or_attach(Self::open_request(
                     &self.b,
                     self.path_stream.stream_id,
-                    true,
-                    self.lane,
+                    true
                 ))
                 .expect("attach current Regular B to the same response"),
-            ServerReliableStreamOpen::Existing(lane) if lane == self.lane
+            ServerReliableStreamOpen::Existing(TrafficClass::Throughput)
         ));
         let mut state = self.owner.lock();
-        publish_prepared_response_work(&mut state, &self.owner, self.lane, self.quantum, true);
+        publish_prepared_response_work(
+            &mut state,
+            &self.owner,
+            TrafficClass::Throughput,
+            self.quantum,
+            true,
+        );
         let b = self
             .owner
             .binding()
-            .sender_path_targets(self.lane, self.quantum)
+            .sender_path_targets(TrafficClass::Throughput, self.quantum)
             .into_iter()
             .find(|target| target.observation.key.path_id == PathId(1))
             .unwrap();
@@ -225,7 +225,7 @@ impl PreparedResponseFixture {
     fn original_bytes(&self, path_id: PathId) -> u64 {
         self.owner
             .binding()
-            .sender_path_targets(self.lane, self.quantum)
+            .sender_path_targets(TrafficClass::Throughput, self.quantum)
             .into_iter()
             .find(|target| {
                 target.observation.key
@@ -234,9 +234,9 @@ impl PreparedResponseFixture {
                         path_id,
                     }
             })
-            // B's protected carrier exists before its Product attachment. No
-            // Original can be assigned to that not-yet-attached fixture output.
-            .map_or(0, |target| target.observation.original_data_in_flight_bytes)
+            .unwrap()
+            .observation
+            .original_data_in_flight_bytes
     }
 
     fn assert_source(&self, accepted: usize, claimed: usize, acked: usize) {
@@ -298,7 +298,13 @@ impl PreparedResponseFixture {
                 ..
             } = &mut *state;
             update_reinjection_authoritative_ack_snapshot(last_send_ack, &ack, send_stream);
-            publish_prepared_response_work(&mut state, &self.owner, self.lane, self.quantum, true);
+            publish_prepared_response_work(
+                &mut state,
+                &self.owner,
+                TrafficClass::Throughput,
+                self.quantum,
+                true,
+            );
         }
     }
 }

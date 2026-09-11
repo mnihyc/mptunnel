@@ -1,13 +1,9 @@
 //! Payload-free wake ownership for either direction's shared prepared source.
 
 use super::commands::ReliablePathCommandSender;
-use super::native_commitment::{
-    NativeCommitmentError, NativeCommitmentView, NativeOperationCommitment,
-};
 use super::writer_boundary::ReliableWriterReadyGuard;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
 use crate::protocol::{Frame, StreamId};
-use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::sender::{
     WeakSharedRequestProduct, WeakSharedResponseProduct, claim_prepared_request_data,
@@ -29,131 +25,8 @@ const NOTIFIED_AGAIN: u8 = 2;
 pub(in crate::runtime) type PreparedOriginalWait =
     Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-/// Native reads happen before final Product ownership. The exact FIFO's captured
-/// acceptance/packetization boundary then qualifies new Original opportunity.
-pub(in crate::runtime) struct PreparedNativeCommitmentInputs<K> {
-    entries: Vec<(K, Result<NativeCommitmentView, NativeCommitmentError>)>,
-}
-
-impl<K: Copy + Eq> PreparedNativeCommitmentInputs<K> {
-    pub(in crate::runtime) fn capture(
-        handles: impl IntoIterator<Item = (K, Option<NativeOperationCommitment>)>,
-    ) -> Self {
-        Self {
-            entries: handles
-                .into_iter()
-                .filter_map(|(key, handle)| handle.map(|handle| (key, handle.capture())))
-                .collect(),
-        }
-    }
-
-    /// Surface only the invoking FIFO's failure through its physical writer.
-    /// This uses only the captured Native result; it never queries Native while
-    /// the final Product owner is held.
-    pub(in crate::runtime) fn check_selected(
-        &self,
-        identity: K,
-    ) -> Result<(), NativeCommitmentError> {
-        let Some((_, captured)) = self
-            .entries
-            .iter()
-            .find(|(current, _)| *current == identity)
-        else {
-            return Ok(());
-        };
-        captured.as_ref().map(|_| ()).map_err(Clone::clone)
-    }
-
-    /// Subscribe to the invoking send half even when no operation is blocked.
-    /// Future construction performs no Native read; the writer polls it after
-    /// releasing Product ownership. Unsupported FIFOs supply no fabricated wake.
-    pub(in crate::runtime) fn selected_terminal_wait(
-        &self,
-        identity: K,
-    ) -> Option<PreparedOriginalWait> {
-        let (_, captured) = self
-            .entries
-            .iter()
-            .find(|(current, _)| *current == identity)?;
-        Some(match captured {
-            Ok(view) => {
-                let terminal = view.wait_until_terminated();
-                Box::pin(async move {
-                    let _ = terminal.await;
-                })
-            }
-            Err(_) => Box::pin(std::future::ready(())),
-        })
-    }
-
-    pub(in crate::runtime) fn original_ready(
-        &self,
-        ready: Vec<K>,
-        waits: &mut Vec<PreparedOriginalWait>,
-    ) -> Vec<K> {
-        ready
-            .into_iter()
-            .filter(|key| {
-                let Some((_, captured)) = self.entries.iter().find(|(current, _)| current == key)
-                else {
-                    // No exact capability was supplied. This is not an empty-FIFO
-                    // receipt; all the existing Product/native authorities remain.
-                    return true;
-                };
-                let Ok(view) = captured else {
-                    // The invoking writer surfaces its own failure through
-                    // check_selected. Other FIFOs remain excluded here until
-                    // their own notice or lifecycle retires them.
-                    return false;
-                };
-                match view.barrier() {
-                    None => true,
-                    Some(barrier) => {
-                        waits.push(Box::pin(async move {
-                            let _ = barrier.wait_until_packetized().await;
-                        }));
-                        false
-                    }
-                }
-            })
-            .collect()
-    }
-}
-
-pub(in crate::runtime) fn prepared_wait_with_native_commitment(
-    ordinary: PreparedOriginalWait,
-    mut native: Vec<PreparedOriginalWait>,
-) -> PreparedOriginalWait {
-    if native.is_empty() {
-        return ordinary;
-    }
-    native.push(ordinary);
-    Box::pin(async move {
-        let _ = futures::future::select_all(native).await;
-    })
-}
-
-pub(in crate::runtime) fn prepared_wait_with_recovery_deadline(
-    ordinary: PreparedOriginalWait,
-    deadline: Option<std::time::Instant>,
-) -> PreparedOriginalWait {
-    let Some(deadline) = deadline else {
-        return ordinary;
-    };
-    Box::pin(async move {
-        tokio::select! {
-            () = ordinary => {}
-            () = tokio::time::sleep_until(deadline.into()) => {}
-        }
-    })
-}
-
 pub(in crate::runtime) enum PreparedOriginalClaim {
     Claimed(Frame),
-    /// Failure belongs to the invoking FIFO, not the shared Product source.
-    CarrierFailed(RuntimeError),
-    /// One exact repair queue/copy Apply committed; no Original was claimed.
-    RecoveryQueued,
     Busy(Pin<Box<tokio::sync::futures::OwnedNotified>>),
     Blocked(PreparedOriginalWait),
     Empty,
@@ -436,22 +309,5 @@ impl Drop for PreparedOriginalWork {
                 registration.notify();
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod deadline_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn recovery_deadline_crossed_during_handoff_still_wakes() {
-        // The query returned a future assignment deadline; task descheduling
-        // consumed that interval before its wait was constructed.
-        let deadline = std::time::Instant::now();
-        let wait =
-            prepared_wait_with_recovery_deadline(Box::pin(std::future::pending()), Some(deadline));
-        tokio::time::timeout(std::time::Duration::from_secs(1), wait)
-            .await
-            .expect("crossed immutable deadline must retry without unrelated input");
     }
 }

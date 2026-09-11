@@ -15,7 +15,6 @@ pub(super) mod commands;
 mod health;
 pub(in crate::runtime) mod input;
 pub(super) mod model;
-pub(in crate::runtime) mod native_commitment;
 mod ports;
 pub(in crate::runtime) mod prepared;
 pub(super) mod proof;

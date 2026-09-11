@@ -102,8 +102,6 @@ pub(in crate::runtime) enum RelaySendCause {
     PersistentClientAckGapReinjection(PersistentClientAckGapBatch),
     PersistentServerAckGapReinjection(ServerBoundReinjectionBatch),
     TailReinjection,
-    // Completion authority is either the retained owner fallback or the
-    // prepared candidate's explicitly bounded once-per-byte Latency opportunity.
     CompletionTailReinjection(ClientReinjectionOutputIdentity),
     ResponseCompletionTailReinjection(ServerBoundReinjectionBatch),
     PathFailureReinjection,

@@ -240,38 +240,6 @@ impl RequestFlightLedger {
             .collect()
     }
 
-    /// The first retained prefix with no previously accepted copy. Expiry and
-    /// attachment retirement do not renew this per-byte completion opportunity;
-    /// only positive ACK release removes the corresponding flight records.
-    /// A spent first byte must not make the caller skip to a younger obligation.
-    pub(in crate::runtime) fn raw_uncopied_prefix(
-        &self,
-        range: OffsetRange,
-    ) -> Option<OffsetRange> {
-        if range.is_empty() {
-            return None;
-        }
-        let mut end = range.end;
-        for (start, flights) in self.flights.range(..range.end) {
-            if *start >= end {
-                break;
-            }
-            for flight in flights {
-                if flight.kind != CarrierWorkKind::ReinjectedData || flight.end <= range.start {
-                    continue;
-                }
-                if *start <= range.start {
-                    return None;
-                }
-                end = end.min(*start);
-            }
-        }
-        Some(OffsetRange {
-            start: range.start,
-            end,
-        })
-    }
-
     /// Exact accepted-copy service coverage at one caller-supplied observation.
     /// Expiry removes suppression, not the accepted target's flight ownership.
     pub(in crate::runtime) fn live_copy_coverage(

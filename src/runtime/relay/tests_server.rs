@@ -1247,6 +1247,12 @@ async fn exact_requalification_capacity_release_wakes_an_open_idle_source() {
                     PreparedOriginalClaim::Blocked(wait) => {
                         tcp_receivers.defer_prepared_work(work, wait);
                     }
+                    PreparedOriginalClaim::CarrierFailed(error) => {
+                        panic!("unexpected fixture carrier failure: {error}")
+                    }
+                    PreparedOriginalClaim::RecoveryQueued => {
+                        panic!("fixture has no independently due alternate recovery");
+                    }
                     PreparedOriginalClaim::Empty => {}
                 }
                 continue;

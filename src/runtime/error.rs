@@ -20,6 +20,10 @@ pub enum RuntimeError {
     Udp(UdpTransportError),
     Encrypted(EncryptedFramedTransportError),
     QuicCarrier(QuicCarrierError),
+    /// Transport failure from the repair companion of an accepted attachment.
+    /// Its request-local failures permit attachment migration; the underlying
+    /// source still determines whether the physical connection also failed.
+    QuicRepairAttachment(QuicCarrierError),
     Auth(AuthError),
     Random(getrandom::Error),
     Socks5(Socks5Error),
@@ -74,6 +78,7 @@ pub(in crate::runtime) fn reliable_path_error_is_migratable(err: &RuntimeError) 
     matches!(
         err,
         RuntimeError::PathHeartbeatTimeout
+            | RuntimeError::QuicRepairAttachment(_)
             | RuntimeError::PathOpenTimedOut
             | RuntimeError::ReliablePathSessionClosed
             | RuntimeError::ReliablePathRetired
@@ -176,6 +181,7 @@ impl std::fmt::Display for RuntimeError {
             Self::Udp(err) => write!(f, "{err}"),
             Self::Encrypted(err) => write!(f, "{err}"),
             Self::QuicCarrier(err) => write!(f, "{err}"),
+            Self::QuicRepairAttachment(err) => write!(f, "QUIC repair attachment: {err}"),
             Self::Auth(err) => write!(f, "{err}"),
             Self::Random(err) => write!(f, "random source failed: {err}"),
             Self::Socks5(err) => write!(f, "{err}"),
@@ -275,6 +281,7 @@ impl std::error::Error for RuntimeError {
             Self::Udp(err) => Some(err),
             Self::Encrypted(err) => Some(err),
             Self::QuicCarrier(err) => Some(err),
+            Self::QuicRepairAttachment(err) => Some(err),
             Self::Auth(err) => Some(err),
             Self::Random(_) => None,
             Self::Socks5(err) => Some(err),

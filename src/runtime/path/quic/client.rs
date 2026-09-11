@@ -79,12 +79,23 @@ pub(in crate::runtime) fn client_udp_error_disposition(
 ) -> ClientUdpErrorDisposition {
     match source {
         RuntimeError::RemoteClosed(_) => ClientUdpErrorDisposition::Session,
-        RuntimeError::QuicCarrier(error)
+        RuntimeError::QuicCarrier(error) | RuntimeError::QuicRepairAttachment(error)
             if quic_product_error_has_carrier_lifetime_authority(error) =>
         {
             ClientUdpErrorDisposition::CarrierLifetime
         }
         _ => ClientUdpErrorDisposition::Operation,
+    }
+}
+
+/// Ordinary acceptance is complete before this boundary is used. A rejected
+/// companion response retires that attachment, while its original transport
+/// source retains any physical-connection authority. Explicit Product/session
+/// errors are not reclassified.
+fn client_repair_attachment_error(source: RuntimeError) -> RuntimeError {
+    match source {
+        RuntimeError::QuicCarrier(error) => RuntimeError::QuicRepairAttachment(error),
+        error => error,
     }
 }
 
@@ -1720,7 +1731,7 @@ async fn open_client_udp_stream_on_connection(
             biased;
             result = repair => {
                 if let Err(error) = result {
-                    let _ = frames_tx.send(Err(error)).await;
+                    let _ = frames_tx.send(Err(client_repair_attachment_error(error))).await;
                 }
             }
             () = ordinary => {}

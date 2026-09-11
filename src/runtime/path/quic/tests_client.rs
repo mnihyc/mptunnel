@@ -1610,6 +1610,58 @@ async fn datagram_accepted_n_commit_first_remains_n_until_subsequent_take() {
 }
 
 #[test]
+fn accepted_companion_failure_preserves_request_and_connection_authority() {
+    use crate::runtime::error::reliable_path_error_is_migratable;
+
+    let refused =
+        || RuntimeError::QuicCarrier(QuicCarrierError::H3Status(http::StatusCode::NOT_FOUND));
+    assert!(
+        !reliable_path_error_is_migratable(&refused()),
+        "ordinary HTTP refusal must retain its existing terminal semantics"
+    );
+    for source in [
+        refused(),
+        RuntimeError::QuicCarrier(QuicCarrierError::FrameTooLarge),
+    ] {
+        let original_message = source.to_string();
+        let scoped = client_repair_attachment_error(source);
+        assert!(reliable_path_error_is_migratable(&scoped));
+        assert_eq!(
+            client_udp_error_disposition(&scoped),
+            ClientUdpErrorDisposition::Operation
+        );
+        assert_eq!(
+            std::error::Error::source(&scoped)
+                .expect("preserved transport source")
+                .to_string(),
+            original_message
+        );
+    }
+
+    let physical =
+        client_repair_attachment_error(RuntimeError::QuicCarrier(QuicCarrierError::Read(
+            quinn::ReadError::ConnectionLost(quinn::ConnectionError::LocallyClosed),
+        )));
+    assert!(reliable_path_error_is_migratable(&physical));
+    assert_eq!(
+        client_udp_error_disposition(&physical),
+        ClientUdpErrorDisposition::CarrierLifetime
+    );
+    let session =
+        client_repair_attachment_error(RuntimeError::RemoteClosed(CloseReason::PolicyRejected));
+    assert!(!reliable_path_error_is_migratable(&session));
+    assert_eq!(
+        client_udp_error_disposition(&session),
+        ClientUdpErrorDisposition::Session
+    );
+    let reset = client_repair_attachment_error(RuntimeError::RemoteReset(
+        crate::protocol::ResetReason::PolicyRejected,
+    ));
+    assert!(!reliable_path_error_is_migratable(&reset));
+    assert!(matches!(reset, RuntimeError::RemoteReset(_)));
+}
+
+#[test]
 fn product_error_disposition_separates_session_carrier_and_operation_authority() {
     assert_eq!(
         client_udp_error_disposition(&RuntimeError::RemoteClosed(CloseReason::Normal)),

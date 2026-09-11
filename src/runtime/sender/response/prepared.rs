@@ -8,9 +8,7 @@ use crate::mux::stream::{ReliableSendStream, StreamError};
 use crate::protocol::{Frame, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::prepared::{
-    PreparedNativeCommitmentInputs, PreparedOriginalClaim, PreparedOriginalRegistration,
-    PreparedOriginalWait, prepared_wait_with_native_commitment,
-    prepared_wait_with_recovery_deadline,
+    PreparedOriginalClaim, PreparedOriginalRegistration, PreparedOriginalWait,
 };
 use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
 use crate::runtime::relay::io::AuthoritativeStreamAckSnapshot;
@@ -272,6 +270,12 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     else {
         return PreparedOriginalClaim::Empty;
     };
+    if state.sender.data_bytes() == 0 {
+        return PreparedOriginalClaim::Empty;
+    }
+    let Some(source) = source_prefix(&state) else {
+        return PreparedOriginalClaim::Blocked(wake);
+    };
     let lane = state.prepared.response_lane;
     let quantum = state.prepared.data_quantum_bytes;
     let credit = owner
@@ -279,31 +283,19 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         .mux_limits()
         .max_repair_bytes
         .saturating_sub(state.send_stream.reinjection_bytes());
-    let source = source_prefix(&state).and_then(|source| {
-        owner
-            .binding()
-            .response_startup_fresh_data_limit(
-                state.send_stream.next_offset(),
-                source.len().min(quantum).min(credit),
-            )
-            .filter(|bytes| *bytes > 0)
-            .map(|proposed| source.slice(..proposed))
-    });
+    let Some(proposed) = owner
+        .binding()
+        .response_startup_fresh_data_limit(
+            state.send_stream.next_offset(),
+            source.len().min(quantum).min(credit),
+        )
+        .filter(|bytes| *bytes > 0)
+    else {
+        return PreparedOriginalClaim::Blocked(wake);
+    };
+    let source = source.slice(..proposed);
     let offset = state.send_stream.next_offset();
     drop(state);
-    let commitments = PreparedNativeCommitmentInputs::capture(
-        outputs
-            .iter()
-            .map(|output| (output.identity, output.commands.native_commitment())),
-    );
-    let wake = prepared_wait_with_native_commitment(
-        wake,
-        commitments
-            .selected_terminal_wait(identity)
-            .into_iter()
-            .collect(),
-    );
-    let mut commitment_waits = Vec::new();
     let mut inputs = ResponsePreparedNativeInputs::resolve(outputs.clone());
     let mut state = match owner.arm_claim().try_lock() {
         Ok(state) => state,
@@ -312,13 +304,14 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     if !current(&state, identity, registration) {
         return PreparedOriginalClaim::Empty;
     }
-    if state.prepared.data_quantum_bytes != quantum || !ready.receipt().is_current() {
+    if state.prepared.data_quantum_bytes != quantum
+        || state.send_stream.next_offset() != offset
+        || !source_prefix(&state).is_some_and(|current| {
+            current.as_ptr() == source.as_ptr() && current.len() >= source.len()
+        })
+        || !ready.receipt().is_current()
+    {
         return PreparedOriginalClaim::Blocked(wake);
-    }
-    if let Err(error) = commitments.check_selected(identity) {
-        return PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(std::io::Error::other(
-            error,
-        )));
     }
     let Some(observation) = owner
         .binding()
@@ -326,150 +319,6 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     else {
         return PreparedOriginalClaim::Blocked(wake);
     };
-    let recovery = state.sender.next_prepared_recovery(
-        owner.binding(),
-        &state.send_stream,
-        &state.last_send_ack,
-        lane,
-        &observation.targets,
-        &ready_outputs(&outputs),
-        Instant::now(),
-    );
-    let wake = prepared_wait_with_recovery_deadline(wake, recovery.next_deadline);
-    if let Some(candidate) = recovery.candidate {
-        let selected = ResponseAcquisitionOutputId {
-            key: candidate.target.key,
-            path_instance_id: candidate.target.path_instance_id,
-            incarnation: candidate.target.incarnation,
-        };
-        if selected != identity {
-            let selected = state
-                .prepared
-                .registrations
-                .iter()
-                .find(|registration| registration.response_instance() == Some(selected))
-                .cloned();
-            drop(state);
-            if let Some(selected) = selected {
-                selected.notify();
-            }
-            return PreparedOriginalClaim::Blocked(wake);
-        }
-        drop(state);
-        let attempt = owner.arm_claim();
-        let mut other_selected = None;
-        let commit = |shape| {
-            let mut state = match attempt.try_lock() {
-                Ok(state) => state,
-                Err(wait) => return Some(PreparedOriginalClaim::Busy(wait)),
-            };
-            if !current(&state, identity, registration) {
-                return Some(PreparedOriginalClaim::Empty);
-            }
-            if !ready.receipt().is_current() {
-                return None;
-            }
-            if let Err(error) = commitments.check_selected(identity) {
-                return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(
-                    std::io::Error::other(error),
-                )));
-            }
-            if let Some(shape) = shape {
-                inputs.replace_fenced_target(identity, shape);
-            }
-            let observation = owner.binding().observe_prepared_original(
-                &inputs,
-                lane,
-                state.send_stream.next_offset(),
-            )?;
-            let current = state
-                .sender
-                .next_prepared_recovery(
-                    owner.binding(),
-                    &state.send_stream,
-                    &state.last_send_ack,
-                    lane,
-                    &observation.targets,
-                    &ready_outputs(&outputs),
-                    Instant::now(),
-                )
-                .candidate?;
-            if current.target != candidate.target {
-                let selected = ResponseAcquisitionOutputId {
-                    key: current.target.key,
-                    path_instance_id: current.target.path_instance_id,
-                    incarnation: current.target.incarnation,
-                };
-                other_selected = state
-                    .prepared
-                    .registrations
-                    .iter()
-                    .find(|registration| registration.response_instance() == Some(selected))
-                    .cloned();
-                return None;
-            }
-            // The fresh query re-proves authority. Its newly constructed
-            // batch validity deadline is not the identity of that authority;
-            // compare cause kind while retaining exact target/range checks.
-            if current.frame != candidate.frame
-                || std::mem::discriminant(&current.cause)
-                    != std::mem::discriminant(&candidate.cause)
-            {
-                return None;
-            }
-            let ResponseProductState {
-                sender,
-                send_stream,
-                ..
-            } = &mut *state;
-            match sender.commit_prepared_recovery(
-                owner.binding(),
-                send_stream,
-                &current,
-                ready,
-                shape,
-            ) {
-                Ok(_) => {
-                    state.prepared.work_changed.notify_waiters();
-                    Some(PreparedOriginalClaim::RecoveryQueued)
-                }
-                Err(RuntimeError::SenderServiceBlocked) => None,
-                Err(error) => {
-                    source_error(&mut state, error);
-                    Some(PreparedOriginalClaim::Empty)
-                }
-            }
-        };
-        let result = match (
-            output.commands.native_rate_authority(),
-            candidate.target.native_authority_stamp,
-        ) {
-            (Some(authority), Some(stamp)) => authority
-                .commit_with_current_scheduling_shape(stamp, |shape| commit(Some(shape)))
-                .ok()
-                .flatten(),
-            (None, None) if identity.key.underlay == UnderlayProtocol::Tcp => commit(None),
-            _ => None,
-        };
-        if let Some(selected) = other_selected {
-            selected.notify();
-        }
-        return result.unwrap_or(PreparedOriginalClaim::Blocked(wake));
-    }
-    let Some(source) = source else {
-        return if state.sender.data_bytes() == 0 && state.send_stream.reinjection_bytes() == 0 {
-            PreparedOriginalClaim::Empty
-        } else {
-            PreparedOriginalClaim::Blocked(wake)
-        };
-    };
-    if state.send_stream.next_offset() != offset
-        || !source_prefix(&state).is_some_and(|current| {
-            current.as_ptr() == source.as_ptr() && current.len() >= source.len()
-        })
-    {
-        return PreparedOriginalClaim::Blocked(wake);
-    }
     let Some(selection) = select_prepared_response_data_path(
         &observation.targets,
         lane,
@@ -478,12 +327,9 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         &observation.lower_flights,
         state.send_stream.reinjection_bytes(),
         frontier(&state),
-        &commitments.original_ready(ready_outputs(&outputs), &mut commitment_waits),
+        &ready_outputs(&outputs),
     ) else {
-        return PreparedOriginalClaim::Blocked(prepared_wait_with_native_commitment(
-            wake,
-            commitment_waits,
-        ));
+        return PreparedOriginalClaim::Blocked(wake);
     };
     let selected_identity = ResponseAcquisitionOutputId::from(&selection.target);
     if selected_identity != identity {
@@ -497,10 +343,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         if let Some(selected) = selected {
             selected.notify();
         }
-        return PreparedOriginalClaim::Blocked(prepared_wait_with_native_commitment(
-            wake,
-            commitment_waits,
-        ));
+        return PreparedOriginalClaim::Blocked(wake);
     }
     let frame = match state
         .send_stream
@@ -547,64 +390,12 @@ pub(in crate::runtime) fn claim_prepared_response_data(
                 return None;
             }
         }
-        if let Err(error) = commitments.check_selected(identity) {
-            return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(
-                std::io::Error::other(error),
-            )));
-        }
         if let Some(shape) = shape {
             inputs.replace_fenced_target(identity, shape);
         }
         let observation = owner
             .binding()
             .observe_prepared_original(&inputs, lane, offset)?;
-        let recovery = state.sender.next_prepared_recovery(
-            owner.binding(),
-            &state.send_stream,
-            &state.last_send_ack,
-            lane,
-            &observation.targets,
-            &ready_outputs(&outputs),
-            Instant::now(),
-        );
-        if let Some(candidate) = recovery.candidate {
-            let selected = ResponseAcquisitionOutputId {
-                key: candidate.target.key,
-                path_instance_id: candidate.target.path_instance_id,
-                incarnation: candidate.target.incarnation,
-            };
-            if selected != identity {
-                selected_elsewhere = state
-                    .prepared
-                    .registrations
-                    .iter()
-                    .find(|registration| registration.response_instance() == Some(selected))
-                    .cloned();
-                return None;
-            }
-            let ResponseProductState {
-                sender,
-                send_stream,
-                ..
-            } = &mut *state;
-            return match sender.commit_prepared_recovery(
-                owner.binding(),
-                send_stream,
-                &candidate,
-                ready,
-                shape,
-            ) {
-                Ok(_) => {
-                    state.prepared.work_changed.notify_waiters();
-                    Some(PreparedOriginalClaim::RecoveryQueued)
-                }
-                Err(RuntimeError::SenderServiceBlocked) => None,
-                Err(error) => {
-                    source_error(&mut state, error);
-                    Some(PreparedOriginalClaim::Empty)
-                }
-            };
-        }
         let current_plan = select_prepared_response_data_path(
             &observation.targets,
             lane,
@@ -613,7 +404,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
             &observation.lower_flights,
             state.send_stream.reinjection_bytes(),
             frontier(&state),
-            &commitments.original_ready(ready_outputs(&outputs), &mut commitment_waits),
+            &ready_outputs(&outputs),
         )?;
         let selected = ResponseAcquisitionOutputId::from(&current_plan.target);
         if selected != identity {
@@ -689,9 +480,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     if let Some(selected) = selected_elsewhere {
         selected.notify();
     }
-    result.unwrap_or_else(|| {
-        PreparedOriginalClaim::Blocked(prepared_wait_with_native_commitment(wake, commitment_waits))
-    })
+    result.unwrap_or(PreparedOriginalClaim::Blocked(wake))
 }
 
 #[cfg(test)]

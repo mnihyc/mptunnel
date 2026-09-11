@@ -238,10 +238,6 @@ fn lab_server_repair_carrier_accept(
     let Some((offset, end, payload_bytes)) = reliable_stream_frame_extent(frame) else {
         return;
     };
-    // Observation-only cohort; never changes carrier admission or accounting.
-    if !(1..=64).contains(&payload_bytes) {
-        return;
-    }
     let (owner_underlay, owner_path_id, owner_incarnation) = match cause {
         RelaySendCause::StaleResponsePathReinjection(owner) => (
             format!("{:?}", owner.key.underlay),

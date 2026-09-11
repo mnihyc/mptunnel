@@ -135,31 +135,9 @@ pub(super) async fn drain_client_udp_stream_commands(
                             // after the first actual claim and before flush.
                             work.requeue();
                         }
-                        PreparedOriginalClaim::RecoveryQueued => {
-                            work.requeue();
-                            // A repair publication is one finite acquisition
-                            // turn. Preserve every earlier owned Original and
-                            // deferred input before returning to arbitration.
-                            flush_client_udp_frame_batch(
-                                send,
-                                pending_frames,
-                                codec_limits,
-                                path_proofs,
-                                commands,
-                                &mut pending_frame_command_bytes,
-                                stream_id,
-                                carrier_frames,
-                                stream_frames,
-                                deferred_input,
-                                carrier_input_open,
-                            )
-                            .await?;
-                            return Ok(false);
-                        }
                         PreparedOriginalClaim::Busy(wait) => {
                             commands.defer_prepared_work(work, wait);
                         }
-                        PreparedOriginalClaim::CarrierFailed(error) => return Err(error),
                         PreparedOriginalClaim::Blocked(wait) => {
                             commands.defer_prepared_work(work, wait);
                         }

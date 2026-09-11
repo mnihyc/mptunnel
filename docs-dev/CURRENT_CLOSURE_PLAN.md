@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 08:26 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 08:39 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -18,8 +18,9 @@ Continue the authorized closure loop; an intermediary commit is not completion.
   UNACCEPTED.77827 proves assigned receiver HOL. New19038 identifies a3.980s
   TCP46-owned head stall with an actual measured Q47 alternate withheld by the
   retained future loss clock. Clocks do NOT renew; this is local timing policy,
-  not a native requirement or proven CPU bug. Next bounded pre-code credit-rescue
-  contract review below; no blanket hedge/controller/threshold change.
+  not a native requirement or proven CPU bug. Real producer RED52235 now proves
+  that withholding. Tiny request-only ordered-credit head pilot is under test/
+  independent review below; no blanket hedge/controller/threshold change.
 - The finite client Input correction materially improves upload, including
   QoS+QUIC outage: exact-confirmed56.280→186.629Mbps; settlement79.379→43.147s.
   However,6.382s confirmation gap remains. Trace THIS return prefix now.
@@ -50,6 +51,9 @@ Ordinary comparator runtime is **011b724**, finite ordered ACK/MAX Input
 service, with binary ./.tmp/reflection/bin/ordered-feedback-20260911/mptunnel.
 Current trial04f1e56 adds only the two-file clipped repair-range
 correction described below, plus its focused tests and RFC clarification.
+The working tree additionally contains the unaccepted request-only credit-head
+pilot below (request.rs predicate, RFC, producer/opposite tests). No ordinary
+candidate executable exists for that pilot yet; no performance claim follows.
 Rejected **f8b8cac** remains a tracking checkpoint; its frozen ordinary binary
 ./.tmp/reflection/bin/logical-feedback-20260911/mptunnel is NOT active design.
 Ordinary04f1e56 is frozen under ./.tmp/reflection/bin/clipped-range-20260911/mptunnel.
@@ -1261,6 +1265,101 @@ or cost shared service. No guaranteed .122s latency or whole-run Mbps gain is
 inferred from ETA. Existing clocks, exact exclusion/D, admission and all global
 gates must remain; no coefficient/queue/window change or blanket copy ban.
 
+### Selected ordered-credit head rescue pilot,08:27+08
+
+Issue: the measured known receiver head can hold all assigned credit while a
+distinct measured alternate exists and only the live Original's local loss
+classification floor prevents trying it. This is not renewed-clock corruption.
+Independent history/model critique confirms the floor is local anti-duplication
+policy. Root read all145lines19038 and checked11-file archive integrity/manifest;
+independent input-byte checks pass. Evidence checkpoint e2375e9 preserves it.
+
+Small model change proposed for the REQUEST owner only: when F is exactly the
+first authoritative gap start and assigned A equals actual peerMAX, treat that
+head as urgent ordered-credit repair. Only its exact ranked quantum M may bypass
+the Original maturity comparison. Never apply the exception to later enumerated
+gaps, absent/unknown Original ownership, missing target/model evidence, a live
+copy/queued overlap, exhausted actual service, or stale membership/Apply. Keep
+all Original loss/fallback fields unchanged; urgency is not native packet loss,
+a new timer, a fabricated deadline, or fallback/aggregate-owner ETA as proof.
+
+"One" means one existing-quantum action per invocation, not one per lifetime F.
+After an accepted copy's immutable D expires, a still-distinct attached slot
+may receive another attempt through the existing exclusions/capacity model.
+Credit exhaustion is a decision-time urgency trigger. Existing bounded queued
+intent may survive later MAX relief; covering positive ACKs still prune it and
+fresh exact target/native Apply is unchanged. This deliberately accepts that
+after-relief duplicate risk rather than creating a new per-head attempt epoch,
+queued-cause framework or cross-layer MAX cancellation contract. Debt bounds
+do not prove a low cumulative duplicate fraction. No shared timing helper may
+silently extend the pilot to responses, where behavior remains unchanged.
+
+Forecast: earliest actual credit-exhausted witness23.17s bounds this policy's
+observed opportunity to at most the remaining~1.98s, not the full3.98s gap.
+Advisory targetETA gives a conditional~.75–1s head-service opportunity, not an
+arrival guarantee;14.6KiB quantum covers only part of the64KiB group. No gain or
+regression remains plausible. Healthy small-window/high-BDP and asymmetric
+feedback can also exhaust credit with old gap knowledge; window size is NOT
+changed to manufacture urgency, and default64MiB rarity is not a safety proof.
+Shared contention/earlier-copy wire/CPU/native queue/latency costs are explicit.
+Value: material seconds-long credit stall, not a micro-optimization or pursuit
+of an average. Narrow cause scope excludes unsaturated normal reordering.
+
+First test-only reachable RED via actual Original claims, receiver-produced gap
+and actual peer credit exhaustion, with true measured target and future retained
+clock asserted before the intended failed service/enqueue assertion. Existing
+typed priors may establish the declared test topology; no fake aged ledger or
+runtime parameter change. Opposite controls retain credit-available waiting,
+non-head waiting, live-copy/queued exclusion and exact clock immutability.
+The minimal UNIT fixture uses one legal receiver-produced64KiB MAX advertisement
+and actual sender credit update, not a reduced Product resource configuration.
+This avoids1024claims merely to reach default64MiB; ordinary labs keep defaults.
+Reassert the retained loss deadline is future after evaluation so a host pause
+cannot make ordinary matured recovery falsely satisfy the intended RED.
+Root alone runs tests/builds/labs. Only after causal RED implement the small
+request decision predicate/RFC exception, independent review, focused GREEN.
+
+Then ONE ordinary same200+200QoS/outageUP pilot against preserved04f95178:
+complete source/target/confirmation series, first service, all stalls/settlement
+and wire/CPU/RSS. No observer numbers as comparator or favourable repeat. Material
+timing improvement without adverse composition selects healthy/shared controls;
+no benefit/adverse cost stops promotion and triggers exact attribution/rejection.
+This pilot cannot claim all mixed latency, CPU bursts, or response-side stalls
+resolved. Unchanged global baseline/browser/both-direction gates remain required.
+
+08:35+08 first test compile8616 CLOSED101: fixture used sender-private
+front_reinjection from the relay test module. This is a test visibility error,
+not Product RED. Preserve ordered-credit-head-red-0911.patch/log. Correct only
+the test's read through the existing public queue front (source is empty);
+do not widen runtime visibility or add an observation API. No runtime change.
+
+08:36+08 independent pre-code wake review finds a required composition detail:
+keep clock_due distinct from urgent service. Future Original deadline retention
+and existing shorter-assignment retry must still depend on clock maturity, not
+the widened urgency predicate. Otherwise an urgent but unavailable target could
+silently lose its timer wake or shorter-range opportunity. No new wake/clock;
+retain the actual previous obligations while adding the exact-head opportunity.
+
+08:36+08 true producer RED52235 CLOSED101: all claim/receiverMAX/ACK/exacthead/
+measuredtarget/room/no-copy and POST-evaluation future-clock assertions pass;
+intended enqueue is0vs14600B, ready=false/measured=true/exhausted=false. This
+proves the local rule withholds this reachable service; practical benefit remains
+unproved. Root implements only the request urgency predicate, keeping clock_due
+separate for both previous deadline and shorter-boundary obligations. RFC15.2
+explicitly permits the bounded local exception and records response scope and
+duplicate/MAX-relief tradeoffs. Independent actual-diff/opposite tests follow;
+no native, target preference, queue, window, multiplier or profile change.
+
+08:43+08 GREEN96843:14client checks pass, including the actual producer's
+0→14600B rescue and one shared fixture's real unmeasured/blocked target wake,
+nonhead, queued/live-copy, actual ACK/MAX relief and unchanged clock controls.
+Further74multipath+57request+6assignment-clock+1epoch+1ordered-terminal checks
+pass (153distinct). Runtime/RFC and expanded producer independent reviews PASS.
+The test's claimed target delivery is command/flight admission, not a physical
+network result. No semantic edit after GREEN. Next freeze isolated candidate
+checkpoint/patch, sole ordinary four-job build, then the ONE declared comparison.
+There is still no practical promotion or CPU/whole-mixed resolution claim.
+
 ## Separate open issue: one-core burst near20%QUIC loss
 
 [Four ordinary500Mbps DOWN controls](QUIC_LOSS_CPU_20260910.md) on d44:
@@ -1405,6 +1504,6 @@ nonrenewing clocks, half-close/cancel and retained capacity wakes.
 Build/artifact identities and failed candidates remain explicit; never run an
 old target/release by assumption. Exact commits only; docs-dev requires force-add.
 PROGRESS is ignored continuity. AGENTS.md immutable; userdoc+7lines untouched.
-Telegram last23:27:19UTC, next nonurgent>=00:27:19UTC. Commentary within60s; verification
+Telegram exact-head milestone delivered by00:28:10UTC; next nonurgent>=01:28:10UTC. Commentary within60s; verification
 polls by minutes. Before compaction record current sessions, next decision,
 source/binary identities and open/adverse outcomes. Do not stop at a checkpoint.

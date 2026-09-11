@@ -59,6 +59,164 @@ Next transaction (before code or experiments):
   Independent agents check topology and prior claim scope;
   root alone runs all builds and traffic. Broad research remains deferred.
 
+### Active severe failure selected after the ten cells
+
+Current04f split TCP47+QUIC46 upload completes but has a5.699s confirmation gap
+and five zero confirmation bins20--24 while QUIC46 UP is10Mbps and TCP47 UP
+remains200Mbps. Same orientation DOWN delivers about10--22Mbps through the cut
+despite a healthy independent TCP cut; max read gap alone(.327s) hides this
+sustained collapse. TCP46+QUIC47 DOWN also has a five-second17.608Mbps band.
+These exceed the user's practical severity filter; whole means are not a pass.
+
+Next exact question: does the unaffected TCP47 singleton sustain native/user
+service under the identical physical schedule, and is split UP held at target
+delivery or only returned confirmation? Run current TCP47 singleton UP/DOWN
+and publishedv0.4.8 split TCP47+QUIC46 UP/DOWN, unchanged200+200 QoS/outage
+profile. These four controls distinguish physical/singleton limitation and
+new-versus-existing regression. Inspect existing target/native evidence first;
+do not resurrect rejected urgency clocks or prefer a protocol from the average.
+Forecast: if TCP47 is healthy, physical shortage on that cut cannot explain
+split collapse; if the released composition also stalls, this is not solely a
+new04f regression. Neither outcome alone chooses a model fix. Bound any next
+diagnostic to the exact missing prefix/feedback owner. No runtime edit yet.
+
+Control outcome,2026-09-11: unaffected current TCP47 sustains179.141Mbps DOWN
+and180.160 UP, with80/80 echoes and maximum read/confirmation gaps .391/.455s.
+Publishedv0.4.8 split DOWN is127.054Mbps with interactive failures; UP209.835
+with3.330s confirmation gap. This is not solely a newly introduced04f failure.
+The current UP5.699s confirmation gap includes a return-prefix hold: over a
+five-second bracket the client reply frontier stays1119B, server replies grow
+1119→1231B and target successful writes advance80,143,392B. TCP47 native ACKs
+also advance86,071,574B. Do not call that entire interval a forward-service
+freeze or assume a QUIC congestion-controller cause.
+
+Next bounded diagnostic transaction: reuse the existing04f observation-only
+clipped-prefix executable, unchanged TCP47+QUIC46 UP QoS/outage profile, one
+capture. Enable only response Original/repair, receive-hole/ACK, recovery wake
+and existing selected-stream small-frame TCP boundary events; no native trace
+or performance instrumentation. Information forecast: join the capture's
+actual missing reply frontier with Original/repair admission and arrival to
+distinguish unissued recovery from an already-issued but late copy. Existing
+events do not guarantee exact QUIC native write/decode attribution, and Original
+claim lacks selected path. Preserve those limits rather than infer them.
+Falsifier/stop: no reproduced severe hold means this capture cannot attribute
+the ordinary hold; do not tune or rerun for a favorable number. If a concrete
+blocking owner is identified, inspect its exact model/RFC/history before any
+bounded correction. No runtime logic or product parameter change is authorized
+by an aggregate-only throughput difference.
+
+Trace outcome: one exact961,347,584B upload completes; maximum confirmation
+gap4.145898s. Its missing reply is[1078,1092), committed at1789091895282ms.
+QUIC releases it at1899197ms(+3.915s). The first/only overlapping repair is
+TCP2 at1899639ms,442ms AFTER that release; queue residence0ms, native write18us,
+client authentication30ms later. Thus late TCP repair delivery is falsified for
+this critical hold: the delay precedes repair admission. This does not yet
+distinguish original-owner maturity from other admission gates.
+
+Next discriminator: one same-policy capture with two observation-only hooks:
+exact response Original identity and the active retained-frontier evaluation
+outcome (head, frozen owner deadline, queued/pending, capacity-blocked, extent).
+Reuse existing events for final repair admission and client ordered release.
+Forecast: a future owner deadline identifies an intentionally withheld recovery
+clock; an already-due deadline with no queue selects an actual admission gate.
+Neither observation is a performance improvement. No timer or congestion gain
+change; remove observer source after freezing its explicit diagnostic binary.
+
+Gate capture outcome: exact1,010,368,512B completion, max confirmation1.829351s;
+the >3s hold did NOT recur. Its own QUIC heads1121 and1163 wait1.660/2.092s
+before receipt; all recorded active-head evaluations stop at a future retained
+owner deadline (approximately4.98/6.30s after their Original assignments),
+before target/copy gates. This identifies that policy in those shorter episodes
+only, and does not justify a timer change. First trace serverF1078 was already
+known3.152s before release, so older positive-frontier lag is not its whole cause.
+Both diagnostic source hooks are removed; exact diff against04f is empty.
+The fresh diagnostic binary is retained-reply-gate-20260911; target/release is
+now that observer executable, NOT an ordinary candidate.
+
+Next bounded discriminator remains the separately observed severe DOWN B
+collapse (13.381Mbps duringQoS versus TCP47 control183.595). Reuse the same
+observer once in DOWN with bulk stream selected, unchanged physical schedule.
+Question: is useful TCP service withheld at a missing response prefix, or is
+the sender simply not offering work on TCP while the other cut is throttled?
+The direction swap is not a favorable repeat of the shorter UP trace. It
+addresses the already-selected ten-second service collapse that max-gap<3s
+hides. Preserve all bins and actual allocations/receipts; no policy edits.
+If it does not reproduce, stop that discriminator without tuning its settings.
+
+DOWN discriminator CLOSED: raw16--24s mean14.248778Mbps; HTTP/80echoes succeed,
+max read gap.396887s. In exact seven-second interior, all765 advancing heads
+are pre-QoS QUIC Originals. Their12,549,504B of ordered progress equals new
+TCP Original assignment; assigned-minus-positive-frontier repeatedly fills
+64MiB while received reorder grows25.955→34.238MB. No newQUIC Originals there.
+TCP native flight~.21MB versus~7MB windows and physicalcut200 remain underused.
+395 acceptedTCP repairs total5,041,220B,98.55% already below an earlier recorded
+client release frontier; every repair START is1--31ms late. Exact head579050494
+takes5.692s fromQOriginal toQreceipt, its firstTCPcopy follows18ms afterward.
+All4,305 retained-helper outcomes are skipped defaults because ACK-gap exposes
+one/two frames, not proof that the retained fallback itself was evaluated.
+This selects oldQdebt/ordered-credit/recovery service, not newQallocation or a
+nativeTCP bandwidth ceiling. Observer numbers do not replace ordinary speed.
+
+Next mechanism transaction: prove/disprove response recovery head-of-line
+serialization with one real-producer regression. After a first exactTCPrepair
+is accepted, does an unchanged positive/negativeACK frontier prevent serving
+a disjoint mature retained successor even though another repair quantum fits?
+Current first-gap/positive-F selection checks queued/live-copy overlap only
+after constructing that same prefix; ACK-gap frame_count also suppresses the
+independent retained helper even when it queued nothing. Terminal/stale-owner
+recovery has different uncovered-range machinery and is not this allegation.
+
+Information forecast: a production-path second-admission RED distinguishes
+unnecessary receipt-frontier serialization from actual target-service limits.
+Correction candidate, only after RED/review: retain owner clocks, all exact
+copy/slot/credit/native bounds and one ranked quantum per evaluation; choose
+the lowest retained range NOT already covered by queued/current live repair,
+rather than require the receiver ACK frontier to advance after every quantum.
+Prefer using immutable retained fallback for successors, without broadening
+negativeACK authority or changing speculative loss clocks. Do not revive the
+rejected request urgency or full-gap repeated enumeration that caused31sCPU.
+Tests must constrain actual next disjoint admission, not a particular helper.
+
+Benefit forecast, conditional not promised: the observed33--41MB retained debt
+needs roughly1.5--1.9s at180Mbps TCP useful service versus26--33s at10Mbps;
+the allowed target window/native service and actual loss determine the result.
+The removable issue is waiting for Product feedback between recovery quanta,
+not old bytes already inside the QUIC queue. Expect material recovery in the
+ten-second cut phase if this dominates; healthy extra copy/CPU/latency can
+instead regress. A lack of meaningful ordinary phase benefit rejects the
+candidate, not another threshold adjustment. Verify exactcopy/expiry/positive
+ACK holes/immature owner/retirement and bounded work first, then unchanged
+ordinary affected DOWN/UP plus healthy split/shared controls. No runtime
+correction or RFC change is accepted yet.
+
+Pre-implementation review: the old RFC also says retained fallback starts at
+positive F. Its useful intention was one exactly ranked quantum per decision,
+not an aggregate suffix grant; that wording can impose unnecessary receipt-
+serialized decisions. Candidate model is `min(retained cache minus queued/live
+copy coverage)`, with unchanged per-assignment maturity and exactly one current
+owner/rank evaluation. Covered bytes remain unacknowledged and consume credit;
+expiry does not erase their exact publication identity. Do not skip the first
+uncovered immature, ambiguous, or no-service owner to find easier later work.
+Preserve actor-wide copy-expiry wakes even if no uncovered range exists.
+Independent review rejected two coarse gates before implementation: requiring
+two payload-eligible outputs excludes a retained ineligible Original plus one
+valid alternate; checking only global F's Original misses an uncovered successor
+with a different owner. A cheap current-membership/any-eligible-output gate can
+avoid singleton full-ledger work without pretending to select the exact range.
+The final selected range retains all fresh eligibility checks.
+
+Mechanism RED,2026-09-11 02:36UTC: the actual-producer Q+2TCP test passes all
+Original/receiver-ACK/first-copy/native-target controls and fails only at the
+second uncovered-prefix queue assertion. Compile-only Debug formatting was
+corrected in the test (ReliablePathCommand intentionally has no Debug); that
+compiler failure is not the RED. Production behavior was unchanged for RED.
+Candidate now implements the coverage frontier and changes both ACK callers
+from frame_count==0 to queued==0. It preserves all existing owner clocks,
+per-decision sizing, exact-target credit, copy expiry and final writer admission.
+RFC15.2 explicitly separates recovery coverage from affirmative receipt. This
+is a candidate model correction, not an accepted practical improvement; next
+are exact successor final admission and boundary checks, then ordinary DOWN B.
+
 ## Decision: freeze scope, finish a release
 
 The user's latest instruction stops further broad exploration and prioritizes
@@ -88,8 +246,10 @@ Do not republish an existing version or tag before the gates pass.
   or run. Other previously rejected trials remain removed. Do not restore them.
 - Current ordinary candidate executable:
   ./.tmp/reflection/bin/clipped-range-20260911/mptunnel.
-  target/release/mptunnel and bin/ordered-credit-head-20260911/mptunnel are the
-  REJECTED trial executable, not the frozen candidate. Always use explicit paths.
+  target/release/mptunnel is now the retained-reply-gate observer executable,
+  also frozen at ./.tmp/reflection/bin/retained-reply-gate-20260911/mptunnel,
+  NOT the ordinary candidate. bin/ordered-credit-head-20260911/mptunnel
+  remains the REJECTED trial executable. Always use explicit paths.
 - Version/package/docs changes may follow the gates. A runtime change requires
   a reproduced release blocker, its exact cause and a bounded correction or
   withdrawal. No speculative cleanup accompanies it.
@@ -211,10 +371,11 @@ review, and is not part of the candidate.
 21 regular files; independent input-byte verification, root complete171-line
 appendix review and gzip/manifest checks done. No observer follow-up exists.
 
-No compiler, laboratory run or subagent exploration remains active.
+Root is preparing the next selected regression test build; no laboratory run
+is active.
 Root alone runs builds/labs, without overlap. Existing project Docker only;
 no sudo, outside-root work or /mnt/storage use. Preserve the unrelated user
 seven-line edit in LIVE_OWNER_FRONTIER_WORK_BOUND.md; AGENTS.md is immutable.
-Last Telegram milestone delivered by00:28:10 UTC; next nonurgent notification
-no earlier than01:28:10 UTC. Commentary stays timely; no release notification
+Next nonurgent Telegram notification no earlier than02:50 UTC.
+Commentary stays timely; no release notification
 before an actual milestone.

@@ -140,6 +140,11 @@ pub struct StreamsState {
 }
 
 impl StreamsState {
+    pub(super) fn packetization_changed(&mut self, id: StreamId) {
+        self.events
+            .push_back(StreamEvent::PacketizationChanged { id });
+    }
+
     #[allow(unreachable_pub)] // fuzzing only
     pub fn new(
         side: Side,
@@ -610,6 +615,17 @@ impl StreamsState {
                 offsets.start += data.len() as u64;
                 buf.put_slice(data);
             }
+            // Publish only after the actual STREAM frame bytes were constructed.
+            // Retransmission leaves this cursor unchanged. One arm coalesces all
+            // observers of this stream, and unrelated streams emit no event.
+            if stream
+                .packetization_target
+                .is_some_and(|end| stream.pending.first_unpacketized() >= end)
+            {
+                stream.packetization_target = None;
+                self.events
+                    .push_back(StreamEvent::PacketizationChanged { id });
+            }
             stream_frames.push(meta);
         }
 
@@ -984,6 +1000,10 @@ pub(super) fn get_or_insert_recv(
 #[cfg(test)]
 #[path = "tests_repair_ordering.rs"]
 mod tests_repair_ordering;
+
+#[cfg(test)]
+#[path = "tests_send_progress.rs"]
+mod tests_send_progress;
 
 #[cfg(test)]
 mod tests {

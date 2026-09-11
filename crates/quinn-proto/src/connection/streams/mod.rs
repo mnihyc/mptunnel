@@ -202,6 +202,60 @@ pub struct SendStream<'a> {
 
 #[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
 impl<'a> SendStream<'a> {
+    /// Snapshot native byte acceptance and initial packet construction for this stream.
+    ///
+    /// These are stream offsets including any protocol adapter headers. They do not
+    /// describe UDP socket emission, acknowledgement, or application delivery. A
+    /// reset/removed stream is closed. Before handshake completion, 0-RTT rejection
+    /// can replace streams and rewind these offsets.
+    pub fn packetization_progress(&self) -> Result<SendStreamProgress, ClosedStream> {
+        if self.id.initiator() != self.state.side
+            && self.id.index() >= self.state.next_remote[self.id.dir() as usize]
+        {
+            return Err(ClosedStream { _private: () });
+        }
+        match self.state.send.get(&self.id) {
+            Some(Some(stream)) if !stream.is_reset() => Ok(SendStreamProgress {
+                accepted_end: stream.pending.offset(),
+                first_unpacketized: stream.pending.first_unpacketized(),
+            }),
+            Some(None) => Ok(SendStreamProgress {
+                accepted_end: 0,
+                first_unpacketized: 0,
+            }),
+            _ => Err(ClosedStream { _private: () }),
+        }
+    }
+
+    /// Arm one coalesced, already accepted initial-packetization target.
+    ///
+    /// Returns the current snapshot. A target outside the accepted but not yet
+    /// packetized interval needs no subscription and is not armed. Multiple calls
+    /// retain the earliest target; its event consumes the arm, allowing observers
+    /// of later ends to recheck and rearm. This does not alter stream scheduling.
+    pub fn request_packetization_notification(
+        &mut self,
+        end: u64,
+    ) -> Result<SendStreamProgress, ClosedStream> {
+        let progress = self.packetization_progress()?;
+        if progress.first_unpacketized < end && end <= progress.accepted_end {
+            let stream = self.state.send.get_mut(&self.id).unwrap().as_mut().unwrap();
+            stream.packetization_target = Some(
+                stream
+                    .packetization_target
+                    .map_or(end, |current| current.min(end)),
+            );
+        }
+        Ok(progress)
+    }
+
+    /// Remove the observation arm when the last observer of this stream leaves.
+    pub fn cancel_packetization_notification(&mut self) {
+        if let Some(Some(stream)) = self.state.send.get_mut(&self.id) {
+            stream.packetization_target = None;
+        }
+    }
+
     #[cfg(fuzzing)]
     pub fn new(
         id: StreamId,
@@ -329,6 +383,9 @@ impl<'a> SendStream<'a> {
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
         self.state.unacked_data -= stream.pending.unacked();
         stream.reset();
+        if stream.packetization_target.take().is_some() {
+            self.state.packetization_changed(self.id);
+        }
         self.pending.reset_stream.push((self.id, error_code));
 
         // Don't reopen an already-closed stream we haven't forgotten yet
@@ -454,9 +511,27 @@ struct PendingStream {
     id: StreamId,
 }
 
+/// Coherent native-stream byte acceptance and initial packet construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendStreamProgress {
+    /// End of all bytes accepted by this native stream, including adapter headers.
+    pub accepted_end: u64,
+    /// First byte not yet selected for initial STREAM frame construction.
+    ///
+    /// Retransmission and acknowledgement do not advance this cursor.
+    pub first_unpacketized: u64,
+}
+
 /// Application events about streams
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamEvent {
+    /// An armed initial-packetization target crossed, or its stream was reset.
+    ///
+    /// Observers must query current state; this event grants no write credit.
+    PacketizationChanged {
+        /// The exact native stream whose observation arm was consumed.
+        id: StreamId,
+    },
     /// One or more new streams has been opened and might be readable
     Opened {
         /// Directionality for which streams have been opened

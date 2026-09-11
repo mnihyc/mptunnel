@@ -206,6 +206,9 @@ impl SendStream {
             return Ok(());
         }
         conn.inner.send_stream(self.stream).reset(error_code)?;
+        if let Some(notify) = conn.packetization_observers.remove(&self.stream) {
+            notify.notify_waiters();
+        }
         conn.wake();
         Ok(())
     }

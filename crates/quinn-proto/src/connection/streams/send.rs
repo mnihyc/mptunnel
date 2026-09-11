@@ -15,6 +15,8 @@ pub(super) struct Send {
     pub(super) connection_blocked: bool,
     /// The reason the peer wants us to stop, if `STOP_SENDING` was received
     pub(super) stop_reason: Option<VarInt>,
+    /// One coalesced observation target, independent of write credit and recovery.
+    pub(super) packetization_target: Option<u64>,
 }
 
 impl Send {
@@ -27,6 +29,7 @@ impl Send {
             fin_pending: false,
             connection_blocked: false,
             stop_reason: None,
+            packetization_target: None,
         })
     }
 

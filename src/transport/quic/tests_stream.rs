@@ -542,6 +542,112 @@ async fn quic_carrier_round_trips_product_frames() {
     server_task.await.expect("server task");
 }
 
+/// Keep one uninterrupted producer turn between API acceptance and observation:
+/// the native driver cannot run inside that current-thread turn. The payload
+/// crosses an MPP record boundary; native offsets come from Quinn, not a model
+/// of HTTP/3 or Product framing overhead.
+#[tokio::test(flavor = "current_thread")]
+async fn accepted_h3_product_envelope_has_an_independent_packetization_wake() {
+    let limits = CodecLimits::default();
+    let mux_limits = MuxLimits::default();
+    let payload = Bytes::from(vec![0x6d; QUIC_STREAM_RECORD_PAYLOAD_BYTES + 1]);
+    let server_payload = payload.clone();
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (client_done_tx, client_done_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.expect("accepted connection");
+        let (mut send, mut recv) = connection.accept_bi().await.expect("accepted stream");
+        assert_eq!(
+            read_frame(&mut recv, limits).await.expect("warmup ping"),
+            Frame::Ping { nonce: 42 }
+        );
+        write_frame(&mut send, &Frame::Pong { nonce: 42 }, limits)
+            .await
+            .expect("warmup pong");
+        let mut received = Vec::new();
+        while received.len() < server_payload.len() {
+            let Frame::StreamData {
+                stream_id,
+                offset,
+                payload,
+            } = read_frame(&mut recv, limits).await.expect("Product record")
+            else {
+                panic!("expected Product data");
+            };
+            assert_eq!(stream_id, StreamId(7));
+            assert_eq!(offset, received.len() as u64);
+            received.extend_from_slice(&payload);
+        }
+        assert_eq!(received.as_slice(), server_payload.as_ref());
+        received_tx.send(()).expect("receiver confirmation");
+        client_done_rx.await.expect("client completion");
+    });
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let connection = client.connect(server_addr).await.expect("client connect");
+    let (mut send, mut recv) = connection.open_bi().await.expect("client stream");
+    write_frame(&mut send, &Frame::Ping { nonce: 42 }, limits)
+        .await
+        .expect("warmup ping");
+    assert_eq!(
+        timeout(Duration::from_secs(5), read_frame(&mut recv, limits))
+            .await
+            .expect("warmup timeout")
+            .expect("warmup pong"),
+        Frame::Pong { nonce: 42 }
+    );
+    let observer = send
+        .connection
+        .observe_send_stream(send.request_stream_id)
+        .expect("established native stream observer");
+    let before = observer.snapshot().expect("pre-write native progress");
+    let frame = Frame::StreamData {
+        stream_id: StreamId(7),
+        offset: 0,
+        payload,
+    };
+    let mut write = Box::pin(write_frame(&mut send, &frame, limits));
+    assert!(matches!(
+        futures::poll!(&mut write),
+        std::task::Poll::Ready(Ok(()))
+    ));
+    drop(write);
+    let accepted = observer.snapshot().expect("accepted native envelope");
+    assert!(accepted.accepted_end > before.accepted_end);
+    assert!(accepted.first_unpacketized < accepted.accepted_end);
+    assert_eq!(connection.congestion_metrics().pending_bytes, 0);
+
+    let mut crossing = Box::pin(observer.wait_until_packetized(accepted.accepted_end));
+    assert!(futures::poll!(&mut crossing).is_pending());
+    let packetized = timeout(Duration::from_secs(5), crossing)
+        .await
+        .expect("packetization wake timeout")
+        .expect("packetization progress");
+    assert!(packetized.first_unpacketized >= accepted.accepted_end);
+    assert_eq!(packetized.accepted_end, accepted.accepted_end);
+    timeout(Duration::from_secs(5), received_rx)
+        .await
+        .expect("receiver timeout")
+        .expect("receiver confirmed exact Product bytes");
+    client_done_tx.send(()).expect("client completion");
+    server_task.await.expect("server task");
+}
+
 #[tokio::test]
 async fn http_datagram_send_requires_an_open_request_send_side() {
     let limits = CodecLimits::default();

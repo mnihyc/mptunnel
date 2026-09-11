@@ -64,8 +64,8 @@ pub use proto::{
     ConfigError, ConnectError, ConnectionClose, ConnectionError, ConnectionId,
     ConnectionIdGenerator, ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats,
     FrameType, IdleTimeout, MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats,
-    ServerConfig, Side, StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache,
-    TokenReuseError, TokenStore, Transmit, TransportConfig, TransportErrorCode, UdpStats,
+    SendStreamProgress, ServerConfig, Side, StdSystemTime, StreamId, TimeSource, TokenLog,
+    TokenMemoryCache, TokenReuseError, TokenStore, Transmit, TransportConfig, TransportErrorCode, UdpStats,
     ValidationTokenConfig, VarInt, VarIntBoundsExceeded, Written, congestion, crypto,
 };
 #[cfg(feature = "qlog")]
@@ -89,6 +89,9 @@ pub use crate::runtime::SmolRuntime;
 pub use crate::runtime::TokioRuntime;
 pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller, default_runtime};
 pub use crate::send_stream::{SendStream, StoppedError, WriteError};
+pub use crate::send_stream_observer::{SendStreamObservationError, SendStreamObserver};
+
+mod send_stream_observer;
 
 #[cfg(test)]
 mod tests;

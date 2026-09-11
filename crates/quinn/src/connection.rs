@@ -32,6 +32,14 @@ use proto::{
     EndpointEvent, Side, StreamEvent, StreamId, congestion::Controller,
 };
 
+#[cfg(all(
+    test,
+    feature = "runtime-tokio",
+    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
+))]
+#[path = "tests_send_stream_observer.rs"]
+mod tests_send_stream_observer;
+
 /// In-progress connection attempt future
 #[derive(Debug)]
 pub struct Connecting {
@@ -252,7 +260,26 @@ impl Future for ConnectionDriver {
             conn.terminate(e, &self.0.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = match conn.drive_transmit(cx) {
+            Ok(keep_going) => keep_going,
+            Err(error) => {
+                // No driver remains to publish progress or service a waiter.
+                // Retained public handles prevent last-reference cleanup, so
+                // publish the fatal local failure before returning it to the
+                // runtime. Preserve an already published close reason.
+                if conn.error.is_none() {
+                    conn.terminate(
+                        ConnectionError::TransportError(proto::TransportError {
+                            code: proto::TransportErrorCode::INTERNAL_ERROR,
+                            frame: None,
+                            reason: format!("local UDP transmit failed: {error}"),
+                        }),
+                        &self.0.shared,
+                    );
+                }
+                return Poll::Ready(Err(error));
+            }
+        };
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -688,6 +715,19 @@ impl Connection {
             .priority()
     }
 
+    /// Observe acceptance and first packet construction on an existing send stream.
+    ///
+    /// Creation is unavailable until the handshake completes: rejected 0-RTT can
+    /// rewind offsets and reuse stream IDs. The ID must identify the caller's
+    /// current established stream, not an abandoned early-data stream. H3 and
+    /// other adapters may retain this identity while owning the concrete sender.
+    pub fn observe_send_stream(
+        &self,
+        stream: StreamId,
+    ) -> Result<crate::SendStreamObserver, crate::SendStreamObservationError> {
+        crate::SendStreamObserver::new(self.0.clone(), stream)
+    }
+
     /// See [`proto::TransportConfig::receive_window()`]
     pub fn set_receive_window(&self, receive_window: VarInt) {
         let mut conn = self.0.state.lock("set_receive_window");
@@ -954,6 +994,7 @@ impl ConnectionRef {
                 blocked_writers: FxHashMap::default(),
                 blocked_readers: FxHashMap::default(),
                 stopped: FxHashMap::default(),
+                packetization_observers: FxHashMap::default(),
                 error: None,
                 io_poller: socket.clone().create_io_poller(),
                 socket,
@@ -1036,6 +1077,9 @@ pub(crate) struct State {
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
+    /// At most one notification cell per observed native stream, not per write
+    /// or target. The final observer drop removes the cell and its proto arm.
+    pub(crate) packetization_observers: FxHashMap<StreamId, Arc<Notify>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
     socket: Arc<dyn AsyncUdpSocket>,
@@ -1182,6 +1226,15 @@ impl State {
                     self.terminate(reason, shared);
                 }
                 Stream(StreamEvent::Writable { id }) => wake_stream(id, &mut self.blocked_writers),
+                Stream(StreamEvent::PacketizationChanged { id }) => {
+                    if self.inner.send_stream(id).packetization_progress().is_err() {
+                        wake_stream_notify(id, &mut self.packetization_observers);
+                        continue;
+                    }
+                    if let Some(notify) = self.packetization_observers.get(&id) {
+                        notify.notify_waiters();
+                    }
+                }
                 Stream(StreamEvent::Opened { dir: Dir::Uni }) => {
                     shared.stream_incoming[Dir::Uni as usize].notify_waiters();
                 }
@@ -1199,10 +1252,14 @@ impl State {
                     // Might mean any number of streams are ready, so we wake up everyone
                     shared.stream_budget_available[dir as usize].notify_waiters();
                 }
-                Stream(StreamEvent::Finished { id }) => wake_stream_notify(id, &mut self.stopped),
+                Stream(StreamEvent::Finished { id }) => {
+                    wake_stream_notify(id, &mut self.stopped);
+                    wake_stream_notify(id, &mut self.packetization_observers);
+                }
                 Stream(StreamEvent::Stopped { id, .. }) => {
                     wake_stream_notify(id, &mut self.stopped);
                     wake_stream(id, &mut self.blocked_writers);
+                    wake_stream_notify(id, &mut self.packetization_observers);
                 }
             }
         }
@@ -1276,6 +1333,7 @@ impl State {
             let _ = x.send(false);
         }
         wake_all_notify(&mut self.stopped);
+        wake_all_notify(&mut self.packetization_observers);
         shared.closed.notify_waiters();
     }
 

@@ -172,6 +172,11 @@ impl SendBuffer {
         self.offset
     }
 
+    /// First offset not yet selected for its initial STREAM frame construction.
+    pub(super) fn first_unpacketized(&self) -> u64 {
+        self.unsent
+    }
+
     /// Whether all sent data has been acknowledged
     pub(super) fn is_fully_acked(&self) -> bool {
         self.unacked_len == 0

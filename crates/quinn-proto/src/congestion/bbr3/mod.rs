@@ -3110,9 +3110,63 @@ impl Controller for Bbr3 {
                     }
                     self.rs = Some(rate_sample);
                     self.finish_inflight_rtt_ack_epoch();
+                    // Diagnostic only: one record per native round, using this ACK's exact sample.
+                    static TRACE: std::sync::OnceLock<Option<(String, Instant)>> =
+                        std::sync::OnceLock::new();
+                    let trace = TRACE.get_or_init(|| {
+                        std::env::var("MPTUNNEL_NATIVE_STATE_TRACE_ROLE")
+                            .ok()
+                            .filter(|role| matches!(role.as_str(), "server" | "client"))
+                            .map(|role| (role, now))
+                    });
+                    let trace_before = trace.as_ref().map(|_| {
+                        (
+                            self.state,
+                            self.full_bw,
+                            self.full_bw_count,
+                            self.full_bw_reached,
+                            self.full_bw_now,
+                            self.round_count,
+                            self.bw,
+                            self.max_bw,
+                            self.pacing_rate,
+                            self.cwnd,
+                        )
+                    });
                     // UpdateOnACK consumes exactly this ACK's completed sample, exactly once.
                     self.update_model_and_state(rate_sample.last_packet, now);
                     self.update_control_parameters();
+                    if let (true, Some((role, started)), Some(before)) =
+                        (self.round_start, trace.as_ref(), trace_before)
+                    {
+                        let rtt_us = |rtt: Duration| {
+                            (rtt != Duration::from_secs(u64::MAX)).then(|| rtt.as_micros())
+                        };
+                        let unix_us = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_micros());
+                        eprintln!(concat!(
+                            "native_control_round role={} controller={:p} elapsed_us={:?} unix_us={:?} ",
+                            "state_before={:?} state_after={:?} full_bw_before={} full_bw_after={} ",
+                            "full_bw_count_before={} full_bw_count_after={} full_bw_reached_before={} full_bw_reached_after={} ",
+                            "full_bw_now_before={} full_bw_now_after={} round_before={} round_after={} round_start={} ",
+                            "caller_app_limited={} rs_app_limited={} rs_raw_bytes_per_s={} rs_model_bytes_per_s={} rs_interval_us={} rs_rtt_us={} ",
+                            "bw_before={} bw_after={} max_bw_before={} max_bw_after={} pacing_before={} pacing_after={} pacing_gain={} cwnd_gain={} ",
+                            "cwnd_before={} cwnd_after={} flight_bytes={} min_rtt_us={:?} operational_rtt_us={:?} ",
+                            "space={:?} packet={} sample_valid={}"
+                        ), role, self as *const Self, now.checked_duration_since(*started).map(|d| d.as_micros()), unix_us,
+                            before.0, self.state, before.1, self.full_bw,
+                            before.2, self.full_bw_count, before.3, self.full_bw_reached,
+                            before.4, self.full_bw_now, before.5, self.round_count, self.round_start,
+                            app_limited, rate_sample.is_app_limited, rate_sample.delivery_rate,
+                            self.model_delivery_rate(rate_sample), rate_sample.interval.as_micros(), rate_sample.rtt.as_micros(),
+                            before.6, self.bw, before.7, self.max_bw, before.8, self.pacing_rate,
+                            self.pacing_gain, self.cwnd_gain, before.9, self.cwnd, self.inflight,
+                            rtt_us(self.min_rtt), rtt_us(self.inflight_rtt), rate_sample.last_packet.space,
+                            rate_sample.last_packet.packet_number, valid_interval && rate_sample.interval != Duration::ZERO
+                                && rate_sample.delivery_rate.is_finite() && rate_sample.delivery_rate > 0.0);
+                    }
 
                     let next_revision =
                         self.latest_completed_bandwidth_sample.map_or(1, |sample| {

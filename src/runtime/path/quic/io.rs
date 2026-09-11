@@ -452,24 +452,7 @@ async fn udp_path_write_frames(
     codec_limits: CodecLimits,
 ) -> Result<(), RuntimeError> {
     ensure_quic_data_plane_frames(frames)?;
-    // One complete bounded writer flush owns this boundary. Individual prepared
-    // claims and partial H3 writes must not advance the next Original opportunity.
-    let operation = if let Some(commitment) = &send.native_commitment {
-        Some((
-            commitment.clone(),
-            commitment
-                .begin_operation()
-                .map_err(native_commitment_error)?,
-        ))
-    } else {
-        None
-    };
     quic_transport::write_frames(&mut send.stream, frames, codec_limits).await?;
-    if let Some((commitment, operation)) = operation {
-        commitment
-            .complete_operation(operation)
-            .map_err(native_commitment_error)?;
-    }
     Ok(())
 }
 

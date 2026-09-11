@@ -3,6 +3,148 @@
 Updated: 2026-09-11 12:08 +08:00. Authoritative repository: ./.
 Category: user-directed release convergence. No release acceptance yet.
 
+### Current transaction: native QUIC Original refill (2026-09-11 13:23 +08)
+
+Global map is unchanged: close the severe isolated-cut recovery defect, then
+the finite ordinary/lifecycle/platform gates below, then docs/version/release.
+No new controller, recovery timer, inferred bottleneck or broad audit enters.
+The user permits extra copies when they improve stability; the withdrawn
+pipeline's healthy slowdown still excludes restoring it unchanged.
+
+Observed failure and competing causes: the native inventory proves about34MB
+of never-packetized QUIC data behind completed API writes; old ordinary DOWN
+cut service is13.381Mbps despite the independent TCP control's183.595Mbps.
+Native flight, transmitted network queues, stale receipt knowledge and ordered
+recovery also contribute. The inventory does not attribute every stalled byte.
+Origin:9720e4b/0449b9f moved Original claim to the actual physical writer to
+avoid fixed-target source staging. That corrected Product ownership, but QUIC
+API completion still denotes insertion into a large native memory window, not
+service of those bytes. TCP later acquired a native unsent readiness boundary.
+
+Bounded candidate model: keep exact connection-wide never-packetized stream
+bytes Q and outstanding pre-write reservations R under Quinn's state lock.
+Offer a new Original transaction only if Q+R is below the current native cwnd W;
+reserve its existing maximum framed service quantum before Product claim.
+The reservation lives through the one Original flush and is refunded on every
+exit. Writes add to Q, first packetization removes from Q, reset/rejected0RTT
+reconcile Q, and ACK/loss of already-packetized bytes do not change Q. This is
+one native-window refill ahead of native flight, NOT W minus native flight,
+another congestion window, a lowered memory ceiling or a pacing clock. A
+transaction may cross the threshold by its existing framed quantum; simultaneous
+writers cannot each consume an unreserved W. A window shrink stops new claims
+without revoking old ownership. Control/repair are not gated by this predicate.
+Native drive/refund/close wakes recheck current state without timer polling;
+the actor keeps servicing input/lifecycle and normal class arbitration. No
+native lock may span Product claim or an await. Exact counter work is O(1),
+not the observer's per-stream scan.
+
+Forecast: reducing the observed pre-packet inventory from tens of MB toward
+one actual native window can reduce the old QUIC prefix stranded by a cut.
+No fixed Mbps or stall-time gain is promised: inflated native W, transmitted
+queues or recovery selection can still dominate. Unlike a one-frame refill,
+the W-sized reserve is intended to keep the native ACK/pacing pipeline supplied;
+that intention requires ordinary validation, not an application-limited override.
+Falsifiers: incorrect aggregate/refund/cancellation/wake; blocked control or
+healthy writer; materially lower healthy useful service or higher gaps/latency;
+no material cut-phase benefit. Do not tune W, gains, delays or copy limits to
+rescue an adverse result. Prove the real writer refusal against the existing
+claim path, test counter and concurrent-owner lifetimes, then one matched20%
+ordinary control/candidate DOWN comparison including healthy and cut phases.
+UP and other release cells follow only a useful non-adverse outcome. Root alone
+builds/runs; source20% ordinary control is building first, no traffic overlaps.
+
+Control closed:20% omission policy still reproduces the collapse: whole215.861,
+healthy5--15=345.358, QoS15--25=22.217, interior17--24=11.513Mbps; bodygap.580s,
+75/75attempted echoes, p95/max.719/1.588s. Healthy native windows are5.14--5.83MB,
+not the34MB pre-packet inventory measured earlier. No claimed release progress
+from the whole mean. Ordinary control binary is bin/native-refill-control-20260911.
+
+Real-producer RED: server_quic_prepared_original_waits_for_shared_native_refill
+passes the actual connection, shared reservation, native-negative, source and
+priority-notice controls, then existing writer incorrectly commits41bytes
+(expected0). No fake telemetry or compiler failure supplied this RED. The
+new native counter/API are dormant for ordinary production until the writer
+integration below; no controller or recovery policy changed. Native wake design
+uses FIFO notify-one plus positive-ready handoff, not waking every waiting
+logical stream on each native packet batch; termination wakes all waiters.
+
+User's estimate hypothesis is reproduced in the SAME20% ordinary control,
+not dismissed: native capacity/pacing remain198.325/196.342Mbps throughout
+the10Mbps QoS phase. Same-epoch native ACK counter333914097→341907357 over
+sample timestamps17572786→24150875us is9.721Mbps, not198Mbps. Thus the native
+capacity estimate is not current delivered service. It can underestimate
+completion cost; old D's absence of new QUIC Originals during its interior
+also means new-placement imbalance alone did not explain that old capture.
+Keep this as a competing/composing cause within the SAME blocker. The current
+candidate intentionally does not alter estimator clocks/rates, so ordinary
+comparison can isolate whether avoiding pre-packet exposure materially helps.
+Neither static model nor a passing writer test closes the performance issue.
+
+Focused verification closed,2026-09-11 13:42+08:167 root QUIC checks,30 native
+stream-state checks and one real Quinn connection/reservation check pass.
+The production refusal test now also queues a control Pong before the blocked
+Original and proves it is flushed; cancellation/close/partial write and two
+armed native waiters are covered. The final root batch was repeated once
+because its prior completed tool output was lost at compaction; no concurrent
+build or traffic occurred. Ordinary candidate build is active. Next is exactly
+the already-recorded20% DOWN control profile, with only binary/tag changed;
+full phases, gaps, echoes and resource/wire cost decide its disposition.
+
+Ordinary outcome and withdrawal,2026-09-11 13:49+08: candidate whole220.382
+versus215.861Mbps, healthy299.787versus345.358(-13.20%), QoS39.700versus22.217.
+The interior still spends17--22s at13.8--19.2Mbps; only its end recovers.
+Bodygap improves.580→.317s; firstbody stays.578s. Echo80/80 versus75/75attempts,
+p95.719→.400s,max1.588→.635s. Sampled DOWN wire1.338→1.354GB, wire/useful
+1.240→1.229; peak server/client RSS294668/82764→320808/99976KiB and final
+lifetime-average CPU110/44.6→138/47.1percent. These counters do not attribute
+CPU causes. Native W still inflates to49--55MB after QoS; one W is not a small
+wall-clock service bound. Partial timing benefit does NOT close the sustained
+independent-TCP underuse. No UP promotion or rescue tuning follows.
+
+The complete candidate is withdrawn with apply_patch; src/crates/RFC/manifests
+again match61279f0, retaining the committed20% defaults. Exact trial patch and
+ordinary binaries/results are retained under native-refill-{control,candidate}.
+target/release currently contains the WITHDRAWN candidate; never use it as the
+current executable. The experiment disproves the sufficiency of this refill
+boundary, not the existence of pre-packet backlog. Native flight and slow
+ordered recovery remain composing causes. No runtime correction accepted.
+
+Next bounded causal question directly tests the user's estimate hypothesis:
+would a correct10Mbps QUIC scheduling-rate projection during the physical
+10Mbps cut alone restore healthy TCP service? Use one diagnostic-only oracle
+on the clean20% control. It changes only the exported bandwidth component in
+the server's known cut interval, leaving native bw, cwnd, pacing, memory,
+recovery logic and other observations unchanged. This is deliberately NOT a
+production estimator or fix. Its finite interval is the experimental profile,
+not a shipped threshold. Verify actual oracle activation against captured tc
+and use the shared interior; no claim about unmatched transition edges.
+
+Information forecast: restoration would implicate the capacity projection's
+downstream scheduling/recovery consumers; persistent collapse despite a verified
+10Mbps projection falsifies it as the sufficient remedy and focuses on retained
+ordered debt/recovery. Neither result alone proves a controller defect or
+authorizes using raw ACK throughput as capacity. Old D's absent newQUICOriginals
+makes little benefit plausible. One ordinary-profile capture, no parameter
+tuning or favourable rerun. Archive/remove the diagnostic patch before traffic.
+
+Rate intervention CLOSED,2026-09-11 13:56+08: the oracle export is verified
+10Mbps on every16.145--26.146s server snapshot; physical10Mbps is15.145--24.146s.
+The common17--24s interior STILL gives18.249Mbps (whole216.319,healthy333.580,
+QoS21.113). Native pacing stays176--196Mbps, RTT grows to4.180s; the intervention
+did not alter nativeCC. Rate substitution alone is experimentally insufficient,
+not proof that a retained maximum is current service or that all rate effects
+are irrelevant. An echo times out after3.005s at18.093--21.097s;33succeed and
+38later scheduled attempts are unavailable after disconnection. Do not hide
+that failure with the successful-only.349s p95. Its exact cause is unassigned.
+One build/run completed; no favourable repeat or production override follows.
+All diagnostic source was removed BEFORE traffic. target/release is now the
+explicit oracle binary, never the clean comparator. Raw pair/intervention and
+exact patches/recipe are preserved together; no unaccepted runtime remains.
+Archive:NATIVE_REFILL_AND_RATE_QOS_20260911.raw.tar.gz contains18regular files
+(three complete runs, two exact patches and the reproduction/interpretation
+record); gzip and manifest checks pass. This is an evidence checkpoint, not
+a runtime acceptance or permission to publish performance claims.
+
 Current outcome: efed8ec commits the two20% defaults with47focused checks.
 Recovery remains04f and blocked by the reproduced split-link slowdown. The
 latest closed discriminator directly finds tens of MB of native QUIC stream

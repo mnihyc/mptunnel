@@ -2376,6 +2376,12 @@ async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
                             owner_receivers.release_pending_command_bytes(charged);
                             work.requeue();
                         }
+                        PreparedOriginalClaim::CarrierFailed(error) => {
+                            panic!("unexpected fixture carrier failure: {error}")
+                        }
+                        PreparedOriginalClaim::RecoveryQueued => {
+                            panic!("fixture has no independently due alternate recovery");
+                        }
                         PreparedOriginalClaim::Empty => {}
                         PreparedOriginalClaim::Busy(_) | PreparedOriginalClaim::Blocked(_) => {
                             panic!("sole healthy ready writer must claim finite source");
@@ -2701,11 +2707,25 @@ async fn prepared_request_actor_keeps_eof_source_claimable_until_final_offset() 
                             receivers.release_pending_command_bytes(charged);
                             work.requeue();
                         }
+                        PreparedOriginalClaim::CarrierFailed(error) => {
+                            panic!("unexpected fixture carrier failure: {error}")
+                        }
+                        PreparedOriginalClaim::RecoveryQueued => {
+                            panic!("fixture has no independently due alternate recovery");
+                        }
                         PreparedOriginalClaim::Empty => {
                             // An exhausted or superseded weak notice owns no bytes.
                         }
-                        PreparedOriginalClaim::Busy(_) | PreparedOriginalClaim::Blocked(_) => {
-                            panic!("the sole ready healthy writer must claim admitted EOF source");
+                        PreparedOriginalClaim::Busy(_) => {
+                            panic!("the sole ready healthy fixture writer has no competing Product holder");
+                        }
+                        PreparedOriginalClaim::Blocked(wait) => {
+                            assert_eq!(claimed.len(), source.len(),
+                                "all admitted EOF source must remain immediately claimable");
+                            // The final weak notice can retain outstanding recovery
+                            // deadlines after source is exhausted. The real writer
+                            // parks that notice and still services the queued FIN.
+                            receivers.defer_prepared_work(work, wait);
                         }
                     }
                 }

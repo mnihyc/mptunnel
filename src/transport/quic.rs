@@ -92,12 +92,12 @@ impl QuicCandidateVerifier for ExactTestCandidateVerifier {
 }
 
 #[cfg(test)]
-pub(super) fn test_candidate_selector() -> QuicCandidateSelector {
+pub(crate) fn test_candidate_selector() -> QuicCandidateSelector {
     QuicCandidateSelector::derive("test-credential", b"mptunnel test candidate secret 00")
 }
 
 #[cfg(test)]
-pub(super) fn test_candidate_verifier() -> std::sync::Arc<dyn QuicCandidateVerifier> {
+pub(crate) fn test_candidate_verifier() -> std::sync::Arc<dyn QuicCandidateVerifier> {
     std::sync::Arc::new(ExactTestCandidateVerifier(test_candidate_selector()))
 }
 

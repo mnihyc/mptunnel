@@ -33,6 +33,17 @@ pub(super) async fn run_client_udp_stream(
     mut commands: ReliablePathCommandReceivers,
     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
 ) {
+    let commitment = match send.bind_product_commitment(stream_id) {
+        Ok(commitment) => commitment,
+        Err(error) => {
+            let _ = frames.send(Err(error)).await;
+            return;
+        }
+    };
+    if let Err(error) = commands.bind_native_commitment(commitment) {
+        let _ = frames.send(Err(error)).await;
+        return;
+    }
     let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::from_limits(mux_limits);

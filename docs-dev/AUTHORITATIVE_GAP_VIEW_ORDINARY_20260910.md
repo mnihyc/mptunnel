@@ -6289,3 +6289,149 @@ Archive: [CLIPPED_RANGE_PREFIX_DIAGNOSTIC_20260911.raw.tar.gz](CLIPPED_RANGE_PRE
 11 safe regular members,362,034B compressed /2,919,024B uncompressed, every byte
 verified: six raw files, exact two-file patch, build/driver logs, run.py/shape.sh.
 No binary or configuration is included.
+
+## Exact-head diagnostic19038: a future Original clock on the longest hole
+
+The longest observed receiver stall has a TCP46-owned head whose retained
+recovery deadline remains future in three actual sampled evaluations, despite
+a measured QUIC47 alternative. This identifies sampled clock gating, not the
+eventual winning transmission, an all-call history or a proven timer defect.
+Other episodes have live-copy or queued coverage; no universal explanation follows.
+
+Source04f1e56 plus the exact six-file observer was built96258 in1m26; all
+observer source was reversed before sole run19038. Existing warning only,
+no build overlap or runtime-policy change. Results are
+`aggregate-combined-up-exact-head-diagnostic-0911`. This is an information
+capture, not a replacement for ordinary95178 or evidence of a speed improvement.
+
+| Own exact upload outcome | Value |
+|---|---:|
+| Accepted = confirmed bytes; completion |953,221,120;1/1 complete,0failed, no errors|
+| Probe / driver elapsed,s |44.779863 /45.546014|
+| Whole confirmed Mbps |170.295|
+| First write / confirmation,s |.105612 /.409299|
+| Maximum write / confirmation gap,s |3.290572 /4.704106|
+| Raw bins / zeros |45 /5 (indices21,22,23,24,26)|
+
+Untrimmed phase means,Mbps:0–5=162.300;5–15=208.124;15–25=73.939;
+strict16–25=69.916;25–30=320.489;30–33=40.284;33–40=214.121;
+40–45=154.300 including partial last bin. These are target-confirmation bins,
+not native wire rates; buffered bursts can exceed link capacity. No UP echo.
+
+```text
+00–09: 12.347 199.562 218.999 195.722 184.870 179.362 270.627 205.880 192.009 202.471
+10–19: 147.655 147.260 223.132 270.080 242.762 110.142 140.905 82.096 210.645 50.730
+20–29: 144.872 0 0 0 0 748.422 0 453.455 123.628 276.938
+30–39: 10.914 60.708 49.229 140.717 523.036 1.573 525.591 211.558 41.113 55.259
+40–44: 289.407 116.255 131.283 180.640 53.916
+```
+
+Join session15998913629368331950/stream0 and sample_unix_us, not log order
+alone. Probe.started1789085825.148432970s anchors the relative times below.
+Raw retained records precede the real evaluation; signed clock offsets refer to
+its entry Instant, while evaluated_delta_us identifies the actual comparison
+time. None is unknown/unobserved, not expired. Microsecond wall conversions
+are approximate anchors; server event stamps have millisecond precision.
+
+Server seq142 reports3.979938s without ordered delivery, approximately
+21.164629–25.144567s, with prior R479,411,258. Seq138–141 observe R=W at
+that exact value, reorder3.024→66.978MB and head omission[479411258,479476794).
+Actual target T is also479,411,258 at distinct generation21.975567 through
+24.975567s; sampled loopback queues are zero. Client eventually reaches
+A=peerMAX546,520,122,U0,F479,411,258, exhausting ordered credit behind that
+hole. Its retained unacked source falls20.449MB→174,016B as suffix ACKs arrive:
+large assigned-minus-F is not all retained missing data.
+
+| Actual sampled head evaluation |22.154910s,seq113|23.158446s,seq117|24.273281s,seq122|
+|---|---:|---:|---:|
+| Head / sole Original |479,411,258 /TCP0|same|same|
+| Retained loss remaining,s |3.757773|2.754237|1.639402|
+| Retained fallback remaining,s |4.943018|3.939481|2.824646|
+| Head target QUIC47 ETA,us |636,932|958,325|122,083|
+| Actual head reason |future_clock|future_clock|future_clock|
+| Selected range start |502,170,630|524,469,082|479,411,258|
+| Head enqueued / total enqueued frames |false /0|false /0|false /0|
+
+The immutable Original is TCP index0, physical4, attachment0, assigned
+[479411258,479476794) at approximately19.986463s. All three raw samples retain
+only that attached record covering F, without accepted-copy D; actual queued
+and live-copy coverage are false. The evaluated head slice is14,600B; target
+UDP index1/physical1/attachment3 is neither pending nor service-exhausted.
+Owner timing is5346.596ms RTT/167.342ms jitter, owner ETA16.054s. The first
+two selected ranges are later work, not the head. In the third, target service
+limit14600 still yields apply_limit0 because the head's deadline is future.
+Clock sums preserve loss approximately25.912683s and fallback27.097928s;
+they do not renew between samples. Ordered release25.144567 precedes loss.
+The matched write of4,390,912B completes in1384us, excluding target-write
+residence as the cause of this sampled forward hole. No first-byte winner or
+unsampled copy admission is logged, so release-before-deadline does not prove
+that the Original won or that every recovery mechanism remained inactive.
+
+Native mapping is same-role: physical4=tcp-46, physical1=quic-47. TCP4's
+management producer advances from sampled_at_us19,908,164 (RTT3.470s) to
+20,973,183 (5.244s) then21,089,191 (5.347s); the latter stamp/ACK41,647,363
+repeat across rows22–25 despite newer management generation stamps.
+Do not infer a native freeze from that cache. The unique heavy TCP46 socket
+49870 matches ACK40,033,933 in row19 and independently remains present:
+
+| Fresh socket sample,runner s |20.016610|21.016711|22.016813|23.016916|24.018447|25.018593|
+|---|---:|---:|---:|---:|---:|---:|
+| RTT,ms |4986.47|5811.31|6722.87|7109.49|7147.84|157.173|
+| Native ACKed bytes |41,286,913|42,229,865|43,351,903|43,708,453|43,709,901|46,956,249|
+| Native unsent bytes |160,728|121,632|121,632|121,632|121,632|not reported|
+
+Thus multi-second TCP RTT is real native context, not solely a stale display;
+ACK progress coexists with the ordered hole. Neither native ACKs nor unsent
+totals locate its exact protected bytes. QUIC47 producer stamps advance
+22,555,341→25,441,455us and ACK370,057,697→422,039,259B in rows22–25.
+The physical47 link remains200Mbps. Existing timing/native producers, not a
+larger timer or presumed congestion defect, are the next evidence boundary.
+
+The next1.969740s receiver gap at F551,763,002 has a QUIC46 Original and
+sampled future clocks too, but its evaluations genuinely enqueue later ranges
+582,538,331 and599,416,106,14,600B each; head_enqueued remains false. Conversely
+the1.124861s gap at F752,527,916 has a live attached TCP copy with D408423us
+ahead of its sample, and the head model is skipped. A later expired-clock head
+819,680,580 is queued-covered. These are distinct sampled owners, not durations
+that can be added or shares of whole-run recovery traffic.
+
+Across45 sampled evaluations:28 live-copy-covered,7 future-clock,3 queued-covered,
+3 due-no-target,1 no-frontier/capable-owner,3 no-authoritative-gap. All45 raw
+retained summaries reconcile87 records. There are zero sampled head enqueues,
+but15 actual Product-queue insertions/182,336B for other ranges; these are NOT
+carrier/native acceptance or a whole-run enqueue census. Sampled invocation
+elapsed median356us,max27091us includes observer work, not CPU or all calls.
+Client response frontier1134 holds with42B reordered at22–24s and56B at25.274s;
+the probe's4.704106s confirmation maximum is separate from3.979938s forward HOL.
+Without exact reply endpoints, their critical-path contributions cannot be summed.
+
+| Own sampled cost | Value |
+|---|---:|
+| UP46 /47; DOWN46 /47 class-byte deltas |788,039,221 /1,016,810,897;9,126,938 /12,864,331B|
+| UP /DOWN bytes per confirmed byte |1.893422 /.023070|
+| UP46 /47 backlog peaks; simultaneous UP /DOWN peak |11,373,146 /26,242,206;31,817,018 /36,008B|
+| Client native /Product flight peak; client /server queue peak |67,402,124 /54,797,176;641,510 /133,650B|
+| Client /server peak RSS; final RSS,KiB |391,572 /138,140;368,480 /130,324|
+| Client /server peak lifetime ps CPU; final,% of one core |169 /71.7;152 /58.5|
+
+No exact lifetime amplification or interval CPU follows from these sampled costs.
+SinkPID25/start71521824 persists,164 additional ticks, no major-fault increase,
+peak RSS201,812KiB, historical swap672,492KiB constant. All eight native epochs
+per role remain stable without ACK regression; active8/suspect0/failed0 does
+not mean all Product paths are qualified. The same direct200+200 profile is
+verified: UP70/DOWN30ms, no jitter/random loss/netem drops;46UP10Mbps observed
+15.009875–25.018593s, UDP blackhole30.030804–33.306350s with separate DROP
+accounting.45 service rows span.000089–44.545855s; client44/server43 unique
+generation stamps exclude repeats. Final target snapshot contains all953,221,120B.
+
+Logs total447lines/217,761B:177 head records,45 client and45 server prefixes,
+76 write begin/end,46 receive stalls,58 hole events. All38 sampled writes
+succeed (median58.5us,max8288us); unsampled writes remain unbounded by this
+sample. This low-volume diagnostic supplies the declared distinction—future
+Original clock versus queued/live-copy coverage—without promoting04f or
+proving that changing that clock would improve ordinary service.
+
+Archive: [EXACT_HEAD_DIAGNOSTIC_20260911.raw.tar.gz](EXACT_HEAD_DIAGNOSTIC_20260911.raw.tar.gz),
+11 safe regular members,397,247B compressed /3,153,751B uncompressed; all bytes
+verified. Six raw files, exact six-file patch, build/driver logs, run.py/shape.sh;
+no configurations or executable.

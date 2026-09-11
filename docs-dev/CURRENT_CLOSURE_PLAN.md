@@ -1,6 +1,6 @@
 # Current deterministic closure plan
 
-Updated: 2026-09-11 07:59 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 08:26 +08:00. Authoritative repository: ./.
 **No performance/release acceptance, push or public README update.**
 Continue the authorized closure loop; an intermediary commit is not completion.
 
@@ -15,8 +15,11 @@ Continue the authorized closure loop; an intermediary commit is not completion.
   The bounded exact-range exclusion correction04f1e56 passes152focused checks
   and independent review. Ordinary95178 completes, but shorter stalls accompany
   lower useful speed and higher wire/queue cost. Exact defect fixed; composition
-  UNACCEPTED. Diagnostic77827 now proves a2.551s assigned receiver head gap,
-  not local target parking. Next exact owner/copy/deadline attribution, not tune.
+  UNACCEPTED.77827 proves assigned receiver HOL. New19038 identifies a3.980s
+  TCP46-owned head stall with an actual measured Q47 alternate withheld by the
+  retained future loss clock. Clocks do NOT renew; this is local timing policy,
+  not a native requirement or proven CPU bug. Next bounded pre-code credit-rescue
+  contract review below; no blanket hedge/controller/threshold change.
 - The finite client Input correction materially improves upload, including
   QoS+QUIC outage: exact-confirmed56.280→186.629Mbps; settlement79.379→43.147s.
   However,6.382s confirmation gap remains. Trace THIS return prefix now.
@@ -50,8 +53,8 @@ correction described below, plus its focused tests and RFC clarification.
 Rejected **f8b8cac** remains a tracking checkpoint; its frozen ordinary binary
 ./.tmp/reflection/bin/logical-feedback-20260911/mptunnel is NOT active design.
 Ordinary04f1e56 is frozen under ./.tmp/reflection/bin/clipped-range-20260911/mptunnel.
-target/release/mptunnel is the two-file prefix DIAGNOSTIC, also frozen under
-./.tmp/reflection/bin/clipped-prefix-20260911/mptunnel. Use explicit binary
+target/release/mptunnel is the six-file exact-head DIAGNOSTIC, also frozen under
+./.tmp/reflection/bin/exact-head-20260911/mptunnel. Use explicit binary
 paths. All observer and rejected-trial runtime edits are reversed.
 The user's seven-line LIVE_OWNER_FRONTIER_WORK_BOUND.md is unrelated
 dirty source; never edit/stage it. The temporary two-file ACK-admission observer
@@ -1191,6 +1194,72 @@ checks pass. Author is implementing the declared observer, reviewer independentl
 checks actual evaluator/ledger boundaries. Expected six feature-only files include
 the existing two prefix hooks and narrow sender/ledger bridges. No new runtime
 fix, compiler or lab is active; ordinary04f remains composition-unaccepted.
+
+08:15+08 observer review PASS from root and independent actual-diff reviewer.
+Six-file feature-only overlay is frozen at exact-head-observer-0911.patch;
+sample state is an ordinary Option, no RefCell/Sync change. Actual coverage
+uses the existing combined vector's pre-normalization copy/queue slices. Raw
+retained fields precede the evaluator; only its real timing observation supplies
+the separately labelled evaluated retained clocks. Shorter same-head retries
+clear superseded observations; later ranges cannot overwrite the head. All three
+early returns and normal completion finalize the sample; actual enqueue counters
+do not imply native acceptance. One selected sample per second, no new runtime
+authority or query. Root sole four-job feature build next, no lab overlap; freeze
+bin/exact-head-20260911 and reverse all six files before the declared one capture.
+
+08:16+08 build96258 CLOSED0 in1m26, pre-existing unused-wrapper warning only.
+Frozen source patch unchanged; executable copied to bin/exact-head-20260911.
+All six observer source files reversed with apply_patch and empty diff verified
+before the sole exact-head-diagnostic-0911 lab. Same200+200QoS/outageUP and the
+six declared head/prefix/write/hole events, selected stream0; no compiler overlap.
+target/release is diagnostic, not the ordinary04f executable. Source04f remains
+clean except docs and the untouched userdoc. Full ordinary acceptance unchanged.
+
+08:23+08 diagnostic19038 CLOSED0:953221120B/44.779863s=170.295Mbps,
+allacceptedconfirmed/noerrors; driver45.546014s. Maxconfirmation4.704106s and
+write3.290572s are diagnostic, not ordinary regression claims. Exact largest
+receive gap is3.979938s atR479411258,21.164629→25.144567s; matched target write
+1384us. At22.154910/23.158446/24.273281s, the same sole attached TCP0 physical4
+Original[479411258,479476794) owns F; no copy or queued coverage. ACTUAL head
+model has Q1 physical1 measured/notpending/notexhausted, targetETA.637/.958/.122s,
+but future loss clock prevents enqueue. Retained loss≈25.912683/fallback27.097927s
+remain fixed across samples, not renewed. Original assignment≈19.986464s;
+current ownerRTT5346.596ms/legacyETA16.054s is not exact remaining head residence.
+TCP46 live socket evidence independently confirms real multi-secondRTT and
+continuing ACK progress; some management-native stamps later freeze. Q47 ACKs
+continue. R=W=T stays athead through21.976–24.976s; winner atrelease is unknown.
+The larger confirmation gap also includes reverse reorder, not allforwardHOL.
+
+Information forecast succeeds: this stall has actual Original-clock withholding,
+not unassigned source/localtarget write/accepted-copy suppression or absenttarget
+at those sampled decisions. There are45 sampled evaluator calls: zero head
+enqueue but15 later-range insertions/182336B, not zero whole-run repair. Most
+other samples are live-copy covered; do not generalize one head cause to all.
+Reader archives full series/cost/profile; no runtime fix or promotion follows.
+
+Next pre-code decision is the timing policy, not timer renewal or a new BBR
+parameter. Historyfaee89d borrowed native-style loss thresholds to replace an
+older3-interval wait; later exact clocks and owner-completion comparison retained
+the early-launch floor. RFC8684§3.3.6 leaves cross-subflow reinjection to local
+policy; RFC9002§6.1.2 describes packet-loss inference inside one packet-number
+space, not a mandatory Product cross-carrier safety gate. Native rules remain
+unchanged. Sources: https://www.rfc-editor.org/rfc/rfc8684.html#section-3.3.6 and
+https://www.rfc-editor.org/rfc/rfc9002.html#section-6.1.2 .
+
+Blanket pre-loss hedging is NOT selected: known healthy ACK-return delay and
+aggregate owner suffix debt can produce useless extra copies/shared queue harm.
+Root is reviewing a narrower ordered-credit rescue contract: exact authoritative
+omitted F, A=peerMAX (no new DSNs available), no queued/live copy, and a normally
+measured/fresh distinct target. One existing-quantum head repair could avoid
+waiting for the congested Original's loss classification without declaring native
+loss or using a fallback deadline as a delivery estimate. This is a candidate
+policy distinction, not yet implementation or acceptance. Independent critique
+must establish its meaning across sparse/healthy/asymmetric/shared conditions.
+Conditional information/gain forecast: earlier alternate might remove part of
+the observed~2s credit-exhausted interior, but could lose to Original/ACK arrival
+or cost shared service. No guaranteed .122s latency or whole-run Mbps gain is
+inferred from ETA. Existing clocks, exact exclusion/D, admission and all global
+gates must remain; no coefficient/queue/window change or blanket copy ban.
 
 ## Separate open issue: one-core burst near20%QUIC loss
 

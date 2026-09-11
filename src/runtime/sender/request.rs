@@ -49,9 +49,11 @@ use crate::protocol::frame::{
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::commands::{
     ReliablePathCommandSender, ReliablePathFrameReservation, reliable_path_effective_frame_lane,
 };
+use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::relay::io::{
     AuthoritativeStreamAckSnapshot, exact_contiguous_retransmission_frames, first_proven_ack_gap,
@@ -269,6 +271,32 @@ pub(in crate::runtime) struct RequestDataAckGapService {
     pub(in crate::runtime) due_recovery_work: bool,
     pub(in crate::runtime) target_service_exhausted: bool,
     pub(in crate::runtime) has_measured_target: bool,
+    pub(in crate::runtime) next_deadline: Option<Instant>,
+}
+
+/// One candidate for normal carrier repair Apply, not provisional queue intent.
+pub(in crate::runtime) struct RequestPreparedRecoveryCandidate {
+    pub(in crate::runtime) frame: Frame,
+    pub(in crate::runtime) target: RelayPathInstance,
+    pub(in crate::runtime) snapshot: PathSnapshot,
+    pub(in crate::runtime) cause: RelaySendCause,
+    pub(in crate::runtime) lane: TrafficClass,
+    plan: RequestMultipathPlan,
+}
+
+impl RequestPreparedRecoveryCandidate {
+    pub(in crate::runtime) fn commit_with_current_native_shape<R>(
+        &self,
+        commands: &ReliablePathCommandSender,
+        commit: impl FnOnce(Option<NativeCarrierSchedulingShapeSnapshot>) -> R,
+    ) -> Option<R> {
+        self.plan.commit_with_current_native_shape(commands, commit)
+    }
+}
+
+#[derive(Default)]
+pub(in crate::runtime) struct RequestPreparedRecoveryObservation {
+    pub(in crate::runtime) candidate: Option<RequestPreparedRecoveryCandidate>,
     pub(in crate::runtime) next_deadline: Option<Instant>,
 }
 
@@ -865,6 +893,303 @@ impl RequestSenderService {
         model.uniform_frontier_extent_bytes = uniform_frontier_extent_bytes;
         model.owner_recovery_timing = owner_recovery_timing;
         model
+    }
+
+    /// Candidate policy: continue only through accepted current suppression.
+    /// The caller captures Native outside Product and repeats this query under
+    /// the selected Native fence before committing its exact queue reservation.
+    #[allow(clippy::too_many_arguments)]
+    fn next_prepared_recovery(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        sender_queue: &ReliableRelaySenderQueue,
+        authoritative_ack: &AuthoritativeStreamAckSnapshot,
+        lane: TrafficClass,
+        inputs: RequestRelayNativeInputs,
+        ready: &[RelayPathInstance],
+        observed_at: Instant,
+    ) -> RequestPreparedRecoveryObservation {
+        let live = remotes.path_instances();
+        let (covered, next_deadline) = self.multipath.live_copy_coverage(&live, observed_at);
+        let mut result = RequestPreparedRecoveryObservation {
+            candidate: None,
+            next_deadline,
+        };
+        let retained = send_stream.retained_ranges_in_scope(OffsetRange {
+            start: send_stream.data_ack_frontier(),
+            end: send_stream.next_offset(),
+        });
+        let Some(mut range) = offset_ranges_not_covered(&retained, &covered)
+            .first()
+            .copied()
+        else {
+            return result;
+        };
+        for queued in sender_queue.queued_reinjection_ranges() {
+            if queued.start <= range.start && queued.end > range.start {
+                return result;
+            }
+            if queued.start > range.start {
+                range.end = range.end.min(queued.start);
+            }
+        }
+        if let Some(gap) = authoritative_ack
+            .gaps()
+            .iter()
+            .find(|gap| gap.start <= range.start && gap.end > range.start)
+        {
+            range.end = range.end.min(gap.end);
+        }
+        let Some(observation) = self
+            .multipath
+            .observe_prepared_recovery_from_inputs(context, remotes, lane, inputs)
+        else {
+            return result;
+        };
+        let selection_quantum = observation
+            .paths
+            .iter()
+            .filter(|path| ready.contains(&path.instance))
+            .filter_map(|path| path.shared_snapshot)
+            .map(|snapshot| {
+                adaptive_reliable_relay_reinjection_bytes(Some(snapshot), lane, context.mux_limits)
+            })
+            .max()
+            .unwrap_or(0);
+        let selection_quantum = reliable_live_frontier_reinjection_limit_bytes(
+            selection_quantum,
+            selection_quantum,
+            flight_interval_bytes(range.start, range.end),
+            send_stream.reinjection_bytes(),
+            context.mux_limits,
+        );
+        if selection_quantum == 0 {
+            return result;
+        }
+        range.end = range
+            .end
+            .min(range.start.saturating_add(selection_quantum as u64));
+        let boundary = self
+            .multipath
+            .recovery_service_boundaries(&[range])
+            .into_iter()
+            .find(|end| *end > range.start)
+            .unwrap_or(range.end);
+        loop {
+            let Some(frontier) = self.multipath.live_owner_uniform_frontier(range, &live) else {
+                return result;
+            };
+            if frontier.owners.len() != 1 {
+                return result;
+            }
+            let scored = frontier.range;
+            let Some(frames) = exact_contiguous_retransmission_frames(send_stream, scored) else {
+                return result;
+            };
+            let preview = &frames[0];
+            let mut avoid = frontier.avoid.clone();
+            avoid.extend(
+                live.iter()
+                    .copied()
+                    .filter(|instance| !ready.contains(instance)),
+            );
+            let model = self
+                .multipath
+                .data_ack_gap_reinjection_model_from_observation(
+                    context,
+                    remotes,
+                    preview,
+                    lane,
+                    flight_interval_bytes(scored.start, scored.end),
+                    Some((
+                        sender_queue,
+                        send_stream.reinjection_bytes(),
+                        context.mux_limits,
+                    )),
+                    &avoid,
+                    &observation,
+                );
+            let Some(timing) = self
+                .multipath
+                .observe_original_recovery_timing_for_range(scored, |_| model.original_path_timing)
+            else {
+                return result;
+            };
+            let proven = authoritative_ack
+                .gaps()
+                .iter()
+                .any(|gap| gap.start <= scored.start && gap.end >= scored.end);
+            let deadline = if proven {
+                timing
+                    .target_deadline(
+                        model.reinjection_completion,
+                        model.owner_completion,
+                        observed_at,
+                    )
+                    .unwrap_or(timing.fallback_at)
+            } else {
+                timing.fallback_at
+            };
+            if deadline > observed_at {
+                result.next_deadline = Some(
+                    result
+                        .next_deadline
+                        .map_or(deadline, |old| old.min(deadline)),
+                );
+                if boundary < scored.end {
+                    range.end = boundary;
+                    continue;
+                }
+                return result;
+            }
+            let Some((target, snapshot)) = model.reinjection_target else {
+                return result;
+            };
+            if !ready.contains(&target.instance) || model.target_service_exhausted {
+                return result;
+            }
+            let target_service = reliable_reinjection_service_limit_bytes(
+                ReliableReinjectionTargetWork::new(
+                    Some(snapshot),
+                    sender_queue.request_target_queued_reinjection_bytes(target.instance, false),
+                    model.reinjection_target_flight_bytes,
+                ),
+                send_stream.reinjection_bytes(),
+                context.mux_limits,
+            );
+            let extent = reliable_live_frontier_reinjection_limit_bytes(
+                adaptive_reliable_relay_reinjection_bytes(Some(snapshot), lane, context.mux_limits),
+                selection_quantum,
+                flight_interval_bytes(scored.start, scored.end),
+                send_stream.reinjection_bytes(),
+                context.mux_limits,
+            )
+            .min(target_service);
+            if extent == 0 {
+                return result;
+            }
+            let Some(frames) = exact_contiguous_retransmission_frames(
+                send_stream,
+                OffsetRange {
+                    start: scored.start,
+                    end: scored.start.saturating_add(extent as u64),
+                },
+            ) else {
+                return result;
+            };
+            // A carrier Apply owns one real frame; another cache fragment is
+            // selected again only after this one's accepted occupancy commits.
+            let frame = frames[0].clone();
+            let cause = if proven {
+                RelaySendCause::persistent_client_ack_gap_reinjection(target, snapshot)
+            } else {
+                RelaySendCause::CompletionTailReinjection(target)
+            };
+            let Ok(plan) = self.multipath.prepared_recovery_plan_from_observation(
+                &observation,
+                target.instance,
+                lane,
+            ) else {
+                return result;
+            };
+            result.candidate = Some(RequestPreparedRecoveryCandidate {
+                frame,
+                target: target.instance,
+                snapshot,
+                cause,
+                lane,
+                plan,
+            });
+            return result;
+        }
+    }
+
+    /// Normal repair queue Apply using the caller-held Native -> Product fence.
+    /// No Native read, source conversion, or private future repair payload.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn commit_prepared_recovery(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        sender_queue: &ReliableRelaySenderQueue,
+        candidate: &RequestPreparedRecoveryCandidate,
+        ready: &ReliableWriterReadyGuard,
+        shape: Option<NativeCarrierSchedulingShapeSnapshot>,
+    ) -> Result<Instant, RuntimeError> {
+        let target = candidate.target;
+        if ready.receipt().instance() != target.path_instance_id
+            || !ready.receipt().is_current()
+            || !candidate.plan.supplied_native_shape_matches(shape)
+            || !candidate
+                .plan
+                .target_retains_exact_eligibility(context, candidate.lane)
+            || self
+                .multipath
+                .reinjection_avoid_instances(&candidate.frame, candidate.cause, remotes)
+                .contains(&target)
+            || sender_queue.has_queued_reinjection_overlap(&candidate.frame)
+            || self
+                .reinjection_suppression_deadline_for_frame(&candidate.frame, remotes)
+                .is_some()
+        {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
+        let Some((start, end, payload_bytes)) =
+            crate::protocol::frame::reliable_stream_frame_extent(&candidate.frame)
+        else {
+            return Err(RuntimeError::SenderServiceBlocked);
+        };
+        if exact_contiguous_retransmission_frames(send_stream, OffsetRange { start, end })
+            .is_none_or(|frames| frames.len() != 1 || frames[0] != candidate.frame)
+        {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
+        let Some(position) = candidate
+            .plan
+            .target_position_for_apply(remotes, candidate.lane)
+        else {
+            return Err(RuntimeError::SenderServiceBlocked);
+        };
+        let commands =
+            fixed_request_output_commands(&remotes.paths[position].stream.output)?.clone();
+        let command =
+            commands.try_reserve_reinjection_frame(candidate.frame.clone(), candidate.lane)?;
+        let exact_service = reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(
+                Some(candidate.snapshot),
+                sender_queue.request_target_queued_reinjection_bytes(target, false),
+                self.multipath.accepted_reinjected_data_bytes(target),
+            ),
+            send_stream.reinjection_bytes(),
+            context.mux_limits,
+        );
+        if exact_service < payload_bytes || !ready.try_consume() {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
+        let path_count = remotes.paths.len();
+        let (_, deadline) = self
+            .commit_fenced_frame_product(
+                context,
+                remotes,
+                RequestFrameProductCommit {
+                    plan: &candidate.plan,
+                    frame: &candidate.frame,
+                    cause: candidate.cause,
+                    position,
+                    path_count,
+                    reinjection_target_snapshot: Some(candidate.snapshot),
+                    request_load_claim: None,
+                },
+                None,
+            )
+            .map_err(RequestFrameAdmissionError::into_runtime)?;
+        command.commit();
+        self.optional_reinjection.record_reinjection(payload_bytes);
+        self.record_decision(target.key, payload_bytes, &candidate.frame, candidate.cause);
+        Ok(deadline.expect("accepted recovery owns its suppression deadline"))
     }
 
     /// Selects one independently due omission extent after already serviced
@@ -2443,7 +2768,6 @@ impl RequestFrameAdmissionError {
         }
     }
 
-    #[cfg(test)]
     fn into_runtime(self) -> RuntimeError {
         match self {
             Self::ServiceBlocked => RuntimeError::SenderServiceBlocked,

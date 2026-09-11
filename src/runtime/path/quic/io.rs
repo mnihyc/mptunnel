@@ -3,7 +3,7 @@
 use super::client::ClientUdpPathSessionRuntime;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{CloseReason, DatagramFlowId, Frame, StreamId};
+use crate::protocol::{CloseReason, DatagramFlowId, Frame};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authority::{
     NativeCarrierRateAuthorityBinding, NativeCarrierRateAuthorityHandle,
@@ -13,7 +13,6 @@ use crate::runtime::path::commands::{
     reliable_path_command_queue, reliable_stream_frame_queue_for_payload,
 };
 use crate::runtime::path::input::{CarrierInputRoute, PendingMailboxFrame};
-use crate::runtime::path::native_commitment::{NativeCommitmentError, NativeOperationCommitment};
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::scheduler::TrafficClass;
@@ -40,7 +39,6 @@ pub(in crate::runtime) struct UdpPathConnection {
 #[derive(Debug)]
 pub(in crate::runtime) struct UdpPathSendStream {
     stream: quic_transport::SendStream,
-    native_commitment: Option<NativeOperationCommitment>,
 }
 
 #[derive(Debug)]
@@ -78,25 +76,6 @@ fn quic_stream_priority(lane: TrafficClass) -> i32 {
 }
 
 impl UdpPathSendStream {
-    pub(super) fn bind_product_commitment(
-        &mut self,
-        stream_id: StreamId,
-    ) -> Result<NativeOperationCommitment, RuntimeError> {
-        if self.native_commitment.is_some() {
-            return Err(RuntimeError::Protocol(
-                "QUIC Product commitment bound twice",
-            ));
-        }
-        let observer = self
-            .stream
-            .native_progress_observer()
-            .map_err(|error| RuntimeError::Io(std::io::Error::other(error)))?;
-        let commitment =
-            NativeOperationCommitment::new(observer, stream_id).map_err(native_commitment_error)?;
-        self.native_commitment = Some(commitment.clone());
-        Ok(commitment)
-    }
-
     pub(super) fn request_stream_id(&self) -> u64 {
         self.stream.request_stream_id()
     }
@@ -350,10 +329,7 @@ impl UdpPathConnection {
     ) -> Result<(UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
         let (send, recv) = self.connection.open_bi().await?;
         Ok((
-            UdpPathSendStream {
-                stream: send,
-                native_commitment: None,
-            },
+            UdpPathSendStream { stream: send },
             UdpPathRecvStream { stream: recv },
         ))
     }
@@ -363,10 +339,7 @@ impl UdpPathConnection {
     ) -> Result<(UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
         let (send, recv) = self.connection.accept_bi().await?;
         Ok((
-            UdpPathSendStream {
-                stream: send,
-                native_commitment: None,
-            },
+            UdpPathSendStream { stream: send },
             UdpPathRecvStream { stream: recv },
         ))
     }
@@ -418,7 +391,9 @@ pub(in crate::runtime) async fn udp_path_write_frame(
     frame: &Frame,
     codec_limits: CodecLimits,
 ) -> Result<(), RuntimeError> {
-    udp_path_write_frames(send, std::slice::from_ref(frame), codec_limits).await
+    ensure_quic_data_plane_frames(std::slice::from_ref(frame))?;
+    quic_transport::write_frame(&mut send.stream, frame, codec_limits).await?;
+    Ok(())
 }
 
 pub(super) async fn udp_path_write_datagram_refusal(
@@ -455,23 +430,8 @@ async fn udp_path_write_frames(
     codec_limits: CodecLimits,
 ) -> Result<(), RuntimeError> {
     ensure_quic_data_plane_frames(frames)?;
-    let operation = send
-        .native_commitment
-        .as_ref()
-        .map(|commitment| commitment.prepare_operation(frames))
-        .transpose()
-        .map_err(native_commitment_error)?;
     quic_transport::write_frames(&mut send.stream, frames, codec_limits).await?;
-    if let (Some(commitment), Some(operation)) = (&send.native_commitment, operation) {
-        commitment
-            .record_accepted_operation(operation)
-            .map_err(native_commitment_error)?;
-    }
     Ok(())
-}
-
-fn native_commitment_error(error: NativeCommitmentError) -> RuntimeError {
-    RuntimeError::Io(std::io::Error::other(error))
 }
 
 fn ensure_quic_data_plane_frames(frames: &[Frame]) -> Result<(), RuntimeError> {
@@ -779,7 +739,3 @@ pub(super) fn spawn_quic_path_reader(
 #[cfg(test)]
 #[path = "tests_io.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "tests_native_commitment_producer.rs"]
-mod native_commitment_producer_tests;

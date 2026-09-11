@@ -770,17 +770,6 @@ impl RequestMultipathPlan {
         self.product_mutation.assigns_original_data()
     }
 
-    pub(super) fn supplied_native_shape_matches(
-        &self,
-        shape: Option<NativeCarrierSchedulingShapeSnapshot>,
-    ) -> bool {
-        match (self.native_authority_stamp, shape) {
-            (Some(expected), Some(current)) => expected == current.stamp(),
-            (None, None) => self.target.instance.key.underlay == UnderlayProtocol::Tcp,
-            _ => false,
-        }
-    }
-
     /// Records one target-local apply failure for a finite same-quantum
     /// ordinary replan. This owns no scheduling order: the next attempt is
     /// selected again by ordinary finite ranking with this exact incarnation
@@ -1181,71 +1170,6 @@ impl RequestMultipathController {
         )
     }
 
-    pub(super) fn observe_prepared_recovery_from_inputs(
-        &self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        lane: TrafficClass,
-        inputs: RequestRelayNativeInputs,
-    ) -> Option<RequestRelaySchedulingObservation> {
-        let shapes = inputs.attached_paths.clone();
-        let mut observation = observe_prepared_request_relay_scheduling_from_native_inputs(
-            context,
-            self.stream_id,
-            remotes.membership_generation(),
-            &remotes.paths,
-            lane,
-            PATH_OPEN_SCORE_BYTES,
-            true,
-            inputs,
-        )?;
-        for path in &mut observation.paths {
-            let Some((_, _, ReliableRequestNativeShape::Current(shape))) = shapes
-                .iter()
-                .find(|(instance, _, _)| *instance == path.instance)
-            else {
-                continue;
-            };
-            if let Some(snapshot) = path.shared_snapshot.as_mut() {
-                if !shape.srtt().is_zero() {
-                    snapshot.srtt_ms = shape.srtt().as_secs_f64() * 1_000.0;
-                    snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1_000.0;
-                }
-                snapshot.bytes_in_flight = shape.bytes_in_flight();
-                snapshot.carrier_inflight_limit_bytes = shape
-                    .congestion_window()
-                    .max(u64::from(shape.current_mtu()));
-                snapshot.app_limited = shape.app_limited();
-            }
-        }
-        Some(observation)
-    }
-
-    /// An already ranked recovery target, never an Original source plan.
-    pub(super) fn prepared_recovery_plan_from_observation(
-        &self,
-        observation: &RequestRelaySchedulingObservation,
-        instance: RelayPathInstance,
-        lane: TrafficClass,
-    ) -> Result<RequestMultipathPlan, RequestMultipathPlanError> {
-        RequestMultipathPlan::new(
-            RequestMultipathTarget {
-                membership_generation: observation.membership_generation,
-                instance,
-            },
-            RequestProductSendMutation::None,
-        )
-        .with_eligibility_expectation(
-            observation,
-            lane,
-            Some(RequestSchedulingState {
-                operation: self.request.ack_clock_operation,
-                path_states: &self.request.path_states,
-                flights: Some(&self.request.flights),
-            }),
-        )
-    }
-
     /// Preserve full membership and Original debt when choosing among actual
     /// imminent writers. The finite tier pass does not reclassify a filtered
     /// survivor as FirstPath and does not turn a busy regular into a dead path.
@@ -1441,43 +1365,6 @@ impl RequestMultipathController {
         service: Option<(&ReliableRelaySenderQueue, usize, MuxLimits)>,
         scoring_avoid: &[RelayPathInstance],
     ) -> RequestDataAckGapObservation {
-        let recovery_observation = observe_request_relay_scheduling(
-            context,
-            self.stream_id,
-            remotes.membership_generation(),
-            &remotes.paths,
-            None,
-            TrafficClass::Throughput,
-            PATH_OPEN_SCORE_BYTES,
-            true,
-            &self.request.requalification,
-        );
-        self.data_ack_gap_reinjection_model_from_observation(
-            context,
-            remotes,
-            preview,
-            lane,
-            scoring_payload_bytes,
-            service,
-            scoring_avoid,
-            &recovery_observation,
-        )
-    }
-
-    /// Product-only recovery projection. Native values were captured before
-    /// acquiring Product ownership, or supplied by the selected Native fence.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn data_ack_gap_reinjection_model_from_observation(
-        &self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        preview: &Frame,
-        lane: TrafficClass,
-        scoring_payload_bytes: usize,
-        service: Option<(&ReliableRelaySenderQueue, usize, MuxLimits)>,
-        scoring_avoid: &[RelayPathInstance],
-        recovery_observation: &RequestRelaySchedulingObservation,
-    ) -> RequestDataAckGapObservation {
         let original_flight = self
             .request
             .flights
@@ -1489,6 +1376,17 @@ impl RequestMultipathController {
             .request
             .flights
             .original_transmission_underlay_for_frame(preview);
+        let recovery_observation = observe_request_relay_scheduling(
+            context,
+            self.stream_id,
+            remotes.membership_generation(),
+            &remotes.paths,
+            None,
+            TrafficClass::Throughput,
+            PATH_OPEN_SCORE_BYTES,
+            true,
+            &self.request.requalification,
+        );
         // A replacement carrier with the same numeric path key must not lend
         // its RTT or congestion evidence to an older attachment's flight. The
         // owner and alternate below are both projected from this one immutable
@@ -1496,7 +1394,7 @@ impl RequestMultipathController {
         // OriginalData debt, so only the alternate is charged the new copy.
         let original_path_timing = original_path.and_then(|instance| {
             self.request_reinjection_target_snapshot_from_observation(
-                recovery_observation,
+                &recovery_observation,
                 instance,
             )
         });
@@ -1529,7 +1427,7 @@ impl RequestMultipathController {
                     .is_some_and(|observed| observed.has_bulk_model_evidence)
                     || self
                         .request_reinjection_target_snapshot_from_observation(
-                            recovery_observation,
+                            &recovery_observation,
                             instance,
                         )
                         .is_none())
@@ -1544,7 +1442,7 @@ impl RequestMultipathController {
                 RelaySendCause::PersistentAckGapReinjection,
                 &avoid_instances,
                 scoring_payload_bytes,
-                Some(recovery_observation),
+                Some(&recovery_observation),
             ) {
                 Ok(position) => position,
                 Err(RequestMultipathPlanError::ServiceBlocked) => {
@@ -1566,7 +1464,7 @@ impl RequestMultipathController {
                 break None;
             }
             let Some(snapshot) = self.request_reinjection_target_snapshot_from_observation(
-                recovery_observation,
+                &recovery_observation,
                 instance,
             ) else {
                 break None;
@@ -2314,7 +2212,7 @@ impl RequestMultipathController {
         Some(snapshot)
     }
 
-    pub(super) fn request_reinjection_target_snapshot_from_observation(
+    fn request_reinjection_target_snapshot_from_observation(
         &self,
         observation: &RequestRelaySchedulingObservation,
         instance: RelayPathInstance,

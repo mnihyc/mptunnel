@@ -2,6 +2,7 @@ use super::authority::NativeCarrierRateAuthorityHandle;
 use super::commands::ReliablePathCommand;
 #[cfg(test)]
 use super::commands::{RequestTcpCapacityProbeRequest, TcpCapacityProbeCommand};
+use super::native_commitment::NativeOperationCommitment;
 use super::prepared::{PreparedOriginalWait, PreparedOriginalWork};
 use super::writer_boundary::{ReliableWriterBoundary, ReliableWriterReadyGuard};
 #[cfg(feature = "lab-diagnostics")]
@@ -317,6 +318,9 @@ struct ReliablePathCommandQueueMetrics {
     pending_bytes: AtomicU64,
     writer_pending_bytes: AtomicU64,
     writer_boundary: Arc<ReliableWriterBoundary>,
+    /// Exact capability for this exclusive FIFO, when supplied by its adapter.
+    /// Absence means unavailable, never an empty native queue observation.
+    native_commitment: Mutex<Option<NativeOperationCommitment>>,
     /// Upper/lower 32 bits hold total and latency-sensitive live flows.
     flow_counts: AtomicU64,
     capacity_released: Arc<Notify>,
@@ -788,6 +792,22 @@ impl ReliablePathCommandQueueMetrics {
 }
 
 impl ReliablePathCommandReceivers {
+    pub(in crate::runtime) fn bind_native_commitment(
+        &mut self,
+        commitment: NativeOperationCommitment,
+    ) -> Result<(), RuntimeError> {
+        let mut current = self
+            .metrics
+            .native_commitment
+            .lock()
+            .expect("native commitment binding");
+        if current.is_some() {
+            return Err(RuntimeError::Protocol("native FIFO commitment bound twice"));
+        }
+        *current = Some(commitment);
+        Ok(())
+    }
+
     /// Moves the existing recovery queue to an independently polled native
     /// ordering domain. Only a single-stream attachment may use this split.
     /// Capacity, reservations and byte accounting are not duplicated.
@@ -1051,6 +1071,13 @@ impl Drop for ReliablePathCommandReceivers {
     fn drop(&mut self) {
         self.metrics.lifecycle.finish_failed();
         self.metrics.writer_boundary.invalidate();
+        // Retired sender handles must not retain the old native stream through
+        // this capability. Readiness is invalidated before removing the binding.
+        self.metrics
+            .native_commitment
+            .lock()
+            .expect("native commitment binding")
+            .take();
         // Queued envelopes reconcile themselves. This covers a command already
         // removed from mpsc when a writer exits through an async error path.
         let outstanding = self.dequeued_unreleased_bytes.swap(0, Ordering::Relaxed);
@@ -1060,6 +1087,14 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
+    pub(in crate::runtime) fn native_commitment(&self) -> Option<NativeOperationCommitment> {
+        self.metrics
+            .native_commitment
+            .lock()
+            .expect("native commitment binding")
+            .clone()
+    }
+
     /// Preserves the existing Original lane and queue capacity. A full queue
     /// owns only one weak registration wait, never a reserved source payload.
     pub(in crate::runtime::path) fn enqueue_prepared_work(&self, work: PreparedOriginalWork) {

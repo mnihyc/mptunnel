@@ -1,7 +1,82 @@
 # v0.4.9 release closure plan
 
-Updated: 2026-09-11 12:08 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 14:06 +08:00. Authoritative repository: ./.
 Category: user-directed release convergence. No release acceptance yet.
+
+### Next same-owner interaction discriminator (2026-09-11 14:00+08)
+
+The correct-rate intervention below leaves severe collapse. Do not start a
+controller/estimator rewrite from that failed sufficient-cause hypothesis.
+The two demonstrated mechanisms remain: large pre-packet Original exposure,
+and feedback-serialized alternate recovery behind that exposure. Each isolated
+candidate failed composed service. Next test their interaction, not a new timer,
+reserve, bandwidth scalar or protocol preference: EXACT native-refill trial
+plus EXACT ec8 coverage-pipeline trial, with the committed20% defaults.
+
+Why this is one bounded model question: the pipeline can remove oldQUICprefixes
+using healthy TCP, but its isolated healthy run wastes material alternate work;
+refill reduces pre-packet exposure but cannot itself accelerate already-owned
+prefix recovery. Smaller exposure could reduce the pipeline's healthy copy
+cost. This is a hypothesis, not attribution of every copied byte: native RTT,
+already-packetized debt, stale receipt knowledge and late W inflation remain.
+No selected W/quantum/timer is changed to rescue either result.
+
+Information/benefit forecast: if the interaction matters, QoS service should
+materially approach the independent TCP control's~180Mbps while preserving
+healthy timing/service. A high whole mean alone cannot pass. No gain, the
+previous healthy40% loss, new gaps/echo failures, or unbounded work are plausible
+falsifiers. Run the existing exact counter/refill and uncovered-range producer
+checks, then ONE ordinary20% same-DOWN-profile comparison against the retained
+control. No new test harness. This is not automatic reinstatement or stacking
+unverified mechanisms: both isolated trials, including adverse results, remain
+explicit. Only a useful interaction permits affected UP/shared/singleton gates;
+otherwise withdraw the whole combination and stop this composition hypothesis.
+Root alone builds/runs; no auxiliary review is claimed after service quota.
+
+Combined focused checks closed:350 response-filter tests and167QUIC-filter
+tests pass (overlapping sets, not517distinct assertions). The real second
+disjoint repair admission and native-blocked source/Pong cases are included.
+Native counter/0RTT/reservation code is byte-identical to the separately tested
+refill patch. Ordinary release build is active; no traffic overlaps. Exact
+combined source is native-refill-coverage-combined-0911.patch; no oracle code,
+gain, deadline, source quantum, W reference or20% policy changes are included.
+
+Interaction CLOSED and withdrawn: ordinary whole200.413,healthy226.657,
+QoS142.116Mbps; healthy is34.37% below matching20% control345.358. The1.838s
+bodygap at19.973--21.810s coexists with one3.003s echo timeout;35exchanges
+succeed and39later scheduled attempts are unavailable after disconnection.
+SampledDOWNwire/useful1.509 versus1.240control. Peakserver/clientRSS242148/95188
+KiB, finalpsCPU132/43.1%; not every resource worsens. Complete timing, exact
+patch, costs and reproduction are added to the same raw evidence archive.
+The ENTIRE combination is removed with apply_patch; no trial/oracle remains
+in src/crates/RFC/manifests. target/release holds the rejected combined binary.
+
+Reflection/next decision: the four captures separate three claims. The high
+native capacity/currentACK-rate mismatch is REAL. Replacing its scheduling
+projection with the known correct rate is NOT a sufficient repair. Faster
+alternate recovery materially helps the cut, but both isolated and combined
+versions sacrifice healthy service. Thus native buffer permission, Original
+ownership, loss/recovery maturity and useful copy service must be composed;
+local-counter/coverage correctness does not supply that timing model. No
+gain/queue/deadline tuning, raw-rate estimator, protocol preference or blanket
+shared-bottleneck explanation is justified by these results.
+
+The remaining exact question is which healthy copies are already progressing
+normally in native service when Product recovery becomes eligible. Current
+captures have assignment/receipt/ACK timing and aggregate native inventory,
+not a per-range first-packetization boundary. Do not promote aggregate Q/C or
+assignment age into that missing observation, or repeat a rejected pipeline.
+A subsequent bounded recovery-model decision must supply this causal boundary
+before another correction; no new implementation is selected here. The severe
+split-link recovery gate remains blocked; README/version/release stay pending.
+
+Handoff checkpoint: the expanded archive now has24regular files (four complete
+runs, three exact patches, one reproduction/interpretation record), gzip and
+manifest verified. No build/lab remains active. After explicit artifact
+preflight, target/release/mptunnel is restored to the clean20% control binary
+(31,213,336B; byte comparison passes), not the rejected trial. The old binary
+is still recoverable in its explicitly named scratch directory. Source runtime
+diff against61279f0 is empty. Preserve the unrelated seven-line user edit.
 
 ### Current transaction: native QUIC Original refill (2026-09-11 13:23 +08)
 

@@ -3144,31 +3144,51 @@ bound to one exact FIFO lifetime; an early-data rewind or replacement stream
 cannot inherit it. Unavailable capability MUST remain unavailable and MUST NOT
 be replaced with zero or an approximate cursor.
 
-For a FIFO with this capability, a new Original writer transaction is eligible
-only when `E == P`. When `E > P`, leave new Original source unclaimed, including
-when this is the sole Ready writer. Wait for the captured `E` to be packetized
-or for exact FIFO termination. A past crossing resolves immediately. Product
-ACK, elapsed policy time and exported capacity cannot clear this condition.
+For a FIFO with this capability, retain the exact native interval `[B_k, E_k)`
+of its latest successfully completed, positive-length writer transaction. Capture
+`B_k` before the actual flush and publish `E_k` after successful native acceptance,
+before the writer can offer another Ready epoch. Individual prepared claims,
+refusals, zero-native-byte operations and partial writes MUST NOT advance this
+operation boundary. Unknown intervening native writes invalidate its use for
+early refill: the recorded `E_k` must equal the captured current accepted end `E`.
+
+A new Original transaction is eligible when the FIFO is empty (`E == P`), or
+when that exact latest transaction has started first packetization (`P > B_k`).
+Otherwise leave Original source unclaimed, including on the sole Ready writer.
+Wait for the accepted target `B_k + 1` when the operation is known, or conservatively
+for `E` when it is not, or for exact FIFO termination. Native adapter headers count
+toward this start crossing; it does not assert Product payload transmission. A past
+crossing resolves immediately. Product ACK, elapsed time and exported capacity
+cannot clear this condition.
 
 The transaction remains the existing bounded writer drain/flush unit, possibly
 containing multiple frames. Claimed work retains its exact bytes, offsets and
 charges through that complete transaction, including partial API writes. Do not
 park a staged batch waiting for more source or first packetization of bytes that
 have not yet been submitted. Before another transaction can claim Originals,
-finish the existing write and capture its actual native boundary. The bound is
-one existing transaction awaiting first packetization on each supported FIFO;
-it is not one quantum per receiver ACK or a global concurrency restriction.
+finish the existing write and capture its actual native boundary. Failure or
+cancellation retains the existing writer-retirement contract, never a new Ready
+permission for an abandoned partial operation.
+
+FIFO order gives a two-stage bound: one transaction whose packetization has
+started, plus one bounded successor staged or accepted behind it. Before a third
+Original transaction can enter, the successor must start, which proves every
+earlier transaction has completed first packetization. Thus at most two existing
+bounded Original transactions remain before first packetization on a supported
+FIFO. This is producer/service overlap, not a tunable byte reserve, one quantum
+per receiver ACK or a global concurrency restriction. Existing configured native
+connection limits remain additional bounds.
 
 Existing control and admitted recovery work remain serviceable through their
 ordinary priority and accounting. Other eligible Ready FIFOs remain able to
-claim shared source. The next Original also respects unpacketized control or
-recovery bytes already accepted on its own FIFO. Native transmission and loss
+claim shared source. A completed control or recovery flush also becomes the latest
+native operation; it does not bypass older FIFO predecessors. Native transmission and loss
 recovery continue independently. No operation-to-Product settlement ledger or
 header geometry is needed to establish this native opportunity.
 
 Capture native progress outside Product ownership. The invoking exclusive
 writer's exact Ready epoch MUST still be current at final Original claim, so
-another writer cannot append bytes between the captured empty boundary and that
+another writer cannot append bytes between the captured operation boundary and that
 claim. Other candidates likewise require their current Ready receipts. Within
 that lifetime, a captured busy boundary is conservative because `P` cannot
 rewind; arm its exact crossing wake rather than polling or manufacturing fresh
@@ -3186,12 +3206,22 @@ bounds, without an invented empty-FIFO receipt. This availability distinction
 neither prefers a protocol nor asserts an exact guarantee for every platform.
 QUIC FIFOs retain independent opportunities and share connection resources.
 
+Waiting for complete FIFO emptiness before every refill can repeatedly create
+native application-limited epochs, preventing bandwidth-plateau qualification and
+retaining Startup pacing despite sustained Product demand. Starting the successor
+while the active transaction still has native work removes that mandatory empty
+handoff without rewriting native application-limited provenance or congestion
+control. A native driver may nevertheless drain a small operation before delivering
+the wake; source or CPU delay and control-only flushes can also interrupt refill.
+This rule does not promise an always nonempty native queue.
+
 This rule bounds new Original inventory before first packetization, not its
 residence time, packetized flight, qdisc queues or physical delivery. Native
 packet and stream inventories overlap and MUST NOT be summed as disjoint work.
 Control, recovery and concurrent FIFOs remain accounted through their existing
-owners. Empty/refill handoffs can reduce service or create native application-
-limited observations; those costs MUST remain visible. Practical acceptance must
+owners. An additional overlapping transaction can increase native backlog, and
+remaining empty/refill handoffs can still create application-limited observations;
+those costs MUST remain visible. Practical acceptance must
 assess healthy and impaired service, continuity, latency and actual copy costs.
 
 Connection-wide source staging precedes stream-offset assignment and may

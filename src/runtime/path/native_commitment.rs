@@ -7,7 +7,7 @@
 
 use quinn::{SendStreamObservationError, SendStreamObserver, SendStreamProgress};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::runtime) enum NativeCommitmentError {
@@ -20,7 +20,7 @@ impl std::fmt::Display for NativeCommitmentError {
         match self {
             Self::Native(error) => write!(formatter, "native stream progress: {error}"),
             Self::InvalidNativeProgress => {
-                formatter.write_str("native progress exceeds its accepted end")
+                formatter.write_str("native stream progress or operation boundary is inconsistent")
             }
         }
     }
@@ -44,11 +44,29 @@ impl From<SendStreamObservationError> for NativeCommitmentError {
 /// One established observer for an exclusive native writer.
 ///
 /// Clones share observation, not permission for concurrent writes. A captured
-/// empty FIFO is usable only while the caller preserves that writer's current
+/// opportunity is usable only while the caller preserves that writer's current
 /// Ready ownership. Opposite directions and independent FIFOs stay separate.
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct NativeOperationCommitment {
     observer: Arc<NativeObserver>,
+    // One small, coherently published value shared by the writer and observers.
+    // Never hold this mutex across a Native read, Product ownership, or an await.
+    latest_operation: Arc<Mutex<Option<NativeOperationSpan>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeOperationSpan {
+    begin: u64,
+    completed: SendStreamProgress,
+}
+
+/// Captured before one real writer flush; creating or dropping it publishes no
+/// opportunity. The exclusive writer completes it only after successful I/O.
+#[derive(Debug)]
+pub(in crate::runtime) struct NativeOperationStart {
+    owner: Arc<Mutex<Option<NativeOperationSpan>>>,
+    previous_operation: Option<NativeOperationSpan>,
+    progress: SendStreamProgress,
 }
 
 #[derive(Debug)]
@@ -92,9 +110,11 @@ impl NativeObserver {
 pub(in crate::runtime) struct NativeCommitmentView {
     observer: Arc<NativeObserver>,
     progress: SendStreamProgress,
+    target: u64,
 }
 
-/// Wait for the accepted end from one captured FIFO snapshot, not for an ACK.
+/// Wait for a known operation's start, or the accepted end when its boundary is
+/// unknown. Both targets describe first packetization, not an ACK.
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct NativeCommitmentBarrier {
     observer: Arc<NativeObserver>,
@@ -122,17 +142,91 @@ impl NativeOperationCommitment {
         checked_progress(observer.snapshot())?;
         Ok(Self {
             observer: Arc::new(observer),
+            latest_operation: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Copy metadata before the Native read, releasing its mutex first. A later
+    /// operation may make this copy stale, but then a larger accepted end falls
+    /// back to draining that end. A published boundary can never be newer than
+    /// this Native snapshot, so a backward cursor is invalid rather than a race.
+    fn observe_operation(
+        &self,
+    ) -> Result<(Option<NativeOperationSpan>, SendStreamProgress), NativeCommitmentError> {
+        let operation = *self
+            .latest_operation
+            .lock()
+            .expect("native operation boundary");
+        let progress = checked_progress(self.observer.snapshot())?;
+        if operation.is_some_and(|operation| {
+            progress.accepted_end < operation.completed.accepted_end
+                || progress.first_unpacketized < operation.completed.first_unpacketized
+        }) {
+            return Err(NativeCommitmentError::InvalidNativeProgress);
+        }
+        Ok((operation, progress))
+    }
+
+    pub(in crate::runtime) fn begin_operation(
+        &self,
+    ) -> Result<NativeOperationStart, NativeCommitmentError> {
+        let (previous_operation, progress) = self.observe_operation()?;
+        Ok(NativeOperationStart {
+            owner: self.latest_operation.clone(),
+            previous_operation,
+            progress,
+        })
+    }
+
+    /// Publish exactly one complete writer transaction, never an advisory claim
+    /// or a partial write. Failure leaves the previous boundary unchanged; the
+    /// enclosing writer remains responsible for retiring failed or cancelled I/O.
+    pub(in crate::runtime) fn complete_operation(
+        &self,
+        start: NativeOperationStart,
+    ) -> Result<(), NativeCommitmentError> {
+        if !Arc::ptr_eq(&self.latest_operation, &start.owner) {
+            return Err(NativeCommitmentError::InvalidNativeProgress);
+        }
+        let progress = checked_progress(self.observer.snapshot())?;
+        if progress.accepted_end < start.progress.accepted_end
+            || progress.first_unpacketized < start.progress.first_unpacketized
+        {
+            return Err(NativeCommitmentError::InvalidNativeProgress);
+        }
+        let mut operation = self
+            .latest_operation
+            .lock()
+            .expect("native operation boundary");
+        if *operation != start.previous_operation {
+            return Err(NativeCommitmentError::InvalidNativeProgress);
+        }
+        if progress.accepted_end > start.progress.accepted_end {
+            *operation = Some(NativeOperationSpan {
+                begin: start.progress.accepted_end,
+                completed: progress,
+            });
+        }
+        Ok(())
     }
 
     /// Capture outside Product ownership and before the final writer Ready check.
     pub(in crate::runtime) fn capture(
         &self,
     ) -> Result<NativeCommitmentView, NativeCommitmentError> {
-        let progress = checked_progress(self.observer.snapshot())?;
+        let (operation, progress) = self.observe_operation()?;
+        let target = match operation {
+            Some(operation) if operation.completed.accepted_end == progress.accepted_end => {
+                // Only positive completed extents are published, so begin + 1
+                // is representable and already accepted on this exact FIFO.
+                operation.begin + 1
+            }
+            _ => progress.accepted_end,
+        };
         Ok(NativeCommitmentView {
             observer: self.observer.clone(),
             progress,
+            target,
         })
     }
 }
@@ -148,14 +242,12 @@ impl NativeCommitmentView {
     }
 
     /// A busy snapshot stays conservative if packetization advances meanwhile.
-    /// Its wait then completes immediately. An empty snapshot grants no reusable
-    /// permission across another writer operation; Ready must still be current.
+    /// Its wait then completes immediately. An eligible snapshot grants no
+    /// reusable permission across another operation; Ready must still be current.
     pub(in crate::runtime) fn barrier(&self) -> Option<NativeCommitmentBarrier> {
-        (self.progress.first_unpacketized < self.progress.accepted_end).then(|| {
-            NativeCommitmentBarrier {
-                observer: self.observer.clone(),
-                native_end: self.progress.accepted_end,
-            }
+        (self.progress.first_unpacketized < self.target).then(|| NativeCommitmentBarrier {
+            observer: self.observer.clone(),
+            native_end: self.target,
         })
     }
 }

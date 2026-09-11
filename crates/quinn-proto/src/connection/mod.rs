@@ -41,6 +41,8 @@ use crate::{
 mod ack_frequency;
 use ack_frequency::AckFrequencyState;
 
+pub(crate) mod classifier_trace;
+
 mod assembler;
 pub use assembler::Chunk;
 
@@ -520,6 +522,11 @@ impl Connection {
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         assert!(max_datagrams != 0);
+        let _classifier_context = classifier_trace::enter_poll(
+            now,
+            self as *const Self as usize,
+            self.path.controller_epoch(),
+        );
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => 1,
             true => max_datagrams,
@@ -595,6 +602,7 @@ impl Connection {
         let mut send_blocked = false;
         // Only a full congestion window supplies BBR's C.is_cwnd_limited signal.
         let mut cwnd_blocked = false;
+        let mut diagnostic_had_sendable_frames = false;
 
         // Iterate over all spaces and find data to send
         let mut space_idx = 0;
@@ -615,6 +623,7 @@ impl Connection {
 
             // Is there data or a close message to send in this space?
             let can_send = self.space_can_send(space_id, frame_space_1rtt);
+            diagnostic_had_sendable_frames |= !can_send.is_empty();
             if can_send.is_empty() && (!close || self.spaces[space_id].crypto.is_none()) {
                 space_idx += 1;
                 continue;
@@ -1021,7 +1030,23 @@ impl Connection {
             );
         }
 
+        let diagnostic_flag_before = self.app_limited;
         self.app_limited = buf.is_empty() && !send_blocked;
+        if buf.is_empty() {
+            classifier_trace::empty_poll(
+                now,
+                classifier_trace::EmptyPoll {
+                    flag_before: diagnostic_flag_before,
+                    flag_after: self.app_limited,
+                    flight: self.path.in_flight.bytes,
+                    cwnd: self.path.congestion.window(),
+                    mtu: self.path.current_mtu(),
+                    send_blocked,
+                    cwnd_blocked,
+                    had_sendable_frames: diagnostic_had_sendable_frames,
+                },
+            );
+        }
 
         if cwnd_blocked {
             self.path.congestion.on_cwnd_limited();
@@ -1561,6 +1586,11 @@ impl Connection {
         space: SpaceId,
         ack: frame::Ack,
     ) -> Result<(), TransportError> {
+        let _classifier_context = classifier_trace::enter_ack(
+            now,
+            self as *const Self as usize,
+            self.path.controller_epoch(),
+        );
         if ack.largest >= self.spaces[space].next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }

@@ -2931,6 +2931,7 @@ impl Controller for Bbr3 {
         app_limited: bool,
     ) -> Option<crate::congestion::PacketDeliveryState> {
         self.inflight = prior_in_flight;
+        let diagnostic_old_mark = self.app_limited;
         // Quinn's send-time signal is authoritative for whether this packet begins or extends an
         // application-limited epoch. Refresh the delivery watermark before idle-restart handling
         // and before taking P.is_app_limited. A false signal must not clear an epoch whose packets
@@ -2941,6 +2942,20 @@ impl Controller for Bbr3 {
                 Ord::max(self.delivered.saturating_add(prior_in_flight), 1),
             );
         }
+        crate::connection::classifier_trace::mark_update(
+            now,
+            crate::connection::classifier_trace::MarkUpdate {
+                controller: self as *const Self as usize,
+                callback: "send",
+                old: diagnostic_old_mark,
+                after_expiry: diagnostic_old_mark,
+                new: self.app_limited,
+                delivered: self.delivered,
+                flight: prior_in_flight,
+                cwnd: self.cwnd,
+                flag: app_limited,
+            },
+        );
         let is_initial_zero_flight =
             self.inflight == 0 && self.delivered == 0 && self.first_send_time.is_none();
         let is_idle_zero_flight = self.inflight == 0 && self.app_limited != 0;
@@ -3075,15 +3090,31 @@ impl Controller for Bbr3 {
     ) {
         self.inflight = in_flight;
         if largest_packet_num_acked.is_some() {
+            let diagnostic_old_mark = self.app_limited;
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
             }
+            let diagnostic_after_expiry = self.app_limited;
             // The current connection state wins after an old watermark expires. Keeping this
             // independent from the expiry branch avoids one ACK-sized unmarked gap during idle
             // control traffic, which can otherwise look like a low non-app-limited Startup round.
             if app_limited {
                 self.app_limited = Ord::max(self.delivered.saturating_add(self.inflight), 1);
             }
+            crate::connection::classifier_trace::mark_update(
+                now,
+                crate::connection::classifier_trace::MarkUpdate {
+                    controller: self as *const Self as usize,
+                    callback: "ack",
+                    old: diagnostic_old_mark,
+                    after_expiry: diagnostic_after_expiry,
+                    new: self.app_limited,
+                    delivered: self.delivered,
+                    flight: in_flight,
+                    cwnd: self.cwnd,
+                    flag: app_limited,
+                },
+            );
             for packets in self.packets.iter_mut() {
                 packets.retain(|&p| !p.stale);
                 for p in packets.iter_mut() {

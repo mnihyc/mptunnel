@@ -4,9 +4,6 @@
 //! advertised receive credit are real; no rate, flight, or Native capacity is
 //! injected. They prove ordered placement, not a wall-clock speed improvement.
 
-#[path = "tests_prepared_recovery.rs"]
-mod recovery;
-
 use super::*;
 use crate::model::capacity::{
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, reliable_path_startup_sample_limit_bytes,
@@ -237,9 +234,9 @@ impl PreparedResponseFixture {
                         path_id,
                     }
             })
-            // B's protected carrier exists before its Product attachment. No
-            // Original can be assigned to that not-yet-attached fixture output.
-            .map_or(0, |target| target.observation.original_data_in_flight_bytes)
+            .unwrap()
+            .observation
+            .original_data_in_flight_bytes
     }
 
     fn assert_source(&self, accepted: usize, claimed: usize, acked: usize) {

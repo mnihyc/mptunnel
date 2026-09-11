@@ -54,30 +54,6 @@ impl SendStreamObserver {
         )
     }
 
-    /// Wait for this send half to stop, reset, finish, or lose its connection.
-    ///
-    /// This works with no accepted bytes or pending packetization target. It
-    /// uses the same stream-local notification cell without arming a native
-    /// offset. Cancelling the owned future leaves all native service and other
-    /// observers unchanged. The returned error identifies the ended lifetime.
-    pub fn wait_until_terminated(
-        &self,
-    ) -> impl Future<Output = SendStreamObservationError> + Send + 'static {
-        let observer = self.clone();
-        async move {
-            loop {
-                // Register before checking under the same connection lock used
-                // to publish terminal events. A stop cannot fall between them.
-                let mut changed = pin!(observer.notify.notified());
-                changed.as_mut().enable();
-                if let Err(error) = observer.snapshot() {
-                    return error;
-                }
-                changed.await;
-            }
-        }
-    }
-
     /// Wait until the already accepted `end` has been initially packetized.
     ///
     /// The target is validated when first polled. A past crossing returns

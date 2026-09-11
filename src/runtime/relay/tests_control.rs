@@ -2383,8 +2383,16 @@ async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
                             panic!("fixture has no independently due alternate recovery");
                         }
                         PreparedOriginalClaim::Empty => {}
-                        PreparedOriginalClaim::Busy(_) | PreparedOriginalClaim::Blocked(_) => {
-                            panic!("sole healthy ready writer must claim finite source");
+                        PreparedOriginalClaim::Busy(_) => {
+                            panic!("sole fixture writer has no competing Product holder");
+                        }
+                        PreparedOriginalClaim::Blocked(wait) => {
+                            assert_eq!(claimed_bytes, source.len(),
+                                "sole healthy ready writer must claim all finite source before blocking");
+                            // The final requeued notice can retain recovery work
+                            // for these unACKed Originals after source is exhausted.
+                            // Park its actual wait while the actor publishes FIN.
+                            owner_receivers.defer_prepared_work(work, wait);
                         }
                     }
                 }

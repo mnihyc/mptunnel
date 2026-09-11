@@ -509,3 +509,141 @@ run.py/shape.sh:23regular members,182,570,325B raw /7,407,634B compressed,
 all source bytes verified. No binaries, credentials, ordinary cells or
 unrelated captures are included. Diagnostic and ordinary archives remain
 separate; no source/runtime/build/lab change was made during this archival task.
+
+## Response uncovered-prefix ordinary trial — ADVERSE / NOT ACCEPTED
+
+Recorded2026-09-11. The isolated response recovery-coverage candidate is
+retained at checkpoint `ec8cd2f`; it is NOT an accepted runtime correction.
+Root is withdrawing its eight owned runtime/test/RFC files to `dbed0c5`.
+No further lab cell is justified by this result alone. This appendix/archive
+does not alter source or CURRENT and does not declare the trial's code the
+proven cause of every difference between two ordinary realizations.
+
+Candidate: `./.tmp/reflection/results/aggregate-combined-down-isolated-tcp47-quic46-uncovered-prefix-0911/`,
+ordinary no-feature executable `bin/response-uncovered-prefix-20260911/mptunnel`,
+driver session27582 CLOSED0. Matching baseline is B DOWN above:
+`aggregate-combined-down-isolated-tcp47-quic46-qos-outage-0911`.
+The real-producer test first failed at the intended second-uncovered-prefix
+assertion, after earlier setup controls; it then passed. The final170focused
+tests passed. Build finished1m27s. Those mechanism/component results do NOT
+override adverse ordinary service. Two old covered-frontier-stop expectations
+were migrated to successor/no-overlap/all-covered-wake controls, not silently
+waived. The earlier Debug-format compile error is not the intended RED.
+
+| User service |Baseline B|Candidate|
+|---|---:|---:|
+| HTTP status / partial objects |200 /1|200 /1|
+| Body bytes |1076684352|907696120|
+| Actual body duration,s |40.000305|40.000731|
+| Whole Mbps |215.335|181.536|
+| First body,s |.577984|.578617|
+| Maximum body gap,s |.327493|3.300801|
+| Echo successes/failures |80/0|80/0|
+| Echo p50/p95/max,ms |158.150/326.850/654.008|244.641/436.064/541.064|
+| Maximum successful-echo spacing,s |.926587|.732532|
+| Raw bins / zero bins |40/0|40/5|
+
+Both are40s duration-partial8GiB downloads, not full-object completion.
+All echoes succeed, neither disconnects, and both stderr files are empty.
+Whole useful rate is15.70% lower, but that number alone is within the user's
+speed tolerance; the new3.300801s body hold and healthy-phase40.37% reduction
+are the adverse practical results. Improved QoS mean does not erase them.
+
+Candidate maximum gap is exactly20.968530551–24.269331275 probe seconds,
+body463318468→463384004B. Baseline maximum is30.417986828–30.745479455s,
+body803541246→803555846B. Candidate's worst successful echo is attempt20 at
+10.032186206–10.573250526s; it is not the maximum bulk-gap interval.
+
+| Complete raw phase mean,Mbps |Baseline B|Candidate|
+|---|---:|---:|
+|0–5|223.399|151.587|
+|5–15|324.202|193.307|
+|15–25|13.381|153.633|
+|16–25|12.904|153.222|
+|25–30|365.910|232.120|
+|30–33|161.683|160.703|
+|33–40|257.994|198.762|
+
+All40candidate bins, Mbps, no trimming; baseline's entire series remains above.
+Catch-up bursts inside the QoS phase are delivery, not sustained physical rate.
+
+```text
+00: 1.572 174.799 199.290 192.607 189.665 175.903 168.061 189.953 225.448 188.315
+10: 220.656 187.904 164.582 192.425 219.821 157.331 190.652 165.339 0 0
+20: 502.224 0 0 0 520.783 289.421 228.056 226.124 215.944 201.057
+30: 151.808 163.671 166.630 189.394 143.577 269.562 195.847 223.420 189.195 180.339
+```
+
+Physical checks retain40service rows each, exactly3TCP47+1QUIC46,4active,
+no suspect/failed or changed physical identity. Both directions are200Mbps
+except QUIC46's DOWN cut10Mbps; DOWN70/UP30ms, no random loss or jitter,
+class/netem drops0. Candidate new-state row times areQoS15.002109→25.003121,
+UDP-blackhole30.003662→33.495635; baseline15.055191→25.109579 and
+30.269739→33.706486. These are pre-command loop stamps, not exact rule-install
+instants. TCP47 remains200Mbps. No new physical-profile mismatch is observed.
+
+| Sampled cost |Baseline B|Candidate|
+|---|---:|---:|
+| DOWN TCP47 bytes |738667538|923852556|
+| DOWN QUIC46 bytes |667294658|635677756|
+| Summed DOWN wire / useful |1.305826|1.718119|
+| UP return bytes |20509816|22047225|
+| DOWN backlog peak,B |11748316|12735010|
+| Client/server peak RSS,KiB |81864/313896|104048/331540|
+| Client/server peak lifetime CPU,% |54.4/131|49.5/106|
+| Server native flight peak,B |47874162|28978275|
+| Server queue summary peak,B |556842|539884|
+
+Wire is last-minus-first class samples, not exactly the probe lifetime;
+sample endpoints are40.093744s baseline and39.739496s candidate. Total sampled
+DOWN wire rises10.92% while useful bytes fall15.70%. This is materially more
+carrier work per useful byte, NOT a measurement of exact copy bytes. No
+ordinary Original/copy event ledger identifies the residual. Process CPU is
+a lifetime percentage, not an exclusive instantaneous bottleneck attribution.
+
+In healthy rows5→15, native TCP/QUIC ACK advancement is227022732/238422756B
+baseline versus229420514/226867471B candidate: aggregate465.445→456.288MB,
+nearly unchanged. Client logical delivery instead advances407856392→242820169B,
+and server source reads408571568→242908290B. Own management durations are10s
+(candidate server9.999s); both cuts are busy, around190/193Mbps baseline and
+192/183Mbps candidate in physical TCP47/QUIC46 samples. Thus the healthy loss
+of useful aggregation is not simply unused native throughput or absent source
+demand. Ordinary counters still do not distinguish Original overlap, repairs,
+native retransmission, framing or ordered buffering as the cause.
+
+The new stalls are confirmed independently of echo traffic. HTTP8080 flow2
+client delivery stays463318676B at Unix1789094635501/6501/7501ms; that is
+the probe's463318468B body frontier plus208HTTP-header bytes. Server HTTP
+source reads stay530427540B at5503/6503/7503ms in the same1789094630000ms
+base, exactly64MiB ahead. These are distinct observations2s apart, not repeats.
+During the same server bracket TCP native ACKs advance41276933B and QUIC
+4055436B, while successful echoes continue. Earlier rows18→20 have another
+HTTP-only2s plateau at400540724B; server source467649588B is also flat, while
+TCP native ACKs advance47828888B. No useful-source/read stall is inferred
+merely from a raw zero or from including/excluding64B echoes.
+
+Source-read minus delivered bytes is NOT the exact assigned-offset/peer-MAX
+pair, nor a per-path Product-credit measurement. The plateau's body identity
+matches the probe, but independently generated management rows do not provide
+the probe's exact wall-clock start/end. Candidate server management repeats
+once elsewhere; baseline client repeats once. Neither repeated row was used
+as a distinct plateau sample. TCP/native progress cannot identify which
+critical DSN is missing or which carrier originally owns it.
+
+All native paths keep one epoch and nondecreasing producer time/ACK counters.
+Maximum server QUIC RTT is similar4.243→4.259s. TCP aggregate flight limits
+remain roughly4–6MB; candidate sometimes has several MB in flight during a
+stall and later drains nearly completely. Native headroom is not exact
+Product repair credit. DOWN Product-flight summaries0 do not imply zero
+retained response work. The separately observed long-lived upload sink is
+idle(2CPU ticks,0major faults each); its148816/157468KiB RSS and preexisting
+704004/716464KiB swap are not a traced HTTP/echo cause or a new leak proof.
+
+Archive `./docs-dev/RESPONSE_UNCOVERED_PREFIX_ORDINARY_20260911.raw.tar.gz`:
+9regular files,1,877,251B raw /235,057B compressed, every member byte-verified.
+It contains the candidate's five raw files plus build log and three test logs:
+`response-uncovered-prefix-red-exec-0911.log`, `-green-0911.log`, and
+`-controls-accepted-0911.log` with the same prefix. The last filename denotes
+170component tests passing, NOT ordinary acceptance. Baseline and runner are
+already archived in ISOLATED_LINK_ADVERSE; exact trial source is checkpoint
+ec8cd2f. No binary, credentials, invalid run or unrelated test log is included.

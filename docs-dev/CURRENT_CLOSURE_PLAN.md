@@ -263,6 +263,53 @@ cause clocks when copy expiry moves the selection cursor backwards? If that
 requires a broader timing model, stop implementation and present the concrete
 tradeoff rather than stack another plausibly helpful correction.
 
+Withdrawal CLOSED: ec8cd2f retains the isolated adverse trial;843a63f restores
+all eight owned runtime/test/RFC files exactly to dbed0c5/current04f. No trial
+is left in working source. Explicit ordinary trial binary remains archived in
+scratch; target/release still contains that rejected binary and MUST NOT be
+used as the current comparator. Telegram adverse-result notification sent
+02:53UTC approximately (next nonurgent>=03:53UTC), keys
+task=mptunnel-stability-closure/session=mptunnel-v049-20260911.
+
+Independent theoretical challenge rejects a simple omission-cursor rewrite:
+the scalar ACK-gap progress resets clocks when first-gap start changes. Copy
+expiry can move that selection backwards and renew the unchanged Original's
+old deadline; carrying a previous head's readiness can instead prematurely
+repair a younger successor. Canonical G/F must not be changed by coverage.
+
+Next diagnostic transaction (no candidate2 implementation): question whether
+the adverse trial's material extra recovery is inside explicit receiver G or
+only retained-cache silence. Existing ordinary counters cannot answer; existing
+stream_ack_received logs expose counts, not exact ranges. Freeze one ec8 trial
+diagnostic binary with only an observation field for incoming ACK ranges and
+the post-apply canonical G, reuse existing actual-copy/receiver-hole events,
+restore current source, and run the same DOWN B schedule once. Forecast is
+information only: a large outside-G component supports considering bounded
+post-fallback omission service while preserving old silence probes; predominantly
+inside-G copying falsifies that easy explanation. No throughput promotion from
+the observer. No new timing fields, controller, threshold or reserve. If the
+observer does not reproduce relevant copy/service behavior, keep that limit;
+do not rerun for a favourable number or stack a hypothetical model.
+
+Post-fallback-only variant review (theory, NOT implementation): preserve the
+old early ACK-gap scalar and the raw-F silence probe; any new successor service
+would be restricted to canonical G and use the existing per-Original retained
+fallback minima, avoiding a new ACK-loss journal or coverage-cursor renewal.
+This still cannot assume G reflects current receiver occupancy, and additional
+tail-clock observations still touch all Originals. One admitted quantum across
+the paths, exact G clipping, no skip of an uncovered blocked owner, unchanged
+credit/copy identity and global wakes remain required. The capture must first
+justify this narrower hypothesis; source review alone does not recommend it.
+
+Diagnostic build CLOSED1m23s: ec8 runtime plus the single observation-only
+ACK field patch, explicit bin/response-uncovered-proof-20260911/mptunnel.
+Its exact patch/build log are preserved. The temporary source overlay is removed
+and the entire src/RFC/manifests diff against dbed0c5 is empty before traffic.
+No ordinary candidate2 exists. target/release now contains this rejected-trial
+observer, never the comparator. Ordinary adverse evidence is archived as
+RESPONSE_UNCOVERED_PREFIX_ORDINARY_20260911.raw.tar.gz (9files/235057B), with
+full timing/cost and copied-feedback attribution limits in the report appendix.
+
 ## Decision: freeze scope, finish a release
 
 The user's latest instruction stops further broad exploration and prioritizes

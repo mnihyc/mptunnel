@@ -611,3 +611,200 @@ async fn prepared_response_cancelled_source_notice_does_not_own_the_carrier() {
     }
     drop((path_stream, _accepted, registry));
 }
+
+#[tokio::test]
+async fn prepared_repair_offer_yields_to_original_busy_and_cancels_without_payload() {
+    let mut fixture = PreparedResponseFixture::new().await;
+    fixture.publish(Bytes::from(vec![0x61; fixture.quantum]));
+    let instance = fixture.a.0.path_registration.path_instance_id();
+    let registration = fixture.owner.lock().prepared.registrations[0].clone();
+    for _ in 0..8 {
+        registration.notify_repair();
+    }
+    assert_eq!(
+        fixture.a.2.pending_bytes(),
+        0,
+        "offers carry no retained payload charge"
+    );
+    assert_eq!(fixture.a.2.writer_pending_bytes(), 0);
+    fixture
+        .a
+        .0
+        .commands_rx
+        .writer_ready_boundary(instance)
+        .unwrap();
+
+    let command = try_recv_reliable_path_command(&mut fixture.a.0.commands_rx).unwrap();
+    assert!(matches!(&command, ReliablePathCommand::PreparedOriginal(work) if !work.is_repair()));
+    // Execute the actual TCP writer while its real Product owner is held.
+    // The writer's nonblocking callback must report Busy and park the weak
+    // Original without treating that uncertainty as spare repair service.
+    let owner = fixture.owner.clone();
+    {
+        let _held = owner.lock();
+        let mut drain = Box::pin(fixture.a.0.drain_commands(command));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(
+                std::future::Future::poll(drain.as_mut(), &mut cx),
+                std::task::Poll::Ready(Ok(_))
+            ),
+            "Busy is returned without awaiting the Product lock"
+        );
+        drop(drain);
+        assert!(try_recv_reliable_path_command(&mut fixture.a.0.commands_rx).is_none());
+        assert_eq!(fixture.a.2.pending_bytes(), 0);
+    }
+    let command = try_recv_reliable_path_command(&mut fixture.a.0.commands_rx).unwrap();
+    assert!(
+        matches!(&command, ReliablePathCommand::PreparedOriginal(work) if !work.is_repair()),
+        "unlock makes the Original runnable before any background offer"
+    );
+
+    // Cancellation releases both independent weak notices; neither notice
+    // keeps Product alive or leaves a copy slot/native writer charge behind.
+    let lifetime = fixture.owner.actor_lifetime();
+    drop(lifetime);
+    drop(registration);
+    drop(command);
+    fixture
+        .a
+        .0
+        .commands_rx
+        .writer_ready_boundary(instance)
+        .unwrap();
+    while let Some(command) = try_recv_reliable_path_command(&mut fixture.a.0.commands_rx) {
+        fixture.a.0.drain_commands(command).await.unwrap();
+    }
+    assert_eq!(fixture.a.2.pending_bytes(), 0);
+    assert_eq!(fixture.a.2.writer_pending_bytes(), 0);
+    assert_eq!(fixture.owner.lock().send_stream.next_offset(), 0);
+}
+
+#[tokio::test]
+async fn prepared_repair_successors_cross_protected_tcp_writer_before_copy_ack() {
+    let mut fixture = PreparedResponseFixture::new().await;
+    fixture.attach_b();
+    let stream_id = fixture.path_stream.stream_id;
+    let owner_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let target_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    // Seed one retained history within the already admitted startup extent.
+    // Product policy tests establish the quantum bounds separately; this test
+    // proves accepted successors traverse the actual protected native writer.
+    let bytes = fixture.quantum / 3;
+    assert!(bytes > 0);
+    let mut frames = Vec::new();
+    {
+        let mut state = fixture.owner.lock();
+        for marker in [0x71, 0x72, 0x73] {
+            let frame = state
+                .send_stream
+                .send_data(Bytes::from(vec![marker; bytes]))
+                .unwrap();
+            fixture
+                .owner
+                .binding()
+                .record_original_flight(owner_key, &frame);
+            frames.push(frame);
+        }
+        fixture
+            .owner
+            .binding()
+            .record_reinjected_flight(target_key, &frames[0]);
+        fixture
+            .owner
+            .binding()
+            .age_original_flights_for_test(std::time::Duration::from_secs(2));
+        publish_prepared_response_work(
+            &mut state,
+            &fixture.owner,
+            TrafficClass::Throughput,
+            fixture.quantum,
+            true,
+        );
+    }
+    let mut received_offset = bytes as u64;
+    let mut writes = 0;
+    while received_offset < (3 * bytes) as u64 {
+        fixture
+            .b
+            .0
+            .commands_rx
+            .writer_ready_boundary(fixture.b.0.path_registration.path_instance_id())
+            .unwrap();
+        let command = try_recv_reliable_path_command(&mut fixture.b.0.commands_rx)
+            .expect("weak successor notice");
+        assert!(
+            matches!(&command, ReliablePathCommand::PreparedOriginal(work) if work.is_repair())
+        );
+        fixture.b.0.drain_commands(command).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), fixture.b.1.read_frame())
+            .await
+            .expect("accepted successor crosses the protected writer")
+            .unwrap();
+        let Frame::StreamData {
+            stream_id: received_id,
+            offset,
+            payload,
+        } = received
+        else {
+            panic!("writer emits successor StreamData");
+        };
+        assert_eq!(received_id, stream_id);
+        assert_eq!(offset, received_offset);
+        assert!(!payload.is_empty());
+        let Frame::StreamData {
+            offset: source_offset,
+            payload: source,
+            ..
+        } = &frames[(offset as usize) / bytes]
+        else {
+            unreachable!()
+        };
+        let start = (offset - source_offset) as usize;
+        assert!(start + payload.len() <= source.len());
+        assert!(
+            payload.as_ref() == &source[start..start + payload.len()],
+            "exact retained successor bytes"
+        );
+        received_offset += payload.len() as u64;
+        writes += 1;
+        assert_eq!(fixture.b.2.pending_bytes(), 0);
+        assert_eq!(fixture.b.2.writer_pending_bytes(), 0);
+    }
+    assert!(
+        writes >= 2,
+        "distinct service transactions precede any Product ACK"
+    );
+    let state = fixture.owner.lock();
+    assert_eq!(state.send_stream.data_ack_frontier(), 0);
+    assert_eq!(state.send_stream.reinjection_bytes(), 3 * bytes);
+    assert!(state.sender.is_empty());
+    assert!(matches!(&frames[2], Frame::StreamData { stream_id: id, .. } if *id == stream_id));
+    let target = fixture
+        .owner
+        .binding()
+        .prepared_outputs()
+        .into_iter()
+        .find(|output| output.identity.key == target_key)
+        .unwrap()
+        .identity;
+    assert_eq!(
+        fixture
+            .owner
+            .binding()
+            .accepted_reinjected_data_in_flight_bytes_at(
+                crate::runtime::sender::ServerReinjectionOutputIdentity {
+                    key: target.key,
+                    incarnation: target.incarnation,
+                }
+            ),
+        3 * bytes
+    );
+}

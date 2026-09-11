@@ -18,6 +18,76 @@ fn stream_data_frame(stream_id: u64, bytes: usize) -> Frame {
     }
 }
 
+#[test]
+fn background_writer_receipt_is_defeated_by_real_reservation_and_retirement() {
+    use crate::model::path::CarrierPathInstanceId;
+
+    let (commands, mut ordinary) = reliable_path_command_channels(2);
+    let instance = CarrierPathInstanceId::from_raw(1);
+    let offered = ordinary
+        .writer_ready_boundary(instance)
+        .unwrap()
+        .background_handoff();
+    assert!(commands.background_repair_ready().is_some());
+    let reservation = commands
+        .try_reserve_admitted_frame(stream_data_frame(1, 64), TrafficClass::Throughput)
+        .unwrap();
+    assert!(commands.background_repair_ready().is_none());
+    assert!(
+        !offered.try_consume(),
+        "an accepted Original reservation is foreground"
+    );
+    drop(reservation);
+    assert_eq!(commands.pending_bytes(), 0);
+    assert!(commands.background_repair_ready().is_some());
+    commands.retire_accepted_stream(StreamId(1)).unwrap();
+    assert!(
+        !offered.try_consume(),
+        "zero-byte terminal work also defeats the offer"
+    );
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut ordinary),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach {
+            stream_id: StreamId(1)
+        }))
+    ));
+    ordinary.withdraw_writer_ready();
+    assert!(!offered.try_consume());
+}
+
+#[tokio::test]
+async fn split_repair_foreground_remains_owned_until_native_write_work_drops() {
+    use crate::model::path::CarrierPathInstanceId;
+
+    let (commands, mut ordinary) = reliable_path_command_channels(2);
+    let instance = CarrierPathInstanceId::from_raw(1);
+    let mut repair = ordinary.take_repair_receiver(StreamId(1));
+    let offered = ordinary
+        .writer_ready_boundary(instance)
+        .unwrap()
+        .background_handoff();
+    commands
+        .try_enqueue_reinjection_frame(stream_data_frame(1, 64), TrafficClass::Throughput)
+        .unwrap();
+    let work = repair.recv().await.unwrap().unwrap();
+    assert!(
+        !offered.try_consume(),
+        "dequeue is not completed native repair service"
+    );
+    assert!(commands.background_repair_ready().is_none());
+    assert_eq!(commands.writer_pending_bytes(), 64);
+    drop(work);
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(commands.writer_pending_bytes(), 0);
+    // The producer publishes readiness only when called after the write;
+    // dropping accounted work alone does not invent a new writer opportunity.
+    assert!(commands.background_repair_ready().is_none());
+    let receive = repair.recv();
+    tokio::pin!(receive);
+    assert!(futures::poll!(&mut receive).is_pending());
+    assert!(commands.background_repair_ready().is_some());
+}
+
 #[tokio::test]
 async fn repair_split_keeps_existing_capacity_and_cancellation_charges() {
     let (commands, mut ordinary) = reliable_path_command_channels(1);

@@ -109,6 +109,16 @@ pub(super) async fn drain_client_udp_stream_commands(
         }
         let should_close = match command {
             ReliablePathCommand::PreparedOriginal(work) => {
+                if work.is_repair() {
+                    if work.request_instance().is_some()
+                        && work.stream_id() == stream_id
+                        && work.path_instance_id() == path_instance_id
+                    {
+                        debug_assert!(pending_frames.is_empty());
+                        commands.handoff_prepared_repair(work, path_instance_id);
+                    }
+                    return Ok(false);
+                }
                 if work.request_instance().is_none()
                     || work.stream_id() != stream_id
                     || work.path_instance_id() != path_instance_id
@@ -136,7 +146,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                             work.requeue();
                         }
                         PreparedOriginalClaim::Busy(wait) => {
-                            commands.defer_prepared_work(work, wait);
+                            commands.defer_prepared_busy(work, wait);
                         }
                         PreparedOriginalClaim::Blocked(wait) => {
                             commands.defer_prepared_work(work, wait);

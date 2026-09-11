@@ -229,6 +229,17 @@ pub(in crate::runtime) fn publish_prepared_request_work(
                 registration.notify();
             }
         }
+        if prepared.claims_active
+            && product.send_stream.reinjection_bytes() > 0
+            && product.sender.has_current_repair_copy(&product.remotes)
+        {
+            for registration in &prepared.registrations {
+                // A weak opportunity, not queued payload or source-read debt.
+                // The native writer rechecks foreground work and exact repair
+                // ownership before any copy can be recorded.
+                registration.notify_repair();
+            }
+        }
     }
 }
 

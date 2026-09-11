@@ -68,6 +68,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+#[path = "tests_server_native_commitment.rs"]
+mod native_commitment_prepared_tests;
+
 struct PolicyDenyQuicDatagramBackend;
 
 impl ServerDatagramPortBackend for PolicyDenyQuicDatagramBackend {

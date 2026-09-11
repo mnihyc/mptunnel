@@ -341,6 +341,31 @@ pub(super) fn apply_client_stream_data_state(
     {
         let frontier_after = recv_stream.next_offset();
         let reorder_bytes = recv_stream.reorder_bytes();
+        if crate::lab_diagnostics::lab_diagnostic_event_enabled("product_data_receipt") {
+            lab_diagnostic(
+                "product_data_receipt",
+                format_args!(
+                    "stream_id={} source_underlay={:?} source_path_index={} source_instance={} source_attachment={} offset={} end={} payload_bytes={} frontier_before={} frontier_after={} reorder_before={} reorder_after={} delivered_bytes={}",
+                    stream_id.0,
+                    path_key.underlay,
+                    path_key.index,
+                    instance.path_instance_id.as_u64(),
+                    instance.attachment_id,
+                    offset,
+                    offset.saturating_add(payload_len as u64),
+                    payload_len,
+                    frontier_before,
+                    frontier_after,
+                    reorder_before,
+                    reorder_bytes,
+                    outcome
+                        .delivered
+                        .iter()
+                        .map(bytes::Bytes::len)
+                        .sum::<usize>(),
+                ),
+            );
+        }
         if reorder_before > 0 && frontier_after > frontier_before {
             let released_bytes = outcome
                 .delivered

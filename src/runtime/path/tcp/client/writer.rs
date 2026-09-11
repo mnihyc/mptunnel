@@ -166,9 +166,25 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                         )
                         .await?;
                     }
+                    PreparedOriginalClaim::RecoveryQueued => {
+                        work.requeue();
+                        commit_client_tcp_command_frame_transaction(
+                            connection,
+                            pending_frames,
+                            streams,
+                            closed_streams,
+                            datagrams,
+                            runtime,
+                            commands,
+                            &mut writer_pending_bytes,
+                            &mut deferred_frame,
+                        )
+                        .await?;
+                    }
                     PreparedOriginalClaim::Busy(wait) => {
                         commands.defer_prepared_work(work, wait);
                     }
+                    PreparedOriginalClaim::CarrierFailed(error) => return Err(error),
                     PreparedOriginalClaim::Blocked(wait) => {
                         commands.defer_prepared_work(work, wait);
                     }

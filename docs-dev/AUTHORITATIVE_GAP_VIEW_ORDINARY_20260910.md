@@ -6435,3 +6435,175 @@ Archive: [EXACT_HEAD_DIAGNOSTIC_20260911.raw.tar.gz](EXACT_HEAD_DIAGNOSTIC_20260
 11 safe regular members,397,247B compressed /3,153,751B uncompressed; all bytes
 verified. Six raw files, exact six-file patch, build/driver logs, run.py/shape.sh;
 no configurations or executable.
+
+## Ordered-credit head urgency: adverse ordinary trial55898
+
+Practical promotion stops. The ordinary candidate completes, but almost unchanged
+mean speed accompanies longer write/confirmation gaps, a severe cut-period target
+plateau and greater peak forward backlog. Improved pre-cut and36–38s service,
+and lower sampled wire per useful byte, are preserved rather than erased.
+The three-file8596f30 trial is fully removed from active source; its checkpoint,
+patch and executable remain evidence, not accepted release code. Empty source
+diff against e2375e9 is verified by root. Diagnostic19038 is not the comparator.
+
+The predeclared comparator is ordinary04f95178 at
+`aggregate-combined-up-clipped-range-outage-candidate-0911`; new55898 is
+`aggregate-combined-up-ordered-credit-head-outage-candidate-0911`, frozen in
+`./.tmp/reflection/bin/ordered-credit-head-20260911/mptunnel`. Same direct
+200+200Mbps, UP70/DOWN30ms, no random loss/jitter,46UP10Mbps15–25 and both
+QUIC paths blackholed30–33; forty seconds offered, default windows and85s guard.
+One chronological candidate against the preserved control, not a paired random
+realization or favourable repeat. No diagnostics, per-role override or build overlap.
+
+The request-only exception treats exact F=first authoritative gap start at actual
+A=peerMAX as urgent, preserving measured distinct target, coverage, service limits
+and fresh Apply. Only the exact ranked head quantum bypasses Original maturity;
+clocks remain unchanged, with clock_due separately preserving deadline/shorter-
+boundary obligations. Queued intent can survive later MAX relief; that duplicate
+risk is disclosed, not silently cancelled. Response timing is unchanged.
+Initial8616 is a fixture visibility/type compile failure, not Product RED.
+Corrected real producer52235 passes its reachability and post-evaluation future-
+clock controls, then fails0 versus14600B. Six GREEN groups pass153 distinct
+checks (14client,74multipath,57request,6clocks,1epoch,1terminal). Independent
+review passes; ordinary97483 builds in1m20 with the existing warning only.
+
+| Exact ordinary upload outcome |04f95178|8596f30 /55898|
+|---|---:|---:|
+| Accepted = confirmed bytes |960,823,296|988,413,952|
+| Probe elapsed,s / whole Mbps |43.614186 /176.241|44.573108 /177.401|
+| Driver elapsed,s |43.813266|45.101429|
+| First write / confirmation,s |.105407 /.408633|.106518 /.409409|
+| Maximum write / confirmation gap,s |1.865375 /1.717023|2.495271 /4.357523|
+| Raw bins / zeros |44 /1|45 /4 (22,23,24,32)|
+| Complete / failed streams; errors |1 /0;none|1 /0;none|
+
+All bytes settle without censoring. Mean rises.66%, completed work2.87%, elapsed
+2.20%; maxima worsen33.77% write and153.78% confirmation. Different offered
+work reaching settlement prevents an equal-work duration claim, but not reporting
+the worse experienced gaps. Their exact subsecond endpoints are not saved.
+
+| Untrimmed confirmation phase,Mbps |04f|8596|
+|---|---:|---:|
+|0–5 startup |172.245|153.530|
+|5–15 pre-cut |218.893|233.761|
+|15–25 nominal cut |123.499|118.778|
+|16–25 strict cut |118.415|111.720|
+|25–30 restored |193.882|257.857|
+|30–33 nominal outage |39.653|95.314|
+|33–40 restored |212.394|162.691|
+|36–39 late |2.447|175.986|
+|40–end settlement, including partial last bin |206.580|180.041|
+
+All raw one-second bins follow, indexed from zero without trimming. Confirmation
+bursts are buffered target accounting, not physical throughput above400Mbps.
+There is no UP echo measurement; zero recovery_gap_s is not zero maximum gap.
+
+```text
+04f00–09: 9.652 186.143 262.411 174.072 228.945 152.583 240.700 175.264 319.675 210.905
+04f10–19: 221.479 160.964 144.755 301.944 260.660 169.252 57.166 73.747 191.789 103.329
+04f20–29: 195.551 164.256 142.969 116.150 20.780 277.043 156.984 137.604 169.029 228.752
+04f30–39: 62.962 50.421 5.575 56.295 524.812 365.964 4.717 0 2.623 532.345
+04f40–43: 282.783 249.273 138.272 155.991
+8596 00–09: 8.695 177.638 187.171 229.262 164.884 297.508 203.538 66.157 350.461 270.409
+8596 10–19: 200.250 234.136 263.614 207.606 243.933 182.304 162.168 63.694 9.473 2.688
+8596 20–29: 691.094 76.363 0 0 0 718.783 177.410 161.786 152.580 78.728
+8596 30–39: 248.678 37.264 0 13.714 176.585 405.902 231.103 82.838 214.017 14.679
+8596 40–44: 7.736 55.874 460.475 139.900 236.218
+```
+
+Actual target T is successful target-socket write acceptance, including partial
+writes, not receive R or completed-flush W. Own producer times use saved probe
+anchors04f1789083716.575837374s and8596 1789087495.359634876s. Roles can differ
+by a second in the same management row; subtract only explicitly aligned stamps.
+Pre-cut approximately5–15s target service improves213.219→236.383Mbps, while
+strict approximately16–25s falls131.232→123.684Mbps. The candidate also has
+a distinct one-second T440,686,128 plateau at17.922365–18.922365s.
+
+The critical cut episode is not solely delayed confirmation:
+
+| Candidate server generation time,s | Actual target bytes | Server reply bytes |
+|---|---:|---:|
+|22.922365 |553,174,768|1216|
+|23.923365 |553,174,768|1216|
+|24.922365 |553,203,968|1244|
+
+Only29,200B advance in two seconds,.1168Mbps, versus132.055Mbps in the control's
+nearby22.957163–24.956163 window. Candidate source620,283,632 at23.917365 and
+620,312,832 at24.917365 is target+64MiB within about5ms of the server stamps.
+This does not expose assigned A, actual MAX or prove the urgency rule fired.
+Both target-loopback endpoints have zero queues at runner22.341450,23.342427,
+24.342539 and25.342671s; those samples are not continuous socket-state proof.
+Client reply1160B remains flat21.917365–24.917365 while server reply1202→1244B
+over21.923365–24.922365. Forward stagnation and return holding coexist; neither
+alone is assigned the entire4.357523s confirmation maximum.
+
+At candidate client22.918365–24.917365, QUIC47 native ACK advances43,314,612B
+and TCP2,752,650B while target barely moves. QUIC46 ACK is flat; its producer
+stamp advances to24,605,562us then repeats in the final row, so the last
+management sample is not another true native poll. During outage rows30–32,
+both QUIC ACK counters stay flat with advancing native stamps, while TCP grows
+36,814,183B. These are native-byte progress facts, not unique Original/copy or
+critical-prefix delivery. No whole-native freeze or urgency-caused stall is proved.
+
+The old36–38s target slowdown does not recur at that time; nevertheless new
+late target growth874,315,816→879,754,428B over38.922365–40.922365s is only
+21.754Mbps. Raw39–41 bins14.679/7.736/55.874 preserve the weak tail. Both QUIC
+carriers and TCP continue sampled ACK progress there; exact outstanding head,
+urgency activation and repair outcome remain absent from ordinary telemetry.
+
+| Sampled resource / wire cost |04f|8596|
+|---|---:|---:|
+| UP46 /47 class-byte deltas |774,473,735 /1,028,038,144|833,941,608 /998,410,026|
+| DOWN46 /47 class-byte deltas |13,439,738 /11,749,929|12,537,333 /9,823,126|
+| UP /DOWN bytes per confirmed byte |1.876008 /.026217|1.853830 /.022623|
+| UP46 /47 peak backlog,B |22,044,298 /28,677,686|34,943,802 /41,237,680|
+| Simultaneous UP /DOWN backlog peak,B |38,663,206 /48,260|75,377,502 /56,636|
+| Client native /Product flight peak,B |61,234,630 /54,740,096|95,684,566 /64,365,128|
+| Client /server carrier-queue peak,B |886,738 /131,446|721,442 /131,517|
+| Client /server peak RSS,KiB |414,136 /118,816|388,900 /137,800|
+| Client /server final RSS,KiB |356,352 /118,816|388,900 /137,800|
+| Client /server peak lifetime ps CPU,% of one core |167 /73.0|173 /72.3|
+| Client /server final lifetime ps CPU,% |165 /67.4|166 /64.8|
+
+Sampled UP wire rises1.66% with2.87% more useful bytes; UP/DOWN bytes per useful
+byte improve1.18/13.71%. Do not describe this as worse aggregate amplification.
+But peak simultaneous UP backlog rises94.96% and server RSS15.98%; client RSS
+improves. These unequal sampled windows are not exact lifetime efficiency or
+copy accounting, and lifetime ps is not interval CPU or a causal cost attribution.
+
+All eight native identities per role retain one observed epoch without ACK
+regression; summary8active/0suspect/0failed is not Product qualification. Candidate
+QUIC46/47 native flight peaks68.693/28.256MB, RTT2.724/1.614s. Native ACK or
+flight does not identify missing bytes, redundant copies or the urgency branch.
+SinkPID25/start71521824 is unchanged;187 additional ticks versus188 baseline,
+no major-fault increase, peak RSS191,652 versus193,552KiB and constant historical
+swap672,492KiB. No ownership leak or CPU cause follows from these samples.
+
+Profile readback matches the declared physical experiment: all four classes
+200Mbps except46UP10; UP70/DOWN30ms, zero jitter, absent random-loss field and
+zero class/netem drops (blackhole uses separate DROP rules). Actual QoS interval
+is15.227951–25.342671s versus15.195176–25.196242 baseline; blackhole
+30.456212–33.807927 versus30.210717–33.550690. Candidate44 service rows span
+.000048–44.101266s; client has42 unique generation stamps (rows6/34 repeat),
+server44. Native producer stamps can repeat independently of these management
+stamps. Last sampled target958,842,900B precedes final988,413,952B confirmation.
+Candidate client/probe.err logs are empty; two server H3_NO_ERROR warnings,
+366B total, occur520ms after probe completion, not an autonomous failure.
+
+Forecast disposition: the narrow producer opportunity is proven, but this one
+ordinary comparison fails the practical composition gate. Mean is essentially
+flat and continuity is worse despite some better phases and normalized wire.
+No claim is made that the trial caused each adverse interval or that larger
+urgency/another quantum would cure it. Under the user's stop-exploration
+instruction, root fully reversed all three trial files; the proposed follow-up
+observer was neither applied nor built. No favourable rerun or further
+attribution capture follows this report. Release selection is a separate root
+decision; this failed pilot is not silently retained as a dependency.
+
+Archive: [ORDERED_CREDIT_HEAD_ORDINARY_20260911.raw.tar.gz](ORDERED_CREDIT_HEAD_ORDINARY_20260911.raw.tar.gz),
+21 safe regular members,375,679B compressed /2,903,051B uncompressed, every byte
+verified. Six raw files; driver/build; exact three-file candidate patch;
+true producer RED log/patch; initial fixture compile-failure log/patch;
+six GREEN logs; run.py/shape.sh. No configuration or binary is included.
+Comparator inputs remain in
+[CLIPPED_RANGE_OUTAGE_ORDINARY_20260911.raw.tar.gz](CLIPPED_RANGE_OUTAGE_ORDINARY_20260911.raw.tar.gz).

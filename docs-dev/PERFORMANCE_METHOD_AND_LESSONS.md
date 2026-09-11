@@ -6,6 +6,15 @@ CURRENT_CLOSURE_PLAN remains the active scope/next-action ledger; this document
 specifies how to execute it. Historical evidence remains in CHANGE_DISPOSITION_20260907,
 PERFORMANCE_REFLECTION_20260907 and REVIEW_AND_PRACTICAL_ACCEPTANCE.
 
+Release convergence amendment,2026-09-11 08:57+08: the user stopped further
+broad exploration and requested a deterministic next release. CURRENT_CLOSURE_PLAN
+now freezes the candidate and defines a finite regression/functional/platform
+gate. The broader optimization matrix below is deferred, not silently passed.
+Keep the causal evidence, complete timing/cost, no-tweak and honest disposition
+rules. A gate failure permits only its bounded blocker correction or withdrawal;
+it does not automatically reopen the optimization campaign. Publish no claim
+of universal competitiveness from the narrower release gate.
+
 ## Mandatory execution contract
 
 The user explicitly adopted this method on 2026-09-08. Read this document and

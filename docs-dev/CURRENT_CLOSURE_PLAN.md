@@ -1,7 +1,63 @@
 # v0.4.9 release closure plan
 
-Updated: 2026-09-11 08:57 +08:00. Authoritative repository: ./.
+Updated: 2026-09-11 09:34 +08:00. Authoritative repository: ./.
 Category: user-directed release convergence. No release acceptance yet.
+
+## Active amendment: challenge claims, prioritize severe user impact
+
+The user now explicitly requests proving/challenging the preceding conclusions,
+including TCP on link 1 and QUIC on link 2, and correcting demonstrated severe
+defects. Stable browsing/downloading/uploading/gaming is the objective, not an
+ideal allocator. A speed deficit within 20% or an isolated gap under 3s is not
+a tuning task in this batch. These are user impact triage guidelines, not new
+runtime thresholds, permission to hide recurring disruption, or proof that
+larger differences are automatically defects. Preserve all timings and failures.
+
+Next transaction (before code or experiments):
+
+- Issue/question: does native shared-cut competition adequately explain the
+  observed mixed deficit, and can protocol-isolated links provide usable
+  aggregation and recovery without prolonged application stalls?
+- Existing evidence: healthy shared500 mixed about398--404Mbps versus single
+  modes429/443Mbps is preceding011 evidence; external TCP raises QUIC latency
+  without MPP TCP scheduling. Prior independent200+200 uses TCP AND QUIC on each
+  cut, not protocol isolation. Current04f has an independently observed ordered
+  prefix hole; neither that nor native competition explains every result.
+- Competing causes: no extra physical capacity; unequal native achievable
+  service; ordered-prefix/feedback coupling; local processing/resources;
+  measurement or endpoint limitations. Do not assume which dominates.
+- Information forecast: using the SAME current04f executable and ordinary
+  probes, TCP46 alone, QUIC47 alone and TCP46+QUIC47 reveal whether extra cut
+  capacity translates to useful delivery. This can falsify a blanket shared-
+  bottleneck explanation, not prove a universal allocator or promised400Mbps.
+- Smallest next action: six healthy200Mbps-per-cut cells (three modes, UP and
+  DOWN), then four split-mode QoS/outage cells (TCP46+QUIC47 and reversed
+  TCP47+QUIC46, both directions). Retain the shipped three-TCP carrier pool
+  in both singleton and split controls; one QUIC per configured QUIC endpoint.
+  Healthy has zero deliberate loss/jitter and UP70/DOWN30ms. Stress changes
+  only46 in the transfer direction to10Mbps at15--25s (UP uses mirror=1;
+  DOWN mirror unset gives DOWN70/UP30ms) and blocks UDP30--33s. This tests placement and recovery,
+  not the entire random Internet. No change to existing guards or shapers.
+- Only measurement change: an explicit client-config override in the existing
+  scratch runner; archive it and exact path sets. No new harness or runtime
+  diagnostic overlay. Verify actual interface/connection counts and service.
+- Acceptance/stop: retain full receiver-confirmed series, completion, all
+  stalls, loaded echo, wire/CPU/RSS. A material failure selects its smallest
+  discriminator before runtime edits; no gain tuning or favourable rerun loop.
+  Isolated/shared baselines and released-v0.4.8 controls distinguish ordinary
+  native limits and new regressions as needed. Existing source/platform and
+  practical release gates below remain; fresh matching cells may be reused.
+- First closed outcome: current04f healthy DOWN singleton TCP46=179.278Mbps,
+  QUIC47=178.857, split=309.377; 80/80 echoes each, worst body gaps .401/.101/
+  .274s. Independent checks verify3TCP46/1QUIC47 and both200Mbps cuts used;
+  split beats the best singleton72.57%, not a universal aggregation guarantee.
+  UP drivers also closed; exact results under review. Two earlier unsuffixed
+  QUIC/split DOWN attempts are invalid: root launched a successor before the
+  prior driver closed, causing shaping/teardown interference. INVALID.md marks
+  both raw directories. Neither is an MPP failure; strict completion guards now
+  precede every successor. Their serial replacements are the valid observations.
+  Independent agents check topology and prior claim scope;
+  root alone runs all builds and traffic. Broad research remains deferred.
 
 ## Decision: freeze scope, finish a release
 

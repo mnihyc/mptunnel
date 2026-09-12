@@ -3210,6 +3210,37 @@ carrier scope; unavailable cause remains explicit, never a fabricated error or a
 attachment-local status. The cost of serialized actor polling and synchronous
 cancellation remains visible.
 
+Product relays, their TCP writers, and coupled Native connection drivers share
+one explicit execution domain per authenticated session lifetime. Complete finite
+polls and actual actor destruction MUST exclude one another within that domain;
+an asynchronous wait releases execution ownership. The domain precedes source,
+Product and Native locks, and does not replace their existing authority rules.
+This execution rule preserves atomic ACK reconciliation and immediate inline
+refill while avoiding concurrent Product claims observing an actor-owned mutex
+as temporary supply exhaustion. It does not fabricate supply when selection is
+actually pending. Actors from separate sessions remain independently executable.
+
+Domain admission queues ready actors FIFO and wakes the next waiter, without a
+scan of all streams or a wake-all on each turn. Synchronous actor destruction
+waits only for finite executing work and takes precedence over queued async
+polls, so worker threads cannot all wait for a task that needs a free worker.
+Actual destruction completes before its cancellation or completion is observed.
+Same-domain nested cleanup remains within the outer exclusive interval; generic
+routers, DNS coordinators and global supervisors do not inherit a session domain.
+
+A QUIC connection begins unbound. Authentication binds it once to the live
+session's domain before application-ready or writer ownership is published. The
+handoff MUST fence the complete prior driver poll, including intervals when the
+Native lock is released. Binding cannot hold Product, Native or source locks and
+cannot reassign a live connection to another domain. Retirement and late cleanup
+retain the original domain identity independently of registry removal.
+
+This model trades simultaneous CPU execution within a session for serial service
+of its ownership graph. It adds no limit on admitted streams, paths or demand.
+Endpoint input, other sessions and independent decoding remain concurrent.
+Within-session CPU capacity, queued-memory retention and cancellation delay are
+real costs to measure under ordinary concurrent and bidirectional workloads.
+
 This rule bounds new Original inventory before first packetization, not its
 residence time, packetized flight, qdisc queues or physical delivery. Native
 packet and stream inventories overlap and MUST NOT be summed as disjoint work.

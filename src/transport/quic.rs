@@ -109,6 +109,7 @@ pub enum QuicCarrierError {
     Connect(quinn::ConnectError),
     Connection(ConnectionError),
     NativeDriverStopped,
+    ExecutionDomainConflict(quinn::ExecutionDomainConflict),
     Write(quinn::WriteError),
     Read(quinn::ReadError),
     H3Connection(h3::error::ConnectionError),
@@ -185,6 +186,7 @@ impl fmt::Display for QuicCarrierError {
                 f,
                 "native QUIC connection driver stopped without a terminal cause"
             ),
+            Self::ExecutionDomainConflict(err) => write!(f, "QUIC execution binding failed: {err}"),
             Self::Write(err) => write!(f, "QUIC carrier write failed: {err}"),
             Self::Read(err) => write!(f, "QUIC carrier read failed: {err}"),
             Self::H3Connection(err) => write!(f, "HTTP/3 connection failed: {err}"),

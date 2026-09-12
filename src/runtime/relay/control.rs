@@ -784,7 +784,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let retirement = context.session_retirement().wait();
-    let active = relay_migrating_tcp_stream_active(
+    // The wrapper also owns cancellation cleanup: revoking prepared claims
+    // and dropping committed output membership share the writer's domain.
+    let execution_domain = context.execution_domain();
+    let active = execution_domain.wrap(relay_migrating_tcp_stream_active(
         local,
         context,
         performance,
@@ -793,7 +796,7 @@ where
         idle_timeout,
         #[cfg(test)]
         None,
-    );
+    ));
     tokio::pin!(retirement);
     tokio::pin!(active);
     tokio::select! {

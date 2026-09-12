@@ -1336,6 +1336,9 @@ async fn connect_client_udp_path(
                 }
                 Err(error) => return Err(error),
             };
+        // Authentication fixes the MPP session before any Product can be
+        // published. Native joins that session's poll/drop owner first.
+        connection.bind_execution_domain(runtime.state.execution_domain())?;
         let path_instance_id =
             try_next_carrier_path_instance_id().ok_or(RuntimeError::ExactIdentityExhausted)?;
         connection
@@ -1689,7 +1692,8 @@ async fn open_client_udp_stream_on_connection(
     let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);
     let repair_commands = receivers.take_repair_receiver(stream_id);
     let stream_runtime = runtime.clone();
-    tokio::spawn(async move {
+    let execution_domain = stream_runtime.state.execution_domain();
+    tokio::spawn(execution_domain.wrap(async move {
         let repair = async {
             repair_send.set_repair_priority()?;
             udp_path_write_frame(
@@ -1746,7 +1750,7 @@ async fn open_client_udp_stream_on_connection(
                 }
             }
         }
-    });
+    }));
     let mut startup = path_startup_snapshot_for_instance(
         runtime.path(),
         PathId(runtime.path_index as u16),

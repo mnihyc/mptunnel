@@ -80,6 +80,7 @@ impl Connecting {
             conn: conn.clone(),
             sources: TransmitSources::new(transmit_sources_rx),
         };
+        let driver = conn.execution.wrap(driver);
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
@@ -273,7 +274,9 @@ impl Future for ConnectionDriver {
         loop {
             diagnostic_pass += 1;
             let diagnostic = crate::source_trace::driver_context(
-                this.conn.stable_id(), &mut diagnostic_turn, diagnostic_pass,
+                this.conn.stable_id(),
+                &mut diagnostic_turn,
+                diagnostic_pass,
             );
             let mut conn = this.conn.state.lock("poll");
             let span = debug_span!("drive", id = conn.handle.0);
@@ -385,6 +388,24 @@ impl Future for ConnectionDriver {
 pub struct Connection(ConnectionRef);
 
 impl Connection {
+    /// Join an authenticated session's execution domain exactly once.
+    ///
+    /// This fences the entire current unauthenticated driver poll before
+    /// returning. Call before publishing application ownership, without holding
+    /// Native, Product or source locks. It can wait for one finite driver poll.
+    /// Existing children must not be moved between live session domains.
+    pub fn bind_execution_domain(
+        &self,
+        domain: crate::ExecutionDomain,
+    ) -> Result<(), crate::ExecutionDomainConflict> {
+        self.0.execution.bind(domain)
+    }
+
+    /// The bound execution domain, if authentication has established one.
+    pub fn execution_domain(&self) -> Option<crate::ExecutionDomain> {
+        self.0.execution.domain()
+    }
+
     /// Register an opt-in producer polled by this connection's driver.
     ///
     /// The driver polls this future outside the native connection mutex and
@@ -413,7 +434,9 @@ impl Connection {
         drop(state);
         if let Err(rejected) = sent {
             drop(rejected);
-            return Err(self.close_reason().unwrap_or(ConnectionError::LocallyClosed));
+            return Err(self
+                .close_reason()
+                .unwrap_or(ConnectionError::LocallyClosed));
         }
         Ok(())
     }
@@ -792,11 +815,7 @@ impl Connection {
     /// This is equivalent to [`SendStream::set_priority`], but remains usable
     /// by protocol adapters that retain the stream identity while wrapping the
     /// concrete [`SendStream`].
-    pub fn set_stream_priority(
-        &self,
-        stream: StreamId,
-        priority: i32,
-    ) -> Result<(), ClosedStream> {
+    pub fn set_stream_priority(&self, stream: StreamId, priority: i32) -> Result<(), ClosedStream> {
         let mut conn = self.0.state.lock("set_stream_priority");
         conn.inner.send_stream(stream).set_priority(priority)?;
         Ok(())
@@ -1102,6 +1121,7 @@ impl ConnectionRef {
             }),
             shared: Shared::default(),
             transmit_sources,
+            execution: Arc::new(crate::execution_binding::ExecutionBinding::default()),
         }))
     }
 
@@ -1144,6 +1164,7 @@ impl std::ops::Deref for ConnectionRef {
 
 #[derive(Debug)]
 pub(crate) struct ConnectionInner {
+    execution: Arc<crate::execution_binding::ExecutionBinding>,
     transmit_sources: mpsc::UnboundedSender<TransmitSource>,
     pub(crate) state: Mutex<State>,
     pub(crate) shared: Shared,
@@ -1215,7 +1236,8 @@ impl State {
                     self.send_buffer.reserve(self.inner.current_mtu() as usize);
                     let transmit = {
                         let _diagnostic = proto::enter_native_source_driver(diagnostic);
-                        self.inner.poll_transmit(now, max_datagrams, &mut self.send_buffer)
+                        self.inner
+                            .poll_transmit(now, max_datagrams, &mut self.send_buffer)
                     };
                     match transmit {
                         Some(t) => {

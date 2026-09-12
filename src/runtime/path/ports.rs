@@ -1083,6 +1083,11 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         session_id: SessionId,
     ) -> Result<ServerSessionRetirement, RuntimeError>;
 
+    fn session_execution_domain(
+        &self,
+        session_id: SessionId,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError>;
+
     fn retire_session(&self, session_id: SessionId, reason: CloseReason) -> CloseReason;
 
     fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState);
@@ -1427,6 +1432,13 @@ impl ServerStreamPort {
         session_id: SessionId,
     ) -> Result<ServerSessionRetirement, RuntimeError> {
         self.backend.session_retirement(session_id)
+    }
+
+    pub(in crate::runtime) fn session_execution_domain(
+        &self,
+        session_id: SessionId,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError> {
+        self.backend.session_execution_domain(session_id)
     }
 
     pub(in crate::runtime) fn retire_session(

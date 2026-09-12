@@ -155,15 +155,24 @@ impl ServerReliableRelayService {
                             continue;
                         }
                     };
+                    let execution_domain = match accepted.session_execution_domain() {
+                        Ok(domain) => domain,
+                        Err(_) => {
+                            accepted.close().await;
+                            continue;
+                        }
+                    };
                     let retirement = accepted.supervise();
                     let context = self.context.clone();
-                    let task = relays.spawn(async move {
+                    // ACK application and actual cancellation/drop participate
+                    // in the same session domain as the carrier source claim.
+                    let task = relays.spawn(execution_domain.wrap(async move {
                         tokio::select! {
                             biased;
                             _ = session_retirement.wait() => Ok(()),
                             result = relay_accepted_stream(context, accepted) => result,
                         }
-                    });
+                    }));
                     let replaced = retirements.insert(task.id(), retirement);
                     debug_assert!(replaced.is_none());
                 }

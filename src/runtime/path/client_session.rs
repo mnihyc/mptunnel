@@ -15,6 +15,10 @@ pub(in crate::runtime) struct ClientSessionLifecycle {
 }
 
 struct ClientSessionLifecycleInner {
+    /// One execution owner across every carrier and Product in this session.
+    /// It survives carrier replacement and excludes poll/drop overlap without
+    /// changing the separate terminal/admission commitment below.
+    execution_domain: quinn::ExecutionDomain,
     /// Serializes terminal publication with readiness/Product admission. The
     /// protected closures must stay synchronous and bounded.
     commitment: Mutex<()>,
@@ -25,10 +29,15 @@ impl ClientSessionLifecycle {
     pub(in crate::runtime) fn new() -> Self {
         Self {
             inner: Arc::new(ClientSessionLifecycleInner {
+                execution_domain: quinn::ExecutionDomain::default(),
                 commitment: Mutex::new(()),
                 retirement: watch::channel(None).0,
             }),
         }
+    }
+
+    pub(in crate::runtime) fn execution_domain(&self) -> quinn::ExecutionDomain {
+        self.inner.execution_domain.clone()
     }
 
     pub(in crate::runtime) fn retirement(&self) -> ClientSessionRetirement {

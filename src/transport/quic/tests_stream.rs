@@ -94,6 +94,185 @@ async fn native_source_h3_fixture() -> NativeSourceH3Fixture {
     }
 }
 
+/// Actual source ownership crosses two runtime workers here: Native has begun
+/// a framed write, while the original owner cancels its handle on another
+/// worker. The gates control finite poll/drop boundaries, not network policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_native_source_cancel_fences_actual_drop_and_preserves_h3_sibling() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::task::{Context, Poll};
+
+    const LIFECYCLE_GUARD: Duration = Duration::from_secs(5);
+
+    struct LastSourceDrop {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Drop for LastSourceDrop {
+        fn drop(&mut self) {
+            self.entered
+                .take()
+                .expect("one source destruction")
+                .send(())
+                .expect("source destruction observer");
+            self.release
+                .recv_timeout(LIFECYCLE_GUARD)
+                .expect("release finite source destruction");
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ActualSource<F> {
+        // Field order makes the marker run after the actual H3 future/stream.
+        future: Pin<Box<F>>,
+        _last_drop: LastSourceDrop,
+    }
+
+    impl<F: Future> Future for ActualSource<F> {
+        type Output = F::Output;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.get_mut().future.as_mut().poll(cx)
+        }
+    }
+
+    let NativeSourceH3Fixture {
+        _server,
+        _client,
+        client_connection,
+        server_connection,
+        mut send,
+        _recv,
+        _server_send,
+        server_recv: _server_recv,
+    } = native_source_h3_fixture().await;
+    let limits = CodecLimits::default();
+    let native = send.connection.clone();
+    let domain = quinn::ExecutionDomain::default();
+    native
+        .bind_execution_domain(domain.clone())
+        .expect("bind actual client driver");
+    assert!(
+        native
+            .execution_domain()
+            .expect("actual driver retains binding")
+            .same_domain(&domain)
+    );
+    let (client_sibling, server_sibling) = timeout(LIFECYCLE_GUARD, async {
+        tokio::join!(client_connection.open_bi(), server_connection.accept_bi())
+    })
+    .await
+    .expect("sibling attachment lifecycle");
+    let (mut sibling_send, mut sibling_recv) = client_sibling.expect("client sibling");
+    let (mut peer_send, mut peer_recv) = server_sibling.expect("server sibling");
+    let (poll_entered_tx, poll_entered_rx) = tokio::sync::oneshot::channel();
+    let (poll_release_tx, poll_release_rx) = std::sync::mpsc::channel();
+    let (drop_entered_tx, drop_entered_rx) = tokio::sync::oneshot::channel();
+    let (drop_release_tx, drop_release_rx) = std::sync::mpsc::channel();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let owner = send
+        .native_source_registration()
+        .register(ActualSource {
+            future: Box::pin(async move {
+                write_frame(&mut send, &Frame::Ping { nonce: 2 }, limits)
+                    .await
+                    .expect("actual source framed write");
+                poll_entered_tx
+                    .send(std::thread::current().id())
+                    .expect("actual Native source poll observer");
+                poll_release_rx
+                    .recv_timeout(LIFECYCLE_GUARD)
+                    .expect("release finite actual source poll");
+                std::future::pending::<()>().await;
+            }),
+            _last_drop: LastSourceDrop {
+                entered: Some(drop_entered_tx),
+                release: drop_release_rx,
+                count: drops.clone(),
+            },
+        })
+        .expect("register actual bound source");
+    let source_worker = timeout(LIFECYCLE_GUARD, poll_entered_rx)
+        .await
+        .expect("actual source poll lifecycle")
+        .expect("actual source entered Native poll");
+    let (cancel_started_tx, cancel_started_rx) = tokio::sync::oneshot::channel();
+    let cancel_returned = Arc::new(AtomicBool::new(false));
+    let cancel_observed = cancel_returned.clone();
+    let cancelled_drops = drops.clone();
+    let cancel_domain = domain.clone();
+    let cancel_task = tokio::spawn(async move {
+        cancel_started_tx
+            .send(std::thread::current().id())
+            .expect("cancelling worker observer");
+        // This exercises wrapper Drop without first polling the owner handle,
+        // as can happen when a freshly spawned Product task is aborted.
+        drop(cancel_domain.wrap(owner));
+        assert_eq!(cancelled_drops.load(Ordering::SeqCst), 1);
+        cancel_observed.store(true, Ordering::SeqCst);
+    });
+    let cancel_worker = timeout(LIFECYCLE_GUARD, cancel_started_rx)
+        .await
+        .expect("other worker cancellation lifecycle")
+        .expect("other worker started cancellation");
+    assert_ne!(source_worker, cancel_worker);
+    assert!(!cancel_returned.load(Ordering::SeqCst));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    poll_release_tx.send(()).expect("finish actual source poll");
+    timeout(LIFECYCLE_GUARD, drop_entered_rx)
+        .await
+        .expect("source destructor lifecycle")
+        .expect("actual source fields destroyed before final marker");
+    assert!(!cancel_returned.load(Ordering::SeqCst));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop_release_tx
+        .send(())
+        .expect("finish actual source destruction");
+    timeout(LIFECYCLE_GUARD, cancel_task)
+        .await
+        .expect("cancellation completion lifecycle")
+        .expect("cancelling worker did not panic");
+    assert!(cancel_returned.load(Ordering::SeqCst));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(native.close_reason().is_none());
+
+    let sibling = sibling_send
+        .native_source_registration()
+        .register(async move {
+            write_frame(&mut sibling_send, &Frame::Ping { nonce: 42 }, limits)
+                .await
+                .expect("bound sibling write after cancellation");
+            read_frame(&mut sibling_recv, limits)
+                .await
+                .expect("bound sibling response after cancellation")
+        })
+        .expect("register sibling on the same actual bound driver");
+    let (response, ()) = timeout(LIFECYCLE_GUARD, async {
+        tokio::join!(domain.wrap(sibling), async {
+            assert_eq!(
+                read_frame(&mut peer_recv, limits)
+                    .await
+                    .expect("actual sibling request"),
+                Frame::Ping { nonce: 42 }
+            );
+            write_frame(&mut peer_send, &Frame::Pong { nonce: 42 }, limits)
+                .await
+                .expect("actual sibling response");
+        })
+    })
+    .await
+    .expect("bound sibling remains serviceable");
+    assert_eq!(
+        response.expect("bound sibling source live"),
+        Frame::Pong { nonce: 42 }
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
 /// This counts adapter operations, not Product claims. Every operation uses
 /// real MPP framing and an exclusively owned H3 send half; native observation
 /// only gates the next operation after the previous accepted envelope crosses.

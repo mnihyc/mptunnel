@@ -102,6 +102,10 @@ impl ClientPathState {
         &self.session_lifecycle
     }
 
+    pub(in crate::runtime) fn execution_domain(&self) -> quinn::ExecutionDomain {
+        self.session_lifecycle.execution_domain()
+    }
+
     pub(in crate::runtime) fn session_retirement(&self) -> ClientSessionRetirement {
         self.session_lifecycle.retirement()
     }
@@ -839,6 +843,10 @@ impl Drop for RelayPathLoadLease {
 }
 
 impl ClientPathContext {
+    pub(in crate::runtime) fn execution_domain(&self) -> quinn::ExecutionDomain {
+        self.state.execution_domain()
+    }
+
     pub(in crate::runtime) fn health(&self) -> &Mutex<ClientPathHealth> {
         self.state.health()
     }

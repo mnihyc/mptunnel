@@ -555,6 +555,14 @@ impl AcceptedServerReliableStream {
         self.retirement.registry.session_retirement(self.session_id)
     }
 
+    pub(in crate::runtime) fn session_execution_domain(
+        &self,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError> {
+        self.retirement
+            .registry
+            .session_execution_domain(self.session_id)
+    }
+
     pub(in crate::runtime) fn target(&self) -> &TargetAddr {
         &self.target
     }
@@ -1047,6 +1055,13 @@ impl ServerReliableStreamRegistry {
         session_id: SessionId,
     ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
         self.session_tracker.session_retirement(session_id)
+    }
+
+    pub(in crate::runtime) fn session_execution_domain(
+        &self,
+        session_id: SessionId,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError> {
+        self.session_tracker.session_execution_domain(session_id)
     }
 
     pub(in crate::runtime) fn retire_session(
@@ -2521,6 +2536,13 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         session_id: SessionId,
     ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
         self.registry.session_retirement(session_id)
+    }
+
+    fn session_execution_domain(
+        &self,
+        session_id: SessionId,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError> {
+        self.registry.session_execution_domain(session_id)
     }
 
     fn retire_session(

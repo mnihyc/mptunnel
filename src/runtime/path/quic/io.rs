@@ -78,9 +78,7 @@ fn quic_stream_priority(lane: TrafficClass) -> i32 {
 }
 
 impl UdpPathSendStream {
-    pub(super) fn native_source_registration(
-        &self,
-    ) -> quic_transport::NativeSourceRegistration {
+    pub(super) fn native_source_registration(&self) -> quic_transport::NativeSourceRegistration {
         self.stream.native_source_registration()
     }
 
@@ -221,6 +219,15 @@ impl UdpPathEndpoint {
 }
 
 impl UdpPathConnection {
+    /// Fence the pre-authentication driver before this carrier can serve Product work.
+    pub(super) fn bind_execution_domain(
+        &self,
+        domain: quinn::ExecutionDomain,
+    ) -> Result<(), RuntimeError> {
+        self.connection.bind_execution_domain(domain)?;
+        Ok(())
+    }
+
     fn new(connection: quic_transport::Connection) -> Self {
         Self {
             connection,

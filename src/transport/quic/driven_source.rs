@@ -38,7 +38,10 @@ impl NativeSourceRegistration {
         F: Future<Output = R> + Send + 'static,
         R: Send + 'static,
     {
-        let (handle, mut proxy) = source_pair(future);
+        let (mut handle, mut proxy) = source_pair(future);
+        // Product registers only after authenticated execution binding. Keep
+        // the lifetime capability even if the carrier registry later detaches.
+        handle.domain = self.connection.execution_domain();
         proxy.connection = Some(self.connection.clone());
         proxy.native_stream_id = Some(self.native_stream_id);
         self.connection.register_transmit_source(Box::pin(proxy))?;
@@ -106,6 +109,7 @@ impl<R> SourceState<R> {
 #[must_use = "dropping a driven source synchronously cancels its actor"]
 pub struct DrivenSource<R> {
     state: Arc<Mutex<SourceState<R>>>,
+    domain: Option<quinn::ExecutionDomain>,
     completed: bool,
 }
 
@@ -157,6 +161,18 @@ impl<R> Future for DrivenSource<R> {
 
 impl<R> Drop for DrivenSource<R> {
     fn drop(&mut self) {
+        if let Some(domain) = self.domain.clone() {
+            // Domain must precede SourceState, including when the original
+            // parent is cancelled from a different runtime worker.
+            domain.with_exclusive(|| self.cancel());
+        } else {
+            self.cancel();
+        }
+    }
+}
+
+impl<R> DrivenSource<R> {
+    fn cancel(&mut self) {
         if self.completed {
             return;
         }
@@ -256,6 +272,20 @@ impl<R> Future for NativeSourceProxy<R> {
 
 impl<R> Drop for NativeSourceProxy<R> {
     fn drop(&mut self) {
+        if let Some(domain) = self
+            .connection
+            .as_ref()
+            .and_then(quinn::Connection::execution_domain)
+        {
+            domain.with_exclusive(|| self.stop());
+        } else {
+            self.stop();
+        }
+    }
+}
+
+impl<R> NativeSourceProxy<R> {
+    fn stop(&mut self) {
         // The registering driver has released Native. Read its recorded cause
         // before taking source ownership; no Native guard spans actor cleanup.
         let cause = self
@@ -293,6 +323,7 @@ where
     (
         DrivenSource {
             state: state.clone(),
+            domain: None,
             completed: false,
         },
         NativeSourceProxy {

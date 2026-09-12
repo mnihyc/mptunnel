@@ -1153,6 +1153,44 @@ async fn cached_target_datagram_is_delivered_when_live_route_capacity_returns() 
 
 #[tokio::test]
 async fn attachment_drop_starts_full_retention_and_target_traffic_does_not_extend_it() {
+    async fn wait_at_frozen_time(
+        frozen_at: tokio::time::Instant,
+        condition: impl Fn() -> bool,
+        context: &str,
+    ) {
+        let started = std::time::Instant::now();
+        loop {
+            assert_eq!(
+                tokio::time::Instant::now(),
+                frozen_at,
+                "{context}: the controlled clock must not auto-advance"
+            );
+            if condition() {
+                return;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1), "{context}");
+            // A runnable observer prevents idle-time auto-advance while actual
+            // UDP I/O progresses. The failure guard uses the unpaused clock.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    struct FloodGuard {
+        running: Arc<AtomicBool>,
+        task: tokio::task::AbortHandle,
+        clock_paused: bool,
+    }
+
+    impl Drop for FloodGuard {
+        fn drop(&mut self) {
+            if self.clock_paused {
+                tokio::time::resume();
+            }
+            self.running.store(false, Ordering::Release);
+            self.task.abort();
+        }
+    }
+
     let retention = Duration::from_millis(200);
     let target = Arc::new(
         UdpSocket::bind("127.0.0.1:0")
@@ -1239,23 +1277,67 @@ async fn attachment_drop_starts_full_retention_and_target_traffic_does_not_exten
             }
         }
     });
+    let mut flood_guard = FloodGuard {
+        running: flood_running.clone(),
+        task: flood_task.abort_handle(),
+        clock_paused: false,
+    };
     tokio::time::timeout(Duration::from_secs(1), flood_started_rx)
         .await
         .expect("target flood start timeout")
         .expect("target flood start signal");
+    tokio::time::pause();
+    flood_guard.clock_paused = true;
     let dropped_at = tokio::time::Instant::now();
+    let before_drop_packets = telemetry.snapshot().datagram.io.to_peer_packets;
     drop(flow);
 
-    tokio::time::sleep_until(dropped_at + Duration::from_millis(140)).await;
+    // Two post-drop native receives require an intervening worker loop. On
+    // this current-thread runtime, that loop observes the absent attachment
+    // at dropped_at and establishes the full retention deadline at fixed time.
+    wait_at_frozen_time(
+        dropped_at,
+        || {
+            let snapshot = telemetry.snapshot();
+            assert_eq!(snapshot.datagram.flows.active, 1);
+            snapshot.datagram.io.to_peer_packets >= before_drop_packets + 2
+        },
+        "worker did not receive target traffic after detachment",
+    )
+    .await;
+
+    // Exercise the last representable instant before expiry, not a real-time
+    // sleep whose observer can be scheduled after the retention deadline.
+    let boundary_step = Duration::from_nanos(1);
+    let before_deadline = dropped_at + retention - boundary_step;
+    let before_boundary_packets = telemetry.snapshot().datagram.io.to_peer_packets;
+    tokio::time::advance(retention - boundary_step).await;
+    wait_at_frozen_time(
+        before_deadline,
+        || {
+            let snapshot = telemetry.snapshot();
+            assert_eq!(snapshot.datagram.flows.active, 1);
+            snapshot.datagram.io.to_peer_packets >= before_boundary_packets + 2
+        },
+        "worker did not retain and receive target traffic immediately before expiry",
+    )
+    .await;
     let retained = telemetry.snapshot();
     assert_eq!(retained.datagram.flows.opened, 1);
     assert_eq!(retained.datagram.flows.active, 1);
 
-    tokio::time::sleep_until(dropped_at + Duration::from_millis(260)).await;
-    await_active_datagram_flows(&telemetry, 0, "detached datagram flow did not expire").await;
+    tokio::time::advance(boundary_step).await;
+    wait_at_frozen_time(
+        dropped_at + retention,
+        || telemetry.snapshot().datagram.flows.active == 0,
+        "detached datagram flow did not expire despite continuing target traffic",
+    )
+    .await;
     let expired = telemetry.snapshot();
     assert_eq!(expired.datagram.flows.opened, 1);
     assert_eq!(expired.datagram.flows.completed, 1);
+    tokio::time::resume();
+    flood_guard.clock_paused = false;
     flood_running.store(false, Ordering::Release);
     tokio::time::timeout(Duration::from_secs(1), flood_task)
         .await

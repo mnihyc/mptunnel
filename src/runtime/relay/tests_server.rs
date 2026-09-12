@@ -7780,3 +7780,302 @@ fn subthreshold_receive_tail_retains_one_existing_ack_deadline() {
     assert!(progress.should_send_ack(&recv_stream, None, TrafficClass::Throughput, limits, true,));
     assert!(!progress.ack_update_pending());
 }
+
+// Diagnostic of current behavior; refusal assertions are not permanent policy.
+// Shared real Product/registry producer; no native socket, QUIC, or H3 claim.
+// One-byte duplex capacity is the smallest deterministic partial-write device:
+// two source bytes produce an observed successful prefix followed by Pending.
+// The existing one-second relay-fixture settlement guard is unchanged in meaning.
+//
+// Controlled event order after the first target write parks:
+//   ACK(actual response Original), DATA("cd"), PathDetached(exact old owner).
+// The second pending target write is a barrier proving that ACK has been applied
+// and DATA removed from input; the only remaining input is then PathDetached.
+
+#[tokio::test]
+async fn server_target_backpressure_diagnostic_retains_ordered_detach_until_input_resumes() {
+    use crate::protocol::{StreamAttachmentPhase, StreamReturnPlan};
+    use crate::runtime::path::prepared::PreparedOriginalClaim;
+    use std::future::{Future, poll_fn};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    struct WriteObserved {
+        inner: tokio::io::DuplexStream,
+        accepted: Arc<AtomicUsize>,
+        pending_polls: Arc<AtomicUsize>,
+    }
+    impl AsyncRead for WriteObserved {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buffer)
+        }
+    }
+    impl AsyncWrite for WriteObserved {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
+            match &result {
+                Poll::Ready(Ok(bytes)) => {
+                    self.accepted.fetch_add(*bytes, Ordering::Release);
+                }
+                Poll::Pending => {
+                    self.pending_polls.fetch_add(1, Ordering::Release);
+                }
+                Poll::Ready(Err(_)) => {}
+            }
+            result
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    // Drive the real actor and inspect a synchronous producer observation after
+    // its poll. Pending is never inferred from a sleep or an elapsed deadline.
+    async fn drive_until<F, T>(mut relay: Pin<&mut F>, ready: impl Fn() -> bool)
+    where
+        F: Future<Output = T>,
+        T: std::fmt::Debug,
+    {
+        poll_fn(|cx| {
+            if ready() {
+                return Poll::Ready(());
+            }
+            if let Poll::Ready(result) = relay.as_mut().poll(cx) {
+                panic!("open Product unexpectedly completed: {result:?}");
+            }
+            if ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let limits = MuxLimits::default();
+        let session_id = SessionId(718);
+        let stream_id = StreamId(718);
+        let lane = TrafficClass::Throughput;
+        let id = crate::product::OutboundId::parse("test-direct").expect("outbound");
+        let outbound_registry = RuntimeOutboundRegistry::compile(
+            [RuntimeOutboundLeaf::Local {
+                id: id.clone(),
+                config: OutboundConfig::Direct,
+                connect_timeout: Duration::from_secs(1),
+                native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+            }], &[], crate::runtime::outbound_registry::test_dns_generation(),
+        ).expect("registry");
+        let router = ClientIngressRouter::new(
+            &ProductPolicyConfig {
+                generation: 1,
+                routes: vec![RouteRuleSpec::new(
+                    RuleId::parse("default").expect("route ID"),
+                    RouteMatchSpec::default(),
+                    RouteAction::allow_restricted(
+                        EgressAction::Outbound(id), None, InitialDemand::Automatic,
+                    ),
+                )],
+            }, outbound_registry,
+        ).expect("router");
+        let context = ServerReliableRelayContext {
+            router,
+            inbound: InboundId::parse("test-inbound").expect("inbound"),
+            performance: MppPerformanceConfig::default(),
+            mux_limits: limits,
+            max_paths_per_session: ResourceLimits::default().max_paths,
+            // As in the existing lifecycle fixture, expiry must not supply the
+            // observed detach completion. No Product idle timeout is installed.
+            session_retention_timeout: Duration::from_secs(60),
+            flow_idle_timeout: None,
+            telemetry: RuntimeTelemetry::new(1),
+        };
+        let (registry, mut accepted_rx) = ServerReliableStreamRegistry::new_accepting_with_limits(
+            limits, ResourceLimits::default().max_paths,
+        );
+        let port = registry.path_port();
+        let registration = port.register_test_carrier_path(
+            session_id, UnderlayProtocol::Tcp, PathId(0), ServerLocalPathProperties::default(),
+        );
+        let key = CarrierPathKey { underlay: registration.underlay(), path_id: registration.path_id() };
+        let path_instance = registration.path_instance_id();
+        let target = TargetAddr::Ip("127.0.0.1:443".parse().expect("target identity"));
+        let open = |commands, phase| ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            initial_demand: StreamDemandHint::Throughput,
+            return_plan: StreamReturnPlan { phase, ..Default::default() },
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration.clone(), commands,
+                max_frame_payload_bytes: limits.max_payload_bytes,
+            },
+            mux_limits: limits,
+        };
+        let (commands, mut receiver) = reliable_path_command_channels(8);
+        assert!(matches!(
+            port.open_or_attach(open(commands, StreamAttachmentPhase::Create)).await.unwrap(),
+            ServerStreamOpenOutcome::New(_),
+        ));
+        let zero = recv_reliable_path_command(&mut receiver).await.expect("initial acceptance");
+        receiver.release_pending_command_bytes(reliable_path_command_pending_bytes(&zero));
+        assert!(matches!(zero, ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+            stream_id: id, max_offset: 0,
+        }) if id == stream_id));
+        let mut accepted = accepted_rx.recv().await.expect("accepted Product");
+        let retirement = accepted.supervise();
+        let send_buffer = accepted.session_send_buffer();
+        let mut path_stream = accepted.take_stream();
+        let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
+            panic!("registry-backed Product output");
+        };
+        let binding = binding.clone();
+        let old = binding.sender_path_targets(lane, 1)[0].observation;
+        assert_eq!(old.path_instance_id, path_instance);
+        drop(accepted);
+
+        // Supply the ordinary successful-target request grant, exactly as the
+        // existing WriteObserved relay-body fixture does. Response credit is a
+        // real routed peer frame, not a send-state mutation.
+        let initial_grant = reliable_stream_initial_advertised_window_bytes(key.underlay, lane, limits);
+        assert!(initial_grant >= 4);
+        assert_eq!(path_stream.publish_max_data(initial_grant).max_data.published_offset, Some(initial_grant));
+        port.route_frame(&registration, stream_id, Frame::StreamMaxData { stream_id, max_offset: 1 })
+            .await.expect("peer permits one actual response byte");
+        let (mut application, relay_side) = tokio::io::duplex(1);
+        application.write_all(b"r").await.expect("real target response source");
+        let written = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let mut close = ServerRelayClose { sent: false, lane };
+        let mut relay = Box::pin(relay_reliable_stream_body(
+            WriteObserved { inner: relay_side, accepted: written.clone(), pending_polls: pending.clone() },
+            &mut path_stream, &context, session_id, send_buffer, &mut close,
+        ));
+
+        // Use the current real prepared-source writer claim. This publishes an
+        // actual response Original; no synthetic flight or fabricated ACK range.
+        let original: Frame = loop {
+            let command = tokio::select! {
+                result = relay.as_mut() => panic!("response source Product ended: {result:?}"),
+                command = recv_reliable_path_command(&mut receiver) => command.expect("response command"),
+            };
+            if let ReliablePathCommand::PreparedOriginal(work) = command {
+                let ready = receiver.writer_ready_boundary(work.path_instance_id()).expect("idle writer boundary");
+                match work.try_claim(ready) {
+                    PreparedOriginalClaim::Claimed(frame) => {
+                        let bytes = receiver.register_claimed_writer_frame(&frame);
+                        receiver.release_pending_command_bytes(bytes);
+                        break frame;
+                    }
+                    PreparedOriginalClaim::Busy(wait) => {
+                        receiver.defer_prepared_work(work, wait);
+                    }
+                    PreparedOriginalClaim::Blocked(wait) => {
+                        receiver.defer_prepared_work(work, wait);
+                    }
+                    PreparedOriginalClaim::Empty => {}
+                    PreparedOriginalClaim::CarrierFailed(error) => panic!("fixture carrier: {error}"),
+                    PreparedOriginalClaim::RecoveryQueued => panic!("no earlier recovery source"),
+                }
+            } else {
+                receiver.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+                assert!(!matches!(command, ReliablePathCommand::SendFrame(Frame::StreamData { .. })));
+            }
+        };
+        let Frame::StreamData { stream_id: id, offset, payload } = &original else { panic!("real response DATA"); };
+        assert_eq!((*id, *offset, payload.as_ref()), (stream_id, 0, b"r".as_slice()));
+        assert_eq!(binding.original_flight_outputs_overlapping_frame(&original), vec![(key, old.incarnation)]);
+        let mut peer = ReliableRecvStream::new_with_initial_max_offset(stream_id, limits, 1);
+        let delivered = peer.receive_data(*offset, payload.clone()).expect("peer receives real response");
+        assert_eq!(delivered.delivered.concat(), b"r");
+        let response_ack = peer.ack_frames().into_iter().next().expect("actual peer receipt");
+
+        port.route_frame(&registration, stream_id, Frame::StreamData {
+            stream_id, offset: 0, payload: Bytes::from_static(b"ab"),
+        }).await.expect("first request batch");
+        drive_until(relay.as_mut(), || pending.load(Ordering::Acquire) > 0).await;
+        assert_eq!(written.load(Ordering::Acquire), 1, "actual partial target write");
+
+        port.route_frame(&registration, stream_id, response_ack).await.expect("ACK before retirement");
+        port.route_frame(&registration, stream_id, Frame::StreamData {
+            stream_id, offset: 2, payload: Bytes::from_static(b"cd"),
+        }).await.expect("earlier DATA before retirement");
+        port.detach_path(&registration, stream_id).expect("exact output retirement");
+        assert!(!binding.has_live_output());
+        assert!(binding.has_output_incarnation(key, old.incarnation));
+        assert_eq!(binding.original_flight_outputs_overlapping_frame(&original), vec![(key, old.incarnation)]);
+        // Exercise a real pending-write poll after ACK/DATA/Detach are queued.
+        let before = pending.load(Ordering::Acquire);
+        drive_until(relay.as_mut(), || pending.load(Ordering::Acquire) > before).await;
+        let (refused, _refused_receiver) = reliable_path_command_channels(8);
+        assert!(matches!(
+            port.open_or_attach(open(refused, StreamAttachmentPhase::Ordinary)).await.unwrap(),
+            ServerStreamOpenOutcome::DuplicateLiveIgnored,
+        ), "current behavior: exact retirement is blocked behind earlier input");
+
+        // Release only the first write. ACK and the second DATA are now ahead of
+        // Detach. The second partial write provides a deterministic observation
+        // between ACK application and the next lifecycle receive opportunity.
+        let before = pending.load(Ordering::Acquire);
+        let mut first = [0; 2];
+        tokio::select! {
+            result = relay.as_mut() => panic!("open Product ended during first drain: {result:?}"),
+            result = application.read_exact(&mut first) => { result.expect("release first target write"); },
+        }
+        assert_eq!(&first, b"ab");
+        drive_until(relay.as_mut(), || written.load(Ordering::Acquire) == 3 && pending.load(Ordering::Acquire) > before).await;
+        assert!(binding.original_flight_outputs_overlapping_frame(&original).is_empty(),
+            "the real preceding ACK is applied, not discarded by retirement");
+        assert!(binding.has_output_incarnation(key, old.incarnation),
+            "the following detach did not overtake ACK/DATA processing");
+        // Controlled input is exhausted through second DATA; PathDetached is
+        // now at the head while that DATA's already-owned local write parks.
+        let (head_refused, _head_receiver) = reliable_path_command_channels(8);
+        assert!(matches!(
+            port.open_or_attach(open(head_refused, StreamAttachmentPhase::Ordinary)).await.unwrap(),
+            ServerStreamOpenOutcome::DuplicateLiveIgnored,
+        ), "current behavior: head lifecycle is still withheld by target write");
+
+        let mut second = [0; 2];
+        tokio::select! {
+            result = relay.as_mut() => panic!("open Product ended during final drain: {result:?}"),
+            result = application.read_exact(&mut second) => { result.expect("release final target write"); },
+        }
+        assert_eq!(&second, b"cd");
+        drive_until(relay.as_mut(), || !binding.has_output_incarnation(key, old.incarnation)).await;
+        assert_eq!(written.load(Ordering::Acquire), 4, "no partial-prefix replay");
+        assert!(binding.original_flight_outputs_overlapping_frame(&original).is_empty());
+        let (replacement, _replacement_receiver) = reliable_path_command_channels(8);
+        assert!(matches!(
+            port.open_or_attach(open(replacement, StreamAttachmentPhase::Ordinary)).await.unwrap(),
+            ServerStreamOpenOutcome::Existing(_),
+        ), "only target reads changed; the same physical registration now admits replacement");
+        let fresh = binding.sender_path_targets(lane, 1)[0].observation;
+        assert_eq!(fresh.path_instance_id, path_instance);
+        assert_ne!(fresh.incarnation, old.incarnation);
+        assert!(binding.original_flight_outputs_overlapping_frame(&original).is_empty(),
+            "fresh output cannot inherit acknowledged predecessor flight");
+
+        // The Product remains open throughout. Destruction/supervision is
+        // cleanup after the decisive observations, not the cause of admission.
+        drop(relay);
+        drop(path_stream);
+        retirement.retire().await;
+        drop(application);
+    }).await.expect("existing one-second real-relay fixture settlement guard");
+}

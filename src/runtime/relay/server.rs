@@ -15,8 +15,8 @@ use super::io::{
     ReliableResponsePathStaleness, apply_ready_stream_data_batch, begin_reliable_stream_ack,
     collect_ready_stream_data_batch, exact_contiguous_retransmission_frames,
     pending_stream_fin_ready, preserve_reinjection_frontier_quantum, read_reliable_relay_payload,
-    receive_stream_fin, reconcile_accepted_copy_wake, resize_reliable_relay_buffer,
-    retain_accepted_copy_wake, stream_ack_gap_frontier_reinjection_frames_normalized,
+    receive_stream_fin, reconcile_accepted_copy_wake, retain_accepted_copy_wake,
+    stream_ack_gap_frontier_reinjection_frames_normalized,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required, update_reinjection_authoritative_ack_snapshot,
     write_applied_ready_stream_data_batch,
@@ -3118,9 +3118,6 @@ where
                 .min(sender_queue_limit)
                 .min(latency_startup_credit)
                 .min(source_staging_headroom);
-            if source_read_ceiling > 0 {
-                resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
-            }
             let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
                 reliable_relay_sender_dispatch_budget(
                     mux_limits,

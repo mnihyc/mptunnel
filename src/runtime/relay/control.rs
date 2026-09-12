@@ -11,7 +11,7 @@ use super::io::{
     AuthoritativeStreamAckSnapshot, ReadyStreamDataBatchBounds, ReadyStreamDataDirection,
     accepted_copy_wake_is_due, apply_ready_stream_data_batch, collect_ready_stream_data_batch,
     pending_stream_fin_ready, read_reliable_relay_payload, receive_stream_fin,
-    reconcile_accepted_copy_wake, resize_reliable_relay_buffer, retain_accepted_copy_wake,
+    reconcile_accepted_copy_wake, retain_accepted_copy_wake,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required, write_applied_ready_stream_data_batch,
 };
@@ -1665,7 +1665,6 @@ where
                     .min(remotes.max_frame_payload_bytes(context.mux_limits))
                     .min(sender_queue_limit)
                     .max(1);
-                resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
                 let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
                     reliable_relay_sender_dispatch_budget(
                         context.mux_limits,

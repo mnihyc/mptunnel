@@ -221,10 +221,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                     match work.try_claim(ready) {
                         PreparedOriginalClaim::Claimed(frame) => {
                             let bytes = commands.register_claimed_writer_frame(&frame);
-                            quinn::note_source_state("server_prepared_claim", format_args!(
-                                "stream_id={} path_id={} outcome=Claimed command_bytes={}",
-                                stream_id.0, path_id.0, bytes,
-                            ));
                             pending_frame_command_bytes = pending_frame_command_bytes
                                 .checked_add(bytes)
                                 .ok_or(RuntimeError::Protocol(
@@ -238,9 +234,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                             work.requeue();
                         }
                         PreparedOriginalClaim::RecoveryQueued => {
-                            quinn::note_source_state("server_prepared_claim", format_args!(
-                                "stream_id={} path_id={} outcome=RecoveryQueued", stream_id.0, path_id.0,
-                            ));
                             work.requeue();
                             // The independent repair stream may already run;
                             // it never takes ownership of this staged batch.
@@ -262,28 +255,14 @@ pub(super) async fn drain_server_udp_reliable_commands(
                             return Ok(false);
                         }
                         PreparedOriginalClaim::Busy(wait) => {
-                            quinn::note_source_state("server_prepared_claim", format_args!(
-                                "stream_id={} path_id={} outcome=Busy", stream_id.0, path_id.0,
-                            ));
                             commands.defer_prepared_work(work, wait)
                         }
                         PreparedOriginalClaim::CarrierFailed(error) => return Err(error),
                         PreparedOriginalClaim::Blocked(wait) => {
-                            quinn::note_source_state("server_prepared_claim", format_args!(
-                                "stream_id={} path_id={} outcome=Blocked", stream_id.0, path_id.0,
-                            ));
                             commands.defer_prepared_work(work, wait)
                         }
-                        PreparedOriginalClaim::Empty => {
-                            quinn::note_source_state("server_prepared_claim", format_args!(
-                                "stream_id={} path_id={} outcome=Empty", stream_id.0, path_id.0,
-                            ));
-                        }
+                        PreparedOriginalClaim::Empty => {}
                     }
-                } else {
-                    quinn::note_source_state("server_prepared_claim_gate", format_args!(
-                        "stream_id={} path_id={} outcome=NotEntered", stream_id.0, path_id.0,
-                    ));
                 }
                 false
             }
@@ -532,21 +511,6 @@ async fn flush_server_udp_frame_batch(
         },
     )
     .await;
-    if let Err(error) = &result {
-        let deferred_reset = match deferred_input {
-            Some(Ok(Frame::StreamReset { stream_id, .. })) => Some(stream_id.0),
-            _ => None,
-        };
-        super::io::terminal_trace(
-            "server_interlock_write_error",
-            stream_id,
-            format_args!(
-                "error={error} deferred={} deferred_reset={deferred_reset:?} channel_len={}",
-                deferred_input.is_some(),
-                carrier_frames.len()
-            ),
-        );
-    }
     commands.release_pending_command_bytes(std::mem::take(pending_frame_command_bytes));
     let _routed_frames = result?;
     #[cfg(feature = "lab-diagnostics")]

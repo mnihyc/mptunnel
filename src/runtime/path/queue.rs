@@ -2123,24 +2123,24 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
             || !receivers.deferred_prepared.is_empty();
         let received = tokio::select! {
             biased;
-            command = quinn::observe_source_future("queue_retirement_recv", receivers.retirement.recv()), if retirement_may_recv => {
+            command = receivers.retirement.recv(), if retirement_may_recv => {
                 ReceivedCommand::Retirement(command)
             }
-            command = quinn::observe_source_future("queue_control_recv", receivers.control.recv()), if control_may_recv => {
+            command = receivers.control.recv(), if control_may_recv => {
                 ReceivedCommand::Queued(command)
             }
-            command = quinn::observe_source_future("queue_priority_recv", receivers.priority.recv()), if priority_may_recv => {
+            command = receivers.priority.recv(), if priority_may_recv => {
                 ReceivedCommand::Queued(command)
             }
-            command = quinn::observe_source_future("queue_repair_recv", recv_ordinary_repair_queue(&mut receivers.reinjection)), if reinjection_may_recv => {
+            command = recv_ordinary_repair_queue(&mut receivers.reinjection), if reinjection_may_recv => {
                 ReceivedCommand::Queued(command)
             }
-            command = quinn::observe_source_future("queue_data_recv", receivers.data.recv()), if data_may_recv => {
+            command = receivers.data.recv(), if data_may_recv => {
                 ReceivedCommand::Queued(command)
             }
-            () = quinn::observe_source_future("queue_prepared_waits", std::future::poll_fn(|cx| poll_prepared_waits(
+            () = std::future::poll_fn(|cx| poll_prepared_waits(
                 &mut receivers.prepared_waits, &mut receivers.deferred_prepared, cx,
-            ))), if prepared_may_recv => ReceivedCommand::PreparedWake,
+            )), if prepared_may_recv => ReceivedCommand::PreparedWake,
             else => return None,
         };
         match received {
@@ -2278,11 +2278,7 @@ pub(in crate::runtime) async fn try_coalesce_reliable_path_writer_run(
     ) {
         return false;
     }
-    quinn::note_source_state("writer_coalescing", format_args!(
-        "sent_items={} sent_bytes={} byte_budget={} item_budget={}",
-        sent_items, sent_bytes, byte_budget, item_budget,
-    ));
-    quinn::observe_source_future("writer_coalescing_yield", tokio::task::yield_now()).await;
+    tokio::task::yield_now().await;
     if let Some(command) = try_recv_reliable_path_command(receivers) {
         *next_command = Some(command);
         return true;

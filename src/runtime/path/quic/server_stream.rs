@@ -364,7 +364,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
     );
     let mut repair = repair;
     tokio::pin!(ordinary);
-    let result = tokio::select! {
+    tokio::select! {
         biased;
         Ok(()) = stopped_send => {
             // The ordinary writer has released its failed output. Cancel its
@@ -373,24 +373,9 @@ pub(super) async fn handle_server_udp_reliable_stream(
             drop(repair);
             ordinary.await?
         },
-        result = &mut repair => {
-            super::io::terminal_trace("server_repair_exit", stream_id, format_args!("session_id={} path_id={} result={result:?}", session_id.0, path_id.0));
-            result
-        },
-        result = &mut ordinary => {
-            super::io::terminal_trace("server_ordinary_exit", stream_id, format_args!("session_id={} path_id={} result={result:?}", session_id.0, path_id.0));
-            result?
-        },
-    };
-    super::io::terminal_trace(
-        "server_attachment_exit",
-        stream_id,
-        format_args!(
-            "session_id={} path_id={} result={result:?}",
-            session_id.0, path_id.0
-        ),
-    );
-    result
+        result = &mut repair => result,
+        result = &mut ordinary => result?,
+    }
 }
 
 struct ServerUdpReliableStreamLoop {
@@ -504,12 +489,12 @@ async fn run_server_udp_reliable_stream_loop(
         }
         tokio::select! {
             biased;
-            frame = quinn::observe_source_future("server_actor_input_recv", async {
+            frame = async {
                 match deferred_input.take() {
                     Some(input) => Some(input),
                     None => carrier_frames.recv().await,
                 }
-            }) => {
+            } => {
                 commands_rx.withdraw_writer_ready();
                 match frame {
                     Some(Ok(frame @ Frame::StreamRequalifyData {
@@ -541,13 +526,10 @@ async fn run_server_udp_reliable_stream_loop(
                         | Frame::StreamReset { stream_id: received_stream_id, .. })))
                         if received_stream_id == stream_id =>
                     {
-                        quinn::observe_source_future(
-                            "server_input_route_mailbox",
-                            context
-                                .reliable_streams
-                                .route_frame(&path_registration, stream_id, frame),
-                        )
-                        .await?;
+                        context
+                            .reliable_streams
+                            .route_frame(&path_registration, stream_id, frame)
+                            .await?;
                     }
                     Some(Ok(Frame::StreamDetach { stream_id: detach_stream_id }))
                         if detach_stream_id == stream_id =>
@@ -736,7 +718,7 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                 }
             }
-            command = quinn::observe_source_future("server_actor_command_recv", recv_reliable_path_command(&mut commands_rx)), if command_may_recv => {
+            command = recv_reliable_path_command(&mut commands_rx), if command_may_recv => {
                 if let Some(command) = command {
                     let result = drain_server_udp_reliable_commands(
                         command,
@@ -780,11 +762,6 @@ async fn run_server_udp_reliable_stream_loop(
             let _ = stopped.send(());
         }
         if owner_closed.is_some() {
-            super::io::terminal_trace(
-                "server_stopped_send_input_preserved",
-                stream_id,
-                format_args!(""),
-            );
             drain_server_udp_terminal_input(
                 &mut carrier_frames,
                 &mut deferred_input,

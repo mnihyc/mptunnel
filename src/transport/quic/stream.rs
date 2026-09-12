@@ -60,7 +60,7 @@ impl IpPacketSender {
 impl SendStream {
     /// Capture a registration before moving this exclusive H3 half into its actor.
     pub fn native_source_registration(&self) -> super::NativeSourceRegistration {
-        super::NativeSourceRegistration::new(self.connection.clone(), self.request_stream_id.into())
+        super::NativeSourceRegistration::new(self.connection.clone())
     }
 
     pub(crate) fn request_stream_id(&self) -> u64 {
@@ -1146,11 +1146,3 @@ pub async fn finish_stream(send: &mut SendStream) -> Result<(), QuicCarrierError
 #[cfg(test)]
 #[path = "tests_stream.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "tests_driven_source_feedback.rs"]
-mod driven_source_feedback_tests;
-
-#[cfg(test)]
-#[path = "tests_native_source_network.rs"]
-mod native_source_network_tests;

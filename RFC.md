@@ -2452,9 +2452,8 @@ through the ordinary permit.
 This preserves shared, zero-copy payload ownership without repeatedly pinning
 mostly unused old allocations. It can require an additional read/admission turn
 at a backing boundary, and the larger partially filled backing per source is a
-resource cost. This explicitly refines the earlier grant-sized refill rule; the
-arbitration and unique-byte envelope do not change. Unique bytes still differ from
-physical allocation capacity: an outstanding slice after partial ACK can pin an
+resource cost within the same arbitration and unique-byte envelope. Unique bytes
+still differ from physical allocation capacity: an outstanding slice after partial ACK can pin an
 otherwise consumed backing allocation, and each live source retains its current
 buffer. Repair item/lifetime bounds and measured resource behavior still apply.
 
@@ -3260,7 +3259,8 @@ bounds, without an invented empty-FIFO receipt. This availability distinction
 neither prefers a protocol nor asserts an exact guarantee for every platform.
 QUIC FIFOs retain independent opportunities and share connection resources.
 
-An adapter MAY couple a live writer actor to its native connection driver. At
+An adapter MAY couple a live writer actor to its native connection driver. The MPP
+QUIC implementation uses this coupling for ordinary actors in both directions. At
 native packetization or writable events, it forwards the exact event and offers
 the signaled actor a poll before the next no-work classification. The native
 state lock MUST be released while polling or destroying the actor. A pending
@@ -3278,7 +3278,9 @@ is not retirement. Actor panic MUST remain isolated from the shared native drive
 and reach the original actor parent. A dedicated actor-execution guard may exclude
 concurrent polling and destruction; cancellation MUST NOT acquire it while holding
 Native or Product ownership locks. It is distinct from a Product ownership guard.
-Existing send/receive half-close and sibling repair lifetimes remain independent.
+Send/receive half-close remains directional. Retiring a failed output also retires
+its companion repair future; authenticated ordinary request input continues under
+its own Product-input or native terminal lifetime, as specified in §8.5.
 Native termination retains its observed connection-close cause and physical
 carrier scope; unavailable cause remains explicit, never a fabricated error or an
 attachment-local status. The cost of serialized actor polling and synchronous

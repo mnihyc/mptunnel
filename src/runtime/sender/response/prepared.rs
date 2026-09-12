@@ -257,10 +257,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     }
     let state = match owner.arm_claim().try_lock() {
         Ok(state) => state,
-        Err(wait) => {
-            quinn::note_source_state("response_prepared_refusal", format_args!("stage=initial reason=ProductBusy owner_id={}", owner.observation_identity()));
-            return PreparedOriginalClaim::Busy(wait);
-        }
+        Err(wait) => return PreparedOriginalClaim::Busy(wait),
     };
     if !current(&state, identity, registration) {
         return PreparedOriginalClaim::Empty;
@@ -312,16 +309,12 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     let mut inputs = ResponsePreparedNativeInputs::resolve(outputs.clone());
     let mut state = match owner.arm_claim().try_lock() {
         Ok(state) => state,
-        Err(wait) => {
-            quinn::note_source_state("response_prepared_refusal", format_args!("stage=native_recheck reason=ProductBusy owner_id={}", owner.observation_identity()));
-            return PreparedOriginalClaim::Busy(wait);
-        }
+        Err(wait) => return PreparedOriginalClaim::Busy(wait),
     };
     if !current(&state, identity, registration) {
         return PreparedOriginalClaim::Empty;
     }
     if state.prepared.data_quantum_bytes != quantum || !ready.receipt().is_current() {
-        quinn::note_source_state("response_prepared_refusal", format_args!("stage=native_recheck reason=QuantumOrReadyChanged"));
         return PreparedOriginalClaim::Blocked(wake);
     }
     if let Err(error) = commitments.check_selected(identity) {
@@ -333,7 +326,6 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         .binding()
         .observe_prepared_original(&inputs, lane, offset)
     else {
-        quinn::note_source_state("response_prepared_refusal", format_args!("stage=native_recheck reason=ObservationUnavailable"));
         return PreparedOriginalClaim::Blocked(wake);
     };
     let recovery = state.sender.next_prepared_recovery(
@@ -467,15 +459,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         return result.unwrap_or(PreparedOriginalClaim::Blocked(wake));
     }
     let Some(source) = source else {
-        let queued_data_empty = state.sender.data_bytes() == 0;
-        let return_empty = queued_data_empty && state.send_stream.reinjection_bytes() == 0;
-        // This selection was made before Native resolution and also includes
-        // startup/quantum/repair-credit restrictions. It is not producer EOF.
-        quinn::note_source_state("response_source_selection_none", format_args!(
-            "queued_data_empty={} return_empty={} selected_offset={} quantum={} repair_credit={}",
-            queued_data_empty, return_empty, offset, quantum, credit,
-        ));
-        return if return_empty {
+        return if state.sender.data_bytes() == 0 && state.send_stream.reinjection_bytes() == 0 {
             PreparedOriginalClaim::Empty
         } else {
             PreparedOriginalClaim::Blocked(wake)
@@ -486,7 +470,6 @@ pub(in crate::runtime) fn claim_prepared_response_data(
             current.as_ptr() == source.as_ptr() && current.len() >= source.len()
         })
     {
-        quinn::note_source_state("response_prepared_refusal", format_args!("stage=selection reason=SourceChanged"));
         return PreparedOriginalClaim::Blocked(wake);
     }
     let Some(selection) = select_prepared_response_data_path(
@@ -499,9 +482,6 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         frontier(&state),
         &commitments.original_ready(ready_outputs(&outputs), &mut commitment_waits),
     ) else {
-        quinn::note_source_state("response_prepared_refusal", format_args!(
-            "stage=selection reason=NoOriginalSelection commitment_waits={}", commitment_waits.len(),
-        ));
         return PreparedOriginalClaim::Blocked(prepared_wait_with_native_commitment(
             wake,
             commitment_waits,
@@ -509,7 +489,6 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     };
     let selected_identity = ResponseAcquisitionOutputId::from(&selection.target);
     if selected_identity != identity {
-        quinn::note_source_state("response_prepared_refusal", format_args!("stage=selection reason=OtherTarget"));
         let selected = state
             .prepared
             .registrations
@@ -534,10 +513,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
             StreamError::FlowControlBlocked { .. }
             | StreamError::ReinjectionCacheFull { .. }
             | StreamError::TooManyReinjectionCacheChunks { .. },
-        ) => {
-            quinn::note_source_state("response_prepared_refusal", format_args!("stage=prepare_data reason=FlowOrRetentionBlocked"));
-            return PreparedOriginalClaim::Blocked(wake);
-        }
+        ) => return PreparedOriginalClaim::Blocked(wake),
         Err(error) => {
             source_error(&mut state, RuntimeError::Stream(error));
             return PreparedOriginalClaim::Empty;

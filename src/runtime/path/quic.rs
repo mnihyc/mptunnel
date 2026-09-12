@@ -6,8 +6,8 @@
 pub(in crate::runtime) mod client;
 mod client_stream;
 mod client_writer;
-mod driven;
 pub(in crate::runtime) mod datagram;
+mod driven;
 mod estimator;
 pub(in crate::runtime) mod io;
 pub(in crate::runtime) mod ip_tunnel;

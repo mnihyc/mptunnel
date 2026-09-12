@@ -2931,7 +2931,6 @@ impl Controller for Bbr3 {
         app_limited: bool,
     ) -> Option<crate::congestion::PacketDeliveryState> {
         self.inflight = prior_in_flight;
-        let diagnostic_old_mark = self.app_limited;
         // Quinn's send-time signal is authoritative for whether this packet begins or extends an
         // application-limited epoch. Refresh the delivery watermark before idle-restart handling
         // and before taking P.is_app_limited. A false signal must not clear an epoch whose packets
@@ -2942,20 +2941,6 @@ impl Controller for Bbr3 {
                 Ord::max(self.delivered.saturating_add(prior_in_flight), 1),
             );
         }
-        crate::connection::classifier_trace::mark_update(
-            now,
-            crate::connection::classifier_trace::MarkUpdate {
-                controller: self as *const Self as usize,
-                callback: "send",
-                old: diagnostic_old_mark,
-                after_expiry: diagnostic_old_mark,
-                new: self.app_limited,
-                delivered: self.delivered,
-                flight: prior_in_flight,
-                cwnd: self.cwnd,
-                flag: app_limited,
-            },
-        );
         let is_initial_zero_flight =
             self.inflight == 0 && self.delivered == 0 && self.first_send_time.is_none();
         let is_idle_zero_flight = self.inflight == 0 && self.app_limited != 0;
@@ -3090,31 +3075,15 @@ impl Controller for Bbr3 {
     ) {
         self.inflight = in_flight;
         if largest_packet_num_acked.is_some() {
-            let diagnostic_old_mark = self.app_limited;
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
             }
-            let diagnostic_after_expiry = self.app_limited;
             // The current connection state wins after an old watermark expires. Keeping this
             // independent from the expiry branch avoids one ACK-sized unmarked gap during idle
             // control traffic, which can otherwise look like a low non-app-limited Startup round.
             if app_limited {
                 self.app_limited = Ord::max(self.delivered.saturating_add(self.inflight), 1);
             }
-            crate::connection::classifier_trace::mark_update(
-                now,
-                crate::connection::classifier_trace::MarkUpdate {
-                    controller: self as *const Self as usize,
-                    callback: "ack",
-                    old: diagnostic_old_mark,
-                    after_expiry: diagnostic_after_expiry,
-                    new: self.app_limited,
-                    delivered: self.delivered,
-                    flight: in_flight,
-                    cwnd: self.cwnd,
-                    flag: app_limited,
-                },
-            );
             for packets in self.packets.iter_mut() {
                 packets.retain(|&p| !p.stale);
                 for p in packets.iter_mut() {
@@ -3141,63 +3110,9 @@ impl Controller for Bbr3 {
                     }
                     self.rs = Some(rate_sample);
                     self.finish_inflight_rtt_ack_epoch();
-                    // Diagnostic only: one record per native round, using this ACK's exact sample.
-                    static TRACE: std::sync::OnceLock<Option<(String, Instant)>> =
-                        std::sync::OnceLock::new();
-                    let trace = TRACE.get_or_init(|| {
-                        std::env::var("MPTUNNEL_NATIVE_STATE_TRACE_ROLE")
-                            .ok()
-                            .filter(|role| matches!(role.as_str(), "server" | "client"))
-                            .map(|role| (role, now))
-                    });
-                    let trace_before = trace.as_ref().map(|_| {
-                        (
-                            self.state,
-                            self.full_bw,
-                            self.full_bw_count,
-                            self.full_bw_reached,
-                            self.full_bw_now,
-                            self.round_count,
-                            self.bw,
-                            self.max_bw,
-                            self.pacing_rate,
-                            self.cwnd,
-                        )
-                    });
                     // UpdateOnACK consumes exactly this ACK's completed sample, exactly once.
                     self.update_model_and_state(rate_sample.last_packet, now);
                     self.update_control_parameters();
-                    if let (true, Some((role, started)), Some(before)) =
-                        (self.round_start, trace.as_ref(), trace_before)
-                    {
-                        let rtt_us = |rtt: Duration| {
-                            (rtt != Duration::from_secs(u64::MAX)).then(|| rtt.as_micros())
-                        };
-                        let unix_us = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_micros());
-                        crate::emit_native_trace(format_args!(concat!(
-                            "native_control_round role={} controller={:p} elapsed_us={:?} unix_us={:?} ",
-                            "state_before={:?} state_after={:?} full_bw_before={} full_bw_after={} ",
-                            "full_bw_count_before={} full_bw_count_after={} full_bw_reached_before={} full_bw_reached_after={} ",
-                            "full_bw_now_before={} full_bw_now_after={} round_before={} round_after={} round_start={} ",
-                            "caller_app_limited={} rs_app_limited={} rs_raw_bytes_per_s={} rs_model_bytes_per_s={} rs_interval_us={} rs_rtt_us={} ",
-                            "bw_before={} bw_after={} max_bw_before={} max_bw_after={} pacing_before={} pacing_after={} pacing_gain={} cwnd_gain={} ",
-                            "cwnd_before={} cwnd_after={} flight_bytes={} min_rtt_us={:?} operational_rtt_us={:?} ",
-                            "space={:?} packet={} sample_valid={}"
-                        ), role, self as *const Self, now.checked_duration_since(*started).map(|d| d.as_micros()), unix_us,
-                            before.0, self.state, before.1, self.full_bw,
-                            before.2, self.full_bw_count, before.3, self.full_bw_reached,
-                            before.4, self.full_bw_now, before.5, self.round_count, self.round_start,
-                            app_limited, rate_sample.is_app_limited, rate_sample.delivery_rate,
-                            self.model_delivery_rate(rate_sample), rate_sample.interval.as_micros(), rate_sample.rtt.as_micros(),
-                            before.6, self.bw, before.7, self.max_bw, before.8, self.pacing_rate,
-                            self.pacing_gain, self.cwnd_gain, before.9, self.cwnd, self.inflight,
-                            rtt_us(self.min_rtt), rtt_us(self.inflight_rtt), rate_sample.last_packet.space,
-                            rate_sample.last_packet.packet_number, valid_interval && rate_sample.interval != Duration::ZERO
-                                && rate_sample.delivery_rate.is_finite() && rate_sample.delivery_rate > 0.0));
-                    }
 
                     let next_revision =
                         self.latest_completed_bandwidth_sample.map_or(1, |sample| {

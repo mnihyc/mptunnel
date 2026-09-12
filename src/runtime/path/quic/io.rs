@@ -77,48 +77,7 @@ fn quic_stream_priority(lane: TrafficClass) -> i32 {
     }
 }
 
-// Diagnostic-only terminal boundary observation; no per-byte trace or waiting.
-pub(in crate::runtime) fn terminal_trace(
-    event: &str,
-    stream_id: crate::protocol::StreamId,
-    detail: std::fmt::Arguments<'_>,
-) {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ENABLED.get_or_init(|| std::env::var("MPTUNNEL_TERMINAL_TRACE").as_deref() == Ok("1")) {
-        let unix_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("diagnostic clock")
-            .as_micros();
-        eprintln!(
-            "terminal_trace unix_us={unix_us} event={event} stream_id={} {detail}",
-            stream_id.0
-        );
-    }
-}
-
 impl UdpPathSendStream {
-    pub(super) fn trace_terminal_progress(
-        &self,
-        event: &str,
-        stream_id: crate::protocol::StreamId,
-    ) {
-        if std::env::var("MPTUNNEL_TERMINAL_TRACE").as_deref() != Ok("1") {
-            return;
-        }
-        let progress = self
-            .stream
-            .native_progress_observer()
-            .and_then(|observer| observer.snapshot());
-        terminal_trace(
-            event,
-            stream_id,
-            format_args!(
-                "request_stream_id={} progress={progress:?}",
-                self.request_stream_id()
-            ),
-        );
-    }
-
     #[cfg(test)]
     pub(super) fn native_progress_observer_for_test(
         &self,
@@ -586,14 +545,11 @@ where
     }
     debug_assert!(deferred_input.is_none());
     let write = udp_path_write_frames(send, frames, codec_limits);
-    let (write_result, routed_frames) = quinn::observe_source_future(
-        "udp_interlocked_write",
-        await_udp_write_while_routing_stream_frames(
-            write,
-            carrier_frames,
-            deferred_input,
-            try_route_frame,
-        ),
+    let (write_result, routed_frames) = await_udp_write_while_routing_stream_frames(
+        write,
+        carrier_frames,
+        deferred_input,
+        try_route_frame,
     )
     .await;
     write_result?;
@@ -620,29 +576,27 @@ where
     loop {
         tokio::select! {
             biased;
-            result = quinn::observe_source_future("udp_h3_write", &mut write) => {
+            result = &mut write => {
                 if let Some(pending) = mailbox.take() {
                     *deferred_input = Some(Ok(pending.into_frame()));
                 }
                 return (result, routed_frames);
             }
-            _ = quinn::observe_source_future("udp_input_mailbox_deliver", async {
+            _ = async {
                 mailbox.as_mut().expect("pending mailbox").deliver().await
-            }),
+            },
                 if mailbox.is_some() => {
                 mailbox = None;
                 routed_frames = routed_frames.saturating_add(1);
             }
-            incoming = quinn::observe_source_future("udp_interlocked_input_recv", carrier_frames.recv()), if deferred_input.is_none() && mailbox.is_none() => {
+            incoming = carrier_frames.recv(), if deferred_input.is_none() && mailbox.is_none() => {
                 match incoming {
                     Some(Ok(frame)) => match try_route_frame(frame) {
                         Ok(CarrierInputRoute::Routed) => routed_frames = routed_frames.saturating_add(1),
                         Ok(CarrierInputRoute::Barrier(frame)) => {
-                            quinn::note_source_state("udp_input_route", format_args!("result=Barrier"));
                             *deferred_input = Some(Ok(frame));
                         }
                         Ok(CarrierInputRoute::Mailbox(pending)) => {
-                            quinn::note_source_state("udp_input_route", format_args!("result=Mailbox"));
                             mailbox = Some(pending);
                         }
                         Err(err) => *deferred_input = Some(Err(err)),
@@ -834,22 +788,8 @@ pub(super) fn spawn_quic_path_reader(
                 }
                 Err(err) => Err(err),
             };
-            let terminal_stream = match &frame {
-                Ok(Frame::StreamReset { stream_id, .. }) => Some(*stream_id),
-                _ => None,
-            };
-            if let Some(stream_id) = terminal_stream {
-                terminal_trace("reader_reset_decoded", stream_id, format_args!(""));
-            }
             let done = frame.is_err();
             let send_result = frames_tx.send(frame).await;
-            if let Some(stream_id) = terminal_stream {
-                terminal_trace(
-                    "reader_reset_channel_send",
-                    stream_id,
-                    format_args!("accepted={}", send_result.is_ok()),
-                );
-            }
             if send_result.is_err() || done {
                 return;
             }

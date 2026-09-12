@@ -52,15 +52,10 @@ mod mutex;
 mod recv_stream;
 mod runtime;
 mod send_stream;
-mod source_trace;
 mod work_limiter;
 
 pub use execution_binding::ExecutionDomainConflict;
 pub use execution_domain::{DomainFuture, ExecutionDomain};
-
-#[doc(hidden)]
-pub use proto::{emit_native_trace, native_source_window_at};
-pub use source_trace::{note_source_state, observe_source_future};
 
 #[cfg(not(wasm_browser))]
 pub(crate) use std::time::{Duration, Instant};

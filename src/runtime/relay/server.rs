@@ -2286,66 +2286,6 @@ fn refresh_server_response_flow_demand(
     )
 }
 
-// Diagnostic only: completed positive reads, not reserve attempts or source
-// readiness claims. Publication uses the existing source-admission cadence.
-#[derive(Default)]
-struct ServerSourceReadObservation {
-    positive_reads: u64,
-    positive_bytes: u64,
-    successful_granted_bytes: u64,
-    successful_refund_bytes: u64,
-    filled_buffer_below_grant_reads: u64,
-    filled_buffer_below_grant_bytes: u64,
-    filled_buffer_below_grant_refund_bytes: u64,
-    completed_positive_refill_reads: u64,
-    refill_capacity_sum_bytes: u64,
-    refill_capacity_min_bytes: Option<u64>,
-    refill_capacity_max_bytes: Option<u64>,
-}
-
-impl ServerSourceReadObservation {
-    fn record(&mut self, read: usize, grant: usize, capacity_before: usize, capacity_after: usize) {
-        if read == 0 {
-            return;
-        }
-        let read = read as u64;
-        let grant = grant as u64;
-        let refund = grant.saturating_sub(read);
-        self.positive_reads = self.positive_reads.saturating_add(1);
-        self.positive_bytes = self.positive_bytes.saturating_add(read);
-        self.successful_granted_bytes = self.successful_granted_bytes.saturating_add(grant);
-        self.successful_refund_bytes = self.successful_refund_bytes.saturating_add(refund);
-        // This says the read filled the offered buffer below its permit. It
-        // does not establish that the target had further bytes ready to read.
-        if capacity_after == 0 && read < grant {
-            self.filled_buffer_below_grant_reads =
-                self.filled_buffer_below_grant_reads.saturating_add(1);
-            self.filled_buffer_below_grant_bytes =
-                self.filled_buffer_below_grant_bytes.saturating_add(read);
-            self.filled_buffer_below_grant_refund_bytes = self
-                .filled_buffer_below_grant_refund_bytes
-                .saturating_add(refund);
-        }
-        // An exhausted buffer can reclaim unique storage as well as allocate.
-        // A refill cancelled before a positive result is deliberately absent.
-        if capacity_before == 0 {
-            let capacity = read.saturating_add(capacity_after as u64);
-            self.completed_positive_refill_reads =
-                self.completed_positive_refill_reads.saturating_add(1);
-            self.refill_capacity_sum_bytes =
-                self.refill_capacity_sum_bytes.saturating_add(capacity);
-            self.refill_capacity_min_bytes = Some(
-                self.refill_capacity_min_bytes
-                    .map_or(capacity, |old| old.min(capacity)),
-            );
-            self.refill_capacity_max_bytes = Some(
-                self.refill_capacity_max_bytes
-                    .map_or(capacity, |old| old.max(capacity)),
-            );
-        }
-    }
-}
-
 // Reliable server response relay
 async fn relay_reliable_stream<S>(
     local: S,
@@ -2509,15 +2449,6 @@ where
     let mut ready_path_data = super::io::ReadyStreamDataBatch::new();
     let mut send_buffer_reservation = session_send_buffer.stream_reservation();
     let mut send_buffer_updates = session_send_buffer.subscribe();
-    let source_admission_observe =
-        std::env::var("MPTUNNEL_SOURCE_ADMISSION_OBSERVE").as_deref() == Ok("1");
-    let mut last_source_admission_observation = None::<Instant>;
-    // Starts count the first poll of each reserve attempt, including attempts
-    // later cancelled by select. They are not unique queued-waiter counts.
-    let mut source_reserve_starts = 0u64;
-    let mut source_reserve_grants = 0u64;
-    let mut source_reserve_granted_bytes = 0u64;
-    let mut source_read_observation = ServerSourceReadObservation::default();
     let mut response_sender_retry_at: Option<tokio::time::Instant> = None;
     let mut response_requalification_capacity_wait = None;
     let mut no_output_since: Option<Instant> = None;
@@ -2901,9 +2832,6 @@ where
                 + reliable_stream_recv_progress_interval(request_feedback_path_snapshot),
         );
         let recv_progress_ack_update_pending = remote_open && recv_progress.ack_update_pending();
-        let observe_source_admission = source_admission_observe
-            && last_source_admission_observation
-                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(1));
         let (
             response_state_capacity_blocked,
             has_request_ack_capacity_wait,
@@ -2931,7 +2859,6 @@ where
             read_budget,
             can_send_pending_fin,
             prepared_work_wait,
-            source_admission_observation,
         ) = {
             let mut product = response_product.lock();
             if let Some(error) = product.prepared.pending_error.take() {
@@ -3274,16 +3201,6 @@ where
                 send_path_snapshot.is_some() && can_read_by_flow && read_budget > 0;
             let can_send_pending_fin =
                 pending_local_fin && response_sender.is_empty() && !close.sent;
-            let source_admission_observation = observe_source_admission.then(|| {
-                (
-                    session_send_buffer.used_bytes(),
-                    session_send_buffer.limit_bytes(),
-                    response_sender.bytes(),
-                    send_stream.send_credit_bytes(),
-                    send_stream.reinjection_bytes(),
-                )
-            });
-
             // Membership and pending control publication can become reconciled in
             // this turn without producing another wake. Reconsider completion only
             // after that work, while retaining every exact-recipient obligation.
@@ -3347,41 +3264,8 @@ where
                 read_budget,
                 can_send_pending_fin,
                 prepared_work_wait,
-                source_admission_observation,
             )
         };
-        if let Some((shared_used, shared_limit, queue_bytes, credit_bytes, reinjection_bytes)) =
-            source_admission_observation
-        {
-            // Observe only existing actor turns; do not add a diagnostic wake.
-            // The Product mutex is released before formatting or writing stderr.
-            last_source_admission_observation = Some(Instant::now());
-            let unix_us = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("source admission observation clock")
-                .as_micros();
-            let refill_capacity_min = source_read_observation
-                .refill_capacity_min_bytes
-                .map_or_else(|| "unavailable".to_owned(), |bytes| bytes.to_string());
-            let refill_capacity_max = source_read_observation
-                .refill_capacity_max_bytes
-                .map_or_else(|| "unavailable".to_owned(), |bytes| bytes.to_string());
-            eprintln!(
-                "source_admission unix_us={unix_us} session_id={} stream_id={} can_read_local={can_read_local} read_budget={read_budget} shared_used={shared_used} shared_limit={shared_limit} queue_bytes={queue_bytes} credit_bytes={credit_bytes} reinjection_bytes={reinjection_bytes} reserve_starts={source_reserve_starts} reserve_grants={source_reserve_grants} reserve_granted_bytes={source_reserve_granted_bytes} positive_reads={} positive_read_bytes={} successful_read_granted_bytes={} successful_read_refund_bytes={} filled_buffer_below_grant_reads={} filled_buffer_below_grant_bytes={} filled_buffer_below_grant_refund_bytes={} completed_positive_refill_reads={} refill_capacity_sum_bytes={} refill_capacity_min_bytes={refill_capacity_min} refill_capacity_max_bytes={refill_capacity_max}",
-                session_id.0,
-                stream_id.0,
-                source_read_observation.positive_reads,
-                source_read_observation.positive_bytes,
-                source_read_observation.successful_granted_bytes,
-                source_read_observation.successful_refund_bytes,
-                source_read_observation.filled_buffer_below_grant_reads,
-                source_read_observation.filled_buffer_below_grant_bytes,
-                source_read_observation.filled_buffer_below_grant_refund_bytes,
-                source_read_observation.completed_positive_refill_reads,
-                source_read_observation.refill_capacity_sum_bytes,
-            );
-        }
-
         if !can_read_local {
             // Eligibility ended. An inactive source owns no admission position;
             // a losing select alone preserves its unsatisfied position instead.
@@ -3944,7 +3828,6 @@ where
                     stream_id: reset_stream_id,
                     reason,
                 } if reset_stream_id == stream_id => {
-                    crate::runtime::path::quic::io::terminal_trace("server_product_reset_consumed", stream_id, format_args!("reason={reason:?}"));
                     return Err(RuntimeError::RemoteReset(reason));
                 },
                 Frame::StreamData {
@@ -4229,34 +4112,23 @@ where
             tokio::task::yield_now().await;
         }
         read = async {
-            if source_admission_observe {
-                source_reserve_starts = source_reserve_starts.saturating_add(1);
-            }
             let permit = session_send_buffer
                 .reserve(&mut send_buffer_updates, read_budget)
                 .await;
             let reserved_read_budget = permit.bytes();
-            if source_admission_observe {
-                source_reserve_grants = source_reserve_grants.saturating_add(1);
-                source_reserve_granted_bytes =
-                    source_reserve_granted_bytes.saturating_add(reserved_read_budget as u64);
-            }
             #[cfg(feature = "lab-diagnostics")]
             let read_started = Instant::now();
-            let capacity_before = if source_admission_observe { buf.capacity() } else { 0 };
+
             let result =
                 read_reliable_relay_payload(&mut local, &mut buf, reserved_read_budget, read_budget).await;
             #[cfg(feature = "lab-diagnostics")]
             if let Ok((read, _)) = &result {
                 lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
             }
-            (result, permit, capacity_before)
+            (result, permit)
         }, if can_read_local => {
-            let (read, permit, capacity_before) = read;
+            let (read, permit) = read;
             let (read, payload) = read?;
-            if source_admission_observe {
-                source_read_observation.record(read, permit.bytes(), capacity_before, buf.capacity());
-            }
             permit.retain(&mut send_buffer_reservation, read);
             if read == 0 {
                 pending_local_fin = true;
@@ -4315,30 +4187,19 @@ where
                     let read = tokio::select! {
                         biased;
                         read = async {
-                            if source_admission_observe {
-                                source_reserve_starts = source_reserve_starts.saturating_add(1);
-                            }
                             let permit = session_send_buffer
                                 .reserve(&mut send_buffer_updates, next_read_budget)
                                 .await;
-                            if source_admission_observe {
-                                source_reserve_grants = source_reserve_grants.saturating_add(1);
-                                source_reserve_granted_bytes =
-                                    source_reserve_granted_bytes.saturating_add(permit.bytes() as u64);
-                            }
-                            let capacity_before = if source_admission_observe { buf.capacity() } else { 0 };
+
                             let result = read_reliable_relay_payload(
                                 &mut local, &mut buf, permit.bytes(), next_read_budget,
                             ).await;
-                            (result, permit, capacity_before)
+                            (result, permit)
                         } => read,
                         _ = std::future::ready(()) => break,
                     };
-                    let (read, permit, capacity_before) = read;
+                    let (read, permit) = read;
                     let (read, payload) = read?;
-                    if source_admission_observe {
-                        source_read_observation.record(read, permit.bytes(), capacity_before, buf.capacity());
-                    }
                     permit.retain(&mut send_buffer_reservation, read);
                     if read == 0 {
                         pending_local_fin = true;

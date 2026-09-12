@@ -307,18 +307,6 @@ pub(super) async fn handle_server_udp_reliable_stream(
     let (_repair_parent, repair_streams) =
         repair_bindings.register(send.request_stream_id(), stream_id)?;
     let repair_commands = commands_rx.take_repair_receiver(stream_id);
-    #[cfg(test)]
-    if let Some(abort) = take_server_udp_stream_abort_for_test(session_id, stream_id) {
-        let _ = abort.attached.send(());
-        if abort.abort.await.is_ok() {
-            // Drop only this native H3 request-stream attachment. The detach
-            // guard removes its logical-path lease; the shared QUIC connection
-            // and every sibling request stream remain alive.
-            drop(_output_detach_guard);
-            let _ = abort.released.send(());
-            return Ok(());
-        }
-    }
     let (send_stopped, stopped_send) = tokio::sync::oneshot::channel();
     let repair_context = context.clone();
     let repair_registration = path_registration.clone();
@@ -431,6 +419,19 @@ async fn run_server_udp_reliable_stream_loop(
             write_udp_stream_accept(
                 &mut send, &context, &path_registration, stream_id, &mut path_proofs,
             ).await?;
+        }
+        // The injection pauses an accepted request. Waiting before this accept
+        // would prevent the client commit that the test requires before abort.
+        #[cfg(test)]
+        if let Some(abort) = take_server_udp_stream_abort_for_test(session_id, stream_id) {
+            let _ = abort.attached.send(());
+            if abort.abort.await.is_ok() {
+                // Retire the logical output before publishing release; the
+                // enclosing guard shares this one-shot authority.
+                retirement.retire()?;
+                let _ = abort.released.send(());
+                return Ok(());
+            }
         }
     loop {
         if let Some(deadline) = terminal_drain_deadline {

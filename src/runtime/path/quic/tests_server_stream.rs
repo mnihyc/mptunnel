@@ -1000,10 +1000,62 @@ async fn server_quic_drains_exact_ack_without_consuming_deferred_probe_slot() {
 
 #[tokio::test]
 async fn server_quic_live_attachment_requalifies_without_replacement() {
-    tokio::time::timeout(Duration::from_secs(1), async {
+    // Diagnostic only: observe the existing finite test without changing its
+    // service opportunities, probe deadline, or actor cleanup.
+    let started = Instant::now();
+    let phase = std::cell::Cell::new(("opening QUIC fixture", started));
+    let probe_deadline = std::cell::Cell::new(None::<Instant>);
+    let mark_phase = |next| phase.set((next, Instant::now()));
+    struct NativeDiagnostic<'a> {
+        phase: &'a std::cell::Cell<(&'static str, Instant)>,
+        probe_deadline: &'a std::cell::Cell<Option<Instant>>,
+        started: Instant,
+        server: UdpPathConnection,
+        client: UdpPathConnection,
+        server_before: quinn::ConnectionStats,
+        client_before: quinn::ConnectionStats,
+    }
+    impl Drop for NativeDiagnostic<'_> {
+        fn drop(&mut self) {
+            let (phase, phase_started) = self.phase.get();
+            if phase != "complete" {
+                eprintln!(
+                    "same-carrier requalification diagnostic: phase={phase}; \
+                     phase_age={:?}; total_age={:?}; probe_deadline={:?}; \
+                     now={:?}; server_before={:?}; server_now={:?}; \
+                     server_closed={}; client_before={:?}; client_now={:?}; \
+                     client_closed={}",
+                    phase_started.elapsed(),
+                    self.started.elapsed(),
+                    self.probe_deadline.get(),
+                    Instant::now(),
+                    self.server_before,
+                    self.server.connection.stats(),
+                    self.server.is_closed(),
+                    self.client_before,
+                    self.client.connection.stats(),
+                    self.client.is_closed(),
+                );
+            }
+        }
+    }
+    let result = tokio::time::timeout(Duration::from_secs(1), async {
         let stream_id = StreamId(415);
         let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+        // Dropped before the fixture on failure; these read-only handles do not
+        // retain the connections beyond the fixture's existing lifetime.
+        let _native_diagnostic = NativeDiagnostic {
+            phase: &phase,
+            probe_deadline: &probe_deadline,
+            started,
+            server: fixture._server_connection.clone(),
+            client: fixture._client_connection.clone(),
+            server_before: fixture._server_connection.connection.stats(),
+            client_before: fixture._client_connection.connection.stats(),
+        };
+        mark_phase("draining initial zero credit");
         fixture.drain_zero_credit_admission().await;
+        mark_phase("preparing stale response attachment");
         let binding = match &fixture.accepted.stream().output {
             ReliablePathStreamOutput::Switchable(binding) => binding.clone(),
             _ => panic!("expected switchable server response output"),
@@ -1040,6 +1092,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
         assert!(binding.mark_output_stale(identity, TrafficClass::Throughput));
         assert!(binding.output_is_stale(identity), "becomes Stale");
         drop(alternate_rx);
+        mark_phase("publishing requalification probe");
         assert_eq!(
             binding
                 .try_enqueue_response_requalification_probe(
@@ -1055,7 +1108,9 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
             binding.response_requalification_deadline().is_some(),
             "becomes Requalifying"
         );
+        probe_deadline.set(binding.response_requalification_deadline());
 
+        mark_phase("starting response actor");
         let mut product_stream = fixture.accepted.take_stream();
         let actor = tokio::spawn(run_server_udp_reliable_stream_loop(
             fixture.server_send.take().expect("server QUIC sender"),
@@ -1075,6 +1130,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
                 path_proofs: PathProofTracker::default(),
             },
         ));
+        mark_phase("client waiting for requalification probe");
         let client_recv = fixture.client_recv.as_mut().expect("client QUIC receiver");
         let (probe_id, offset, payload_bytes) = loop {
             let frame = udp_path_read_frame(client_recv, fixture.context.codec_limits)
@@ -1091,6 +1147,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
                 break (probe_id, offset, payload.len() as u32);
             }
         };
+        mark_phase("client locally accepting exact probe ACK");
         let client_send = fixture.client_send.as_mut().expect("client QUIC sender");
         udp_path_write_frame(
             client_send,
@@ -1104,9 +1161,11 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
         )
         .await
         .expect("return exact response probe ACK");
+        mark_phase("server applying locally accepted probe ACK");
         while binding.response_requalification_deadline().is_some() {
             tokio::task::yield_now().await;
         }
+        mark_phase("checking Acquiring and preparing fresh data");
         assert!(
             !binding.output_is_stale(identity),
             "Acquiring admits fresh original data"
@@ -1133,16 +1192,19 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
         let fresh_range =
             OffsetRange::new(offset, offset + payload.len() as u64).expect("fresh range");
         binding.record_original_flight(initial.key, &fresh);
+        mark_phase("admitting fresh data to response actor");
         fixture
             .commands_tx
             .send_stream_ordered_frame(fresh.clone(), TrafficClass::Throughput)
             .await
             .expect("send fresh data on same attachment");
+        mark_phase("client waiting for admitted fresh data");
         while udp_path_read_frame(client_recv, fixture.context.codec_limits)
             .await
             .expect("read fresh data")
             != fresh
         {}
+        mark_phase("client locally accepting fresh data ACK");
         udp_path_write_frame(
             client_send,
             &Frame::StreamAck {
@@ -1154,11 +1216,13 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
         )
         .await
         .expect("return fresh ACK");
+        mark_phase("Product waiting for locally accepted fresh ACK");
         let Frame::StreamAck { ranges, .. } =
             product_stream.recv_frame().await.expect("route fresh ACK")
         else {
             panic!("expected routed fresh STREAM_ACK");
         };
+        mark_phase("checking qualification and carrier identity");
         assert_eq!(
             binding
                 .release_normalized_acked_ranges(&ranges)
@@ -1180,11 +1244,24 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
             &fixture._server_connection.write_activity_notify()
         ));
         assert!(!fixture._server_connection.is_closed());
+        mark_phase("awaiting existing actor abort");
         actor.abort();
         let _ = actor.await;
+        mark_phase("complete");
     })
-    .await
-    .expect("live same-carrier requalification must finish within one second");
+    .await;
+    if let Err(error) = result {
+        let (phase, phase_started) = phase.get();
+        panic!(
+            "live same-carrier requalification must finish within one second: \
+             {error:?}; phase={phase}; phase_age={:?}; total_age={:?}; \
+             probe_deadline={:?}; now={:?}",
+            phase_started.elapsed(),
+            started.elapsed(),
+            probe_deadline.get(),
+            Instant::now(),
+        );
+    }
 }
 
 #[tokio::test]

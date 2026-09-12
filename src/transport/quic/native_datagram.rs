@@ -630,6 +630,16 @@ impl NativeDatagramReceiver {
     fn insert_ip_fragment(&mut self, fragment: IpFragment) -> Option<(Frame, Instant)> {
         let now = Instant::now();
         if fragment.deadline <= now {
+            #[cfg(test)]
+            eprintln!(
+                "native IP fragment expired before insertion: request={} tunnel={:?} packet={:?} index={}/{} overdue={:?}",
+                self.request_stream_id,
+                fragment.tunnel_id,
+                fragment.packet_id,
+                fragment.index,
+                fragment.count,
+                now.saturating_duration_since(fragment.deadline)
+            );
             self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -682,6 +692,11 @@ impl NativeDatagramReceiver {
             .remove(&key)
             .expect("completed native IP reassembly exists");
         if complete.deadline <= Instant::now() {
+            #[cfg(test)]
+            eprintln!(
+                "native IP complete reassembly expired before delivery: request={} key={key:?}",
+                self.request_stream_id
+            );
             return None;
         }
         let mut payload = Vec::with_capacity(complete.total_len);
@@ -707,8 +722,13 @@ impl NativeDatagramReceiver {
         let now = Instant::now();
         self.reassemblies
             .retain(|_, reassembly| reassembly.deadline > now);
-        self.ip_reassemblies
-            .retain(|_, reassembly| reassembly.deadline > now);
+        self.ip_reassemblies.retain(|_key, reassembly| {
+            #[cfg(test)]
+            if reassembly.deadline <= now {
+                eprintln!("native IP incomplete reassembly expired: key={_key:?} parts={}/{} bytes={}/{} overdue={:?}", reassembly.parts.iter().filter(|part| part.is_some()).count(), reassembly.parts.len(), reassembly.received_len, reassembly.total_len, now.saturating_duration_since(reassembly.deadline));
+            }
+            reassembly.deadline > now
+        });
     }
 
     fn next_reassembly_expiry(&self) -> Option<Instant> {

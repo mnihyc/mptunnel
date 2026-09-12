@@ -403,8 +403,13 @@ async fn probe_selected_paths(
             Ok(PathProbeResult::Udp {
                 path_index,
                 expected_path_instance_id,
-                result: Err(_),
+                result: Err(_error),
             }) => {
+                #[cfg(test)]
+                eprintln!(
+                    "QUIC path probe failed: session_id={} path_index={path_index} expected_instance={expected_path_instance_id:?} timeout={timeout:?} error={_error:?}",
+                    context.session_id.0,
+                );
                 context.mark_udp_path_establishment_failure_if_current(
                     path_index,
                     expected_path_instance_id,

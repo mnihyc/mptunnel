@@ -2650,10 +2650,36 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         );
 
         enter_phase("QUIC path probe");
+        // Copy diagnostic state while locked; the readiness assertion must not
+        // poison Product cleanup's health mutex when this optional probe fails.
+        let quic_probe_health = || {
+            let health = context.health().lock().expect("health lock");
+            let record = &health.udp[0];
+            (
+                record.path_instance_id(),
+                record.state,
+                record.active_flows,
+                record.consecutive_failures,
+                record.manual_disabled,
+                record.has_live_authenticated_carrier(),
+                record.relay_bytes_in_flight,
+                record.relay_queue_bytes,
+            )
+        };
+        let health_before_probe = quic_probe_health();
+        let sockets_before_probe = carrier_network.socket_count();
+        let probe_started = Instant::now();
         probe_client_paths(&context, Duration::from_millis(500)).await;
-        let quic_instance = context.health().lock().expect("health lock").udp[0]
-            .path_instance_id()
-            .expect("live QUIC instance");
+        let probe_elapsed = probe_started.elapsed();
+        let health_after_probe = quic_probe_health();
+        if health_after_probe.0.is_none() {
+            eprintln!(
+                "initial QUIC readiness absent: session_id={} probe_elapsed={probe_elapsed:?} sockets_before={sockets_before_probe} sockets_after={} health(instance,state,active_flows,failures,disabled,authenticated,flight,queue) before={health_before_probe:?} after={health_after_probe:?}",
+                context.session_id.0,
+                carrier_network.socket_count(),
+            );
+        }
+        let quic_instance = health_after_probe.0.expect("live QUIC instance");
         let mut attachment_commits =
             arm_client_relay_attachment_commits_for_test(quic_instance, stream_id);
         let patterned = Arc::new(

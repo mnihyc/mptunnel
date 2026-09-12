@@ -2386,6 +2386,108 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
     flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
     ranges: &[OffsetRange],
 ) -> Vec<(u64, CarrierPathReleasedFlight)> {
+    // One process-wide diagnostic choice keeps both algorithms available in
+    // the same binary. Default remains the established full-map algorithm.
+    static INTERSECTION_RELEASE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let intersections = *INTERSECTION_RELEASE
+        .get_or_init(|| std::env::var("MPTUNNEL_ACK_INTERSECTION_RELEASE").as_deref() == Ok("1"));
+    let started = Instant::now();
+    let trace_start = quinn::native_source_window_at(started);
+    let keys_before = flights.len();
+    let released = if intersections {
+        release_carrier_path_flight_intersections(flights, ranges)
+    } else {
+        release_carrier_path_flight_ranges_full_scan(flights, ranges)
+    };
+    if let Some(start_elapsed) = trace_start {
+        let finished = Instant::now();
+        // Only wholly in-window calls emit. A boundary-crossing call is not
+        // silently assigned an invented elapsed endpoint.
+        if let Some(end_elapsed) = quinn::native_source_window_at(finished) {
+            quinn::emit_native_trace(format_args!(
+                "ack_flight_release role=server window=first_native_poll_10_11 mode={} flight_ledger={:p} start_elapsed_ns={} end_elapsed_ns={} duration_ns={} keys_before={} keys_after={} ack_ranges={} released_fragments={}",
+                if intersections {
+                    "intersection"
+                } else {
+                    "full_scan"
+                },
+                flights,
+                start_elapsed.as_nanos(),
+                end_elapsed.as_nanos(),
+                finished.duration_since(started).as_nanos(),
+                keys_before,
+                flights.len(),
+                ranges.len(),
+                released.len(),
+            ));
+        }
+    }
+    released
+}
+
+/// Callers supply normalized positive ACK ranges and canonical flight extents,
+/// as required by the existing splitter. A selected key retains every member
+/// of its Vec, including nonintersecting members, to preserve insertion order.
+fn release_carrier_path_flight_intersections(
+    flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
+    ranges: &[OffsetRange],
+) -> Vec<(u64, CarrierPathReleasedFlight)> {
+    let Some(max_ack_end) = ranges
+        .iter()
+        .filter(|range| !range.is_empty())
+        .map(|range| range.end)
+        .max()
+    else {
+        return Vec::new();
+    };
+    let selected_keys = flights
+        .range(..max_ack_end)
+        .filter_map(|(&start, entries)| {
+            entries
+                .iter()
+                .any(|flight| {
+                    ranges
+                        .iter()
+                        .any(|range| start.max(range.start) < flight.end.min(range.end))
+                })
+                .then_some(start)
+        })
+        .collect::<Vec<_>>();
+    let mut selected = BTreeMap::new();
+    for start in selected_keys {
+        selected.insert(
+            start,
+            flights
+                .remove(&start)
+                .expect("selected flight key remains owned"),
+        );
+    }
+
+    // Every flight overlapping released bytes is included, so the reference
+    // ambiguity calculation and exact receipt splitting remain authoritative.
+    let released = release_carrier_path_flight_ranges_full_scan(&mut selected, ranges);
+    for (start, mut retained) in selected {
+        match flights.entry(start) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(retained);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                // Any selected fragment colliding with an untouched key came
+                // from a strictly earlier original start. Prepend the complete
+                // ordered Vec once; per-fragment prepending would reverse it.
+                retained.append(entry.get_mut());
+                *entry.get_mut() = retained;
+            }
+        }
+    }
+    released
+}
+
+/// Retained verbatim as the diagnostic control and equivalence-test reference.
+fn release_carrier_path_flight_ranges_full_scan(
+    flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
+    ranges: &[OffsetRange],
+) -> Vec<(u64, CarrierPathReleasedFlight)> {
     if ranges.is_empty() || flights.is_empty() {
         return Vec::new();
     }

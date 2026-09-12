@@ -27,6 +27,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          set +e
           sysctl hw.ncpu hw.memsize
           sysctl net.inet.udp.recvspace net.inet.udp.maxdgram
           failed=0
@@ -39,7 +40,7 @@ jobs:
           for index in 0 1 2 3; do
             netstat -s -p udp > ".tmp/mac-gate/${index}-udp-before.txt"
             if [[ "$index" == 0 ]]; then
-              /usr/bin/time -l cargo test --locked --all-features --target x86_64-apple-darwin --lib > ".tmp/mac-gate/${index}-test.log" 2>&1
+              /usr/bin/time -l cargo test --locked --all-features --target x86_64-apple-darwin --lib -- --show-output > ".tmp/mac-gate/${index}-test.log" 2>&1
             else
               /usr/bin/time -l cargo test --locked --all-features --target x86_64-apple-darwin --lib "${filters[$index]}" -- --exact --nocapture > ".tmp/mac-gate/${index}-test.log" 2>&1
             fi

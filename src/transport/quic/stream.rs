@@ -1141,3 +1141,7 @@ pub async fn finish_stream(send: &mut SendStream) -> Result<(), QuicCarrierError
 #[cfg(test)]
 #[path = "tests_stream.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_driven_source_feedback.rs"]
+mod driven_source_feedback_tests;

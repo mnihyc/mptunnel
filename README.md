@@ -70,39 +70,21 @@ TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 
 ## Performance
 
-The v0.4.9 candidate runtime was measured at `2ced0d0`, with package version
-0.4.9, against published v0.4.8 source `d1a99ad`. Eighteen controlled Linux runs
-cover nine paired transport/direction profiles, with one observation per version
-per profile.
+MPTUNNEL combines independent link capacity within one connection. TCP and QUIC
+on the same physical link share that link's capacity.
 
-The candidate completed **310/310 concurrent download echoes** and confirmed every
-accepted byte in **all four uploads**. With independent TCP and QUIC links under
-restriction and outage, download goodput was 266.0 versus 124.2 Mbps, and the
-longest read gap was 0.530 versus 0.920 seconds. All actual echo attempts succeeded
-in both versions; slower successful exchanges left v0.4.8 with 64 attempts versus
-the candidate's 80. During the QUIC restriction, ordered download delivery was
-185.0 versus 10.4 Mbps while the candidate preserved service on the healthy TCP link.
+In controlled Linux measurements, a shared 500 Mbps link delivered 410 Mbps
+mixed download and 441 Mbps upload. With two independent 200 Mbps links and
+QUIC restricted to 10 Mbps, mixed download maintained 185 Mbps while TCP
+continued serving traffic. Loaded latency and recovery timing are shown alongside
+throughput below.
 
-[![Candidate and v0.4.8 independent mixed download goodput, echo latency and upload confirmations through restriction and outage](docs/assets/performance/v0.4.9-independent.svg)](docs/assets/performance/v0.4.9-independent.svg)
+[![Mixed download, echo latency and upload through QUIC restriction and outage](docs/assets/performance/independent-links.svg)](docs/assets/performance/independent-links.svg)
 
-The improvements have costs. Healthy QUIC download was about 4% slower, the
-loss-clear test's echo p95 increased from 231 to 350 ms, and healthy mixed download
-used more CPU and server memory. Independent mixed upload improved during
-restriction (24 to 173 Mbps), but its preceding healthy phase fell from 330 to
-276 Mbps; the cause remains unresolved. Mixed loaded latency remains hundreds of
-milliseconds, and full aggregate service does not return immediately after every
-disruption. These are complete-version comparisons, including
-10%/10% sender defaults in v0.4.8 versus 20%/20% in the candidate.
-
-See the [nine comparisons, timing plots and measurement limits](docs/PERFORMANCE.md#september-12-candidate-comparison)
-for startup, delivery gaps, latency, resource costs and upload accounting.
-The default mixed Cloudflare browser workload also completed on this candidate.
-Platform test and package results are available in [CI](https://github.com/mnihyc/mptunnel/actions/workflows/ci.yml)
-and [Release Check](https://github.com/mnihyc/mptunnel/actions/workflows/release-check.yml).
-The [historical packet-reordering limitation](docs/PERFORMANCE.md#historical-packet-reordering-limitation)
-was not retested by these profiles. Earlier accepted comparisons against other
-products remain [historical evidence](docs/PERFORMANCE.md#historical-accepted-fixed-profile-evidence-v021v022),
-not a ranking of the current candidate.
+The [performance guide](docs/PERFORMANCE.md) includes TCP, QUIC and mixed results,
+loss/reordering scenarios, matched Hysteria2/Xray measurements, timing plots and
+CPU/memory costs. Results depend on network conditions, direction and available
+processing capacity.
 
 ## Quick start
 

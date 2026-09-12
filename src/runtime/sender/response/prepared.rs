@@ -258,7 +258,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     let state = match owner.arm_claim().try_lock() {
         Ok(state) => state,
         Err(wait) => {
-            quinn::note_source_state("response_prepared_refusal", format_args!("stage=initial reason=ProductBusy"));
+            quinn::note_source_state("response_prepared_refusal", format_args!("stage=initial reason=ProductBusy owner_id={}", owner.observation_identity()));
             return PreparedOriginalClaim::Busy(wait);
         }
     };
@@ -313,7 +313,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     let mut state = match owner.arm_claim().try_lock() {
         Ok(state) => state,
         Err(wait) => {
-            quinn::note_source_state("response_prepared_refusal", format_args!("stage=native_recheck reason=ProductBusy"));
+            quinn::note_source_state("response_prepared_refusal", format_args!("stage=native_recheck reason=ProductBusy owner_id={}", owner.observation_identity()));
             return PreparedOriginalClaim::Busy(wait);
         }
     };

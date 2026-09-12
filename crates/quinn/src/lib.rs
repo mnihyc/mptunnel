@@ -54,6 +54,8 @@ mod source_trace;
 mod work_limiter;
 
 pub use source_trace::{note_source_state, observe_source_future};
+#[doc(hidden)]
+pub use proto::{emit_native_trace, native_source_window_at};
 
 #[cfg(not(wasm_browser))]
 pub(crate) use std::time::{Duration, Instant};

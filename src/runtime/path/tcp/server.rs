@@ -257,7 +257,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
                 &observed_context,
             );
         },
-        move |_| terminal_commands.terminate_failed_path(),
+        move || terminal_commands.terminate_failed_path(),
     );
     let evidence =
         ServerTcpEvidenceState::new(tcp_metrics, Some(local_metrics), context.mux_limits);

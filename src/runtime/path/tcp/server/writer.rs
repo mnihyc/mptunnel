@@ -8,6 +8,7 @@ use super::super::io::{EncryptedTcpWriter, encrypted_framed_peer_closed};
 use super::evidence::ServerTcpEvidenceState;
 use crate::protocol::Frame;
 use crate::runtime::error::RuntimeError;
+use crate::transport::encrypted::EncryptedFramedTransportError;
 use crate::transport::tcp_write_admission::TcpWriteAdmission;
 
 pub(in crate::runtime::path::tcp) struct ServerTcpWriter {
@@ -48,7 +49,7 @@ impl ServerTcpWriter {
         self.write_admission
             .as_ref()
             .map_or(Ok(true), TcpWriteAdmission::is_ready)
-            .map_err(RuntimeError::Io)
+            .map_err(|error| RuntimeError::Encrypted(EncryptedFramedTransportError::Io(error)))
     }
 
     /// Model permission only: native socket negative/wake behavior is tested
@@ -60,7 +61,10 @@ impl ServerTcpWriter {
 
     pub(super) async fn native_writable(&self) -> Result<(), RuntimeError> {
         match &self.write_admission {
-            Some(admission) => admission.writable().await.map_err(RuntimeError::Io),
+            Some(admission) => admission
+                .writable()
+                .await
+                .map_err(|error| RuntimeError::Encrypted(EncryptedFramedTransportError::Io(error))),
             None => std::future::pending().await,
         }
     }

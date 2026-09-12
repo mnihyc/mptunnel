@@ -35,6 +35,14 @@ use crate::transport::encrypted::EncryptedFramedTransportError;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+fn server_tcp_native_result(error: EncryptedFramedTransportError) -> Result<(), RuntimeError> {
+    if encrypted_framed_peer_closed(&error) {
+        Ok(())
+    } else {
+        Err(RuntimeError::Encrypted(error))
+    }
+}
+
 enum ServerTcpSessionDisposition {
     Continue,
     Stop,
@@ -162,39 +170,62 @@ impl ServerTcpPathSession {
         let carrier_terminal_signal = self.commands_tx.terminal_signal();
         let carrier_terminal = carrier_terminal_signal.wait();
         tokio::pin!(carrier_terminal);
-        let native_terminal = self.native_terminal.take();
-        let native_terminal = async move {
-            match native_terminal {
-                Some(receiver) => match receiver.await {
-                    Ok(error) => error,
-                    // Reader cancellation without an owned transport result is
-                    // not a new result class. The shared lifecycle signal owns
-                    // any external failure or planned retirement instead.
-                    Err(_) => std::future::pending::<EncryptedFramedTransportError>().await,
+        let mut native_terminal = self.native_terminal.take();
+        let (result, reconcile_native) = {
+            let native_result = async {
+                match native_terminal.as_mut() {
+                    Some(receiver) => match receiver.await {
+                        Ok(error) => error,
+                        // Reader cancellation without an owned transport result is
+                        // not a new result class. The shared lifecycle signal owns
+                        // any external failure or planned retirement instead.
+                        Err(_) => std::future::pending::<EncryptedFramedTransportError>().await,
+                    },
+                    None => std::future::pending::<EncryptedFramedTransportError>().await,
+                }
+            };
+            tokio::pin!(native_result);
+            tokio::select! {
+                biased;
+                reason = &mut session_retirement => (Err(RuntimeError::RemoteClosed(reason)), false),
+                () = &mut retirement => (Ok(()), false),
+                error = &mut native_result => (server_tcp_native_result(error), false),
+                cause = &mut carrier_terminal => match cause {
+                    ReliablePathCarrierTerminalCause::Failed => {
+                        (Err(RuntimeError::ReliablePathSessionClosed), true)
+                    }
+                    ReliablePathCarrierTerminalCause::Retired => (Ok(()), false),
                 },
-                None => std::future::pending::<EncryptedFramedTransportError>().await,
+                () = &mut drain_expiry => (Err(RuntimeError::ReliablePathSessionClosed), false),
+                result = self.run_active() => {
+                    // Native readiness can observe a carrier close before a
+                    // framed write or the reader does. It has the same terminal
+                    // scope; unrelated application I/O is never normalized here.
+                    let result = match result {
+                        Err(RuntimeError::Encrypted(error)) if encrypted_framed_peer_closed(&error) => Ok(()),
+                        result => result,
+                    };
+                    let reconcile = matches!(result, Ok(()) | Err(RuntimeError::ReliablePathSessionClosed));
+                    (result, reconcile)
+                },
             }
         };
-        tokio::pin!(native_terminal);
-        let result = tokio::select! {
-            biased;
-            reason = &mut session_retirement => Err(RuntimeError::RemoteClosed(reason)),
-            () = &mut retirement => Ok(()),
-            error = &mut native_terminal => {
-                if encrypted_framed_peer_closed(&error) {
-                    Ok(())
-                } else {
-                    Err(RuntimeError::Encrypted(error))
-                }
+        let result = if reconcile_native {
+            // A biased select is not an atomic snapshot. The reader may publish
+            // its result and failure fence after the native branch polls Pending,
+            // but before the carrier or closed frame mailbox is polled. Take a
+            // ready result directly: another Future poll could still be deferred
+            // by cooperative task budgeting. Never wait for an external failure
+            // to produce a native result. Explicit terminal outcomes keep priority.
+            match native_terminal
+                .as_mut()
+                .and_then(|receiver| receiver.try_recv().ok())
+            {
+                Some(error) => server_tcp_native_result(error),
+                None => result,
             }
-            cause = &mut carrier_terminal => match cause {
-                ReliablePathCarrierTerminalCause::Failed => {
-                    Err(RuntimeError::ReliablePathSessionClosed)
-                }
-                ReliablePathCarrierTerminalCause::Retired => Ok(()),
-            },
-            () = &mut drain_expiry => Err(RuntimeError::ReliablePathSessionClosed),
-            result = self.run_active() => result,
+        } else {
+            result
         };
         // Native EOF/error, credential expiry, session retirement, and drain
         // expiry all retire this exact registry instance explicitly. Ordered

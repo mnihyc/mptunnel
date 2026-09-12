@@ -62,10 +62,10 @@ where
 
 /// Separates successful ordered frames from the server's owned native result.
 ///
-/// The terminal callback freezes Product admission before the exact transport
-/// error is moved through an unbounded one-shot result plane. A full ordered
-/// frame queue therefore cannot defer carrier retirement or erase the prior
-/// peer-close versus encrypted-error classification.
+/// The exact transport error is published before the terminal callback freezes
+/// Product admission. A consumer observing that failure fence can therefore
+/// recover its owned result even if it polled the result plane before publication.
+/// A full ordered frame queue cannot delay this terminal publication.
 pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_terminal_result<
     Observe,
     ObserveTerminal,
@@ -80,7 +80,7 @@ pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_terminal_result<
 )
 where
     Observe: FnMut(&Frame) + Send + 'static,
-    ObserveTerminal: FnMut(&EncryptedFramedTransportError) + Send + 'static,
+    ObserveTerminal: FnMut() + Send + 'static,
 {
     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
     let (terminal_tx, terminal_rx) = oneshot::channel();
@@ -105,8 +105,10 @@ where
                     }
                 }
                 Err(error) => {
-                    observe_terminal(&error);
                     let _ = terminal_tx.send(error);
+                    // Fence admission even when the result recipient has already
+                    // retired. The callback retains its own lifecycle handle.
+                    observe_terminal();
                     break;
                 }
             }
@@ -167,7 +169,7 @@ mod tests {
             server_reader,
             1,
             |_| {},
-            move |_| {
+            move || {
                 if let Some(observed_terminal_tx) = observed_terminal_tx.take() {
                     let _ = observed_terminal_tx.send(());
                 }

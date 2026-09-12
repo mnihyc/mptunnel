@@ -303,6 +303,49 @@ async fn server_tcp_test_session_with_mode(
     mpsc::Sender<Result<Frame, EncryptedFramedTransportError>>,
     crate::runtime::relay::ServerReliableRelayService,
 ) {
+    let (session, client, commands, frames, relay, _reader) =
+        server_tcp_test_session_with_reader(session_id, path_id, forwarding_mode, command_capacity)
+            .await;
+    (session, client, commands, frames, relay)
+}
+
+async fn server_tcp_test_session_with_reader(
+    session_id: SessionId,
+    path_id: PathId,
+    forwarding_mode: crate::config::ForwardingMode,
+    command_capacity: Option<usize>,
+) -> (
+    ServerTcpPathSession,
+    EncryptedFramedStream<TcpStream>,
+    crate::runtime::path::commands::ReliablePathCommandSender,
+    mpsc::Sender<Result<Frame, EncryptedFramedTransportError>>,
+    crate::runtime::relay::ServerReliableRelayService,
+    crate::runtime::path::tcp::io::EncryptedTcpReader,
+) {
+    server_tcp_test_session_with_socket_setup(
+        session_id,
+        path_id,
+        forwarding_mode,
+        command_capacity,
+        |_| None,
+    )
+    .await
+}
+
+async fn server_tcp_test_session_with_socket_setup(
+    session_id: SessionId,
+    path_id: PathId,
+    forwarding_mode: crate::config::ForwardingMode,
+    command_capacity: Option<usize>,
+    setup: impl FnOnce(&TcpStream) -> Option<crate::transport::tcp_write_admission::TcpWriteAdmission>,
+) -> (
+    ServerTcpPathSession,
+    EncryptedFramedStream<TcpStream>,
+    crate::runtime::path::commands::ReliablePathCommandSender,
+    mpsc::Sender<Result<Frame, EncryptedFramedTransportError>>,
+    crate::runtime::relay::ServerReliableRelayService,
+    crate::runtime::path::tcp::io::EncryptedTcpReader,
+) {
     let security = ServerSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret"),
@@ -327,6 +370,7 @@ async fn server_tcp_test_session_with_mode(
         .await
         .expect("connect test TCP carrier");
     let (server_socket, _) = listener.accept().await.expect("accept test TCP carrier");
+    let write_admission = setup(&server_socket);
     let client_tls = crate::transport::encrypted::test_client_tls_config();
     let server_tls = &context.tls;
     let (client_framed, server_framed) = tokio::join!(
@@ -362,7 +406,7 @@ async fn server_tcp_test_session_with_mode(
             .expect("read carrier confirmation"),
         Frame::Pong { nonce: 1 }
     );
-    let (_server_reader, server_writer) = server_framed.split().expect("split server carrier");
+    let (server_reader, server_writer) = server_framed.split().expect("split server carrier");
 
     let path_registration = context.reliable_streams.register_test_carrier_path(
         session_id,
@@ -375,13 +419,15 @@ async fn server_tcp_test_session_with_mode(
     let (path_frames_tx, path_frames) = mpsc::channel(1);
     let evidence = ServerTcpEvidenceState::new(None, None, context.mux_limits);
     let peer_status = context.peer_status.register(session_id);
+    let mut writer = ServerTcpWriter::new(server_writer);
+    writer.set_write_admission(write_admission);
     (
         ServerTcpPathSession::new(ServerTcpPathAdmission {
             context,
             session_id,
             path_id,
             path_registration,
-            writer: ServerTcpWriter::new(server_writer),
+            writer,
             path_frames,
             native_terminal: None,
             commands_tx,
@@ -393,6 +439,7 @@ async fn server_tcp_test_session_with_mode(
         commands,
         path_frames_tx,
         reliable_relay,
+        server_reader,
     )
 }
 
@@ -1741,6 +1788,341 @@ async fn server_tcp_native_terminal_signal_cancels_and_retires_the_exact_registr
         "native terminal retirement must not synthesize an ordered PATH_CLOSE"
     );
     drop(retained_registration);
+}
+
+#[tokio::test]
+async fn server_tcp_real_reader_close_preserves_result_when_actor_polls_at_terminal_fence() {
+    type Actor = Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send>>;
+
+    let (mut session, client, commands, _old_frames, _relay, reader) =
+        server_tcp_test_session_with_reader(
+            SessionId(406),
+            PathId(0),
+            crate::config::ForwardingMode::L4,
+            None,
+        )
+        .await;
+    let context = session.context.clone();
+    let actor_slot: Arc<Mutex<Option<Actor>>> = Arc::new(Mutex::new(None));
+    let callback_actor = actor_slot.clone();
+    let terminal_commands = commands.clone();
+    let (polled_tx, polled_rx) = oneshot::channel();
+    let mut polled_tx = Some(polled_tx);
+    let (frames, native_terminal) =
+        crate::runtime::path::tcp::io::spawn_encrypted_tcp_reader_with_terminal_result(
+            reader,
+            1,
+            |_| {},
+            move || {
+                terminal_commands.terminate_failed_path();
+                // Force a consumer poll at the real producer's terminal fence.
+                // No task scheduling, sleep, or blocking barrier may defer this
+                // poll until after the reader returns from the callback.
+                let mut actor = callback_actor
+                    .lock()
+                    .expect("native close actor slot")
+                    .take()
+                    .expect("primed native close actor");
+                let result = actor
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+                polled_tx
+                    .take()
+                    .expect("one native terminal callback")
+                    .send(result)
+                    .expect("publish actor result at native terminal fence");
+            },
+        );
+    session.path_frames = frames;
+    session.native_terminal = Some(native_terminal);
+    let mut actor: Actor = Box::pin(session.run());
+    assert!(
+        actor
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_pending(),
+        "the live protected carrier must await input before native close"
+    );
+    *actor_slot.lock().expect("native close actor slot") = Some(actor);
+    drop(client);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), polled_rx)
+        .await
+        .expect("real protected reader did not observe peer close")
+        .expect("native terminal callback did not publish its consumer poll");
+    assert!(
+        matches!(result, std::task::Poll::Ready(Ok(()))),
+        "the owned peer-close result must be visible when its failure fence wakes the actor: {result:?}"
+    );
+    assert_eq!(
+        commands.terminal_signal().cause(),
+        Some(ReliablePathCarrierTerminalCause::Failed),
+        "a clean handler result must still fence the failed native carrier"
+    );
+    assert!(
+        context
+            .reliable_streams
+            .management_snapshot()
+            .paths
+            .is_empty(),
+        "native close must retire the exact carrier registration"
+    );
+}
+
+#[tokio::test]
+async fn server_tcp_external_failure_does_not_wait_for_an_unobserved_native_result() {
+    let (mut session, _client, commands, _frames, _relay) =
+        server_tcp_test_session(SessionId(407), PathId(0)).await;
+    let (_native_terminal_tx, native_terminal_rx) = oneshot::channel();
+    session.native_terminal = Some(native_terminal_rx);
+    commands.terminate_failed_path();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), session.run())
+        .await
+        .expect("external carrier failure cannot wait for a still-live native reader");
+    assert!(matches!(
+        result,
+        Err(RuntimeError::ReliablePathSessionClosed)
+    ));
+}
+
+#[tokio::test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn server_tcp_native_write_admission_hangup_retires_without_a_reader_result() {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    fn assert_socket_terminal(error: &RuntimeError) {
+        let kind = match error {
+            RuntimeError::Io(error)
+            | RuntimeError::Encrypted(EncryptedFramedTransportError::Io(error)) => error.kind(),
+            other => panic!("expected an observed native socket terminal: {other:?}"),
+        };
+        assert_eq!(kind, std::io::ErrorKind::ConnectionAborted);
+    }
+
+    let mut terminal_socket = None;
+    let (mut session, _client, commands, _frames, _relay, _reader) =
+        server_tcp_test_session_with_socket_setup(
+            SessionId(409),
+            PathId(0),
+            crate::config::ForwardingMode::L4,
+            None,
+            |socket| {
+                terminal_socket = Some(
+                    socket
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .expect("retain exact socket for a test-owned terminal event"),
+                );
+                Some(
+                    crate::transport::tcp_write_admission::TcpWriteAdmission::capture(
+                        socket,
+                        crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES,
+                    )
+                    .expect("capture real native writer admission")
+                    .expect("Linux/Android native writer admission is available"),
+                )
+            },
+        )
+        .await;
+    assert!(
+        session
+            .writer
+            .allows_original_handoff()
+            .expect("the authenticated live socket is writable")
+    );
+    let terminal_socket = terminal_socket.expect("captured exact carrier socket");
+    // SAFETY: this test owns the descriptor for the fixture's exact connected
+    // socket. Full local shutdown creates a real kernel terminal condition;
+    // it does not invent a peer action or consume SO_ERROR.
+    let shutdown = unsafe { libc::shutdown(terminal_socket.as_raw_fd(), libc::SHUT_RDWR) };
+    assert_eq!(
+        shutdown,
+        0,
+        "native shutdown: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_socket_terminal(
+        &session
+            .writer
+            .allows_original_handoff()
+            .expect_err("a terminal socket cannot authorize a new Original claim"),
+    );
+    assert_socket_terminal(
+        &tokio::time::timeout(Duration::from_secs(5), session.writer.native_writable())
+            .await
+            .expect("native hangup must wake the writer")
+            .expect_err("native hangup is not writable admission"),
+    );
+
+    // Keep the ordered-frame sender live and the native result pending. The
+    // readiness adapter alone must settle this exact carrier; no EOF queue or
+    // reader-result shortcut can make the test pass.
+    let (_native_tx, native_rx) = oneshot::channel();
+    session.native_terminal = Some(native_rx);
+    let context = session.context.clone();
+    let _retained_registration = session.path_registration.clone();
+    tokio::time::timeout(Duration::from_secs(5), session.run())
+        .await
+        .expect("native write-admission terminal must settle the carrier")
+        .expect("native carrier termination keeps the established clean handler result");
+    assert_eq!(
+        commands.terminal_signal().cause(),
+        Some(ReliablePathCarrierTerminalCause::Failed)
+    );
+    assert!(
+        context
+            .reliable_streams
+            .management_snapshot()
+            .paths
+            .is_empty(),
+        "native write-admission terminal must explicitly retire the exact registry row"
+    );
+}
+
+#[tokio::test]
+async fn server_tcp_native_result_published_during_active_poll_reconciles_only_untyped_results() {
+    type Publish = Box<
+        dyn FnOnce(&crate::runtime::path::commands::ReliablePathCommandSender) -> RuntimeError
+            + Send,
+    >;
+    struct PublishDuringOpen {
+        publish: Mutex<Option<Publish>>,
+        exhaust_budget: bool,
+    }
+
+    impl ServerDatagramPortBackend for PublishDuringOpen {
+        fn open<'a>(
+            &'a self,
+            request: ServerDatagramOpenRequest,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<AcceptedServerDatagramFlow, ServerDatagramOpenError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let publish = self
+                .publish
+                .lock()
+                .expect("native result publication transaction")
+                .take()
+                .expect("one native result publication");
+            let result = publish(&request.commands);
+            let exhaust_budget = self.exhaust_budget;
+            Box::pin(async move {
+                if exhaust_budget {
+                    // Enter the real actor and its active branch before
+                    // exhausting the executor's actual remaining budget. The
+                    // already-published native result must survive this branch
+                    // completing in the same poll; actor entry may still yield.
+                    while tokio::task::coop::has_budget_remaining() {
+                        tokio::task::coop::consume_budget().await;
+                    }
+                }
+                Err(ServerDatagramOpenError::new(result))
+            })
+        }
+    }
+
+    for (case, active_error, exhaust_budget) in [
+        (
+            "generic failure",
+            RuntimeError::ReliablePathSessionClosed,
+            false,
+        ),
+        ("reader queue exhausted", RuntimeError::RouteDropped, false),
+        (
+            "concrete protocol failure",
+            RuntimeError::Protocol("independent active-frame violation"),
+            false,
+        ),
+        (
+            "unrelated application I/O failure",
+            RuntimeError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "independent application I/O failure",
+            )),
+            false,
+        ),
+        (
+            "typed carrier readiness close",
+            RuntimeError::Encrypted(EncryptedFramedTransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "carrier readiness terminal",
+            ))),
+            false,
+        ),
+        (
+            "executor budget exhausted inside active poll",
+            RuntimeError::ReliablePathSessionClosed,
+            true,
+        ),
+    ] {
+        let (mut session, _client, _commands, frames, _relay) =
+            server_tcp_test_session(SessionId(408), PathId(0)).await;
+        let (native_tx, native_rx) = oneshot::channel();
+        session.native_terminal = Some(native_rx);
+        frames
+            .try_send(Ok(Frame::OpenDatagramFlow {
+                flow_id: crate::protocol::DatagramFlowId(1),
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
+            }))
+            .expect("queue the active frame before the actor poll");
+        session.context.datagrams = Some(ServerDatagramPort::new(Arc::new(PublishDuringOpen {
+            publish: Mutex::new(Some(Box::new(move |commands| {
+                // The outer select has already polled its still-empty native
+                // receiver. Publish during the active branch's same poll, in
+                // the real reader's result-before-fence order.
+                native_tx
+                    .send(EncryptedFramedTransportError::InvalidNoiseRecordLength(7))
+                    .expect("publish native protocol error during active poll");
+                commands.terminate_failed_path();
+                // A real terminal reader also releases its ordered-frame
+                // sender. A silent flow-local refusal then lets run_active
+                // encounter queue exhaustion and return its ordinary Ok(()).
+                drop(frames);
+                active_error
+            }))),
+            exhaust_budget,
+        })));
+        let mut actor = Box::pin(session.run());
+        let result = actor
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+
+        if case == "concrete protocol failure" {
+            assert!(
+                matches!(
+                    result,
+                    std::task::Poll::Ready(Err(RuntimeError::Protocol(
+                        "independent active-frame violation"
+                    )))
+                ),
+                "an exact active-frame error must keep its own authority: {result:?}"
+            );
+        } else if case == "unrelated application I/O failure" {
+            assert!(
+                matches!(
+                    result,
+                    std::task::Poll::Ready(Err(RuntimeError::Io(ref error)))
+                        if error.kind() == std::io::ErrorKind::ConnectionAborted
+                ),
+                "an unrelated application I/O error must keep its own authority: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    std::task::Poll::Ready(Err(RuntimeError::Encrypted(
+                        EncryptedFramedTransportError::InvalidNoiseRecordLength(7)
+                    )))
+                ),
+                "{case} must not hide the native result published in the same actor poll: {result:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

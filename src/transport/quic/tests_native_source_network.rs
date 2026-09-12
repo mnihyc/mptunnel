@@ -4,6 +4,8 @@ use super::super::Endpoint;
 use super::*;
 use crate::mux::MuxLimits;
 use crate::protocol::StreamId;
+use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use tokio::time::{Instant, sleep_until, timeout};
@@ -42,7 +44,19 @@ async fn run_server(driven: bool) {
     let chunk_bytes = mux_limits.max_reliable_relay_chunk_bytes;
     let endpoint = Endpoint::bind_server(
         "0.0.0.0:17443".parse().expect("server address"),
-        &crate::transport::encrypted::test_server_tls_config(),
+        &TcpServerTlsConfig::new(
+            vec![
+                CertificateDer::from_pem_file(
+                    std::env::var("MPTUNNEL_SOURCE_PROBE_CERT").expect("shared certificate path"),
+                )
+                .expect("shared reflection certificate"),
+            ],
+            PrivateKeyDer::from_pem_file(
+                std::env::var("MPTUNNEL_SOURCE_PROBE_KEY").expect("shared key path"),
+            )
+            .expect("shared reflection key"),
+        )
+        .expect("shared server TLS config"),
         super::super::test_candidate_verifier(),
         mux_limits,
     )
@@ -224,7 +238,14 @@ async fn run_client(driven: bool) {
     let limits = CodecLimits::default();
     let endpoint = Endpoint::bind_client(
         "0.0.0.0:0".parse().expect("client address"),
-        &crate::transport::encrypted::test_client_tls_config(),
+        &TcpClientTlsConfig::new(
+            "localhost",
+            CertificateDer::from_pem_file(
+                std::env::var("MPTUNNEL_SOURCE_PROBE_CERT").expect("shared certificate path"),
+            )
+            .expect("shared reflection certificate"),
+        )
+        .expect("shared client TLS config"),
         super::super::test_candidate_selector(),
         MuxLimits::default(),
     )

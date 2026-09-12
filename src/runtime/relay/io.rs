@@ -699,6 +699,14 @@ impl<T> ReadyStreamDataBatch<T> {
         self.payload_bytes = 0;
     }
 
+    /// Transfer validated contiguous payload to a persistent delivery cursor.
+    /// The receive actor can then reuse its bounded collector while the target
+    /// is blocked, without retaining a second queue of raw protocol frames.
+    pub(super) fn take_delivery(&mut self) -> SmallVec<[Bytes; 8]> {
+        self.payload_bytes = 0;
+        std::mem::take(&mut self.delivered)
+    }
+
     #[cfg(test)]
     fn item_capacity(&self) -> usize {
         self.items.capacity()
@@ -772,6 +780,12 @@ pub(in crate::runtime) struct ReadyStreamDataBatchApplyState {
 impl ReadyStreamDataBatchApplyState {
     pub(in crate::runtime) fn has_apply_error(&self) -> bool {
         self.apply_error.is_some()
+    }
+
+    /// A persistent target cursor keeps the successful prefix; its owner must
+    /// report this error only after that prefix has been written and flushed.
+    pub(super) fn into_apply_error(self) -> Option<RuntimeError> {
+        self.apply_error
     }
 }
 

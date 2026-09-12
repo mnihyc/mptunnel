@@ -1041,12 +1041,6 @@ fn spawn_reliable_relay_path_opens(
             #[cfg(not(test))]
             let result =
                 open_remote_stream_for_relay_path(&context, stream_id, &spec, lane, key).await;
-            #[cfg(test)]
-            eprintln!(
-                "attachment diagnostic session={:?} stream={stream_id:?} open_completed key={key:?} generation={generation:?} error={:?}",
-                context.session_id,
-                result.as_ref().err()
-            );
             let message = RelayAdditionalPathOpenResult {
                 key,
                 generation,
@@ -1088,10 +1082,6 @@ fn spawn_reliable_relay_path_opens(
             },
         );
         spawned = true;
-        #[cfg(test)]
-        eprintln!(
-            "attachment diagnostic stream={stream_id:?} open_spawned key={key:?} generation={generation:?} lane={lane:?}"
-        );
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
             "relay_additional_path_open_spawned",

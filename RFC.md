@@ -1583,6 +1583,12 @@ intentional bounded backpressure. Data ACK publication remains independent:
 receipt can release sender Product ownership before application consumption,
 and credit can advance only when receive-buffer capacity is actually freed.
 
+Contiguous receipt alone does not advance `a_r`. Bytes retained for a pending
+target write still belong to the receive envelope; a buffered target writer
+must complete its delivery/flush boundary before that prefix releases credit.
+An interleaved receiver must retain exact partial-write progress, including a
+pending flush, so servicing another protocol event cannot replay accepted bytes.
+
 `STREAM_ACK` releases retained data and flight but grants no new offset.
 `STREAM_MAX_DATA` grants offsets but acknowledges no byte. Transport enqueue
 capacity and native congestion state are additional local constraints, not
@@ -1691,9 +1697,15 @@ does not relax the ordered FIN path used for successful Product completion.
 A reliable-stream owner MUST continue polling its ordered attachment-lifecycle
 input until that logical stream becomes terminal. Product half-close, absence
 of locally sendable payload, or zero retained flight MUST NOT suppress carrier
-detach or failure processing. Lifecycle input is independent of Product work;
+detach or failure processing. A blocked target write, flush or shutdown MUST
+NOT prevent this ordered input service. Lifecycle input is independent of Product work;
 its exact-instance transition may be required to release carrier retirement
 while the remaining Product direction stays open.
+
+Continued service preserves the input order: retirement MUST NOT skip earlier
+Data ACK transactions or discard their exact-output attribution. Pending target
+delivery remains within the existing shared receive grant under Section 8.4;
+processing lifecycle grants no additional buffer or attachment ownership.
 
 Retiring a Product input recipient MUST NOT cancel still-owned ordered terminal
 output on its attachment; actual native transport failure remains independent.

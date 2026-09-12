@@ -2495,6 +2495,10 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() {
+    // Keep both target TCP buffers at this fixture's existing relay quantum.
+    // A non-reading target must exert backpressure before the 4 MiB producer
+    // finishes, independently of the operating system's default socket sizes.
+    const RELAY_QUANTUM_BYTES: u32 = 128 * 1024;
     struct BoundedTargetSocket;
     impl crate::transport::NativeSocketConfigurator for BoundedTargetSocket {
         fn configure_tcp(
@@ -2503,11 +2507,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             request: crate::transport::NativeSocketRequest,
         ) -> std::io::Result<()> {
             crate::transport::SystemNativeSocketConfigurator.configure_tcp(socket, request)?;
-            socket.set_send_buffer_size(128 * 1024)?;
-            eprintln!(
-                "attachment diagnostic target_send_buffer={}",
-                socket.send_buffer_size()?
-            );
+            socket.set_send_buffer_size(RELAY_QUANTUM_BYTES)?;
             Ok(())
         }
 
@@ -2525,8 +2525,8 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
     tokio::time::timeout(ACTOR_SETTLEMENT_TIMEOUT, async {
         let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
         socket2::SockRef::from(&target_listener)
-            .set_recv_buffer_size(128 * 1024)
-            .expect("diagnostic bounded target receive buffer");
+            .set_recv_buffer_size(RELAY_QUANTUM_BYTES as usize)
+            .expect("bounded target receive buffer");
         let target_addr = target_listener.local_addr().expect("target address");
         let (target_release_tx, target_release_rx) = oneshot::channel();
         let (target_payload_tx, target_payload_rx) = oneshot::channel();
@@ -2561,7 +2561,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             max_repair_bytes: 1_048_512,
             max_reorder_bytes: 1_048_512,
             max_path_flight_bytes: 1_048_512,
-            max_reliable_relay_chunk_bytes: 128 * 1024,
+            max_reliable_relay_chunk_bytes: RELAY_QUANTUM_BYTES as usize,
             tcp_path_heartbeat_interval: Duration::from_secs(60),
             tcp_path_heartbeat_timeout: Duration::from_secs(60),
             ..ResourceLimits::default()
@@ -2687,9 +2687,11 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         .await
         .expect("initial client QUIC attachment commit timeout");
         assert_eq!(initial_attachment.path_instance_id, quic_instance);
+        // This observes the producer task, not Product or native byte ownership:
+        // write_all or its following shutdown may still be pending.
         assert!(
             !writer.is_finished(),
-            "the request tail must remain retained when the QUIC attachment is aborted"
+            "the request producer must still be active when the QUIC attachment is aborted"
         );
         let (tcp_instance, quic_instance, quic_failures) = {
             let health = context.health().lock().expect("health lock");

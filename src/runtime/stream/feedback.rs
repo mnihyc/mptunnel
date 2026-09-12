@@ -350,6 +350,14 @@ impl ReliableRecvProgress {
     ) -> bool {
         let window_bytes = reliable_stream_advertised_window_bytes(path, traffic_class, mux_limits);
         let max_offset = recv_stream.max_data_offset_with_window(window_bytes);
+        self.should_send_max_data_offset(max_offset, force)
+    }
+
+    pub(in crate::runtime) fn should_send_max_data_offset(
+        &mut self,
+        max_offset: u64,
+        force: bool,
+    ) -> bool {
         // RFC 8.4: every freed prefix advances the retained grant. Attachment
         // publication already coalesces blocked updates into one latest value;
         // a byte threshold here would withhold usable receive credit.

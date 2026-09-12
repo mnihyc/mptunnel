@@ -808,11 +808,6 @@ impl ResponseStreamBinding {
             .iter()
             .any(|entry| entry.key == key && entry.path_instance_id == path_instance_id)
         {
-            #[cfg(test)]
-            eprintln!(
-                "attachment diagnostic session={:?} refused_pending_ordered_detach key={key:?} path_instance={path_instance_id:?}",
-                self.session_id
-            );
             // The ordered detach still owns this exact carrier incarnation.
             // Refusing reattachment until the actor consumes that boundary
             // prevents authenticated reconnect churn from accumulating

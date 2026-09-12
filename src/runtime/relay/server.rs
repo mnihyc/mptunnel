@@ -19,13 +19,13 @@ use super::io::{
     stream_ack_gap_frontier_reinjection_frames_normalized,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required, update_reinjection_authoritative_ack_snapshot,
-    write_applied_ready_stream_data_batch,
 };
 #[cfg(test)]
 use super::io::{
     stream_ack_gap_reinjection_frames_normalized,
     stream_final_offset_tail_reinjection_frames_normalized,
 };
+use super::server_delivery::ServerTargetIo;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
     lab_assert_server_sender_service_balanced, lab_diagnostic, lab_perf_flush, lab_perf_record,
@@ -90,7 +90,7 @@ use std::future::poll_fn;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::task::{Id, JoinError, JoinSet};
 
@@ -701,95 +701,6 @@ impl ServerAckPublicationState {
     }
 }
 
-struct ServerPendingReceiveAck<'a> {
-    progress: &'a mut ReliableRecvProgress,
-    path: Option<PathSnapshot>,
-    lane: TrafficClass,
-    limits: MuxLimits,
-}
-
-/// Feedback liveness does not belong to the target socket. Keep the same
-/// partially completed write/flush/shutdown future while servicing its exact
-/// route deadline and retained publication work. A DATA write that actually
-/// parks first offers its admitted receipt, independently of target consumption.
-/// Immediately completed writes retain their normal postwrite publication.
-/// This consumes no more input and grants no credit before local delivery.
-async fn service_server_feedback_while_pending<F, T>(
-    operation: F,
-    path_stream: &ReliablePathStream,
-    recv_stream: &mut ReliableRecvStream,
-    publication: &mut ServerAckPublicationState,
-    peer_max_offset: u64,
-    mut pending_receipt: Option<ServerPendingReceiveAck<'_>>,
-) -> Result<T, RuntimeError>
-where
-    F: std::future::Future<Output = Result<T, RuntimeError>>,
-{
-    tokio::pin!(operation);
-    // A separate watch cursor preserves the outer actor's own recovery wake.
-    let mut updates = path_stream.subscribe_output_updates();
-    loop {
-        publication.record_feedback(
-            path_stream.service_feedback_route(peer_max_offset),
-            recv_stream,
-        );
-        publication.record_feedback(path_stream.feedback_status(), recv_stream);
-        let mut notifies = path_stream.pending_ack_capacity_notifies(publication.generation);
-        for notify in path_stream
-            .pending_max_data_capacity_notifies()
-            .into_iter()
-            .chain(path_stream.feedback_route_capacity_notifies())
-        {
-            if !notifies.iter().any(|current| Arc::ptr_eq(current, &notify)) {
-                notifies.push(notify);
-            }
-        }
-        let mut capacity = arm_carrier_capacity_notifies(notifies);
-        // Arm before the final retry, including recipients exposed by expiry.
-        publication.record_feedback(
-            path_stream.service_feedback_route(peer_max_offset),
-            recv_stream,
-        );
-        let deadline = path_stream.feedback_route_deadline();
-        let observe_first_pending = pending_receipt.is_some();
-        tokio::select! {
-            result = poll_fn(|cx| match operation.as_mut().poll(cx) {
-                Poll::Ready(result) => Poll::Ready(Some(result)),
-                Poll::Pending if observe_first_pending => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            }) => {
-                if let Some(result) = result {
-                    return result;
-                }
-                let receipt = pending_receipt.take().expect("first pending DATA write");
-                enqueue_tcp_recv_progress(
-                    path_stream, recv_stream, receipt.progress, publication,
-                    receipt.path, receipt.lane, receipt.limits, true, false, false,
-                );
-                // The new generation can introduce blocked recipients. Re-arm
-                // their exact capacity waits before parking, rather than using
-                // the wait set collected before this receipt was materialized.
-                continue;
-            }
-            _ = async { if let Some(wait) = capacity.as_mut() { wait.as_mut().await; } }, if capacity.is_some() => {}
-            _ = async {
-                match deadline {
-                    Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
-                    None => std::future::pending().await,
-                }
-            } => {}
-            changed = async {
-                match updates.as_mut() {
-                    Some(updates) => updates.changed().await,
-                    None => std::future::pending().await,
-                }
-            }, if updates.is_some() => {
-                changed.map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
-            }
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn enqueue_tcp_recv_progress(
     path_stream: &ReliablePathStream,
@@ -802,6 +713,7 @@ fn enqueue_tcp_recv_progress(
     force_ack: bool,
     publish_max_data: bool,
     force_max_data: bool,
+    delivered_offset: u64,
 ) -> bool {
     let mut sent_any = false;
     let previous_ack_generation = progress.ack_generation();
@@ -830,11 +742,14 @@ fn enqueue_tcp_recv_progress(
             ack_publication.record_feedback(publication, recv_stream);
         }
     }
-    if publish_max_data
-        && progress.should_send_max_data(recv_stream, path, lane, mux_limits, force_max_data)
-    {
-        let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
-        let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
+    // Receipt can advance while the target is blocked. Only successfully
+    // flushed target delivery releases receive capacity; an already published
+    // grant is irrevocable even if path/window observations change.
+    let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
+    let max_offset = delivered_offset
+        .saturating_add(advertised_window)
+        .max(recv_stream.published_max_offset());
+    if publish_max_data && progress.should_send_max_data_offset(max_offset, force_max_data) {
         let publication = path_stream.publish_max_data(max_offset);
         if publication.max_data.published_offset.is_some() {
             sent_any = true;
@@ -2356,7 +2271,7 @@ struct ServerRelayClose {
 }
 
 async fn relay_reliable_stream_body<S>(
-    mut local: S,
+    local: S,
     path_stream: &mut ReliablePathStream,
     context: &ServerReliableRelayContext,
     session_id: SessionId,
@@ -2390,6 +2305,17 @@ where
         mux_limits,
         path_stream.max_frame_payload_bytes,
     );
+    let (mut local_read, mut local_write) = tokio::io::split(local);
+    let mut target_delivery = ServerTargetIo::new(
+        reliable_relay_buffer_len(mux_limits)
+            .min(path_stream.max_frame_payload_bytes)
+            .max(1),
+        initial_recv_max_offset as usize,
+    );
+    let mut target_apply_error = None;
+    let mut target_receipt_pending = false;
+    let mut target_progress_offset = 0;
+    let mut target_shutdown_requested = false;
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
     let mut local_open = true;
     let mut remote_open = true;
@@ -2481,7 +2407,7 @@ where
             path_stream.request_feedback_path_snapshot(previous_request_lane);
         let request_demand_update = request_flow_demand.refresh(
             ReliableRelayFlowSignals::new(recv_stream.next_offset())
-                .with_product_work(0, recv_stream.reorder_bytes()),
+                .with_product_work(target_delivery.pending_bytes(), recv_stream.reorder_bytes()),
             ReliableRelayFlowPathEvidence::timing_only(request_classifier_path),
             mux_limits,
         );
@@ -2501,6 +2427,72 @@ where
                     request_demand_update.rate_proven_sustained_bulk,
                 ),
             );
+        }
+        if !target_shutdown_requested
+            && pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset)
+        {
+            path_stream.finish_feedback_route();
+            if enqueue_tcp_recv_progress(
+                path_stream,
+                &mut recv_stream,
+                &mut recv_progress,
+                &mut request_ack_publication,
+                request_classifier_path,
+                request_lane,
+                mux_limits,
+                true,
+                false,
+                false,
+                target_delivery.delivered_offset(),
+            ) {
+                response_sender_retry_at = None;
+                last_recv_progress_sent_at = Instant::now();
+            }
+            target_shutdown_requested = true;
+            target_delivery.request_shutdown();
+        }
+        let target_poll = if target_delivery.has_work() {
+            poll_fn(|cx| Poll::Ready(target_delivery.poll_io(cx, &mut local_write))).await
+        } else {
+            Poll::Ready(Ok(()))
+        };
+        if let Poll::Ready(Err(error)) = target_poll {
+            break Err(RuntimeError::Io(error));
+        }
+        if !target_delivery.has_work()
+            && let Some(error) = target_apply_error.take()
+        {
+            break Err(error);
+        }
+        let target_progress = target_delivery.delivered_offset() != target_progress_offset;
+        if target_receipt_pending || target_progress {
+            // A genuinely Pending write/flush offers admitted receipt without
+            // waiting for target consumption. Successful flush alone advances
+            // MAX; a partially completed write is durable but grants no credit.
+            let force_ack = target_poll.is_pending()
+                || pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset);
+            if enqueue_tcp_recv_progress(
+                path_stream,
+                &mut recv_stream,
+                &mut recv_progress,
+                &mut request_ack_publication,
+                request_classifier_path,
+                request_lane,
+                mux_limits,
+                force_ack,
+                true,
+                false,
+                target_delivery.delivered_offset(),
+            ) {
+                response_sender_retry_at = None;
+                last_recv_progress_sent_at = Instant::now();
+            }
+            target_receipt_pending = !target_poll.is_pending() && target_delivery.has_work();
+            target_progress_offset = target_delivery.delivered_offset();
+        }
+        if target_delivery.is_shutdown() {
+            remote_open = false;
+            pending_remote_fin_offset = None;
         }
         let (
             previous_response_lane,
@@ -3394,6 +3386,29 @@ where
             }
             continue;
         }
+        result = poll_fn(|cx| match target_delivery.poll_io(cx, &mut local_write) {
+            Poll::Pending if target_receipt_pending => Poll::Ready(None),
+            result => result.map(Some),
+        }),
+            if target_delivery.has_work() => {
+            if let Some(result) = result {
+                result?;
+            } else {
+                // The fast poll may have accepted only a prefix. Surface the
+                // first real Pending here once, before the actor can park.
+                if enqueue_tcp_recv_progress(
+                    path_stream, &mut recv_stream, &mut recv_progress,
+                    &mut request_ack_publication, request_feedback_path_snapshot,
+                    request_lane, mux_limits, true, false, false,
+                    target_delivery.delivered_offset(),
+                ) {
+                    response_sender_retry_at = None;
+                    last_recv_progress_sent_at = Instant::now();
+                }
+                target_receipt_pending = false;
+            }
+            continue;
+        }
         // Server input interleaves Product frames with ordered attachment
         // lifecycle. It must remain polled after Product half-close and while
         // response flight is empty so carrier retirement can complete.
@@ -3413,7 +3428,7 @@ where
                 );
             }
             result
-        } => {
+        }, if target_apply_error.is_none() => {
             let frame = frame?;
             response_sender_retry_at = None;
             match frame {
@@ -3513,58 +3528,11 @@ where
                             Ok(outcome)
                         },
                     );
-                    let peer_max_offset = response_product.lock().send_stream.peer_max_offset();
-                    service_server_feedback_while_pending(
-                        write_applied_ready_stream_data_batch(&mut local, &mut ready_path_data, applied),
-                        path_stream, &mut recv_stream, &mut request_ack_publication, peer_max_offset,
-                        Some(ServerPendingReceiveAck {
-                            progress: &mut recv_progress,
-                            path: request_feedback_path_snapshot,
-                            lane: request_lane,
-                            limits: mux_limits,
-                        }),
-                    ).await?;
-                    if enqueue_tcp_recv_progress(
-                        path_stream,
-                        &mut recv_stream,
-                        &mut recv_progress,
-                        &mut request_ack_publication,
-                        request_feedback_path_snapshot,
-                        request_lane,
-                        mux_limits,
-                        false,
-                        true,
-                        false,
-                    )
-                    {
-                        response_sender_retry_at = None;
-                        last_recv_progress_sent_at = Instant::now();
-                    }
+                    target_apply_error = applied.into_apply_error();
+                    target_delivery.append_batch(ready_path_data.take_delivery())?;
+                    target_receipt_pending = true;
                     if pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset) {
                         path_stream.finish_feedback_route();
-                        if enqueue_tcp_recv_progress(
-                            path_stream,
-                            &mut recv_stream,
-                            &mut recv_progress,
-                            &mut request_ack_publication,
-                            request_feedback_path_snapshot,
-                            request_lane,
-                            mux_limits,
-                            true,
-                            false,
-                            false,
-                        ) {
-                            response_sender_retry_at = None;
-                            last_recv_progress_sent_at = Instant::now();
-                        }
-                        let peer_max_offset = response_product.lock().send_stream.peer_max_offset();
-                        service_server_feedback_while_pending(
-                            async { local.shutdown().await.map_err(RuntimeError::Io) },
-                            path_stream, &mut recv_stream, &mut request_ack_publication, peer_max_offset,
-                            None,
-                        ).await?;
-                        remote_open = false;
-                        pending_remote_fin_offset = None;
                     }
                 }
                 Frame::StreamAck {
@@ -3794,35 +3762,12 @@ where
                     final_offset,
                 } if fin_stream_id == stream_id => {
                     path_stream.finish_feedback_route();
-                    if receive_stream_fin(
+                    receive_stream_fin(
                         &recv_stream,
                         &mut pending_remote_fin_offset,
                         final_offset,
-                    )? {
-                        if enqueue_tcp_recv_progress(
-                            path_stream,
-                            &mut recv_stream,
-                            &mut recv_progress,
-                            &mut request_ack_publication,
-                            request_feedback_path_snapshot,
-                            request_lane,
-                            mux_limits,
-                            true,
-                            false,
-                            false,
-                        ) {
-                            response_sender_retry_at = None;
-                            last_recv_progress_sent_at = Instant::now();
-                        }
-                        let peer_max_offset = response_product.lock().send_stream.peer_max_offset();
-                        service_server_feedback_while_pending(
-                            async { local.shutdown().await.map_err(RuntimeError::Io) },
-                            path_stream, &mut recv_stream, &mut request_ack_publication, peer_max_offset,
-                            None,
-                        ).await?;
-                        remote_open = false;
-                        pending_remote_fin_offset = None;
-                    }
+                    )?;
+                    target_receipt_pending = true;
                 }
                 Frame::StreamReset {
                     stream_id: reset_stream_id,
@@ -3849,6 +3794,7 @@ where
                         true,
                         true,
                         true,
+                        target_delivery.delivered_offset(),
                     ) {
                         response_sender_retry_at = None;
                         last_recv_progress_sent_at = Instant::now();
@@ -4057,6 +4003,7 @@ where
                 true,
                 resend_progress,
                 resend_progress,
+                target_delivery.delivered_offset(),
             ) {
                 response_sender_retry_at = None;
                 last_recv_progress_sent_at = Instant::now();
@@ -4120,7 +4067,7 @@ where
             let read_started = Instant::now();
 
             let result =
-                read_reliable_relay_payload(&mut local, &mut buf, reserved_read_budget, read_budget).await;
+                read_reliable_relay_payload(&mut local_read, &mut buf, reserved_read_budget, read_budget).await;
             #[cfg(feature = "lab-diagnostics")]
             if let Ok((read, _)) = &result {
                 lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
@@ -4192,7 +4139,7 @@ where
                                 .await;
 
                             let result = read_reliable_relay_payload(
-                                &mut local, &mut buf, permit.bytes(), next_read_budget,
+                                &mut local_read, &mut buf, permit.bytes(), next_read_budget,
                             ).await;
                             (result, permit)
                         } => read,

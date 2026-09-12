@@ -12,6 +12,7 @@ pub(super) mod lifecycle;
 pub(super) mod open;
 pub(super) mod remote;
 mod server;
+mod server_delivery;
 mod service;
 
 #[cfg(test)]

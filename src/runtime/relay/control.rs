@@ -494,12 +494,6 @@ fn finish_client_relay_path_error(
         sender.fail_client_path_instance(context, remotes, instance)
     };
     if removed {
-        #[cfg(test)]
-        eprintln!(
-            "attachment diagnostic session={:?} retired={instance:?} retry_after={:?}",
-            context.session_id,
-            retry_at.saturating_duration_since(tokio::time::Instant::now())
-        );
         path_open_suppressions.suppress(instance, retry_at);
     }
 }
@@ -1450,20 +1444,6 @@ where
             let response_rebalance_due =
                 response_flow_demand.should_rebalance(response_demand_update);
             if request_rebalance_due || response_rebalance_due {
-                #[cfg(test)]
-                eprintln!(
-                    "attachment diagnostic session={:?} stream={stream_id:?} rebalance lane={topology_lane:?} queued={} retained={} credit={} paths={:?} pending={:?} request={request_flow_demand:?}",
-                    context.session_id,
-                    sender_queue.data_bytes(),
-                    send_stream.reinjection_bytes(),
-                    send_stream.send_credit_bytes(),
-                    remotes.path_keys(),
-                    state
-                        .recovery
-                        .pending_additional_path_opens
-                        .keys()
-                        .collect::<Vec<_>>()
-                );
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "client_stream_rebalance_due",
@@ -2302,11 +2282,6 @@ where
             _ = wait_for_optional_deadline(path_open_suppression_retry_at), if path_open_suppression_retry_at.is_some() => {
                 // Re-enter serialized demand/recovery decisions exactly when
                 // the failed attachment's path-derived retry bound expires.
-                #[cfg(test)]
-                {
-                    let product = request_product.lock();
-                    eprintln!("attachment diagnostic session={:?} stream={stream_id:?} suppression_wake queued={} retained={} credit={} paths={:?} pending={:?} request={request_flow_demand:?}", context.session_id, product.sender_queue.data_bytes(), product.send_stream.reinjection_bytes(), product.send_stream.send_credit_bytes(), product.remotes.path_keys(), state.recovery.pending_additional_path_opens.keys().collect::<Vec<_>>());
-                }
                 continue;
             }
             _ = async move {

@@ -4245,7 +4245,7 @@ where
             let read_started = Instant::now();
             let capacity_before = if source_admission_observe { buf.capacity() } else { 0 };
             let result =
-                read_reliable_relay_payload(&mut local, &mut buf, reserved_read_budget).await;
+                read_reliable_relay_payload(&mut local, &mut buf, reserved_read_budget, read_budget).await;
             #[cfg(feature = "lab-diagnostics")]
             if let Ok((read, _)) = &result {
                 lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
@@ -4328,7 +4328,7 @@ where
                             }
                             let capacity_before = if source_admission_observe { buf.capacity() } else { 0 };
                             let result = read_reliable_relay_payload(
-                                &mut local, &mut buf, permit.bytes(),
+                                &mut local, &mut buf, permit.bytes(), next_read_budget,
                             ).await;
                             (result, permit, capacity_before)
                         } => read,

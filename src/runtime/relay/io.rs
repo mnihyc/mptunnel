@@ -577,16 +577,18 @@ pub(in crate::runtime) async fn read_reliable_relay_payload<S>(
     local: &mut S,
     buffer: &mut bytes::BytesMut,
     read_budget: usize,
+    source_read_maximum: usize,
 ) -> std::io::Result<(usize, Option<Bytes>)>
 where
     S: AsyncRead + Unpin,
 {
     buffer.clear();
-    // A grant limits bytes read; it does not require that much spare capacity.
-    // Consume the current backing before refilling: previously split payloads
-    // may still own it, so early growth can pin mostly unused allocations.
+    // The grant limits this read; the pre-reservation source maximum sizes an
+    // exhausted backing for subsequent reads. Consume all existing spare first:
+    // previously split payloads may still own it, so early growth can pin mostly
+    // unused allocations. A small grant must not become a separate chunk cap.
     if buffer.capacity() == 0 {
-        buffer.reserve(read_budget.max(1));
+        buffer.reserve(source_read_maximum.max(read_budget).max(1));
     }
     let read = (&mut *local)
         .take(read_budget.max(1) as u64)

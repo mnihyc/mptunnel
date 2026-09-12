@@ -2442,13 +2442,19 @@ eligible actor runs.
 The source read ceiling and an admitted grant are upper bounds, not required read
 sizes. A reusable source buffer MUST consume its existing spare backing before
 allocating a replacement, including when a supplied socket returns short reads.
-Refill occurs only after that spare capacity is exhausted, using the current
-admitted read maximum. The native read remains bounded by that grant; a shorter
-read at a backing boundary refunds unused capacity through the ordinary permit.
+Refill occurs only after that spare capacity is exhausted, using the caller's
+existing source-read maximum before shared reservation. A partial grant controls
+permission to read, not the size of the next backing allocation: choosing backing
+from a small grant can truncate subsequent larger grants and repeatedly require
+short reads, refunds and new admission turns. The local read remains bounded by
+the actual grant; a shorter read at a backing boundary refunds unused capacity
+through the ordinary permit.
 This preserves shared, zero-copy payload ownership without repeatedly pinning
 mostly unused old allocations. It can require an additional read/admission turn
-at a backing boundary. It does not equate the unique-byte envelope with physical
-allocation capacity: an outstanding slice after partial ACK can still pin an
+at a backing boundary, and the larger partially filled backing per source is a
+resource cost. This explicitly refines the earlier grant-sized refill rule; the
+arbitration and unique-byte envelope do not change. Unique bytes still differ from
+physical allocation capacity: an outstanding slice after partial ACK can pin an
 otherwise consumed backing allocation, and each live source retains its current
 buffer. Repair item/lifetime bounds and measured resource behavior still apply.
 

@@ -100,25 +100,42 @@ impl SourceAllocationInterval {
     }
 }
 
-async fn check_retained_source_packing(initial_capacity: usize, chunk: usize, grant: usize) {
+async fn check_retained_source_packing(
+    initial_capacity: usize,
+    chunk: usize,
+    grants_and_maxima: &[(usize, usize)],
+) {
     let mut source = ChunkedSourceProbe {
         position: 0,
         end: 128 * chunk + 7,
         chunk_bytes: chunk,
-        read_limit: grant,
+        read_limit: 0,
         pending_once: false,
     };
     let mut buffer = bytes::BytesMut::with_capacity(initial_capacity);
     let mut allocations = Vec::new();
     let mut retained = Vec::new();
+    let mut read_index = 0;
     loop {
+        let (grant, maximum) = grants_and_maxima[read_index % grants_and_maxima.len()];
+        read_index += 1;
+        source.read_limit = grant;
         let before = source.position;
-        let (read, payload) = read_reliable_relay_payload(&mut source, &mut buffer, grant)
+        let capacity_before = buffer.capacity();
+        let (read, payload) = read_reliable_relay_payload(&mut source, &mut buffer, grant, maximum)
             .await
             .unwrap();
         assert!(buffer.is_empty());
         assert!(read <= grant);
         assert_eq!(source.position, before + read);
+        if capacity_before == 0 {
+            // Refill follows source capacity, even when the current grant is
+            // smaller; the producer still receives only the granted read limit.
+            assert!(read + buffer.capacity() >= maximum.max(grant).max(1));
+        } else {
+            // A changed grant or source maximum cannot cause early replacement.
+            assert_eq!(read + buffer.capacity(), capacity_before);
+        }
         let Some(payload) = payload else {
             assert_eq!(read, 0);
             assert_eq!(source.position, source.end, "zero read must be actual EOF");
@@ -154,13 +171,24 @@ async fn check_retained_source_packing(initial_capacity: usize, chunk: usize, gr
 async fn reliable_source_retained_reads_pack_shared_allocations() {
     const CEILING: usize = 512 * 1024;
     for chunk in [12 * 1024, 16 * 1024] {
-        for initial_capacity in [0, CEILING] {
+        for initial_capacity in [0, PATH_OPEN_SCORE_BYTES, CEILING] {
             // Small admission grants and short source reads under large grants
             // must both consume existing spare capacity before replacement.
-            for grant in [chunk, CEILING] {
-                check_retained_source_packing(initial_capacity, chunk, grant).await;
+            for (grant, maximum) in [(chunk, chunk), (chunk, CEILING), (CEILING, CEILING)] {
+                check_retained_source_packing(initial_capacity, chunk, &[(grant, maximum)]).await;
             }
         }
+        check_retained_source_packing(
+            PATH_OPEN_SCORE_BYTES,
+            chunk,
+            &[
+                (6_000, CEILING),
+                (16 * 1024, 64 * 1024),
+                (64 * 1024, CEILING),
+                (3 * 1024, PATH_OPEN_SCORE_BYTES),
+            ],
+        )
+        .await;
     }
 }
 
@@ -175,31 +203,41 @@ async fn reliable_source_pending_cancellation_preserves_bytes_and_actual_eof() {
     };
     let mut buffer = bytes::BytesMut::new();
     let mut retained = Vec::new();
-    for grant in [16, 3] {
+    for (grant, maximum) in [(16, 0), (3, 128)] {
         source.read_limit = grant;
         source.pending_once = true;
         let before = source.position;
         // Cancel once with zero initial capacity, then after the first payload
         // exhausts its allocation while remaining owned by the caller.
         assert_eq!(buffer.capacity(), 0);
-        let mut read = Box::pin(read_reliable_relay_payload(&mut source, &mut buffer, grant));
+        let mut read = Box::pin(read_reliable_relay_payload(
+            &mut source,
+            &mut buffer,
+            grant,
+            maximum,
+        ));
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(std::future::Future::poll(read.as_mut(), &mut cx).is_pending());
         drop(read);
         assert_eq!(source.position, before);
         assert!(buffer.is_empty());
-        assert!(buffer.capacity() > 0);
-        let (read, payload) = read_reliable_relay_payload(&mut source, &mut buffer, grant)
-            .await
-            .unwrap();
+        let reserved_capacity = buffer.capacity();
+        assert!(reserved_capacity >= maximum.max(grant));
+        // Cancellation may retain newly allocated spare. A larger subsequent
+        // source maximum must reuse it while the smaller grant bounds input.
+        let (read, payload) =
+            read_reliable_relay_payload(&mut source, &mut buffer, grant, maximum.max(grant) * 2)
+                .await
+                .unwrap();
         assert!(read > 0 && read <= grant);
         assert_eq!(source.position, before + read);
+        assert_eq!(read + buffer.capacity(), reserved_capacity);
         retained.push(payload.unwrap());
     }
     source.read_limit = 7;
     loop {
         let before = source.position;
-        let (read, payload) = read_reliable_relay_payload(&mut source, &mut buffer, 7)
+        let (read, payload) = read_reliable_relay_payload(&mut source, &mut buffer, 7, 7)
             .await
             .unwrap();
         assert!(read <= 7);

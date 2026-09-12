@@ -3038,6 +3038,7 @@ where
                         &mut local,
                         &mut buf,
                         reserved_read_budget,
+                        read_budget,
                     )
                     .await;
                     #[cfg(feature = "lab-diagnostics")]
@@ -3298,7 +3299,7 @@ where
                                     let permit = context.session_send_buffer
                                         .reserve(&mut send_buffer_updates, next_read_budget).await;
                                     let result = read_reliable_relay_payload(
-                                        &mut local, &mut buf, permit.bytes(),
+                                        &mut local, &mut buf, permit.bytes(), next_read_budget,
                                     ).await;
                                     (result, permit)
                                 }).await;

@@ -13,7 +13,7 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use crate::mutex::Mutex;
+use crate::{mutex::Mutex, source_trace};
 
 pub(super) type TransmitSource = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -37,6 +37,7 @@ impl Wake for SourceWake {
 }
 
 struct Source {
+    identity: u64,
     future: TransmitSource,
     wake: Arc<SourceWake>,
 }
@@ -65,6 +66,7 @@ impl TransmitSources {
 
     fn insert(&mut self, future: TransmitSource) {
         self.sources.push(Source {
+            identity: source_trace::next_id(),
             future,
             wake: Arc::new(SourceWake {
                 ready: AtomicBool::new(true),
@@ -96,7 +98,11 @@ impl TransmitSources {
     }
 
     /// Poll each signaled source at most once, with no native mutex held.
-    pub(super) fn poll_ready(&mut self, cx: &mut Context<'_>) {
+    pub(super) fn poll_ready(
+        &mut self,
+        cx: &mut Context<'_>,
+        diagnostic: Option<proto::NativeSourceDriverContext>,
+    ) {
         let mut index = 0;
         while index < self.sources.len() {
             let source = &mut self.sources[index];
@@ -108,12 +114,18 @@ impl TransmitSources {
             }
             let complete = if source.wake.ready.swap(false, Ordering::AcqRel) {
                 let waker = Waker::from(source.wake.clone());
-                source
+                let trace = source_trace::SourcePoll::begin(diagnostic, source.identity);
+                let complete = source
                     .future
                     .as_mut()
                     .poll(&mut Context::from_waker(&waker))
-                    .is_ready()
+                    .is_ready();
+                if let Some(trace) = trace {
+                    trace.finish(complete, || source.wake.ready.load(Ordering::Acquire));
+                }
+                complete
             } else {
+                source_trace::skipped(diagnostic, source.identity);
                 false
             };
             if complete {

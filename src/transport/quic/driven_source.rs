@@ -15,11 +15,15 @@ use std::{
 #[derive(Debug)]
 pub struct NativeSourceRegistration {
     connection: quinn::Connection,
+    native_stream_id: u64,
 }
 
 impl NativeSourceRegistration {
-    pub(super) fn new(connection: quinn::Connection) -> Self {
-        Self { connection }
+    pub(super) fn new(connection: quinn::Connection, native_stream_id: u64) -> Self {
+        Self {
+            connection,
+            native_stream_id,
+        }
     }
 
     /// Move an actor into native-driven polling without changing its result.
@@ -36,6 +40,7 @@ impl NativeSourceRegistration {
     {
         let (handle, mut proxy) = source_pair(future);
         proxy.connection = Some(self.connection.clone());
+        proxy.native_stream_id = Some(self.native_stream_id);
         self.connection.register_transmit_source(Box::pin(proxy))?;
         Ok(handle)
     }
@@ -192,12 +197,21 @@ fn resume_parent_panic(panic: PanicPayload) {
 struct NativeSourceProxy<R> {
     state: Arc<Mutex<SourceState<R>>>,
     connection: Option<quinn::Connection>,
+    native_stream_id: Option<u64>,
 }
 
 impl<R> Future for NativeSourceProxy<R> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        quinn::note_source_state(
+            "actor_identity",
+            format_args!(
+                "native_connection={:?} native_stream={:?}",
+                self.connection.as_ref().map(quinn::Connection::stable_id),
+                self.native_stream_id,
+            ),
+        );
         let mut state = self.state.lock().expect("driven source poll");
         if state.actor.is_none() {
             return Poll::Ready(());
@@ -284,6 +298,7 @@ where
         NativeSourceProxy {
             state,
             connection: None,
+            native_stream_id: None,
         },
     )
 }

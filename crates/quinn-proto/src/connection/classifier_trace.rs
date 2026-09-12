@@ -23,6 +23,53 @@ struct Window {
 
 static WINDOW: OnceLock<Option<Window>> = OnceLock::new();
 
+/// Passive view of the already initialized server observation window.
+/// This does not initialize it, emit boundaries, or change classifier counters.
+#[doc(hidden)]
+pub fn native_source_window_at(now: Instant) -> Option<Duration> {
+    let window = WINDOW.get()?.as_ref()?;
+    if window.role != "server" {
+        return None;
+    }
+    let elapsed = now.checked_duration_since(window.first_poll)?;
+    (elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(11))
+        .then_some(elapsed)
+}
+
+/// Exact native-driver turn and source pass enclosing a transmit poll.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeSourceDriverContext {
+    /// Stable runtime connection identity, also present on source observations.
+    pub connection: usize,
+    /// Unique observed driver turn.
+    pub turn: u64,
+    /// Source pass within that turn; zero is never emitted by the driver.
+    pub pass: u64,
+}
+
+thread_local! {
+    static SOURCE_DRIVER: Cell<Option<NativeSourceDriverContext>> = const { Cell::new(None) };
+}
+
+/// Restores the preceding diagnostic context without affecting native state.
+#[doc(hidden)]
+pub struct NativeSourceDriverGuard(Option<NativeSourceDriverContext>);
+
+impl Drop for NativeSourceDriverGuard {
+    fn drop(&mut self) {
+        SOURCE_DRIVER.set(self.0);
+    }
+}
+
+/// Associate only the enclosed real transmit poll with its runtime source pass.
+#[doc(hidden)]
+pub fn enter_native_source_driver(
+    context: Option<NativeSourceDriverContext>,
+) -> NativeSourceDriverGuard {
+    NativeSourceDriverGuard(SOURCE_DRIVER.replace(context))
+}
+
 #[derive(Clone, Copy)]
 struct Context {
     connection: usize,
@@ -141,6 +188,7 @@ pub(super) fn empty_poll(
     // All hypothetical pacing reads/work are inside the existing exact window.
     let pacing = observe_pacing();
     let context = CONTEXT.get();
+    let source_driver = SOURCE_DRIVER.get();
     let byte_full = poll.flight >= poll.cwnd;
     let packet_blocked = poll
         .flight
@@ -157,7 +205,7 @@ pub(super) fn empty_poll(
         .missing_context
         .fetch_add(u64::from(context.is_none()), Ordering::Relaxed);
     eprintln!(
-        "native_empty_poll role={} window=first_native_poll_10_11 event={} elapsed_us={} unix_us={:?} connection={:?} path_epoch={:?} flag_before={} flag_after={} flight={} cwnd={} mtu={} byte_full={} packet_blocked={:?} send_blocked={} cwnd_blocked={} had_sendable_frames={} pacer_capacity_before={} pacer_tokens_before={} pacer_previous_age_ns={} pacer_now_before_previous={} pacer_cached_window={:?} pacer_cached_mtu={:?} pacer_rtt_ns={} pacer_metric_window={} pacer_rate_bytes_per_s={:?} pacer_hypothetical_bytes={} pacer_hypothetical_mtu={} pacer_capacity_after={} pacer_tokens_after={} pacer_previous_after_age_ns={} pacer_delay_some={} pacer_due_gap_ns={:?}",
+        "native_empty_poll role={} window=first_native_poll_10_11 event={} elapsed_us={} unix_us={:?} connection={:?} path_epoch={:?} flag_before={} flag_after={} flight={} cwnd={} mtu={} byte_full={} packet_blocked={:?} send_blocked={} cwnd_blocked={} had_sendable_frames={} pacer_capacity_before={} pacer_tokens_before={} pacer_previous_age_ns={} pacer_now_before_previous={} pacer_cached_window={:?} pacer_cached_mtu={:?} pacer_rtt_ns={} pacer_metric_window={} pacer_rate_bytes_per_s={:?} pacer_hypothetical_bytes={} pacer_hypothetical_mtu={} pacer_capacity_after={} pacer_tokens_after={} pacer_previous_after_age_ns={} pacer_delay_some={} pacer_due_gap_ns={:?} driver_connection={:?} driver_turn={:?} source_pass={:?}",
         window.role,
         event,
         elapsed,
@@ -190,6 +238,9 @@ pub(super) fn empty_poll(
         pacing.previous_after_age_ns,
         pacing.due.is_some(),
         pacing.due_gap_ns,
+        source_driver.map(|driver| driver.connection),
+        source_driver.map(|driver| driver.turn),
+        source_driver.map(|driver| driver.pass),
     );
 }
 

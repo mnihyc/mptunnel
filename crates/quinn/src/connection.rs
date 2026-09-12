@@ -267,7 +267,13 @@ impl Future for ConnectionDriver {
         this.sources.receive(cx);
         // One budget for the entire driver turn, including inline source refills.
         let mut transmits = 0;
+        let mut diagnostic_turn = None;
+        let mut diagnostic_pass = 0;
         loop {
+            diagnostic_pass += 1;
+            let diagnostic = crate::source_trace::driver_context(
+                this.conn.stable_id(), &mut diagnostic_turn, diagnostic_pass,
+            );
             let mut conn = this.conn.state.lock("poll");
             let span = debug_span!("drive", id = conn.handle.0);
             let _guard = span.enter();
@@ -288,7 +294,7 @@ impl Future for ConnectionDriver {
                 if terminal {
                     this.sources.close();
                 } else {
-                    this.sources.poll_ready(cx);
+                    this.sources.poll_ready(cx, diagnostic);
                 }
                 conn = this.conn.state.lock("poll_after_source");
             }
@@ -301,6 +307,7 @@ impl Future for ConnectionDriver {
                     &this.conn.shared,
                     !this.sources.is_empty(),
                     &mut transmits,
+                    diagnostic,
                 ) {
                     Ok(result) => result,
                     Err(error) => {
@@ -1189,6 +1196,7 @@ impl State {
         shared: &Shared,
         interrupt_for_sources: bool,
         transmits: &mut usize,
+        diagnostic: Option<proto::NativeSourceDriverContext>,
     ) -> io::Result<(bool, bool)> {
         let now = self.runtime.now();
 
@@ -1204,10 +1212,11 @@ impl State {
                 None => {
                     self.send_buffer.clear();
                     self.send_buffer.reserve(self.inner.current_mtu() as usize);
-                    match self
-                        .inner
-                        .poll_transmit(now, max_datagrams, &mut self.send_buffer)
-                    {
+                    let transmit = {
+                        let _diagnostic = proto::enter_native_source_driver(diagnostic);
+                        self.inner.poll_transmit(now, max_datagrams, &mut self.send_buffer)
+                    };
+                    match transmit {
                         Some(t) => {
                             *transmits += match t.segment_size {
                                 None => 1,

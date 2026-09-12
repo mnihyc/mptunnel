@@ -522,11 +522,14 @@ where
     }
     debug_assert!(deferred_input.is_none());
     let write = udp_path_write_frames(send, frames, codec_limits);
-    let (write_result, routed_frames) = await_udp_write_while_routing_stream_frames(
-        write,
-        carrier_frames,
-        deferred_input,
-        try_route_frame,
+    let (write_result, routed_frames) = quinn::observe_source_future(
+        "udp_interlocked_write",
+        await_udp_write_while_routing_stream_frames(
+            write,
+            carrier_frames,
+            deferred_input,
+            try_route_frame,
+        ),
     )
     .await;
     write_result?;
@@ -553,23 +556,31 @@ where
     loop {
         tokio::select! {
             biased;
-            result = &mut write => {
+            result = quinn::observe_source_future("udp_h3_write", &mut write) => {
                 if let Some(pending) = mailbox.take() {
                     *deferred_input = Some(Ok(pending.into_frame()));
                 }
                 return (result, routed_frames);
             }
-            _ = async { mailbox.as_mut().expect("pending mailbox").deliver().await },
+            _ = quinn::observe_source_future("udp_input_mailbox_deliver", async {
+                mailbox.as_mut().expect("pending mailbox").deliver().await
+            }),
                 if mailbox.is_some() => {
                 mailbox = None;
                 routed_frames = routed_frames.saturating_add(1);
             }
-            incoming = carrier_frames.recv(), if deferred_input.is_none() && mailbox.is_none() => {
+            incoming = quinn::observe_source_future("udp_interlocked_input_recv", carrier_frames.recv()), if deferred_input.is_none() && mailbox.is_none() => {
                 match incoming {
                     Some(Ok(frame)) => match try_route_frame(frame) {
                         Ok(CarrierInputRoute::Routed) => routed_frames = routed_frames.saturating_add(1),
-                        Ok(CarrierInputRoute::Barrier(frame)) => *deferred_input = Some(Ok(frame)),
-                        Ok(CarrierInputRoute::Mailbox(pending)) => mailbox = Some(pending),
+                        Ok(CarrierInputRoute::Barrier(frame)) => {
+                            quinn::note_source_state("udp_input_route", format_args!("result=Barrier"));
+                            *deferred_input = Some(Ok(frame));
+                        }
+                        Ok(CarrierInputRoute::Mailbox(pending)) => {
+                            quinn::note_source_state("udp_input_route", format_args!("result=Mailbox"));
+                            mailbox = Some(pending);
+                        }
                         Err(err) => *deferred_input = Some(Err(err)),
                     },
                     Some(Err(err)) => *deferred_input = Some(Err(err)),

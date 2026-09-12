@@ -611,12 +611,12 @@ async fn run_server_udp_reliable_stream_loop(
         }
         tokio::select! {
             biased;
-            frame = async {
+            frame = quinn::observe_source_future("server_actor_input_recv", async {
                 match deferred_input.take() {
                     Some(input) => Some(input),
                     None => carrier_frames.recv().await,
                 }
-            } => {
+            }) => {
                 commands_rx.withdraw_writer_ready();
                 match frame {
                     Some(Ok(frame @ Frame::StreamRequalifyData {
@@ -848,7 +848,7 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                 }
             }
-            command = recv_reliable_path_command(&mut commands_rx), if command_may_recv => {
+            command = quinn::observe_source_future("server_actor_command_recv", recv_reliable_path_command(&mut commands_rx)), if command_may_recv => {
                 if let Some(command) = command {
                     let result = drain_server_udp_reliable_commands(
                         command,

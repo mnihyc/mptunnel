@@ -2495,6 +2495,9 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() {
+    let phase = std::cell::Cell::new(("target and carrier setup", Instant::now()));
+    let enter_phase = |name| phase.set((name, Instant::now()));
+    let sampled_pto = std::cell::Cell::new(None);
     tokio::time::timeout(ACTOR_SETTLEMENT_TIMEOUT, async {
         let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
         let target_addr = target_listener.local_addr().expect("target address");
@@ -2590,6 +2593,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         )
         .expect("mixed client context");
         let _tcp_pool = spawn_tcp_pool_reconciliation(&context);
+        enter_phase("initial TCP readiness");
         wait_for_tcp_ready_count(&context, 1).await;
 
         let stream_id = StreamId(0);
@@ -2601,7 +2605,9 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         let mut first_abort = arm_server_udp_stream_abort_for_test(context.session_id, stream_id);
         let (mut client, ingress) = duplex(256 * 1024);
         let product = tokio::spawn(handle_socks5_client_stream(ingress, context.clone()));
+        enter_phase("SOCKS tunnel opening");
         open_socks5_tcp_tunnel(&mut client, target_addr).await;
+        enter_phase("initial TCP client commit");
         let committed_tcp = tokio::time::timeout(
             Duration::from_millis(750),
             initial_tcp_attachment.wait_committed(),
@@ -2615,6 +2621,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             "an attachment without committed OriginalData is membership, not active path demand"
         );
 
+        enter_phase("QUIC path probe");
         probe_client_paths(&context, Duration::from_millis(500)).await;
         let quic_instance = context.health().lock().expect("health lock").udp[0]
             .path_instance_id()
@@ -2636,6 +2643,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             request.shutdown().await.expect("finish patterned payload");
         });
 
+        enter_phase("initial QUIC server attachment");
         let initial_attachment_deadline = tokio::time::Instant::now() + Duration::from_millis(750);
         assert!(
             tokio::time::timeout_at(initial_attachment_deadline, first_abort.wait_attached())
@@ -2643,6 +2651,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
                 .expect("initial QUIC attachment timeout"),
             "the server must own the operation-scoped H3 request stream"
         );
+        enter_phase("initial QUIC client commit");
         let initial_attachment = tokio::time::timeout_at(
             initial_attachment_deadline,
             attachment_commits.wait_committed(),
@@ -2669,9 +2678,11 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         assert_eq!(quic_failures, 0);
         let physical_socket_count = carrier_network.socket_count();
         let pto = crate::model::timing::transport_pto_from_snapshot(context.udp_path_snapshot(0));
+        sampled_pto.set(Some(pto));
         let mut replacement_abort =
             arm_server_udp_stream_abort_for_test(context.session_id, stream_id);
         let aborted_at = tokio::time::Instant::now();
+        enter_phase("aborted server attachment release");
         first_abort.abort();
         assert!(
             first_abort.wait_released().await,
@@ -2683,6 +2694,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             "TCP must survive the QUIC request-stream failure"
         );
 
+        enter_phase("pre-PTO suppression");
         let pre_pto_deadline = aborted_at + pto.saturating_sub(Duration::from_millis(3));
         assert!(
             tokio::time::timeout_at(pre_pto_deadline, replacement_abort.wait_attached())
@@ -2690,6 +2702,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
                 .is_err(),
             "the same failed operation must not spin a replacement before one PTO"
         );
+        enter_phase("replacement QUIC server attachment");
         assert!(
             replacement_abort.wait_attached().await,
             "the same live QUIC carrier must be eligible again after suppression expires"
@@ -2698,6 +2711,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             aborted_at.elapsed() + Duration::from_millis(3) >= pto,
             "reattachment occurred before its path-derived PTO"
         );
+        enter_phase("replacement QUIC client commit");
         let replacement_attachment = attachment_commits.wait_committed().await;
         assert_eq!(replacement_attachment.key, initial_attachment.key);
         assert_eq!(replacement_attachment.path_instance_id, quic_instance);
@@ -2723,10 +2737,12 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             Some(tcp_instance)
         );
 
+        enter_phase("final target drain");
         target_release_tx.send(()).expect("release target");
         writer.await.expect("pattern writer join");
         let received = target_payload_rx.await.expect("target payload result");
         assert_eq!(received.as_slice(), patterned.as_slice());
+        enter_phase("final response");
         let mut done = [0_u8; 4];
         response
             .read_exact(&mut done)
@@ -2734,11 +2750,13 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             .expect("final response");
         assert_eq!(&done, b"done");
         drop(response);
+        enter_phase("Product completion");
         product
             .await
             .expect("product join")
             .expect("product completion");
 
+        enter_phase("actor cleanup");
         tcp_server.abort();
         let _ = tcp_server.await;
         udp_server.abort();
@@ -2748,7 +2766,14 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         target.await.expect("target join");
     })
     .await
-    .expect("focused QUIC attachment recovery exceeded the actor settlement budget");
+    .unwrap_or_else(|error| {
+        panic!(
+            "focused QUIC attachment recovery exceeded the actor settlement budget: phase={}, phase_elapsed={:?}, sampled_pto={:?}, error={error}",
+            phase.get().0,
+            phase.get().1.elapsed(),
+            sampled_pto.get(),
+        )
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

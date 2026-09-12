@@ -34,6 +34,7 @@ use crate::runtime::path::quic::io::{
     udp_path_write_frame,
 };
 use crate::runtime::path::quic::server::handle_server_udp_bidi_stream;
+use crate::runtime::path::quic::server_output_retirement::ServerUdpOutputRetirement;
 use crate::runtime::path::quic::server_writer::{
     drain_one_server_udp_command_while_input_deferred, drain_server_udp_reliable_commands,
 };
@@ -196,6 +197,7 @@ struct ServerUdpTerminalWriterFixture {
     stream_id: StreamId,
     target: TargetAddr,
     _path_registration: ServerCarrierPathRegistration,
+    retirement: Arc<ServerUdpOutputRetirement>,
     commands_tx: ReliablePathCommandSender,
     commands_rx: Option<ReliablePathCommandReceivers>,
     accepted: AcceptedServerReliableStream,
@@ -425,6 +427,11 @@ impl ServerUdpTerminalWriterFixture {
             .await
             .expect("receive accepted server QUIC response stream");
 
+        let retirement = ServerUdpOutputRetirement::new(
+            context.reliable_streams.clone(),
+            path_registration.clone(),
+            stream_id,
+        );
         (
             Self {
                 context,
@@ -433,6 +440,7 @@ impl ServerUdpTerminalWriterFixture {
                 stream_id,
                 target,
                 _path_registration: path_registration,
+                retirement,
                 commands_tx,
                 commands_rx: Some(commands_rx),
                 accepted,
@@ -484,6 +492,7 @@ impl ServerUdpTerminalWriterFixture {
                 &self.context,
                 self.stream_id,
                 &self._path_registration,
+                &self.retirement,
                 &mut path_proofs,
             )
             .await
@@ -501,6 +510,75 @@ impl ServerUdpTerminalWriterFixture {
                 max_offset: 0,
             }
         );
+    }
+
+    async fn stop_response_with_unread_request(&mut self, request: Option<Frame>) {
+        let limits = self.context.codec_limits;
+        assert_eq!(
+            udp_path_read_frame(self.server_recv.as_mut().unwrap(), limits)
+                .await
+                .unwrap(),
+            Frame::Ping { nonce: 1 },
+        );
+        let observer = self
+            .server_send
+            .as_ref()
+            .unwrap()
+            .native_progress_observer_for_test()
+            .unwrap();
+        if let Some(frame) = request {
+            udp_path_write_frame(self.client_send.as_mut().unwrap(), &frame, limits)
+                .await
+                .unwrap();
+        }
+        drop(self.client_recv.take());
+        assert_eq!(
+            observer.wait_until_terminated().await,
+            quinn::SendStreamObservationError::Stopped(quinn::VarInt::from_u32(0)),
+        );
+        // Keep the request send half open. Response STOP has arrived, but no
+        // request frame following the fixture Ping has been decoded or routed.
+    }
+
+    fn spawn_native_stream_loop(&mut self) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
+        let domain = self
+            .context
+            .reliable_streams
+            .session_execution_domain(self.session_id)
+            .unwrap();
+        self._server_connection
+            .bind_execution_domain(domain.clone())
+            .unwrap();
+        let send = self.server_send.take().unwrap();
+        let recv = self.server_recv.take().unwrap();
+        let registration = send.native_source_registration();
+        let retirement = self.retirement.clone();
+        let stream_context = ServerUdpReliableStreamLoop {
+            accept_existing: false,
+            send_stopped: None,
+            context: self.context.clone(),
+            session_id: self.session_id,
+            path_id: self.path_id,
+            path_registration: self._path_registration.clone(),
+            stream_id: self.stream_id,
+            target: self.target.clone(),
+            retirement: retirement.clone(),
+            commands_tx: self.commands_tx.clone(),
+            commands_rx: self.commands_rx.take().unwrap(),
+            path_proofs: PathProofTracker::default(),
+        };
+        tokio::spawn(domain.wrap(async move {
+            let _guard = ServerUdpReliableOutputDetachGuard { retirement };
+            registration
+                .register(run_server_udp_reliable_stream_loop(
+                    send,
+                    recv,
+                    stream_context,
+                ))
+                .expect("register the real stopped server actor with Native")
+                .await
+                .expect("Native must keep polling the independent receive tail")
+        }))
     }
 
     async fn publish_latency_source(
@@ -575,6 +653,7 @@ impl ServerUdpTerminalWriterFixture {
             self.stream_id,
             self.path_id,
             &self._path_registration,
+            &self.retirement,
             &mut pending,
             &mut proofs,
             &mut input_rx,
@@ -682,6 +761,7 @@ async fn server_quic_prepared_latency_waits_for_deferred_probe_then_writes_prefi
         &fixture.context,
         stream_id,
         &fixture._path_registration,
+        &fixture.retirement,
         &mut proofs,
     )
     .await;
@@ -728,6 +808,7 @@ async fn server_quic_prepared_latency_waits_for_deferred_probe_then_writes_prefi
             &fixture.context,
             stream_id,
             &fixture._path_registration,
+            &fixture.retirement,
             &mut proofs,
         )
         .await
@@ -859,6 +940,7 @@ async fn server_quic_drains_exact_ack_without_consuming_deferred_probe_slot() {
             &fixture.context,
             stream_id,
             &fixture._path_registration,
+            &fixture.retirement,
             &mut path_proofs,
         )
         .await
@@ -895,6 +977,7 @@ async fn server_quic_drains_exact_ack_without_consuming_deferred_probe_slot() {
             &fixture.context,
             stream_id,
             &fixture._path_registration,
+            &fixture.retirement,
             &mut path_proofs,
         )
         .await
@@ -978,10 +1061,13 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
             fixture.server_send.take().expect("server QUIC sender"),
             fixture.server_recv.take().expect("server QUIC receiver"),
             ServerUdpReliableStreamLoop {
+                accept_existing: false,
+                send_stopped: None,
                 context: fixture.context.clone(),
                 session_id: fixture.session_id,
                 path_id: fixture.path_id,
                 path_registration: fixture._path_registration.clone(),
+                retirement: fixture.retirement.clone(),
                 stream_id,
                 target: fixture.target.clone(),
                 commands_tx: fixture.commands_tx.clone(),
@@ -1156,9 +1242,7 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
     );
 
     drop(ServerUdpReliableOutputDetachGuard {
-        streams,
-        path_registration,
-        stream_id,
+        retirement: ServerUdpOutputRetirement::new(streams, path_registration, stream_id),
     });
 
     let mut stream = accepted.take_stream();
@@ -1216,6 +1300,7 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
         fixture.stream_id,
         fixture.path_id,
         &fixture._path_registration,
+        &fixture.retirement,
         &mut pending_frames,
         &mut path_proofs,
         &mut carrier_frames,
@@ -1305,9 +1390,7 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
     let command_debt = reliable_path_command_pending_bytes(&command) as u64;
     assert_eq!(fixture.commands_tx.pending_bytes(), command_debt);
     let output_guard = ServerUdpReliableOutputDetachGuard {
-        streams: fixture.context.reliable_streams.clone(),
-        path_registration: fixture._path_registration.clone(),
-        stream_id: fixture.stream_id,
+        retirement: fixture.retirement.clone(),
     };
     let mut server_send = fixture.server_send.take().expect("server QUIC sender");
     let mut pending_frames = Vec::new();
@@ -1326,6 +1409,7 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
         fixture.stream_id,
         fixture.path_id,
         &fixture._path_registration,
+        &fixture.retirement,
         &mut pending_frames,
         &mut path_proofs,
         &mut carrier_frames,
@@ -1435,7 +1519,11 @@ async fn server_quic_response_stop_preserves_unread_request_reset() {
         fixture
             .context
             .reliable_streams
-            .route_frame(&fixture._path_registration, fixture.stream_id, decoded.clone())
+            .route_frame(
+                &fixture._path_registration,
+                fixture.stream_id,
+                decoded.clone(),
+            )
             .await
             .unwrap();
         let mut product = fixture.accepted.take_stream();
@@ -1485,6 +1573,7 @@ async fn server_quic_stopped_writer_diagnostic_preempts_decoded_reset() {
                 stream_id,
                 fixture.path_id,
                 &fixture._path_registration,
+                &fixture.retirement,
                 &mut pending_frames,
                 &mut path_proofs,
                 &mut carrier_frames,
@@ -1505,9 +1594,7 @@ async fn server_quic_stopped_writer_diagnostic_preempts_decoded_reset() {
             // This is the same exact-output retirement invoked on ordinary
             // actor error. A previously routed reset must remain ahead of it.
             drop(ServerUdpReliableOutputDetachGuard {
-                streams: fixture.context.reliable_streams.clone(),
-                path_registration: fixture._path_registration.clone(),
-                stream_id,
+                retirement: fixture.retirement.clone(),
             });
             assert_eq!(fixture.attached_output_count(), 0);
             if route_before_write {
@@ -1515,6 +1602,249 @@ async fn server_quic_stopped_writer_diagnostic_preempts_decoded_reset() {
                 assert_eq!(product.recv_frame().await.unwrap(), decoded);
             }
         }
+    })
+    .await
+    .expect("existing QUIC fixture lifetime bound");
+}
+
+fn assert_stopped_before_commitment(error: RuntimeError) {
+    assert!(
+        matches!(
+            &error,
+            RuntimeError::Io(error) if matches!(
+                error.get_ref().and_then(|source| {
+                    source.downcast_ref::<quinn::SendStreamObservationError>()
+                }),
+                Some(quinn::SendStreamObservationError::Stopped(_)),
+            )
+        ),
+        "preserve the actual pre-bind Native STOP error: {error:?}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_quic_stopped_native_actor_routes_unread_reset_before_returning() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let stream_id = StreamId(423);
+        let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+        fixture.drain_zero_credit_admission().await;
+        let reset = Frame::StreamReset {
+            stream_id,
+            reason: ResetReason::RemoteClosed,
+        };
+        fixture
+            .stop_response_with_unread_request(Some(reset.clone()))
+            .await;
+        let mut product = fixture.accepted.take_stream();
+        let ReliablePathStreamOutput::Switchable(binding) = &product.output else {
+            panic!("server Product output");
+        };
+        let binding = binding.clone();
+        let actor = fixture.spawn_native_stream_loop();
+        assert_eq!(
+            product.recv_frame().await.unwrap(),
+            reset,
+            "the whole Native actor must route the already sent request Reset",
+        );
+        assert_stopped_before_commitment(actor.await.unwrap().unwrap_err());
+        assert!(
+            binding
+                .sender_path_targets(TrafficClass::Throughput, 1)
+                .is_empty(),
+        );
+        assert!(fixture.commands_tx.is_closed());
+        assert_eq!(fixture.commands_tx.pending_bytes(), 0);
+        assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);
+        assert!(!fixture._server_connection.is_closed());
+        assert!(!fixture._client_connection.is_closed());
+    })
+    .await
+    .expect("existing QUIC fixture lifetime bound");
+}
+
+#[tokio::test]
+async fn server_quic_stopped_native_actor_releases_output_before_product_input_closes() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let stream_id = StreamId(424);
+        let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+        fixture.drain_zero_credit_admission().await;
+        fixture.stop_response_with_unread_request(None).await;
+        fixture
+            .commands_tx
+            .send_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id,
+                    offset: 0,
+                    payload: Bytes::from_static(b"queued response must not outlive failed output"),
+                },
+                TrafficClass::Throughput,
+            )
+            .await
+            .unwrap();
+        assert!(fixture.commands_tx.pending_bytes() > 0);
+        let mut product = fixture.accepted.take_stream();
+        let ReliablePathStreamOutput::Switchable(binding) = &product.output else {
+            panic!("server Product output");
+        };
+        let binding = binding.clone();
+        let terminal = fixture.commands_tx.terminal_signal();
+        let actor = fixture.spawn_native_stream_loop();
+        terminal.wait().await;
+        assert!(fixture.commands_tx.is_closed());
+        assert_eq!(fixture.commands_tx.pending_bytes(), 0);
+        assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);
+        assert!(
+            binding
+                .sender_path_targets(TrafficClass::Throughput, 1)
+                .is_empty(),
+            "failed response placement must be withdrawn while request input stays open",
+        );
+        let ack = Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: Vec::new(),
+        };
+        udp_path_write_frame(
+            fixture.client_send.as_mut().unwrap(),
+            &ack,
+            fixture.context.codec_limits,
+        )
+        .await
+        .unwrap();
+        assert_eq!(product.recv_frame().await.unwrap(), ack);
+        assert!(
+            !actor.is_finished(),
+            "a real request ACK reaches Product after failed output withdrawal",
+        );
+        // No request Reset, FIN, detach, or connection close releases this
+        // actor. The captured Product receiver lifetime is the terminating event.
+        drop(product);
+        assert_stopped_before_commitment(actor.await.unwrap().unwrap_err());
+        assert!(!fixture._server_connection.is_closed());
+        assert!(!fixture._client_connection.is_closed());
+    })
+    .await
+    .expect("existing QUIC fixture lifetime bound");
+}
+
+#[tokio::test]
+async fn server_quic_stopped_receive_tail_preserves_same_carrier_replacement() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let stream_id = StreamId(425);
+        let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+        fixture.drain_zero_credit_admission().await;
+        let mut product = fixture.accepted.take_stream();
+        let ReliablePathStreamOutput::Switchable(binding) = &product.output else {
+            panic!("server Product output");
+        };
+        let binding = binding.clone();
+        let old_output = binding.sender_path_targets(TrafficClass::Throughput, 1)[0].observation;
+        fixture.stop_response_with_unread_request(None).await;
+        let terminal = fixture.commands_tx.terminal_signal();
+        let old_actor = fixture.spawn_native_stream_loop();
+        terminal.wait().await;
+        // The ordinary Product receive path applies lifecycle boundaries;
+        // try_recv_frame intentionally leaves PathDetached pending. A real
+        // request ACK routed after writer retirement proves that recv_frame
+        // consumed the old detach before a same-carrier successor is admitted.
+        let ack = Frame::StreamAck {
+            stream_id,
+            scope_start: None,
+            ranges: Vec::new(),
+        };
+        udp_path_write_frame(
+            fixture.client_send.as_mut().unwrap(),
+            &ack,
+            fixture.context.codec_limits,
+        )
+        .await
+        .unwrap();
+        assert_eq!(product.recv_frame().await.unwrap(), ack);
+        assert!(
+            binding
+                .sender_path_targets(TrafficClass::Throughput, 1)
+                .is_empty()
+        );
+        let (mut replacement_send, mut replacement_recv) =
+            fixture._client_connection.open_bi().await.unwrap();
+        udp_path_write_frame(
+            &mut replacement_send,
+            &Frame::OpenStream {
+                stream_id,
+                target: fixture.target.clone(),
+                demand: StreamDemandHint::Throughput,
+                return_plan: StreamReturnPlan {
+                    phase: StreamAttachmentPhase::Ordinary,
+                    ..Default::default()
+                },
+            },
+            fixture.context.codec_limits,
+        )
+        .await
+        .unwrap();
+        let (send, recv) = fixture._server_connection.accept_bi().await.unwrap();
+        let domain = fixture
+            .context
+            .reliable_streams
+            .session_execution_domain(fixture.session_id)
+            .unwrap();
+        let replacement_actor = tokio::spawn(domain.wrap(handle_server_udp_bidi_stream(
+            send,
+            recv,
+            fixture.context.clone(),
+            fixture.session_id,
+            fixture.path_id,
+            fixture._path_registration.clone(),
+        )));
+        assert_eq!(
+            udp_path_read_frame(&mut replacement_recv, fixture.context.codec_limits)
+                .await
+                .unwrap(),
+            Frame::StreamMaxData {
+                stream_id,
+                max_offset: 0
+            },
+        );
+        let replacement = binding.sender_path_targets(TrafficClass::Throughput, 1)[0].observation;
+        assert_eq!(replacement.path_instance_id, old_output.path_instance_id);
+        assert_ne!(replacement.incarnation, old_output.incarnation);
+        assert!(!old_actor.is_finished());
+        udp_path_write_frame(
+            fixture.client_send.as_mut().unwrap(),
+            &Frame::StreamDetach { stream_id },
+            fixture.context.codec_limits,
+        )
+        .await
+        .unwrap();
+        assert_stopped_before_commitment(old_actor.await.unwrap().unwrap_err());
+        let remaining = binding.sender_path_targets(TrafficClass::Throughput, 1);
+        assert_eq!(
+            remaining.len(),
+            1,
+            "old tail guard cannot retire the replacement"
+        );
+        assert_eq!(
+            remaining[0].observation.incarnation,
+            replacement.incarnation
+        );
+        udp_path_write_frame(
+            &mut replacement_send,
+            &Frame::Ping { nonce: 425 },
+            fixture.context.codec_limits,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut replacement_recv, fixture.context.codec_limits)
+                .await
+                .unwrap(),
+            Frame::Pong { nonce: 425 },
+            "the actual replacement writer still responds after old-tail destruction",
+        );
+        assert!(!fixture._server_connection.is_closed());
+        assert!(!fixture._client_connection.is_closed());
+        replacement_actor.abort();
+        assert!(replacement_actor.await.unwrap_err().is_cancelled());
     })
     .await
     .expect("existing QUIC fixture lifetime bound");
@@ -2053,10 +2383,13 @@ async fn late_startup_after_final_refuses_only_the_quic_attachment() {
             fixture.server_send.take().expect("sibling sender"),
             fixture.server_recv.take().expect("sibling receiver"),
             ServerUdpReliableStreamLoop {
+                accept_existing: false,
+                send_stopped: None,
                 context: fixture.context.clone(),
                 session_id: fixture.session_id,
                 path_id: fixture.path_id,
                 path_registration: fixture._path_registration.clone(),
+                retirement: fixture.retirement.clone(),
                 stream_id: sibling_id,
                 target: fixture.target.clone(),
                 commands_tx: fixture.commands_tx.clone(),
@@ -2227,10 +2560,13 @@ async fn server_quic_restart_reset_preserves_fresh_sibling_on_same_carrier() {
             fixture.server_send.take().expect("fresh sibling sender"),
             fixture.server_recv.take().expect("fresh sibling receiver"),
             ServerUdpReliableStreamLoop {
+                accept_existing: false,
+                send_stopped: None,
                 context: fixture.context.clone(),
                 session_id: fixture.session_id,
                 path_id: fixture.path_id,
                 path_registration: fixture._path_registration.clone(),
+                retirement: fixture.retirement.clone(),
                 stream_id: fresh_id,
                 target: fixture.target.clone(),
                 commands_tx: fixture.commands_tx.clone(),
@@ -3295,10 +3631,13 @@ async fn server_quic_ordered_close_drains_peer_until_stream_detach() {
         server_send,
         server_recv,
         ServerUdpReliableStreamLoop {
+            accept_existing: false,
+            send_stopped: None,
             context,
             session_id: fixture.session_id,
             path_id: fixture.path_id,
             path_registration,
+            retirement: fixture.retirement.clone(),
             stream_id,
             target,
             commands_tx,

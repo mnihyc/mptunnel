@@ -302,6 +302,7 @@ async fn server_quic_prepared_original_waits_for_unacknowledged_native_bytes() {
         &fixture.context,
         stream_id,
         &fixture._path_registration,
+        &fixture.retirement,
         &mut control_proofs,
     ));
     let control_poll = futures::poll!(&mut control_write);

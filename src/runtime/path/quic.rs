@@ -15,6 +15,7 @@ pub(in crate::runtime) mod metrics;
 mod repair;
 mod repair_binding;
 pub(in crate::runtime) mod server;
+mod server_output_retirement;
 mod server_stream;
 mod server_writer;
 

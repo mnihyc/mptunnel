@@ -2186,6 +2186,26 @@ impl ServerReliableStreamRegistry {
         Ok(())
     }
 
+    fn input_closed(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+    ) -> Option<crate::runtime::path::ServerStreamInputClosed> {
+        let events = self
+            .streams
+            .lock()
+            .expect("server reliable stream registry lock")
+            .get(&(identity.session_id, stream_id))?
+            .events
+            .clone();
+        // Capture only the exact input channel. A later lookup could observe
+        // different registry state, and retaining the binding would retain the
+        // failed output solely to keep a receive-side lifecycle wait alive.
+        Some(Box::pin(async move {
+            events.closed().await;
+        }))
+    }
+
     fn stream_frame_route_target(
         &self,
         session_id: SessionId,
@@ -2633,6 +2653,14 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
     ) -> Result<ServerStreamFrameRoute, RuntimeError> {
         self.registry
             .try_route_frame_from_path(identity, stream_id, frame)
+    }
+
+    fn input_closed(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+    ) -> Option<crate::runtime::path::ServerStreamInputClosed> {
+        self.registry.input_closed(identity, stream_id)
     }
 
     fn detach_path(

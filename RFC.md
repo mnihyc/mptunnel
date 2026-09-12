@@ -1700,6 +1700,21 @@ output on its attachment; actual native transport failure remains independent.
 
 `STREAM_RESET(stream_id, reason)` terminates the MPP stream.
 
+When a QUIC response send half is stopped, its output MUST be withdrawn and its
+failed writer buffers released before waiting for remaining request-side input.
+The original authenticated receive owner may still carry logical data, feedback
+and terminal frames. Preserve that input until native receive termination, the
+original Product input closes, or its session/connection ends. This continuation
+uses the existing logical lifetime, not a new fixed send-error grace period; it
+MUST NOT translate native STOP into logical reset or revive a closed Product.
+
+Output retirement MUST be idempotent for one output incarnation. Explicit detach
+and later actor destruction share that retirement ownership. Once an output has
+been detached, its old guard MUST NOT remove a replacement that reuses the same
+carrier and logical stream. Receiver-only continuation grants no new scheduling,
+copy, or command-buffer authority. Existing successful terminal-drain policy is
+unchanged by this send-error rule.
+
 Product FIN, detach, reset, or logical-stream terminal cancels only work
 that remains locally removable under the exact queue and reservation owners.
 It does not acknowledge native transport bytes or Product delivery. Already
@@ -3175,7 +3190,10 @@ rewind; arm its exact crossing wake rather than polling or manufacturing fresh
 permission. No Product ownership guard crosses native I/O.
 
 An observed send-half terminal state MUST reach that exact writer's ordinary
-retirement path even if its receive half remains open. A blocked prepared notice
+retirement path even if its receive half remains open. This retires the failed
+output and its command ownership; it MUST NOT by itself destroy valid independent
+receive/lifecycle input. In particular, native STOP on the response direction is
+not evidence that request-side `STREAM_RESET` has been received or is invalid. A blocked prepared notice
 retains a terminal wake independently of a packetization target. Observed failure
 is not unavailable healthy capability; silently excluding that FIFO from
 placement cannot substitute for its lifecycle transition.

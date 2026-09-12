@@ -53,9 +53,10 @@ pub(in crate::runtime) use ports::{
     ServerDatagramTombstone, ServerDatagramTombstoneCache, ServerDatagramWorkerMessage,
     ServerLocalPathProperties, ServerMppIngress, ServerMppIngressObserver, ServerNewStreamPolicy,
     ServerPathValidation, ServerRealtimeFlowLease, ServerSessionManagementSnapshot,
-    ServerSessionRetirement, ServerStreamFrameRoute, ServerStreamManagementSnapshot,
-    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPathAttachment, ServerStreamPort,
-    ServerStreamPortBackend, ServerTargetAdmission, fence_server_carrier_readiness,
+    ServerSessionRetirement, ServerStreamFrameRoute, ServerStreamInputClosed,
+    ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
+    ServerStreamPathAttachment, ServerStreamPort, ServerStreamPortBackend, ServerTargetAdmission,
+    fence_server_carrier_readiness,
 };
 #[cfg(test)]
 pub(super) use proof::*;

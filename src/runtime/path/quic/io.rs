@@ -85,8 +85,14 @@ pub(in crate::runtime) fn terminal_trace(
 ) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ENABLED.get_or_init(|| std::env::var("MPTUNNEL_TERMINAL_TRACE").as_deref() == Ok("1")) {
-        let unix_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("diagnostic clock").as_micros();
-        eprintln!("terminal_trace unix_us={unix_us} event={event} stream_id={} {detail}", stream_id.0);
+        let unix_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("diagnostic clock")
+            .as_micros();
+        eprintln!(
+            "terminal_trace unix_us={unix_us} event={event} stream_id={} {detail}",
+            stream_id.0
+        );
     }
 }
 
@@ -111,6 +117,22 @@ impl UdpPathSendStream {
                 self.request_stream_id()
             ),
         );
+    }
+
+    #[cfg(test)]
+    pub(super) fn native_progress_observer_for_test(
+        &self,
+    ) -> Result<quinn::SendStreamObserver, quinn::SendStreamObservationError> {
+        self.stream.native_progress_observer()
+    }
+
+    pub(super) fn native_peer_stopped(&self) -> bool {
+        matches!(
+            self.stream
+                .native_progress_observer()
+                .and_then(|observer| observer.snapshot()),
+            Err(quinn::SendStreamObservationError::Stopped(_))
+        )
     }
 
     pub(super) fn native_source_registration(&self) -> quic_transport::NativeSourceRegistration {

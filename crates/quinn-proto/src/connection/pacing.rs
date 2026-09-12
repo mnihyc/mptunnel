@@ -30,7 +30,72 @@ struct WindowInputs {
     mtu: u16,
 }
 
+/// Passive diagnostic result from an exact private copy, never live pacing credit.
+pub(super) struct PacerDelayObservation {
+    pub capacity_before: u64,
+    pub tokens_before: u64,
+    pub previous_age_ns: i128,
+    pub now_before_previous: bool,
+    pub cached_window: Option<u64>,
+    pub cached_mtu: Option<u16>,
+    pub rtt_ns: u128,
+    pub metric_window: u64,
+    pub metric_rate: Option<u64>,
+    pub bytes_to_send: u64,
+    pub mtu: u16,
+    pub capacity_after: u64,
+    pub tokens_after: u64,
+    pub previous_after_age_ns: i128,
+    pub due: Option<Instant>,
+    pub due_gap_ns: Option<i128>,
+}
+
+fn diagnostic_signed_nanos(later: Instant, earlier: Instant) -> i128 {
+    match later.checked_duration_since(earlier) {
+        Some(duration) => duration.as_nanos() as i128,
+        None => -(earlier.duration_since(later).as_nanos() as i128),
+    }
+}
+
 impl Pacer {
+    /// Evaluate the existing algorithm on all four copied fields. This is called
+    /// only after the diagnostic window gate; it never arms a timer or debits the
+    /// live pacer. A reversed native Instant retains delay's existing warning.
+    pub(super) fn diagnostic_delay(
+        &self,
+        smoothed_rtt: Duration,
+        bytes_to_send: u64,
+        mtu: u16,
+        now: Instant,
+        controller_metrics: &ControllerMetrics,
+    ) -> PacerDelayObservation {
+        let mut copy = Self {
+            capacity: self.capacity,
+            last_window_inputs: self.last_window_inputs,
+            tokens: self.tokens,
+            prev: self.prev,
+        };
+        let due = copy.delay(smoothed_rtt, bytes_to_send, mtu, now, controller_metrics);
+        PacerDelayObservation {
+            capacity_before: self.capacity,
+            tokens_before: self.tokens,
+            previous_age_ns: diagnostic_signed_nanos(now, self.prev),
+            now_before_previous: now < self.prev,
+            cached_window: self.last_window_inputs.map(|inputs| inputs.window),
+            cached_mtu: self.last_window_inputs.map(|inputs| inputs.mtu),
+            rtt_ns: smoothed_rtt.as_nanos(),
+            metric_window: controller_metrics.congestion_window,
+            metric_rate: controller_metrics.pacing_rate,
+            bytes_to_send,
+            mtu,
+            capacity_after: copy.capacity,
+            tokens_after: copy.tokens,
+            previous_after_age_ns: diagnostic_signed_nanos(now, copy.prev),
+            due,
+            due_gap_ns: due.map(|due| diagnostic_signed_nanos(due, now)),
+        }
+    }
+
     /// Obtains a new [`Pacer`].
     pub(super) fn new(
         smoothed_rtt: Duration,
@@ -243,6 +308,79 @@ const MAX_BURST_SIZE: u64 = 256;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_delay_preserves_live_state_and_matches_private_copy() {
+        let now = Instant::now();
+        let mtu = 1500;
+        let rtt = Duration::from_millis(50);
+        // Cover explicit-rate and window-derived algorithms, a cache change,
+        // sub-microsecond credit, Some(now) rounding, and already-earned credit.
+        let cases = [
+            (Some(1_000_000_000), 2_000_000, 1000, Duration::ZERO),
+            (Some(u64::MAX), 2_000_000, 0, Duration::ZERO),
+            (Some(12_500_000), 2_000_000, 0, Duration::from_millis(1)),
+            (None, 2_000_000, 0, Duration::from_nanos(500)),
+            (None, 1_000_000, 2000, Duration::from_nanos(500)),
+        ];
+        for (rate, window, tokens, elapsed) in cases {
+            let live = Pacer {
+                capacity: 25_000,
+                last_window_inputs: Some(WindowInputs {
+                    window: 2_000_000,
+                    mtu,
+                }),
+                tokens,
+                prev: now - elapsed,
+            };
+            let before = (
+                live.capacity,
+                live.last_window_inputs,
+                live.tokens,
+                live.prev,
+            );
+            let metrics = ControllerMetrics {
+                congestion_window: window,
+                pacing_rate: rate,
+                ..Default::default()
+            };
+            let mut expected = Pacer {
+                capacity: live.capacity,
+                last_window_inputs: live.last_window_inputs,
+                tokens: live.tokens,
+                prev: live.prev,
+            };
+            let due = expected.delay(rtt, u64::from(mtu), mtu, now, &metrics);
+            let observed = live.diagnostic_delay(rtt, u64::from(mtu), mtu, now, &metrics);
+            assert!(
+                before
+                    == (
+                        live.capacity,
+                        live.last_window_inputs,
+                        live.tokens,
+                        live.prev
+                    )
+            );
+            assert_eq!(observed.due, due);
+            assert_eq!(observed.capacity_before, live.capacity);
+            assert_eq!(observed.tokens_before, live.tokens);
+            assert_eq!(observed.capacity_after, expected.capacity);
+            assert_eq!(observed.tokens_after, expected.tokens);
+            assert_eq!(
+                observed.previous_after_age_ns,
+                diagnostic_signed_nanos(now, expected.prev)
+            );
+            assert_eq!(observed.previous_age_ns, elapsed.as_nanos() as i128);
+            assert!(!observed.now_before_previous);
+            if rate == Some(1_000_000_000) {
+                assert_eq!(observed.due_gap_ns, Some(500));
+            }
+            if rate == Some(u64::MAX) {
+                assert_eq!(observed.due, Some(now));
+                assert_eq!(observed.due_gap_ns, Some(0));
+            }
+        }
+    }
 
     /// 100 Mbit/s in bytes/sec, the rate used by the controller-paced tests.
     const TEST_PACING_RATE: u64 = 12_500_000;

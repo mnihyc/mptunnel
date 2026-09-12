@@ -130,10 +130,16 @@ pub(super) struct EmptyPoll {
     pub had_sendable_frames: bool,
 }
 
-pub(super) fn empty_poll(now: Instant, poll: EmptyPoll) {
+pub(super) fn empty_poll(
+    now: Instant,
+    poll: EmptyPoll,
+    observe_pacing: impl FnOnce() -> super::pacing::PacerDelayObservation,
+) {
     let Some((window, elapsed)) = active(now) else {
         return;
     };
+    // All hypothetical pacing reads/work are inside the existing exact window.
+    let pacing = observe_pacing();
     let context = CONTEXT.get();
     let byte_full = poll.flight >= poll.cwnd;
     let packet_blocked = poll
@@ -151,7 +157,7 @@ pub(super) fn empty_poll(now: Instant, poll: EmptyPoll) {
         .missing_context
         .fetch_add(u64::from(context.is_none()), Ordering::Relaxed);
     eprintln!(
-        "native_empty_poll role={} window=first_native_poll_10_11 event={} elapsed_us={} unix_us={:?} connection={:?} path_epoch={:?} flag_before={} flag_after={} flight={} cwnd={} mtu={} byte_full={} packet_blocked={:?} send_blocked={} cwnd_blocked={} had_sendable_frames={}",
+        "native_empty_poll role={} window=first_native_poll_10_11 event={} elapsed_us={} unix_us={:?} connection={:?} path_epoch={:?} flag_before={} flag_after={} flight={} cwnd={} mtu={} byte_full={} packet_blocked={:?} send_blocked={} cwnd_blocked={} had_sendable_frames={} pacer_capacity_before={} pacer_tokens_before={} pacer_previous_age_ns={} pacer_now_before_previous={} pacer_cached_window={:?} pacer_cached_mtu={:?} pacer_rtt_ns={} pacer_metric_window={} pacer_rate_bytes_per_s={:?} pacer_hypothetical_bytes={} pacer_hypothetical_mtu={} pacer_capacity_after={} pacer_tokens_after={} pacer_previous_after_age_ns={} pacer_delay_some={} pacer_due_gap_ns={:?}",
         window.role,
         event,
         elapsed,
@@ -167,7 +173,23 @@ pub(super) fn empty_poll(now: Instant, poll: EmptyPoll) {
         packet_blocked,
         poll.send_blocked,
         poll.cwnd_blocked,
-        poll.had_sendable_frames
+        poll.had_sendable_frames,
+        pacing.capacity_before,
+        pacing.tokens_before,
+        pacing.previous_age_ns,
+        pacing.now_before_previous,
+        pacing.cached_window,
+        pacing.cached_mtu,
+        pacing.rtt_ns,
+        pacing.metric_window,
+        pacing.metric_rate,
+        pacing.bytes_to_send,
+        pacing.mtu,
+        pacing.capacity_after,
+        pacing.tokens_after,
+        pacing.previous_after_age_ns,
+        pacing.due.is_some(),
+        pacing.due_gap_ns,
     );
 }
 

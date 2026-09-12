@@ -1045,6 +1045,16 @@ impl Connection {
                     cwnd_blocked,
                     had_sendable_frames: diagnostic_had_sendable_frames,
                 },
+                || {
+                    let mtu = self.path.current_mtu();
+                    self.path.pacing.diagnostic_delay(
+                        self.path.rtt.get(),
+                        u64::from(mtu),
+                        mtu,
+                        now,
+                        &controller_metrics,
+                    )
+                },
             );
         }
 

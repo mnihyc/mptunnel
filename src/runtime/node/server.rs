@@ -172,13 +172,34 @@ pub(in crate::runtime) fn new_identity_runtime(
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
 ) -> ServerIdentityRuntime {
+    new_identity_runtime_with_native_sockets(
+        server_paths,
+        outbound,
+        outbound_connect_timeout,
+        security,
+        performance,
+        resources,
+        Arc::new(crate::transport::SystemNativeSocketConfigurator),
+    )
+}
+
+#[cfg(test)]
+pub(in crate::runtime) fn new_identity_runtime_with_native_sockets(
+    server_paths: Vec<PathSpec>,
+    outbound: OutboundConfig,
+    outbound_connect_timeout: Duration,
+    security: ServerSecurityConfig,
+    performance: MppPerformanceConfig,
+    resources: ResourceLimits,
+    native_sockets: Arc<dyn crate::transport::NativeSocketConfigurator>,
+) -> ServerIdentityRuntime {
     let id = OutboundId::parse("test-server-egress").expect("static test outbound ID");
     let registry = RuntimeOutboundRegistry::compile(
         [RuntimeOutboundLeaf::Local {
             id: id.clone(),
             config: outbound,
             connect_timeout: outbound_connect_timeout,
-            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+            native_sockets,
         }],
         &[],
         crate::runtime::outbound_registry::test_dns_generation(),

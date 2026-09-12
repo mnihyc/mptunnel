@@ -2495,11 +2495,38 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() {
+    struct BoundedTargetSocket;
+    impl crate::transport::NativeSocketConfigurator for BoundedTargetSocket {
+        fn configure_tcp(
+            &self,
+            socket: &tokio::net::TcpSocket,
+            request: crate::transport::NativeSocketRequest,
+        ) -> std::io::Result<()> {
+            crate::transport::SystemNativeSocketConfigurator.configure_tcp(socket, request)?;
+            socket.set_send_buffer_size(128 * 1024)?;
+            eprintln!(
+                "attachment diagnostic target_send_buffer={}",
+                socket.send_buffer_size()?
+            );
+            Ok(())
+        }
+
+        fn configure_udp(
+            &self,
+            socket: &std::net::UdpSocket,
+            request: crate::transport::NativeSocketRequest,
+        ) -> std::io::Result<()> {
+            crate::transport::SystemNativeSocketConfigurator.configure_udp(socket, request)
+        }
+    }
     let phase = std::cell::Cell::new(("target and carrier setup", Instant::now()));
     let enter_phase = |name| phase.set((name, Instant::now()));
     let sampled_pto = std::cell::Cell::new(None);
     tokio::time::timeout(ACTOR_SETTLEMENT_TIMEOUT, async {
         let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        socket2::SockRef::from(&target_listener)
+            .set_recv_buffer_size(128 * 1024)
+            .expect("diagnostic bounded target receive buffer");
         let target_addr = target_listener.local_addr().expect("target address");
         let (target_release_tx, target_release_rx) = oneshot::channel();
         let (target_payload_tx, target_payload_rx) = oneshot::channel();
@@ -2543,13 +2570,14 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         let ServerIdentityRuntime {
             paths: server_context,
             reliable_relay,
-        } = crate::runtime::node::server::new_identity_runtime(
+        } = crate::runtime::node::server::new_identity_runtime_with_native_sockets(
             Vec::new(),
             OutboundConfig::Direct,
             DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
             server_security(),
             MppPerformanceConfig::default(),
             resources,
+            Arc::new(BoundedTargetSocket),
         );
         let server_relay = tokio::spawn(
             reliable_relay

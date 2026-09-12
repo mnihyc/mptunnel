@@ -129,6 +129,39 @@ struct AcceptedTestCarrier {
     _control_recv: UdpPathRecvStream,
 }
 
+struct QuicCandidateEstablishmentObservation {
+    started_at: tokio::time::Instant,
+    events: std::sync::Mutex<Vec<(Duration, String)>>,
+}
+
+impl QuicCandidateEstablishmentObservation {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started_at: tokio::time::Instant::now(),
+            events: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn record(&self, event: String) {
+        let elapsed = self.started_at.elapsed();
+        self.events
+            .lock()
+            .expect("candidate establishment observation lock")
+            .push((elapsed, event));
+    }
+
+    fn report(&self) {
+        for (elapsed, event) in self
+            .events
+            .lock()
+            .expect("candidate establishment observation lock")
+            .iter()
+        {
+            eprintln!("candidate establishment +{elapsed:?}: {event}");
+        }
+    }
+}
+
 impl ClientOpenRaceFixture {
     async fn new() -> Self {
         Self::new_with_provider(Arc::new(SystemCarrierNetworkProvider)).await
@@ -205,17 +238,45 @@ impl ClientOpenRaceFixture {
     fn spawn_server_accept(
         &self,
     ) -> tokio::task::JoinHandle<Result<AcceptedTestCarrier, RuntimeError>> {
+        self.spawn_server_accept_with_observation(None)
+    }
+
+    fn spawn_server_accept_with_observation(
+        &self,
+        observation: Option<Arc<QuicCandidateEstablishmentObservation>>,
+    ) -> tokio::task::JoinHandle<Result<AcceptedTestCarrier, RuntimeError>> {
         let endpoint = self.server_endpoint.clone();
         let local_path = self.server_local_path.clone();
         let context = self.server_context.clone();
         tokio::spawn(async move {
+            if let Some(observation) = &observation {
+                observation.record("server endpoint accept started".to_string());
+            }
             let connection = endpoint
                 .accept()
                 .await
-                .ok_or(RuntimeError::Protocol("test QUIC endpoint closed"))?;
-            let (registration, control_send, control_recv) =
-                accept_server_udp_path_handshake_for_test(&connection, &local_path, &context)
-                    .await?;
+                .ok_or(RuntimeError::Protocol("test QUIC endpoint closed"));
+            if let Some(observation) = &observation {
+                // Endpoint::accept includes QUIC and H3 presentation setup;
+                // this boundary does not separately time their internals.
+                observation.record(format!(
+                    "server endpoint accept returned (QUIC + H3 presentation): {:?}",
+                    connection.as_ref().map(|_| ())
+                ));
+            }
+            let connection = connection?;
+            if let Some(observation) = &observation {
+                observation.record("server MPP authentication started".to_string());
+            }
+            let handshake =
+                accept_server_udp_path_handshake_for_test(&connection, &local_path, &context).await;
+            if let Some(observation) = &observation {
+                observation.record(format!(
+                    "server MPP authentication returned: {:?}",
+                    handshake.as_ref().map(|_| ())
+                ));
+            }
+            let (registration, control_send, control_recv) = handshake?;
             Ok(AcceptedTestCarrier {
                 connection,
                 registration,
@@ -244,11 +305,23 @@ struct BlockingResolutionProvider {
     calls: AtomicUsize,
     started: mpsc::UnboundedSender<usize>,
     release: Arc<tokio::sync::Notify>,
+    observation: Option<Arc<QuicCandidateEstablishmentObservation>>,
 }
 
 impl BlockingResolutionProvider {
     fn new(
         block_call: usize,
+    ) -> (
+        Arc<Self>,
+        mpsc::UnboundedReceiver<usize>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        Self::new_with_observation(block_call, None)
+    }
+
+    fn new_with_observation(
+        block_call: usize,
+        observation: Option<Arc<QuicCandidateEstablishmentObservation>>,
     ) -> (
         Arc<Self>,
         mpsc::UnboundedReceiver<usize>,
@@ -262,6 +335,7 @@ impl BlockingResolutionProvider {
                 calls: AtomicUsize::new(0),
                 started,
                 release: release.clone(),
+                observation,
             }),
             started_rx,
             release,
@@ -278,16 +352,41 @@ impl CarrierNetworkProvider for BlockingResolutionProvider {
         Box::pin(async move {
             request.validate()?;
             let call = self.calls.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            if let Some(observation) = &self.observation {
+                observation.record(format!("provider resolution call {call} started"));
+            }
             if call == self.block_call {
+                if let Some(observation) = &self.observation {
+                    observation.record(format!("provider resolution call {call} blocked"));
+                }
                 let _ = self.started.send(call);
                 self.release.notified().await;
             }
-            SystemCarrierNetworkProvider.resolve(request).await
+            let result = SystemCarrierNetworkProvider.resolve(request).await;
+            if let Some(observation) = &self.observation {
+                observation.record(format!(
+                    "provider resolution call {call} returned: {result:?}"
+                ));
+            }
+            result
         })
     }
 
     fn create_socket(&self, request: CarrierSocketRequest<'_>) -> std::io::Result<CarrierSocket> {
-        CarrierSocket::system(request)
+        if let Some(observation) = &self.observation {
+            observation.record(format!(
+                "provider socket creation started for {}",
+                request.remote_addr
+            ));
+        }
+        let result = CarrierSocket::system(request);
+        if let Some(observation) = &self.observation {
+            observation.record(format!(
+                "provider socket creation returned: {:?}",
+                result.as_ref().map(|_| ())
+            ));
+        }
+        result
     }
 }
 
@@ -504,7 +603,9 @@ async fn active_product_flow_cannot_suppress_missing_quic_owner_reconciliation()
 
 #[tokio::test]
 async fn cancelled_quic_candidate_leaves_a_bounded_reconcilable_vacancy() {
-    let (provider, mut started, _release) = BlockingResolutionProvider::new(2);
+    let observation = QuicCandidateEstablishmentObservation::new();
+    let (provider, mut started, _release) =
+        BlockingResolutionProvider::new_with_observation(2, Some(observation.clone()));
     let fixture = ClientOpenRaceFixture::new_with_provider(provider.clone()).await;
     let accepted = fixture.establish_current().await;
     let predecessor = current_client_carrier(&fixture.session)
@@ -550,6 +651,7 @@ async fn cancelled_quic_candidate_leaves_a_bounded_reconcilable_vacancy() {
             .is_cancelled()
     );
     let cancellation_observed_at = tokio::time::Instant::now();
+    observation.record("candidate cancellation joined".to_string());
     tokio::time::timeout(Duration::from_secs(5), changes.changed())
         .await
         .expect("cancelled candidate vacancy wake timeout")
@@ -571,12 +673,40 @@ async fn cancelled_quic_candidate_leaves_a_bounded_reconcilable_vacancy() {
     );
 
     tokio::time::sleep_until(retry_at).await;
-    let successor_accept = fixture.spawn_server_accept();
-    fixture
-        .session
-        .reconcile_connection_owner()
-        .await
-        .expect("bounded retry publishes successor");
+    let successor_accept = fixture.spawn_server_accept_with_observation(Some(observation.clone()));
+    let successor_started_at = tokio::time::Instant::now();
+    observation.record(format!(
+        "successor reconciliation started; attempt budget={retry_interval:?}, wake lateness={:?}",
+        successor_started_at.saturating_duration_since(retry_at)
+    ));
+    let successor_result = fixture.session.reconcile_connection_owner().await;
+    let successor_elapsed = successor_started_at.elapsed();
+    observation.record(format!(
+        "successor reconciliation returned after {successor_elapsed:?}: {successor_result:?}"
+    ));
+    if successor_result.is_err() {
+        let owner = fixture.session.owner.connection.try_lock().map(|current| {
+            current.as_ref().map(|connection| {
+                (
+                    connection.carrier.path_instance_id,
+                    connection.carrier.connection.is_closed(),
+                )
+            })
+        });
+        eprintln!(
+            "successor failure state: calls={}, owner(instance,closed)={owner:?}, \
+             retry_interval={:?}, vacancy_not_before={:?}, deadline={:?}, generation={}, \
+             server_accept_finished={}",
+            provider.calls(),
+            fixture.session.owner.reconciliation_attempt_timeout(),
+            fixture.session.owner.vacancy_not_before(),
+            fixture.session.reconciliation_deadline(),
+            fixture.session.runtime.reconciliation.generation(),
+            successor_accept.is_finished(),
+        );
+        observation.report();
+    }
+    successor_result.expect("bounded retry publishes successor");
     let successor = tokio::time::timeout(Duration::from_secs(5), successor_accept)
         .await
         .expect("successor QUIC accept timeout")

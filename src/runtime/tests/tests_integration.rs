@@ -2522,7 +2522,8 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
     let phase = std::cell::Cell::new(("target and carrier setup", Instant::now()));
     let enter_phase = |name| phase.set((name, Instant::now()));
     let sampled_pto = std::cell::Cell::new(None);
-    tokio::time::timeout(ACTOR_SETTLEMENT_TIMEOUT, async {
+    let fixture_deadline = tokio::time::Instant::now() + ACTOR_SETTLEMENT_TIMEOUT;
+    tokio::time::timeout_at(fixture_deadline, async {
         let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
         socket2::SockRef::from(&target_listener)
             .set_recv_buffer_size(RELAY_QUANTUM_BYTES as usize)
@@ -2651,9 +2652,28 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
 
         enter_phase("QUIC path probe");
         probe_client_paths(&context, Duration::from_millis(500)).await;
-        let quic_instance = context.health().lock().expect("health lock").udp[0]
-            .path_instance_id()
-            .expect("live QUIC instance");
+        // Optional measurement may leave the owner absent. This fixture
+        // explicitly requires a live carrier before testing operation recovery;
+        // use ordinary Demand establishment within the same whole-fixture guard.
+        enter_phase("initial authenticated QUIC ownership");
+        context.udp_sessions[0]
+            .prepare_connection(fixture_deadline)
+            .await
+            .expect("establish authenticated QUIC owner");
+        let (quic_instance, accepts_product_commit) = {
+            let health = context.health().lock().expect("health lock");
+            let record = &health.udp[0];
+            let instance = record.path_instance_id();
+            (
+                instance,
+                instance.is_some_and(|instance| record.accepts_product_commit(instance)),
+            )
+        };
+        let quic_instance = quic_instance.expect("live QUIC instance");
+        assert!(
+            accepts_product_commit,
+            "authenticated QUIC owner must admit Product work"
+        );
         let mut attachment_commits =
             arm_client_relay_attachment_commits_for_test(quic_instance, stream_id);
         let patterned = Arc::new(

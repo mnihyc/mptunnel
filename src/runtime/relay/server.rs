@@ -2449,6 +2449,14 @@ where
     let mut ready_path_data = super::io::ReadyStreamDataBatch::new();
     let mut send_buffer_reservation = session_send_buffer.stream_reservation();
     let mut send_buffer_updates = session_send_buffer.subscribe();
+    let source_admission_observe =
+        std::env::var("MPTUNNEL_SOURCE_ADMISSION_OBSERVE").as_deref() == Ok("1");
+    let mut last_source_admission_observation = None::<Instant>;
+    // Starts count the first poll of each reserve attempt, including attempts
+    // later cancelled by select. They are not unique queued-waiter counts.
+    let mut source_reserve_starts = 0u64;
+    let mut source_reserve_grants = 0u64;
+    let mut source_reserve_granted_bytes = 0u64;
     let mut response_sender_retry_at: Option<tokio::time::Instant> = None;
     let mut response_requalification_capacity_wait = None;
     let mut no_output_since: Option<Instant> = None;
@@ -2832,6 +2840,9 @@ where
                 + reliable_stream_recv_progress_interval(request_feedback_path_snapshot),
         );
         let recv_progress_ack_update_pending = remote_open && recv_progress.ack_update_pending();
+        let observe_source_admission = source_admission_observe
+            && last_source_admission_observation
+                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(1));
         let (
             response_state_capacity_blocked,
             has_request_ack_capacity_wait,
@@ -2859,6 +2870,7 @@ where
             read_budget,
             can_send_pending_fin,
             prepared_work_wait,
+            source_admission_observation,
         ) = {
             let mut product = response_product.lock();
             if let Some(error) = product.prepared.pending_error.take() {
@@ -3204,6 +3216,15 @@ where
                 send_path_snapshot.is_some() && can_read_by_flow && read_budget > 0;
             let can_send_pending_fin =
                 pending_local_fin && response_sender.is_empty() && !close.sent;
+            let source_admission_observation = observe_source_admission.then(|| {
+                (
+                    session_send_buffer.used_bytes(),
+                    session_send_buffer.limit_bytes(),
+                    response_sender.bytes(),
+                    send_stream.send_credit_bytes(),
+                    send_stream.reinjection_bytes(),
+                )
+            });
 
             // Membership and pending control publication can become reconciled in
             // this turn without producing another wake. Reconsider completion only
@@ -3268,8 +3289,24 @@ where
                 read_budget,
                 can_send_pending_fin,
                 prepared_work_wait,
+                source_admission_observation,
             )
         };
+        if let Some((shared_used, shared_limit, queue_bytes, credit_bytes, reinjection_bytes)) =
+            source_admission_observation
+        {
+            // Observe only existing actor turns; do not add a diagnostic wake.
+            // The Product mutex is released before formatting or writing stderr.
+            last_source_admission_observation = Some(Instant::now());
+            let unix_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("source admission observation clock")
+                .as_micros();
+            eprintln!(
+                "source_admission unix_us={unix_us} session_id={} stream_id={} can_read_local={can_read_local} read_budget={read_budget} shared_used={shared_used} shared_limit={shared_limit} queue_bytes={queue_bytes} credit_bytes={credit_bytes} reinjection_bytes={reinjection_bytes} reserve_starts={source_reserve_starts} reserve_grants={source_reserve_grants} reserve_granted_bytes={source_reserve_granted_bytes}",
+                session_id.0, stream_id.0,
+            );
+        }
 
         if !can_read_local {
             // Eligibility ended. An inactive source owns no admission position;
@@ -4118,10 +4155,18 @@ where
             tokio::task::yield_now().await;
         }
         read = async {
+            if source_admission_observe {
+                source_reserve_starts = source_reserve_starts.saturating_add(1);
+            }
             let permit = session_send_buffer
                 .reserve(&mut send_buffer_updates, read_budget)
                 .await;
             let reserved_read_budget = permit.bytes();
+            if source_admission_observe {
+                source_reserve_grants = source_reserve_grants.saturating_add(1);
+                source_reserve_granted_bytes =
+                    source_reserve_granted_bytes.saturating_add(reserved_read_budget as u64);
+            }
             #[cfg(feature = "lab-diagnostics")]
             let read_started = Instant::now();
             let result =
@@ -4192,9 +4237,17 @@ where
                     let read = tokio::select! {
                         biased;
                         read = async {
+                            if source_admission_observe {
+                                source_reserve_starts = source_reserve_starts.saturating_add(1);
+                            }
                             let permit = session_send_buffer
                                 .reserve(&mut send_buffer_updates, next_read_budget)
                                 .await;
+                            if source_admission_observe {
+                                source_reserve_grants = source_reserve_grants.saturating_add(1);
+                                source_reserve_granted_bytes =
+                                    source_reserve_granted_bytes.saturating_add(permit.bytes() as u64);
+                            }
                             let result = read_reliable_relay_payload(
                                 &mut local, &mut buf, permit.bytes(),
                             ).await;

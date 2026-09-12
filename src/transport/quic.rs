@@ -8,6 +8,7 @@ use std::fmt;
 // It deliberately does not decide which product flow or range uses this path.
 
 mod congestion;
+mod driven_source;
 mod endpoint;
 mod native_datagram;
 mod presentation;
@@ -19,6 +20,7 @@ pub(crate) use congestion::{
     NativeControllerAuthoritySnapshot, NativeControllerObservationKind,
     NativeControllerShapeSnapshot,
 };
+pub use driven_source::{DrivenSource, NativeSourceRegistration, NativeSourceStopped};
 pub use endpoint::{Connection, Endpoint};
 pub use stream::IpPacketSender;
 pub use stream::{
@@ -106,6 +108,7 @@ pub enum QuicCarrierError {
     Io(std::io::Error),
     Connect(quinn::ConnectError),
     Connection(ConnectionError),
+    NativeDriverStopped,
     Write(quinn::WriteError),
     Read(quinn::ReadError),
     H3Connection(h3::error::ConnectionError),
@@ -158,6 +161,7 @@ impl QuicCarrierError {
             self,
             Self::Io(_)
                 | Self::Connection(_)
+                | Self::NativeDriverStopped
                 | Self::Write(_)
                 | Self::Read(_)
                 | Self::H3Connection(_)
@@ -177,6 +181,10 @@ impl fmt::Display for QuicCarrierError {
             Self::Io(err) => write!(f, "QUIC carrier I/O failed: {err}"),
             Self::Connect(err) => write!(f, "QUIC carrier connect failed: {err}"),
             Self::Connection(err) => write!(f, "QUIC carrier connection failed: {err}"),
+            Self::NativeDriverStopped => write!(
+                f,
+                "native QUIC connection driver stopped without a terminal cause"
+            ),
             Self::Write(err) => write!(f, "QUIC carrier write failed: {err}"),
             Self::Read(err) => write!(f, "QUIC carrier read failed: {err}"),
             Self::H3Connection(err) => write!(f, "HTTP/3 connection failed: {err}"),

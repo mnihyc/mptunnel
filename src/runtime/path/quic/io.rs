@@ -78,6 +78,12 @@ fn quic_stream_priority(lane: TrafficClass) -> i32 {
 }
 
 impl UdpPathSendStream {
+    pub(super) fn native_source_registration(
+        &self,
+    ) -> quic_transport::NativeSourceRegistration {
+        self.stream.native_source_registration()
+    }
+
     pub(super) fn bind_native_commitment(
         &mut self,
     ) -> Result<NativeOperationCommitment, RuntimeError> {

@@ -349,25 +349,29 @@ pub(super) async fn handle_server_udp_reliable_stream(
         )
         .await
     };
-    let ordinary = run_server_udp_reliable_stream_loop(
-        send,
-        recv,
-        ServerUdpReliableStreamLoop {
-            context,
-            session_id,
-            path_id,
-            path_registration,
-            stream_id,
-            target: duplicate_open_target,
-            commands_tx,
-            commands_rx,
-            path_proofs,
-        },
+    let registration = send.native_source_registration();
+    let ordinary = super::driven::run_ordinary_source(
+        registration,
+        run_server_udp_reliable_stream_loop(
+            send,
+            recv,
+            ServerUdpReliableStreamLoop {
+                context,
+                session_id,
+                path_id,
+                path_registration,
+                stream_id,
+                target: duplicate_open_target,
+                commands_tx,
+                commands_rx,
+                path_proofs,
+            },
+        ),
     );
     tokio::select! {
         biased;
         result = repair => result,
-        result = ordinary => result,
+        result = ordinary => result?,
     }
 }
 

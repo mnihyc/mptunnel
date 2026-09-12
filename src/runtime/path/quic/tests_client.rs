@@ -1681,6 +1681,7 @@ fn product_error_disposition_separates_session_carrier_and_operation_authority()
             quinn::ConnectionError::LocallyClosed,
         ))),
         RuntimeError::QuicCarrier(QuicCarrierError::H3DriverClosed),
+        RuntimeError::QuicCarrier(QuicCarrierError::NativeDriverStopped),
         RuntimeError::QuicCarrier(QuicCarrierError::NativeDatagram(
             quinn::SendDatagramError::ConnectionLost(quinn::ConnectionError::LocallyClosed),
         )),

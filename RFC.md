@@ -3172,7 +3172,7 @@ another writer cannot append bytes between the captured empty boundary and that
 claim. Other candidates likewise require their current Ready receipts. Within
 that lifetime, a captured busy boundary is conservative because `P` cannot
 rewind; arm its exact crossing wake rather than polling or manufacturing fresh
-permission. No ownership guard crosses native I/O.
+permission. No Product ownership guard crosses native I/O.
 
 An observed send-half terminal state MUST reach that exact writer's ordinary
 retirement path even if its receive half remains open. A blocked prepared notice
@@ -3185,6 +3185,30 @@ TCP adapters lacking the exact event retain native backpressure and Product
 bounds, without an invented empty-FIFO receipt. This availability distinction
 neither prefers a protocol nor asserts an exact guarantee for every platform.
 QUIC FIFOs retain independent opportunities and share connection resources.
+
+An adapter MAY couple a live writer actor to its native connection driver. At
+native packetization or writable events, it forwards the exact event and offers
+the signaled actor a poll before the next no-work classification. The native
+state lock MUST be released while polling or destroying the actor. A pending
+source, absent Product authority, or actual source exhaustion MUST retain normal
+native application-limited classification; retained demand alone MUST NOT forge
+supply, clear a mark, or change pacing. The native driver's existing datagram
+budget spans these inline handoffs instead of restarting for each producer poll.
+
+This coupling moves the whole existing ordinary actor, including partial writes,
+command priority and receive arbitration; it does not grant a second transaction
+or bypass Product admission. Cancellation of its owning attachment MUST wait
+until the actual actor and its owned resources are destroyed, including a poll
+already in progress. Publishing an empty actor slot before destruction completes
+is not retirement. Actor panic MUST remain isolated from the shared native driver
+and reach the original actor parent. A dedicated actor-execution guard may exclude
+concurrent polling and destruction; cancellation MUST NOT acquire it while holding
+Native or Product ownership locks. It is distinct from a Product ownership guard.
+Existing send/receive half-close and sibling repair lifetimes remain independent.
+Native termination retains its observed connection-close cause and physical
+carrier scope; unavailable cause remains explicit, never a fabricated error or an
+attachment-local status. The cost of serialized actor polling and synchronous
+cancellation remains visible.
 
 This rule bounds new Original inventory before first packetization, not its
 residence time, packetized flight, qdisc queues or physical delivery. Native

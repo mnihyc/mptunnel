@@ -110,6 +110,7 @@ fn quic_product_error_has_carrier_lifetime_authority(source: &QuicCarrierError) 
     match source {
         QuicCarrierError::Io(_)
         | QuicCarrierError::Connection(_)
+        | QuicCarrierError::NativeDriverStopped
         | QuicCarrierError::H3Connection(_)
         | QuicCarrierError::H3DriverClosed
         | QuicCarrierError::Write(quinn::WriteError::ConnectionLost(_))
@@ -137,6 +138,7 @@ fn client_udp_endpoint_error_has_health_authority(source: &RuntimeError) -> bool
             | RuntimeError::QuicCarrier(
                 QuicCarrierError::Io(_)
                     | QuicCarrierError::Connection(_)
+                    | QuicCarrierError::NativeDriverStopped
                     | QuicCarrierError::H3Connection(_)
                     | QuicCarrierError::H3Stream(_)
                     | QuicCarrierError::H3DriverClosed
@@ -1714,18 +1716,22 @@ async fn open_client_udp_stream_on_connection(
             )
             .await
         };
-        let ordinary = run_client_udp_stream(
-            send,
-            recv,
-            stream_id,
-            stream_runtime.path_index,
-            carrier.path_instance_id,
-            stream_runtime.codec_limits,
-            stream_runtime.mux_limits,
-            stream_frame_queue,
-            stream_runtime.state.clone(),
-            receivers,
-            frames_tx.clone(),
+        let registration = send.native_source_registration();
+        let ordinary = super::driven::run_ordinary_source(
+            registration,
+            run_client_udp_stream(
+                send,
+                recv,
+                stream_id,
+                stream_runtime.path_index,
+                carrier.path_instance_id,
+                stream_runtime.codec_limits,
+                stream_runtime.mux_limits,
+                stream_frame_queue,
+                stream_runtime.state.clone(),
+                receivers,
+                frames_tx.clone(),
+            ),
         );
         tokio::select! {
             biased;
@@ -1734,7 +1740,11 @@ async fn open_client_udp_stream_on_connection(
                     let _ = frames_tx.send(Err(client_repair_attachment_error(error))).await;
                 }
             }
-            () = ordinary => {}
+            result = ordinary => {
+                if let Err(error) = result {
+                    let _ = frames_tx.send(Err(error)).await;
+                }
+            }
         }
     });
     let mut startup = path_startup_snapshot_for_instance(

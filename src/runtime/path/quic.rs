@@ -6,6 +6,7 @@
 pub(in crate::runtime) mod client;
 mod client_stream;
 mod client_writer;
+mod driven;
 pub(in crate::runtime) mod datagram;
 mod estimator;
 pub(in crate::runtime) mod io;

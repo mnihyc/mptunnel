@@ -3271,6 +3271,12 @@ where
             )
         };
 
+        if !can_read_local {
+            // Eligibility ended. An inactive source owns no admission position;
+            // a losing select alone preserves its unsatisfied position instead.
+            send_buffer_updates.withdraw();
+        }
+
         // Carrier input and target responses can both remain continuously
         // ready during an upload. Fair polling keeps response progress from
         // being hidden behind an unbounded run of incoming STREAM_DATA.

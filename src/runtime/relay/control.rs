@@ -2260,6 +2260,11 @@ where
                 prepared_work_wait,
             )
         };
+        if !can_read_local {
+            // Match the response direction: withdraw the old demand when source
+            // eligibility ends, without resetting it on ordinary select turns.
+            send_buffer_updates.withdraw();
+        }
         let feedback_deadline = request_product
             .lock()
             .remotes

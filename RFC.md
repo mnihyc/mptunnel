@@ -2431,6 +2431,43 @@ no finite service-time guarantee while its native transport remains live.
 Cancellation MUST reconcile each queue reservation, Product flight,
 measurement ticket, load lease, and registry entry exactly once.
 
+The shared reliable source-byte envelope charges unique bytes before a local
+read and retains that charge through queued, prepared, flight and reinjection
+ownership until Data ACK or exact terminal cleanup releases it. Moving or copying
+those bytes does not grant more unique-source capacity. That byte bound alone
+does not provide admission fairness: waking a reader does not reserve capacity
+for it, and a releasing actor can otherwise reclaim every release before another
+eligible actor runs.
+
+Among currently pending source reservations, the oldest unsatisfied request MUST
+own the next positive grant. The grant is the smaller of currently available
+capacity and that request's current positive maximum; admission MUST NOT wait for
+the whole maximum while a smaller positive grant is available. Ordinary and
+opportunistic reads share this arbitration. An assigned grant is immediately
+charged to the same session envelope and cannot be stolen before its owner runs.
+Only owners of actual grants need a capacity wake.
+
+Cancelling a pending reservation withdraws its active registration and refunds any
+assigned but unconsumed grant exactly once. The source retains only its order
+identity across a losing input/control select while its demand remains eligible;
+on re-entry it joins active arbitration with that identity and its current maximum.
+A dormant identity reserves no bytes or admission turn and blocks no active reader.
+Ineligibility or owner destruction withdraws the old demand. Consuming a grant
+completes that admission turn, even if the following local read is partial or
+cancelled; existing read-permit cleanup returns unused bytes. No admission turn
+spans actual source I/O or an independently selected target write.
+
+This is an explicit shared-resource policy revision, distinct from executor and
+per-relay service-class fairness. Active requests use bounded per-source state and
+ordered insertion/removal; grant and cancellation cost grows logarithmically with
+pending demand rather than broadcasting each release to every source. A release
+assigning k grants can perform k ordered removals and k wakes in one synchronous
+turn; this concurrency cost requires resource validation. Uncontended admission
+remains constant work. Assigned bytes can remain unavailable until their
+owner is polled or cancelled, within the unchanged byte envelope. There is no
+wall-clock service guarantee without capacity release, runnable owners and actual
+source supply, and no proportional flow cap, new timer or native congestion policy.
+
 The final carrier writer preserves dependency and class boundaries while work
 remains MPP-owned. At every command-selection boundary it serves
 dependency-ready Control, lifecycle, and Data ACK work first, then Realtime and

@@ -13,7 +13,7 @@ use crate::runtime::path::commands::{
     reliable_path_command_queue, reliable_stream_frame_queue_for_payload,
 };
 use crate::runtime::path::input::{CarrierInputRoute, PendingMailboxFrame};
-use crate::runtime::path::native_commitment::{NativeCommitmentError, NativeOperationCommitment};
+use crate::runtime::path::native_commitment::NativeOperationCommitment;
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::scheduler::TrafficClass;
@@ -107,9 +107,8 @@ impl UdpPathSendStream {
         let observer = self
             .stream
             .native_progress_observer()
-            .map_err(|error| RuntimeError::Io(std::io::Error::other(error)))?;
-        let commitment =
-            NativeOperationCommitment::new(observer).map_err(native_commitment_error)?;
+            .map_err(RuntimeError::from)?;
+        let commitment = NativeOperationCommitment::new(observer).map_err(RuntimeError::from)?;
         self.native_commitment = Some(commitment.clone());
         Ok(commitment)
     }
@@ -483,10 +482,6 @@ async fn udp_path_write_frames(
     ensure_quic_data_plane_frames(frames)?;
     quic_transport::write_frames(&mut send.stream, frames, codec_limits).await?;
     Ok(())
-}
-
-fn native_commitment_error(error: NativeCommitmentError) -> RuntimeError {
-    RuntimeError::Io(std::io::Error::other(error))
 }
 
 fn ensure_quic_data_plane_frames(frames: &[Frame]) -> Result<(), RuntimeError> {

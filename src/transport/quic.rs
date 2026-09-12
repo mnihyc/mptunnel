@@ -147,11 +147,11 @@ impl QuicCarrierError {
     /// scope: it is not evidence that the shared QUIC connection or sibling
     /// MPP streams failed.
     pub(crate) fn is_peer_stream_abandonment_without_error(&self) -> bool {
-        matches!(
-            self,
-            Self::H3Stream(h3::error::StreamError::RemoteTerminate { code })
-                if code.value() == 0
-        )
+        match self {
+            Self::Write(quinn::WriteError::Stopped(code)) => code.into_inner() == 0,
+            Self::H3Stream(h3::error::StreamError::RemoteTerminate { code }) => code.value() == 0,
+            _ => false,
+        }
     }
 
     /// Whether an established QUIC/H3 carrier instance ended without proving

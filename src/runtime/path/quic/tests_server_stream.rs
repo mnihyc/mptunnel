@@ -1537,12 +1537,9 @@ fn assert_stopped_before_commitment(error: RuntimeError) {
     assert!(
         matches!(
             &error,
-            RuntimeError::Io(error) if matches!(
-                error.get_ref().and_then(|source| {
-                    source.downcast_ref::<quinn::SendStreamObservationError>()
-                }),
-                Some(quinn::SendStreamObservationError::Stopped(_)),
-            )
+            RuntimeError::QuicCarrier(crate::transport::quic::QuicCarrierError::Write(
+                quinn::WriteError::Stopped(code)
+            )) if code.into_inner() == 0
         ),
         "preserve the actual pre-bind Native STOP error: {error:?}",
     );

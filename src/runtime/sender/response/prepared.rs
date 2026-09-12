@@ -318,9 +318,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         return PreparedOriginalClaim::Blocked(wake);
     }
     if let Err(error) = commitments.check_selected(identity) {
-        return PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(std::io::Error::other(
-            error,
-        )));
+        return PreparedOriginalClaim::CarrierFailed(RuntimeError::from(error));
     }
     let Some(observation) = owner
         .binding()
@@ -372,8 +370,8 @@ pub(in crate::runtime) fn claim_prepared_response_data(
                 return None;
             }
             if let Err(error) = commitments.check_selected(identity) {
-                return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(
-                    std::io::Error::other(error),
+                return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::from(
+                    error,
                 )));
             }
             if let Some(shape) = shape {
@@ -550,8 +548,8 @@ pub(in crate::runtime) fn claim_prepared_response_data(
             }
         }
         if let Err(error) = commitments.check_selected(identity) {
-            return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(
-                std::io::Error::other(error),
+            return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::from(
+                error,
             )));
         }
         if let Some(shape) = shape {

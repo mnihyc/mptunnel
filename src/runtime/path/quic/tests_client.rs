@@ -1911,3 +1911,70 @@ async fn relay_request_stream_abandonment_preserves_live_quic_owner_and_health()
     );
     drop(accepted_carrier);
 }
+
+#[test]
+fn native_observation_errors_preserve_recovery_and_exact_failure_scope() {
+    use crate::runtime::error::reliable_path_error_is_migratable;
+    use crate::runtime::path::native_commitment::NativeCommitmentError;
+    use quinn::SendStreamObservationError as Observation;
+
+    for nested in [false, true] {
+        for source in [
+            Observation::Stopped(quinn::VarInt::from_u32(0)),
+            Observation::Stopped(quinn::VarInt::from_u32(42)),
+            Observation::ClosedStream,
+            Observation::ConnectionLost(quinn::ConnectionError::TimedOut),
+        ] {
+            let error = if nested {
+                RuntimeError::from(NativeCommitmentError::Native(source.clone()))
+            } else {
+                RuntimeError::from(source.clone())
+            };
+            assert!(reliable_path_error_is_migratable(&error));
+            let expected = match (&source, &error) {
+                (
+                    Observation::Stopped(expected),
+                    RuntimeError::QuicCarrier(QuicCarrierError::Write(quinn::WriteError::Stopped(
+                        actual,
+                    ))),
+                ) => {
+                    assert_eq!(actual, expected);
+                    ClientUdpErrorDisposition::Operation
+                }
+                (
+                    Observation::ClosedStream,
+                    RuntimeError::QuicCarrier(QuicCarrierError::Write(
+                        quinn::WriteError::ClosedStream,
+                    )),
+                ) => ClientUdpErrorDisposition::Operation,
+                (
+                    Observation::ConnectionLost(expected),
+                    RuntimeError::QuicCarrier(QuicCarrierError::Connection(actual)),
+                ) => {
+                    assert_eq!(actual, expected);
+                    ClientUdpErrorDisposition::CarrierLifetime
+                }
+                _ => panic!("native cause lost: {source:?} became {error:?}"),
+            };
+            assert_eq!(client_udp_error_disposition(&error), expected);
+        }
+        for source in [
+            Observation::NotEstablished,
+            Observation::UnacceptedEnd { accepted_end: 9 },
+        ] {
+            let error = if nested {
+                RuntimeError::from(NativeCommitmentError::Native(source))
+            } else {
+                RuntimeError::from(source)
+            };
+            assert!(matches!(error, RuntimeError::Io(_)));
+            assert!(!reliable_path_error_is_migratable(&error));
+        }
+    }
+    for error in [
+        RuntimeError::from(NativeCommitmentError::InvalidNativeProgress),
+        RuntimeError::Io(std::io::Error::other("target I/O failure")),
+    ] {
+        assert!(!reliable_path_error_is_migratable(&error));
+    }
+}

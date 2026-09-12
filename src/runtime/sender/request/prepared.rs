@@ -264,9 +264,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
         return PreparedOriginalClaim::Blocked(wake);
     }
     if let Err(error) = commitments.check_selected(instance) {
-        return PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(std::io::Error::other(
-            error,
-        )));
+        return PreparedOriginalClaim::CarrierFailed(RuntimeError::from(error));
     }
     let recovery_ready = current_ready_instances(&state);
     let recovery = {
@@ -332,8 +330,8 @@ pub(in crate::runtime) fn claim_prepared_request_data(
                     return None;
                 }
                 if let Err(error) = commitments.check_selected(instance) {
-                    return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(
-                        std::io::Error::other(error),
+                    return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::from(
+                        error,
                     )));
                 }
                 let current_inputs = match shape {
@@ -516,8 +514,8 @@ pub(in crate::runtime) fn claim_prepared_request_data(
             return None;
         }
         if let Err(error) = commitments.check_selected(instance) {
-            return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::Io(
-                std::io::Error::other(error),
+            return Some(PreparedOriginalClaim::CarrierFailed(RuntimeError::from(
+                error,
             )));
         }
         let current_inputs = match shape {

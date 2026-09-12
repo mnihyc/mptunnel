@@ -2910,6 +2910,10 @@ preserves the logical stream and its exact retained ranges on surviving
 authenticated attachments. Frame-codec, authentication, configuration, and
 Product protocol failures do not acquire that recovery authority merely
 because they were observed through a QUIC carrier.
+Native send-progress observation preserves the same failure scope as a direct
+write: stopped or closed send streams retire their operation; connection loss
+retains its exact connection cause. An unavailable or invalid observation does
+not acquire transport-recovery authority.
 
 Peer abandonment of one operation-scoped HTTP/3 request-stream direction with
 application code zero is an operation-local, error-free shutdown signal. It

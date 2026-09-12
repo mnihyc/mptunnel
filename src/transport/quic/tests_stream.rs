@@ -1825,165 +1825,212 @@ async fn native_http_datagram_fragments_preserve_identity_without_reliable_hol()
 
 #[tokio::test]
 async fn native_ip_packets_require_ready_and_preserve_fragmented_identity() {
-    let limits = CodecLimits::default();
-    let mux_limits = MuxLimits::default();
-    let tunnel_id = IpTunnelId(17);
-    let request_id = IpPacketId(31);
-    let response_id = IpPacketId(32);
-    let request_payload = Bytes::from(vec![0x45; 60_000]);
-    let response_payload = Bytes::from(vec![0x60; 32_000]);
+    // Native IP fragments are best effort. Guard every phase, rather than only
+    // the final server join, so a lost packet cannot leave the fixture pending.
+    // This is the existing five-second test bound, not a native expiry change.
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
-    let server = Endpoint::bind_server(
-        "127.0.0.1:0".parse().expect("server addr"),
-        &crate::transport::encrypted::test_server_tls_config(),
-        super::super::test_candidate_verifier(),
-        mux_limits,
-    )
-    .await
-    .expect("server endpoint");
-    let server_addr = server.local_addr().expect("server local addr");
-    let expected_request = request_payload.clone();
-    let expected_response = response_payload.clone();
-    let server_task = tokio::spawn(async move {
-        let connection = server.accept().await.expect("accepted connection");
-        let (mut send, mut recv) = connection.accept_bi().await.expect("accepted request");
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    let phases = Arc::new(Mutex::new(("not started", "not spawned")));
+    let client_phase = |phase: &'static str| {
+        phases.lock().expect("native IP test phases").0 = phase;
+    };
+    let scenario = async {
+        let limits = CodecLimits::default();
+        let mux_limits = MuxLimits::default();
+        let tunnel_id = IpTunnelId(17);
+        let request_id = IpPacketId(31);
+        let response_id = IpPacketId(32);
+        let request_payload = Bytes::from(vec![0x45; 60_000]);
+        let response_payload = Bytes::from(vec![0x60; 32_000]);
+
+        client_phase("binding server endpoint");
+        let server = Endpoint::bind_server(
+            "127.0.0.1:0".parse().expect("server addr"),
+            &crate::transport::encrypted::test_server_tls_config(),
+            super::super::test_candidate_verifier(),
+            mux_limits,
+        )
+        .await
+        .expect("server endpoint");
+        let server_addr = server.local_addr().expect("server local addr");
+        let expected_request = request_payload.clone();
+        let expected_response = response_payload.clone();
+        let server_phases = phases.clone();
+        let mut server_task = AbortOnDrop(tokio::spawn(async move {
+            let server_phase = |phase: &'static str| {
+                server_phases.lock().expect("native IP test phases").1 = phase;
+            };
+            server_phase("accepting connection");
+            let connection = server.accept().await.expect("accepted connection");
+            server_phase("accepting request");
+            let (mut send, mut recv) = connection.accept_bi().await.expect("accepted request");
+            server_phase("reading reliable tunnel open");
+            assert_eq!(
+                read_frame(&mut recv, limits)
+                    .await
+                    .expect("read reliable tunnel open"),
+                Frame::OpenIpTunnel { tunnel_id }
+            );
+            server_phase("writing reliable tunnel ready");
+            write_frame(
+                &mut send,
+                &Frame::IpTunnelReady {
+                    tunnel_id,
+                    mtu: 65_535,
+                    addresses: vec!["10.0.0.2".parse().expect("tunnel address")],
+                },
+                limits,
+            )
+            .await
+            .expect("write reliable tunnel ready");
+            server_phase("reading native request after writing ready");
+            assert_eq!(
+                read_frame(&mut recv, limits)
+                    .await
+                    .expect("read native IP packet"),
+                Frame::IpPacket {
+                    tunnel_id,
+                    packet_id: request_id,
+                    payload: expected_request,
+                }
+            );
+            server_phase("writing native response after reassembling request");
+            write_frame(
+                &mut send,
+                &Frame::IpPacket {
+                    tunnel_id,
+                    packet_id: response_id,
+                    payload: expected_response,
+                },
+                limits,
+            )
+            .await
+            .expect("write native IP response");
+            server_phase("reading reliable close after response fragments locally accepted");
+            assert_eq!(
+                read_frame(&mut recv, limits)
+                    .await
+                    .expect("read reliable tunnel close"),
+                Frame::IpTunnelClose {
+                    tunnel_id,
+                    reason: CloseReason::Normal,
+                }
+            );
+            server_phase("finishing reliable response");
+            finish_stream(&mut send)
+                .await
+                .expect("finish tunnel response");
+            server_phase("complete");
+        }));
+
+        client_phase("binding client endpoint");
+        let client = Endpoint::bind_client(
+            "127.0.0.1:0".parse().expect("client addr"),
+            &crate::transport::encrypted::test_client_tls_config(),
+            super::super::test_candidate_selector(),
+            mux_limits,
+        )
+        .await
+        .expect("client endpoint");
+        client_phase("connecting");
+        let connection = client.connect(server_addr).await.expect("client connect");
+        client_phase("opening request");
+        let (mut send, mut recv) = connection.open_bi().await.expect("client request");
+        client_phase("writing reliable tunnel open");
+        write_frame(&mut send, &Frame::OpenIpTunnel { tunnel_id }, limits)
+            .await
+            .expect("write reliable tunnel open");
+        client_phase("checking native request rejection before ready");
+        assert!(matches!(
+            write_frame(
+                &mut send,
+                &Frame::IpPacket {
+                    tunnel_id,
+                    packet_id: request_id,
+                    payload: request_payload.clone(),
+                },
+                limits,
+            )
+            .await,
+            Err(QuicCarrierError::InvalidNativeDatagram(_))
+        ));
+        client_phase("reading reliable tunnel ready");
         assert_eq!(
             read_frame(&mut recv, limits)
                 .await
-                .expect("read reliable tunnel open"),
-            Frame::OpenIpTunnel { tunnel_id }
-        );
-        write_frame(
-            &mut send,
-            &Frame::IpTunnelReady {
+                .expect("read reliable tunnel ready"),
+            Frame::IpTunnelReady {
                 tunnel_id,
                 mtu: 65_535,
                 addresses: vec!["10.0.0.2".parse().expect("tunnel address")],
+            }
+        );
+        client_phase("writing native request after reading ready");
+        write_frame(
+            &mut send,
+            &Frame::IpPacket {
+                tunnel_id,
+                packet_id: request_id,
+                payload: request_payload,
             },
             limits,
         )
         .await
-        .expect("write reliable tunnel ready");
+        .expect("write native IP request");
+        client_phase("reading native response after request fragments locally accepted");
         assert_eq!(
             read_frame(&mut recv, limits)
                 .await
-                .expect("read native IP packet"),
+                .expect("read native IP response"),
             Frame::IpPacket {
                 tunnel_id,
-                packet_id: request_id,
-                payload: expected_request,
+                packet_id: response_id,
+                payload: response_payload,
             }
         );
+        client_phase("writing reliable close after reassembling response");
         write_frame(
             &mut send,
-            &Frame::IpPacket {
-                tunnel_id,
-                packet_id: response_id,
-                payload: expected_response,
-            },
-            limits,
-        )
-        .await
-        .expect("write native IP response");
-        assert_eq!(
-            read_frame(&mut recv, limits)
-                .await
-                .expect("read reliable tunnel close"),
-            Frame::IpTunnelClose {
+            &Frame::IpTunnelClose {
                 tunnel_id,
                 reason: CloseReason::Normal,
-            }
-        );
+            },
+            limits,
+        )
+        .await
+        .expect("write reliable tunnel close");
+        client_phase("checking native packet rejection after close");
+        assert!(matches!(
+            write_frame(
+                &mut send,
+                &Frame::IpPacket {
+                    tunnel_id,
+                    packet_id: IpPacketId(33),
+                    payload: Bytes::from_static(b"late"),
+                },
+                limits,
+            )
+            .await,
+            Err(QuicCarrierError::InvalidNativeDatagram(_))
+        ));
+        client_phase("finishing reliable request");
         finish_stream(&mut send)
             .await
-            .expect("finish tunnel response");
-    });
-
-    let client = Endpoint::bind_client(
-        "127.0.0.1:0".parse().expect("client addr"),
-        &crate::transport::encrypted::test_client_tls_config(),
-        super::super::test_candidate_selector(),
-        mux_limits,
-    )
-    .await
-    .expect("client endpoint");
-    let connection = client.connect(server_addr).await.expect("client connect");
-    let (mut send, mut recv) = connection.open_bi().await.expect("client request");
-    write_frame(&mut send, &Frame::OpenIpTunnel { tunnel_id }, limits)
+            .expect("finish tunnel request");
+        client_phase("joining server task");
+        (&mut server_task.0).await.expect("server task");
+        client_phase("complete");
+    };
+    timeout(Duration::from_secs(5), scenario)
         .await
-        .expect("write reliable tunnel open");
-    assert!(matches!(
-        write_frame(
-            &mut send,
-            &Frame::IpPacket {
-                tunnel_id,
-                packet_id: request_id,
-                payload: request_payload.clone(),
-            },
-            limits,
-        )
-        .await,
-        Err(QuicCarrierError::InvalidNativeDatagram(_))
-    ));
-    assert_eq!(
-        read_frame(&mut recv, limits)
-            .await
-            .expect("read reliable tunnel ready"),
-        Frame::IpTunnelReady {
-            tunnel_id,
-            mtu: 65_535,
-            addresses: vec!["10.0.0.2".parse().expect("tunnel address")],
-        }
-    );
-    write_frame(
-        &mut send,
-        &Frame::IpPacket {
-            tunnel_id,
-            packet_id: request_id,
-            payload: request_payload,
-        },
-        limits,
-    )
-    .await
-    .expect("write native IP request");
-    assert_eq!(
-        read_frame(&mut recv, limits)
-            .await
-            .expect("read native IP response"),
-        Frame::IpPacket {
-            tunnel_id,
-            packet_id: response_id,
-            payload: response_payload,
-        }
-    );
-    write_frame(
-        &mut send,
-        &Frame::IpTunnelClose {
-            tunnel_id,
-            reason: CloseReason::Normal,
-        },
-        limits,
-    )
-    .await
-    .expect("write reliable tunnel close");
-    assert!(matches!(
-        write_frame(
-            &mut send,
-            &Frame::IpPacket {
-                tunnel_id,
-                packet_id: IpPacketId(33),
-                payload: Bytes::from_static(b"late"),
-            },
-            limits,
-        )
-        .await,
-        Err(QuicCarrierError::InvalidNativeDatagram(_))
-    ));
-    finish_stream(&mut send)
-        .await
-        .expect("finish tunnel request");
-    timeout(Duration::from_secs(5), server_task)
-        .await
-        .expect("server task timeout")
-        .expect("server task");
+        .unwrap_or_else(|_| {
+            let (client, server) = *phases.lock().expect("native IP test phases");
+            panic!("native IP fixture timed out: client={client}; server={server}");
+        });
 }

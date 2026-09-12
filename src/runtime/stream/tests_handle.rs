@@ -600,32 +600,49 @@ fn tcp_fixed_output_product_lower_bound_cannot_downshift_startup_prior() {
         PathRateScope::PathCapacity
     );
     let mut offset = 0_u64;
+    // These assertions require one fresh epoch. Host scheduling delays must
+    // not expire it between acceptance, ACK, and projection.
+    let mut observed_at = Instant::now();
 
     for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
         let frame = stream_data_frame_at(offset, MIN_RATE_SAMPLE_BYTES as usize);
-        let end = offset + reliable_stream_frame_accounted_bytes(&frame) as u64;
-        fixed.record_original_flight(&frame);
-        std::thread::sleep(Duration::from_millis(20));
-        output.release_normalized_acked_ranges(&[OffsetRange { start: offset, end }]);
+        let (start, end, bytes) =
+            reliable_stream_frame_extent(&frame).expect("original data has a flight extent");
+        {
+            let mut model = fixed.model.lock().expect("fixed output model lock");
+            let _ = fixed.record_product_flight_with_model(
+                &mut model,
+                start,
+                end,
+                bytes,
+                observed_at,
+                CarrierWorkKind::OriginalData,
+                None,
+            );
+        }
+        observed_at += Duration::from_millis(20);
+        fixed.release_normalized_acked_ranges_at(&[OffsetRange { start, end }], observed_at);
         offset = end;
     }
 
-    let learned_rate = fixed
+    let epoch = fixed
         .model
         .lock()
         .expect("fixed output model lock")
         .product_rate_epoch
-        .map(|epoch| epoch.rate_bps)
         .expect("persistent samples produce a delivery model");
+    assert_eq!(epoch.sample_count, RELIABLE_INITIAL_WINDOW_PACKETS as u32);
+    assert_eq!(epoch.observed_at, observed_at);
+    let learned_rate = epoch
+        .fresh_rate_at(observed_at)
+        .expect("the exact ACK epoch is fresh at projection");
     assert!(learned_rate < startup_rate * 0.5);
 
-    let snapshot = output
-        .send_path_snapshot(TrafficClass::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
-        .expect("response binding exposes learned path model");
+    let snapshot = fixed.send_path_snapshot_at(TrafficClass::Throughput, observed_at);
     assert_eq!(
         snapshot.product_progress_rate_bps,
         Some(learned_rate),
-        "the exact Product interval remains visible as a historical lower bound",
+        "the fresh exact Product interval remains visible as a lower bound",
     );
     assert_eq!(
         snapshot.delivery_rate_bps, startup_rate,

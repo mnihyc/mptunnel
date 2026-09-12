@@ -1145,3 +1145,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests_driven_source_feedback.rs"]
 mod driven_source_feedback_tests;
+
+#[cfg(test)]
+#[path = "tests_native_source_network.rs"]
+mod native_source_network_tests;

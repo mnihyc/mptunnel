@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import re
 import shlex
+import subprocess
 import tempfile
+import textwrap
 import unittest
 import zipfile
 
@@ -54,6 +57,111 @@ def write_test_version_asset(root: pathlib.Path) -> pathlib.Path:
 
 
 class ReleaseArchiveTests(unittest.TestCase):
+    def release_step(self, name: str) -> str:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        step = workflow.split(f"      - name: {name}\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        return textwrap.dedent(step.split("        run: |\n", 1)[1])
+
+    def run_release_step(
+        self, script: str, response: object, root: pathlib.Path
+    ) -> subprocess.CompletedProcess[str]:
+        fixture = root / "response.json"
+        fixture.write_text(json.dumps(response), encoding="utf-8")
+        api = '''
+gh() {
+  if [[ "$*" == *"--method DELETE"* ]]; then
+    printf '%s\\n' "$*" >> "$DELETE_LOG"
+  else
+    cat "$RELEASE_FIXTURE"
+  fi
+}
+'''
+        return subprocess.run(
+            ["bash", "-c", api + script],
+            cwd=root,
+            env={
+                **os.environ,
+                "RELEASE_FIXTURE": str(fixture),
+                "DELETE_LOG": str(root / "deletions"),
+                "GITHUB_OUTPUT": str(root / "output"),
+                "GITHUB_REPOSITORY": "example/mptunnel",
+                "RELEASE_TAG": f"v{PACKAGE_VERSION}",
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_release_preflight_handles_false_metadata_as_data(self) -> None:
+        # Execute the real API/metadata branch up to independent asset handling.
+        script = self.release_step("Preflight existing release state")
+        script = script.split("jq -r '.assets[].name'", 1)[0]
+        script += 'echo "state=${state}" >> "$GITHUB_OUTPUT"\n'
+        base = {
+            "tag_name": f"v{PACKAGE_VERSION}",
+            "name": f"mptunnel {PACKAGE_VERSION}",
+            "draft": True,
+            "prerelease": False,
+            "immutable": False,
+            "assets": [],
+        }
+        cases = [
+            ("absent", [], "absent"),
+            ("draft", [base], "draft"),
+            (
+                "draft_without_immutable",
+                [{k: v for k, v in base.items() if k != "immutable"}],
+                "draft",
+            ),
+            (
+                "published",
+                [{**base, "draft": False, "immutable": True}],
+                "published",
+            ),
+            ("mutable_published", [{**base, "draft": False}], None),
+            ("prerelease", [{**base, "prerelease": True}], None),
+            ("wrong_title", [{**base, "name": "different release"}], None),
+        ]
+        for name, response, expected in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                result = self.run_release_step(script, response, root)
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse((root / "output").exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        (root / "output").read_text(), f"state={expected}\n"
+                    )
+
+    def test_failed_release_cleanup_only_deletes_its_still_draft_release(self) -> None:
+        script = self.release_step("Remove failed draft")
+        cases = [(True, 42, True), (False, 42, False), (True, 43, False)]
+        for draft, release_id, should_delete in cases:
+            with (
+                self.subTest(draft=draft, release_id=release_id),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = pathlib.Path(temporary)
+                marker = root / ".tmp/ci/release-created-by-run"
+                marker.parent.mkdir(parents=True)
+                marker.write_text("42\n")
+                result = self.run_release_step(
+                    script,
+                    {
+                        "id": release_id,
+                        "draft": draft,
+                        "tag_name": f"v{PACKAGE_VERSION}",
+                    },
+                    root,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((root / "deletions").exists(), should_delete)
+
     def test_every_target_archive_is_byte_reproducible_and_verifies(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

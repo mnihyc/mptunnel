@@ -428,9 +428,9 @@ jobs:
           expected_title="mptunnel ${version}"
           actual_tag="$(jq -er .tag_name "$response")"
           actual_title="$(jq -er .name "$response")"
-          prerelease="$(jq -er .prerelease "$response")"
+          prerelease="$(jq -r .prerelease "$response")"
           state="$(jq -er 'if .draft then "draft" else "published" end' "$response")"
-          immutable="$(jq -er '.immutable // false' "$response")"
+          immutable="$(jq -r '.immutable // false' "$response")"
           [[ "$actual_tag" == "$RELEASE_TAG" ]] || {
             echo "existing release tag mismatch: $actual_tag" >&2
             exit 1
@@ -619,7 +619,7 @@ jobs:
             exit 0
           fi
           current_id="$(jq -er .id "$current")"
-          current_draft="$(jq -er .draft "$current")"
+          current_draft="$(jq -r .draft "$current")"
           current_tag="$(jq -er .tag_name "$current")"
           if [[ "$current_id" == "$created_id" \
             && "$current_tag" == "$RELEASE_TAG" \

@@ -70,127 +70,36 @@ TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 
 ## Performance
 
-The scalar tables below are accepted historical evidence for the releases
-identified with each cohort; they do not characterize the current tree. The
-chart is a historical two-run diagnostic series, not a current-release ranking.
-See the [performance methodology](docs/PERFORMANCE.md) for measurement details
-and the accepted v0.4.7 startup and v0.4.8 mixed-path recovery corrections.
+The v0.4.9 candidate runtime was measured at `65c033c`, before its package-version
+bump, against published v0.4.8 source `d1a99ad`. Eighteen controlled Linux runs
+cover nine paired transport/direction profiles, with one observation per version
+per profile.
 
-Current development testing has also exposed an unresolved QUIC weakness under
-strong packet reordering: throughput can collapse with no injected loss or
-router queue drops,
-and recovery can lag Hysteria2. This is not release-ready. The latest
-[recovery curves and limitations](docs/PERFORMANCE.md#current-reordering-and-recovery)
-include both bulk speed and interrupted interactive service; historical results
-below must not be read as evidence that this case is solved.
+The candidate completed **310/310 concurrent download echoes** and confirmed every
+accepted byte in **all four uploads**. With independent TCP and QUIC links under
+restriction and outage, download goodput was 273.5 versus 143.1 Mbps, and the
+longest read gap was 0.788 versus 1.551 seconds. Its echo connection completed all
+80 checks; v0.4.8 recorded 31 successes, one timed-out I/O error and 35 subsequent
+unavailable observations.
 
-Acceptance includes sustained speed, read gaps, loaded latency and recovery in
-both directions. A higher average alone does not qualify a release.
+[![Candidate and v0.4.8 independent mixed download goodput, echo latency and upload confirmations through restriction and outage](docs/assets/performance/v0.4.9-independent.svg)](docs/assets/performance/v0.4.9-independent.svg)
 
-### Historical diagnostic series
+The improvements have costs. Healthy QUIC download was about 6% slower, the
+loss-clear test's echo p95 increased from 203 to 344 ms, and healthy mixed service
+used more CPU and memory. Independent mixed upload improved during restriction
+(20 to 132 Mbps), but its preceding healthy phase fell from 340 to 266 Mbps; the
+cause remains unresolved. These are complete-version comparisons, including
+10%/10% sender defaults in v0.4.8 versus 20%/20% in the candidate.
 
-[![Receiver goodput and persistent application-echo latency over 40 seconds for MPTUNNEL TCP, QUIC, default TCP+QUIC, Xray, and Hysteria2](docs/assets/performance/diagnostic-random-internet-series.svg)](docs/assets/performance/diagnostic-random-internet-series.svg)
-
-The figure compares TCP, QUIC, default TCP+QUIC, Xray, and Hysteria2 using
-one-second receiver-goodput samples and concurrent application-echo latency.
-Lines show the two-run median; bands show the measured range. Open the chart
-and hover a point for its exact value.
-
-These historical results are receiver-delivered goodput from controlled Linux
-tests, rounded to the nearest Mbps. Xray-core 26.3.27 uses VMess/TCP; Hysteria2
-2.10.0 uses Brutal at the shaped link rate; MPTUNNEL uses the measured
-release's default TCP+QUIC paths unless a transport is named explicitly.
-
-### One link
-
-Each product used the same 500 Mbps link, two parallel downloads, and a
-20-second load window.
-
-| RTT | Jitter | Loss | Xray/VMess | Hysteria2 | MPTUNNEL |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 40 ms | 10 ms | 0.5% | 441 Mbps | 464 Mbps | 414 Mbps |
-| 280 ms | 20 ms | 10% | 71 Mbps | 96 Mbps | 195 Mbps |
-
-MPTUNNEL was 10.6% below the fastest baseline on the ordinary link. On the
-adverse link it delivered 2.02× Hysteria2 and 2.75× Xray/VMess goodput.
-
-### Add links
-
-Every physical link repeats the 500 Mbps, 40 ms RTT, 10 ms jitter, and 0.5%
-loss profile above.
-
-| System | Links | Download | Upload |
-| --- | ---: | ---: | ---: |
-| MPTUNNEL | 1 | 414 Mbps | 425 Mbps |
-| MPTUNNEL | 2 | 772 Mbps | 621 Mbps |
-| Linux MPTCP | 5 | 885 Mbps | — |
-| MPTUNNEL | 5 | 1,366 Mbps | 1,384 Mbps |
-
-Two links provide 1.86× download and 1.46× upload goodput; five provide 3.30×
-and 3.25×. Xray/VMess and Hysteria2 remain the one-link product controls above;
-they do not aggregate one application flow across independent links. Linux
-MPTCP is a kernel transport control, not an encrypted proxy.
-
-### Use each link for what it does best
-
-Link A is 200 Mbps down / 20 Mbps up; Link B is 20 Mbps down / 200 Mbps up.
-The single-path products remain on Link A in both directions. MPTUNNEL receives
-both links in one configuration; this compares fixed-link and same-flow
-multipath capability, not equal path provisioning.
-
-| System | Links | Download | Upload |
-| --- | --- | ---: | ---: |
-| Xray/VMess | A | 182 Mbps | ≥18 Mbps |
-| Hysteria2/Brutal | A | 189 Mbps | ≥19 Mbps |
-| MPTUNNEL (TCP) | A + B | 199 Mbps | 197 Mbps |
-
-MPTUNNEL carried 90.7% of download traffic on Link A and 90.7% of upload
-traffic on Link B without changing endpoints between directions.
-
-The next control combines an 80 Mbps ordinary link with the 500 Mbps adverse
-link from the first table. MPTUNNEL uses default TCP+QUIC paths while bulk,
-short HTTP, persistent TCP, and datagrams run together for 30 seconds.
-
-| Links | Bulk | TCP latency | TCP checks | HTTP latency | HTTP checks | UDP checks |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Ordinary | 61 Mbps | 103/217 ms | 60/60 | 444/1,026 ms | 45/45 | 102/102 |
-| Adverse | 99 Mbps | 452/1,868 ms | 35/35 | 1,835/2,686 ms | 9/11 | 14/18 |
-| Both | 160 Mbps | 173/318 ms | 60/60 | 376/838 ms | 53/53 | 205/205 |
-
-The two-link run measured 160 Mbps versus 61 and 99 Mbps separately, while
-every TCP, HTTP, and UDP check completed. Latency cells are p50/p95;
-check cells are completed/attempted.
-
-### Short connections
-
-| Load | Object | Window | Completed | Rejected | Failed |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 10 every 3 s | 32 KiB | 30 s | 90/90 | 0 | 0 |
-| 20 continuous | 1 MiB | 60 s | 755/755 | 0 | 0 |
-
-The slowest ten-request batch completed in 0.681 seconds against its
-three-second bound. The continuous run held twenty requests in flight and
-immediately replaced each completion.
-
-### Stay online
-
-Each row is one controlled disruption run. Counts are completed/attempted
-application checks; pause is the longest receiver-side download gap.
-
-| Event | TCP checks | HTTP checks | UDP checks | DL pause |
-| --- | ---: | ---: | ---: | ---: |
-| 2 s path blackhole | 60/60 | 72/72 | 228/229 | 636 ms |
-| Latency/loss change | 60/60 | 93/94 | 241/243 | 1,489 ms |
-| Repeated changes | 47/47 | 81/83 | 217/219 | 869 ms |
-
-Additional controls observed same-flow recovery after a five-second total
-carrier outage (1/1) and renewed connectivity after server and client process
-restarts (2/2 checks). New inbound connections are rejected while every
-outbound path is unavailable; established flows remain attached during carrier
-recovery.
-
-See [Performance evidence](docs/PERFORMANCE.md) for exact setup, upload
-accounting, stress tests, recovery evidence, and limitations.
+See the [nine comparisons, timing plots and measurement limits](docs/PERFORMANCE.md#september-12-candidate-comparison)
+for startup, delivery gaps, latency, resource costs and upload accounting.
+The default mixed Cloudflare browser workload also completed on this candidate.
+Platform test and package results are available in [CI](https://github.com/mnihyc/mptunnel/actions/workflows/ci.yml)
+and [Release Check](https://github.com/mnihyc/mptunnel/actions/workflows/release-check.yml).
+The [historical packet-reordering limitation](docs/PERFORMANCE.md#historical-packet-reordering-limitation)
+was not retested by these profiles. Earlier accepted comparisons against other
+products remain [historical evidence](docs/PERFORMANCE.md#historical-accepted-fixed-profile-evidence-v021v022),
+not a ranking of the current candidate.
 
 ## Quick start
 

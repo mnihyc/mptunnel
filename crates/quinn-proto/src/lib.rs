@@ -45,8 +45,8 @@ pub use bloom_token_log::BloomTokenLog;
 mod connection;
 #[doc(hidden)]
 pub use crate::connection::classifier_trace::{
-    NativeSourceDriverContext, NativeSourceDriverGuard, enter_native_source_driver,
-    native_source_window_at,
+    NativeSourceDriverContext, NativeSourceDriverGuard, emit_native_trace, enter_native_source_driver,
+    flush_native_trace_if_due, native_source_window_at,
 };
 pub use crate::connection::{
     ActivePathSnapshot, Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats,

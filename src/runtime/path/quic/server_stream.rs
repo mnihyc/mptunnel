@@ -648,10 +648,13 @@ async fn run_server_udp_reliable_stream_loop(
                         | Frame::StreamReset { stream_id: received_stream_id, .. })))
                         if received_stream_id == stream_id =>
                     {
-                        context
-                            .reliable_streams
-                            .route_frame(&path_registration, stream_id, frame)
-                            .await?;
+                        quinn::observe_source_future(
+                            "server_input_route_mailbox",
+                            context
+                                .reliable_streams
+                                .route_frame(&path_registration, stream_id, frame),
+                        )
+                        .await?;
                     }
                     Some(Ok(Frame::StreamDetach { stream_id: detach_stream_id }))
                         if detach_stream_id == stream_id =>

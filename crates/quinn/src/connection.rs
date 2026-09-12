@@ -264,6 +264,7 @@ impl Future for ConnectionDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
+        proto::flush_native_trace_if_due();
         this.sources.receive(cx);
         // One budget for the entire driver turn, including inline source refills.
         let mut transmits = 0;

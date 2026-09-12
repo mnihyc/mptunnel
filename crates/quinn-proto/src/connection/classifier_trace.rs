@@ -2,14 +2,17 @@
 
 use crate::{Duration, Instant};
 use std::cell::Cell;
+use std::fmt::{self, Write as _};
+use std::io::Write as _;
 use std::sync::{
-    OnceLock,
+    Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 struct Window {
     role: String,
     first_poll: Instant,
+    capture: Option<Mutex<Capture>>,
     started: AtomicBool,
     ended: AtomicBool,
     polls: AtomicU64,
@@ -22,6 +25,105 @@ struct Window {
 }
 
 static WINDOW: OnceLock<Option<Window>> = OnceLock::new();
+
+// Measurement memory only. Overflow invalidates the capture; it never limits
+// transport work or falls back to synchronous output during observation.
+const CAPTURE_BYTES: usize = 64 * 1024 * 1024;
+
+struct Capture {
+    bytes: String,
+    records: u64,
+    dropped: u64,
+    flushed: bool,
+}
+
+struct CappedRecord<'a>(&'a mut String);
+
+impl fmt::Write for CappedRecord<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if value.len() > CAPTURE_BYTES.saturating_sub(self.0.len()) {
+            return Err(fmt::Error);
+        }
+        self.0.push_str(value);
+        Ok(())
+    }
+}
+
+/// One ordered sink for source, classifier and controller diagnostics.
+#[doc(hidden)]
+pub fn emit_native_trace(fields: fmt::Arguments<'_>) {
+    let Some(window) = WINDOW.get().and_then(Option::as_ref) else {
+        eprintln!("{fields}");
+        return;
+    };
+    let Some(capture) = &window.capture else {
+        eprintln!("{fields}");
+        return;
+    };
+    let mut capture = capture.lock().expect("native diagnostic capture");
+    if capture.flushed || Instant::now().duration_since(window.first_poll) < Duration::from_secs(10)
+    {
+        eprintln!("{fields}");
+        return;
+    }
+    if capture.dropped != 0 {
+        capture.dropped += 1;
+        return;
+    }
+    let start = capture.bytes.len();
+    if writeln!(CappedRecord(&mut capture.bytes), "{fields}").is_err() {
+        capture.bytes.truncate(start);
+        capture.dropped += 1;
+    } else {
+        capture.records += 1;
+    }
+}
+
+/// Called only at an existing driver entry, before Native/source locks or polls.
+#[doc(hidden)]
+pub fn flush_native_trace_if_due() {
+    let Some(window) = WINDOW.get().and_then(Option::as_ref) else {
+        return;
+    };
+    let Some(capture) = &window.capture else {
+        return;
+    };
+    if Instant::now().duration_since(window.first_poll) < Duration::from_secs(11) {
+        return;
+    }
+    // Serialize the flush with all later diagnostic output, including callbacks
+    // whose supplied time is older. No Native lock is acquired by this sink.
+    let mut capture = capture.lock().expect("native diagnostic flush");
+    if capture.flushed {
+        return;
+    }
+    let started = Instant::now();
+    let bytes = capture.bytes.len();
+    let mut stderr = std::io::stderr().lock();
+    let header_ok = writeln!(stderr,
+        "native_capture_flush_begin role={} cap_bytes={} bytes={} records={} dropped={} elapsed_ns={} unix_us={:?}",
+        window.role, CAPTURE_BYTES, bytes, capture.records, capture.dropped,
+        started.duration_since(window.first_poll).as_nanos(), unix_us(),
+    ).is_ok();
+    let body_ok = stderr.write_all(capture.bytes.as_bytes()).is_ok();
+    let ended = Instant::now();
+    let _ = writeln!(
+        stderr,
+        "native_capture_flush_end role={} cap_bytes={} bytes={} records={} dropped={} write_ok={} valid={} elapsed_ns={} write_elapsed_us={} unix_us={:?}",
+        window.role,
+        CAPTURE_BYTES,
+        bytes,
+        capture.records,
+        capture.dropped,
+        header_ok && body_ok,
+        header_ok && body_ok && capture.dropped == 0,
+        ended.duration_since(window.first_poll).as_nanos(),
+        ended.duration_since(started).as_micros(),
+        unix_us(),
+    );
+    capture.flushed = true;
+    capture.bytes = String::new();
+}
 
 /// Passive view of the already initialized server observation window.
 /// This does not initialize it, emit boundaries, or change classifier counters.
@@ -103,7 +205,7 @@ fn active(now: Instant) -> Option<(&'static Window, u128)> {
     }
     if elapsed >= Duration::from_secs(11) {
         if !window.ended.swap(true, Ordering::Relaxed) {
-            eprintln!(
+            emit_native_trace(format_args!(
                 "native_classifier_window_end role={} window=first_native_poll_10_11 elapsed_us={} unix_us={:?} started={} polls={} empty_polls={} byte_full={} packet_blocked={} send_marks={} ack_marks={} missing_context={}",
                 window.role,
                 elapsed.as_micros(),
@@ -116,17 +218,17 @@ fn active(now: Instant) -> Option<(&'static Window, u128)> {
                 window.send_marks.load(Ordering::Relaxed),
                 window.ack_marks.load(Ordering::Relaxed),
                 window.missing_context.load(Ordering::Relaxed)
-            );
+            ));
         }
         return None;
     }
     if !window.started.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        emit_native_trace(format_args!(
             "native_classifier_window_start role={} window=first_native_poll_10_11 elapsed_us={} unix_us={:?}",
             window.role,
             elapsed.as_micros(),
             unix_us()
-        );
+        ));
     }
     Some((window, elapsed.as_micros()))
 }
@@ -137,6 +239,14 @@ pub(super) fn enter_poll(now: Instant, connection: usize, path_epoch: u64) -> Op
             .ok()
             .filter(|role| matches!(role.as_str(), "server" | "client"))
             .map(|role| Window {
+                capture: (role == "server").then(|| {
+                    Mutex::new(Capture {
+                        bytes: String::with_capacity(CAPTURE_BYTES),
+                        records: 0,
+                        dropped: 0,
+                        flushed: false,
+                    })
+                }),
                 role,
                 first_poll: now,
                 started: AtomicBool::new(false),
@@ -204,7 +314,7 @@ pub(super) fn empty_poll(
     window
         .missing_context
         .fetch_add(u64::from(context.is_none()), Ordering::Relaxed);
-    eprintln!(
+    emit_native_trace(format_args!(
         "native_empty_poll role={} window=first_native_poll_10_11 event={} elapsed_us={} unix_us={:?} connection={:?} path_epoch={:?} flag_before={} flag_after={} flight={} cwnd={} mtu={} byte_full={} packet_blocked={:?} send_blocked={} cwnd_blocked={} had_sendable_frames={} pacer_capacity_before={} pacer_tokens_before={} pacer_previous_age_ns={} pacer_now_before_previous={} pacer_cached_window={:?} pacer_cached_mtu={:?} pacer_rtt_ns={} pacer_metric_window={} pacer_rate_bytes_per_s={:?} pacer_hypothetical_bytes={} pacer_hypothetical_mtu={} pacer_capacity_after={} pacer_tokens_after={} pacer_previous_after_age_ns={} pacer_delay_some={} pacer_due_gap_ns={:?} driver_connection={:?} driver_turn={:?} source_pass={:?}",
         window.role,
         event,
@@ -241,7 +351,7 @@ pub(super) fn empty_poll(
         source_driver.map(|driver| driver.connection),
         source_driver.map(|driver| driver.turn),
         source_driver.map(|driver| driver.pass),
-    );
+    ));
 }
 
 pub(crate) struct MarkUpdate {
@@ -273,7 +383,7 @@ pub(crate) fn mark_update(now: Instant, mark: MarkUpdate) {
     window
         .missing_context
         .fetch_add(u64::from(context.is_none()), Ordering::Relaxed);
-    eprintln!(
+    emit_native_trace(format_args!(
         "native_mark_update role={} window=first_native_poll_10_11 callback={} event={} elapsed_us={} unix_us={:?} connection={:?} path_epoch={:?} controller={:#x} old={} after_expiry={} new={} delivered={} flight={} cwnd={} flag={}",
         window.role,
         mark.callback,
@@ -290,5 +400,5 @@ pub(crate) fn mark_update(now: Instant, mark: MarkUpdate) {
         mark.flight,
         mark.cwnd,
         mark.flag
-    );
+    ));
 }

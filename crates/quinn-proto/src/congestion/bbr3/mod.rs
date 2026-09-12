@@ -3177,7 +3177,7 @@ impl Controller for Bbr3 {
                             .duration_since(std::time::UNIX_EPOCH)
                             .ok()
                             .map(|d| d.as_micros());
-                        eprintln!(concat!(
+                        crate::emit_native_trace(format_args!(concat!(
                             "native_control_round role={} controller={:p} elapsed_us={:?} unix_us={:?} ",
                             "state_before={:?} state_after={:?} full_bw_before={} full_bw_after={} ",
                             "full_bw_count_before={} full_bw_count_after={} full_bw_reached_before={} full_bw_reached_after={} ",
@@ -3196,7 +3196,7 @@ impl Controller for Bbr3 {
                             self.pacing_gain, self.cwnd_gain, before.9, self.cwnd, self.inflight,
                             rtt_us(self.min_rtt), rtt_us(self.inflight_rtt), rate_sample.last_packet.space,
                             rate_sample.last_packet.packet_number, valid_interval && rate_sample.interval != Duration::ZERO
-                                && rate_sample.delivery_rate.is_finite() && rate_sample.delivery_rate > 0.0);
+                                && rate_sample.delivery_rate.is_finite() && rate_sample.delivery_rate > 0.0));
                     }
 
                     let next_revision =

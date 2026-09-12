@@ -41,7 +41,7 @@ fn emit(event: &str, context: Context, elapsed: Duration, fields: fmt::Arguments
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_micros());
-    eprintln!(
+    proto::emit_native_trace(format_args!(
         "{event} role=server window=first_native_poll_10_11 event={} driver_connection={} driver_turn={} source_pass={} source_id={} source_poll={} await_id={:?} parent_await={:?} depth={} elapsed_ns={} unix_us={:?} {}",
         NEXT_EVENT.fetch_add(1, Ordering::Relaxed),
         context.driver.connection,
@@ -55,7 +55,7 @@ fn emit(event: &str, context: Context, elapsed: Duration, fields: fmt::Arguments
         elapsed.as_nanos(),
         unix_us,
         fields,
-    );
+    ));
 }
 
 /// Give an existing turn an identity only when its actual pass is in-window.

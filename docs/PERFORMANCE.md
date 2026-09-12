@@ -6,11 +6,10 @@ workload, host capacity, and the native TCP or QUIC implementation.
 
 ## September 12 candidate comparison
 
-This cohort measures the **v0.4.9 runtime at `65c033c`**, built before the package
-version changed from **0.4.8** to **0.4.9**, against **`d1a99ad`**, the published
-v0.4.8 source. Subsequent release preparation changes package version and public
-documentation; the measured scheduling and recovery code is unchanged. Both measured
-executables are optimized local builds of the named sources. There are eighteen runs: one observation per
+This cohort measures the **v0.4.9 runtime at `2ced0d0`**, full source commit
+`2ced0d03a388c614ff00692c3540fe306e378bf3`, with package version **0.4.9**, against
+**`d1a99ad`**, the published v0.4.8 source. Both measured executables are optimized
+local builds of the named sources. There are eighteen runs: one observation per
 version for each of the nine comparisons below. The
 [complete sampled series and source identities](assets/performance/v0.4.9-comparison-series.json)
 accompany the figures; no repetitions, confidence bands or best-run selection
@@ -60,39 +59,45 @@ application body reads; UP gaps are between target-sink confirmations. Echo p95
 uses successful attempts only, with failures stated separately. Mbps is rounded
 to one decimal, gaps to milliseconds and echo latency to whole milliseconds.
 
-| Profile / transport | Direction | Goodput, Mbps | Longest delivery gap, s | DOWN echo p95, ms |
-| --- | --- | ---: | ---: | ---: |
-| Healthy TCP | DOWN | 386.2 → 423.7 | 0.318 → 0.306 | 1100 → 335 |
-| Healthy TCP | UP | 447.5 → 439.4 | 0.471 → 0.437 | Not measured |
-| Healthy QUIC | DOWN | 431.4 → 407.1 | 0.169 → 0.100 | 199 → 209 |
-| Healthy QUIC | UP | 434.1 → 422.5 | 0.368 → 0.304 | Not measured |
-| Healthy TCP+QUIC | DOWN | 397.2 → 412.9 | 0.206 → 0.444 | 1023 → 414 |
-| Healthy TCP+QUIC | UP | 423.2 → 439.1 | 0.836 → 0.649 | Not measured |
-| Independent TCP+QUIC | DOWN | 143.1 → 273.5 | 1.551 → 0.788 | 1297 → 342 |
-| Independent TCP+QUIC | UP | 212.8 → 248.5 | 1.392 → 0.964 | Not measured |
-| Loss-clear QUIC | DOWN | 206.5 → 391.5 | 0.408 → 0.376 | 203 → 344 |
+| Profile / transport | Direction | Goodput, Mbps | First delivery, s | Longest delivery gap, s | DOWN echo p95, ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Healthy TCP | DOWN | 400.7 → 430.1 | 0.443 → 0.440 | 0.402 → 0.426 | 1129 → 334 |
+| Healthy TCP | UP | 448.2 → 443.1 | 0.414 → 0.242 | 0.390 → 0.389 | Not measured |
+| Healthy QUIC | DOWN | 429.0 → 412.5 | 0.406 → 0.410 | 0.102 → 0.101 | 166 → 249 |
+| Healthy QUIC | UP | 427.4 → 430.5 | 1.108 → 0.208 | 0.295 → 0.273 | Not measured |
+| Healthy TCP+QUIC | DOWN | 403.8 → 410.3 | 0.442 → 0.473 | 0.206 → 0.509 | 994 → 471 |
+| Healthy TCP+QUIC | UP | 413.4 → 440.9 | 0.414 → 0.260 | 0.906 → 0.371 | Not measured |
+| Independent TCP+QUIC | DOWN | 124.2 → 266.0 | 0.443 → 0.434 | 0.920 → 0.530 | 1860 → 353 |
+| Independent TCP+QUIC | UP | 203.0 → 249.7 | 0.415 → 0.243 | 1.322 → 1.136 | Not measured |
+| Loss-clear QUIC | DOWN | 209.3 → 393.7 | 1.703 → 0.725 | 0.437 → 0.442 | 231 → 350 |
 
 Healthy candidate DOWN completes 50/50 echoes for each transport. The corresponding
-v0.4.8 TCP/QUIC/mixed runs complete 37/37, 50/50 and 40/40; slower sequential
-exchanges leave fewer attempts within the fixed duration. Independent candidate
-DOWN completes 80/80. Its comparator has **31 successes, one I/O error reporting a
-timeout, then 35 unavailable-after-disconnect observations**. Those are not 36
-independent timeouts. Both loss-clear runs complete 80/80 echoes.
+v0.4.8 TCP/QUIC/mixed runs complete 36/36, 50/50 and 38/38. Independent candidate
+DOWN completes 80/80 versus 64/64; loss-clear completes 80/80 versus 79/79.
+Every recorded echo succeeds in this cohort. Slower sequential exchanges leave
+fewer attempts within a fixed duration; an unattempted echo is not a timeout or
+packet loss.
 
 ### Healthy service
 
 [![Paired TCP, QUIC and mixed healthy download, concurrent echo and upload-confirmation timing](assets/performance/v0.4.9-healthy.svg)](assets/performance/v0.4.9-healthy.svg)
 
-Every healthy one-second delivery bin is positive. TCP and mixed DOWN improve
-whole-run goodput and echo p95 in this pair. QUIC DOWN is 5.6% slower and QUIC UP
-2.7% slower. The candidate's healthy mixed maximum read gap increases from 0.206
-to 0.444 seconds, at 9.674–10.118 seconds, followed by continuing delivery; all
-50 echoes succeed. Neither a better average nor the short duration removes that
-observed pause from the comparison.
+Every candidate healthy one-second delivery bin is positive. TCP and mixed DOWN
+improve whole-run goodput and echo p95 in this pair. QUIC DOWN is 3.8% slower; healthy
+TCP UP is 1.1% slower. The candidate's healthy mixed maximum read gap increases
+from 0.206 to 0.509 seconds, at 9.731–10.240 seconds, followed by continuing
+delivery. The overlapping echo takes 706 ms; all 50 echoes succeed. Healthy mixed
+DOWN median echo latency improves from 569 to 360 ms but remains well above the
+configured 100 ms base RTT.
 
-Candidate healthy uploads confirm 1,447,231,488 bytes over TCP, 1,407,778,816 over
-QUIC and 1,456,209,920 over mixed paths. Their full elapsed times are 26.35, 26.66
-and 26.53 seconds for 25 seconds of offered load. All accepted bytes are confirmed;
+QUIC DOWN echo p95 rises from 166 to 249 ms. All candidate echoes above 150 ms
+occur in the first four seconds; after five seconds its median/maximum are
+105/140 ms. This timing distinguishes its startup cost from sustained loaded
+latency. First delivery values for every workload remain visible in the table.
+
+Candidate healthy uploads confirm 1,461,190,656 bytes over TCP, 1,426,587,648 over
+QUIC and 1,448,411,136 over mixed paths. Their full elapsed times are 26.38, 26.51
+and 26.28 seconds for 25 seconds of offered load. All accepted bytes are confirmed;
 the extra elapsed time includes setup/settlement and is not an exact final-write
 drain-time measurement.
 
@@ -100,63 +105,126 @@ drain-time measurement.
 
 [![Paired independent mixed download, echo and upload-confirmation series with rate restriction and UDP outage](assets/performance/v0.4.9-independent.svg)](assets/performance/v0.4.9-independent.svg)
 
-The candidate keeps its echo connection usable throughout restriction, outage and
-recovery. During nominal 15–25 second restriction, DOWN averages 177.5 versus
-118.1 Mbps and UP confirmations average 132.1 versus 19.6 Mbps. Whole independent
-UP confirms 1,297,547,264 bytes in 41.76 seconds, compared with 1,144,586,240 bytes
-in 43.03 seconds; both exactly confirm all accepted bytes. The maximum local-write
-gap improves from 2.061 to 1.007 seconds, distinct from the confirmation gaps in
-the table.
+Both versions keep their echo connection usable throughout this capture. The
+candidate sustains much more ordered delivery when QUIC is restricted:
+
+| Nominal probe phase | DOWN Mbps, prior → candidate | UP Mbps, prior → candidate |
+| --- | ---: | ---: |
+| Healthy, 5–15 s | 197.0 → 365.5 | 330.0 → 275.8 |
+| Restricted, 15–25 s | 10.4 → 185.0 | 23.7 → 173.1 |
+| Restored, 25–30 s | 220.9 → 348.3 | 278.1 → 277.8 |
+| UDP outage, 30–33 s | 60.1 → 224.4 | 58.6 → 216.6 |
+| Late recovery, 33–40 s | 152.1 → 207.6 | 160.7 → 264.3 |
+
+During restriction, sampled TCP egress is about 188 Mbps in the candidate versus
+14 Mbps in v0.4.8, while both QUIC paths send about 10 Mbps. Candidate TCP Native
+ACK counters also show about 184 Mbps of service. The surviving TCP link thus
+continues contributing to ordered application delivery. Wire transmission,
+Native acknowledgements and application delivery use different byte/time
+boundaries; their differences are not an exact recovery-overhead calculation.
+
+Recovery is not immediately aggregate-optimal. Candidate DOWN stays around
+172–192 Mbps in the first six bins after the nominal outage, then reaches
+326 Mbps in the final bin as QUIC contributes more. UP has a restriction-phase
+confirmation dip to 63 and 16 Mbps in bins 16/17, followed by 421 Mbps in bin 18.
+These are confirmation-arrival intervals, including catch-up of earlier delivery.
+
+Candidate independent UP confirms 1,330,839,552 bytes in 42.64 seconds, compared
+with 1,073,545,216 bytes in 42.31 seconds; both exactly confirm all accepted bytes.
+The maximum local-write gap improves from 1.693 to 0.789 seconds, distinct from
+the confirmation gaps in the table. No concurrent UP echo latency was measured.
+
+DOWN echo p95 improves from 1860 to 353 ms, but its median rises from 103 to
+226 ms. Even before restriction, candidate median/p95 are 230/287 ms versus
+103/214 ms. The candidate carries substantially more bulk traffic under the same
+offered workload; these values describe the loaded experience rather than an
+isolated latency effect of one change.
 
 There is also a substantial healthy-phase disadvantage in this upload: over
-5–15 seconds, candidate confirmations average **265.9 versus 339.8 Mbps**. Its
-cause remains unresolved. Existing path observations localize the lower service
-to QUIC while TCP continues near 180–190 Mbps; they do not identify the responsible
-admission or native pacing/execution boundary. The bounded release prioritizes
+5–15 seconds, candidate confirmations average **275.8 versus 330.0 Mbps**. The
+disadvantage persists in both halves of that window. Its cause remains unresolved.
+Existing path observations localize the lower service primarily to QUIC while
+TCP continues near 185–190 Mbps; they do not identify the responsible admission
+or native pacing/execution boundary. The bounded release prioritizes
 usable continuity, exact transfers and the separately validated ownership/resource
 corrections while retaining this documented limitation. The measured disadvantage
 is not established as an inevitable cost of recovery, and aggregation is not ideal
 in every phase.
 
 Shading marks nominal probe time. Actual shaper samples and loss events keep their
-own timestamps in the data; collection and commands are sequential. Short phase
-comparisons therefore have boundary uncertainty. A catch-up burst can release
-previously buffered data rather than represent additional physical service.
+own timestamps in the data; collection and commands are sequential. In DOWN,
+the first recorded restored-rate states have collector elapsed labels of
+25.632 seconds for the candidate versus 25.003 for v0.4.8; the first outage-off
+states have labels of 33.934 versus 33.333 seconds. These labels precede the
+sequential shaping commands and are not exact rule-completion timestamps. DOWN lacks an exact
+probe-start wall-clock marker. Boundary bins therefore are not perfectly matched
+intervention windows. A catch-up burst can release previously buffered data
+rather than represent additional physical service.
 
 ### Loss and recovery after it clears
 
 [![Paired QUIC download and echo timing during 20 percent loss and after loss clears](assets/performance/v0.4.9-loss-clear.svg)](assets/performance/v0.4.9-loss-clear.svg)
 
 The candidate avoids the comparator's prolonged low-service interval in this run.
-Mean DOWN goodput at 15–20 seconds is 384.7 versus 9.3 Mbps; at 20–25 seconds it
-is 474.8 versus 14.6 Mbps. Both eventually return to useful service. This comes
-with worse echo tail latency: whole-run p95 is **344 versus 203 ms**, and the
-maximum is 447 versus 302 ms. First body also arrives later, at 0.933 versus
-0.528 seconds. Both complete all 80 echoes. These latency/startup costs accompany
-the throughput result; the different version defaults prevent attribution to a
-single change.
+Mean DOWN goodput at 15–20 seconds is 385.8 versus 28.4 Mbps; at 20–25 seconds it
+is 499.3 versus 88.4 Mbps. Both eventually return to useful service. The candidate
+is slower late in recovery: at 30–40 seconds it delivers **414.5 versus
+444.2 Mbps**, a 6.7% disadvantage.
+
+Whole-run echo p95 is higher, **350 versus 231 ms**, and the maximum is 454 versus
+409 ms. After clearance, candidate 30–40 second median/p95 improve to 105/115 ms
+versus 121/208 ms. First body arrives sooner, at 0.725 versus 1.703 seconds. Every
+actual echo succeeds in both versions. These timing differences accompany the
+throughput result; the different version defaults prevent attribution to a single
+change.
+
+The loss-clear commands begin at profile elapsed 20.197 seconds for the candidate
+and 20.694 seconds for v0.4.8. Exact probe-to-profile offsets are unavailable;
+short receiver bins above 500 Mbps during clearance can drain buffered bytes and
+do not establish higher physical link capacity.
 
 ### Resource costs and validation scope
 
-Healthy mixed service uses more CPU and memory in these observations:
+Healthy mixed service uses more CPU, with higher server memory in DOWN:
 
 | Workload | Peak server/client RSS, KiB, prior → candidate | Summed final endpoint CPU %, prior → candidate |
 | --- | --- | ---: |
-| Mixed DOWN | 122,196 / 72,384 → 190,660 / 58,876 | 117.9 → 132.2 |
-| Mixed UP | 62,608 / 210,928 → 79,260 / 228,576 | 161.1 → 174.4 |
+| Mixed DOWN | 124,940 / 75,180 → 213,164 / 61,980 | 131.5 → 139.1 |
+| Mixed UP | 100,072 / 246,116 → 61,444 / 211,768 | 161.5 → 171.5 |
 
 RSS is sampled process memory, not occupied heap. CPU here is the sum of the two
 processes' final `ps` lifetime-average percentages, not instantaneous CPU or CPU per
 delivered GB. These numbers record additional mixed-workload cost without proving
 its cause. QUIC sender peak RSS is lower in this pair: server DOWN
-347,820 → 179,964 KiB and client UP 385,652 → 154,096 KiB.
+358,868 → 187,520 KiB and client UP 384,004 → 185,432 KiB. Healthy QUIC UP summed
+CPU rises from 176.6% to 186.1% while goodput changes by less than 1%.
 
-The sampled healthy mixed wire/application quotients are 1.230 → 1.132 DOWN and
-1.149 → 1.078 UP. They divide both endpoints' sampled HTB byte increases by
+The sampled healthy mixed wire/application quotients are 1.218 → 1.140 DOWN and
+1.109 → 1.076 UP. They divide both endpoints' sampled HTB byte increases by
 application bytes; sample boundaries differ from probe boundaries and copies,
 framing and ACKs are not separately classified. They are comparative indicators,
-not exact traffic-overhead percentages. RSS fluctuations or finite cleanup tests
-do not establish indefinite sustainability.
+not exact traffic-overhead percentages.
+
+Under independent-link disruption, sampled server/client peak RSS falls from
+218.4/69.5 to 180.2/51.5 MiB in DOWN and from 85.2/214.8 to 57.7/184.8 MiB in UP.
+Loss-clear DOWN instead raises client peak RSS from 67.7 to 96.6 MiB while server
+peak falls from 321.2 to 222.0 MiB. These are loaded process samples, not occupied
+heap or post-teardown retention.
+
+The loss-clear runs also include CPU tick deltas for stable process identities:
+
+| Collector interval | Server/client CPU %, prior → candidate |
+| --- | ---: |
+| Loss, 5–20 s | 17.1 / 9.9 → 91.3 / 40.4 |
+| After clearance, 25–40 s | 137.4 / 93.8 → 107.7 / 89.6 |
+
+Here 100% means one logical CPU; percentages use actual elapsed time between
+process observations. These interval values differ from the lifetime averages
+above. The candidate does substantially more work during loss; after clearance
+both endpoint CPU values are lower. Neither comparison attributes cost to a
+particular function. The eighteen finite runs do not establish indefinite
+sustainability, post-idle memory reuse, or behavior under many concurrent bulk
+flows.
 
 The release gate includes native platform tests and package/link checks for Linux,
 Windows, macOS and Android. Results are recorded by [CI](https://github.com/mnihyc/mptunnel/actions/workflows/ci.yml)
@@ -167,20 +235,29 @@ macOS Network Extension behavior, or performance beyond the measured conditions.
 ### Actual browser workload
 
 Chrome completed Cloudflare's download/upload workload through the default three
-TCP carriers plus one QUIC carrier on this same candidate. The page displayed
-277 Mbps DOWN, 176 Mbps UP, 203 ms idle latency and 204/199 ms loaded DOWN/UP latency.
-The main page and two concurrent navigations returned HTTP 200 and reached complete
-page state; the concurrent pages loaded in about 1.9 and 10.2 seconds. There were
-zero console errors and five GPU/Canvas warnings. Network records also retained
-17 aborted requests: eleven map tiles and six zero-byte phase-latency probes, so
-this does not mean every page request succeeded.
+TCP carriers plus one QUIC carrier on **`2ced0d0`**. The page displayed 263 Mbps
+DOWN, 234 Mbps UP, 198 ms idle latency and 199/198 ms loaded DOWN/UP median latency.
+Loaded maxima were 569/315 ms. The workload completed all 31 download and 25 upload batches. The speed page and two concurrent Cloudflare
+About/documentation navigations returned HTTP 200 and reached complete page state;
+the concurrent pages loaded in 1.42/2.03 seconds.
 
-Cumulative ACK-byte increases on unchanged path identities and epochs show that
-both TCP and QUIC carried traffic in both directions during the workload. Some
-final delivery samples were stale; those counters establish service over the
-observation window, not a current rate at its end. Public destination conditions
-were uncontrolled, so the displayed scores are a browser smoke result, not a
-controlled throughput comparison or an attribution of the slower navigation.
+There were zero console errors and five graphics performance warnings. The speed
+page's captured request list contains 304 HTTP 200 responses, 18 aborted requests
+(eleven map tiles and seven zero-byte phase-latency probes), and two requests with
+unreported terminal outcomes. This is not a census of every tab's subresources,
+and workload completion does not mean every page request completed.
+
+Both endpoints retained the same session and their three TCP plus one QUIC
+carrier identities throughout the observations. Every carrier's cumulative
+Native ACK bytes increased from the initial snapshot to the in-progress snapshot
+and again by completion, with unchanged endpoint-local direction and counter
+epoch. This establishes TCP and
+QUIC service in both directions during the capture. Final rates were stale or
+unavailable; cumulative counters include navigation/control traffic and do not
+establish a current rate or exact speed-test payload.
+
+Public destination conditions were uncontrolled, so the displayed scores are a
+browser smoke result, not a controlled throughput comparison.
 Browser QUIC was disabled to honor the explicit HTTP proxy; the tunnel's QUIC
 carrier remained enabled. The page's WebRTC/packet-loss display does not establish
 tunneled UDP performance.

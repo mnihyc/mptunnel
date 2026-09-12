@@ -70,25 +70,28 @@ TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 
 ## Performance
 
-The v0.4.9 candidate runtime was measured at `65c033c`, before its package-version
-bump, against published v0.4.8 source `d1a99ad`. Eighteen controlled Linux runs
+The v0.4.9 candidate runtime was measured at `2ced0d0`, with package version
+0.4.9, against published v0.4.8 source `d1a99ad`. Eighteen controlled Linux runs
 cover nine paired transport/direction profiles, with one observation per version
 per profile.
 
 The candidate completed **310/310 concurrent download echoes** and confirmed every
 accepted byte in **all four uploads**. With independent TCP and QUIC links under
-restriction and outage, download goodput was 273.5 versus 143.1 Mbps, and the
-longest read gap was 0.788 versus 1.551 seconds. Its echo connection completed all
-80 checks; v0.4.8 recorded 31 successes, one timed-out I/O error and 35 subsequent
-unavailable observations.
+restriction and outage, download goodput was 266.0 versus 124.2 Mbps, and the
+longest read gap was 0.530 versus 0.920 seconds. All actual echo attempts succeeded
+in both versions; slower successful exchanges left v0.4.8 with 64 attempts versus
+the candidate's 80. During the QUIC restriction, ordered download delivery was
+185.0 versus 10.4 Mbps while the candidate preserved service on the healthy TCP link.
 
 [![Candidate and v0.4.8 independent mixed download goodput, echo latency and upload confirmations through restriction and outage](docs/assets/performance/v0.4.9-independent.svg)](docs/assets/performance/v0.4.9-independent.svg)
 
-The improvements have costs. Healthy QUIC download was about 6% slower, the
-loss-clear test's echo p95 increased from 203 to 344 ms, and healthy mixed service
-used more CPU and memory. Independent mixed upload improved during restriction
-(20 to 132 Mbps), but its preceding healthy phase fell from 340 to 266 Mbps; the
-cause remains unresolved. These are complete-version comparisons, including
+The improvements have costs. Healthy QUIC download was about 4% slower, the
+loss-clear test's echo p95 increased from 231 to 350 ms, and healthy mixed download
+used more CPU and server memory. Independent mixed upload improved during
+restriction (24 to 173 Mbps), but its preceding healthy phase fell from 330 to
+276 Mbps; the cause remains unresolved. Mixed loaded latency remains hundreds of
+milliseconds, and full aggregate service does not return immediately after every
+disruption. These are complete-version comparisons, including
 10%/10% sender defaults in v0.4.8 versus 20%/20% in the candidate.
 
 See the [nine comparisons, timing plots and measurement limits](docs/PERFORMANCE.md#september-12-candidate-comparison)

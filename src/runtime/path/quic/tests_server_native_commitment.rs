@@ -3,6 +3,169 @@ use crate::mux::stream::ReliableRecvStream;
 use crate::runtime::path::prepared::PreparedOriginalClaim;
 use std::task::Poll;
 
+/// Diagnostic counterexample for the retained wait's notification, not a
+/// throughput test. An independent observer proves the real native crossing;
+/// neither arm polls the command receiver again before recording its wakes.
+#[tokio::test(flavor = "current_thread")]
+async fn server_quic_native_wait_noop_repoll_diagnostic_loses_writer_wake() {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    #[derive(Default)]
+    struct WriterWake(AtomicUsize);
+
+    impl Wake for WriterWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn observe_crossing(overwrite: bool) -> usize {
+        let stream_id = StreamId(410);
+        let (mut fixture, _accepted_rx) =
+            ServerUdpTerminalWriterFixture::open_with_native_authority(stream_id, None, true).await;
+        fixture.drain_zero_credit_admission().await;
+        let commitment = fixture
+            .server_send
+            .as_mut()
+            .unwrap()
+            .bind_native_commitment()
+            .unwrap();
+        fixture
+            .commands_rx
+            .as_mut()
+            .unwrap()
+            .bind_native_commitment(commitment.clone())
+            .unwrap();
+        let payload = Bytes::from_static(b"source retained through the native wait");
+        let (owner, _stream) = fixture.publish_latency_source(payload.clone()).await;
+
+        // A real H3 control predecessor creates E > P without an Original
+        // flight, so no Product recovery deadline can supply an unrelated wake.
+        // This fixture starts no Product reader or periodic metrics actor.
+        let control = Frame::Ping { nonce: 410 };
+        let mut write = Box::pin(udp_path_write_frame(
+            fixture.server_send.as_mut().unwrap(),
+            &control,
+            fixture.context.codec_limits,
+        ));
+        assert!(matches!(futures::poll!(&mut write), Poll::Ready(Ok(()))));
+        drop(write);
+        let barrier = commitment
+            .capture()
+            .unwrap()
+            .barrier()
+            .expect("accepted H3 predecessor");
+        let native_end = barrier.native_end();
+
+        let authority = fixture.commands_tx.native_rate_authority().unwrap();
+        let scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+            fixture._path_registration.path_instance_id(),
+            crate::protocol::PathMetricDirection::ServerToClient,
+        );
+        let shape = authority.refresh_scheduling_shape(scope).unwrap();
+        assert!(
+            authority
+                .commit_if_current(shape.stamp(), || {
+                    fixture
+                        .context
+                        .reliable_streams
+                        .stage_native_scheduling_shape(&fixture._path_registration, shape)
+                })
+                .unwrap()
+        );
+        fixture
+            .context
+            .reliable_streams
+            .fanout_native_scheduling_shape(&fixture._path_registration, shape);
+        let commands = fixture.commands_rx.as_mut().unwrap();
+        let ReliablePathCommand::PreparedOriginal(work) =
+            try_recv_reliable_path_priority_command(commands).expect("actual source notice")
+        else {
+            panic!("expected prepared Original notice");
+        };
+        let ready = commands
+            .writer_ready_boundary(fixture._path_registration.path_instance_id())
+            .unwrap();
+        let receipt = ready.receipt();
+        let PreparedOriginalClaim::Blocked(wait) = work.try_claim(ready) else {
+            panic!("native predecessor must block this actual Original claim");
+        };
+        commands.defer_prepared_work(work, wait);
+
+        // A real async receiver poll arms the actual deferred work. Cancelling
+        // this receive only releases its borrow: the queue retains the wait,
+        // just as when the actor's competing input branch wins its select.
+        let wakes = Arc::new(WriterWake::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut receive = Box::pin(recv_reliable_path_command(commands));
+        assert!(receive.as_mut().poll(&mut cx).is_pending());
+        drop(receive);
+        assert!(
+            tokio::task::coop::has_budget_remaining(),
+            "isolate wake forwarding from coop suspension"
+        );
+        wakes.0.store(0, Ordering::SeqCst);
+        if overwrite {
+            assert!(try_recv_reliable_path_priority_command(commands).is_none());
+        }
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        assert!(receipt.is_current());
+        {
+            let state = owner.lock();
+            assert_eq!(state.sender.data_bytes(), payload.len());
+            assert_eq!(state.send_stream.next_offset(), 0);
+            assert_eq!(state.send_stream.reinjection_bytes(), 0);
+        }
+
+        // No yield has occurred since acceptance, so neither arm can miss the
+        // transition before its counting waker is installed. This separate
+        // native waiter uses the test task's waker, never the writer counter.
+        let progress =
+            tokio::time::timeout(Duration::from_secs(5), barrier.wait_until_packetized())
+                .await
+                .expect("existing fixture native crossing watchdog")
+                .unwrap();
+        assert_eq!(progress.accepted_end, native_end);
+        assert_eq!(progress.first_unpacketized, native_end);
+        let crossing_wakes = wakes.0.load(Ordering::SeqCst);
+
+        // Only now inspect the receiver. Even the overwritten arm retains a
+        // ready wait and the same unclaimed source; this manual poll must not
+        // be mistaken for evidence that native packetization woke its writer.
+        let notice = try_recv_reliable_path_priority_command(fixture.commands_rx.as_mut().unwrap())
+            .expect("manual repoll recovers the retained prepared notice");
+        assert!(matches!(notice, ReliablePathCommand::PreparedOriginal(_)));
+        assert!(receipt.is_current());
+        let state = owner.lock();
+        assert_eq!(state.sender.data_bytes(), payload.len());
+        assert_eq!(state.send_stream.next_offset(), 0);
+        assert_eq!(state.send_stream.reinjection_bytes(), 0);
+        assert_eq!(fixture.commands_tx.pending_bytes(), 0);
+        assert_eq!(fixture.commands_tx.writer_pending_bytes(), 0);
+        crossing_wakes
+    }
+
+    let retained_real_waker = observe_crossing(false).await;
+    let overwritten_by_noop = observe_crossing(true).await;
+    assert!(
+        retained_real_waker > 0,
+        "real native crossing must wake the armed writer"
+    );
+    // This diagnostic deliberately documents the current defect. A correction
+    // must change this arm to require a positive wake, not discard its wait.
+    assert_eq!(
+        overwritten_by_noop, 0,
+        "synchronous noop repoll loses writer notification"
+    );
+}
+
 /// Exercise the actual shared-source notice and ordinary H3 writer. This child
 /// uses the existing server fixture; all native coordinates come from its real
 /// observer and successful adapter write, without reconstructing framing sizes.

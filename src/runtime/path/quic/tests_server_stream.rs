@@ -1375,6 +1375,151 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
     );
 }
 
+/// Establishes the exact direction ordering with Native's termination wake,
+/// rather than a sleep or a fabricated writer error. The caller deliberately
+/// leaves server request decoding unpolled until response STOP is observed.
+async fn stopped_response_with_decoded_request_reset(
+    stream_id: StreamId,
+) -> (ServerUdpTerminalWriterFixture, Frame) {
+    use crate::runtime::path::native_commitment::NativeCommitmentError;
+
+    let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+    fixture.drain_zero_credit_admission().await;
+    let limits = fixture.context.codec_limits;
+    assert_eq!(
+        udp_path_read_frame(fixture.server_recv.as_mut().unwrap(), limits)
+            .await
+            .unwrap(),
+        Frame::Ping { nonce: 1 },
+    );
+    let commitment = fixture
+        .server_send
+        .as_mut()
+        .unwrap()
+        .bind_native_commitment()
+        .unwrap();
+    let view = commitment.capture().unwrap();
+    let stopped = view.wait_until_terminated();
+    let reset = Frame::StreamReset {
+        stream_id,
+        reason: ResetReason::RemoteClosed,
+    };
+    udp_path_write_frame(fixture.client_send.as_mut().unwrap(), &reset, limits)
+        .await
+        .unwrap();
+    udp_path_finish_stream(fixture.client_send.as_mut().unwrap())
+        .await
+        .unwrap();
+    drop(fixture.client_recv.take());
+
+    assert_eq!(
+        stopped.await,
+        NativeCommitmentError::Native(quinn::SendStreamObservationError::Stopped(
+            quinn::VarInt::from_u32(0),
+        )),
+    );
+    // STOP is a fact about the opposite native direction. Decode the real H3
+    // record only after that fact, while preserving the client send half.
+    let decoded = udp_path_read_frame(fixture.server_recv.as_mut().unwrap(), limits)
+        .await
+        .expect("response STOP must not invalidate the request receive direction");
+    assert_eq!(decoded, reset);
+    (fixture, decoded)
+}
+
+#[tokio::test]
+async fn server_quic_response_stop_preserves_unread_request_reset() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut fixture, decoded) =
+            stopped_response_with_decoded_request_reset(StreamId(419)).await;
+        fixture
+            .context
+            .reliable_streams
+            .route_frame(&fixture._path_registration, fixture.stream_id, decoded.clone())
+            .await
+            .unwrap();
+        let mut product = fixture.accepted.take_stream();
+        assert_eq!(product.recv_frame().await.unwrap(), decoded);
+    })
+    .await
+    .expect("existing QUIC fixture lifetime bound");
+}
+
+/// Diagnostic ordering counterexample, not a proposed desired policy and not
+/// attribution of the ordinary HTTP-abort run. Both inputs come from real H3;
+/// only the actor's routing opportunity is deliberately ordered by this test.
+#[tokio::test]
+async fn server_quic_stopped_writer_diagnostic_preempts_decoded_reset() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for route_before_write in [false, true] {
+            let stream_id = StreamId(if route_before_write { 421 } else { 420 });
+            let (mut fixture, decoded) =
+                stopped_response_with_decoded_request_reset(stream_id).await;
+            let (carrier_tx, mut carrier_frames) = mpsc::channel(1);
+            if route_before_write {
+                fixture
+                    .context
+                    .reliable_streams
+                    .route_frame(&fixture._path_registration, stream_id, decoded.clone())
+                    .await
+                    .unwrap();
+            } else {
+                carrier_tx.send(Ok(decoded.clone())).await.unwrap();
+            }
+            fixture
+                .commands_tx
+                .send_control(ReliablePathCommand::SendFrame(Frame::Pong { nonce: 420 }))
+                .await
+                .unwrap();
+            let command = recv_reliable_path_command(fixture.commands_rx.as_mut().unwrap())
+                .await
+                .unwrap();
+            let mut pending_frames = Vec::new();
+            let mut path_proofs = PathProofTracker::default();
+            let mut deferred_input = None;
+            let error = drain_server_udp_reliable_commands(
+                command,
+                fixture.commands_rx.as_mut().unwrap(),
+                fixture.server_send.as_mut().unwrap(),
+                &fixture.context,
+                stream_id,
+                fixture.path_id,
+                &fixture._path_registration,
+                &mut pending_frames,
+                &mut path_proofs,
+                &mut carrier_frames,
+                &mut deferred_input,
+            )
+            .await
+            .expect_err("the actual native response send half is stopped");
+            assert!(matches!(error, RuntimeError::QuicCarrier(_)));
+            assert!(deferred_input.is_none());
+            assert_eq!(fixture.commands_tx.pending_bytes(), 0);
+            if !route_before_write {
+                assert_eq!(carrier_frames.try_recv().unwrap().unwrap(), decoded);
+            }
+            assert!(matches!(
+                carrier_frames.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            // This is the same exact-output retirement invoked on ordinary
+            // actor error. A previously routed reset must remain ahead of it.
+            drop(ServerUdpReliableOutputDetachGuard {
+                streams: fixture.context.reliable_streams.clone(),
+                path_registration: fixture._path_registration.clone(),
+                stream_id,
+            });
+            assert_eq!(fixture.attached_output_count(), 0);
+            if route_before_write {
+                let mut product = fixture.accepted.take_stream();
+                assert_eq!(product.recv_frame().await.unwrap(), decoded);
+            }
+        }
+    })
+    .await
+    .expect("existing QUIC fixture lifetime bound");
+}
+
 #[tokio::test]
 async fn client_quic_closed_product_recipient_preserves_ordered_terminal_writer() {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1457,6 +1602,113 @@ async fn client_quic_closed_product_recipient_preserves_ordered_terminal_writer(
     })
     .await
     .expect("retired input and ordered terminal writer must complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_quic_native_writer_delivers_reset_after_product_output_drop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // This is a lifecycle failure guard, shared with neighboring H3 tests,
+    // rather than a new timeout in Product or transport behavior.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let stream_id = StreamId(440);
+        let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+        let mut server_recv = fixture.server_recv.take().expect("server receiver");
+        let client_send = fixture.client_send.take().expect("client sender");
+        let client_recv = fixture.client_recv.take().expect("client receiver");
+        let limits = fixture.context.codec_limits;
+        let mux_limits = fixture.context.mux_limits;
+        assert_eq!(
+            udp_path_read_frame(&mut server_recv, limits)
+                .await
+                .expect("read fixture's native opening frame"),
+            Frame::Ping { nonce: 1 }
+        );
+
+        let state = ClientPathState::new(ClientPathHealth::new(
+            Vec::new(),
+            vec![ClientPathHealthRecord::default()],
+        ));
+        let domain = state.execution_domain();
+        fixture
+            ._client_connection
+            .bind_execution_domain(domain.clone())
+            .expect("bind actual Native driver before publishing its source");
+        let (commands, receivers) = reliable_path_command_channels(8);
+        let (frames_tx, frames_rx) = mpsc::channel(1);
+        let output =
+            ReliablePathStreamOutput::fixed(UnderlayProtocol::Udp, PathId(0), commands, mux_limits);
+        let started = Arc::new(AtomicBool::new(false));
+        let observed_started = started.clone();
+        let registration = client_send.native_source_registration();
+
+        // Registering the actual actor, accepting the terminal command, and
+        // releasing Product input/output handles share one domain-owned poll.
+        // Native therefore cannot turn mere queue acceptance into an earlier
+        // transmission before this cancellation boundary has been exercised.
+        let driven = domain
+            .wrap(async move {
+                let driven = registration
+                    .register(async move {
+                        observed_started.store(true, Ordering::SeqCst);
+                        run_client_udp_stream(
+                            client_send,
+                            client_recv,
+                            stream_id,
+                            0,
+                            next_carrier_path_instance_id(),
+                            limits,
+                            mux_limits,
+                            8,
+                            state,
+                            receivers,
+                            frames_tx,
+                        )
+                        .await;
+                    })
+                    .expect("register the real client writer with Native");
+                // reset_all uses this same fixed-output API. It returns on
+                // queue acceptance; the writer owns subsequent native I/O.
+                output
+                    .reset_and_close_stream(stream_id, ResetReason::RemoteClosed)
+                    .await;
+                drop(output);
+                drop(frames_rx);
+                assert!(
+                    !started.load(Ordering::SeqCst),
+                    "the test must release Product before the writer first polls"
+                );
+                driven
+            })
+            .await;
+        let actor = tokio::spawn(domain.wrap(async move {
+            driven
+                .await
+                .expect("native writer remains owned until reset completion");
+        }));
+
+        assert_eq!(
+            udp_path_read_frame(&mut server_recv, limits)
+                .await
+                .expect("peer must decode the reset after Product/output drop"),
+            Frame::StreamReset {
+                stream_id,
+                reason: ResetReason::RemoteClosed,
+            }
+        );
+        let terminal = udp_path_read_frame(&mut server_recv, limits)
+            .await
+            .expect_err("the request direction must finish after its logical reset");
+        assert!(
+            super::super::io::udp_path_input_finished(&terminal),
+            "reset must precede clean native EOF, got {terminal:?}"
+        );
+        actor.await.expect("client writer supervisor must finish");
+        assert!(!fixture._client_connection.is_closed());
+        assert!(!fixture._server_connection.is_closed());
+    })
+    .await
+    .expect("queued reset must reach the native peer without retaining Product");
 }
 
 #[tokio::test]

@@ -236,6 +236,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                         "client QUIC terminal command stream does not match writer",
                     ));
                 }
+                send.trace_terminal_progress("client_reset_dequeued", stream_id);
                 pending_frames.push(Frame::StreamReset {
                     stream_id: reset_stream_id,
                     reason,
@@ -254,7 +255,14 @@ pub(super) async fn drain_client_udp_stream_commands(
                     carrier_input_open,
                 )
                 .await?;
-                let _ = udp_path_finish_stream(send).await;
+                send.trace_terminal_progress("client_reset_flushed", stream_id);
+                let finish_result = udp_path_finish_stream(send).await;
+                super::io::terminal_trace(
+                    "client_reset_finish",
+                    stream_id,
+                    format_args!("result={finish_result:?}"),
+                );
+                send.trace_terminal_progress("client_reset_after_finish", stream_id);
                 true
             }
             ReliablePathCommand::CloseStream(close_stream_id) => {

@@ -368,11 +368,26 @@ pub(super) async fn handle_server_udp_reliable_stream(
             },
         ),
     );
-    tokio::select! {
+    let result = tokio::select! {
         biased;
-        result = repair => result,
-        result = ordinary => result?,
-    }
+        result = repair => {
+            super::io::terminal_trace("server_repair_exit", stream_id, format_args!("session_id={} path_id={} result={result:?}", session_id.0, path_id.0));
+            result
+        },
+        result = ordinary => {
+            super::io::terminal_trace("server_ordinary_exit", stream_id, format_args!("session_id={} path_id={} result={result:?}", session_id.0, path_id.0));
+            result?
+        },
+    };
+    super::io::terminal_trace(
+        "server_attachment_exit",
+        stream_id,
+        format_args!(
+            "session_id={} path_id={} result={result:?}",
+            session_id.0, path_id.0
+        ),
+    );
+    result
 }
 
 struct ServerUdpReliableStreamLoop {

@@ -77,7 +77,42 @@ fn quic_stream_priority(lane: TrafficClass) -> i32 {
     }
 }
 
+// Diagnostic-only terminal boundary observation; no per-byte trace or waiting.
+pub(in crate::runtime) fn terminal_trace(
+    event: &str,
+    stream_id: crate::protocol::StreamId,
+    detail: std::fmt::Arguments<'_>,
+) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var("MPTUNNEL_TERMINAL_TRACE").as_deref() == Ok("1")) {
+        let unix_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("diagnostic clock").as_micros();
+        eprintln!("terminal_trace unix_us={unix_us} event={event} stream_id={} {detail}", stream_id.0);
+    }
+}
+
 impl UdpPathSendStream {
+    pub(super) fn trace_terminal_progress(
+        &self,
+        event: &str,
+        stream_id: crate::protocol::StreamId,
+    ) {
+        if std::env::var("MPTUNNEL_TERMINAL_TRACE").as_deref() != Ok("1") {
+            return;
+        }
+        let progress = self
+            .stream
+            .native_progress_observer()
+            .and_then(|observer| observer.snapshot());
+        terminal_trace(
+            event,
+            stream_id,
+            format_args!(
+                "request_stream_id={} progress={progress:?}",
+                self.request_stream_id()
+            ),
+        );
+    }
+
     pub(super) fn native_source_registration(&self) -> quic_transport::NativeSourceRegistration {
         self.stream.native_source_registration()
     }
@@ -777,8 +812,23 @@ pub(super) fn spawn_quic_path_reader(
                 }
                 Err(err) => Err(err),
             };
+            let terminal_stream = match &frame {
+                Ok(Frame::StreamReset { stream_id, .. }) => Some(*stream_id),
+                _ => None,
+            };
+            if let Some(stream_id) = terminal_stream {
+                terminal_trace("reader_reset_decoded", stream_id, format_args!(""));
+            }
             let done = frame.is_err();
-            if frames_tx.send(frame).await.is_err() || done {
+            let send_result = frames_tx.send(frame).await;
+            if let Some(stream_id) = terminal_stream {
+                terminal_trace(
+                    "reader_reset_channel_send",
+                    stream_id,
+                    format_args!("accepted={}", send_result.is_ok()),
+                );
+            }
+            if send_result.is_err() || done {
                 return;
             }
         }

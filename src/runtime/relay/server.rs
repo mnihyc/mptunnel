@@ -3826,7 +3826,10 @@ where
                 Frame::StreamReset {
                     stream_id: reset_stream_id,
                     reason,
-                } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
+                } if reset_stream_id == stream_id => {
+                    crate::runtime::path::quic::io::terminal_trace("server_product_reset_consumed", stream_id, format_args!("reason={reason:?}"));
+                    return Err(RuntimeError::RemoteReset(reason));
+                },
                 Frame::StreamData {
                     stream_id: received_stream_id,
                     offset,

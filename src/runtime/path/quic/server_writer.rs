@@ -537,6 +537,21 @@ async fn flush_server_udp_frame_batch(
         },
     )
     .await;
+    if let Err(error) = &result {
+        let deferred_reset = match deferred_input {
+            Some(Ok(Frame::StreamReset { stream_id, .. })) => Some(stream_id.0),
+            _ => None,
+        };
+        super::io::terminal_trace(
+            "server_interlock_write_error",
+            stream_id,
+            format_args!(
+                "error={error} deferred={} deferred_reset={deferred_reset:?} channel_len={}",
+                deferred_input.is_some(),
+                carrier_frames.len()
+            ),
+        );
+    }
     commands.release_pending_command_bytes(std::mem::take(pending_frame_command_bytes));
     let _routed_frames = result?;
     #[cfg(feature = "lab-diagnostics")]

@@ -15,8 +15,8 @@ use super::io::{
     ReliableResponsePathStaleness, apply_ready_stream_data_batch, begin_reliable_stream_ack,
     collect_ready_stream_data_batch, exact_contiguous_retransmission_frames,
     pending_stream_fin_ready, preserve_reinjection_frontier_quantum, read_reliable_relay_payload,
-    receive_stream_fin, reconcile_accepted_copy_wake, resize_reliable_relay_buffer,
-    retain_accepted_copy_wake, stream_ack_gap_frontier_reinjection_frames_normalized,
+    receive_stream_fin, reconcile_accepted_copy_wake, retain_accepted_copy_wake,
+    stream_ack_gap_frontier_reinjection_frames_normalized,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required, update_reinjection_authoritative_ack_snapshot,
     write_applied_ready_stream_data_batch,
@@ -155,15 +155,24 @@ impl ServerReliableRelayService {
                             continue;
                         }
                     };
+                    let execution_domain = match accepted.session_execution_domain() {
+                        Ok(domain) => domain,
+                        Err(_) => {
+                            accepted.close().await;
+                            continue;
+                        }
+                    };
                     let retirement = accepted.supervise();
                     let context = self.context.clone();
-                    let task = relays.spawn(async move {
+                    // ACK application and actual cancellation/drop participate
+                    // in the same session domain as the carrier source claim.
+                    let task = relays.spawn(execution_domain.wrap(async move {
                         tokio::select! {
                             biased;
                             _ = session_retirement.wait() => Ok(()),
                             result = relay_accepted_stream(context, accepted) => result,
                         }
-                    });
+                    }));
                     let replaced = retirements.insert(task.id(), retirement);
                     debug_assert!(replaced.is_none());
                 }
@@ -3097,9 +3106,6 @@ where
                 .min(sender_queue_limit)
                 .min(latency_startup_credit)
                 .min(source_staging_headroom);
-            if source_read_ceiling > 0 {
-                resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
-            }
             let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
                 reliable_relay_sender_dispatch_budget(
                     mux_limits,
@@ -3195,7 +3201,6 @@ where
                 send_path_snapshot.is_some() && can_read_by_flow && read_budget > 0;
             let can_send_pending_fin =
                 pending_local_fin && response_sender.is_empty() && !close.sent;
-
             // Membership and pending control publication can become reconciled in
             // this turn without producing another wake. Reconsider completion only
             // after that work, while retaining every exact-recipient obligation.
@@ -3261,6 +3266,11 @@ where
                 prepared_work_wait,
             )
         };
+        if !can_read_local {
+            // Eligibility ended. An inactive source owns no admission position;
+            // a losing select alone preserves its unsatisfied position instead.
+            send_buffer_updates.withdraw();
+        }
 
         // Carrier input and target responses can both remain continuously
         // ready during an upload. Fair polling keeps response progress from
@@ -3817,7 +3827,9 @@ where
                 Frame::StreamReset {
                     stream_id: reset_stream_id,
                     reason,
-                } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
+                } if reset_stream_id == stream_id => {
+                    return Err(RuntimeError::RemoteReset(reason));
+                },
                 Frame::StreamData {
                     stream_id: received_stream_id,
                     offset,
@@ -4106,8 +4118,9 @@ where
             let reserved_read_budget = permit.bytes();
             #[cfg(feature = "lab-diagnostics")]
             let read_started = Instant::now();
+
             let result =
-                read_reliable_relay_payload(&mut local, &mut buf, reserved_read_budget).await;
+                read_reliable_relay_payload(&mut local, &mut buf, reserved_read_budget, read_budget).await;
             #[cfg(feature = "lab-diagnostics")]
             if let Ok((read, _)) = &result {
                 lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
@@ -4177,8 +4190,9 @@ where
                             let permit = session_send_buffer
                                 .reserve(&mut send_buffer_updates, next_read_budget)
                                 .await;
+
                             let result = read_reliable_relay_payload(
-                                &mut local, &mut buf, permit.bytes(),
+                                &mut local, &mut buf, permit.bytes(), next_read_budget,
                             ).await;
                             (result, permit)
                         } => read,

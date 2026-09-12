@@ -27,6 +27,9 @@ pub(in crate::runtime) struct ServerSessionTracker {
 struct ServerSessionEntry {
     references: u32,
     send_buffer: SessionSendBuffer,
+    // Lifetime capability shared by this authenticated session's Product
+    // actor and carrier polls; it owns no path policy or native packet state.
+    execution_domain: quinn::ExecutionDomain,
     principal_permit: PrincipalPermit,
     retirement: watch::Sender<Option<CloseReason>>,
     retired_until: Option<Instant>,
@@ -90,6 +93,7 @@ impl ServerSessionTracker {
             .or_insert_with(|| ServerSessionEntry {
                 references: 0,
                 send_buffer: SessionSendBuffer::new(self.send_buffer_limit_bytes),
+                execution_domain: quinn::ExecutionDomain::default(),
                 principal_permit: principal_permit.clone(),
                 retirement: watch::channel(None).0,
                 retired_until: None,
@@ -144,6 +148,19 @@ impl ServerSessionTracker {
         Ok(ServerSessionRetirement::pending(
             entry.retirement.subscribe(),
         ))
+    }
+
+    pub(in crate::runtime::stream) fn session_execution_domain(
+        &self,
+        session_id: SessionId,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError> {
+        let sessions = self.sessions.lock().expect("server session tracker lock");
+        let entry = sessions
+            .get(&session_id)
+            .ok_or(RuntimeError::ReliablePathSessionClosed)?;
+        // Existing retiring owners still need the same domain for destruction.
+        // This lookup never admits or creates an authenticated session.
+        Ok(entry.execution_domain.clone())
     }
 
     fn commit_if_active<T>(

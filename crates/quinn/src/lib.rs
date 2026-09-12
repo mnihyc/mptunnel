@@ -45,12 +45,17 @@ use std::sync::Arc;
 
 mod connection;
 mod endpoint;
+mod execution_binding;
+mod execution_domain;
 mod incoming;
 mod mutex;
 mod recv_stream;
 mod runtime;
 mod send_stream;
 mod work_limiter;
+
+pub use execution_binding::ExecutionDomainConflict;
+pub use execution_domain::{DomainFuture, ExecutionDomain};
 
 #[cfg(not(wasm_browser))]
 pub(crate) use std::time::{Duration, Instant};
@@ -65,8 +70,8 @@ pub use proto::{
     ConnectionIdGenerator, ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats,
     FrameType, IdleTimeout, MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats,
     SendStreamProgress, ServerConfig, Side, StdSystemTime, StreamId, TimeSource, TokenLog,
-    TokenMemoryCache, TokenReuseError, TokenStore, Transmit, TransportConfig, TransportErrorCode, UdpStats,
-    ValidationTokenConfig, VarInt, VarIntBoundsExceeded, Written, congestion, crypto,
+    TokenMemoryCache, TokenReuseError, TokenStore, Transmit, TransportConfig, TransportErrorCode,
+    UdpStats, ValidationTokenConfig, VarInt, VarIntBoundsExceeded, Written, congestion, crypto,
 };
 #[cfg(feature = "qlog")]
 pub use proto::{QlogConfig, QlogStream};

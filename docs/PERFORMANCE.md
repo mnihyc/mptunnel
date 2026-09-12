@@ -4,48 +4,213 @@ MPTUNNEL aggregates independent links and keeps active traffic attached when a
 carrier changes or disappears. Results depend on path conditions, direction,
 workload, host capacity, and the native TCP or QUIC implementation.
 
-## Current evidence publication gate
+## September 12 candidate comparison
 
-No current-release time-series ranking is published. Publication requires
-matched repetitions that pass the complete measurement gate; individual
-diagnostic runs do not update the historical scalar tables below.
+This cohort measures the **v0.4.9 runtime at `65c033c`**, built before the package
+version changed from **0.4.8** to **0.4.9**, against **`d1a99ad`**, the published
+v0.4.8 source. Subsequent release preparation changes package version and public
+documentation; the measured scheduling and recovery code is unchanged. Both measured
+executables are optimized local builds of the named sources. There are eighteen runs: one observation per
+version for each of the nine comparisons below. The
+[complete sampled series and source identities](assets/performance/v0.4.9-comparison-series.json)
+accompany the figures; no repetitions, confidence bands or best-run selection
+are implied.
 
-The gate includes TCP, QUIC and mixed traffic, sudden QoS and outages, both
-directions, short/concurrent browser requests and sustained transfers. It also
-requires independent-versus-shared link checks and long-lived resource checks.
-Improved bulk throughput cannot substitute for missing interactive service or
-poor recovery after the link improves.
+The candidate completed all **310/310 download echo checks** and all **four upload
+streams**, with target-confirmed bytes equal to locally accepted bytes and valid
+sink-ACK accounting. It sustained useful service through the two impaired
+profiles and recovered in the same running client. The observed costs below
+remain part of acceptance. The default TCP+QUIC Cloudflare browser workload also
+completed on this candidate. Linux/Windows/macOS/Android validation has the separate
+build, test and package scope described below. These finite observations do not
+establish universal non-regression.
 
-## Current reordering and recovery
+### Conditions and accounting
 
-Current development QUIC has a reproducible performance limitation under deep
-packet reordering, also present in v0.4.8. This prevents a competitive release
-verdict; passing component correctness tests does not resolve it.
+All runs use isolated Linux containers on one host, the same paired configurations
+and receiver probes, normal worker pools, and no diagnostic observer overrides.
+Each version uses its own documented defaults: optional reinjection and QUIC loss
+compensation are 10%/10% in v0.4.8 and 20%/20% in the candidate. This compares whole
+versions, not the isolated causal effect of one mechanism or default.
 
-[![Current MPP QUIC and Hysteria2 bulk speed and echo latency when packet jitter ends](assets/performance/quic-reordering-recovery.svg)](assets/performance/quic-reordering-recovery.svg)
+- **Healthy:** one shared 500 Mbps link, 70 ms DOWN/30 ms UP, no injected loss,
+  jitter, rate cut or blackhole; 25 seconds of offered load. TCP uses three default
+  carriers, QUIC one; mixed uses both on that same physical link.
+- **Independent:** three TCP carriers on one 200 Mbps link and one QUIC carrier on
+  another 200 Mbps link, 70/30 ms, 40 seconds. QUIC forward capacity is restricted
+  to 10 Mbps nominally at 15–25 seconds, with a UDP blackhole nominally at
+  30–33 seconds. UP mirrors the impairment onto its sending direction.
+- **Loss-clear:** QUIC, 500 Mbps, 70/30 ms, 40 seconds; 20% DOWN loss until the first
+  existing profile epoch at or after 20 seconds, then zero. UP loss remains zero;
+  no jitter, rate cut or blackhole is injected.
 
-This focused comparison uses a forwarding router with 500 Mbps downstream,
-100 Mbps upstream, 100 ms base RTT and unequal directional jitter, removed
-after about eight seconds. No packet loss is injected. Both products keep the
-same download connection throughout. MPP discovers bandwidth dynamically;
-Hysteria2 2.10.0 uses configured 500/100-Mbps Brutal rates.
+DOWN goodput measures ordered application-body delivery. Each finite download
+intentionally stops with a partial 8 GiB HTTP 200 response at its duration limit.
+UP measures target-sink confirmation arrival, including setup and settlement in
+its whole-run elapsed time. Confirmation bins can burst above physical link rate;
+that does not mean the target received new bytes at that instantaneous rate. UP
+has no concurrent echo probe. The tunnel processes start before each probe, so
+first-body/first-confirmation values cover application startup over established
+carriers, not a separate cold-process startup test.
 
-MPP reached about 450 Mbps roughly eight seconds after jitter ended; Hysteria2
-did so in roughly two seconds. Full-run receiver averages were 294 and
-363 Mbps, respectively. Hysteria2 had the longer bulk pause during reordering
-(5.36 versus 1.80 seconds), but completed all 80 concurrent echo checks. MPP's
-echo request timed out after four successful checks; later samples are missing,
-not zero latency. One run per product establishes a counterexample, not a
-general ranking or a statistically established recovery bound.
+### Whole-run results
 
-Separate router runs with sustained jitter and no injected loss measured
-0.74 Mbps for current MPP QUIC, 0.67 Mbps for v0.4.8 QUIC and 9.39 Mbps for raw
-TCP. All router queue-drop counters stayed zero in the current QUIC run.
-The low current throughput is therefore not explained simply by injected
-packet loss or by a regression introduced after v0.4.8. The exact native
-loss/reordering correction and its wider performance effects remain under
-investigation. Independent-link aggregation and complete bidirectional browser
-comparisons have not yet been rerun for this development candidate.
+All paired values below are **published v0.4.8 → candidate**. DOWN gaps are between
+application body reads; UP gaps are between target-sink confirmations. Echo p95
+uses successful attempts only, with failures stated separately. Mbps is rounded
+to one decimal, gaps to milliseconds and echo latency to whole milliseconds.
+
+| Profile / transport | Direction | Goodput, Mbps | Longest delivery gap, s | DOWN echo p95, ms |
+| --- | --- | ---: | ---: | ---: |
+| Healthy TCP | DOWN | 386.2 → 423.7 | 0.318 → 0.306 | 1100 → 335 |
+| Healthy TCP | UP | 447.5 → 439.4 | 0.471 → 0.437 | Not measured |
+| Healthy QUIC | DOWN | 431.4 → 407.1 | 0.169 → 0.100 | 199 → 209 |
+| Healthy QUIC | UP | 434.1 → 422.5 | 0.368 → 0.304 | Not measured |
+| Healthy TCP+QUIC | DOWN | 397.2 → 412.9 | 0.206 → 0.444 | 1023 → 414 |
+| Healthy TCP+QUIC | UP | 423.2 → 439.1 | 0.836 → 0.649 | Not measured |
+| Independent TCP+QUIC | DOWN | 143.1 → 273.5 | 1.551 → 0.788 | 1297 → 342 |
+| Independent TCP+QUIC | UP | 212.8 → 248.5 | 1.392 → 0.964 | Not measured |
+| Loss-clear QUIC | DOWN | 206.5 → 391.5 | 0.408 → 0.376 | 203 → 344 |
+
+Healthy candidate DOWN completes 50/50 echoes for each transport. The corresponding
+v0.4.8 TCP/QUIC/mixed runs complete 37/37, 50/50 and 40/40; slower sequential
+exchanges leave fewer attempts within the fixed duration. Independent candidate
+DOWN completes 80/80. Its comparator has **31 successes, one I/O error reporting a
+timeout, then 35 unavailable-after-disconnect observations**. Those are not 36
+independent timeouts. Both loss-clear runs complete 80/80 echoes.
+
+### Healthy service
+
+[![Paired TCP, QUIC and mixed healthy download, concurrent echo and upload-confirmation timing](assets/performance/v0.4.9-healthy.svg)](assets/performance/v0.4.9-healthy.svg)
+
+Every healthy one-second delivery bin is positive. TCP and mixed DOWN improve
+whole-run goodput and echo p95 in this pair. QUIC DOWN is 5.6% slower and QUIC UP
+2.7% slower. The candidate's healthy mixed maximum read gap increases from 0.206
+to 0.444 seconds, at 9.674–10.118 seconds, followed by continuing delivery; all
+50 echoes succeed. Neither a better average nor the short duration removes that
+observed pause from the comparison.
+
+Candidate healthy uploads confirm 1,447,231,488 bytes over TCP, 1,407,778,816 over
+QUIC and 1,456,209,920 over mixed paths. Their full elapsed times are 26.35, 26.66
+and 26.53 seconds for 25 seconds of offered load. All accepted bytes are confirmed;
+the extra elapsed time includes setup/settlement and is not an exact final-write
+drain-time measurement.
+
+### Independent links and recovery
+
+[![Paired independent mixed download, echo and upload-confirmation series with rate restriction and UDP outage](assets/performance/v0.4.9-independent.svg)](assets/performance/v0.4.9-independent.svg)
+
+The candidate keeps its echo connection usable throughout restriction, outage and
+recovery. During nominal 15–25 second restriction, DOWN averages 177.5 versus
+118.1 Mbps and UP confirmations average 132.1 versus 19.6 Mbps. Whole independent
+UP confirms 1,297,547,264 bytes in 41.76 seconds, compared with 1,144,586,240 bytes
+in 43.03 seconds; both exactly confirm all accepted bytes. The maximum local-write
+gap improves from 2.061 to 1.007 seconds, distinct from the confirmation gaps in
+the table.
+
+There is also a substantial healthy-phase disadvantage in this upload: over
+5–15 seconds, candidate confirmations average **265.9 versus 339.8 Mbps**. Its
+cause remains unresolved. Existing path observations localize the lower service
+to QUIC while TCP continues near 180–190 Mbps; they do not identify the responsible
+admission or native pacing/execution boundary. The bounded release prioritizes
+usable continuity, exact transfers and the separately validated ownership/resource
+corrections while retaining this documented limitation. The measured disadvantage
+is not established as an inevitable cost of recovery, and aggregation is not ideal
+in every phase.
+
+Shading marks nominal probe time. Actual shaper samples and loss events keep their
+own timestamps in the data; collection and commands are sequential. Short phase
+comparisons therefore have boundary uncertainty. A catch-up burst can release
+previously buffered data rather than represent additional physical service.
+
+### Loss and recovery after it clears
+
+[![Paired QUIC download and echo timing during 20 percent loss and after loss clears](assets/performance/v0.4.9-loss-clear.svg)](assets/performance/v0.4.9-loss-clear.svg)
+
+The candidate avoids the comparator's prolonged low-service interval in this run.
+Mean DOWN goodput at 15–20 seconds is 384.7 versus 9.3 Mbps; at 20–25 seconds it
+is 474.8 versus 14.6 Mbps. Both eventually return to useful service. This comes
+with worse echo tail latency: whole-run p95 is **344 versus 203 ms**, and the
+maximum is 447 versus 302 ms. First body also arrives later, at 0.933 versus
+0.528 seconds. Both complete all 80 echoes. These latency/startup costs accompany
+the throughput result; the different version defaults prevent attribution to a
+single change.
+
+### Resource costs and validation scope
+
+Healthy mixed service uses more CPU and memory in these observations:
+
+| Workload | Peak server/client RSS, KiB, prior → candidate | Summed final endpoint CPU %, prior → candidate |
+| --- | --- | ---: |
+| Mixed DOWN | 122,196 / 72,384 → 190,660 / 58,876 | 117.9 → 132.2 |
+| Mixed UP | 62,608 / 210,928 → 79,260 / 228,576 | 161.1 → 174.4 |
+
+RSS is sampled process memory, not occupied heap. CPU here is the sum of the two
+processes' final `ps` lifetime-average percentages, not instantaneous CPU or CPU per
+delivered GB. These numbers record additional mixed-workload cost without proving
+its cause. QUIC sender peak RSS is lower in this pair: server DOWN
+347,820 → 179,964 KiB and client UP 385,652 → 154,096 KiB.
+
+The sampled healthy mixed wire/application quotients are 1.230 → 1.132 DOWN and
+1.149 → 1.078 UP. They divide both endpoints' sampled HTB byte increases by
+application bytes; sample boundaries differ from probe boundaries and copies,
+framing and ACKs are not separately classified. They are comparative indicators,
+not exact traffic-overhead percentages. RSS fluctuations or finite cleanup tests
+do not establish indefinite sustainability.
+
+The release gate includes native platform tests and package/link checks for Linux,
+Windows, macOS and Android. Results are recorded by [CI](https://github.com/mnihyc/mptunnel/actions/workflows/ci.yml)
+and [Release Check](https://github.com/mnihyc/mptunnel/actions/workflows/release-check.yml).
+Their build/test/package evidence does not establish Android VPN device performance,
+macOS Network Extension behavior, or performance beyond the measured conditions.
+
+### Actual browser workload
+
+Chrome completed Cloudflare's download/upload workload through the default three
+TCP carriers plus one QUIC carrier on this same candidate. The page displayed
+277 Mbps DOWN, 176 Mbps UP, 203 ms idle latency and 204/199 ms loaded DOWN/UP latency.
+The main page and two concurrent navigations returned HTTP 200 and reached complete
+page state; the concurrent pages loaded in about 1.9 and 10.2 seconds. There were
+zero console errors and five GPU/Canvas warnings. Network records also retained
+17 aborted requests: eleven map tiles and six zero-byte phase-latency probes, so
+this does not mean every page request succeeded.
+
+Cumulative ACK-byte increases on unchanged path identities and epochs show that
+both TCP and QUIC carried traffic in both directions during the workload. Some
+final delivery samples were stale; those counters establish service over the
+observation window, not a current rate at its end. Public destination conditions
+were uncontrolled, so the displayed scores are a browser smoke result, not a
+controlled throughput comparison or an attribution of the slower navigation.
+Browser QUIC was disabled to honor the explicit HTTP proxy; the tunnel's QUIC
+carrier remained enabled. The page's WebRTC/packet-loss display does not establish
+tunneled UDP performance.
+
+## Historical packet-reordering limitation
+
+Older development snapshots and v0.4.8 exhibited a severe QUIC limitation under
+deep packet reordering. **This schedule was not repeated in the September 12
+candidate matrix.** The new restriction/loss-clear evidence does not establish
+that this historical case is resolved.
+
+[![Historical MPP QUIC and Hysteria2 bulk and echo timing when packet jitter ends](assets/performance/quic-reordering-recovery.svg)](assets/performance/quic-reordering-recovery.svg)
+
+The historical comparison used a forwarding router with 500 Mbps downstream,
+100 Mbps upstream, 100 ms base RTT and unequal directional jitter, removed after
+about eight seconds. No packet loss was injected. Both products kept the same
+download connection; Hysteria2 2.10.0 used configured 500/100-Mbps Brutal rates.
+
+The measured MPP snapshot reached about 450 Mbps roughly eight seconds after
+jitter ended; Hysteria2 did so in roughly two seconds. Full-run receiver averages
+were 294 and 363 Mbps. Hysteria2 had the longer bulk pause during reordering
+(5.36 versus 1.80 seconds), but completed all 80 concurrent echoes. MPP's echo
+timed out after four successes; subsequent observations were unavailable, not zero
+latency. One run per product establishes that counterexample, not a general ranking.
+
+Separate historical router runs with sustained jitter and no injected loss
+measured 0.74 Mbps for the development MPP QUIC snapshot, 0.67 Mbps for v0.4.8 QUIC
+and 9.39 Mbps for raw TCP. Router queue-drop counters stayed zero in that development
+QUIC run. These observations retain their original limited scope and do not
+characterize the newly measured candidate under the different profiles above.
 
 ## Historical ordered diagnostic series
 
@@ -61,9 +226,9 @@ values in hover text.
 
 ## v0.4.5-v0.4.8 accepted correctness evidence
 
-Focused correctness gates establish the following bounded corrections. They
-are not throughput or latency measurements and do not establish a product
-ranking.
+These records describe bounded corrections in the identified earlier releases.
+They are historical correctness evidence, not new throughput/latency measurements
+or a product ranking of the September 12 candidate.
 
 - Exact stream-attachment requalification uses a non-owning data-bearing probe,
   an exact attachment ACK, and fresh uniquely owned Product data to restore
@@ -384,9 +549,13 @@ time-series figure is therefore evidence only for its own cohort. It does not
 update the historical tables above, establish behavior outside its observation
 window, or prove the cause of a rate or latency change by itself.
 
-Interpret samples at the interval recorded by their cohort. The historical
-fixed-profile runs used 200 ms delivery samples and one-second management-rate
-samples; a derived series may aggregate those samples further. Short zero or
+Interpret samples at the interval recorded by their cohort. The September 12
+figures retain every raw one-second bin and actual echo attempt, with no smoothing
+or variability bands. Echo failures remain explicit outcomes, and unavailable
+latencies remain gaps. UP confirmation settlement is retained beyond offered load;
+no later zero bins or missing UP echo series are fabricated. Whole quantiles come
+from the probes. The historical fixed-profile runs used 200 ms delivery samples
+and one-second management-rate samples; their derived series may aggregate further. Short zero or
 spike buckets can reflect application buffering or ACK release. Diagnose
 interruptions with ordered-delivery gaps, native service, Data ACK progress,
 queue and flight ownership, interface drops, and the path lifecycle together.
@@ -400,6 +569,7 @@ cap. Production contains no fixed Mbps target or fixed percentage threshold.
 These measurements do not establish:
 
 - current-release performance from the historical v0.2.1–v0.2.2 tables;
+- resolution of the historical deep-reordering case by the different September 12 profiles;
 - performance outside any cohort's exact conditions or after its measured
   observation window;
 - causality from a throughput or latency trace alone;

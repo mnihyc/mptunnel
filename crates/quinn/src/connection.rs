@@ -40,6 +40,10 @@ use proto::{
 #[path = "tests_send_stream_observer.rs"]
 mod tests_send_stream_observer;
 
+#[path = "transmit_source.rs"]
+mod transmit_source;
+use transmit_source::{TransmitSource, TransmitSources};
+
 /// In-progress connection attempt future
 #[derive(Debug)]
 pub struct Connecting {
@@ -59,6 +63,7 @@ impl Connecting {
     ) -> Self {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
+        let (transmit_sources_tx, transmit_sources_rx) = mpsc::unbounded_channel();
         let conn = ConnectionRef::new(
             handle,
             conn,
@@ -68,9 +73,14 @@ impl Connecting {
             on_connected_send,
             socket,
             runtime.clone(),
+            transmit_sources_tx,
         );
 
-        let driver = ConnectionDriver(conn.clone());
+        let driver = ConnectionDriver {
+            conn: conn.clone(),
+            sources: TransmitSources::new(transmit_sources_rx),
+        };
+        let driver = conn.execution.wrap(driver);
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
@@ -245,60 +255,107 @@ impl Future for ZeroRttAccepted {
 /// packets still in flight from the peer are handled gracefully.
 #[must_use = "connection drivers must be spawned for their connections to function"]
 #[derive(Debug)]
-struct ConnectionDriver(ConnectionRef);
+struct ConnectionDriver {
+    conn: ConnectionRef,
+    sources: TransmitSources,
+}
 
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let conn = &mut *self.0.state.lock("poll");
+        let this = self.get_mut();
+        this.sources.receive(cx);
+        // One budget for the entire driver turn, including inline source refills.
+        let mut transmits = 0;
+        loop {
+            let mut conn = this.conn.state.lock("poll");
+            let span = debug_span!("drive", id = conn.handle.0);
+            let _guard = span.enter();
 
-        let span = debug_span!("drive", id = conn.handle.0);
-        let _guard = span.enter();
+            if let Err(e) = conn.process_conn_events(&this.conn.shared, cx) {
+                conn.terminate(e, &this.conn.shared);
+                drop(conn);
+                this.sources.close();
+                return Poll::Ready(Ok(()));
+            }
+            if !this.sources.is_empty() {
+                // ACK/flow-control and packetization wakes must be forwarded
+                // before polling a producer. Its poll and drop may lock native.
+                conn.forward_app_events(&this.conn.shared);
+                conn.driver = Some(cx.waker().clone());
+                let terminal = conn.error.is_some();
+                drop(conn);
+                if terminal {
+                    this.sources.close();
+                } else {
+                    this.sources.poll_ready(cx);
+                }
+                conn = this.conn.state.lock("poll_after_source");
+            }
 
-        if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
-            conn.terminate(e, &self.0.shared);
+            let (mut keep_going, source_ready) = if transmits >= MAX_TRANSMIT_DATAGRAMS {
+                (true, false)
+            } else {
+                match conn.drive_transmit(
+                    cx,
+                    &this.conn.shared,
+                    !this.sources.is_empty(),
+                    &mut transmits,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        // Publish fatal local failure before dropping sources,
+                        // including those holding public connection handles.
+                        if conn.error.is_none() {
+                            conn.terminate(
+                                ConnectionError::TransportError(proto::TransportError {
+                                    code: proto::TransportErrorCode::INTERNAL_ERROR,
+                                    frame: None,
+                                    reason: format!("local UDP transmit failed: {error}"),
+                                }),
+                                &this.conn.shared,
+                            );
+                        }
+                        drop(conn);
+                        this.sources.close();
+                        return Poll::Ready(Err(error));
+                    }
+                }
+            };
+            keep_going |= conn.drive_timer(cx);
+            conn.forward_endpoint_events();
+            conn.forward_app_events(&this.conn.shared);
+
+            if conn.error.is_some() {
+                // A source destructor can wake native work. Publish the driver
+                // waker before releasing its mutex, including during draining.
+                conn.driver = Some(cx.waker().clone());
+                drop(conn);
+                this.sources.close();
+                conn = this.conn.state.lock("poll_after_source_close");
+            }
+            if source_ready && !this.sources.is_empty() {
+                // The actual packetization event has now been forwarded. Do
+                // not call poll_transmit again until its ready source had the
+                // inline opportunity, even at the last datagram of this turn.
+                conn.driver = Some(cx.waker().clone());
+                drop(conn);
+                continue;
+            }
+            if !conn.inner.is_drained() {
+                if keep_going {
+                    cx.waker().wake_by_ref();
+                } else {
+                    conn.driver = Some(cx.waker().clone());
+                }
+                return Poll::Pending;
+            }
+            if conn.error.is_none() {
+                unreachable!("drained connections always have an error");
+            }
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = match conn.drive_transmit(cx) {
-            Ok(keep_going) => keep_going,
-            Err(error) => {
-                // No driver remains to publish progress or service a waiter.
-                // Retained public handles prevent last-reference cleanup, so
-                // publish the fatal local failure before returning it to the
-                // runtime. Preserve an already published close reason.
-                if conn.error.is_none() {
-                    conn.terminate(
-                        ConnectionError::TransportError(proto::TransportError {
-                            code: proto::TransportErrorCode::INTERNAL_ERROR,
-                            frame: None,
-                            reason: format!("local UDP transmit failed: {error}"),
-                        }),
-                        &self.0.shared,
-                    );
-                }
-                return Poll::Ready(Err(error));
-            }
-        };
-        // If a timer expires, there might be more to transmit. When we transmit something, we
-        // might need to reset a timer. Hence, we must loop until neither happens.
-        keep_going |= conn.drive_timer(cx);
-        conn.forward_endpoint_events();
-        conn.forward_app_events(&self.0.shared);
-
-        if !conn.inner.is_drained() {
-            if keep_going {
-                // If the connection hasn't processed all tasks, schedule it again
-                cx.waker().wake_by_ref();
-            } else {
-                conn.driver = Some(cx.waker().clone());
-            }
-            return Poll::Pending;
-        }
-        if conn.error.is_none() {
-            unreachable!("drained connections always have an error");
-        }
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -321,6 +378,59 @@ impl Future for ConnectionDriver {
 pub struct Connection(ConnectionRef);
 
 impl Connection {
+    /// Join an authenticated session's execution domain exactly once.
+    ///
+    /// This fences the entire current unauthenticated driver poll before
+    /// returning. Call before publishing application ownership, without holding
+    /// Native, Product or source locks. It can wait for one finite driver poll.
+    /// Existing children must not be moved between live session domains.
+    pub fn bind_execution_domain(
+        &self,
+        domain: crate::ExecutionDomain,
+    ) -> Result<(), crate::ExecutionDomainConflict> {
+        self.0.execution.bind(domain)
+    }
+
+    /// The bound execution domain, if authentication has established one.
+    pub fn execution_domain(&self) -> Option<crate::ExecutionDomain> {
+        self.0.execution.domain()
+    }
+
+    /// Register an opt-in producer polled by this connection's driver.
+    ///
+    /// The driver polls this future outside the native connection mutex and
+    /// forwards its wakes, including ordinary source availability and native
+    /// flow credit. An exact packetization event gives a ready producer an
+    /// inline opportunity before the next native transmit poll, within the
+    /// existing per-turn datagram budget. Each poll must perform finite,
+    /// cooperative work; an in-progress write must stay owned across Pending.
+    ///
+    /// The driver owns the future until completion or connection termination,
+    /// and drops it outside native state. Registering after termination fails.
+    /// Native pacing and congestion control remain responsible for transmission.
+    pub fn register_transmit_source(
+        &self,
+        source: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> Result<(), ConnectionError> {
+        let state = self.0.state.lock("register_transmit_source");
+        if let Some(error) = state.error.clone() {
+            drop(state);
+            return Err(error);
+        }
+        // Publication is fenced with termination. Sending only enqueues the
+        // future; neither it nor a returned SendError may be dropped while
+        // native is locked, because owned stream destructors can lock native.
+        let sent = self.0.transmit_sources.send(source);
+        drop(state);
+        if let Err(rejected) = sent {
+            drop(rejected);
+            return Err(self
+                .close_reason()
+                .unwrap_or(ConnectionError::LocallyClosed));
+        }
+        Ok(())
+    }
+
     /// Initiate a new outgoing unidirectional stream.
     ///
     /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
@@ -695,11 +805,7 @@ impl Connection {
     /// This is equivalent to [`SendStream::set_priority`], but remains usable
     /// by protocol adapters that retain the stream identity while wrapping the
     /// concrete [`SendStream`].
-    pub fn set_stream_priority(
-        &self,
-        stream: StreamId,
-        priority: i32,
-    ) -> Result<(), ClosedStream> {
+    pub fn set_stream_priority(&self, stream: StreamId, priority: i32) -> Result<(), ClosedStream> {
         let mut conn = self.0.state.lock("set_stream_priority");
         conn.inner.send_stream(stream).set_priority(priority)?;
         Ok(())
@@ -978,6 +1084,7 @@ impl ConnectionRef {
         on_connected: oneshot::Sender<bool>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
+        transmit_sources: mpsc::UnboundedSender<TransmitSource>,
     ) -> Self {
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
@@ -1003,6 +1110,8 @@ impl ConnectionRef {
                 buffered_transmit: None,
             }),
             shared: Shared::default(),
+            transmit_sources,
+            execution: Arc::new(crate::execution_binding::ExecutionBinding::default()),
         }))
     }
 
@@ -1045,6 +1154,8 @@ impl std::ops::Deref for ConnectionRef {
 
 #[derive(Debug)]
 pub(crate) struct ConnectionInner {
+    execution: Arc<crate::execution_binding::ExecutionBinding>,
+    transmit_sources: mpsc::UnboundedSender<TransmitSource>,
     pub(crate) state: Mutex<State>,
     pub(crate) shared: Shared,
 }
@@ -1091,9 +1202,14 @@ pub(crate) struct State {
 }
 
 impl State {
-    fn drive_transmit(&mut self, cx: &mut Context) -> io::Result<bool> {
+    fn drive_transmit(
+        &mut self,
+        cx: &mut Context,
+        shared: &Shared,
+        interrupt_for_sources: bool,
+        transmits: &mut usize,
+    ) -> io::Result<(bool, bool)> {
         let now = self.runtime.now();
-        let mut transmits = 0;
 
         let max_datagrams = self
             .socket
@@ -1112,7 +1228,7 @@ impl State {
                         .poll_transmit(now, max_datagrams, &mut self.send_buffer)
                     {
                         Some(t) => {
-                            transmits += match t.segment_size {
+                            *transmits += match t.segment_size {
                                 None => 1,
                                 Some(s) => t.size.div_ceil(s), // round up
                             };
@@ -1126,7 +1242,8 @@ impl State {
             if self.io_poller.as_mut().poll_writable(cx)?.is_pending() {
                 // Retry after a future wakeup
                 self.buffered_transmit = Some(t);
-                return Ok(false);
+                let source_ready = interrupt_for_sources && self.forward_app_events(shared);
+                return Ok((false, source_ready));
             }
 
             let len = t.size;
@@ -1144,19 +1261,26 @@ impl State {
                 // registers us for a wakeup, or the send succeeds if this really was just a
                 // transient failure.
                 self.buffered_transmit = Some(t);
+                if interrupt_for_sources && self.forward_app_events(shared) {
+                    return Ok((false, true));
+                }
                 continue;
             }
 
-            if transmits >= MAX_TRANSMIT_DATAGRAMS {
+            let source_ready = interrupt_for_sources && self.forward_app_events(shared);
+            if *transmits >= MAX_TRANSMIT_DATAGRAMS {
                 // TODO: What isn't ideal here yet is that if we don't poll all
                 // datagrams that could be sent we don't go into the `app_limited`
                 // state and CWND continues to grow until we get here the next time.
                 // See https://github.com/quinn-rs/quinn/issues/1126
-                return Ok(true);
+                return Ok((true, source_ready));
+            }
+            if source_ready {
+                return Ok((false, true));
             }
         }
 
-        Ok(false)
+        Ok((false, false))
     }
 
     fn forward_endpoint_events(&mut self) {
@@ -1199,7 +1323,8 @@ impl State {
         }
     }
 
-    fn forward_app_events(&mut self, shared: &Shared) {
+    fn forward_app_events(&mut self, shared: &Shared) -> bool {
+        let mut packetization_changed = false;
         while let Some(event) = self.inner.poll() {
             use proto::Event::*;
             match event {
@@ -1227,6 +1352,7 @@ impl State {
                 }
                 Stream(StreamEvent::Writable { id }) => wake_stream(id, &mut self.blocked_writers),
                 Stream(StreamEvent::PacketizationChanged { id }) => {
+                    packetization_changed = true;
                     if self.inner.send_stream(id).packetization_progress().is_err() {
                         wake_stream_notify(id, &mut self.packetization_observers);
                         continue;
@@ -1263,6 +1389,7 @@ impl State {
                 }
             }
         }
+        packetization_changed
     }
 
     fn drive_timer(&mut self, cx: &mut Context<'_>) -> bool {

@@ -573,26 +573,23 @@ pub(in crate::runtime) fn first_proven_ack_gap(gaps: &[OffsetRange]) -> Option<(
     gaps.first().map(|gap| (gap.start, gap.end))
 }
 
-pub(in crate::runtime) fn resize_reliable_relay_buffer(
-    buffer: &mut bytes::BytesMut,
-    target_len: usize,
-) {
-    let target_len = target_len.max(1);
-    buffer.clear();
-    if buffer.capacity() < target_len {
-        buffer.reserve(target_len.saturating_sub(buffer.capacity()));
-    }
-}
-
 pub(in crate::runtime) async fn read_reliable_relay_payload<S>(
     local: &mut S,
     buffer: &mut bytes::BytesMut,
     read_budget: usize,
+    source_read_maximum: usize,
 ) -> std::io::Result<(usize, Option<Bytes>)>
 where
     S: AsyncRead + Unpin,
 {
-    resize_reliable_relay_buffer(buffer, read_budget);
+    buffer.clear();
+    // The grant limits this read; the pre-reservation source maximum sizes an
+    // exhausted backing for subsequent reads. Consume all existing spare first:
+    // previously split payloads may still own it, so early growth can pin mostly
+    // unused allocations. A small grant must not become a separate chunk cap.
+    if buffer.capacity() == 0 {
+        buffer.reserve(source_read_maximum.max(read_budget).max(1));
+    }
     let read = (&mut *local)
         .take(read_budget.max(1) as u64)
         .read_buf(buffer)

@@ -13,7 +13,7 @@ use crate::runtime::path::commands::{
     reliable_path_command_queue, reliable_stream_frame_queue_for_payload,
 };
 use crate::runtime::path::input::{CarrierInputRoute, PendingMailboxFrame};
-use crate::runtime::path::native_commitment::{NativeCommitmentError, NativeOperationCommitment};
+use crate::runtime::path::native_commitment::NativeOperationCommitment;
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::scheduler::TrafficClass;
@@ -78,6 +78,26 @@ fn quic_stream_priority(lane: TrafficClass) -> i32 {
 }
 
 impl UdpPathSendStream {
+    #[cfg(test)]
+    pub(super) fn native_progress_observer_for_test(
+        &self,
+    ) -> Result<quinn::SendStreamObserver, quinn::SendStreamObservationError> {
+        self.stream.native_progress_observer()
+    }
+
+    pub(super) fn native_peer_stopped(&self) -> bool {
+        matches!(
+            self.stream
+                .native_progress_observer()
+                .and_then(|observer| observer.snapshot()),
+            Err(quinn::SendStreamObservationError::Stopped(_))
+        )
+    }
+
+    pub(super) fn native_source_registration(&self) -> quic_transport::NativeSourceRegistration {
+        self.stream.native_source_registration()
+    }
+
     pub(super) fn bind_native_commitment(
         &mut self,
     ) -> Result<NativeOperationCommitment, RuntimeError> {
@@ -87,9 +107,8 @@ impl UdpPathSendStream {
         let observer = self
             .stream
             .native_progress_observer()
-            .map_err(|error| RuntimeError::Io(std::io::Error::other(error)))?;
-        let commitment =
-            NativeOperationCommitment::new(observer).map_err(native_commitment_error)?;
+            .map_err(RuntimeError::from)?;
+        let commitment = NativeOperationCommitment::new(observer).map_err(RuntimeError::from)?;
         self.native_commitment = Some(commitment.clone());
         Ok(commitment)
     }
@@ -215,6 +234,15 @@ impl UdpPathEndpoint {
 }
 
 impl UdpPathConnection {
+    /// Fence the pre-authentication driver before this carrier can serve Product work.
+    pub(super) fn bind_execution_domain(
+        &self,
+        domain: quinn::ExecutionDomain,
+    ) -> Result<(), RuntimeError> {
+        self.connection.bind_execution_domain(domain)?;
+        Ok(())
+    }
+
     fn new(connection: quic_transport::Connection) -> Self {
         Self {
             connection,
@@ -456,10 +484,6 @@ async fn udp_path_write_frames(
     Ok(())
 }
 
-fn native_commitment_error(error: NativeCommitmentError) -> RuntimeError {
-    RuntimeError::Io(std::io::Error::other(error))
-}
-
 fn ensure_quic_data_plane_frames(frames: &[Frame]) -> Result<(), RuntimeError> {
     if frames.iter().any(Frame::is_path_capacity) {
         return Err(RuntimeError::Protocol(
@@ -553,7 +577,9 @@ where
                 }
                 return (result, routed_frames);
             }
-            _ = async { mailbox.as_mut().expect("pending mailbox").deliver().await },
+            _ = async {
+                mailbox.as_mut().expect("pending mailbox").deliver().await
+            },
                 if mailbox.is_some() => {
                 mailbox = None;
                 routed_frames = routed_frames.saturating_add(1);
@@ -562,8 +588,12 @@ where
                 match incoming {
                     Some(Ok(frame)) => match try_route_frame(frame) {
                         Ok(CarrierInputRoute::Routed) => routed_frames = routed_frames.saturating_add(1),
-                        Ok(CarrierInputRoute::Barrier(frame)) => *deferred_input = Some(Ok(frame)),
-                        Ok(CarrierInputRoute::Mailbox(pending)) => mailbox = Some(pending),
+                        Ok(CarrierInputRoute::Barrier(frame)) => {
+                            *deferred_input = Some(Ok(frame));
+                        }
+                        Ok(CarrierInputRoute::Mailbox(pending)) => {
+                            mailbox = Some(pending);
+                        }
                         Err(err) => *deferred_input = Some(Err(err)),
                     },
                     Some(Err(err)) => *deferred_input = Some(Err(err)),
@@ -754,7 +784,8 @@ pub(super) fn spawn_quic_path_reader(
                 Err(err) => Err(err),
             };
             let done = frame.is_err();
-            if frames_tx.send(frame).await.is_err() || done {
+            let send_result = frames_tx.send(frame).await;
+            if send_result.is_err() || done {
                 return;
             }
         }

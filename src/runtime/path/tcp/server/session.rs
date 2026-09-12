@@ -140,7 +140,15 @@ impl ServerTcpPathSession {
         }
     }
 
-    pub(in crate::runtime::path::tcp) async fn run(mut self) -> Result<(), RuntimeError> {
+    pub(in crate::runtime::path::tcp) async fn run(self) -> Result<(), RuntimeError> {
+        let execution_domain = self
+            .context
+            .reliable_streams
+            .session_execution_domain(self.session_id)?;
+        execution_domain.wrap(self.run_in_session()).await
+    }
+
+    async fn run_in_session(mut self) -> Result<(), RuntimeError> {
         let retirement = self
             .context
             .wait_for_credential_retirement(self.path_registration.principal_permit().clone());

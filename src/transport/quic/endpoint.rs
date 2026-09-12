@@ -231,6 +231,15 @@ impl Endpoint {
 }
 
 impl Connection {
+    pub(crate) fn bind_execution_domain(
+        &self,
+        domain: quinn::ExecutionDomain,
+    ) -> Result<(), super::QuicCarrierError> {
+        self.connection
+            .bind_execution_domain(domain)
+            .map_err(super::QuicCarrierError::ExecutionDomainConflict)
+    }
+
     /// Mark the authenticated MPP carrier ready to offer application traffic.
     pub(crate) fn mark_application_ready(&self) {
         self.connection.mark_application_ready();

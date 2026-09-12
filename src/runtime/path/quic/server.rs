@@ -142,6 +142,30 @@ async fn handle_server_udp_connection(
             }
         };
     drop(authentication_slot);
+    let execution_domain = context
+        .reliable_streams
+        .session_execution_domain(path_registration.session_id())?;
+    execution_domain
+        .clone()
+        .wrap(run_authenticated_server_udp_connection(
+            connection.clone(),
+            context,
+            path_registration,
+            control_send,
+            control_recv,
+            execution_domain,
+        ))
+        .await
+}
+
+async fn run_authenticated_server_udp_connection(
+    connection: UdpPathConnection,
+    context: ServerPathContext,
+    path_registration: ServerCarrierPathRegistration,
+    control_send: UdpPathSendStream,
+    control_recv: UdpPathRecvStream,
+    execution_domain: quinn::ExecutionDomain,
+) -> Result<(), RuntimeError> {
     let session_id = path_registration.session_id();
     let path_id = path_registration.path_id();
     let Some(native_rate_authority) = connection.native_rate_authority() else {
@@ -232,7 +256,9 @@ async fn handle_server_udp_connection(
                 let path_registration = path_registration.clone();
                 let native_rate_authority = native_rate_authority.clone();
                 let repair_bindings = repair_bindings.clone();
-                streams.spawn(async move {
+                // Parent cancellation destroys the owning Native source
+                // handle under the same domain as its actual writer poll.
+                streams.spawn(execution_domain.wrap(async move {
                     if let Err(err) = handle_server_udp_bidi_stream_with_native_rate_authority(
                         send,
                         recv,
@@ -250,7 +276,7 @@ async fn handle_server_udp_connection(
                             &err,
                         );
                     }
-                });
+                }));
             }
             Some(result) = streams.join_next(), if !streams.is_empty() => {
                 if let Err(err) = result {
@@ -399,6 +425,13 @@ async fn admit_server_udp_path(
             ServerCarrierPeer::observed(move || observed.remote_address()),
             context.configured_path_name(local_path.config_ordinal()),
         )?;
+    let execution_domain = context
+        .reliable_streams
+        .session_execution_domain(session_id)?;
+    // Authentication establishes the session identity first. The Native bind
+    // fences prior driver work before rate authority and SessionReady expose
+    // an application-ready carrier to this session's Product actors.
+    connection.bind_execution_domain(execution_domain)?;
     let native_scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
         path_registration.path_instance_id(),
         PathMetricDirection::ServerToClient,

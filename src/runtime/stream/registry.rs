@@ -555,6 +555,14 @@ impl AcceptedServerReliableStream {
         self.retirement.registry.session_retirement(self.session_id)
     }
 
+    pub(in crate::runtime) fn session_execution_domain(
+        &self,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError> {
+        self.retirement
+            .registry
+            .session_execution_domain(self.session_id)
+    }
+
     pub(in crate::runtime) fn target(&self) -> &TargetAddr {
         &self.target
     }
@@ -1047,6 +1055,13 @@ impl ServerReliableStreamRegistry {
         session_id: SessionId,
     ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
         self.session_tracker.session_retirement(session_id)
+    }
+
+    pub(in crate::runtime) fn session_execution_domain(
+        &self,
+        session_id: SessionId,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError> {
+        self.session_tracker.session_execution_domain(session_id)
     }
 
     pub(in crate::runtime) fn retire_session(
@@ -2171,6 +2186,26 @@ impl ServerReliableStreamRegistry {
         Ok(())
     }
 
+    fn input_closed(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+    ) -> Option<crate::runtime::path::ServerStreamInputClosed> {
+        let events = self
+            .streams
+            .lock()
+            .expect("server reliable stream registry lock")
+            .get(&(identity.session_id, stream_id))?
+            .events
+            .clone();
+        // Capture only the exact input channel. A later lookup could observe
+        // different registry state, and retaining the binding would retain the
+        // failed output solely to keep a receive-side lifecycle wait alive.
+        Some(Box::pin(async move {
+            events.closed().await;
+        }))
+    }
+
     fn stream_frame_route_target(
         &self,
         session_id: SessionId,
@@ -2523,6 +2558,13 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         self.registry.session_retirement(session_id)
     }
 
+    fn session_execution_domain(
+        &self,
+        session_id: SessionId,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError> {
+        self.registry.session_execution_domain(session_id)
+    }
+
     fn retire_session(
         &self,
         session_id: SessionId,
@@ -2611,6 +2653,14 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
     ) -> Result<ServerStreamFrameRoute, RuntimeError> {
         self.registry
             .try_route_frame_from_path(identity, stream_id, frame)
+    }
+
+    fn input_closed(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+    ) -> Option<crate::runtime::path::ServerStreamInputClosed> {
+        self.registry.input_closed(identity, stream_id)
     }
 
     fn detach_path(

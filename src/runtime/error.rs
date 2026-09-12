@@ -95,6 +95,42 @@ impl From<std::io::Error> for RuntimeError {
     }
 }
 
+impl From<quinn::SendStreamObservationError> for RuntimeError {
+    fn from(error: quinn::SendStreamObservationError) -> Self {
+        use quinn::SendStreamObservationError;
+        match error {
+            // An observer reports the same lifetime as a direct native write.
+            // Preserve that authority before generic source/target I/O policy.
+            SendStreamObservationError::Stopped(code) => {
+                QuicCarrierError::Write(quinn::WriteError::Stopped(code)).into()
+            }
+            SendStreamObservationError::ClosedStream => {
+                QuicCarrierError::Write(quinn::WriteError::ClosedStream).into()
+            }
+            SendStreamObservationError::ConnectionLost(cause) => {
+                QuicCarrierError::Connection(cause).into()
+            }
+            // Invalid observation does not prove a failed transport lifetime.
+            error @ (SendStreamObservationError::NotEstablished
+            | SendStreamObservationError::UnacceptedEnd { .. }) => {
+                Self::Io(std::io::Error::other(error))
+            }
+        }
+    }
+}
+
+impl From<crate::runtime::path::native_commitment::NativeCommitmentError> for RuntimeError {
+    fn from(error: crate::runtime::path::native_commitment::NativeCommitmentError) -> Self {
+        use crate::runtime::path::native_commitment::NativeCommitmentError;
+        match error {
+            NativeCommitmentError::Native(error) => error.into(),
+            error @ NativeCommitmentError::InvalidNativeProgress => {
+                Self::Io(std::io::Error::other(error))
+            }
+        }
+    }
+}
+
 impl From<TcpTransportError> for RuntimeError {
     fn from(value: TcpTransportError) -> Self {
         Self::Tcp(value)

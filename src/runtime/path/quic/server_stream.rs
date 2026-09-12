@@ -5,6 +5,7 @@ use super::io::{
     udp_path_finish_stream, udp_path_max_stream_payload_bytes, udp_path_write_frame,
     udp_reliable_stream_frame_queue,
 };
+use super::server_output_retirement::ServerUdpOutputRetirement;
 use super::server_writer::{
     drain_one_server_udp_command_while_input_deferred, drain_server_udp_reliable_commands,
 };
@@ -22,7 +23,7 @@ use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame};
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
     ServerCarrierPathRegistration, ServerStreamOpenOutcome, ServerStreamOpenRequest,
-    ServerStreamPathAttachment, ServerStreamPort,
+    ServerStreamPathAttachment,
 };
 
 #[cfg(test)]
@@ -163,16 +164,12 @@ pub(super) struct ServerUdpReliableStreamContext {
 }
 
 struct ServerUdpReliableOutputDetachGuard {
-    streams: ServerStreamPort,
-    path_registration: ServerCarrierPathRegistration,
-    stream_id: StreamId,
+    retirement: std::sync::Arc<ServerUdpOutputRetirement>,
 }
 
 impl Drop for ServerUdpReliableOutputDetachGuard {
     fn drop(&mut self) {
-        let _ = self
-            .streams
-            .detach_path(&self.path_registration, self.stream_id);
+        let _ = self.retirement.retire();
     }
 }
 
@@ -229,7 +226,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
         Some(authority) => commands_tx.with_native_rate_authority(authority),
         None => commands_tx,
     };
-    let mut path_proofs = PathProofTracker::from_limits(context.mux_limits);
+    let path_proofs = PathProofTracker::from_limits(context.mux_limits);
     let accept_existing = match context
         .reliable_streams
         .open_or_attach(ServerStreamOpenRequest {
@@ -299,39 +296,21 @@ pub(super) async fn handle_server_udp_reliable_stream(
     // Arm cleanup only after this native stream owns the attachment. A refused
     // duplicate has no attachment to detach and must leave the existing owner
     // untouched.
-    let _output_detach_guard = ServerUdpReliableOutputDetachGuard {
-        streams: context.reliable_streams.clone(),
-        path_registration: path_registration.clone(),
+    let retirement = ServerUdpOutputRetirement::new(
+        context.reliable_streams.clone(),
+        path_registration.clone(),
         stream_id,
+    );
+    let _output_detach_guard = ServerUdpReliableOutputDetachGuard {
+        retirement: retirement.clone(),
     };
     let (_repair_parent, repair_streams) =
         repair_bindings.register(send.request_stream_id(), stream_id)?;
     let repair_commands = commands_rx.take_repair_receiver(stream_id);
-    if accept_existing {
-        write_udp_stream_accept(
-            &mut send,
-            &context,
-            &path_registration,
-            stream_id,
-            &mut path_proofs,
-        )
-        .await?;
-    }
-    #[cfg(test)]
-    if let Some(abort) = take_server_udp_stream_abort_for_test(session_id, stream_id) {
-        let _ = abort.attached.send(());
-        if abort.abort.await.is_ok() {
-            // Drop only this native H3 request-stream attachment. The detach
-            // guard removes its logical-path lease; the shared QUIC connection
-            // and every sibling request stream remain alive.
-            drop(_output_detach_guard);
-            let _ = abort.released.send(());
-            return Ok(());
-        }
-    }
+    let (send_stopped, stopped_send) = tokio::sync::oneshot::channel();
     let repair_context = context.clone();
     let repair_registration = path_registration.clone();
-    let repair = async {
+    let repair = Box::pin(async {
         let (repair_send, repair_recv) = repair_streams
             .await
             .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
@@ -348,26 +327,42 @@ pub(super) async fn handle_server_udp_reliable_stream(
             },
         )
         .await
-    };
-    let ordinary = run_server_udp_reliable_stream_loop(
-        send,
-        recv,
-        ServerUdpReliableStreamLoop {
-            context,
-            session_id,
-            path_id,
-            path_registration,
-            stream_id,
-            target: duplicate_open_target,
-            commands_tx,
-            commands_rx,
-            path_proofs,
-        },
+    });
+    let registration = send.native_source_registration();
+    let ordinary = super::driven::run_ordinary_source(
+        registration,
+        run_server_udp_reliable_stream_loop(
+            send,
+            recv,
+            ServerUdpReliableStreamLoop {
+                context,
+                session_id,
+                path_id,
+                path_registration,
+                stream_id,
+                target: duplicate_open_target,
+                retirement,
+                accept_existing,
+                send_stopped: Some(send_stopped),
+                commands_tx,
+                commands_rx,
+                path_proofs,
+            },
+        ),
     );
+    let mut repair = repair;
+    tokio::pin!(ordinary);
     tokio::select! {
         biased;
-        result = repair => result,
-        result = ordinary => result,
+        Ok(()) = stopped_send => {
+            // The ordinary writer has released its failed output. Cancel its
+            // companion now, including a still-unopened repair stream and any
+            // queued/in-progress repair envelope, before retaining input only.
+            drop(repair);
+            ordinary.await?
+        },
+        result = &mut repair => result,
+        result = &mut ordinary => result?,
     }
 }
 
@@ -378,6 +373,9 @@ struct ServerUdpReliableStreamLoop {
     path_registration: ServerCarrierPathRegistration,
     stream_id: StreamId,
     target: TargetAddr,
+    retirement: std::sync::Arc<ServerUdpOutputRetirement>,
+    accept_existing: bool,
+    send_stopped: Option<tokio::sync::oneshot::Sender<()>>,
     commands_tx: ReliablePathCommandSender,
     commands_rx: ReliablePathCommandReceivers,
     path_proofs: PathProofTracker,
@@ -395,12 +393,13 @@ async fn run_server_udp_reliable_stream_loop(
         path_registration,
         stream_id,
         target,
+        retirement,
+        accept_existing,
+        mut send_stopped,
         commands_tx,
         mut commands_rx,
         mut path_proofs,
     } = stream_context;
-    let commitment = send.bind_native_commitment()?;
-    commands_rx.bind_native_commitment(commitment)?;
     let carrier_frame_queue =
         udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits);
     let mut carrier_frames =
@@ -408,158 +407,40 @@ async fn run_server_udp_reliable_stream_loop(
     let mut pending_frames = Vec::<Frame>::new();
     let mut deferred_input = None;
     let mut terminal_drain_deadline = None;
+    // Capture the original Product input lifetime before output retirement.
+    // A Sender observes closure; it does not keep the Product receiver alive.
+    let owner_closed = context
+        .reliable_streams
+        .input_closed(&path_registration, stream_id)?;
+    let result = async {
+        let commitment = send.bind_native_commitment()?;
+        commands_rx.bind_native_commitment(commitment)?;
+        if accept_existing {
+            write_udp_stream_accept(
+                &mut send, &context, &path_registration, stream_id, &mut path_proofs,
+            ).await?;
+        }
+        // The injection pauses an accepted request. Waiting before this accept
+        // would prevent the client commit that the test requires before abort.
+        #[cfg(test)]
+        if let Some(abort) = take_server_udp_stream_abort_for_test(session_id, stream_id) {
+            let _ = abort.attached.send(());
+            if abort.abort.await.is_ok() {
+                // Retire the logical output before publishing release; the
+                // enclosing guard shares this one-shot authority.
+                retirement.retire()?;
+                let _ = abort.released.send(());
+                return Ok(());
+            }
+        }
     loop {
-        // Finishing the server send half must not STOP the client's final
-        // feedback. Drain the independent receive half to explicit detach.
         if let Some(deadline) = terminal_drain_deadline {
             commands_rx.withdraw_writer_ready();
-            let input = tokio::time::timeout_at(deadline, async {
-                match deferred_input.take() {
-                    Some(input) => Some(input),
-                    None => carrier_frames.recv().await,
-                }
-            })
-            .await;
-            match input {
-                Err(_) | Ok(None) => return Ok(()),
-                Ok(Some(Ok(Frame::StreamDetach {
-                    stream_id: detach_stream_id,
-                }))) if detach_stream_id == stream_id => return Ok(()),
-                Ok(Some(Ok(Frame::StreamDetach { .. }))) => {
-                    return Err(RuntimeError::Protocol(
-                        "QUIC UDP terminal drain stream mismatch",
-                    ));
-                }
-                Ok(Some(Ok(
-                    frame @ (Frame::StreamData {
-                        stream_id: received_stream_id,
-                        ..
-                    }
-                    | Frame::StreamAck {
-                        stream_id: received_stream_id,
-                        ..
-                    }
-                    | Frame::StreamFeedbackProbe {
-                        stream_id: received_stream_id,
-                        ..
-                    }
-                    | Frame::StreamFeedbackReceipt {
-                        stream_id: received_stream_id,
-                        ..
-                    }
-                    | Frame::StreamReturnPlanFinal {
-                        stream_id: received_stream_id,
-                        ..
-                    }
-                    | Frame::StreamMaxData {
-                        stream_id: received_stream_id,
-                        ..
-                    }
-                    | Frame::StreamFin {
-                        stream_id: received_stream_id,
-                        ..
-                    }
-                    | Frame::StreamReset {
-                        stream_id: received_stream_id,
-                        ..
-                    }),
-                ))) if received_stream_id == stream_id => {
-                    context
-                        .reliable_streams
-                        .route_frame(&path_registration, stream_id, frame)
-                        .await?;
-                }
-                Ok(Some(Ok(
-                    Frame::StreamRequalifyData {
-                        stream_id: received_stream_id,
-                        ..
-                    }
-                    | Frame::StreamRequalifyAck {
-                        stream_id: received_stream_id,
-                        ..
-                    },
-                ))) if received_stream_id == stream_id => {
-                    // The exact response half is already finished and
-                    // detached. A delayed receipt has no current authority,
-                    // and a new probe cannot be acknowledged on this exact
-                    // attachment; tolerate either until peer detach.
-                }
-                Ok(Some(Ok(
-                    Frame::StreamData { .. }
-                    | Frame::StreamAck { .. }
-                    | Frame::StreamFeedbackProbe { .. }
-                    | Frame::StreamFeedbackReceipt { .. }
-                    | Frame::StreamReturnPlanFinal { .. }
-                    | Frame::StreamRequalifyData { .. }
-                    | Frame::StreamRequalifyAck { .. }
-                    | Frame::StreamMaxData { .. }
-                    | Frame::StreamFin { .. }
-                    | Frame::StreamReset { .. },
-                ))) => {
-                    return Err(RuntimeError::Protocol(
-                        "QUIC UDP terminal drain stream mismatch",
-                    ));
-                }
-                Ok(Some(Ok(Frame::PathMetrics { metrics }))) if metrics.path_id == path_id => {
-                    context
-                        .reliable_streams
-                        .record_peer_path_metrics(&path_registration, metrics);
-                }
-                Ok(Some(Ok(Frame::PathStatus {
-                    path_id: status_path_id,
-                    sequence,
-                    usage,
-                }))) if status_path_id == path_id => {
-                    context.reliable_streams.record_peer_path_usage(
-                        &path_registration,
-                        sequence,
-                        usage,
-                    );
-                }
-                Ok(Some(Ok(Frame::PathProofAck {
-                    path_id: proof_path_id,
-                    proof_id,
-                    payload_bytes,
-                }))) if proof_path_id == path_id => {
-                    if let Some(observation) =
-                        path_proofs.acknowledge(path_id, proof_id, payload_bytes)
-                    {
-                        // QUIC owns congestion and capacity evidence; this frame
-                        // validates only the response direction of the carrier.
-                        context
-                            .reliable_streams
-                            .record_path_proof_success(&path_registration, observation);
-                    }
-                }
-                // These requests can already be deferred behind the terminal
-                // write. The send half is finished, so no reply is possible.
-                Ok(Some(Ok(Frame::Ping { .. }))) => {}
-                Ok(Some(Ok(Frame::PathProofData {
-                    path_id: proof_path_id,
-                    ..
-                }))) if proof_path_id == path_id => {}
-                Ok(Some(Ok(Frame::SessionClose { reason }))) => {
-                    context.retire_session(session_id, reason);
-                    return Err(RuntimeError::RemoteClosed(reason));
-                }
-                Ok(Some(Ok(
-                    Frame::PathCapacityData { .. }
-                    | Frame::PathCapacityFinish { .. }
-                    | Frame::PathCapacityReceipt { .. },
-                ))) => {
-                    return Err(RuntimeError::Protocol(
-                        "PATH_CAPACITY frames are not valid on QUIC carriers",
-                    ));
-                }
-                Ok(Some(Ok(_))) => {
-                    return Err(RuntimeError::Protocol(
-                        "unexpected server QUIC UDP terminal drain frame",
-                    ));
-                }
-                Ok(Some(Err(err))) if super::io::udp_path_input_finished(&err) => return Ok(()),
-                Ok(Some(Err(RuntimeError::ReliablePathSessionClosed))) => return Ok(()),
-                Ok(Some(Err(err))) => return Err(err),
-            }
+            return drain_server_udp_terminal_input(
+                &mut carrier_frames, &mut deferred_input, &context,
+                &path_registration, stream_id, session_id, path_id,
+                &mut path_proofs, Some(deadline), None,
+            ).await;
         }
         let command_may_recv = !reliable_path_receivers_closed(&commands_rx);
         // A deferred exact requalification probe can itself be waiting for a
@@ -575,6 +456,7 @@ async fn run_server_udp_reliable_stream_loop(
                     &context,
                     stream_id,
                     &path_registration,
+                    &retirement,
                     &mut path_proofs,
                 )
                 .await
@@ -587,6 +469,7 @@ async fn run_server_udp_reliable_stream_loop(
                     stream_id,
                     path_id,
                     &path_registration,
+                    &retirement,
                     &mut pending_frames,
                     &mut path_proofs,
                     &mut carrier_frames,
@@ -652,10 +535,7 @@ async fn run_server_udp_reliable_stream_loop(
                     Some(Ok(Frame::StreamDetach { stream_id: detach_stream_id }))
                         if detach_stream_id == stream_id =>
                     {
-                        context
-                            .reliable_streams
-                            .detach_path(&path_registration, stream_id)
-                            ?;
+                        retirement.retire()?;
                         let _ = udp_path_finish_stream(&mut send).await;
                         return Ok(());
                     }
@@ -805,17 +685,11 @@ async fn run_server_udp_reliable_stream_loop(
                         return Err(RuntimeError::Protocol("unexpected server QUIC UDP path reliable stream frame"));
                     }
                     Some(Err(err)) if super::io::udp_path_input_finished(&err) => {
-                        context
-                            .reliable_streams
-                            .detach_path(&path_registration, stream_id)
-                            ?;
+                        retirement.retire()?;
                         return Ok(());
                     }
                     Some(Err(RuntimeError::ReliablePathSessionClosed)) | None => {
-                        context
-                            .reliable_streams
-                            .detach_path(&path_registration, stream_id)
-                            ?;
+                        retirement.retire()?;
                         return Ok(());
                     }
                     Some(Err(err)) => return Err(err),
@@ -830,6 +704,7 @@ async fn run_server_udp_reliable_stream_loop(
                         stream_id,
                         path_id,
                         &path_registration,
+                        &retirement,
                         &mut pending_frames,
                         &mut path_proofs,
                         &mut carrier_frames,
@@ -854,6 +729,7 @@ async fn run_server_udp_reliable_stream_loop(
                         stream_id,
                         path_id,
                         &path_registration,
+                        &retirement,
                         &mut pending_frames,
                         &mut path_proofs,
                         &mut carrier_frames,
@@ -867,6 +743,245 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                 }
             }
+        }
+    }
+    }.await;
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| server_udp_send_stopped(error, &send))
+    {
+        // Retire/disarm before any await. Failed output buffers and command
+        // charges cannot be retained merely to preserve independent input.
+        commands_rx.withdraw_writer_ready();
+        retirement.retire()?;
+        drop(commands_rx);
+        drop(commands_tx);
+        drop(send);
+        drop(pending_frames);
+        if let Some(stopped) = send_stopped.take() {
+            let _ = stopped.send(());
+        }
+        if owner_closed.is_some() {
+            drain_server_udp_terminal_input(
+                &mut carrier_frames,
+                &mut deferred_input,
+                &context,
+                &path_registration,
+                stream_id,
+                session_id,
+                path_id,
+                &mut path_proofs,
+                None,
+                owner_closed,
+            )
+            .await?;
+        }
+    }
+    result
+}
+
+fn server_udp_send_stopped(error: &RuntimeError, send: &UdpPathSendStream) -> bool {
+    use crate::runtime::path::native_commitment::NativeCommitmentError;
+    use crate::transport::quic::QuicCarrierError;
+    match error {
+        RuntimeError::Io(error) => {
+            matches!(
+                error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<NativeCommitmentError>()),
+                Some(NativeCommitmentError::Native(
+                    quinn::SendStreamObservationError::Stopped(_)
+                ))
+            ) || matches!(
+                error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<quinn::SendStreamObservationError>()),
+                Some(quinn::SendStreamObservationError::Stopped(_))
+            )
+        }
+        RuntimeError::QuicCarrier(QuicCarrierError::Write(quinn::WriteError::Stopped(_))) => true,
+        RuntimeError::QuicCarrier(QuicCarrierError::H3Stream(
+            h3::error::StreamError::RemoteTerminate { .. },
+        )) => {
+            // H3's error may originate in either direction. Retain input only
+            // when the actual Native send half independently confirms STOP.
+            send.native_peer_stopped()
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_server_udp_terminal_input(
+    carrier_frames: &mut tokio::sync::mpsc::Receiver<Result<Frame, RuntimeError>>,
+    deferred_input: &mut Option<Result<Frame, RuntimeError>>,
+    context: &ServerPathContext,
+    path_registration: &ServerCarrierPathRegistration,
+    stream_id: StreamId,
+    session_id: SessionId,
+    path_id: PathId,
+    path_proofs: &mut PathProofTracker,
+    deadline: Option<tokio::time::Instant>,
+    mut owner_closed: Option<crate::runtime::path::ServerStreamInputClosed>,
+) -> Result<(), RuntimeError> {
+    loop {
+        let receive = async {
+            match deferred_input.take() {
+                Some(input) => Some(input),
+                None => carrier_frames.recv().await,
+            }
+        };
+        let input = if let Some(deadline) = deadline {
+            // Preserve the existing successful terminal-drain policy.
+            tokio::time::timeout_at(deadline, receive).await
+        } else {
+            tokio::select! {
+                biased;
+                _ = owner_closed.as_mut().expect("failed send retains Product input lifetime") => return Ok(()),
+                input = receive => Ok(input),
+            }
+        };
+        match input {
+            Err(_) | Ok(None) => return Ok(()),
+            Ok(Some(Ok(Frame::StreamDetach {
+                stream_id: detach_stream_id,
+            }))) if detach_stream_id == stream_id => return Ok(()),
+            Ok(Some(Ok(Frame::StreamDetach { .. }))) => {
+                return Err(RuntimeError::Protocol(
+                    "QUIC UDP terminal drain stream mismatch",
+                ));
+            }
+            Ok(Some(Ok(
+                frame @ (Frame::StreamData {
+                    stream_id: received_stream_id,
+                    ..
+                }
+                | Frame::StreamAck {
+                    stream_id: received_stream_id,
+                    ..
+                }
+                | Frame::StreamFeedbackProbe {
+                    stream_id: received_stream_id,
+                    ..
+                }
+                | Frame::StreamFeedbackReceipt {
+                    stream_id: received_stream_id,
+                    ..
+                }
+                | Frame::StreamReturnPlanFinal {
+                    stream_id: received_stream_id,
+                    ..
+                }
+                | Frame::StreamMaxData {
+                    stream_id: received_stream_id,
+                    ..
+                }
+                | Frame::StreamFin {
+                    stream_id: received_stream_id,
+                    ..
+                }
+                | Frame::StreamReset {
+                    stream_id: received_stream_id,
+                    ..
+                }),
+            ))) if received_stream_id == stream_id => {
+                let is_reset = matches!(&frame, Frame::StreamReset { .. });
+                context
+                    .reliable_streams
+                    .route_frame(path_registration, stream_id, frame)
+                    .await?;
+                if is_reset && owner_closed.is_some() {
+                    return Ok(());
+                }
+            }
+            Ok(Some(Ok(
+                Frame::StreamRequalifyData {
+                    stream_id: received_stream_id,
+                    ..
+                }
+                | Frame::StreamRequalifyAck {
+                    stream_id: received_stream_id,
+                    ..
+                },
+            ))) if received_stream_id == stream_id => {
+                // The exact response half is already finished and
+                // detached. A delayed receipt has no current authority,
+                // and a new probe cannot be acknowledged on this exact
+                // attachment; tolerate either until peer detach.
+            }
+            Ok(Some(Ok(
+                Frame::StreamData { .. }
+                | Frame::StreamAck { .. }
+                | Frame::StreamFeedbackProbe { .. }
+                | Frame::StreamFeedbackReceipt { .. }
+                | Frame::StreamReturnPlanFinal { .. }
+                | Frame::StreamRequalifyData { .. }
+                | Frame::StreamRequalifyAck { .. }
+                | Frame::StreamMaxData { .. }
+                | Frame::StreamFin { .. }
+                | Frame::StreamReset { .. },
+            ))) => {
+                return Err(RuntimeError::Protocol(
+                    "QUIC UDP terminal drain stream mismatch",
+                ));
+            }
+            Ok(Some(Ok(Frame::PathMetrics { metrics }))) if metrics.path_id == path_id => {
+                context
+                    .reliable_streams
+                    .record_peer_path_metrics(path_registration, metrics);
+            }
+            Ok(Some(Ok(Frame::PathStatus {
+                path_id: status_path_id,
+                sequence,
+                usage,
+            }))) if status_path_id == path_id => {
+                context
+                    .reliable_streams
+                    .record_peer_path_usage(path_registration, sequence, usage);
+            }
+            Ok(Some(Ok(Frame::PathProofAck {
+                path_id: proof_path_id,
+                proof_id,
+                payload_bytes,
+            }))) if proof_path_id == path_id => {
+                if let Some(observation) = path_proofs.acknowledge(path_id, proof_id, payload_bytes)
+                {
+                    // QUIC owns congestion and capacity evidence; this frame
+                    // validates only the response direction of the carrier.
+                    context
+                        .reliable_streams
+                        .record_path_proof_success(path_registration, observation);
+                }
+            }
+            // These requests can already be deferred behind the terminal
+            // write. The send half is finished, so no reply is possible.
+            Ok(Some(Ok(Frame::Ping { .. }))) => {}
+            Ok(Some(Ok(Frame::PathProofData {
+                path_id: proof_path_id,
+                ..
+            }))) if proof_path_id == path_id => {}
+            Ok(Some(Ok(Frame::SessionClose { reason }))) => {
+                context.retire_session(session_id, reason);
+                return Err(RuntimeError::RemoteClosed(reason));
+            }
+            Ok(Some(Ok(
+                Frame::PathCapacityData { .. }
+                | Frame::PathCapacityFinish { .. }
+                | Frame::PathCapacityReceipt { .. },
+            ))) => {
+                return Err(RuntimeError::Protocol(
+                    "PATH_CAPACITY frames are not valid on QUIC carriers",
+                ));
+            }
+            Ok(Some(Ok(_))) => {
+                return Err(RuntimeError::Protocol(
+                    "unexpected server QUIC UDP terminal drain frame",
+                ));
+            }
+            Ok(Some(Err(err))) if super::io::udp_path_input_finished(&err) => return Ok(()),
+            Ok(Some(Err(RuntimeError::ReliablePathSessionClosed))) => return Ok(()),
+            Ok(Some(Err(err))) => return Err(err),
         }
     }
 }

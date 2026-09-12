@@ -698,7 +698,8 @@ impl ClientTcpPathSessionHandle {
         }
         successor_claim.commit();
 
-        tokio::spawn(run_client_tcp_path_session_with_connection(
+        let execution_domain = runtime.state.execution_domain();
+        let actor = run_client_tcp_path_session_with_connection(
             runtime,
             receivers,
             self.ready_carrier_instance.clone(),
@@ -706,7 +707,8 @@ impl ClientTcpPathSessionHandle {
             terminal,
             reservation,
             connection,
-        ));
+        );
+        tokio::spawn(execution_domain.wrap(actor));
         predecessor.commands.begin_path_drain();
         Ok(ClientTcpCarrierReplacement {
             group_index: self.runtime.config_index,
@@ -904,7 +906,8 @@ impl ClientTcpPathSessionHandle {
         endpoint_generation: u64,
         remote_port: Option<u16>,
     ) -> Result<ClientTcpPathSessionSlot, RuntimeError> {
-        self.runtime
+        let (session, pending_actor) = self
+            .runtime
             .state
             .session_lifecycle()
             .commit_if_active(|| {
@@ -915,7 +918,7 @@ impl ClientTcpPathSessionHandle {
                         if let Some(session) = member.current.as_ref()
                             && !session.terminal.load(Ordering::Acquire)
                         {
-                            return Ok(session.clone());
+                            return Ok((session.clone(), None));
                         }
                         if member.successor_establishing {
                             return Err(RuntimeError::NoSchedulableTcpPath);
@@ -931,25 +934,36 @@ impl ClientTcpPathSessionHandle {
                             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
                         let path_id = reservation.path_id();
                         let runtime = self.runtime.for_carrier(path_id, remote_port);
-                        tokio::spawn(run_client_tcp_path_session(
+                        let execution_domain = runtime.state.execution_domain();
+                        let actor = run_client_tcp_path_session(
                             runtime,
                             receivers,
                             self.ready_carrier_instance.clone(),
                             self.ready_remote_port.clone(),
                             terminal.clone(),
                             reservation,
-                        ));
+                        );
                         let session = ClientTcpPathSessionSlot {
                             commands,
                             terminal,
                             path_id,
                         };
                         member.current = Some(session.clone());
-                        Ok(session)
+                        Ok((session, Some((execution_domain, actor))))
                     })
             })
             .map_err(RuntimeError::RemoteClosed)?
-            .ok_or(RuntimeError::NoSchedulableTcpPath)?
+            .ok_or(RuntimeError::NoSchedulableTcpPath)??;
+        if let Some((execution_domain, actor)) = pending_actor {
+            // Tokio can synchronously destroy a new task during shutdown.
+            // Entering its destruction domain must happen after releasing the
+            // lifecycle, endpoint-generation, and member commitment locks.
+            // Publication still commits exactly once above; as with a queued
+            // task, commands may arrive before its first poll. No await splits
+            // that publication from this spawn.
+            tokio::spawn(execution_domain.wrap(actor));
+        }
+        Ok(session)
     }
 }
 

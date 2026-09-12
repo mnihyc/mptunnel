@@ -11,7 +11,7 @@ use super::io::{
     AuthoritativeStreamAckSnapshot, ReadyStreamDataBatchBounds, ReadyStreamDataDirection,
     accepted_copy_wake_is_due, apply_ready_stream_data_batch, collect_ready_stream_data_batch,
     pending_stream_fin_ready, read_reliable_relay_payload, receive_stream_fin,
-    reconcile_accepted_copy_wake, resize_reliable_relay_buffer, retain_accepted_copy_wake,
+    reconcile_accepted_copy_wake, retain_accepted_copy_wake,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required, write_applied_ready_stream_data_batch,
 };
@@ -784,7 +784,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let retirement = context.session_retirement().wait();
-    let active = relay_migrating_tcp_stream_active(
+    // The wrapper also owns cancellation cleanup: revoking prepared claims
+    // and dropping committed output membership share the writer's domain.
+    let execution_domain = context.execution_domain();
+    let active = execution_domain.wrap(relay_migrating_tcp_stream_active(
         local,
         context,
         performance,
@@ -793,7 +796,7 @@ where
         idle_timeout,
         #[cfg(test)]
         None,
-    );
+    ));
     tokio::pin!(retirement);
     tokio::pin!(active);
     tokio::select! {
@@ -1662,7 +1665,6 @@ where
                     .min(remotes.max_frame_payload_bytes(context.mux_limits))
                     .min(sender_queue_limit)
                     .max(1);
-                resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
                 let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
                     reliable_relay_sender_dispatch_budget(
                         context.mux_limits,
@@ -2257,6 +2259,11 @@ where
                 prepared_work_wait,
             )
         };
+        if !can_read_local {
+            // Match the response direction: withdraw the old demand when source
+            // eligibility ends, without resetting it on ordinary select turns.
+            send_buffer_updates.withdraw();
+        }
         let feedback_deadline = request_product
             .lock()
             .remotes
@@ -3031,6 +3038,7 @@ where
                         &mut local,
                         &mut buf,
                         reserved_read_budget,
+                        read_budget,
                     )
                     .await;
                     #[cfg(feature = "lab-diagnostics")]
@@ -3291,7 +3299,7 @@ where
                                     let permit = context.session_send_buffer
                                         .reserve(&mut send_buffer_updates, next_read_budget).await;
                                     let result = read_reliable_relay_payload(
-                                        &mut local, &mut buf, permit.bytes(),
+                                        &mut local, &mut buf, permit.bytes(), next_read_budget,
                                     ).await;
                                     (result, permit)
                                 }).await;

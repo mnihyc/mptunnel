@@ -4,6 +4,7 @@ use super::io::{
     UdpPathSendStream, flush_udp_frame_batch_with_path_proofs_interlocked, udp_path_finish_stream,
     udp_path_write_frame,
 };
+use super::server_output_retirement::ServerUdpOutputRetirement;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{Frame, PathId, StreamId};
@@ -35,7 +36,8 @@ pub(super) async fn drain_one_server_udp_command_while_input_deferred(
     send: &mut UdpPathSendStream,
     context: &ServerPathContext,
     stream_id: StreamId,
-    path_registration: &ServerCarrierPathRegistration,
+    _path_registration: &ServerCarrierPathRegistration,
+    retirement: &ServerUdpOutputRetirement,
     path_proofs: &mut PathProofTracker,
 ) -> Result<bool, RuntimeError> {
     commands.withdraw_writer_ready();
@@ -88,9 +90,7 @@ pub(super) async fn drain_one_server_udp_command_while_input_deferred(
             let result = udp_path_write_frame(send, &frame, context.codec_limits).await;
             commands.release_pending_command_bytes(pending_bytes);
             result?;
-            context
-                .reliable_streams
-                .detach_path(path_registration, stream_id)?;
+            retirement.retire()?;
             let _ = udp_path_finish_stream(send).await;
             Ok(true)
         }
@@ -99,9 +99,7 @@ pub(super) async fn drain_one_server_udp_command_while_input_deferred(
             if close_stream_id != stream_id {
                 return Ok(false);
             }
-            context
-                .reliable_streams
-                .detach_path(path_registration, stream_id)?;
+            retirement.retire()?;
             if !send.cancel_pending_response() {
                 let _ = udp_path_finish_stream(send).await;
             }
@@ -136,6 +134,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
     stream_id: StreamId,
     path_id: PathId,
     path_registration: &ServerCarrierPathRegistration,
+    retirement: &ServerUdpOutputRetirement,
     pending_frames: &mut Vec<Frame>,
     path_proofs: &mut PathProofTracker,
     carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
@@ -361,9 +360,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 )
                 .await?;
                 pending_released_by_batch = true;
-                context
-                    .reliable_streams
-                    .detach_path(path_registration, stream_id)?;
+                retirement.retire()?;
                 let _ = udp_path_finish_stream(send).await;
                 true
             }
@@ -384,9 +381,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 )
                 .await?;
                 if close_stream_id == stream_id {
-                    context
-                        .reliable_streams
-                        .detach_path(path_registration, stream_id)?;
+                    retirement.retire()?;
                     // An unordered close before any response is the wire
                     // representation used by a post-resolution policy drop.
                     // Cancel that request without manufacturing HTTP 200;

@@ -8,6 +8,585 @@ use bytes::Bytes;
 use std::time::Duration;
 use tokio::time::timeout;
 
+struct NativeSourceH3Fixture {
+    _server: Endpoint,
+    _client: Endpoint,
+    client_connection: super::super::Connection,
+    server_connection: super::super::Connection,
+    send: SendStream,
+    _recv: RecvStream,
+    _server_send: SendStream,
+    server_recv: RecvStream,
+}
+
+async fn native_source_h3_fixture() -> NativeSourceH3Fixture {
+    // Restrict this stream's peer credit, keeping connection credit available
+    // for a sibling. The test payload crosses both this limit and MPP records.
+    let mux_limits = MuxLimits {
+        max_stream_window_bytes: 4 * 1024,
+        ..MuxLimits::default()
+    };
+    let limits = CodecLimits::default();
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let (client_connection, server_connection) = timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            client.connect(server.local_addr().expect("server local addr")),
+            server.accept()
+        )
+    })
+    .await
+    .expect("connection lifecycle timeout");
+    let client_connection = client_connection.expect("client connection");
+    let server_connection = server_connection.expect("server connection");
+    let (client_stream, server_stream) = timeout(Duration::from_secs(5), async {
+        tokio::join!(client_connection.open_bi(), server_connection.accept_bi())
+    })
+    .await
+    .expect("request lifecycle timeout");
+    let (mut send, mut recv) = client_stream.expect("client request");
+    let (mut server_send, mut server_recv) = server_stream.expect("server request");
+    timeout(Duration::from_secs(5), async {
+        write_frame(&mut send, &Frame::Ping { nonce: 1 }, limits)
+            .await
+            .expect("warmup ping");
+        assert_eq!(
+            read_frame(&mut server_recv, limits)
+                .await
+                .expect("warmup request"),
+            Frame::Ping { nonce: 1 }
+        );
+        write_frame(&mut server_send, &Frame::Pong { nonce: 1 }, limits)
+            .await
+            .expect("warmup pong");
+        assert_eq!(
+            read_frame(&mut recv, limits)
+                .await
+                .expect("warmup response"),
+            Frame::Pong { nonce: 1 }
+        );
+    })
+    .await
+    .expect("warmup lifecycle timeout");
+    NativeSourceH3Fixture {
+        _server: server,
+        _client: client,
+        client_connection,
+        server_connection,
+        send,
+        _recv: recv,
+        _server_send: server_send,
+        server_recv,
+    }
+}
+
+/// Actual source ownership crosses two runtime workers here: Native has begun
+/// a framed write, while the original owner cancels its handle on another
+/// worker. The gates control finite poll/drop boundaries, not network policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_native_source_cancel_fences_actual_drop_and_preserves_h3_sibling() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::task::{Context, Poll};
+
+    const LIFECYCLE_GUARD: Duration = Duration::from_secs(5);
+
+    struct LastSourceDrop {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Drop for LastSourceDrop {
+        fn drop(&mut self) {
+            self.entered
+                .take()
+                .expect("one source destruction")
+                .send(())
+                .expect("source destruction observer");
+            self.release
+                .recv_timeout(LIFECYCLE_GUARD)
+                .expect("release finite source destruction");
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ActualSource<F> {
+        // Field order makes the marker run after the actual H3 future/stream.
+        future: Pin<Box<F>>,
+        _last_drop: LastSourceDrop,
+    }
+
+    impl<F: Future> Future for ActualSource<F> {
+        type Output = F::Output;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.get_mut().future.as_mut().poll(cx)
+        }
+    }
+
+    let NativeSourceH3Fixture {
+        _server,
+        _client,
+        client_connection,
+        server_connection,
+        mut send,
+        _recv,
+        _server_send,
+        server_recv: _server_recv,
+    } = native_source_h3_fixture().await;
+    let limits = CodecLimits::default();
+    let native = send.connection.clone();
+    let domain = quinn::ExecutionDomain::default();
+    native
+        .bind_execution_domain(domain.clone())
+        .expect("bind actual client driver");
+    assert!(
+        native
+            .execution_domain()
+            .expect("actual driver retains binding")
+            .same_domain(&domain)
+    );
+    let (client_sibling, server_sibling) = timeout(LIFECYCLE_GUARD, async {
+        tokio::join!(client_connection.open_bi(), server_connection.accept_bi())
+    })
+    .await
+    .expect("sibling attachment lifecycle");
+    let (mut sibling_send, mut sibling_recv) = client_sibling.expect("client sibling");
+    let (mut peer_send, mut peer_recv) = server_sibling.expect("server sibling");
+    let (poll_entered_tx, poll_entered_rx) = tokio::sync::oneshot::channel();
+    let (poll_release_tx, poll_release_rx) = std::sync::mpsc::channel();
+    let (drop_entered_tx, drop_entered_rx) = tokio::sync::oneshot::channel();
+    let (drop_release_tx, drop_release_rx) = std::sync::mpsc::channel();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let owner = send
+        .native_source_registration()
+        .register(ActualSource {
+            future: Box::pin(async move {
+                write_frame(&mut send, &Frame::Ping { nonce: 2 }, limits)
+                    .await
+                    .expect("actual source framed write");
+                poll_entered_tx
+                    .send(std::thread::current().id())
+                    .expect("actual Native source poll observer");
+                poll_release_rx
+                    .recv_timeout(LIFECYCLE_GUARD)
+                    .expect("release finite actual source poll");
+                std::future::pending::<()>().await;
+            }),
+            _last_drop: LastSourceDrop {
+                entered: Some(drop_entered_tx),
+                release: drop_release_rx,
+                count: drops.clone(),
+            },
+        })
+        .expect("register actual bound source");
+    let source_worker = timeout(LIFECYCLE_GUARD, poll_entered_rx)
+        .await
+        .expect("actual source poll lifecycle")
+        .expect("actual source entered Native poll");
+    let (cancel_started_tx, cancel_started_rx) = tokio::sync::oneshot::channel();
+    let cancel_returned = Arc::new(AtomicBool::new(false));
+    let cancel_observed = cancel_returned.clone();
+    let cancelled_drops = drops.clone();
+    let cancel_domain = domain.clone();
+    let cancel_task = tokio::spawn(async move {
+        cancel_started_tx
+            .send(std::thread::current().id())
+            .expect("cancelling worker observer");
+        // This exercises wrapper Drop without first polling the owner handle,
+        // as can happen when a freshly spawned Product task is aborted.
+        drop(cancel_domain.wrap(owner));
+        assert_eq!(cancelled_drops.load(Ordering::SeqCst), 1);
+        cancel_observed.store(true, Ordering::SeqCst);
+    });
+    let cancel_worker = timeout(LIFECYCLE_GUARD, cancel_started_rx)
+        .await
+        .expect("other worker cancellation lifecycle")
+        .expect("other worker started cancellation");
+    assert_ne!(source_worker, cancel_worker);
+    assert!(!cancel_returned.load(Ordering::SeqCst));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    poll_release_tx.send(()).expect("finish actual source poll");
+    timeout(LIFECYCLE_GUARD, drop_entered_rx)
+        .await
+        .expect("source destructor lifecycle")
+        .expect("actual source fields destroyed before final marker");
+    assert!(!cancel_returned.load(Ordering::SeqCst));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop_release_tx
+        .send(())
+        .expect("finish actual source destruction");
+    timeout(LIFECYCLE_GUARD, cancel_task)
+        .await
+        .expect("cancellation completion lifecycle")
+        .expect("cancelling worker did not panic");
+    assert!(cancel_returned.load(Ordering::SeqCst));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(native.close_reason().is_none());
+
+    let sibling = sibling_send
+        .native_source_registration()
+        .register(async move {
+            write_frame(&mut sibling_send, &Frame::Ping { nonce: 42 }, limits)
+                .await
+                .expect("bound sibling write after cancellation");
+            read_frame(&mut sibling_recv, limits)
+                .await
+                .expect("bound sibling response after cancellation")
+        })
+        .expect("register sibling on the same actual bound driver");
+    let (response, ()) = timeout(LIFECYCLE_GUARD, async {
+        tokio::join!(domain.wrap(sibling), async {
+            assert_eq!(
+                read_frame(&mut peer_recv, limits)
+                    .await
+                    .expect("actual sibling request"),
+                Frame::Ping { nonce: 42 }
+            );
+            write_frame(&mut peer_send, &Frame::Pong { nonce: 42 }, limits)
+                .await
+                .expect("actual sibling response");
+        })
+    })
+    .await
+    .expect("bound sibling remains serviceable");
+    assert_eq!(
+        response.expect("bound sibling source live"),
+        Frame::Pong { nonce: 42 }
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+/// This counts adapter operations, not Product claims. Every operation uses
+/// real MPP framing and an exclusively owned H3 send half; native observation
+/// only gates the next operation after the previous accepted envelope crosses.
+#[tokio::test(flavor = "current_thread")]
+async fn native_driven_h3_source_retains_partial_write_and_resumes_after_packetization() {
+    use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
+
+    let NativeSourceH3Fixture {
+        _server,
+        _client,
+        client_connection,
+        server_connection,
+        mut send,
+        _recv,
+        _server_send,
+        mut server_recv,
+    } = native_source_h3_fixture().await;
+    let limits = CodecLimits::default();
+    let payloads = [
+        Bytes::from(vec![0x35; QUIC_STREAM_RECORD_PAYLOAD_BYTES * 2 + 17]),
+        Bytes::from(vec![0xa7; QUIC_STREAM_RECORD_PAYLOAD_BYTES * 2 + 17]),
+        Bytes::from_static(b"source available again"),
+    ];
+    let expected: Vec<u8> = payloads
+        .iter()
+        .flat_map(|bytes| bytes.iter().copied())
+        .collect();
+    let native = send.connection.clone();
+    let observer = send
+        .native_progress_observer()
+        .expect("established observer");
+    let write_backlog = send.write_backlog.clone();
+    let started = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let source_started = started.clone();
+    let source_completed = completed.clone();
+    let source_backlog = write_backlog.clone();
+    let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+    let (exhausted_tx, exhausted_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+
+    native
+        .register_transmit_source(Box::pin(async move {
+            let mut partial_tx = Some(partial_tx);
+            let mut exhausted_tx = Some(exhausted_tx);
+            let mut resume_rx = Some(resume_rx);
+            let initial = observer.snapshot().expect("initial progress");
+            observer
+                .wait_until_packetized(initial.accepted_end)
+                .await
+                .expect("warmup packetized");
+            let mut offset = 0;
+            for (index, payload) in payloads.into_iter().enumerate() {
+                if index == 2 {
+                    let idle = observer.snapshot().expect("source exhaustion progress");
+                    assert_eq!(idle.first_unpacketized, idle.accepted_end);
+                    assert_eq!(source_backlog.load(Ordering::Relaxed), 0);
+                    exhausted_tx
+                        .take()
+                        .expect("one exhaustion")
+                        .send(idle)
+                        .expect("exhaustion receiver");
+                    // This is a real absence of source work, not native credit.
+                    // Its unrelated wake must resume the registered future.
+                    resume_rx
+                        .take()
+                        .expect("one resume")
+                        .await
+                        .expect("resume source");
+                }
+                let before = observer.snapshot().expect("operation boundary");
+                assert_eq!(before.first_unpacketized, before.accepted_end);
+                assert_eq!(source_started.load(Ordering::Relaxed), index);
+                assert_eq!(source_completed.load(Ordering::Relaxed), index);
+                source_started.fetch_add(1, Ordering::Relaxed);
+                let payload_len = payload.len();
+                let frame = Frame::StreamData {
+                    stream_id: StreamId(7),
+                    offset,
+                    payload,
+                };
+                let mut write = Box::pin(write_frame(&mut send, &frame, limits));
+                std::future::poll_fn(|cx| {
+                    let result = write.as_mut().poll(cx);
+                    if result.is_pending()
+                        && let Some(notice) = partial_tx.take()
+                    {
+                        let partial = observer.snapshot().expect("partial native acceptance");
+                        // The peer has not consumed the bulk body. A positive
+                        // accepted prefix followed by Pending belongs to this
+                        // same future until credit arrives; it is not refusal.
+                        assert!(partial.accepted_end > before.accepted_end);
+                        assert!(partial.accepted_end - before.accepted_end < payload_len as u64);
+                        let charge = source_backlog.load(Ordering::Relaxed);
+                        assert!(charge > 0);
+                        notice
+                            .send((before, partial, charge))
+                            .expect("partial receiver");
+                    }
+                    result
+                })
+                .await
+                .expect("retained H3 write completes");
+                drop(write);
+                source_completed.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(source_backlog.load(Ordering::Relaxed), 0);
+                let accepted = observer.snapshot().expect("complete native envelope");
+                assert!(accepted.accepted_end > before.accepted_end);
+                let packetized = observer
+                    .wait_until_packetized(accepted.accepted_end)
+                    .await
+                    .expect("exact operation packetization wake");
+                assert_eq!(packetized.first_unpacketized, packetized.accepted_end);
+                offset += payload_len as u64;
+            }
+            let final_progress = observer.snapshot().expect("final packetization");
+            finish_stream(&mut send)
+                .await
+                .expect("finish finite source");
+            finished_tx
+                .send(final_progress)
+                .expect("source completion receiver");
+        }))
+        .expect("register exclusive H3 source");
+
+    let (before, partial, charge) = timeout(Duration::from_secs(5), partial_rx)
+        .await
+        .expect("partial write lifecycle timeout")
+        .expect("partial write notice");
+    assert!(partial.accepted_end > before.accepted_end);
+    assert_eq!(started.load(Ordering::Relaxed), 1);
+    assert_eq!(completed.load(Ordering::Relaxed), 0);
+    assert_eq!(write_backlog.load(Ordering::Relaxed), charge);
+
+    // No bulk read happens before this independent control round trip.
+    let (mut control_send, mut control_recv) =
+        timeout(Duration::from_secs(5), client_connection.open_bi())
+            .await
+            .expect("sibling open timeout")
+            .expect("sibling request");
+    timeout(Duration::from_secs(5), async {
+        write_frame(&mut control_send, &Frame::Ping { nonce: 99 }, limits)
+            .await
+            .expect("sibling ping");
+        let (mut peer_send, mut peer_recv) = server_connection
+            .accept_bi()
+            .await
+            .expect("sibling accepted");
+        assert_eq!(
+            read_frame(&mut peer_recv, limits)
+                .await
+                .expect("sibling request"),
+            Frame::Ping { nonce: 99 }
+        );
+        write_frame(&mut peer_send, &Frame::Pong { nonce: 99 }, limits)
+            .await
+            .expect("sibling pong");
+        assert_eq!(
+            read_frame(&mut control_recv, limits)
+                .await
+                .expect("sibling response"),
+            Frame::Pong { nonce: 99 }
+        );
+    })
+    .await
+    .expect("sibling progress while bulk flow-blocked");
+    assert_eq!(started.load(Ordering::Relaxed), 1);
+    assert_eq!(completed.load(Ordering::Relaxed), 0);
+    assert_eq!(write_backlog.load(Ordering::Relaxed), charge);
+
+    let receiver = tokio::spawn(async move {
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            let Frame::StreamData {
+                stream_id,
+                offset,
+                payload,
+            } = read_frame(&mut server_recv, limits)
+                .await
+                .expect("bulk record")
+            else {
+                panic!("expected bulk STREAM_DATA")
+            };
+            assert_eq!(stream_id, StreamId(7));
+            assert_eq!(offset, received.len() as u64);
+            received.extend_from_slice(&payload);
+        }
+        assert_eq!(received, expected);
+        server_recv
+    });
+    let exhausted = timeout(Duration::from_secs(5), exhausted_rx)
+        .await
+        .expect("finite source drain timeout")
+        .expect("source exhausted");
+    assert_eq!(exhausted.first_unpacketized, exhausted.accepted_end);
+    assert_eq!(started.load(Ordering::Relaxed), 2);
+    assert_eq!(completed.load(Ordering::Relaxed), 2);
+    assert_eq!(write_backlog.load(Ordering::Relaxed), 0);
+    // A registered source waiting for new input must still allow ordinary
+    // native empty classification. This is not a BBR round-eligibility proof.
+    timeout(Duration::from_secs(5), async {
+        while !native.active_path_snapshot().app_limited {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("genuinely exhausted source can be application limited");
+    resume_tx
+        .send(())
+        .expect("publish unrelated source availability");
+    let finished = timeout(Duration::from_secs(5), finished_rx)
+        .await
+        .expect("resumed source timeout")
+        .expect("finite source finished");
+    assert_eq!(finished.first_unpacketized, finished.accepted_end);
+    assert_eq!(started.load(Ordering::Relaxed), 3);
+    assert_eq!(completed.load(Ordering::Relaxed), 3);
+    assert_eq!(write_backlog.load(Ordering::Relaxed), 0);
+    let _server_recv = timeout(Duration::from_secs(5), receiver)
+        .await
+        .expect("exact receiver timeout")
+        .expect("exact receiver task");
+    native.close(0u32.into(), b"finite H3 source complete");
+}
+
+struct NativeSourceDropNotice(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for NativeSourceDropNotice {
+    fn drop(&mut self) {
+        if let Some(notice) = self.0.take() {
+            let _ = notice.send(());
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_driven_h3_source_connection_close_drops_in_progress_write() {
+    use std::future::Future;
+
+    let NativeSourceH3Fixture {
+        _server,
+        _client,
+        client_connection: _client_connection,
+        server_connection: _server_connection,
+        mut send,
+        _recv,
+        _server_send,
+        server_recv: _server_recv,
+    } = native_source_h3_fixture().await;
+    let limits = CodecLimits::default();
+    let native = send.connection.clone();
+    let observer = send
+        .native_progress_observer()
+        .expect("established observer");
+    let source_observer = observer.clone();
+    let backlog = send.write_backlog.clone();
+    let source_backlog = backlog.clone();
+    let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    native
+        .register_transmit_source(Box::pin(async move {
+            let _drop_notice = NativeSourceDropNotice(Some(dropped_tx));
+            let before = source_observer.snapshot().expect("initial native frontier");
+            source_observer
+                .wait_until_packetized(before.accepted_end)
+                .await
+                .expect("warmup packetized");
+            let payload_len = QUIC_STREAM_RECORD_PAYLOAD_BYTES * 2 + 17;
+            let frame = Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: 0,
+                payload: Bytes::from(vec![0x5c; payload_len]),
+            };
+            let mut partial_tx = Some(partial_tx);
+            let mut write = Box::pin(write_frame(&mut send, &frame, limits));
+            let result = std::future::poll_fn(|cx| {
+                let result = write.as_mut().poll(cx);
+                if result.is_pending()
+                    && let Some(notice) = partial_tx.take()
+                {
+                    let partial = source_observer.snapshot().expect("partial native frontier");
+                    assert!(partial.accepted_end > before.accepted_end);
+                    assert!(partial.accepted_end - before.accepted_end < payload_len as u64);
+                    assert!(source_backlog.load(Ordering::Relaxed) > 0);
+                    notice.send(partial).expect("partial receiver");
+                }
+                result
+            })
+            .await;
+            assert!(
+                result.is_err(),
+                "held peer credit cannot complete this operation"
+            );
+        }))
+        .expect("register retained terminal source");
+    let partial = timeout(Duration::from_secs(5), partial_rx)
+        .await
+        .expect("partial terminal write timeout")
+        .expect("partial terminal write");
+    assert!(partial.accepted_end > 0);
+    assert!(backlog.load(Ordering::Relaxed) > 0);
+    assert!(native.close_reason().is_none());
+    native.close(0u32.into(), b"cancel retained H3 operation");
+    timeout(Duration::from_secs(5), dropped_rx)
+        .await
+        .expect("driver source drop timeout")
+        .expect("driver dropped source");
+    assert_eq!(backlog.load(Ordering::Relaxed), 0);
+    assert!(native.close_reason().is_some());
+    assert!(observer.snapshot().is_err());
+}
+
 #[test]
 fn quic_writer_splits_large_stream_data_below_product_scheduler() {
     let limits = CodecLimits::default();

@@ -154,7 +154,17 @@ fn quic_clean_stream_finish_is_distinct_from_truncated_frame() {
 }
 
 #[test]
-fn quic_h3_zero_code_peer_abandonment_is_operation_scoped() {
+fn quic_zero_code_peer_abandonment_is_operation_scoped() {
+    for code in [0, 42] {
+        let stopped = RuntimeError::from(quinn::SendStreamObservationError::Stopped(
+            quinn::VarInt::from_u32(code),
+        ));
+        assert!(!udp_runtime_error_is_expected_shutdown(&stopped));
+        assert_eq!(
+            udp_operation_error_is_expected_shutdown(&stopped),
+            code == 0
+        );
+    }
     let abandoned = RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::H3Stream(
         h3::error::StreamError::RemoteTerminate {
             code: h3::error::Code::from(0_u64),

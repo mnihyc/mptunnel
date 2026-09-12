@@ -1048,6 +1048,10 @@ pub(in crate::runtime) enum ServerNewStreamPolicy {
     Reject,
 }
 
+/// Closure of one captured Product input; does not retain its receiver.
+pub(in crate::runtime) type ServerStreamInputClosed =
+    Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
 type ServerStreamPortFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, RuntimeError>> + Send + 'a>>;
 
@@ -1083,6 +1087,11 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         session_id: SessionId,
     ) -> Result<ServerSessionRetirement, RuntimeError>;
 
+    fn session_execution_domain(
+        &self,
+        session_id: SessionId,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError>;
+
     fn retire_session(&self, session_id: SessionId, reason: CloseReason) -> CloseReason;
 
     fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState);
@@ -1112,6 +1121,14 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         stream_id: StreamId,
         frame: Frame,
     ) -> Result<ServerStreamFrameRoute, RuntimeError>;
+
+    /// Capture the current logical input's closure, without owning its receiver.
+    /// A missing input returns None; an existing closed input resolves at once.
+    fn input_closed(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+    ) -> Option<ServerStreamInputClosed>;
 
     fn detach_path(
         &self,
@@ -1429,6 +1446,13 @@ impl ServerStreamPort {
         self.backend.session_retirement(session_id)
     }
 
+    pub(in crate::runtime) fn session_execution_domain(
+        &self,
+        session_id: SessionId,
+    ) -> Result<quinn::ExecutionDomain, RuntimeError> {
+        self.backend.session_execution_domain(session_id)
+    }
+
     pub(in crate::runtime) fn retire_session(
         &self,
         session_id: SessionId,
@@ -1512,6 +1536,26 @@ impl ServerStreamPort {
         }
         self.backend
             .try_route_frame(path_registration.inner.identity, stream_id, frame)
+    }
+
+    /// Capture the exact current Product input lifetime before output detach.
+    ///
+    /// The owned future observes that original receiver even if the registry
+    /// later changes. It does not retain Product or response-output ownership,
+    /// and introduces no independent lifetime or timeout.
+    pub(in crate::runtime) fn input_closed(
+        &self,
+        path_registration: &ServerCarrierPathRegistration,
+        stream_id: StreamId,
+    ) -> Result<Option<ServerStreamInputClosed>, RuntimeError> {
+        if !path_registration.belongs_to(self) {
+            return Err(RuntimeError::Protocol(
+                "reliable path registration does not match stream service",
+            ));
+        }
+        Ok(self
+            .backend
+            .input_closed(path_registration.inner.identity, stream_id))
     }
 
     pub(in crate::runtime) fn detach_path(

@@ -396,7 +396,11 @@ async fn send_stream_observer_fatal_socket_error_wakes_retained_waiter() {
             });
             state.io_poller = state.socket.clone().create_io_poller();
         }
-        let mut driver = Box::pin(ConnectionDriver(connection.0.clone()));
+        let (_source_tx, source_rx) = mpsc::unbounded_channel();
+        let mut driver = Box::pin(ConnectionDriver {
+            conn: connection.0.clone(),
+            sources: TransmitSources::new(source_rx),
+        });
         assert!(matches!(poll(driver.as_mut(), &wakes), Poll::Ready(Err(_))));
         assert!(
             connection.close_reason().is_some(),

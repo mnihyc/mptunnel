@@ -1700,6 +1700,21 @@ output on its attachment; actual native transport failure remains independent.
 
 `STREAM_RESET(stream_id, reason)` terminates the MPP stream.
 
+When a QUIC response send half is stopped, its output MUST be withdrawn and its
+failed writer buffers released before waiting for remaining request-side input.
+The original authenticated receive owner may still carry logical data, feedback
+and terminal frames. Preserve that input until native receive termination, the
+original Product input closes, or its session/connection ends. This continuation
+uses the existing logical lifetime, not a new fixed send-error grace period; it
+MUST NOT translate native STOP into logical reset or revive a closed Product.
+
+Output retirement MUST be idempotent for one output incarnation. Explicit detach
+and later actor destruction share that retirement ownership. Once an output has
+been detached, its old guard MUST NOT remove a replacement that reuses the same
+carrier and logical stream. Receiver-only continuation grants no new scheduling,
+copy, or command-buffer authority. Existing successful terminal-drain policy is
+unchanged by this send-error rule.
+
 Product FIN, detach, reset, or logical-stream terminal cancels only work
 that remains locally removable under the exact queue and reservation owners.
 It does not acknowledge native transport bytes or Product delivery. Already
@@ -2416,6 +2431,61 @@ no finite service-time guarantee while its native transport remains live.
 Cancellation MUST reconcile each queue reservation, Product flight,
 measurement ticket, load lease, and registry entry exactly once.
 
+The shared reliable source-byte envelope charges unique bytes before a local
+read and retains that charge through queued, prepared, flight and reinjection
+ownership until Data ACK or exact terminal cleanup releases it. Moving or copying
+those bytes does not grant more unique-source capacity. That byte bound alone
+does not provide admission fairness: waking a reader does not reserve capacity
+for it, and a releasing actor can otherwise reclaim every release before another
+eligible actor runs.
+
+The source read ceiling and an admitted grant are upper bounds, not required read
+sizes. A reusable source buffer MUST consume its existing spare backing before
+allocating a replacement, including when a supplied socket returns short reads.
+Refill occurs only after that spare capacity is exhausted, using the caller's
+existing source-read maximum before shared reservation. A partial grant controls
+permission to read, not the size of the next backing allocation: choosing backing
+from a small grant can truncate subsequent larger grants and repeatedly require
+short reads, refunds and new admission turns. The local read remains bounded by
+the actual grant; a shorter read at a backing boundary refunds unused capacity
+through the ordinary permit.
+This preserves shared, zero-copy payload ownership without repeatedly pinning
+mostly unused old allocations. It can require an additional read/admission turn
+at a backing boundary, and the larger partially filled backing per source is a
+resource cost within the same arbitration and unique-byte envelope. Unique bytes
+still differ from physical allocation capacity: an outstanding slice after partial ACK can pin an
+otherwise consumed backing allocation, and each live source retains its current
+buffer. Repair item/lifetime bounds and measured resource behavior still apply.
+
+Among currently pending source reservations, the oldest unsatisfied request MUST
+own the next positive grant. The grant is the smaller of currently available
+capacity and that request's current positive maximum; admission MUST NOT wait for
+the whole maximum while a smaller positive grant is available. Ordinary and
+opportunistic reads share this arbitration. An assigned grant is immediately
+charged to the same session envelope and cannot be stolen before its owner runs.
+Only owners of actual grants need a capacity wake.
+
+Cancelling a pending reservation withdraws its active registration and refunds any
+assigned but unconsumed grant exactly once. The source retains only its order
+identity across a losing input/control select while its demand remains eligible;
+on re-entry it joins active arbitration with that identity and its current maximum.
+A dormant identity reserves no bytes or admission turn and blocks no active reader.
+Ineligibility or owner destruction withdraws the old demand. Consuming a grant
+completes that admission turn, even if the following local read is partial or
+cancelled; existing read-permit cleanup returns unused bytes. No admission turn
+spans actual source I/O or an independently selected target write.
+
+This is an explicit shared-resource policy revision, distinct from executor and
+per-relay service-class fairness. Active requests use bounded per-source state and
+ordered insertion/removal; grant and cancellation cost grows logarithmically with
+pending demand rather than broadcasting each release to every source. A release
+assigning k grants can perform k ordered removals and k wakes in one synchronous
+turn; this concurrency cost requires resource validation. Uncontended admission
+remains constant work. Assigned bytes can remain unavailable until their
+owner is polled or cancelled, within the unchanged byte envelope. There is no
+wall-clock service guarantee without capacity release, runnable owners and actual
+source supply, and no proportional flow cap, new timer or native congestion policy.
+
 The final carrier writer preserves dependency and class boundaries while work
 remains MPP-owned. At every command-selection boundary it serves
 dependency-ready Control, lifecycle, and Data ACK work first, then Realtime and
@@ -2840,6 +2910,10 @@ preserves the logical stream and its exact retained ranges on surviving
 authenticated attachments. Frame-codec, authentication, configuration, and
 Product protocol failures do not acquire that recovery authority merely
 because they were observed through a QUIC carrier.
+Native send-progress observation preserves the same failure scope as a direct
+write: stopped or closed send streams retire their operation; connection loss
+retains its exact connection cause. An unavailable or invalid observation does
+not acquire transport-recovery authority.
 
 Peer abandonment of one operation-scoped HTTP/3 request-stream direction with
 application code zero is an operation-local, error-free shutdown signal. It
@@ -3172,10 +3246,13 @@ another writer cannot append bytes between the captured empty boundary and that
 claim. Other candidates likewise require their current Ready receipts. Within
 that lifetime, a captured busy boundary is conservative because `P` cannot
 rewind; arm its exact crossing wake rather than polling or manufacturing fresh
-permission. No ownership guard crosses native I/O.
+permission. No Product ownership guard crosses native I/O.
 
 An observed send-half terminal state MUST reach that exact writer's ordinary
-retirement path even if its receive half remains open. A blocked prepared notice
+retirement path even if its receive half remains open. This retires the failed
+output and its command ownership; it MUST NOT by itself destroy valid independent
+receive/lifecycle input. In particular, native STOP on the response direction is
+not evidence that request-side `STREAM_RESET` has been received or is invalid. A blocked prepared notice
 retains a terminal wake independently of a packetization target. Observed failure
 is not unavailable healthy capability; silently excluding that FIFO from
 placement cannot substitute for its lifecycle transition.
@@ -3185,6 +3262,64 @@ TCP adapters lacking the exact event retain native backpressure and Product
 bounds, without an invented empty-FIFO receipt. This availability distinction
 neither prefers a protocol nor asserts an exact guarantee for every platform.
 QUIC FIFOs retain independent opportunities and share connection resources.
+
+An adapter MAY couple a live writer actor to its native connection driver. The MPP
+QUIC implementation uses this coupling for ordinary actors in both directions. At
+native packetization or writable events, it forwards the exact event and offers
+the signaled actor a poll before the next no-work classification. The native
+state lock MUST be released while polling or destroying the actor. A pending
+source, absent Product authority, or actual source exhaustion MUST retain normal
+native application-limited classification; retained demand alone MUST NOT forge
+supply, clear a mark, or change pacing. The native driver's existing datagram
+budget spans these inline handoffs instead of restarting for each producer poll.
+
+This coupling moves the whole existing ordinary actor, including partial writes,
+command priority and receive arbitration; it does not grant a second transaction
+or bypass Product admission. Cancellation of its owning attachment MUST wait
+until the actual actor and its owned resources are destroyed, including a poll
+already in progress. Publishing an empty actor slot before destruction completes
+is not retirement. Actor panic MUST remain isolated from the shared native driver
+and reach the original actor parent. A dedicated actor-execution guard may exclude
+concurrent polling and destruction; cancellation MUST NOT acquire it while holding
+Native or Product ownership locks. It is distinct from a Product ownership guard.
+Send/receive half-close remains directional. Retiring a failed output also retires
+its companion repair future; authenticated ordinary request input continues under
+its own Product-input or native terminal lifetime, as specified in §8.5.
+Native termination retains its observed connection-close cause and physical
+carrier scope; unavailable cause remains explicit, never a fabricated error or an
+attachment-local status. The cost of serialized actor polling and synchronous
+cancellation remains visible.
+
+Product relays, their TCP writers, and coupled Native connection drivers share
+one explicit execution domain per authenticated session lifetime. Complete finite
+polls and actual actor destruction MUST exclude one another within that domain;
+an asynchronous wait releases execution ownership. The domain precedes source,
+Product and Native locks, and does not replace their existing authority rules.
+This execution rule preserves atomic ACK reconciliation and immediate inline
+refill while avoiding concurrent Product claims observing an actor-owned mutex
+as temporary supply exhaustion. It does not fabricate supply when selection is
+actually pending. Actors from separate sessions remain independently executable.
+
+Domain admission queues ready actors FIFO and wakes the next waiter, without a
+scan of all streams or a wake-all on each turn. Synchronous actor destruction
+waits only for finite executing work and takes precedence over queued async
+polls, so worker threads cannot all wait for a task that needs a free worker.
+Actual destruction completes before its cancellation or completion is observed.
+Same-domain nested cleanup remains within the outer exclusive interval; generic
+routers, DNS coordinators and global supervisors do not inherit a session domain.
+
+A QUIC connection begins unbound. Authentication binds it once to the live
+session's domain before application-ready or writer ownership is published. The
+handoff MUST fence the complete prior driver poll, including intervals when the
+Native lock is released. Binding cannot hold Product, Native or source locks and
+cannot reassign a live connection to another domain. Retirement and late cleanup
+retain the original domain identity independently of registry removal.
+
+This model trades simultaneous CPU execution within a session for serial service
+of its ownership graph. It adds no limit on admitted streams, paths or demand.
+Endpoint input, other sessions and independent decoding remain concurrent.
+Within-session CPU capacity, queued-memory retention and cancellation delay are
+real costs to measure under ordinary concurrent and bidirectional workloads.
 
 This rule bounds new Original inventory before first packetization, not its
 residence time, packetized flight, qdisc queues or physical delivery. Native

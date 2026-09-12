@@ -58,6 +58,11 @@ impl IpPacketSender {
 }
 
 impl SendStream {
+    /// Capture a registration before moving this exclusive H3 half into its actor.
+    pub fn native_source_registration(&self) -> super::NativeSourceRegistration {
+        super::NativeSourceRegistration::new(self.connection.clone())
+    }
+
     pub(crate) fn request_stream_id(&self) -> u64 {
         self.request_stream_id.into()
     }

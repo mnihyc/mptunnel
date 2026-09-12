@@ -110,6 +110,7 @@ fn quic_product_error_has_carrier_lifetime_authority(source: &QuicCarrierError) 
     match source {
         QuicCarrierError::Io(_)
         | QuicCarrierError::Connection(_)
+        | QuicCarrierError::NativeDriverStopped
         | QuicCarrierError::H3Connection(_)
         | QuicCarrierError::H3DriverClosed
         | QuicCarrierError::Write(quinn::WriteError::ConnectionLost(_))
@@ -137,6 +138,7 @@ fn client_udp_endpoint_error_has_health_authority(source: &RuntimeError) -> bool
             | RuntimeError::QuicCarrier(
                 QuicCarrierError::Io(_)
                     | QuicCarrierError::Connection(_)
+                    | QuicCarrierError::NativeDriverStopped
                     | QuicCarrierError::H3Connection(_)
                     | QuicCarrierError::H3Stream(_)
                     | QuicCarrierError::H3DriverClosed
@@ -1334,6 +1336,9 @@ async fn connect_client_udp_path(
                 }
                 Err(error) => return Err(error),
             };
+        // Authentication fixes the MPP session before any Product can be
+        // published. Native joins that session's poll/drop owner first.
+        connection.bind_execution_domain(runtime.state.execution_domain())?;
         let path_instance_id =
             try_next_carrier_path_instance_id().ok_or(RuntimeError::ExactIdentityExhausted)?;
         connection
@@ -1687,7 +1692,8 @@ async fn open_client_udp_stream_on_connection(
     let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);
     let repair_commands = receivers.take_repair_receiver(stream_id);
     let stream_runtime = runtime.clone();
-    tokio::spawn(async move {
+    let execution_domain = stream_runtime.state.execution_domain();
+    tokio::spawn(execution_domain.wrap(async move {
         let repair = async {
             repair_send.set_repair_priority()?;
             udp_path_write_frame(
@@ -1714,18 +1720,22 @@ async fn open_client_udp_stream_on_connection(
             )
             .await
         };
-        let ordinary = run_client_udp_stream(
-            send,
-            recv,
-            stream_id,
-            stream_runtime.path_index,
-            carrier.path_instance_id,
-            stream_runtime.codec_limits,
-            stream_runtime.mux_limits,
-            stream_frame_queue,
-            stream_runtime.state.clone(),
-            receivers,
-            frames_tx.clone(),
+        let registration = send.native_source_registration();
+        let ordinary = super::driven::run_ordinary_source(
+            registration,
+            run_client_udp_stream(
+                send,
+                recv,
+                stream_id,
+                stream_runtime.path_index,
+                carrier.path_instance_id,
+                stream_runtime.codec_limits,
+                stream_runtime.mux_limits,
+                stream_frame_queue,
+                stream_runtime.state.clone(),
+                receivers,
+                frames_tx.clone(),
+            ),
         );
         tokio::select! {
             biased;
@@ -1734,9 +1744,13 @@ async fn open_client_udp_stream_on_connection(
                     let _ = frames_tx.send(Err(client_repair_attachment_error(error))).await;
                 }
             }
-            () = ordinary => {}
+            result = ordinary => {
+                if let Err(error) = result {
+                    let _ = frames_tx.send(Err(error)).await;
+                }
+            }
         }
-    });
+    }));
     let mut startup = path_startup_snapshot_for_instance(
         runtime.path(),
         PathId(runtime.path_index as u16),

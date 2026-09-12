@@ -301,11 +301,28 @@ impl ClientOpenRaceFixture {
 }
 
 struct BlockingResolutionProvider {
-    block_call: usize,
+    block_call: AtomicUsize,
     calls: AtomicUsize,
+    socket_create_calls: AtomicUsize,
+    resolution_starts: std::sync::Mutex<Vec<(usize, tokio::time::Instant)>>,
+    blocked_resolution_drops: std::sync::Mutex<Vec<(usize, tokio::time::Instant)>>,
     started: mpsc::UnboundedSender<usize>,
     release: Arc<tokio::sync::Notify>,
     observation: Option<Arc<QuicCandidateEstablishmentObservation>>,
+}
+
+struct BlockedResolutionDrop<'a> {
+    call: usize,
+    observations: &'a std::sync::Mutex<Vec<(usize, tokio::time::Instant)>>,
+}
+
+impl Drop for BlockedResolutionDrop<'_> {
+    fn drop(&mut self) {
+        self.observations
+            .lock()
+            .expect("blocked resolution observations")
+            .push((self.call, tokio::time::Instant::now()));
+    }
 }
 
 impl BlockingResolutionProvider {
@@ -331,8 +348,11 @@ impl BlockingResolutionProvider {
         let release = Arc::new(tokio::sync::Notify::new());
         (
             Arc::new(Self {
-                block_call,
+                block_call: AtomicUsize::new(block_call),
                 calls: AtomicUsize::new(0),
+                socket_create_calls: AtomicUsize::new(0),
+                resolution_starts: std::sync::Mutex::new(Vec::new()),
+                blocked_resolution_drops: std::sync::Mutex::new(Vec::new()),
                 started,
                 release: release.clone(),
                 observation,
@@ -345,6 +365,24 @@ impl BlockingResolutionProvider {
     fn calls(&self) -> usize {
         self.calls.load(AtomicOrdering::Acquire)
     }
+
+    fn resolution_started_at(&self, call: usize) -> tokio::time::Instant {
+        self.resolution_starts
+            .lock()
+            .expect("resolution start observations")
+            .iter()
+            .find_map(|(observed, at)| (*observed == call).then_some(*at))
+            .expect("observed resolution call start")
+    }
+
+    fn blocked_resolution_dropped_at(&self, call: usize) -> tokio::time::Instant {
+        self.blocked_resolution_drops
+            .lock()
+            .expect("blocked resolution observations")
+            .iter()
+            .find_map(|(observed, at)| (*observed == call).then_some(*at))
+            .expect("observed blocked resolution destruction")
+    }
 }
 
 impl CarrierNetworkProvider for BlockingResolutionProvider {
@@ -352,10 +390,18 @@ impl CarrierNetworkProvider for BlockingResolutionProvider {
         Box::pin(async move {
             request.validate()?;
             let call = self.calls.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            self.resolution_starts
+                .lock()
+                .expect("resolution start observations")
+                .push((call, tokio::time::Instant::now()));
             if let Some(observation) = &self.observation {
                 observation.record(format!("provider resolution call {call} started"));
             }
-            if call == self.block_call {
+            if call == self.block_call.load(AtomicOrdering::Acquire) {
+                let _blocked = BlockedResolutionDrop {
+                    call,
+                    observations: &self.blocked_resolution_drops,
+                };
                 if let Some(observation) = &self.observation {
                     observation.record(format!("provider resolution call {call} blocked"));
                 }
@@ -373,6 +419,8 @@ impl CarrierNetworkProvider for BlockingResolutionProvider {
     }
 
     fn create_socket(&self, request: CarrierSocketRequest<'_>) -> std::io::Result<CarrierSocket> {
+        self.socket_create_calls
+            .fetch_add(1, AtomicOrdering::AcqRel);
         if let Some(observation) = &self.observation {
             observation.record(format!(
                 "provider socket creation started for {}",
@@ -611,6 +659,7 @@ async fn cancelled_quic_candidate_leaves_a_bounded_reconcilable_vacancy() {
     let predecessor = current_client_carrier(&fixture.session)
         .await
         .expect("predecessor QUIC owner");
+    let predecessor_socket_calls = provider.socket_create_calls.load(AtomicOrdering::Acquire);
     {
         let mut health = fixture.context.health().lock().expect("QUIC path health");
         let record = &mut health.udp[0];
@@ -672,19 +721,163 @@ async fn cancelled_quic_candidate_leaves_a_bounded_reconcilable_vacancy() {
         "candidate Drop derives its deadline from the exact 765 ms owner clock",
     );
 
-    tokio::time::sleep_until(retry_at).await;
-    let successor_accept = fixture.spawn_server_accept_with_observation(Some(observation.clone()));
-    let successor_started_at = tokio::time::Instant::now();
-    observation.record(format!(
-        "successor reconciliation started; attempt budget={retry_interval:?}, wake lateness={:?}",
-        successor_started_at.saturating_duration_since(retry_at)
-    ));
-    let successor_result = fixture.session.reconcile_connection_owner().await;
-    let successor_elapsed = successor_started_at.elapsed();
-    observation.record(format!(
-        "successor reconciliation returned after {successor_elapsed:?}: {successor_result:?}"
-    ));
-    if successor_result.is_err() {
+    assert!(current_client_carrier(&fixture.session).await.is_none());
+    assert_eq!(
+        provider.socket_create_calls.load(AtomicOrdering::Acquire),
+        predecessor_socket_calls,
+        "cancelled resolution never created a successor socket",
+    );
+    assert_eq!(
+        fixture.context.authenticated_carriers.snapshot().live_count,
+        0
+    );
+    assert_eq!(
+        fixture
+            .context
+            .peer_status
+            .carrier_count(fixture.context.session_id),
+        0,
+    );
+
+    // Keep the same maintenance service alive across the timeout. Its immediate
+    // optional measurement must not establish through the Demand path instead.
+    fixture
+        .context
+        .health()
+        .lock()
+        .expect("QUIC path health")
+        .udp[0]
+        .active_flows = 1;
+    assert_eq!(fixture.context.udp_path_probe_expected_instance(0), None);
+    provider.block_call.store(3, AtomicOrdering::Release);
+    let service_context = fixture.context.clone();
+    let service = tokio::spawn(async move {
+        crate::runtime::node::run_path_probe_service(
+            service_context,
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        )
+        .await
+    });
+    let mut successor_accept =
+        fixture.spawn_server_accept_with_observation(Some(observation.clone()));
+    let settlement = tokio::time::timeout(Duration::from_secs(5), async {
+        assert_eq!(
+            started.recv().await.expect("maintenance resolution start"),
+            3
+        );
+        assert!(
+            provider.resolution_started_at(3) >= retry_at,
+            "maintenance attempted the vacancy before the cancellation deadline",
+        );
+        assert_eq!(
+            fixture.session.owner.reconciliation_attempt_timeout(),
+            retry_interval
+        );
+        assert_eq!(
+            provider.socket_create_calls.load(AtomicOrdering::Acquire),
+            predecessor_socket_calls,
+        );
+
+        // Call 3 remains Pending without a release notification. With this same
+        // service and session alive, destruction comes from its actual timeout.
+        changes.changed().await.expect("timeout vacancy wake");
+        let timeout_observed_at = tokio::time::Instant::now();
+        let timed_out_at = provider.blocked_resolution_dropped_at(3);
+        assert!(timed_out_at >= retry_at + retry_interval);
+        assert!(!service.is_finished());
+        fixture
+            .context
+            .ensure_session_active()
+            .expect("active test session");
+        assert_eq!(
+            fixture.session.runtime.reconciliation.generation(),
+            generation.wrapping_add(2),
+            "one timeout adds exactly one durable rearm after cancellation",
+        );
+        assert_eq!(provider.calls(), 3);
+        assert!(current_client_carrier(&fixture.session).await.is_none());
+        assert_eq!(
+            fixture.context.authenticated_carriers.snapshot().live_count,
+            0
+        );
+        assert_eq!(
+            fixture
+                .context
+                .peer_status
+                .carrier_count(fixture.context.session_id),
+            0,
+        );
+        assert_eq!(
+            provider.socket_create_calls.load(AtomicOrdering::Acquire),
+            predecessor_socket_calls,
+            "timed-out resolution never created a successor socket",
+        );
+        {
+            let health = fixture.context.health().lock().expect("QUIC path health");
+            assert_eq!(
+                health.udp[0].path_instance_id(),
+                Some(predecessor.path_instance_id)
+            );
+            assert!(!health.udp[0].accepts_product_commit(predecessor.path_instance_id));
+        }
+        let timeout_retry_at = fixture
+            .session
+            .reconciliation_deadline()
+            .expect("timed-out candidate retains a maintenance deadline");
+        assert!(
+            timeout_retry_at >= timed_out_at + retry_interval
+                && timeout_retry_at <= timeout_observed_at + retry_interval,
+            "timeout Drop retains the same exact owner clock",
+        );
+
+        // Keep the real server available across later Native failures. Only
+        // maintenance owns client retries, under the same single finite guard.
+        loop {
+            match (&mut successor_accept)
+                .await
+                .expect("successor accept join")
+            {
+                Ok(successor) => {
+                    if let Some(replacement) = current_client_carrier(&fixture.session).await
+                        && !replacement.connection.is_closed()
+                    {
+                        assert!(provider.calls() >= 4);
+                        assert!(
+                            provider.resolution_started_at(4) >= timeout_retry_at,
+                            "maintenance retried before the timeout vacancy deadline",
+                        );
+                        assert_eq!(
+                            fixture.session.owner.reconciliation_attempt_timeout(),
+                            retry_interval,
+                        );
+                        return (successor, replacement);
+                    }
+                    drop(successor);
+                }
+                Err(error) => observation.record(format!(
+                    "server successor attempt ended before publication: {error:?}"
+                )),
+            }
+            successor_accept =
+                fixture.spawn_server_accept_with_observation(Some(observation.clone()));
+        }
+    })
+    .await;
+    service.abort();
+    assert!(
+        service
+            .await
+            .expect_err("maintenance cancellation")
+            .is_cancelled()
+    );
+    if !successor_accept.is_finished() {
+        successor_accept.abort();
+        if let Err(error) = successor_accept.await {
+            assert!(error.is_cancelled());
+        }
+    }
+    if settlement.is_err() {
         let owner = fixture.session.owner.connection.try_lock().map(|current| {
             current.as_ref().map(|connection| {
                 (
@@ -694,29 +887,39 @@ async fn cancelled_quic_candidate_leaves_a_bounded_reconcilable_vacancy() {
             })
         });
         eprintln!(
-            "successor failure state: calls={}, owner(instance,closed)={owner:?}, \
+            "maintenance settlement failure: calls={}, owner(instance,closed)={owner:?}, \
              retry_interval={:?}, vacancy_not_before={:?}, deadline={:?}, generation={}, \
-             server_accept_finished={}",
+             socket_create_calls={}",
             provider.calls(),
             fixture.session.owner.reconciliation_attempt_timeout(),
             fixture.session.owner.vacancy_not_before(),
             fixture.session.reconciliation_deadline(),
             fixture.session.runtime.reconciliation.generation(),
-            successor_accept.is_finished(),
+            provider.socket_create_calls.load(AtomicOrdering::Acquire),
         );
         observation.report();
     }
-    successor_result.expect("bounded retry publishes successor");
-    let successor = tokio::time::timeout(Duration::from_secs(5), successor_accept)
-        .await
-        .expect("successor QUIC accept timeout")
-        .expect("successor QUIC accept join")
-        .expect("successor QUIC authentication");
-    let replacement = current_client_carrier(&fixture.session)
-        .await
-        .expect("replacement QUIC owner");
+    let (successor, replacement) = settlement.expect("bounded maintenance publishes successor");
     assert_ne!(replacement.path_instance_id, predecessor.path_instance_id);
-    assert_eq!(provider.calls(), 3);
+    let health = fixture.context.health().lock().expect("QUIC path health");
+    assert_eq!(
+        health.udp[0].path_instance_id(),
+        Some(replacement.path_instance_id)
+    );
+    assert!(health.udp[0].accepts_product_commit(replacement.path_instance_id));
+    drop(health);
+    assert_eq!(
+        fixture.context.authenticated_carriers.snapshot().live_count,
+        1
+    );
+    assert_eq!(
+        fixture
+            .context
+            .peer_status
+            .carrier_count(fixture.context.session_id),
+        1,
+    );
+    assert_eq!(fixture.session.reconciliation_deadline(), None);
     drop(successor);
 }
 

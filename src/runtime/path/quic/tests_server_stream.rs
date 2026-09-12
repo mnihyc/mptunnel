@@ -1902,6 +1902,10 @@ async fn client_quic_native_writer_delivers_reset_after_product_output_drop() {
         // releasing Product input/output handles share one domain-owned poll.
         // Native therefore cannot turn mere queue acceptance into an earlier
         // transmission before this cancellation boundary has been exercised.
+        #[allow(
+            clippy::async_yields_async,
+            reason = "transfer the owning Native handle out of the cancellation-boundary poll before awaiting it"
+        )]
         let driven = domain
             .wrap(async move {
                 let driven = registration

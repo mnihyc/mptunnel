@@ -24,9 +24,11 @@ pub(crate) struct TcpWriteAdmission {
 impl TcpWriteAdmission {
     /// Captures an already nonblocking carrier socket inside its Tokio runtime.
     ///
-    /// Linux wakes writers below half the unsent low-water threshold. Twice the
-    /// caller's native-byte refill quantum supplies that reserve; this is not a
-    /// protected-frame size or an estimate of congestion-window capacity.
+    /// Linux reports writability below half the unsent low-water threshold.
+    /// Twice the caller's native-byte refill quantum places that writable boundary at
+    /// one quantum; it does not guarantee that a quantum remains queued when
+    /// the writer runs. Native batching may drain it further. This is neither a
+    /// protected-frame reservation nor an estimate of congestion-window capacity.
     pub(crate) fn capture(
         stream: &TcpStream,
         refill_quantum_bytes: usize,

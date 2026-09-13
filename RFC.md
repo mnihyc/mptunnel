@@ -2535,6 +2535,12 @@ validation; a smaller reserve is not intrinsically better. Unsupported native
 capability retains the structural-only handoff contract explicitly, not invented
 zero queue or measured native readiness.
 
+A low-water writable predicate supplies an upper bound on unsent inventory, not
+a minimum inventory remaining when the writer runs. Native packet batches and
+work between wake and write can drain it further. Dividing the threshold by a
+pacing rate therefore does not establish a refill time allowance or continuous
+native supply. The ownership and arbitration contract requires no such guarantee.
+
 This priority cannot preempt bytes already accepted by a shared TCP socket,
 QUIC stream, kernel queue, or other native FIFO. No lower-class command still
 owned by MPP may be selected ahead of dependency-ready higher-class work, but

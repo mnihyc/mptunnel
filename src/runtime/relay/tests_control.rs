@@ -3065,3 +3065,305 @@ async fn bulk_request_staging_uses_resource_ceiling_and_bounded_ready_work() {
         "cancelling a not-ready opportunistic source read releases its reservation"
     );
 }
+
+/// One selected third endpoint uses the existing authenticated TCP test-peer
+/// sequence. Initial members remain channel-backed writer producers, as in the
+/// ready-ACK actor fixture; no third pending task/result is installed by a test.
+#[tokio::test]
+async fn first_product_stall_acquires_one_real_tcp_output_without_inventing_replay() {
+    for application_holds_reply in [false, true] {
+        first_product_stall_acquisition_fixture(application_holds_reply).await;
+    }
+}
+
+async fn first_product_stall_acquisition_fixture(application_holds_reply: bool) {
+    use super::super::client::observe_first_product_stall_for_test;
+    use crate::config::ServerSecurityConfig;
+    use crate::model::path::RelayPathInstance;
+    use crate::mux::stream::ReliableRecvStream;
+    use crate::protocol::StreamAttachmentPhase;
+    use crate::protocol::codec::CodecLimits;
+    use crate::runtime::path::commands::reliable_path_command_pending_bytes;
+    use crate::runtime::sender::PreparedOriginalClaim;
+    use crate::runtime::stream::arm_client_relay_attachment_commits_for_test;
+    use crate::transport::encrypted::EncryptedFramedStream;
+    use std::sync::atomic::AtomicUsize;
+
+    struct FixtureTasks {
+        context: ClientPathContext,
+        aborts: Vec<tokio::task::AbortHandle>,
+    }
+    impl Drop for FixtureTasks {
+        fn drop(&mut self) {
+            self.context.retire_session(CloseReason::Normal);
+            for task in &self.aborts {
+                task.abort();
+            }
+        }
+    }
+
+    // The watchdog is fixture containment, not a selected recovery deadline.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let context = ClientPathContext::new(
+            ["tcp://127.0.0.1:9?max-tcp-carriers=1".to_owned(),
+             "tcp://127.0.0.1:10?max-tcp-carriers=1".to_owned(),
+             format!("tcp://{endpoint}?max-tcp-carriers=1")]
+                .into_iter().map(|path| path.parse::<PathSpec>().unwrap()).collect(),
+            test_security(), ResourceLimits::default(),
+        ).unwrap();
+        let mut tasks = FixtureTasks { context: context.clone(), aborts: Vec::new() };
+        let stream_id = StreamId(if application_holds_reply { 726 } else { 725 });
+        let target = TargetAddr::Ip("127.0.0.1:443".parse().unwrap());
+        let limits = context.mux_limits;
+        let received_request = Arc::new(Mutex::new((ReliableRecvStream::new(stream_id, limits), Vec::<u8>::new())));
+        let request_ready = Arc::new(Notify::new());
+        let original_retired = Arc::new(AtomicBool::new(false));
+        let mut opened = Vec::new();
+        let mut writer_tasks = Vec::new();
+        let mut initial_instances = Vec::new();
+        for index in 0..2 {
+            let (commands, mut receivers) = reliable_path_command_channels(32);
+            let (frames_tx, frames_rx) = mpsc::channel(32);
+            let member = test_opened_remote_stream(stream_id, index, commands, frames_rx);
+            let instance = RelayPathInstance {
+                key: RelayPathKey { underlay: UnderlayProtocol::Tcp, index },
+                path_instance_id: member.path_instance_id(), attachment_id: index as u64,
+            };
+            context.install_relay_path_instance_for_test(instance);
+            initial_instances.push(instance);
+            opened.push(member);
+            let received_request = received_request.clone();
+            let request_ready = request_ready.clone();
+            let retired = original_retired.clone();
+            let writer = tokio::spawn(async move {
+                while let Some(command) = recv_reliable_path_command(&mut receivers).await {
+                    let charged = reliable_path_command_pending_bytes(&command);
+                    let frame = match command {
+                        ReliablePathCommand::PreparedOriginal(work) => {
+                            let ready = receivers.writer_ready_boundary(work.path_instance_id()).unwrap();
+                            match work.try_claim(ready) {
+                                PreparedOriginalClaim::Claimed(frame) => {
+                                    let charged = receivers.register_claimed_writer_frame(&frame);
+                                    receivers.release_pending_command_bytes(charged);
+                                    work.requeue();
+                                    Some(frame)
+                                }
+                                PreparedOriginalClaim::Blocked(wait) => {
+                                    receivers.defer_prepared_work(work, wait);
+                                    None
+                                }
+                                PreparedOriginalClaim::Empty | PreparedOriginalClaim::RecoveryQueued => None,
+                                PreparedOriginalClaim::Busy(wait) => {
+                                    receivers.defer_prepared_work(work, wait);
+                                    None
+                                }
+                                PreparedOriginalClaim::CarrierFailed(error) => panic!("live fixture writer failed: {error:?}"),
+                            }
+                        }
+                        ReliablePathCommand::SendFrame(frame) => {
+                            receivers.release_pending_command_bytes(charged);
+                            Some(frame)
+                        }
+                        ReliablePathCommand::CloseStream(_) | ReliablePathCommand::ResetAndCloseStream { .. } => {
+                            retired.store(true, Ordering::Release);
+                            receivers.release_pending_command_bytes(charged);
+                            None
+                        }
+                        _ => { receivers.release_pending_command_bytes(charged); None }
+                    };
+                    match frame {
+                        Some(Frame::StreamData { stream_id: actual, offset, payload }) => {
+                            assert_eq!(actual, stream_id);
+                            let (acks, warm_response) = {
+                                let mut request = received_request.lock().unwrap();
+                                let before = request.1.len();
+                                let outcome = request.0.receive_data(offset, payload).unwrap();
+                                for bytes in outcome.delivered { request.1.extend_from_slice(&bytes); }
+                                assert!(request.1.len() <= 128);
+                                let warm_response = (before < 64 && request.1.len() >= 64)
+                                    .then(|| Bytes::copy_from_slice(&request.1[..64]));
+                                (request.0.ack_frames(), warm_response)
+                            };
+                            for ack in acks { frames_tx.send(Ok(ack)).await.unwrap(); }
+                            if let Some(payload) = warm_response {
+                                frames_tx.send(Ok(Frame::StreamData { stream_id, offset: 0, payload })).await.unwrap();
+                            }
+                            request_ready.notify_one();
+                        }
+                        Some(Frame::StreamDetach { .. } | Frame::StreamReset { .. } | Frame::SessionClose { .. }) => { retired.store(true, Ordering::Release); }
+                        _ => {}
+                    }
+                }
+            });
+            tasks.aborts.push(writer.abort_handle());
+            writer_tasks.push(writer);
+        }
+
+        let actual_opens = Arc::new(AtomicUsize::new(0));
+        let request_replays = Arc::new(AtomicUsize::new(0));
+        let release_reply = Arc::new(Notify::new());
+        let (reply_held_tx, reply_held_rx) = tokio::sync::oneshot::channel();
+        let (response_acked_tx, response_acked_rx) = tokio::sync::oneshot::channel();
+        let peer_opens = actual_opens.clone();
+        let peer_replays = request_replays.clone();
+        let peer_reply = release_reply.clone();
+        let peer_request = received_request.clone();
+        let peer_target = target.clone();
+        let session_id = context.session_id;
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed = EncryptedFramedStream::accept(socket,
+                &crate::transport::encrypted::test_server_tls_config(), CodecLimits::default()).await?;
+            let security = ServerSecurityConfig::for_test(
+                SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).unwrap());
+            let binding = framed.tcp_admission_binding()?;
+            let encoded = framed.read_tcp_admission().await?;
+            let authenticated = crate::runtime::path::tcp::admission::authenticate_prelude(
+                &security, crate::runtime::path::authentication::ProductCredentialAdmission::from_security(&security),
+                &encoded, &binding)?.expect("authenticated test prelude");
+            let joined = authenticated.authenticate_path_join(UnderlayProtocol::Tcp, framed.read_frame().await?)?
+                .expect("authenticated actual PATH_JOIN");
+            assert_eq!(joined.session_id, session_id);
+            let path_id = joined.path_id;
+            assert!(matches!(framed.read_frame().await?, Frame::PathStatus { path_id: actual, sequence: 0, .. } if actual == path_id));
+            framed.write_frames(&[Frame::SessionReady,
+                Frame::PathStatus { path_id, sequence: 0, usage: PathUsage::Available }]).await?;
+            framed.flush().await?;
+            let mut peer_credit = 0;
+            let mut open = false;
+            let mut sent = false;
+            let mut held = Some(reply_held_tx);
+            let mut response_acked = Some(response_acked_tx);
+            loop {
+                if open && peer_credit >= 128 && !sent {
+                    if let Some(held) = held.take() { let _ = held.send(()); }
+                    if application_holds_reply { peer_reply.notified().await; }
+                    {
+                        let payload = {
+                            let request = peer_request.lock().unwrap();
+                            assert_eq!(request.1.len(), 128, "response uses actually received request bytes");
+                            Bytes::copy_from_slice(&request.1[64..128])
+                        };
+                        framed.write_frame(&Frame::StreamData { stream_id, offset: 64, payload }).await?;
+                        framed.flush().await?;
+                        sent = true;
+                    }
+                }
+                match framed.read_frame().await? {
+                        Frame::OpenStream { stream_id: actual, target, return_plan, .. } => {
+                            assert!(!open, "one ordinary recovery acquisition");
+                            assert_eq!((actual, target), (stream_id, peer_target.clone()));
+                            assert_eq!(return_plan.phase, StreamAttachmentPhase::Ordinary);
+                            peer_opens.fetch_add(1, Ordering::Release);
+                            open = true;
+                            framed.write_frame(&Frame::StreamMaxData { stream_id, max_offset: limits.max_stream_window_bytes }).await?;
+                            framed.flush().await?;
+                        }
+                        Frame::StreamMaxData { stream_id: actual, max_offset } => {
+                            assert_eq!(actual, stream_id); peer_credit = peer_credit.max(max_offset);
+                        }
+                        Frame::StreamData { stream_id: actual, .. } => {
+                            assert_eq!(actual, stream_id); peer_replays.fetch_add(1, Ordering::Release);
+                        }
+                        Frame::PathProofData { path_id: actual, proof_id, payload } => {
+                            assert_eq!(actual, path_id);
+                            framed.write_frame(&Frame::PathProofAck { path_id, proof_id, payload_bytes: u32::try_from(payload.len()).unwrap() }).await?;
+                            framed.flush().await?;
+                        }
+                        Frame::Ping { nonce } => { framed.write_frame(&Frame::Pong { nonce }).await?; framed.flush().await?; }
+                        Frame::StreamAck { stream_id: actual, ranges, .. } => {
+                            assert_eq!(actual, stream_id);
+                            if sent && ranges.iter().any(|range| range.start == 0 && range.end == 128)
+                                && let Some(acked) = response_acked.take()
+                            { let _ = acked.send(()); }
+                        }
+                        Frame::SessionClose { .. } => return Ok::<(), RuntimeError>(()),
+                        Frame::PathMetrics { .. } | Frame::PathStatus { .. } | Frame::StreamReturnPlanFinal { .. }
+                        | Frame::StreamFeedbackProbe { .. } | Frame::StreamFeedbackReceipt { .. } => {}
+                        other => panic!("unexpected selected TCP peer input: {other:?}"),
+                }
+            }
+        });
+        tasks.aborts.push(peer.abort_handle());
+        context.tcp_sessions[2].prepare_connection(tokio::time::Instant::now() + Duration::from_secs(2)).await.unwrap();
+        let third_instance = context.tcp_sessions[2].connection_instance_id().expect("actual third carrier is ready");
+        assert_eq!(actual_opens.load(Ordering::Acquire), 0, "carrier preparation creates no Product attachment");
+        let mut third_committed = arm_client_relay_attachment_commits_for_test(third_instance, stream_id);
+        let mut third_settlement = context.arm_reliable_tcp_settlement_test(2);
+        let release_second = Arc::new(Notify::new());
+        let (second_consumed_tx, second_consumed_rx) = tokio::sync::oneshot::channel();
+        let second = opened.pop().unwrap();
+        let initial = opened.pop().unwrap();
+        let ingress = super::super::lifecycle::BlockedWriteOpenTestIngress {
+            key: initial_instances[1].key, obsolete_generation: false, opened: Some(second),
+            release: release_second.clone(), consumed: second_consumed_tx,
+        };
+        let (mut application, local) = duplex(4096);
+        let (stall_tx, mut stall_rx) = mpsc::unbounded_channel();
+        let relay_context = context.clone();
+        let relay = tokio::spawn(observe_first_product_stall_for_test(stream_id, stall_tx, async move {
+            relay_migrating_tcp_stream_active(local, &relay_context, MppPerformanceConfig::default(),
+                ReliableRelayOpenSpec::new(target, TrafficClass::Latency), initial, None, Some(ingress)).await
+        }));
+        tasks.aborts.push(relay.abort_handle());
+        release_second.notify_one();
+        second_consumed_rx.await.expect("actual relay consumed second member setup");
+        // Actual warm delivery places progress after setup's Recovery postaction;
+        // no test clock or last-attempt mutation creates the first-stall premise.
+        application.write_all(&[0x70; 64]).await.unwrap();
+        let mut warm_response = [0u8; 64];
+        application.read_exact(&mut warm_response).await.unwrap();
+        assert_eq!(warm_response, [0x70; 64]);
+        application.write_all(&[0x71; 64]).await.unwrap();
+        loop {
+            if received_request.lock().unwrap().1.len() == 128 { break; }
+            request_ready.notified().await;
+        }
+        let first = stall_rx.recv().await.expect("actual first stall branch completed");
+        assert_eq!(first.members, initial_instances, "first stall retains both exact attachment owners");
+        assert_eq!((first.assigned, first.retained, first.receive_frontier, first.reorder_bytes), (128, 0, 64, 0),
+            "actual request ACK cleared ownership; exact warm delivery established the response frontier");
+        assert!(!first.queued_existing_tail, "no retained request authority licenses a replay");
+        assert!(first.recovery_open_spawned,
+            "observed first Product stall deferred acquisition despite two live non-delivering members and one ready nonmember: {first:?}");
+        assert_eq!(first.pending, vec![RelayPathKey { underlay: UnderlayProtocol::Tcp, index: 2 }],
+            "ordinary ranking created exactly one new pending open at the first stage");
+        third_settlement.wait_reached().await;
+        assert_eq!(actual_opens.load(Ordering::Acquire), 1, "ordinary authenticated OPEN reached the selected peer");
+        third_settlement.release();
+        let attached = third_committed.wait_committed().await;
+        assert_eq!((attached.key.index, attached.path_instance_id), (2, third_instance));
+        assert!(!original_retired.load(Ordering::Acquire));
+        reply_held_rx.await.expect("peer consumed actual response credit");
+        if application_holds_reply {
+            let mut one = [0u8; 1];
+            let mut buffer = ReadBuf::new(&mut one);
+            std::future::poll_fn(|cx| {
+                assert!(Pin::new(&mut application).poll_read(cx, &mut buffer).is_pending(),
+                    "opening a carrier cannot manufacture an application-held reply");
+                Poll::Ready(())
+            }).await;
+            assert_eq!(request_replays.load(Ordering::Acquire), 0);
+            release_reply.notify_one();
+        }
+        let mut response = [0u8; 64];
+        application.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0x71; 64]);
+        response_acked_rx.await.expect("actual response ACK reaches the third peer");
+        assert_eq!(request_replays.load(Ordering::Acquire), 0,
+            "new membership did not replay fully ACKed request bytes");
+        assert_eq!(actual_opens.load(Ordering::Acquire), 1);
+        assert!(!original_retired.load(Ordering::Acquire), "existing owners remain intact through delivery");
+        // The response ACK completed this peer's observation. Session retirement
+        // cancels native work and does not promise an orderly TLS close exchange.
+        // Join deliberate cancellation before retiring the fixture context;
+        // an earlier peer failure must still fail the fixture.
+        peer.abort();
+        assert!(peer.await.expect_err("scripted peer stays live until explicit cleanup").is_cancelled());
+        context.retire_session(CloseReason::Normal);
+        relay.abort(); let _ = relay.await;
+        for writer in writer_tasks { writer.abort(); let _ = writer.await; }
+    }).await.expect("bounded first-stall actor/native-open fixture");
+}

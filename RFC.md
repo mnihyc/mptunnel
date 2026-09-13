@@ -1766,16 +1766,26 @@ original retention deadline.
 
 Lack of Product progress while attachments remain live is stream-local
 recovery evidence, not carrier failure. The sender first evaluates retained
-ranges and the currently attached outputs. That first recovery cycle MUST NOT
-infer omitted data outside the receiver's explicitly proven missing set. If no
-Product progress follows that bounded cycle, recovery MAY extend through the
-current retained send extent and MAY attach the same logical stream to one
-additional authenticated configured carrier that is not already attached. A
-new recovery attachment MAY immediately carry that retained extent. At most
-one such recovery attachment may be pending at a time; the configured
-attachment and carrier bounds still apply, and Product progress ends the
-expansion. This decision uses Product progress and exact attachment membership,
-not source address, interface, or an inferred physical-link identity.
+ranges and the currently attached outputs. That first recovery cycle MAY also
+start one ordinarily ranked additional attachment for the same logical stream
+on an eligible configured carrier that is not already attached. Multiple live
+attachments do not prove that another output lacks a useful service opportunity;
+acquiring one MUST NOT wait for a second recovery cycle solely because more than
+one attachment remains live. Existing attachments and their native recovery
+remain active.
+
+Attachment acquisition grants no new missing-data authority. The first recovery
+cycle MUST NOT infer omitted data outside the receiver's explicitly proven
+missing set; independently authorized retained-owner fallback remains governed
+by Section 8.7. If no Product progress follows that bounded cycle, recovery MAY
+extend through the current retained send extent under those same recovery rules.
+A new attachment MAY immediately carry otherwise eligible recovery data, with
+unchanged owner-age, copy-coverage, Ready, credit and resource checks. At most one
+such recovery attachment may be pending at a time; configured attachment and
+carrier bounds, candidate policy, suppression and retry intervals still apply.
+Product progress ends the expansion. This decision uses Product progress and
+exact attachment membership, not source address, interface, hardcoded protocol preference,
+or an inferred physical-link identity.
 
 ### 8.7 Reinjection
 

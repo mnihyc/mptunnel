@@ -512,6 +512,47 @@ fn request_target_reinjection_service_limit(
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(super) struct FirstProductStallObservation {
+    pub(super) members: Vec<RelayPathInstance>,
+    pub(super) pending: Vec<RelayPathKey>,
+    pub(super) recovery_open_spawned: bool,
+    pub(super) queued_existing_tail: bool,
+    pub(super) assigned: u64,
+    pub(super) retained: usize,
+    pub(super) receive_frontier: u64,
+    pub(super) reorder_bytes: usize,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static FIRST_PRODUCT_STALL_OBSERVER: (StreamId, tokio::sync::mpsc::UnboundedSender<FirstProductStallObservation>);
+}
+
+#[cfg(test)]
+pub(super) async fn observe_first_product_stall_for_test<F: std::future::Future>(
+    stream_id: StreamId,
+    observed: tokio::sync::mpsc::UnboundedSender<FirstProductStallObservation>,
+    future: F,
+) -> F::Output {
+    FIRST_PRODUCT_STALL_OBSERVER
+        .scope((stream_id, observed), future)
+        .await
+}
+
+#[cfg(test)]
+pub(super) fn record_first_product_stall_for_test(
+    stream_id: StreamId,
+    capture: impl FnOnce() -> FirstProductStallObservation,
+) {
+    let _ = FIRST_PRODUCT_STALL_OBSERVER.try_with(|(selected, observed)| {
+        if *selected == stream_id {
+            let _ = observed.send(capture());
+        }
+    });
+}
+
+#[cfg(test)]
 tokio::task_local! {
     static READY_FEEDBACK_OBSERVER: (StreamId, std::sync::Arc<ReadyFeedbackObserver>);
 }

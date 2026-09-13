@@ -2520,7 +2520,13 @@ where
                     send_stream,
                     request_lane,
                 );
-                let recovery_open_spawned = persistent_product_stall
+                let preserve_attached_path_set =
+                    reliable_relay_product_stall_preserves_attached_path_set(remotes);
+                // Multiple live members may share unavailable service. Acquire
+                // one ordinary alternative at the first stall while retaining
+                // those owners; membership grants no new recovery-copy authority.
+                let recovery_open_spawned = (persistent_product_stall
+                    || preserve_attached_path_set)
                     && spawn_reliable_relay_recovery_path_open(
                         context,
                         &spec,
@@ -2534,7 +2540,7 @@ where
                     );
                 if queued_existing_tail_reinjection
                     || recovery_open_spawned
-                    || reliable_relay_product_stall_preserves_attached_path_set(remotes)
+                    || preserve_attached_path_set
                 {
                     if queued_existing_tail_reinjection {
                         state.progress.sender_retry_at = None;
@@ -2574,6 +2580,21 @@ where
                     );
                     state.progress.last_response_stall_reinjection_at = Instant::now();
                     state.progress.last_product_stall_attempt_at = Some(Instant::now());
+                    #[cfg(test)]
+                    if !persistent_product_stall {
+                        super::client::record_first_product_stall_for_test(stream_id, || {
+                            super::client::FirstProductStallObservation {
+                                members: remotes.path_instances(),
+                                pending: state.recovery.pending_additional_path_opens.keys().copied().collect(),
+                                recovery_open_spawned,
+                                queued_existing_tail: queued_existing_tail_reinjection,
+                                assigned: send_stream.next_offset(),
+                                retained: send_stream.reinjection_bytes(),
+                                receive_frontier: recv_stream.next_offset(),
+                                reorder_bytes: recv_stream.reorder_bytes(),
+                            }
+                        });
+                    }
                     continue;
                 }
                 if reliable_relay_product_stall_should_try_alternate_attach(remotes) {

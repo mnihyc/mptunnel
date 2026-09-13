@@ -8,6 +8,7 @@ use self::multipath::{
     RequestMultipathController, RequestMultipathPlan, RequestMultipathPlanError,
     RequestRelayNativeCapture, RequestRelayNativeInputs,
 };
+use self::scheduling::RequestRelaySchedulingObservation;
 use super::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
 use super::work::{
     CarrierEmitMode, ClientReinjectionOutputIdentity, RelaySendCause, RelaySendOutcome,
@@ -69,6 +70,7 @@ use crate::runtime::stream::{
 use crate::scheduler::{PathSnapshot, TrafficClass};
 #[cfg(test)]
 use bytes::Bytes;
+use std::cell::OnceCell;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -642,6 +644,13 @@ impl RequestSenderService {
     }
 
     #[cfg(test)]
+    pub(in crate::runtime) fn count_scheduling_captures_for_test<T>(
+        observe: impl FnOnce() -> T,
+    ) -> (T, usize) {
+        multipath::count_request_relay_scheduling_captures(observe)
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn request_reinjection_target_snapshot_for_test(
         &self,
         context: &ClientPathContext,
@@ -772,6 +781,7 @@ impl RequestSenderService {
         let ownership = self
             .multipath
             .recovery_ownership_view(normalized_ranges.last().map_or(0, |range| range.end));
+        let recovery_observation = OnceCell::new();
         self.data_ack_gap_reinjection_model_from_view(
             context,
             remotes,
@@ -781,6 +791,7 @@ impl RequestSenderService {
             preview_limit,
             lane,
             &ownership,
+            &recovery_observation,
         )
     }
 
@@ -795,6 +806,7 @@ impl RequestSenderService {
         preview_limit: usize,
         lane: TrafficClass,
         ownership: &RequestRecoveryOwnershipView,
+        recovery_observation: &OnceCell<RequestRelaySchedulingObservation>,
     ) -> RequestDataAckGapObservation {
         let Some((frontier, horizon)) = first_proven_ack_gap(normalized_ranges) else {
             return RequestDataAckGapObservation::default();
@@ -867,6 +879,7 @@ impl RequestSenderService {
                 context.mux_limits,
                 scoring_payload_bytes,
                 &scoring_frontier.avoid,
+                recovery_observation,
             );
         let exact_owner = uniform_frontier.owners[0];
         let owner_snapshot = model.original_path_timing;
@@ -1282,10 +1295,13 @@ impl RequestSenderService {
         }
         let boundaries = self.multipath.recovery_service_boundaries(gaps);
         // Product ownership cannot mutate during this synchronous evaluation.
-        // Native eligibility and target service are still observed per action.
+        // Share one lazy advisory Native/health epoch across its range models.
+        // Range ownership, clocks, eligibility and queue checks remain per action;
+        // a later invocation and final writer Apply observe fresh authority.
         let ownership = self
             .multipath
             .recovery_ownership_view(gaps.last().map_or(0, |range| range.end));
+        let recovery_observation = OnceCell::new();
         let mut observation_deadline = None::<Instant>;
         for range in ranges {
             let mut cursor = range.start;
@@ -1312,6 +1328,7 @@ impl RequestSenderService {
                         preview_limit,
                         lane,
                         &ownership,
+                        &recovery_observation,
                     );
                     let extent = preview_limit.min(model.uniform_frontier_extent_bytes);
                     if !model.has_live_original_path || extent == 0 {

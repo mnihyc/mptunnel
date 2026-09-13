@@ -74,7 +74,7 @@ use crate::runtime::stream::{
 };
 use crate::scheduler::{self, PathSnapshot, TrafficClass, cyclic_cursor_distance};
 use smallvec::SmallVec;
-use std::cell::{Cell, LazyCell};
+use std::cell::{Cell, LazyCell, OnceCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -238,7 +238,9 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-fn count_request_relay_scheduling_captures<T>(observe: impl FnOnce() -> T) -> (T, usize) {
+pub(super) fn count_request_relay_scheduling_captures<T>(
+    observe: impl FnOnce() -> T,
+) -> (T, usize) {
     let before = REQUEST_RELAY_SCHEDULING_CAPTURES.with(Cell::get);
     let result = observe();
     let captures = REQUEST_RELAY_SCHEDULING_CAPTURES.with(|count| count.get() - before);
@@ -1419,8 +1421,11 @@ impl RequestMultipathController {
         mux_limits: MuxLimits,
         scoring_payload_bytes: usize,
         scoring_avoid: &[RelayPathInstance],
+        recovery_observation: &OnceCell<RequestRelaySchedulingObservation>,
     ) -> RequestDataAckGapObservation {
-        self.data_ack_gap_reinjection_model_with_service(
+        let recovery_observation = recovery_observation
+            .get_or_init(|| self.observe_data_ack_gap_reinjection(context, remotes));
+        self.data_ack_gap_reinjection_model_from_observation(
             context,
             remotes,
             preview,
@@ -1428,6 +1433,25 @@ impl RequestMultipathController {
             scoring_payload_bytes,
             Some((sender_queue, reinjection_debt_bytes, mux_limits)),
             scoring_avoid,
+            recovery_observation,
+        )
+    }
+
+    fn observe_data_ack_gap_reinjection(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+    ) -> RequestRelaySchedulingObservation {
+        observe_request_relay_scheduling(
+            context,
+            self.stream_id,
+            remotes.membership_generation(),
+            &remotes.paths,
+            None,
+            TrafficClass::Throughput,
+            PATH_OPEN_SCORE_BYTES,
+            true,
+            &self.request.requalification,
         )
     }
 
@@ -1442,17 +1466,7 @@ impl RequestMultipathController {
         service: Option<(&ReliableRelaySenderQueue, usize, MuxLimits)>,
         scoring_avoid: &[RelayPathInstance],
     ) -> RequestDataAckGapObservation {
-        let recovery_observation = observe_request_relay_scheduling(
-            context,
-            self.stream_id,
-            remotes.membership_generation(),
-            &remotes.paths,
-            None,
-            TrafficClass::Throughput,
-            PATH_OPEN_SCORE_BYTES,
-            true,
-            &self.request.requalification,
-        );
+        let recovery_observation = self.observe_data_ack_gap_reinjection(context, remotes);
         self.data_ack_gap_reinjection_model_from_observation(
             context,
             remotes,

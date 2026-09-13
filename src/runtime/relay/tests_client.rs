@@ -876,6 +876,22 @@ async fn authoritative_request_gap_evaluation_does_not_repeat_full_horizon_sweep
         start: (missing_assignments * assignment_bytes) as u64,
         end: gap.end,
     };
+    // A real retained gap with no scoring quantum must retain lazy capture;
+    // the ownership/cache prerequisite checks cannot acquire Native authority.
+    let (unscored, unscored_captures) =
+        RequestSenderService::count_scheduling_captures_for_test(|| {
+            sender.data_ack_gap_reinjection_model(
+                &context,
+                &remotes,
+                &send_stream,
+                &queue,
+                &[last_assignment],
+                0,
+                lane,
+            )
+        });
+    assert_eq!(unscored.uniform_frontier_extent_bytes, 0);
+    assert!(unscored.reinjection_target.is_none());
     let last_model = sender.data_ack_gap_reinjection_model(
         &context,
         &remotes,
@@ -908,20 +924,23 @@ async fn authoritative_request_gap_evaluation_does_not_repeat_full_horizon_sweep
         .unwrap();
     assert!(!target_commands.can_enqueue_reinjection_frame_now(&originals[1]));
     let mut state = ClientRelayState::new();
-    let (blocked, visits) = observe_frontier_span_visits_for_test(|| {
-        evaluate_client_data_ack_reinjection(
-            &mut state,
-            &last_send_ack,
-            &mut sender,
-            &mut queue,
-            &context,
-            &remotes,
-            &send_stream,
-            path,
-            lane,
-            stream_id,
-        )
-    });
+    let ((blocked, visits), blocked_captures) =
+        RequestSenderService::count_scheduling_captures_for_test(|| {
+            observe_frontier_span_visits_for_test(|| {
+                evaluate_client_data_ack_reinjection(
+                    &mut state,
+                    &last_send_ack,
+                    &mut sender,
+                    &mut queue,
+                    &context,
+                    &remotes,
+                    &send_stream,
+                    path,
+                    lane,
+                    stream_id,
+                )
+            })
+        });
     assert!(blocked.has_multipath_alternative && blocked.due_recovery_work);
     assert!(blocked.target_service_exhausted && !blocked.persistent_ready);
     assert_eq!(blocked.frame_count, 0);
@@ -938,18 +957,20 @@ async fn authoritative_request_gap_evaluation_does_not_repeat_full_horizon_sweep
     target_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
     assert!(matches!(command, ReliablePathCommand::SendFrame(ref frame) if frame == &filler));
     assert!(target_commands.can_enqueue_reinjection_frame_now(&originals[1]));
-    let ready = evaluate_client_data_ack_reinjection(
-        &mut state,
-        &last_send_ack,
-        &mut sender,
-        &mut queue,
-        &context,
-        &remotes,
-        &send_stream,
-        path,
-        lane,
-        stream_id,
-    );
+    let (ready, ready_captures) = RequestSenderService::count_scheduling_captures_for_test(|| {
+        evaluate_client_data_ack_reinjection(
+            &mut state,
+            &last_send_ack,
+            &mut sender,
+            &mut queue,
+            &context,
+            &remotes,
+            &send_stream,
+            path,
+            lane,
+            stream_id,
+        )
+    });
     assert!(ready.persistent_ready && ready.has_measured_target);
     assert_eq!(queue.reinjection_bytes(), q);
     let mut admitted_until = gap.start;
@@ -979,6 +1000,15 @@ async fn authoritative_request_gap_evaluation_does_not_repeat_full_horizon_sweep
     assert!(
         visits <= bounded_frontier_visits,
         "one actual evaluator must not rebuild every remaining horizon: visits={visits}, one-view-plus-scored-prefix bound={bounded_frontier_visits}",
+    );
+    // Semantic controls precede the work assertion. One synchronous traversal
+    // shares its advisory epoch; the next invocation must capture a new one.
+    // This counts scheduling captures, not final Apply or runtime performance.
+    assert_eq!(unscored_captures, 0, "no scoring work means no capture");
+    assert_eq!(
+        (blocked_captures, ready_captures),
+        (1, 1),
+        "each finite recovery evaluation captures once, independently of assignment count",
     );
 }
 

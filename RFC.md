@@ -2019,6 +2019,13 @@ consumer would use a later publication in its next pass without turning every
 rank-only timing update into an Apply fence. The current legacy rank retains
 its existing observation and commit fences.
 
+A finite synchronous recovery query MAY share one lazily captured Native/health
+observation across its candidate range evaluations. Its capture time and sampled
+freshness remain unchanged. Independent health or control publication may still
+advance during the query; this observation is advisory, not current commitment
+authority. It MUST NOT survive into another query, an asynchronous wait, or final
+writer Apply, which retains the ordinary current-authority checks.
+
 Ranking is advisory. It cannot grant Product credit, queue capacity, native
 send credit, path proof, lifecycle eligibility, or recovery authority. The
 commit owner tries its captured finite action order until one exact reservation
@@ -3838,6 +3845,11 @@ captured payload `M_s`; after selection, Apply may shrink the ranked frontier
 only to exact `F_t^r`. For a live owner, Apply MUST NOT extend total service
 beyond `F_t^r`; `L(s,r,t)` remains a capacity bound, not authority to append an
 unranked suffix.
+Sharing the advisory observation under Section 10.1 does not cache a range's
+recovery permission. Every examined extent retains its own exact ownership and
+exclusion set, assignment-clock observation, target service checks, and traversal
+order. A query with no extent requiring target scoring need not capture Native
+or health state. A subsequent query and final writer Apply use fresh observations.
 These ownership sets describe byte ranges, not stored frame-start keys: a
 repair slice may start inside an earlier assignment. Current actor-attached
 holders remain in the exclusion set even when temporarily ineligible for new

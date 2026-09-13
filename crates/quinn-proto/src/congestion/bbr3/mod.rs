@@ -6691,9 +6691,11 @@ mod test {
         let mut config = Bbr3Config::default();
         config.loss_compensation_floor(0.20);
         let mut bbr = Bbr3::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
+        bbr.on_packet_sent(base, BASE_DATAGRAM_SIZE as u16, 0, SpaceId::Initial);
         send_test_flight(&mut bbr, base, 9);
-        // P0 is still Native-live; same-ACK snapshots surround the missing P3..P5.
-        for packet in [1, 2, 6, 7, 8] {
+        // Initial P0 remains live independently of Data loss detection; this Data ACK's
+        // snapshots surround the missing P3..P5 without exempting an older Data packet.
+        for packet in [0, 1, 2, 6, 7, 8] {
             ack_test_packet(
                 &mut bbr,
                 &rtt,
@@ -6750,7 +6752,7 @@ mod test {
         assert!(bbr.packets[SpaceId::Data as usize][ecn_index].stale);
         bbr.on_congestion_event(ack_at, base, false, true, 0, 8, SpaceId::Data);
         assert_eq!(bbr.packet_index(SpaceId::Data, 8), None);
-        assert!(bbr.packet_index(SpaceId::Data, 0).is_some());
+        assert!(bbr.packet_index(SpaceId::Initial, 0).is_some());
 
         let next_sent = ack_at + Duration::from_millis(1);
         bbr.on_packet_sent(next_sent, BASE_DATAGRAM_SIZE as u16, 9, SpaceId::Data);
@@ -6774,9 +6776,10 @@ mod test {
             .collect();
         assert_eq!(
             retained,
-            [0, 9],
-            "younger ACKs cannot retire older live evidence"
+            [9],
+            "the next Data ACK retires only the previous ACK's snapshots"
         );
+        assert!(bbr.packet_index(SpaceId::Initial, 0).is_some());
     }
 
     #[test]

@@ -192,6 +192,8 @@ class ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             return self.progress_connections[connection]
 
     def record_progress(self, connection, total, final, received_at=None):
+        if not self.progress_file:
+            return
         connection = self._resolve_connection(connection)
         receive_event = None
         with connection.lock:
@@ -264,6 +266,8 @@ class ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 request = self.active_requests.pop(connection.connection_id, None)
                 if request is not None:
                     self.request_connections.pop(id(request), None)
+                if not self.progress_file:
+                    self.progress_connections.pop(connection.connection_id, None)
                 self.active_condition.notify_all()
 
     def _snapshot_data(self):

@@ -118,6 +118,49 @@ class TcpSinkTests(unittest.TestCase):
             ],
         )
 
+    def test_default_sink_releases_history_after_each_handler_lifecycle(self):
+        server = ThreadingTcpServer(("127.0.0.1", 0), SinkHandler)
+        try:
+            for chunks in ([b"first", b"-tail"], [b"second", b"-tail"]):
+                request = BlockingRequest(chunks)
+                handler = threading.Thread(
+                    target=SinkHandler,
+                    args=(request, ("127.0.0.1", 12345), server),
+                    daemon=True,
+                )
+                handler.start()
+                try:
+                    self.assertTrue(request.waiting_for_eof.wait(timeout=1.0))
+                    with server.active_condition:
+                        connection = server.request_connections[id(request)]
+                        self.assertEqual(len(server.active_requests), 1)
+                        self.assertEqual(len(server.request_connections), 1)
+                        self.assertIs(
+                            server.active_requests[connection.connection_id], request
+                        )
+                        self.assertIs(
+                            server.progress_connections[connection.connection_id],
+                            connection,
+                        )
+                    self.assertEqual(server.receive_events, [])
+                finally:
+                    request.release_eof.set()
+                    handler.join(timeout=1.0)
+                self.assertFalse(handler.is_alive())
+                self.assertEqual(server.active_requests, {})
+                self.assertEqual(server.request_connections, {})
+                self.assertEqual(server.progress_connections, {})
+                self.assertEqual(server.receive_events, [])
+
+                responses = [line.decode("ascii").split() for line in request.responses]
+                self.assertEqual(responses[0], ["ACK", str(len(chunks[0]))])
+                self.assertEqual(responses[-1], ["OK", str(sum(map(len, chunks)))])
+                self.assertTrue(all(kind == "ACK" for kind, _ in responses[:-1]))
+                totals = [int(total) for _, total in responses]
+                self.assertEqual(totals, sorted(totals))
+        finally:
+            server.server_close()
+
     def test_progress_file_resets_and_tracks_connections_atomically(self):
         with tempfile.TemporaryDirectory() as directory:
             progress_file = Path(directory) / "sink-progress.json"

@@ -237,6 +237,9 @@ struct BbrPacket {
     acknowledged: bool,
     /// once a packet has been acknowledged on a given round it is marked for removal on the next round.
     stale: bool,
+    /// Logically absent after terminal loss; interior storage is compacted at loss-batch end.
+    /// Unlike `stale`, this snapshot must not supply same-ACK ECN or other feedback evidence.
+    retired: bool,
     /// Source delivery round, retained for bandwidth-sample provenance.
     round_count: u64,
 }
@@ -543,6 +546,8 @@ pub struct Bbr3 {
     /// space indexed by `SpaceId as usize`. Packet numbers are only unique and only monotonic
     /// within a space, so the queues must be kept separate for the ordered lookups below to hold.
     packets: [VecDeque<BbrPacket>; 3],
+    /// Spaces containing interior loss tombstones awaiting the existing batch-end callback.
+    packet_retirement_pending: [bool; 3],
     /// equivalent to RS: Per-ACK Rate Sample State <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.2>
     rs: Option<BbrRateSample>,
     /// True while per-packet delivery callbacks are accumulating the rate sample for one ACK.
@@ -826,6 +831,7 @@ impl Bbr3 {
             ack_epoch_open: false,
             latest_completed_bandwidth_sample: None,
             packets: Default::default(),
+            packet_retirement_pending: [false; 3],
             rounds_since_bw_probe: 0,
             bw_probe_wait: Duration::ZERO,
             bw_probe_up_rounds: 0,
@@ -2677,6 +2683,47 @@ impl Bbr3 {
         false
     }
 
+    /// Terminal loss makes a snapshot unavailable immediately, even while its physical slot
+    /// remains in the sorted deque until this synchronous loss batch finishes.
+    fn packet_index(&self, space: SpaceId, packet_number: u64) -> Option<usize> {
+        let packets = &self.packets[space as usize];
+        packets
+            .binary_search_by_key(&packet_number, |packet| packet.packet_number)
+            .ok()
+            .filter(|&index| !packets[index].retired)
+    }
+
+    fn retire_packet_snapshot(&mut self, space: SpaceId, index: usize, actual_loss: bool) {
+        let packets = &mut self.packets[space as usize];
+        if index == 0 {
+            packets.pop_front();
+        } else if index + 1 == packets.len() {
+            packets.pop_back();
+        } else if actual_loss {
+            // Repeated middle removals can move the same retained ACK prefix quadratically.
+            // Keep its ordering and evidence intact; compact these terminal slots once below.
+            packets[index].retired = true;
+            self.packet_retirement_pending[space as usize] = true;
+        } else {
+            // ECN names one snapshot and does not produce a per-packet actual-loss batch.
+            packets.remove(index);
+        }
+    }
+
+    fn compact_retired_packet_snapshots(&mut self) {
+        for (packets, pending) in self
+            .packets
+            .iter_mut()
+            .zip(self.packet_retirement_pending.iter_mut())
+        {
+            if *pending {
+                // Keep this ACK's stale snapshots for the ECN callback following loss detection.
+                packets.retain(|packet| !packet.retired);
+                *pending = false;
+            }
+        }
+    }
+
     /// equivalent to BBRHandleLostPacket <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-11>
     fn process_lost_packet(
         &mut self,
@@ -2703,13 +2750,13 @@ impl Bbr3 {
             );
         }
         if covered_by_raw_batch {
-            self.packets[space as usize].remove(packet_index);
+            self.retire_packet_snapshot(space, packet_index, actual_loss);
             return self.undo_transaction;
         }
         self.record_loss_round_evidence(p);
         self.note_loss(space, p.packet_number);
         if !self.bw_probe_samples {
-            self.packets[space as usize].remove(packet_index);
+            self.retire_packet_snapshot(space, packet_index, actual_loss);
             return self.undo_transaction;
         }
         if let Some(mut rate_sample) = self.rs {
@@ -2729,7 +2776,7 @@ impl Bbr3 {
                 }
             }
         }
-        self.packets[space as usize].remove(packet_index);
+        self.retire_packet_snapshot(space, packet_index, actual_loss);
         self.undo_transaction
     }
 
@@ -2967,6 +3014,7 @@ impl Controller for Bbr3 {
             lost: self.lost,
             acknowledged: false,
             stale: false,
+            retired: false,
             round_count: self.round_count,
         });
         None
@@ -3005,11 +3053,10 @@ impl Controller for Bbr3 {
             rate_sample.newly_acked += bytes;
             self.rs = Some(rate_sample);
         }
-        let p_index_result =
-            self.packets[space as usize].binary_search_by_key(&packet_number, |p| p.packet_number);
+        let p_index_result = self.packet_index(space, packet_number);
         let is_newest_packet = self.is_newest_packet(sent, space, packet_number);
         let mut inflight_rtt_sample = None;
-        if let Ok(p_index) = p_index_result {
+        if let Some(p_index) = p_index_result {
             if let Some(p) = self.packets[space as usize].get_mut(p_index) {
                 p.acknowledged = true;
                 if p.is_operational_rtt_evidence {
@@ -3175,9 +3222,7 @@ impl Controller for Bbr3 {
         // only process ecn here, regular packet loss is detected per packet in on_packet_lost.
         if is_ecn {
             self.lost += lost_bytes;
-            let p_index_result = self.packets[space as usize]
-                .binary_search_by_key(&largest_lost, |p| p.packet_number);
-            if let Ok(p_index) = p_index_result {
+            if let Some(p_index) = self.packet_index(space, largest_lost) {
                 self.process_lost_packet(p_index, space, now, false);
             }
         }
@@ -3206,6 +3251,7 @@ impl Controller for Bbr3 {
         self.loss_budget_current_batch.clear();
         self.loss_budget_batch_raw_action_taken = false;
         self.maybe_compact_loss_budget_journal();
+        self.compact_retired_packet_snapshots();
     }
 
     fn on_packet_lost(
@@ -3218,9 +3264,7 @@ impl Controller for Bbr3 {
         let lost_bytes_64 = lost_bytes as u64;
         self.inflight = self.inflight.saturating_sub(lost_bytes_64);
         self.lost += lost_bytes_64;
-        let p_index_result =
-            self.packets[space as usize].binary_search_by_key(&packet_number, |p| p.packet_number);
-        if let Ok(p_index) = p_index_result {
+        if let Some(p_index) = self.packet_index(space, packet_number) {
             return self.process_lost_packet(p_index, space, now, true);
         }
         if self.loss_compensation_floor > 0.0 {
@@ -3243,10 +3287,10 @@ impl Controller for Bbr3 {
     }
 
     fn on_packet_discarded(&mut self, packet_number: u64, space: SpaceId) {
-        let packets = &mut self.packets[space as usize];
-        if let Ok(index) = packets.binary_search_by_key(&packet_number, |packet| packet.packet_number)
-        {
-            packets.remove(index);
+        if let Some(index) = self.packet_index(space, packet_number) {
+            // A live storage-only terminal also applies to parked controller copies, which do
+            // not receive a matching loss-batch callback. Already retired active losses are absent.
+            self.packets[space as usize].remove(index);
         }
     }
 
@@ -3901,6 +3945,7 @@ mod test {
             lost: 0,
             acknowledged: true,
             stale: false,
+            retired: false,
             round_count: 0,
         };
         BbrRateSample {
@@ -4790,6 +4835,7 @@ mod test {
             lost: 0,
             acknowledged: true,
             stale: false,
+            retired: false,
             round_count: 0,
         };
         let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
@@ -4847,6 +4893,7 @@ mod test {
             lost: 0,
             acknowledged: false,
             stale: false,
+            retired: false,
             round_count: 0,
         };
 
@@ -4904,6 +4951,7 @@ mod test {
             lost: 0,
             acknowledged: false,
             stale: false,
+            retired: false,
             round_count: 0,
         };
 
@@ -5009,6 +5057,7 @@ mod test {
             lost: 0,
             acknowledged: false,
             stale: false,
+            retired: false,
             round_count: 0,
         };
         let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
@@ -5366,6 +5415,7 @@ mod test {
             lost: 0,
             acknowledged: true,
             stale: false,
+            retired: false,
             round_count: 0,
         };
         let sample = |newly_acked| BbrRateSample {
@@ -6421,6 +6471,7 @@ mod test {
             lost: 0,
             acknowledged: true,
             stale: false,
+            retired: false,
             round_count: 0,
         };
         bbr.rs = Some(BbrRateSample {
@@ -6630,6 +6681,183 @@ mod test {
             false,
             rtt,
         );
+    }
+
+    #[test]
+    fn packet_retirement_preserves_same_ack_ecn_and_live_discard_owners() {
+        let base = Instant::now();
+        let ack_at = base + Duration::from_millis(100);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut config = Bbr3Config::default();
+        config.loss_compensation_floor(0.20);
+        let mut bbr = Bbr3::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
+        send_test_flight(&mut bbr, base, 9);
+        // P0 is still Native-live; same-ACK snapshots surround the missing P3..P5.
+        for packet in [1, 2, 6, 7, 8] {
+            ack_test_packet(
+                &mut bbr,
+                &rtt,
+                ack_at,
+                base + Duration::from_micros(packet),
+                packet,
+            );
+        }
+        bbr.on_end_acks(
+            ack_at,
+            4 * BASE_DATAGRAM_SIZE,
+            false,
+            Some(8),
+            SpaceId::Data,
+        );
+        let mut parked = bbr.clone();
+        let parked_delivered = parked.delivered;
+        let parked_lost = parked.lost;
+        for packet in 3..6 {
+            bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, packet, SpaceId::Data, ack_at);
+            assert_eq!(bbr.packet_index(SpaceId::Data, packet), None);
+            bbr.on_packet_discarded(packet, SpaceId::Data);
+            assert_eq!(bbr.packets[SpaceId::Data as usize].len(), 9);
+            // Native dispatches storage-only terminals to the parked copy, with no batch end.
+            parked.on_packet_discarded(packet, SpaceId::Data);
+            assert_eq!(
+                parked.packets[SpaceId::Data as usize].len(),
+                11 - packet as usize
+            );
+        }
+        assert_eq!(
+            (parked.delivered, parked.lost),
+            (parked_delivered, parked_lost)
+        );
+        assert_eq!(parked.packet_retirement_pending, [false; 3]);
+        bbr.on_congestion_event(
+            ack_at,
+            base,
+            false,
+            false,
+            3 * BASE_DATAGRAM_SIZE,
+            5,
+            SpaceId::Data,
+        );
+        assert_eq!(bbr.packet_retirement_pending, [false; 3]);
+        let retained: Vec<_> = bbr.packets[SpaceId::Data as usize]
+            .iter()
+            .map(|packet| packet.packet_number)
+            .collect();
+        assert_eq!(retained, [0, 1, 2, 6, 7, 8]);
+        let ecn_index = bbr
+            .packet_index(SpaceId::Data, 8)
+            .expect("same-ACK ECN snapshot");
+        assert!(bbr.packets[SpaceId::Data as usize][ecn_index].stale);
+        bbr.on_congestion_event(ack_at, base, false, true, 0, 8, SpaceId::Data);
+        assert_eq!(bbr.packet_index(SpaceId::Data, 8), None);
+        assert!(bbr.packet_index(SpaceId::Data, 0).is_some());
+
+        let next_sent = ack_at + Duration::from_millis(1);
+        bbr.on_packet_sent(next_sent, BASE_DATAGRAM_SIZE as u16, 9, SpaceId::Data);
+        ack_test_packet(
+            &mut bbr,
+            &rtt,
+            next_sent + Duration::from_millis(100),
+            next_sent,
+            9,
+        );
+        bbr.on_end_acks(
+            next_sent + Duration::from_millis(100),
+            BASE_DATAGRAM_SIZE,
+            false,
+            Some(9),
+            SpaceId::Data,
+        );
+        let retained: Vec<_> = bbr.packets[SpaceId::Data as usize]
+            .iter()
+            .map(|packet| packet.packet_number)
+            .collect();
+        assert_eq!(
+            retained,
+            [0, 9],
+            "younger ACKs cannot retire older live evidence"
+        );
+    }
+
+    #[test]
+    fn packet_retirement_matches_physical_absence_for_intermediate_feedback() {
+        let base = Instant::now();
+        let at = base + Duration::from_millis(100);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut config = Bbr3Config::default();
+        config.loss_compensation_floor(0.20);
+        let mut pending = Bbr3::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
+        send_test_flight(&mut pending, base, 3);
+        pending.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, at);
+        assert!(pending.packets[SpaceId::Data as usize][1].retired);
+        let mut absent = pending.clone();
+        // Oracle: the old representation physically removed this exact terminal snapshot.
+        absent.packets[SpaceId::Data as usize].remove(1);
+        absent.packet_retirement_pending[SpaceId::Data as usize] = false;
+        for feedback in 0..4 {
+            let mut actual = pending.clone();
+            let mut expected = absent.clone();
+            for controller in [&mut actual, &mut expected] {
+                match feedback {
+                    0 => ack_test_packet(controller, &rtt, at, base + Duration::from_micros(1), 1),
+                    1 => {
+                        controller.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, at);
+                    }
+                    2 => controller.on_congestion_event(at, base, false, true, 0, 1, SpaceId::Data),
+                    _ => controller.on_packet_discarded(1, SpaceId::Data),
+                }
+                controller.on_congestion_event(
+                    at,
+                    base,
+                    false,
+                    false,
+                    BASE_DATAGRAM_SIZE,
+                    1,
+                    SpaceId::Data,
+                );
+            }
+            // Entire controller state, including rate/RTT evidence, counters, journals and
+            // recovery identity, must match once the representations reach the same boundary.
+            assert_eq!(
+                format!("{actual:?}"),
+                format!("{expected:?}"),
+                "feedback {feedback}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_retirement_covers_loss_exits_and_independent_spaces() {
+        let base = Instant::now();
+        let at = base + Duration::from_millis(100);
+        let mut config = Bbr3Config::default();
+        config.loss_compensation_floor(0.20);
+        let mut bbr = Bbr3::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
+        for space in [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data] {
+            for packet in 0..3 {
+                bbr.on_packet_sent(base, BASE_DATAGRAM_SIZE as u16, packet, space);
+            }
+        }
+        for (branch, space) in [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data]
+            .into_iter()
+            .enumerate()
+        {
+            // Select the three pre-existing policy exits; generated packet snapshots and all
+            // terminal processing still use callbacks. This is branch coverage, not path growth.
+            bbr.bw_probe_samples = branch != 0;
+            bbr.loss_budget_batch_raw_action_taken = branch == 2;
+            bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, space, at);
+            bbr.on_packet_discarded(1, space);
+            assert_eq!(bbr.packet_index(space, 1), None);
+            assert_eq!(bbr.packets[space as usize].len(), 3);
+            bbr.on_congestion_event(at, base, false, false, BASE_DATAGRAM_SIZE, 1, space);
+            let retained: Vec<_> = bbr.packets[space as usize]
+                .iter()
+                .map(|packet| packet.packet_number)
+                .collect();
+            assert_eq!(retained, [0, 2]);
+            assert_eq!(bbr.packet_retirement_pending, [false; 3]);
+        }
     }
 
     #[test]
@@ -10214,6 +10442,7 @@ mod test {
             lost: 0,
             acknowledged: true,
             stale: false,
+            retired: false,
             round_count: 7,
         };
         let sample = |newly_acked| BbrRateSample {

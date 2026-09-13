@@ -398,6 +398,10 @@ pub trait Controller: Send + Sync {
     );
 
     /// One packet was just lost.
+    ///
+    /// The transport reports a synchronous batch of these callbacks to the owning controller,
+    /// each followed by `on_packet_discarded`, then completes it with `on_congestion_event`.
+    /// Storage-only discards on other controller copies do not imply a batch-end callback.
     #[allow(unused_variables)]
     fn on_packet_lost(
         &mut self,

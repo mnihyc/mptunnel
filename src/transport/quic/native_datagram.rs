@@ -404,6 +404,17 @@ impl NativeDatagramSender {
             .filter(|value| *value > 0)
             .ok_or(QuicCarrierError::NativeDatagramTooLarge)?;
         let fragment_count = payload.len().div_ceil(fragment_payload_bytes);
+        #[cfg(test)]
+        eprintln!(
+            "native IP send geometry: request={} tunnel={:?} packet={:?} payload={} maximum={} fragment_payload={} count={}",
+            self.request_stream_id,
+            tunnel_id,
+            packet_id,
+            payload.len(),
+            maximum,
+            fragment_payload_bytes,
+            fragment_count
+        );
         if fragment_count > MAX_NATIVE_FRAGMENTS {
             return Err(QuicCarrierError::NativeDatagramTooLarge);
         }
@@ -432,6 +443,11 @@ impl NativeDatagramSender {
                 .send_datagram_wait(Bytes::from(packet))
                 .await?;
         }
+        #[cfg(test)]
+        eprintln!(
+            "native IP locally accepted: request={} tunnel={:?} packet={:?} fragments={}",
+            self.request_stream_id, tunnel_id, packet_id, fragment_count
+        );
         Ok(())
     }
 }
@@ -630,6 +646,16 @@ impl NativeDatagramReceiver {
     fn insert_ip_fragment(&mut self, fragment: IpFragment) -> Option<(Frame, Instant)> {
         let now = Instant::now();
         if fragment.deadline <= now {
+            #[cfg(test)]
+            eprintln!(
+                "native IP fragment expired before insertion: request={} tunnel={:?} packet={:?} index={}/{} overdue={:?}",
+                self.request_stream_id,
+                fragment.tunnel_id,
+                fragment.packet_id,
+                fragment.index,
+                fragment.count,
+                now.saturating_duration_since(fragment.deadline)
+            );
             self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -682,6 +708,11 @@ impl NativeDatagramReceiver {
             .remove(&key)
             .expect("completed native IP reassembly exists");
         if complete.deadline <= Instant::now() {
+            #[cfg(test)]
+            eprintln!(
+                "native IP complete reassembly expired before delivery: request={} key={key:?}",
+                self.request_stream_id
+            );
             return None;
         }
         let mut payload = Vec::with_capacity(complete.total_len);
@@ -707,8 +738,13 @@ impl NativeDatagramReceiver {
         let now = Instant::now();
         self.reassemblies
             .retain(|_, reassembly| reassembly.deadline > now);
-        self.ip_reassemblies
-            .retain(|_, reassembly| reassembly.deadline > now);
+        self.ip_reassemblies.retain(|_key, reassembly| {
+            #[cfg(test)]
+            if reassembly.deadline <= now {
+                eprintln!("native IP incomplete reassembly expired: key={_key:?} parts={}/{} bytes={}/{} overdue={:?}", reassembly.parts.iter().filter(|part| part.is_some()).count(), reassembly.parts.len(), reassembly.received_len, reassembly.total_len, now.saturating_duration_since(reassembly.deadline));
+            }
+            reassembly.deadline > now
+        });
     }
 
     fn next_reassembly_expiry(&self) -> Option<Instant> {

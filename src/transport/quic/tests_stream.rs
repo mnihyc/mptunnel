@@ -1840,6 +1840,10 @@ async fn native_ip_packets_require_ready_and_preserve_fragmented_identity() {
     let client_phase = |phase: &'static str| {
         phases.lock().expect("native IP test phases").0 = phase;
     };
+    let peers = Arc::new(Mutex::new((
+        None::<super::super::Connection>,
+        None::<super::super::Connection>,
+    )));
     let scenario = async {
         let limits = CodecLimits::default();
         let mux_limits = MuxLimits::default();
@@ -1862,12 +1866,14 @@ async fn native_ip_packets_require_ready_and_preserve_fragmented_identity() {
         let expected_request = request_payload.clone();
         let expected_response = response_payload.clone();
         let server_phases = phases.clone();
+        let server_peers = peers.clone();
         let mut server_task = AbortOnDrop(tokio::spawn(async move {
             let server_phase = |phase: &'static str| {
                 server_phases.lock().expect("native IP test phases").1 = phase;
             };
             server_phase("accepting connection");
             let connection = server.accept().await.expect("accepted connection");
+            server_peers.lock().expect("diagnostic peers").1 = Some(connection.clone());
             server_phase("accepting request");
             let (mut send, mut recv) = connection.accept_bi().await.expect("accepted request");
             server_phase("reading reliable tunnel open");
@@ -1940,6 +1946,7 @@ async fn native_ip_packets_require_ready_and_preserve_fragmented_identity() {
         .expect("client endpoint");
         client_phase("connecting");
         let connection = client.connect(server_addr).await.expect("client connect");
+        peers.lock().expect("diagnostic peers").0 = Some(connection.clone());
         client_phase("opening request");
         let (mut send, mut recv) = connection.open_bi().await.expect("client request");
         client_phase("writing reliable tunnel open");
@@ -2027,10 +2034,23 @@ async fn native_ip_packets_require_ready_and_preserve_fragmented_identity() {
         (&mut server_task.0).await.expect("server task");
         client_phase("complete");
     };
-    timeout(Duration::from_secs(5), scenario)
-        .await
-        .unwrap_or_else(|_| {
-            let (client, server) = *phases.lock().expect("native IP test phases");
-            panic!("native IP fixture timed out: client={client}; server={server}");
-        });
+    tokio::pin!(scenario);
+    let result = timeout(Duration::from_secs(5), &mut scenario).await;
+    {
+        let peers = peers.lock().expect("diagnostic peers");
+        for (role, peer) in [("client", &peers.0), ("server", &peers.1)] {
+            if let Some(peer) = peer {
+                eprintln!(
+                    "native IP diagnostic {role}: closed={} routing={:?} stats={:?}",
+                    peer.is_closed(),
+                    peer.native_datagram_routing_counts(),
+                    peer.stats()
+                );
+            }
+        }
+    }
+    result.unwrap_or_else(|_| {
+        let (client, server) = *phases.lock().expect("native IP test phases");
+        panic!("native IP fixture timed out: client={client}; server={server}");
+    });
 }

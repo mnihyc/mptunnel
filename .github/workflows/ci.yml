@@ -3,139 +3,58 @@ name: CI
 on:
   push:
     branches:
-      - "**"
-  pull_request:
-  workflow_dispatch:
+      - diagnostic/apple-native-ip-20260913
 
 permissions:
   contents: read
 
 env:
+  CARGO_TARGET_DIR: .tmp/cargo-target
   PYTHONPYCACHEPREFIX: .tmp/python-cache
 
 jobs:
-  quality:
-    name: Source quality
-    uses: ./.github/workflows/release-quality-gate.yml
-
-  linked-build:
-    name: Build ${{ matrix.target }}
-    needs: quality
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            kind: musl
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            kind: musl
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            kind: windows
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            kind: windows
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            kind: unix
-          - os: macos-15
-            target: aarch64-apple-darwin
-            kind: unix
-          - os: ubuntu-24.04
-            target: aarch64-linux-android
-            kind: android
-          - os: ubuntu-24.04
-            target: x86_64-linux-android
-            kind: android
+  diagnose:
+    name: Diagnostic Intel macOS native IP reassembly
+    runs-on: macos-15-intel
+    timeout-minutes: 35
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-
-      - name: Install Rust target
-        shell: bash
-        run: rustup target add "${{ matrix.target }}"
-
-      - name: Install musl C compiler
-        if: matrix.kind == 'musl'
-        shell: bash
-        env:
-          CC_ENV: ${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64_unknown_linux_musl' || 'aarch64_unknown_linux_musl' }}
+      - name: Prepare ignored scratch
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes musl-tools
-          echo "CC_${CC_ENV}=musl-gcc" >> "$GITHUB_ENV"
-
-      - name: Install pinned Android NDK
-        if: matrix.kind == 'android'
+          mkdir -p .tmp/mac-gate .tmp/system
+          echo "TMPDIR=${GITHUB_WORKSPACE}/.tmp/system" >> "$GITHUB_ENV"
+      - name: Compile one native test executable
+        run: cargo test --locked --all-features --target x86_64-apple-darwin --lib --no-run
+      - name: Observe one focused fixture and three full suites
         shell: bash
         run: |
-          ndk_version="27.3.13750724"
-          sdkmanager="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
-          "$sdkmanager" "ndk;${ndk_version}"
-          toolchain="${ANDROID_HOME}/ndk/${ndk_version}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          case "${{ matrix.target }}" in
-            aarch64-linux-android)
-              cc="${toolchain}/aarch64-linux-android24-clang"
-              target_env="AARCH64_LINUX_ANDROID"
-              cc_env="aarch64_linux_android"
-              ;;
-            x86_64-linux-android)
-              cc="${toolchain}/x86_64-linux-android24-clang"
-              target_env="X86_64_LINUX_ANDROID"
-              cc_env="x86_64_linux_android"
-              ;;
-            *) exit 1 ;;
-          esac
-          test -x "$cc"
-          {
-            echo "CARGO_TARGET_${target_env}_LINKER=$cc"
-            echo "CC_${cc_env}=$cc"
-            echo "AR_${cc_env}=${toolchain}/llvm-ar"
-          } >> "$GITHUB_ENV"
-
-      - name: Build linked artifact
-        env:
-          RUSTFLAGS: ${{ matrix.kind == 'windows' && '-C target-feature=+crt-static' || '' }}
-        run: cargo build --locked --release --target ${{ matrix.target }} --bin mptunnel
-
-      - name: Run native platform tests
-        if: matrix.kind == 'windows' || matrix.kind == 'unix'
-        env:
-          RUSTFLAGS: ${{ matrix.kind == 'windows' && '-C target-feature=+crt-static' || '' }}
-        run: cargo test --locked --all-features --target ${{ matrix.target }}
-
-      - name: Verify Unix binary version
-        if: matrix.kind != 'android' && matrix.kind != 'windows'
-        shell: bash
-        run: |
-          binary="target/${{ matrix.target }}/release/mptunnel"
-          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          test "$("$binary" --version)" = "mptunnel ${version}"
-
-      - name: Verify Windows binary version
-        if: matrix.kind == 'windows'
-        shell: pwsh
-        run: |
-          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          $binary = "target/${{ matrix.target }}/release/mptunnel.exe"
-          $actual = & $binary --version
-          $expected = "mptunnel $($metadata.packages[0].version)"
-          if ($actual -ne $expected) {
-              throw "Expected '$expected', got '$actual'"
-          }
-
-      - name: Inspect Unix binary format
-        if: matrix.kind == 'musl' || matrix.kind == 'unix' || matrix.kind == 'android'
-        shell: bash
-        run: file target/${{ matrix.target }}/release/mptunnel
-
-      - name: Require static musl linkage
-        if: matrix.kind == 'musl'
-        shell: bash
-        run: file target/${{ matrix.target }}/release/mptunnel | grep -E 'statically linked|static-pie linked'
+          set -uo pipefail
+          set +e
+          sysctl hw.ncpu hw.memsize
+          sysctl net.inet.udp.recvspace net.inet.udp.maxdgram
+          failed=0
+          for index in 0 1 2 3; do
+            netstat -s -p udp > ".tmp/mac-gate/${index}-udp-before.txt"
+            if [[ "$index" != 0 ]]; then
+              /usr/bin/time -l cargo test --locked --all-features --target x86_64-apple-darwin --lib -- --show-output > ".tmp/mac-gate/${index}-test.log" 2>&1
+            else
+              /usr/bin/time -l cargo test --locked --all-features --target x86_64-apple-darwin --lib 'transport::quic::stream::tests::native_ip_packets_require_ready_and_preserve_fragmented_identity' -- --exact --nocapture > ".tmp/mac-gate/${index}-test.log" 2>&1
+            fi
+            result=$?
+            printf '%s %s\n' "$index" "$result" >> .tmp/mac-gate/results.txt
+            if [[ "$result" != 0 ]]; then failed=1; fi
+            netstat -s -p udp > ".tmp/mac-gate/${index}-udp-after.txt"
+            cat ".tmp/mac-gate/${index}-test.log"
+            diff -u ".tmp/mac-gate/${index}-udp-before.txt" ".tmp/mac-gate/${index}-udp-after.txt" || true
+          done
+          exit "$failed"
+      - name: Retain diagnostic observations
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: apple-native-ip-observations
+          path: .tmp/mac-gate/
+          include-hidden-files: true
+          retention-days: 1

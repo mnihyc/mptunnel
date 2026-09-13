@@ -4960,7 +4960,7 @@ enum PreparedWriterClaimCase {
     SelectedDrains,
     BackupFallback,
     RegularBecomesReady,
-    StaleFallback,
+    FreshWriterNotReady,
     FreshReadyDisplacesStale,
 }
 
@@ -5056,7 +5056,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
             .unwrap();
         let stale_case = matches!(
             case,
-            PreparedWriterClaimCase::StaleFallback
+            PreparedWriterClaimCase::FreshWriterNotReady
                 | PreparedWriterClaimCase::FreshReadyDisplacesStale
         );
         if stale_case {
@@ -5172,7 +5172,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
             assert_eq!(state.sender_queue.data_bytes(), quantum);
             assert!(state.send_stream.send_credit_bytes() >= quantum);
         }
-        if !a_is_backup && case != PreparedWriterClaimCase::StaleFallback {
+        if !a_is_backup && case != PreparedWriterClaimCase::FreshWriterNotReady {
             b_receivers
                 .lock()
                 .unwrap()
@@ -5290,7 +5290,7 @@ fn prepared_competing_writer_claim_case(case: PreparedWriterClaimCase) -> (u64, 
                 return (state.send_stream.next_offset(), quantum);
             }
             PreparedOriginalClaim::Blocked(wait) => {
-                if case == PreparedWriterClaimCase::StaleFallback {
+                if case == PreparedWriterClaimCase::FreshWriterNotReady {
                     let state = shared.lock();
                     assert_eq!(state.send_stream.next_offset(), 0);
                     assert_eq!(state.send_stream.reinjection_bytes(), 0);
@@ -5455,13 +5455,13 @@ async fn prepared_request_ready_claim_new_regular_displaces_backup() {
 }
 
 #[tokio::test]
-async fn prepared_request_stale_ready_claim_ignores_nonready_fresh_preference() {
-    let (claimed, quantum) =
-        prepared_competing_writer_claim_case(PreparedWriterClaimCase::StaleFallback);
+async fn prepared_request_stale_ready_claim_waits_for_nonready_fresh_writer() {
+    let (claimed, _) =
+        prepared_competing_writer_claim_case(PreparedWriterClaimCase::FreshWriterNotReady);
     assert_eq!(
-        claimed, quantum as u64,
-        "a fresh but non-Ready attachment must not veto the sole Ready stale writer \
-         after exact current Product authority has passed"
+        claimed, 0,
+        "temporary writer occupancy does not remove the non-stale structural \
+         alternative or reactivate stale Original placement"
     );
 }
 

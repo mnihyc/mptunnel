@@ -73,18 +73,18 @@ TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 MPTUNNEL combines independent link capacity within one connection. TCP and QUIC
 on the same physical link share that link's capacity.
 
-In controlled Linux measurements, a shared 500 Mbps link delivered 410 Mbps
-mixed download and 441 Mbps upload. With two independent 200 Mbps links and
-QUIC restricted to 10 Mbps, mixed download maintained 185 Mbps while TCP
-continued serving traffic. Loaded latency and recovery timing are shown alongside
-throughput below.
+In controlled Linux measurements, a shared 500 Mbps link delivered 419 Mbps
+mixed download and 437 Mbps upload. Loaded echo p95 during mixed download was
+438 ms. With two independent 200 Mbps links and QUIC restricted to 10 Mbps,
+ordered download averaged 151 Mbps and upload confirmations averaged 132 Mbps
+during the restricted phase. The plots show startup, pauses and subsequent recovery.
 
 [![Mixed download, echo latency and upload through QUIC restriction and outage](docs/assets/performance/independent-links.svg)](docs/assets/performance/independent-links.svg)
 
 The [performance guide](docs/PERFORMANCE.md) includes TCP, QUIC and mixed results,
 loss/reordering scenarios, matched Hysteria2/Xray measurements, timing plots and
-CPU/memory costs. Results depend on network conditions, direction and available
-processing capacity.
+CPU/memory costs. It also shows the throughput and loaded-latency tradeoffs.
+Results depend on network conditions, direction and available processing capacity.
 
 ## Quick start
 

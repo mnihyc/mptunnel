@@ -72,6 +72,7 @@ class ReleaseArchiveTests(unittest.TestCase):
         fixture.write_text(json.dumps(response), encoding="utf-8")
         api = '''
 gh() {
+  printf '%s\\n' "$*" >> "$GH_CALL_LOG"
   if [[ "$*" == *"--method DELETE"* ]]; then
     printf '%s\\n' "$*" >> "$DELETE_LOG"
   else
@@ -85,6 +86,7 @@ gh() {
             env={
                 **os.environ,
                 "RELEASE_FIXTURE": str(fixture),
+                "GH_CALL_LOG": str(root / "gh-calls"),
                 "DELETE_LOG": str(root / "deletions"),
                 "GITHUB_OUTPUT": str(root / "output"),
                 "GITHUB_REPOSITORY": "example/mptunnel",
@@ -161,6 +163,166 @@ gh() {
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((root / "deletions").exists(), should_delete)
+
+    def test_publication_requires_all_same_commit_branch_ci(self) -> None:
+        # Execute the actual final publication step, including the real verifier.
+        # The fake API supplies complete pages; no network or release mutation runs.
+        script = self.release_step("Publish verified release")
+        commit = "1" * 40
+        base = {
+            "id": 41,
+            "run_attempt": 1,
+            "path": ".github/workflows/ci.yml",
+            "event": "push",
+            "head_sha": commit,
+            "head_branch": "main",
+            "repository": {"full_name": "example/mptunnel"},
+            "head_repository": {"full_name": "example/mptunnel"},
+            "status": "completed",
+            "conclusion": "success",
+        }
+
+        def page(*runs: dict, total: int | None = None) -> dict:
+            return {
+                "total_count": len(runs) if total is None else total,
+                "workflow_runs": list(runs),
+            }
+
+        cases = [
+            ("success", [page(base)], True),
+            # The API exposes the current attempt, not immutable past attempts.
+            ("successful_current_rerun", [page({**base, "run_attempt": 2})], True),
+            (
+                "all_success_paginated",
+                [page(base, total=2), page({**base, "id": 42}, total=2)],
+                True,
+            ),
+            ("missing", [page()], False),
+            (
+                "separate_failure_not_hidden_by_newer_success",
+                [page({**base, "conclusion": "failure"}, {**base, "id": 42})],
+                False,
+            ),
+            (
+                "pending_run_not_hidden_by_success",
+                [page(base, {**base, "id": 42, "status": "queued", "conclusion": None})],
+                False,
+            ),
+            ("incomplete_pages", [page(base, total=2)], False),
+            ("duplicate_page", [page(base, total=2), page(base, total=2)], False),
+            (
+                "changed_inventory",
+                [page(base, total=2), page({**base, "id": 42}, total=3)],
+                False,
+            ),
+            ("missing_inventory", [{}], False),
+            ("invalid_json", None, False),
+            ("api_error", [page(base)], False),
+        ]
+        for field, value in (
+            ("head_sha", "2" * 40),
+            ("path", ".github/workflows/release.yml"),
+            ("event", "workflow_dispatch"),
+            ("head_branch", None),
+            ("repository", {"full_name": "other/mptunnel"}),
+            ("head_repository", {"full_name": "other/mptunnel"}),
+            ("run_attempt", None),
+            ("status", "in_progress"),
+        ):
+            cases.append((f"wrong_{field}", [page({**base, field: value})], False))
+        for conclusion in ("failure", "cancelled", "timed_out", "neutral", "skipped", None):
+            cases.append(
+                (f"conclusion_{conclusion}", [page({**base, "conclusion": conclusion})], False)
+            )
+
+        api = '''
+gh() {
+  if [[ "$1" == api ]]; then
+    printf '%s\\n' "$*" >> "$API_LOG"
+    [[ "$API_FAILURE" == false ]] || return 7
+    cat "$CI_FIXTURE"
+  elif [[ "$1 $2" == "release edit" ]]; then
+    printf '%s\\n' "$*" >> "$PUBLISH_LOG"
+  else
+    return 8
+  fi
+}
+'''
+        for name, pages, allowed in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                (root / ".tmp/ci").mkdir(parents=True)
+                helper = pathlib.Path("packaging/tools/check_release_ci_gate.py")
+                (root / helper.parent).mkdir(parents=True)
+                (root / helper).write_bytes((REPOSITORY_ROOT / helper).read_bytes())
+                fixture = root / "ci-response.json"
+                fixture.write_text(
+                    "not json" if pages is None else "\n".join(map(json.dumps, pages)),
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    ["bash", "-c", api + script],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "CI_FIXTURE": str(fixture),
+                        "API_FAILURE": "true" if name == "api_error" else "false",
+                        "API_LOG": str(root / "api-calls"),
+                        "PUBLISH_LOG": str(root / "publications"),
+                        "GITHUB_REPOSITORY": "example/mptunnel",
+                        "RELEASE_TAG": f"v{PACKAGE_VERSION}",
+                        "RELEASE_COMMIT": commit,
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, allowed, result.stderr)
+                self.assertEqual((root / "publications").exists(), allowed)
+                self.assertEqual(
+                    (root / "api-calls").read_text().splitlines(),
+                    [
+                        "api --paginate repos/example/mptunnel/actions/workflows/ci.yml/"
+                        f"runs?head_sha={commit}&event=push&per_page=100"
+                    ],
+                )
+                if allowed:
+                    self.assertEqual(
+                        (root / "publications").read_text(),
+                        f"release edit v{PACKAGE_VERSION} --draft=false\n",
+                    )
+                    verdict = json.loads((root / ".tmp/ci/required-ci-verdict.json").read_text())
+                    self.assertEqual(verdict["commit"], commit)
+                    self.assertEqual(len(verdict["runs"]), pages[0]["total_count"])
+
+    def test_published_release_verification_does_not_require_ci_or_mutate(self) -> None:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text()
+        publication = workflow.split("      - name: Publish verified release\n", 1)[1]
+        publication = publication.split("\n      - name:", 1)[0]
+        self.assertIn("if: steps.release_state.outputs.state != 'published'", publication)
+        self.assertIn("check_release_ci_gate.py", publication)
+        publish_job = workflow.split("  publish:\n", 1)[1]
+        self.assertIn("      actions: read\n", publish_job)
+        # Exercise the actual published-state verifier's API boundary. The new
+        # CI requirement is deliberately confined to the mutation step above.
+        script = self.release_step("Verify published state")
+        self.assertNotIn("check_release_ci_gate", script)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            (root / ".tmp/ci").mkdir(parents=True)
+            assets = sorted(public_asset_names())
+            (root / ".tmp/ci/expected-assets.txt").write_text("\n".join(assets) + "\n")
+            result = self.run_release_step(
+                script,
+                {"draft": False, "immutable": True, "assets": [{"name": x} for x in assets]},
+                root,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((root / "deletions").exists())
+            self.assertEqual(
+                (root / "gh-calls").read_text().splitlines(),
+                [f"api repos/example/mptunnel/releases/tags/v{PACKAGE_VERSION}"],
+            )
 
     def test_every_target_archive_is_byte_reproducible_and_verifies(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

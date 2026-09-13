@@ -365,6 +365,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+      actions: read
     steps:
       - name: Checkout tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -583,7 +584,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release edit "$RELEASE_TAG" --draft=false
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Tag and branch pushes run independently. Observe every same-commit
+          # branch CI run's current attempt immediately before publication;
+          # pending/missing/failed evidence stops here without a polling loop.
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${RELEASE_COMMIT}&event=push&per_page=100" \
+            | jq -s . > .tmp/ci/required-ci-runs.json
+          python3 packaging/tools/check_release_ci_gate.py \
+            --runs-file .tmp/ci/required-ci-runs.json \
+            --commit "$RELEASE_COMMIT" \
+            --repository "$GITHUB_REPOSITORY" \
+            > .tmp/ci/required-ci-verdict.json
+          gh release edit "$RELEASE_TAG" --draft=false
 
       - name: Verify published state
         env:

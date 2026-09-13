@@ -142,6 +142,7 @@ fn pending_route_deadline_preserves_v1_ttl_and_uses_local_bound_for_v2() {
 async fn incomplete_native_reassembly_releases_budget_without_a_later_packet() {
     let buffered_bytes = Arc::new(AtomicUsize::new(0));
     let state = Arc::new(HubState {
+        ip_observation: Arc::new(std::sync::OnceLock::new()),
         routing: Mutex::new(RoutingTable::default()),
         next_generation: AtomicU64::new(1),
         buffered_bytes: buffered_bytes.clone(),
@@ -204,6 +205,7 @@ async fn unregistered_route_packet_expires_under_global_bounds_without_traffic()
     let packet_bytes = Bytes::from(vec![0_u8; NATIVE_FRAGMENT_HEADER_BYTES]);
     let buffered_bytes = Arc::new(AtomicUsize::new(packet_bytes.len()));
     let state = HubState {
+        ip_observation: Arc::new(std::sync::OnceLock::new()),
         routing: Mutex::new(RoutingTable::default()),
         next_generation: AtomicU64::new(1),
         buffered_bytes: buffered_bytes.clone(),
@@ -248,6 +250,7 @@ fn resolved_request_evicts_pending_route_without_exceeding_global_route_cap() {
     let packet_len = NATIVE_FRAGMENT_HEADER_BYTES;
     let buffered_bytes = Arc::new(AtomicUsize::new(packet_len * 2));
     let state = HubState {
+        ip_observation: Arc::new(std::sync::OnceLock::new()),
         routing: Mutex::new(RoutingTable::default()),
         next_generation: AtomicU64::new(1),
         buffered_bytes: buffered_bytes.clone(),

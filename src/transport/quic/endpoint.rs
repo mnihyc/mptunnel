@@ -406,6 +406,14 @@ impl Connection {
         self.native_datagrams.routing_counts()
     }
 
+    #[cfg(test)]
+    pub(super) fn observe_native_ip_for_test(
+        &self,
+        observation: super::native_datagram::NativeIpTestObservation,
+    ) {
+        self.native_datagrams.observe_ip(observation);
+    }
+
     pub fn is_closed(&self) -> bool {
         self.connection.close_reason().is_some()
     }

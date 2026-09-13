@@ -1836,9 +1836,22 @@ async fn native_ip_packets_require_ready_and_preserve_fragmented_identity() {
         }
     }
 
-    let phases = Arc::new(Mutex::new(("not started", "not spawned")));
+    use super::super::native_datagram::NativeIpTestObservation;
+    let started = std::time::Instant::now();
+    // The finite fixture has a fixed set of phase transitions and two peers.
+    // Keep times from the beginning so a late Ready cannot look like five
+    // seconds spent waiting for an already accepted native packet.
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let peers = Arc::new(Mutex::new(Vec::<(
+        &'static str,
+        super::super::Connection,
+        NativeIpTestObservation,
+    )>::new()));
     let client_phase = |phase: &'static str| {
-        phases.lock().expect("native IP test phases").0 = phase;
+        phases
+            .lock()
+            .expect("native IP test phases")
+            .push(("client", phase, started.elapsed()));
     };
     let scenario = async {
         let limits = CodecLimits::default();
@@ -1862,14 +1875,32 @@ async fn native_ip_packets_require_ready_and_preserve_fragmented_identity() {
         let expected_request = request_payload.clone();
         let expected_response = response_payload.clone();
         let server_phases = phases.clone();
+        let server_peers = peers.clone();
         let mut server_task = AbortOnDrop(tokio::spawn(async move {
             let server_phase = |phase: &'static str| {
-                server_phases.lock().expect("native IP test phases").1 = phase;
+                server_phases.lock().expect("native IP test phases").push((
+                    "server",
+                    phase,
+                    started.elapsed(),
+                ));
             };
             server_phase("accepting connection");
             let connection = server.accept().await.expect("accepted connection");
             server_phase("accepting request");
             let (mut send, mut recv) = connection.accept_bi().await.expect("accepted request");
+            let observation = NativeIpTestObservation::new(
+                started,
+                send.request_stream_id(),
+                tunnel_id,
+                response_id,
+                request_id,
+            );
+            connection.observe_native_ip_for_test(observation.clone());
+            server_peers.lock().expect("native IP test peers").push((
+                "server",
+                connection.clone(),
+                observation,
+            ));
             server_phase("reading reliable tunnel open");
             assert_eq!(
                 read_frame(&mut recv, limits)
@@ -1942,6 +1973,19 @@ async fn native_ip_packets_require_ready_and_preserve_fragmented_identity() {
         let connection = client.connect(server_addr).await.expect("client connect");
         client_phase("opening request");
         let (mut send, mut recv) = connection.open_bi().await.expect("client request");
+        let observation = NativeIpTestObservation::new(
+            started,
+            send.request_stream_id(),
+            tunnel_id,
+            request_id,
+            response_id,
+        );
+        connection.observe_native_ip_for_test(observation.clone());
+        peers.lock().expect("native IP test peers").push((
+            "client",
+            connection.clone(),
+            observation,
+        ));
         client_phase("writing reliable tunnel open");
         write_frame(&mut send, &Frame::OpenIpTunnel { tunnel_id }, limits)
             .await
@@ -2027,10 +2071,28 @@ async fn native_ip_packets_require_ready_and_preserve_fragmented_identity() {
         (&mut server_task.0).await.expect("server task");
         client_phase("complete");
     };
-    timeout(Duration::from_secs(5), scenario)
-        .await
-        .unwrap_or_else(|_| {
-            let (client, server) = *phases.lock().expect("native IP test phases");
-            panic!("native IP fixture timed out: client={client}; server={server}");
-        });
+    // Borrow the suspended scenario: its stream and route owners must still
+    // exist while the failure snapshot is taken. Unwinding then aborts the
+    // owned server task through AbortOnDrop, as before.
+    tokio::pin!(scenario);
+    let result = timeout(Duration::from_secs(5), &mut scenario).await;
+    if result.is_err() {
+        eprintln!(
+            "native IP fixture timed out at +{:?}; snapshot before cancellation",
+            started.elapsed()
+        );
+        for (role, phase, elapsed) in phases.lock().expect("native IP test phases").iter() {
+            eprintln!("  +{elapsed:?} {role}: {phase}");
+        }
+        for (role, connection, observation) in peers.lock().expect("native IP test peers").iter() {
+            eprintln!(
+                "native IP {role}: closed={} routing={:?} stats={:?}",
+                connection.is_closed(),
+                connection.native_datagram_routing_counts(),
+                connection.stats()
+            );
+            observation.report();
+        }
+    }
+    result.expect("native IP fixture deadline; see phase and packet observations");
 }

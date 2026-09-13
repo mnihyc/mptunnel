@@ -22,6 +22,12 @@ const NATIVE_IP_FRAGMENT_HEADER_BYTES: usize = 1 + 8 + 8 + 2 + 2 + 4;
 const MAX_NATIVE_FRAGMENTS: usize = 64;
 const MAX_QUARTER_STREAM_ID: u64 = (1_u64 << 60) - 1;
 
+#[cfg(test)]
+#[path = "tests_ip_observation.rs"]
+mod ip_observation;
+#[cfg(test)]
+pub(super) use ip_observation::{IpEventKind, IpRejectReason, NativeIpTestObservation};
+
 #[derive(Debug)]
 struct Route {
     generation: u64,
@@ -45,6 +51,8 @@ struct PendingPacket {
 
 #[derive(Debug)]
 struct HubState {
+    #[cfg(test)]
+    ip_observation: Arc<std::sync::OnceLock<NativeIpTestObservation>>,
     routing: Mutex<RoutingTable>,
     next_generation: AtomicU64,
     buffered_bytes: Arc<AtomicUsize>,
@@ -65,6 +73,8 @@ pub(super) struct NativeDatagramHub {
 
 #[derive(Debug, Clone)]
 pub(super) struct NativeDatagramSender {
+    #[cfg(test)]
+    ip_observation: Arc<std::sync::OnceLock<NativeIpTestObservation>>,
     connection: Connection,
     request_stream_id: u64,
 }
@@ -168,6 +178,8 @@ impl NativeDatagramHub {
         route_queue: usize,
     ) -> Self {
         let state = Arc::new(HubState {
+            #[cfg(test)]
+            ip_observation: Arc::new(std::sync::OnceLock::new()),
             routing: Mutex::new(RoutingTable::default()),
             next_generation: AtomicU64::new(1),
             buffered_bytes: Arc::new(AtomicUsize::new(0)),
@@ -189,9 +201,19 @@ impl NativeDatagramHub {
 
     pub(super) fn sender(&self, request_stream_id: u64) -> NativeDatagramSender {
         NativeDatagramSender {
+            #[cfg(test)]
+            ip_observation: self.state.ip_observation.clone(),
             connection: self.connection.clone(),
             request_stream_id,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_ip(&self, observation: NativeIpTestObservation) {
+        self.state
+            .ip_observation
+            .set(observation)
+            .expect("one native IP test observer");
     }
 
     pub(super) fn register(
@@ -412,6 +434,21 @@ impl NativeDatagramSender {
         let total_len =
             u32::try_from(payload.len()).map_err(|_| QuicCarrierError::NativeDatagramTooLarge)?;
 
+        #[cfg(test)]
+        if let Some(observation) = self.ip_observation.get() {
+            observation.record(
+                self.request_stream_id,
+                *tunnel_id,
+                *packet_id,
+                Instant::now(),
+                IpEventKind::Geometry {
+                    count: fragment_count,
+                    fragment_bytes: fragment_payload_bytes,
+                    total_bytes: payload.len(),
+                },
+            );
+        }
+
         for index in 0..fragment_count {
             let start = index.saturating_mul(fragment_payload_bytes);
             let end = start
@@ -431,6 +468,26 @@ impl NativeDatagramSender {
             self.connection
                 .send_datagram_wait(Bytes::from(packet))
                 .await?;
+            #[cfg(test)]
+            if let Some(observation) = self.ip_observation.get() {
+                observation.record(
+                    self.request_stream_id,
+                    *tunnel_id,
+                    *packet_id,
+                    Instant::now(),
+                    IpEventKind::Accepted { index },
+                );
+            }
+        }
+        #[cfg(test)]
+        if let Some(observation) = self.ip_observation.get() {
+            observation.record(
+                self.request_stream_id,
+                *tunnel_id,
+                *packet_id,
+                Instant::now(),
+                IpEventKind::SendComplete,
+            );
         }
         Ok(())
     }
@@ -629,13 +686,53 @@ impl NativeDatagramReceiver {
 
     fn insert_ip_fragment(&mut self, fragment: IpFragment) -> Option<(Frame, Instant)> {
         let now = Instant::now();
+        #[cfg(test)]
+        let observation = self.state.ip_observation.get().cloned();
+        #[cfg(test)]
+        let record = |at, kind| {
+            if let Some(observation) = observation.as_ref() {
+                observation.record(
+                    self.request_stream_id,
+                    fragment.tunnel_id,
+                    fragment.packet_id,
+                    at,
+                    kind,
+                );
+            }
+        };
+        #[cfg(test)]
+        if let Some(observation) = observation.as_ref() {
+            record(
+                now,
+                IpEventKind::InsertCheck {
+                    index: fragment.index,
+                    deadline: observation.elapsed(fragment.deadline),
+                },
+            );
+        }
         if fragment.deadline <= now {
+            #[cfg(test)]
+            record(
+                now,
+                IpEventKind::Rejected {
+                    index: fragment.index,
+                    reason: IpRejectReason::Expired,
+                },
+            );
             self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let key = (fragment.tunnel_id, fragment.packet_id);
         if !self.ip_reassemblies.contains_key(&key) {
             let Some(permit) = try_acquire_reassembly(self.state.clone()) else {
+                #[cfg(test)]
+                record(
+                    Instant::now(),
+                    IpEventKind::Rejected {
+                        index: fragment.index,
+                        reason: IpRejectReason::NoCapacity,
+                    },
+                );
                 self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 return None;
             };
@@ -655,12 +752,28 @@ impl NativeDatagramReceiver {
             .get_mut(&key)
             .expect("native IP reassembly inserted");
         if entry.total_len != fragment.total_len || entry.parts.len() != fragment.count {
+            #[cfg(test)]
+            record(
+                Instant::now(),
+                IpEventKind::Rejected {
+                    index: fragment.index,
+                    reason: IpRejectReason::ShapeMismatch,
+                },
+            );
             self.ip_reassemblies.remove(&key);
             self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         entry.deadline = entry.deadline.min(fragment.deadline);
         let Some(slot) = entry.parts.get_mut(fragment.index) else {
+            #[cfg(test)]
+            record(
+                Instant::now(),
+                IpEventKind::Rejected {
+                    index: fragment.index,
+                    reason: IpRejectReason::InvalidIndex,
+                },
+            );
             self.ip_reassemblies.remove(&key);
             self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -674,6 +787,15 @@ impl NativeDatagramReceiver {
             entry.received_len = entry.received_len.saturating_add(payload_len);
             *slot = Some(fragment.packet);
         }
+        #[cfg(test)]
+        record(
+            Instant::now(),
+            IpEventKind::Inserted {
+                index: fragment.index,
+                parts: ip_part_mask(&entry.parts),
+                bytes: entry.received_len,
+            },
+        );
         if entry.received_len != entry.total_len || entry.parts.iter().any(Option::is_none) {
             return None;
         }
@@ -682,6 +804,17 @@ impl NativeDatagramReceiver {
             .remove(&key)
             .expect("completed native IP reassembly exists");
         if complete.deadline <= Instant::now() {
+            #[cfg(test)]
+            if let Some(observation) = observation.as_ref() {
+                record(
+                    Instant::now(),
+                    IpEventKind::AssemblyExpired {
+                        parts: ip_part_mask(&complete.parts),
+                        bytes: complete.received_len,
+                        deadline: observation.elapsed(complete.deadline),
+                    },
+                );
+            }
             return None;
         }
         let mut payload = Vec::with_capacity(complete.total_len);
@@ -690,9 +823,24 @@ impl NativeDatagramReceiver {
             payload.extend_from_slice(&part.bytes[NATIVE_IP_FRAGMENT_HEADER_BYTES..]);
         }
         if payload.len() != complete.total_len {
+            #[cfg(test)]
+            record(
+                Instant::now(),
+                IpEventKind::Rejected {
+                    index: fragment.index,
+                    reason: IpRejectReason::BadLength,
+                },
+            );
             self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        #[cfg(test)]
+        record(
+            Instant::now(),
+            IpEventKind::Complete {
+                bytes: payload.len(),
+            },
+        );
         Some((
             Frame::IpPacket {
                 tunnel_id: key.0,
@@ -707,8 +855,26 @@ impl NativeDatagramReceiver {
         let now = Instant::now();
         self.reassemblies
             .retain(|_, reassembly| reassembly.deadline > now);
-        self.ip_reassemblies
-            .retain(|_, reassembly| reassembly.deadline > now);
+        self.ip_reassemblies.retain(|key, reassembly| {
+            #[cfg(test)]
+            if reassembly.deadline <= now
+                && let Some(observation) = self.state.ip_observation.get()
+            {
+                observation.record(
+                    self.request_stream_id,
+                    key.0,
+                    key.1,
+                    now,
+                    IpEventKind::AssemblyExpired {
+                        parts: ip_part_mask(&reassembly.parts),
+                        bytes: reassembly.received_len,
+                        deadline: observation.elapsed(reassembly.deadline),
+                    },
+                );
+            }
+            let _ = key;
+            reassembly.deadline > now
+        });
     }
 
     fn next_reassembly_expiry(&self) -> Option<Instant> {
@@ -773,6 +939,8 @@ fn route_datagram(
     let now = Instant::now();
     let ip_deadline = (payload.first().copied() == Some(NATIVE_IP_PACKET_VERSION))
         .then(|| now + pending_route_wait(connection));
+    #[cfg(test)]
+    observe_native_ip_ingress(state, request_stream_id, &payload, now, ip_deadline);
     let budgeted = BudgetedPacket {
         bytes: payload,
         buffered_bytes: state.buffered_bytes.clone(),
@@ -816,6 +984,57 @@ fn route_datagram(
         packet: budgeted,
     });
     Ok(())
+}
+
+#[cfg(test)]
+fn observe_native_ip_ingress(
+    state: &HubState,
+    request_stream_id: u64,
+    payload: &Bytes,
+    received_at: Instant,
+    deadline: Option<Instant>,
+) {
+    let Some(observation) = state.ip_observation.get() else {
+        return;
+    };
+    let Some(deadline) = deadline else {
+        return;
+    };
+    if payload.len() < NATIVE_IP_FRAGMENT_HEADER_BYTES || payload[0] != NATIVE_IP_PACKET_VERSION {
+        return;
+    }
+    let mut cursor = payload.slice(1..);
+    let tunnel_id = IpTunnelId(cursor.get_u64());
+    let packet_id = IpPacketId(cursor.get_u64());
+    let index = usize::from(cursor.get_u16());
+    let count = usize::from(cursor.get_u16());
+    let total_bytes = cursor.get_u32() as usize;
+    // This is admission into the adapter's shared byte budget, before route
+    // delivery. Native frame parsing and prior budget drops remain separately
+    // visible in the connection/routing counters; this is not wire receipt.
+    observation.record(
+        request_stream_id,
+        tunnel_id,
+        packet_id,
+        received_at,
+        IpEventKind::Ingress {
+            index,
+            count,
+            total_bytes,
+            deadline: observation.elapsed(deadline),
+        },
+    );
+}
+
+#[cfg(test)]
+fn ip_part_mask(parts: &[Option<BudgetedPacket>]) -> u64 {
+    parts.iter().enumerate().fold(0, |mask, (index, part)| {
+        if part.is_some() {
+            mask | (1_u64 << index)
+        } else {
+            mask
+        }
+    })
 }
 
 fn route_active_packet(
@@ -1030,3 +1249,7 @@ fn encode_varint(value: u64, output: &mut Vec<u8>) -> Result<(), QuicCarrierErro
 #[cfg(test)]
 #[path = "tests_native_datagram.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_ip_observation_calibration.rs"]
+mod ip_observation_calibration;

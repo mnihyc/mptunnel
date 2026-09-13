@@ -3071,17 +3071,6 @@ async fn server_quic_datagram_tombstones_ignore_in_flight_frames_and_preserve_ca
             .await
             .expect("queue silently dropped flow traffic");
     }
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            udp_path_read_frame(&mut client_recv, fixture.context.codec_limits),
-        )
-        .await
-        .is_err(),
-        "initial and repeated drop must not emit a response",
-    );
-    assert_eq!(backend.opens_for(82), 1);
-
     for (flow, port) in [(1_u64, 90_u16), (2, 91)] {
         udp_path_write_frame(
             &mut client_send,
@@ -3118,6 +3107,8 @@ async fn server_quic_datagram_tombstones_ignore_in_flight_frames_and_preserve_ca
             .await
             .expect("queue capacity-rejected flow traffic");
     }
+    // These same-stream responses follow the DROP controls. Reading them next
+    // proves those controls were processed without emitting a DROP response.
     for _ in 0..2 {
         assert_eq!(
             udp_path_read_frame(&mut client_recv, fixture.context.codec_limits)
@@ -3128,6 +3119,11 @@ async fn server_quic_datagram_tombstones_ignore_in_flight_frames_and_preserve_ca
             },
         );
     }
+    assert_eq!(
+        backend.opens_for(82),
+        1,
+        "initial and repeated DROP controls must call the backend only once",
+    );
     assert_eq!(
         backend.opens_for(92),
         0,
@@ -3178,13 +3174,20 @@ async fn server_quic_datagram_tombstones_ignore_in_flight_frames_and_preserve_ca
             .await
             .expect("send traffic for an evicted denial");
     }
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            udp_path_read_frame(&mut client_recv, fixture.context.codec_limits),
-        )
-        .await
-        .is_err(),
+    // Native sibling data can overtake reliable controls, so use a reliable
+    // same-stream barrier before checking the evicted denial's silence.
+    udp_path_write_frame(
+        &mut client_send,
+        &Frame::Ping { nonce: drop_id.0 },
+        fixture.context.codec_limits,
+    )
+    .await
+    .expect("publish evicted denial barrier");
+    assert_eq!(
+        udp_path_read_frame(&mut client_recv, fixture.context.codec_limits)
+            .await
+            .expect("read evicted denial barrier"),
+        Frame::Pong { nonce: drop_id.0 },
         "an evicted denial must stay terminal and silent",
     );
     assert_eq!(

@@ -389,39 +389,36 @@ async fn spawn_udp_echo_target_count(count: usize) -> (SocketAddr, tokio::task::
     (addr, handle)
 }
 
-async fn spawn_udp_reordered_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("target bind"));
+async fn spawn_udp_reordered_echo_target() -> (
+    SocketAddr,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
     let addr = socket.local_addr().expect("target addr");
+    let (slow_received_tx, slow_received) = tokio::sync::oneshot::channel();
+    let (release_slow, release_slow_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        let mut delayed = tokio::task::JoinSet::new();
         let mut buf = [0u8; 16];
-        for _ in 0..2 {
-            let (len, peer) = socket.recv_from(&mut buf).await.expect("target recv");
-            match &buf[..len] {
-                b"slow" => {
-                    let socket = socket.clone();
-                    delayed.spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        socket
-                            .send_to(b"slow-pong", peer)
-                            .await
-                            .expect("target delayed send");
-                    });
-                }
-                b"fast" => {
-                    socket
-                        .send_to(b"fast-pong", peer)
-                        .await
-                        .expect("target fast send");
-                }
-                payload => panic!("unexpected UDP payload: {payload:?}"),
-            }
-        }
-        while let Some(result) = delayed.join_next().await {
-            result.expect("delayed target response");
-        }
+        let (len, slow_peer) = socket.recv_from(&mut buf).await.expect("target slow recv");
+        assert_eq!(&buf[..len], b"slow");
+        slow_received_tx
+            .send(())
+            .expect("report slow target arrival");
+        let (len, fast_peer) = socket.recv_from(&mut buf).await.expect("target fast recv");
+        assert_eq!(&buf[..len], b"fast");
+        socket
+            .send_to(b"fast-pong", fast_peer)
+            .await
+            .expect("target fast send");
+        release_slow_rx.await.expect("release slow target response");
+        socket
+            .send_to(b"slow-pong", slow_peer)
+            .await
+            .expect("target slow send");
     });
-    (addr, handle)
+    (addr, slow_received, release_slow, handle)
 }
 
 async fn spawn_socks5_udp_proxy_once() -> (Endpoint, tokio::task::JoinHandle<()>) {

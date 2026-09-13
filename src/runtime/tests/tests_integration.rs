@@ -4607,88 +4607,59 @@ async fn tcp_datagram_carrier_setup_uses_remaining_ttl_for_same_family_fallback(
 
 #[tokio::test]
 async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response() {
-    let (target_addr, target) = spawn_udp_reordered_echo_target().await;
-    let path = reserve_udp_path().await;
-    let server = tokio::spawn(run_server(
-        vec![path.clone()],
-        OutboundConfig::Direct,
-        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        server_security(),
-        crate::transport::encrypted::test_server_tls_config(),
-        MppPerformanceConfig::default(),
-        ResourceLimits::default(),
-        SessionConfig::default(),
-        ManagementConfig::default(),
-        None,
-    ));
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let context =
-        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    let (mut control_client, control_server) = duplex(4096);
-    let handler = tokio::spawn(handle_socks5_client_stream(control_server, context));
+    tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, async {
+        let (target_addr, slow_received, release_slow, target) =
+            spawn_udp_reordered_echo_target().await;
+        let (path, server) = spawn_udp_server_path(OutboundConfig::Direct).await;
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+        let (mut control_client, control_server) = duplex(4096);
+        let handler = tokio::spawn(handle_socks5_client_stream(control_server, context));
+        let relay_addr = open_socks5_udp_associate(&mut control_client).await;
+        let udp_client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp client bind");
+        let slow =
+            socks5::udp_datagram(&TargetAddr::Ip(target_addr), b"slow").expect("slow request");
+        let fast =
+            socks5::udp_datagram(&TargetAddr::Ip(target_addr), b"fast").expect("fast request");
+        udp_client
+            .send_to(&slow, relay_addr)
+            .await
+            .expect("send slow request");
+        // SOCKS association and local UDP acceptance do not establish the
+        // carrier or target flow. Date the response-order check after the
+        // first request actually reaches the target, with its reply held.
+        slow_received.await.expect("slow request reached target");
+        udp_client
+            .send_to(&fast, relay_addr)
+            .await
+            .expect("send fast request");
 
-    control_client
-        .write_all(&[0x05, 0x01, 0x00])
+        let mut response = [0u8; 128];
+        let (len, _) = tokio::time::timeout(
+            Duration::from_millis(400),
+            udp_client.recv_from(&mut response),
+        )
         .await
-        .expect("auth request");
-    let mut auth_response = [0u8; 2];
-    control_client
-        .read_exact(&mut auth_response)
-        .await
-        .expect("auth response");
-    assert_eq!(auth_response, [0x05, 0x00]);
-    control_client
-        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await
-        .expect("udp associate");
-    let mut associate_response = [0u8; 10];
-    control_client
-        .read_exact(&mut associate_response)
-        .await
-        .expect("associate response");
-    let relay_addr = SocketAddr::from((
-        [
-            associate_response[4],
-            associate_response[5],
-            associate_response[6],
-            associate_response[7],
-        ],
-        u16::from_be_bytes([associate_response[8], associate_response[9]]),
-    ));
+        .expect("fast response should not wait for slow response")
+        .expect("fast recv");
+        let (datagram, consumed) = socks5::parse_udp_datagram(&response[..len]).expect("datagram");
+        assert_eq!(consumed, len);
+        assert_eq!(datagram.target, TargetAddr::Ip(target_addr));
+        assert_eq!(datagram.payload, Bytes::from_static(b"fast-pong"));
 
-    let udp_client = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("udp client bind");
-    let slow = socks5::udp_datagram(&TargetAddr::Ip(target_addr), b"slow").expect("slow request");
-    let fast = socks5::udp_datagram(&TargetAddr::Ip(target_addr), b"fast").expect("fast request");
-    udp_client
-        .send_to(&slow, relay_addr)
-        .await
-        .expect("send slow request");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    udp_client
-        .send_to(&fast, relay_addr)
-        .await
-        .expect("send fast request");
-
-    let mut response = [0u8; 128];
-    let (len, _) = tokio::time::timeout(
-        Duration::from_millis(400),
-        udp_client.recv_from(&mut response),
-    )
+        release_slow
+            .send(())
+            .expect("release slow response after fast");
+        target.await.expect("target join");
+        control_client.shutdown().await.expect("control shutdown");
+        handler.await.expect("handler join").expect("handler");
+        server.abort();
+        let _ = server.await;
+    })
     .await
-    .expect("fast response should not wait for slow response")
-    .expect("fast recv");
-    let (datagram, consumed) = socks5::parse_udp_datagram(&response[..len]).expect("datagram");
-    assert_eq!(consumed, len);
-    assert_eq!(datagram.target, TargetAddr::Ip(target_addr));
-    assert_eq!(datagram.payload, Bytes::from_static(b"fast-pong"));
-
-    control_client.shutdown().await.expect("control shutdown");
-    handler.await.expect("handler join").expect("handler");
-    server.abort();
-    let _ = server.await;
-    target.await.expect("target join");
+    .expect("SOCKS UDP response-order integration deadline");
 }
 
 async fn assert_tcp_server_rejects_wrong_mpp_credential(transport_secret: Option<[u8; 32]>) {

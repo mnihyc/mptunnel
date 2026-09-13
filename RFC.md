@@ -3217,6 +3217,11 @@ Readiness is separate from membership, qualification and native capacity. Keep
 the full attachment set when deriving first/frontier/additional authority, and
 try the existing eligible preference tiers using current Ready opportunities.
 An occupied preferred writer must not mask the sole eligible Ready survivor.
+Temporary writer occupancy or exhausted queue, flight, credit or pacing capacity
+MUST NOT remove a non-stale structural alternative under Section 15.2. A stale
+writer therefore cannot claim fresh OriginalData merely because it is the only
+Ready writer. Its existing fallback applies when no non-stale active,
+policy-eligible attachment remains schedulable.
 Only the selected exact Ready epoch is consumed; an unselected writer's
 withdrawal does not invalidate unchanged chosen authority. Busy claimants arm
 their owner/change wake before a nonblocking attempt; they do not wait while

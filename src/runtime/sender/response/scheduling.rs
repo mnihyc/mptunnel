@@ -397,15 +397,18 @@ fn select_response_data_path_with_service(
         })
     };
 
+    // Ready is a writer opportunity, not a change in structural placement
+    // eligibility. Temporary pressure on a non-stale output cannot reactivate
+    // a stale owner; retain fallback only when no non-stale output is live.
     select(false, false)
         .or_else(|| select(true, false))
         .or_else(|| {
-            (!has_nonstale_live_path || matches!(service, ResponseOriginalService::Prepared(_)))
+            (!has_nonstale_live_path)
                 .then(|| select(false, true))
                 .flatten()
         })
         .or_else(|| {
-            (!has_nonstale_live_path || matches!(service, ResponseOriginalService::Prepared(_)))
+            (!has_nonstale_live_path)
                 .then(|| select(true, true))
                 .flatten()
         })

@@ -1265,12 +1265,29 @@ impl RequestMultipathController {
         ready: &[RelayPathInstance],
     ) -> Result<RequestMultipathPlan, RequestMultipathPlanError> {
         let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
+        // Preserve placement withdrawal across temporary writer occupancy.
+        // Structural alternatives come from the full observation, before
+        // Ready, whole-frame headroom or queue capacity narrows this turn.
+        let has_nonstale_live_path = observation.paths.iter().any(|path| {
+            !self
+                .request
+                .requalification
+                .stale_for_original_data(path.instance)
+                && request_path_eligibility(path.shared_snapshot, lane)
+                    != RequestPathEligibility::Unavailable
+                && remotes.paths.iter().any(|remote| {
+                    remote.instance() == path.instance && remote.stream.product_admission_active()
+                })
+        });
         for (eligibility, stale) in [
             (RequestPathEligibility::Regular, false),
             (RequestPathEligibility::Backup, false),
             (RequestPathEligibility::Regular, true),
             (RequestPathEligibility::Backup, true),
         ] {
+            if stale && has_nonstale_live_path {
+                continue;
+            }
             let mut tier = observation.clone();
             for path in &mut tier.paths {
                 let eligible = ready.contains(&path.instance)

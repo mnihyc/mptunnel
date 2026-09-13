@@ -26,6 +26,193 @@ async fn receive_one(carrier: &mut ProtectedCarrier) -> Frame {
 }
 
 #[tokio::test]
+async fn prepared_tcp_stale_original_waits_for_occupied_nonstale_writer() {
+    let mut fixture = PreparedResponseFixture::new().await;
+    fixture.attach_b();
+    let stream_id = fixture.path_stream.stream_id;
+    let bytes = 4096.min(fixture.quantum);
+    let first_payload = Bytes::from(vec![0x61; bytes]);
+    let second_payload = Bytes::from(vec![0x62; bytes]);
+    let first = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: first_payload.clone(),
+    };
+    let second = Frame::StreamData {
+        stream_id,
+        offset: bytes as u64,
+        payload: second_payload.clone(),
+    };
+
+    // B owns a real claimed Original and its protected writer transaction.
+    // Its missing Ready receipt is occupancy, not an injected capacity sample.
+    fixture.publish(first_payload);
+    let ReliablePathCommand::PreparedOriginal(b_work) =
+        try_recv_reliable_path_command(&mut fixture.b.0.commands_rx).unwrap()
+    else {
+        panic!("actual B source notice")
+    };
+    let b_instance = fixture.b.0.path_registration.path_instance_id();
+    let b_ready = fixture
+        .b
+        .0
+        .commands_rx
+        .writer_ready_boundary(b_instance)
+        .unwrap();
+    let b_receipt = b_ready.receipt();
+    let PreparedOriginalClaim::Claimed(owned) = b_work.try_claim(b_ready) else {
+        panic!("current Regular B must acquire the first Original")
+    };
+    assert_eq!(owned, first);
+    assert!(!b_receipt.is_current());
+    let mut owned_charge = fixture
+        .b
+        .0
+        .commands_rx
+        .register_claimed_writer_frame(&owned);
+    fixture.b.0.writer.begin_transaction().unwrap();
+    fixture.b.0.writer.stage_transaction_frame(owned).unwrap();
+    b_work.requeue();
+    assert!(owned_charge > 0);
+    assert_eq!(fixture.b.2.writer_pending_bytes(), owned_charge as u64);
+
+    let a_identity = fixture
+        .owner
+        .binding()
+        .sender_path_targets(fixture.lane, bytes)
+        .into_iter()
+        .find(|target| target.observation.key.path_id == PathId(0))
+        .map(|target| ServerReinjectionOutputIdentity {
+            key: target.observation.key,
+            incarnation: target.observation.incarnation,
+        })
+        .unwrap();
+    // Exercise the existing stale consumer state. The separate persistence
+    // clock is not under test, and no assignment timestamp is aged here.
+    assert!(
+        fixture
+            .owner
+            .binding()
+            .mark_output_stale(a_identity, fixture.lane)
+    );
+    assert!(fixture.owner.binding().output_is_stale(a_identity));
+    assert!(
+        fixture
+            .path_stream
+            .has_nonstale_reinjection_alternative(a_identity, fixture.lane),
+        "B remains a structural alternative while its writer is occupied"
+    );
+    fixture.publish(second_payload);
+    fixture.assert_source(2 * bytes, bytes, 0);
+
+    let ReliablePathCommand::PreparedOriginal(a_work) =
+        try_recv_reliable_path_command(&mut fixture.a.0.commands_rx).unwrap()
+    else {
+        panic!("actual A source notice")
+    };
+    let a_instance = fixture.a.0.path_registration.path_instance_id();
+    let a_ready = fixture
+        .a
+        .0
+        .commands_rx
+        .writer_ready_boundary(a_instance)
+        .unwrap();
+    let a_receipt = a_ready.receipt();
+    match a_work.try_claim(a_ready) {
+        PreparedOriginalClaim::Blocked(_) => {}
+        PreparedOriginalClaim::Claimed(frame) => panic!(
+            "stale A acquired a fresh Original while non-stale B was occupied: {:?}",
+            reliable_stream_frame_extent(&frame)
+        ),
+        _ => panic!("stale A must refuse this current source opportunity"),
+    }
+    assert!(
+        a_receipt.is_current(),
+        "stale placement refusal does not consume physical Ready"
+    );
+    assert!(!b_receipt.is_current());
+    assert_eq!(fixture.a.2.pending_bytes(), 0);
+    assert_eq!(fixture.a.2.writer_pending_bytes(), 0);
+    assert_eq!(fixture.b.2.writer_pending_bytes(), owned_charge as u64);
+    fixture.assert_source(2 * bytes, bytes, 0);
+    assert_eq!(fixture.original_bytes(PathId(0)), 0);
+    a_work.requeue();
+
+    // Complete only B's already-owned transaction, then let the same real
+    // writer acquire the still-shared second prefix through normal arbitration.
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture
+                .b
+                .0
+                .commit_transaction_respecting_deferred_input(&mut owned_charge)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        ServerTcpSessionDisposition::Continue
+    ));
+    assert_eq!(owned_charge, 0);
+    assert_eq!(receive_one(&mut fixture.b).await, first);
+    assert_eq!(write_prepared_response(&mut fixture.b).await, second);
+    fixture.assert_source(2 * bytes, 2 * bytes, 0);
+    assert_eq!(fixture.original_bytes(PathId(0)), 0);
+    fixture.acknowledge((2 * bytes) as u64).await;
+    fixture.assert_source(2 * bytes, 2 * bytes, 2 * bytes);
+
+    // A genuine sole-stale survivor retains liveness. Retire the exact B
+    // membership only after both of its Originals have received Product ACKs.
+    let b_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let b_incarnation = fixture
+        .owner
+        .binding()
+        .sender_path_targets(fixture.lane, bytes)
+        .into_iter()
+        .find(|target| target.observation.key == b_key)
+        .unwrap()
+        .observation
+        .incarnation;
+    assert!(
+        fixture
+            .owner
+            .binding()
+            .begin_path_detach(b_key, b_instance)
+            .is_some()
+    );
+    fixture
+        .owner
+        .binding()
+        .complete_path_detach(b_key, b_instance, b_incarnation);
+    assert!(fixture.owner.binding().output_is_stale(a_identity));
+    assert!(
+        !fixture
+            .path_stream
+            .has_nonstale_reinjection_alternative(a_identity, fixture.lane)
+    );
+    let fallback_payload = Bytes::from(vec![0x63; bytes]);
+    fixture.publish(fallback_payload.clone());
+    assert_eq!(
+        write_prepared_response(&mut fixture.a).await,
+        Frame::StreamData {
+            stream_id,
+            offset: (2 * bytes) as u64,
+            payload: fallback_payload,
+        }
+    );
+    fixture.assert_source(3 * bytes, 3 * bytes, 2 * bytes);
+    assert!(
+        fixture.owner.binding().output_is_stale(a_identity),
+        "fallback use does not reactivate Product qualification"
+    );
+    fixture.acknowledge((3 * bytes) as u64).await;
+    fixture.assert_source(3 * bytes, 3 * bytes, 3 * bytes);
+}
+
+#[tokio::test]
 async fn prepared_tcp_recovery_serves_two_due_ranges_before_fresh_original_without_ack() {
     let mut fixture = PreparedResponseFixture::new().await;
     let stream_id = fixture.path_stream.stream_id;

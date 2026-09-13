@@ -233,6 +233,15 @@ async fn prepared_request_data_keeps_wire_horizon_unclaimed_until_writer_start()
 
 #[tokio::test]
 async fn prepared_request_ready_alternate_claims_one_shared_prefix_without_queue_binding() {
+    prepared_request_ready_alternate_claims_shared_prefix(false).await;
+}
+
+#[tokio::test]
+async fn prepared_request_stale_writer_waits_for_occupied_nonstale_alternate() {
+    prepared_request_ready_alternate_claims_shared_prefix(true).await;
+}
+
+async fn prepared_request_ready_alternate_claims_shared_prefix(stale_a: bool) {
     let stream_id = StreamId(718);
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10718", "tcp://127.0.0.1:10719"]);
@@ -413,6 +422,118 @@ async fn prepared_request_ready_alternate_claims_one_shared_prefix_without_queue
                 end: quantum as u64
             }]
         );
+    }
+    if stale_a {
+        // Exercise the validated stale consumer, not the persistence timer.
+        // B is structurally admitted and non-stale while its real claimed
+        // writer frame remains owned; temporary Ready absence must not undo A's
+        // placement withdrawal.
+        assert!(b_commands.writer_boundary().snapshot().is_none());
+        assert_eq!(b_commands.writer_pending_bytes(), charged as u64);
+        {
+            let mut state = shared.lock();
+            let RequestProductState {
+                sender, remotes, ..
+            } = &mut *state;
+            assert!(
+                sender.mark_request_path_stale(&context, remotes, a, TrafficClass::Throughput,)
+            );
+            assert!(sender.request_path_is_stale(a));
+            assert!(!sender.request_path_is_stale(b));
+            assert!(
+                remotes
+                    .paths
+                    .iter()
+                    .find(|path| path.instance() == b)
+                    .unwrap()
+                    .stream
+                    .product_admission_active()
+            );
+        }
+        let a_work = take_notice(&mut a_receivers);
+        let a_ready = a_receivers
+            .writer_ready_boundary(a.path_instance_id)
+            .expect("stale A really reaches an idle writer boundary");
+        let a_receipt = a_ready.receipt();
+        match a_work.try_claim(a_ready) {
+            PreparedOriginalClaim::Blocked(wait) => drop(wait),
+            PreparedOriginalClaim::Claimed(frame) => panic!(
+                "stale A positively claimed forbidden fresh Original {:?} while non-stale B owned its writer transaction",
+                reliable_stream_frame_extent(&frame),
+            ),
+            _ => panic!("demanded source must remain blocked for the non-stale writer"),
+        }
+        assert_eq!(a_commands.writer_boundary().snapshot(), Some(a_receipt));
+        assert!(b_commands.writer_boundary().snapshot().is_none());
+        assert_eq!(a_commands.pending_bytes(), 0);
+        assert_eq!(b_commands.writer_pending_bytes(), charged as u64);
+        {
+            let state = shared.lock();
+            assert_eq!(state.send_stream.next_offset(), quantum as u64);
+            assert_eq!(state.sender_queue.data_bytes(), 2 * quantum);
+            assert_eq!(state.send_stream.reinjection_bytes(), quantum);
+            assert_eq!(state.sender_queue.reinjection_bytes(), 0);
+            assert_eq!(state.prepared.last_claimed_at, Some(first_claimed_at));
+            assert!(
+                state
+                    .sender
+                    .multipath
+                    .latest_unacked_ranges_for_path_instance(a)
+                    .is_empty()
+            );
+            assert_eq!(
+                state
+                    .sender
+                    .multipath
+                    .latest_unacked_ranges_for_path_instance(b),
+                vec![OffsetRange {
+                    start: 0,
+                    end: quantum as u64
+                }]
+            );
+        }
+        // Finish B's actual writer ownership, then invoke its existing weak
+        // callback at a new real Ready epoch. No deadline or retry loop is used.
+        b_receivers.release_pending_command_bytes(charged);
+        assert_eq!(b_commands.writer_pending_bytes(), 0);
+        let b_ready = b_receivers
+            .writer_ready_boundary(b.path_instance_id)
+            .expect("released B can offer the next native writer boundary");
+        let PreparedOriginalClaim::Claimed(second) = b_work.try_claim(b_ready) else {
+            panic!("the released non-stale writer must claim the retained next prefix");
+        };
+        assert_eq!(
+            reliable_stream_frame_extent(&second),
+            Some((quantum as u64, (2 * quantum) as u64, quantum)),
+        );
+        let Frame::StreamData { payload, .. } = &second else {
+            panic!("the callback must return the actual Original payload");
+        };
+        assert_eq!(payload.as_ref(), vec![0x78; quantum].as_slice());
+        let second_charge = b_receivers.register_claimed_writer_frame(&second);
+        assert_eq!(b_commands.writer_pending_bytes(), second_charge as u64);
+        {
+            let state = shared.lock();
+            assert_eq!(state.send_stream.next_offset(), (2 * quantum) as u64);
+            assert_eq!(state.sender_queue.data_bytes(), quantum);
+            assert_eq!(state.send_stream.reinjection_bytes(), 2 * quantum);
+            assert_eq!(state.sender_queue.reinjection_bytes(), 0);
+            assert!(state.sender.request_path_is_stale(a));
+            assert!(!state.sender.request_path_is_stale(b));
+            assert!(
+                state
+                    .sender
+                    .multipath
+                    .latest_unacked_ranges_for_path_instance(a)
+                    .is_empty()
+            );
+            assert!(state.prepared.last_claimed_at.unwrap() >= first_claimed_at);
+        }
+        b_receivers.release_pending_command_bytes(second_charge);
+        assert_eq!(a_commands.pending_bytes(), 0);
+        assert_eq!(b_commands.pending_bytes(), 0);
+        drop(actor_lifetime);
+        return;
     }
     // B's protected frame remains charged. It is not ready again; A claims
     // the next distinct prefix, never a copy or a transfer of B's wire owner.

@@ -5014,17 +5014,6 @@ pacing/window gain, configured probe timer, or congestion threshold; by
 preventing a false full-bandwidth plateau, it can change the loss-informed
 timing of the current ProbeUP-to-ProbeDOWN transition.
 
-The full-bandwidth estimator requires a current, usable delivery-rate sample
-at the packet-timed round boundary. An absent sample, a rejected sampling
-interval, a non-finite or nonpositive rate, or an application-limited sample
-leaves both its growth baseline and plateau count unchanged. This qualification
-applies with either zero or nonzero loss allowance: unavailable rate evidence
-does not demonstrate bandwidth saturation. It does not suppress ACK accounting,
-RTT learning, or independent loss/ECN/congestion exit authority. Both Startup
-acquisition and plateau-driven ProbeBW_UP exit can therefore wait longer while
-rate evidence is unavailable; this rule grants no additional flow-control,
-pacing, or congestion-window exemption.
-
 This allowance is local traffic policy, not a measured path fact and not an
 MPP protocol field. Each endpoint applies its own value only to its sending
 direction; peers do not negotiate it and asymmetric values are valid.

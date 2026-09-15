@@ -28,8 +28,8 @@ use super::lifecycle::{
     reliable_relay_stall_progress_anchor, reliable_relay_stall_watch_active,
     settle_client_return_plan_open_result, spawn_reliable_relay_additional_path_opens,
     spawn_reliable_relay_disconnected_path_open, spawn_reliable_relay_recovery_path_open,
-    spawn_reliable_relay_response_startup_path_opens, try_drain_completed_additional_path_opens,
-    try_handle_additional_path_open_result,
+    try_drain_completed_additional_path_opens, try_handle_additional_path_open_result,
+    withdraw_pending_startup_path_opens,
 };
 use super::open::ReliableRelayOpenSpec;
 use super::remote::{
@@ -646,34 +646,25 @@ enum PendingLocalWritePathOpen {
     Deferred(RelayAdditionalPathOpenResult),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn drive_client_response_startup_control(
-    context: &ClientPathContext,
-    spec: &ReliableRelayOpenSpec,
     return_plan: &mut ClientReliableReturnPlan,
-    output_lane: TrafficClass,
     stream_id: crate::protocol::StreamId,
     response_frontier: u64,
     remotes: &mut ReliableRelayRemoteSet,
     state: &mut ClientRelayState,
-    additional_path_open_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
 ) -> Result<(), RuntimeError> {
-    let response_startup_triggered = return_plan.observe_response_frontier(response_frontier);
-    if return_plan.is_done() {
-        remotes.clear_return_plan_final();
-    }
-    if response_startup_triggered
-        && spawn_reliable_relay_response_startup_path_opens(
-            context,
-            spec,
-            return_plan,
-            output_lane,
+    if return_plan.observe_response_frontier(response_frontier) {
+        // h is the end of provisional startup ownership, not a requirement to
+        // acquire every optional carrier before confirmed service can continue.
+        return_plan.omit_unfinished_candidates_at_response_trigger();
+        withdraw_pending_startup_path_opens(
             stream_id,
             &mut state.recovery.pending_additional_path_opens,
-            additional_path_open_tx,
-        )?
-    {
-        state.progress.last_stream_at = Instant::now();
+            &mut state.recovery.withdrawn_startup_path_opens,
+        );
+    }
+    if return_plan.is_done() {
+        remotes.clear_return_plan_final();
     }
     if let Some(retained_ordinals) = return_plan.prepare_final(remotes).map(ToOwned::to_owned) {
         remotes.publish_return_plan_final(&retained_ordinals)?;
@@ -916,6 +907,7 @@ where
     #[cfg(test)]
     if let Some(ingress) = test_open_ingress {
         ingress.install(
+            &mut return_plan,
             &mut state.recovery.pending_additional_path_opens,
             additional_path_open_tx.clone(),
         );
@@ -1026,17 +1018,10 @@ where
             source_complete,
         )) = disconnected_wait
         {
-            if no_pending_opens {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(retry_at) => continue,
-                    _ = wait_for_optional_deadline(retention_deadline) => {
-                        break Err(RuntimeError::SessionRetentionTimeout);
-                    }
-                    () = &mut idle => break Err(RuntimeError::ProductIdleTimeout),
-                }
-            }
-
+            // A withdrawn generation may still publish a terminal result.
+            // Empty membership cannot disable the result channel while resting.
             tokio::select! {
+                _ = tokio::time::sleep_until(retry_at), if no_pending_opens => continue,
                 additional_path_open = additional_path_open_rx.recv() => {
                     let local_shutdown = {
                     let mut local_shutdown = None;
@@ -1055,33 +1040,30 @@ where
                         }
                         continue;
                     };
-                    state
-                        .recovery
-                        .pending_additional_path_opens
-                        .remove(&additional_path_open.key);
-                    let additional_path_key = additional_path_open.key;
-                    let startup_ordinal = additional_path_open.startup_ordinal;
-                    let attached = match try_handle_additional_path_open_result(
+                    let matched_pending = matching_additional_path_open_pending(
+                        &state.recovery.pending_additional_path_opens,
+                        additional_path_open.key,
+                        additional_path_open.generation,
+                    );
+                    let attached = match settle_matching_client_additional_path_open(
                         stream_id,
+                        &mut state,
+                        &mut return_plan,
                         remotes,
                         send_stream,
-                        source_complete,
                         request_lane,
                         additional_path_open,
-                        state.recovery.pending_additional_path_opens.len(),
-                        &mut state.progress.last_stream_at,
+                        // source_complete already implies local EOF; the
+                        // helper's EOF recheck preserves the existing FIN rule.
+                        source_complete,
                     ) {
                         Ok(mode) => mode.is_some(),
                         Err(err) => break Err(err),
                     };
-                    if let Err(err) = settle_client_return_plan_open_result(
-                        &mut return_plan,
-                        remotes,
-                        additional_path_key,
-                        startup_ordinal,
-                        attached,
-                    ) {
-                        break Err(err);
+                    if !matched_pending {
+                        // An obsolete result cannot postpone the existing
+                        // disconnected retry or consume its current attempt.
+                        continue;
                     }
                     if attached {
                         state.progress.sender_retry_at = None;
@@ -1179,9 +1161,7 @@ where
             let mut pending_rebalance_attach = None;
             let accepted_copy_due_before_topology =
                 accepted_copy_wake_is_due(accepted_copy_wake_at, Instant::now());
-            let completed_additional_path_attached = if !accepted_copy_due_before_topology
-                && !state.recovery.pending_additional_path_opens.is_empty()
-            {
+            let completed_additional_path_attached = if !accepted_copy_due_before_topology {
                 match try_drain_completed_additional_path_opens(
                     stream_id,
                     &mut return_plan,
@@ -1398,15 +1378,11 @@ where
                 );
             }
             if let Err(err) = drive_client_response_startup_control(
-                context,
-                &spec,
                 &mut return_plan,
-                request_lane,
                 stream_id,
                 recv_stream.next_offset(),
                 remotes,
                 &mut state,
-                &additional_path_open_tx,
             ) {
                 break Err(err);
             }
@@ -2999,7 +2975,7 @@ where
             }, if return_plan_final_blocked && has_return_plan_final_capacity_wait => {
                 continue;
             }
-            additional_path_open = additional_path_open_rx.recv(), if !state.recovery.pending_additional_path_opens.is_empty() => {
+            additional_path_open = additional_path_open_rx.recv() => {
                 let mut product_guard = request_product.lock();
                 let (sender_queue, sender, send_stream, remotes) = {
                     let product = &mut *product_guard;
@@ -3656,15 +3632,11 @@ where
                                     Err(err) => break Err(err),
                                 }
                                 if let Err(err) = drive_client_response_startup_control(
-                                    context,
-                                    &spec,
                                     &mut return_plan,
-                                    request_lane,
                                     stream_id,
                                     recv_stream.next_offset(),
                                     remotes,
                                     &mut state,
-                                    &additional_path_open_tx,
                                 ) {
                                     break Err(err);
                                 }
@@ -3697,15 +3669,11 @@ where
                                         remotes.observe_applied_peer_max_offset(applied_max);
                                         remotes.prepare_feedback_route(context);
                                         if let Err(err) = drive_client_response_startup_control(
-                                            context,
-                                            &spec,
                                             &mut return_plan,
-                                            request_lane,
                                             stream_id,
                                             recv_stream.next_offset(),
                                             remotes,
                                             &mut state,
-                                            &additional_path_open_tx,
                                         ) {
                                             break Err(err);
                                         }
@@ -3762,7 +3730,7 @@ where
                                             result = &mut write => break result,
                                             _ = wait_for_optional_deadline(feedback_deadline), if feedback_deadline.is_some() => continue,
                                             () = &mut prepared_work_wait => continue,
-                                            additional_path_open = additional_path_open_rx.recv(), if !state.recovery.pending_additional_path_opens.is_empty() => {
+                                            additional_path_open = additional_path_open_rx.recv() => {
                                                 let mut product_guard = request_product.lock();
                                                 let (sender, send_stream, remotes) = {
                                                     let product = &mut *product_guard;
@@ -4339,6 +4307,7 @@ where
             stream_id,
             &mut state.recovery.pending_additional_path_opens,
         );
+        state.recovery.withdrawn_startup_path_opens.abort_all();
 
         // Successful teardown stays behind ordered FIN work. A failed local
         // product socket is terminal, while carrier failures retain detach-only

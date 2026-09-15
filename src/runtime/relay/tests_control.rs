@@ -480,8 +480,7 @@ async fn observe_response_startup_progress(
         while let Some(command) = try_recv_reliable_path_command(receivers) {
             observation.observe_command(command, stream_id);
         }
-        if observation.open_started
-            && observation.ack_frontier >= trigger_bytes
+        if observation.ack_frontier >= trigger_bytes
             && observation.final_retained_ordinals.is_some()
         {
             return;
@@ -553,11 +552,17 @@ async fn wait_for_buffered_remote_frame(remote_input: &ReliableRelayRemoteInput)
 #[tokio::test]
 async fn restart_reset_terminates_during_blocked_product_write() {
     for obsolete_generation in [false, true] {
-        restart_reset_during_blocked_product_write(obsolete_generation).await;
+        for insert_pending_task in [false, true] {
+            restart_reset_during_blocked_product_write(obsolete_generation, insert_pending_task)
+                .await;
+        }
     }
 }
 
-async fn restart_reset_during_blocked_product_write(obsolete_generation: bool) {
+async fn restart_reset_during_blocked_product_write(
+    obsolete_generation: bool,
+    insert_pending_task: bool,
+) {
     let stream_id = StreamId(621);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -580,6 +585,8 @@ async fn restart_reset_during_blocked_product_write(obsolete_generation: bool) {
     let release_reset = Arc::new(Notify::new());
     let (consumed_tx, consumed_rx) = tokio::sync::oneshot::channel();
     let ingress = super::super::lifecycle::BlockedWriteOpenTestIngress {
+        startup_ordinal: None,
+        insert_pending_task,
         obsolete_generation,
         opened: None,
         key: RelayPathKey {
@@ -637,13 +644,13 @@ async fn restart_reset_during_blocked_product_write(obsolete_generation: bool) {
                 crate::protocol::ResetReason::RemoteClosed
             ))
         ),
-        "terminal reset survives blocked output and obsolete generation={obsolete_generation}"
+        "terminal reset survives blocked output: obsolete generation={obsolete_generation}, pending entry={insert_pending_task}"
     );
     assert_eq!(control.accepted_bytes(), b"b");
 }
 
 #[tokio::test]
-async fn response_startup_ack_open_and_final_progress_during_blocked_local_delivery() {
+async fn response_startup_ack_and_final_progress_during_blocked_local_delivery() {
     const STARTUP_TRIGGER_BYTES: usize = 58_400;
     let stream_id = StreamId(58_400);
     let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -802,7 +809,10 @@ async fn response_startup_ack_open_and_final_progress_during_blocked_local_deliv
         payload.as_ref(),
         "releasing the Product sink must deliver the exact payload once"
     );
-    assert_eq!(open_rounds_after_release, 1, "one frozen OPEN round");
+    assert_eq!(
+        open_rounds_after_release, 0,
+        "reaching the response prefix closes membership without an h-only STARTUP round"
+    );
     assert_eq!(
         observation.ack_frontier, STARTUP_TRIGGER_BYTES as u64,
         "the exact injected Product range must produce exact Data ACK [0,h)"
@@ -810,13 +820,13 @@ async fn response_startup_ack_open_and_final_progress_during_blocked_local_deliv
     assert_eq!(
         observation.final_retained_ordinals,
         Some(vec![0]),
-        "controlled failed ordinal 1 must produce exact FINAL [0]"
+        "the exact committed opening attachment must produce FINAL [0]"
     );
     assert!(
         ack_frontier_while_blocked >= STARTUP_TRIGGER_BYTES as u64
-            && open_while_blocked
+            && !open_while_blocked
             && final_while_blocked == Some(vec![0]),
-        "SEEN-4: contiguous frontier h={STARTUP_TRIGGER_BYTES} reached the blocked Product sink, but independent progress stalled (ACK frontier={ack_frontier_while_blocked}, OPEN={open_while_blocked}, FINAL={final_while_blocked:?}); all three appeared only after local delivery release"
+        "contiguous frontier h={STARTUP_TRIGGER_BYTES} must publish ACK and exact FINAL independently of blocked Product output and unused enrollment (ACK frontier={ack_frontier_while_blocked}, STARTUP={open_while_blocked}, FINAL={final_while_blocked:?})"
     );
 }
 
@@ -2306,6 +2316,8 @@ async fn ready_ack_gap_is_filled_before_intermediate_recovery_discovery() {
     let release_attach = Arc::new(Notify::new());
     let (attached_tx, attached_rx) = tokio::sync::oneshot::channel();
     let ingress = super::super::lifecycle::BlockedWriteOpenTestIngress {
+        startup_ordinal: None,
+        insert_pending_task: true,
         key: RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 1,
@@ -3297,6 +3309,8 @@ async fn first_product_stall_acquisition_fixture(application_holds_reply: bool) 
         let second = opened.pop().unwrap();
         let initial = opened.pop().unwrap();
         let ingress = super::super::lifecycle::BlockedWriteOpenTestIngress {
+            startup_ordinal: None,
+            insert_pending_task: true,
             key: initial_instances[1].key, obsolete_generation: false, opened: Some(second),
             release: release_second.clone(), consumed: second_consumed_tx,
         };
@@ -3366,4 +3380,358 @@ async fn first_product_stall_acquisition_fixture(application_holds_reply: bool) 
         relay.abort(); let _ = relay.await;
         for writer in writer_tasks { writer.abort(); let _ = writer.await; }
     }).await.expect("bounded first-stall actor/native-open fixture");
+}
+
+#[tokio::test]
+async fn response_past_h_continues_while_alternate_startup_is_unfinished() {
+    for initial_underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        response_past_h_with_unfinished_alternate(initial_underlay).await;
+    }
+}
+
+async fn response_past_h_with_unfinished_alternate(initial_underlay: UnderlayProtocol) {
+    const H: usize = 58_400;
+    const RESPONSE_BYTES: usize = 100_204;
+    let stream_id = StreamId(58_401);
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:10906?max-tcp-carriers=1",
+            "quic://127.0.0.1:10907",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("test path"))
+        .collect(),
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let alternate_underlay = match initial_underlay {
+        UnderlayProtocol::Tcp => UnderlayProtocol::Udp,
+        UnderlayProtocol::Udp => UnderlayProtocol::Tcp,
+    };
+    let (commands, mut receivers) = reliable_path_command_channels(32);
+    let (frames_tx, frames_rx) = mpsc::channel(2);
+    let initial = test_opened_remote_stream_on(stream_id, 0, initial_underlay, commands, frames_rx);
+    let initial_key = RelayPathKey {
+        underlay: initial_underlay,
+        index: 0,
+    };
+    let alternate_key = RelayPathKey {
+        underlay: alternate_underlay,
+        index: 0,
+    };
+    let plan = Arc::new(
+        ReliableRelayReturnPlan::new(
+            H as u64,
+            PathUsage::Available,
+            vec![
+                (initial_key, Some(initial.path_instance_id())),
+                (alternate_key, None),
+            ],
+        )
+        .expect("two-candidate startup plan"),
+    );
+    let initial = initial.with_startup(plan, 0, Vec::new());
+    let (consumed_tx, _consumed_rx) = tokio::sync::oneshot::channel();
+    let ingress = super::super::lifecycle::BlockedWriteOpenTestIngress {
+        key: alternate_key,
+        obsolete_generation: false,
+        startup_ordinal: Some(1),
+        insert_pending_task: true,
+        opened: None,
+        // The alternate operation cannot finish on its own. Installation uses
+        // the actual begin_candidate_for_open transition, before actor polling.
+        release: Arc::new(Notify::new()),
+        consumed: consumed_tx,
+    };
+    let (server_commands, _server_receivers) = reliable_path_command_channels(8);
+    let binding = crate::runtime::stream::response::ResponseStreamBinding::new_with_limits(
+        crate::protocol::SessionId(58_401),
+        initial_underlay,
+        PathId(0),
+        server_commands,
+        TrafficClass::Latency,
+        context.mux_limits,
+    );
+    binding.install_unresolved_response_startup_for_test(
+        H as u64,
+        2,
+        PathUsage::Available,
+        crate::model::path::CarrierPathKey {
+            underlay: initial_underlay,
+            path_id: PathId(0),
+        },
+    );
+    let mut peer_max = reliable_stream_initial_advertised_window_bytes(
+        initial_underlay,
+        TrafficClass::Latency,
+        context.mux_limits,
+    );
+    assert!(peer_max >= H as u64);
+    assert_eq!(
+        binding.response_startup_fresh_data_limit(0, RESPONSE_BYTES),
+        Some(H)
+    );
+    assert_eq!(
+        binding.response_startup_fresh_data_limit(H as u64, RESPONSE_BYTES - H),
+        None
+    );
+    let payload = Bytes::from(
+        (0..RESPONSE_BYTES)
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let expected = payload.clone();
+    let (local, mut application) = duplex(RESPONSE_BYTES);
+    let relay = tokio::spawn(async move {
+        relay_migrating_tcp_stream_active(
+            local,
+            &context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec::new(
+                TargetAddr::Ip("127.0.0.1:10908".parse().expect("test target")),
+                TrafficClass::Latency,
+            ),
+            initial,
+            None,
+            Some(ingress),
+        )
+        .await
+    });
+    let producer = tokio::spawn(async move {
+        frames_tx
+            .send(Ok(Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: payload.slice(..H),
+            }))
+            .await
+            .expect("send only the real prefix allowance");
+        let mut finalized = false;
+        while !finalized || peer_max < RESPONSE_BYTES as u64 {
+            let command = recv_reliable_path_command(&mut receivers)
+                .await
+                .expect("client response control");
+            receivers.release_pending_command_bytes(
+                crate::runtime::path::commands::reliable_path_command_pending_bytes(&command),
+            );
+            match command {
+                ReliablePathCommand::SendFrame(Frame::StreamReturnPlanFinal {
+                    stream_id: id,
+                    retained_ordinals,
+                }) if id == stream_id => {
+                    assert_eq!(
+                        retained_ordinals,
+                        [0],
+                        "the unfinished alternate has no accepted membership"
+                    );
+                    binding
+                        .finalize_response_startup_plan(&retained_ordinals)
+                        .expect("apply actual emitted FINAL");
+                    finalized = true;
+                }
+                ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+                    stream_id: id,
+                    max_offset,
+                }) if id == stream_id => peer_max = peer_max.max(max_offset),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            binding.response_startup_fresh_data_limit(H as u64, RESPONSE_BYTES - H),
+            Some(RESPONSE_BYTES - H)
+        );
+        frames_tx
+            .send(Ok(Frame::StreamData {
+                stream_id,
+                offset: H as u64,
+                payload: payload.slice(H..),
+            }))
+            .await
+            .expect("server tail obeys FINAL and receive credit");
+        // Keep the attachment input alive until the application verifies its
+        // exact response, rather than introducing unrelated stream detachment.
+        std::future::pending::<()>().await;
+    });
+    let mut delivered = vec![0; RESPONSE_BYTES];
+    let delivery = tokio::time::timeout(
+        Duration::from_secs(2),
+        application.read_exact(&mut delivered),
+    )
+    .await;
+    relay.abort();
+    if let Err(error) = relay.await {
+        assert!(error.is_cancelled(), "client relay panicked: {error}");
+    }
+    producer.abort();
+    let producer_result = producer.await;
+    if let Err(error) = producer_result {
+        assert!(error.is_cancelled(), "response producer panicked: {error}");
+    }
+    delivery
+        .expect("FINAL must release the healthy response without alternate settlement")
+        .expect("application response");
+    assert_eq!(
+        delivered, expected,
+        "no missing or duplicated bytes for initial {initial_underlay:?}"
+    );
+}
+
+#[tokio::test]
+async fn omitted_startup_result_cannot_replace_disconnected_ordinary_generation() {
+    let stream_id = StreamId(58_402);
+    let initial_key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let alternate_key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let (initial_commands, _initial_receivers) = reliable_path_command_channels(16);
+    let (_initial_frames, initial_input) = mpsc::channel(1);
+    let initial = test_opened_remote_stream(stream_id, 0, initial_commands, initial_input);
+    let plan = Arc::new(
+        ReliableRelayReturnPlan::new(
+            58_400,
+            PathUsage::Available,
+            vec![
+                (initial_key, Some(initial.path_instance_id())),
+                (alternate_key, None),
+            ],
+        )
+        .expect("two-candidate plan"),
+    );
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(initial, 8);
+    let initial_instance = remotes.paths[0].instance();
+    let mut startup = ClientReliableReturnPlan::from_initial_open(
+        crate::runtime::stream::ReliableRelayOpenedStartup {
+            plan,
+            opening_ordinal: 0,
+            failed_ordinals: Vec::new(),
+        },
+        initial_instance,
+    )
+    .expect("client return plan");
+    let mut state = ClientRelayState::new();
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let (tx, mut rx) = mpsc::channel(2);
+    let (old_commands, _old_receivers) = reliable_path_command_channels(8);
+    let (_old_frames, old_input) = mpsc::channel(1);
+    let old_opened =
+        test_opened_remote_stream_on(stream_id, 0, UnderlayProtocol::Udp, old_commands, old_input);
+    let old_instance = old_opened.path_instance_id();
+    let release_old = Arc::new(Notify::new());
+    let (old_consumed, _old_consumed_rx) = tokio::sync::oneshot::channel();
+    super::super::lifecycle::BlockedWriteOpenTestIngress {
+        key: alternate_key,
+        obsolete_generation: false,
+        startup_ordinal: Some(1),
+        insert_pending_task: true,
+        opened: Some(old_opened),
+        release: release_old.clone(),
+        consumed: old_consumed,
+    }
+    .install(
+        &mut startup,
+        &mut state.recovery.pending_additional_path_opens,
+        tx.clone(),
+    );
+    release_old.notify_one();
+    let old_result = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("old open completes")
+        .expect("old result");
+    // Its native completion is deliberately retained across the real h
+    // transition, before owner attachment settlement.
+    drive_client_response_startup_control(
+        &mut startup,
+        stream_id,
+        58_400,
+        &mut remotes,
+        &mut state,
+    )
+    .expect("h closes startup ownership");
+    assert!(state.recovery.pending_additional_path_opens.is_empty());
+    drop(
+        remotes
+            .remove_path_instance(initial_instance)
+            .expect("current carrier disconnects"),
+    );
+    assert!(remotes.is_empty());
+
+    let (new_commands, _new_receivers) = reliable_path_command_channels(8);
+    let (_new_frames, new_input) = mpsc::channel(1);
+    let new_opened =
+        test_opened_remote_stream_on(stream_id, 0, UnderlayProtocol::Udp, new_commands, new_input);
+    let new_instance = new_opened.path_instance_id();
+    assert_ne!(old_instance, new_instance);
+    let release_new = Arc::new(Notify::new());
+    let (new_consumed, _new_consumed_rx) = tokio::sync::oneshot::channel();
+    super::super::lifecycle::BlockedWriteOpenTestIngress {
+        key: alternate_key,
+        obsolete_generation: false,
+        startup_ordinal: None,
+        insert_pending_task: true,
+        opened: Some(new_opened),
+        release: release_new.clone(),
+        consumed: new_consumed,
+    }
+    .install(
+        &mut startup,
+        &mut state.recovery.pending_additional_path_opens,
+        tx,
+    );
+    assert_eq!(state.recovery.pending_additional_path_opens.len(), 1);
+    assert!(
+        settle_matching_client_additional_path_open(
+            stream_id,
+            &mut state,
+            &mut startup,
+            &mut remotes,
+            &mut send_stream,
+            TrafficClass::Latency,
+            old_result,
+            true,
+        )
+        .expect("old result is operation-local")
+        .is_none()
+    );
+    assert!(
+        remotes.is_empty(),
+        "disconnection cannot admit the omitted generation"
+    );
+    assert_eq!(
+        state.recovery.pending_additional_path_opens.len(),
+        1,
+        "old result cannot consume ordinary replacement"
+    );
+
+    release_new.notify_one();
+    let new_result = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("ordinary open completes")
+        .expect("ordinary result");
+    assert!(matches!(
+        settle_matching_client_additional_path_open(
+            stream_id,
+            &mut state,
+            &mut startup,
+            &mut remotes,
+            &mut send_stream,
+            TrafficClass::Latency,
+            new_result,
+            true,
+        )
+        .expect("ordinary owner commits"),
+        Some(ReliableRelayAttachMode::Recovery)
+    ));
+    assert!(state.recovery.pending_additional_path_opens.is_empty());
+    assert_eq!(
+        remotes
+            .path_instance_for_key(alternate_key)
+            .expect("ordinary attachment")
+            .path_instance_id,
+        new_instance
+    );
 }

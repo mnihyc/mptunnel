@@ -10,7 +10,7 @@ use super::io::{
     preserve_reinjection_frontier_quantum, stream_ack_ranges_expose_authoritative_gap,
     update_reinjection_authoritative_ack_snapshot,
 };
-use super::lifecycle::RelayAdditionalPathOpenTask;
+use super::lifecycle::{RelayAdditionalPathOpenTask, WithdrawnStartupPathOpens};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
@@ -64,6 +64,7 @@ pub(super) struct ClientRelayProgressState {
 
 pub(super) struct ClientRelayRecoveryState {
     pub(super) pending_additional_path_opens: HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+    pub(super) withdrawn_startup_path_opens: WithdrawnStartupPathOpens,
     pub(super) path_open_suppressions: ClientRelayPathOpenSuppressions,
     pub(super) disconnected: Option<ClientRelayDisconnectedState>,
 }
@@ -229,6 +230,7 @@ impl ClientRelayState {
             },
             recovery: ClientRelayRecoveryState {
                 pending_additional_path_opens: HashMap::new(),
+                withdrawn_startup_path_opens: WithdrawnStartupPathOpens::default(),
                 path_open_suppressions: ClientRelayPathOpenSuppressions::default(),
                 disconnected: None,
             },

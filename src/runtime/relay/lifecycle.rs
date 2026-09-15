@@ -27,7 +27,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::stream::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayOpenedStartup,
-    ReliableRelayRemoteSet, ReliableRelayReturnCandidate, ReliableRelayReturnPlan,
+    ReliableRelayRemoteSet, ReliableRelayReturnPlan,
 };
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::collections::{HashMap, HashSet};
@@ -55,6 +55,8 @@ enum ReliableReturnCandidateSettlement {
     Opening,
     Accepted(RelayPathInstance),
     Failed,
+    /// The prefix closed before this optional enrollment was retained.
+    Omitted,
 }
 
 /// Serialized requester state for the one-shot response return-plan round.
@@ -222,21 +224,22 @@ impl ClientReliableReturnPlan {
         Some(ordinal)
     }
 
-    pub(super) fn begin_unresolved_after_response_trigger(
-        &mut self,
-    ) -> Vec<ReliableRelayReturnCandidate> {
-        if self.done || !self.response_triggered {
-            return Vec::new();
+    /// Close optional enrollment only after the actual contiguous h frontier.
+    /// A pending or unused candidate is omitted, not evidence of carrier failure.
+    /// The actor fences those operations before publishing the immutable FINAL.
+    pub(super) fn omit_unfinished_candidates_at_response_trigger(&mut self) {
+        if self.done || self.final_retained.is_some() || !self.response_triggered {
+            return;
         }
-        let mut candidates = Vec::new();
-        for candidate in self.plan.candidates().iter().copied() {
-            let settlement = &mut self.settlements[usize::from(candidate.ordinal)];
-            if matches!(settlement, ReliableReturnCandidateSettlement::Unresolved) {
-                *settlement = ReliableReturnCandidateSettlement::Opening;
-                candidates.push(candidate);
+        for ordinal in 0..self.settlements.len() {
+            if matches!(
+                self.settlements[ordinal],
+                ReliableReturnCandidateSettlement::Unresolved
+                    | ReliableReturnCandidateSettlement::Opening
+            ) {
+                self.settlements[ordinal] = ReliableReturnCandidateSettlement::Omitted;
             }
         }
-        candidates
     }
 
     pub(super) fn settle_failed(&mut self, ordinal: u8) -> Result<(), RuntimeError> {
@@ -285,24 +288,6 @@ impl ClientReliableReturnPlan {
             .get(usize::from(ordinal))
             .copied()
             .flatten()
-    }
-
-    pub(super) fn bind_unresolved_slot(
-        &mut self,
-        ordinal: u8,
-        path_instance_id: CarrierPathInstanceId,
-    ) -> Result<bool, RuntimeError> {
-        let binding =
-            self.bound_instances
-                .get_mut(usize::from(ordinal))
-                .ok_or(RuntimeError::Protocol(
-                    "return startup ordinal is out of range",
-                ))?;
-        if binding.is_some_and(|frozen| frozen != path_instance_id) {
-            return Ok(false);
-        }
-        *binding = Some(path_instance_id);
-        Ok(true)
     }
 
     pub(super) fn prepare_final(&mut self, remotes: &ReliableRelayRemoteSet) -> Option<&[u8]> {
@@ -624,6 +609,57 @@ pub(super) fn drain_completed_additional_path_opens(
     .expect("test request attachment identity space")
 }
 
+/// Native opens whose frozen startup membership has been withdrawn. Each
+/// frozen ordinal starts at most once, so this owner retains at most n handles
+/// and needs no recurring scan. Drop also covers cancellation of the relay.
+#[derive(Default)]
+pub(super) struct WithdrawnStartupPathOpens {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl WithdrawnStartupPathOpens {
+    pub(super) fn abort_all(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for WithdrawnStartupPathOpens {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
+/// Revoke membership eligibility without cancelling native settlement. An
+/// authenticated terminal frame may already be parsed while that future waits
+/// for independent carrier cleanup; it must still reach the active relay.
+pub(super) fn withdraw_pending_startup_path_opens(
+    stream_id: StreamId,
+    pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+    withdrawn: &mut WithdrawnStartupPathOpens,
+) {
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = stream_id;
+    for (key, task) in pending.extract_if(|_, task| task.startup_ordinal.is_some()) {
+        // This owner does not await or reenter during extraction. The old
+        // generation is gone before another result or ordinary open can commit.
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = key;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "relay_additional_path_open_withdrawn",
+            format_args!(
+                "stream_id={} path_underlay={:?} path_index={} lane={:?} startup_ordinal={:?} reason=prefix_complete",
+                stream_id.0, key.underlay, key.index, task.lane, task.startup_ordinal,
+            ),
+        );
+        // The native task keeps its original deadlines and result publisher.
+        // Only logical termination aborts it; late acceptance cannot rejoin.
+        withdrawn.tasks.push(task.handle);
+    }
+}
+
 pub(super) fn cancel_pending_additional_path_opens(
     stream_id: StreamId,
     pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
@@ -667,7 +703,6 @@ impl RelayAdditionalPathOpenResult {
 
 pub(super) struct RelayAdditionalPathOpenTask {
     generation: RelayAdditionalPathOpenGeneration,
-    #[cfg(test)]
     startup_ordinal: Option<u8>,
     #[cfg(test)]
     startup_expected_instance: Option<CarrierPathInstanceId>,
@@ -676,12 +711,14 @@ pub(super) struct RelayAdditionalPathOpenTask {
     handle: tokio::task::JoinHandle<()>,
 }
 
-/// Test-only ingress seam for an ordinary successful attachment or RESET,
-/// without setting up another encrypted carrier. Settlement is unchanged.
+/// Test-only ingress seam for a pending open and its successful or terminal
+/// result, without setting up another encrypted carrier. Settlement is unchanged.
 #[cfg(test)]
 pub(super) struct BlockedWriteOpenTestIngress {
     pub(super) key: RelayPathKey,
     pub(super) obsolete_generation: bool,
+    pub(super) startup_ordinal: Option<u8>,
+    pub(super) insert_pending_task: bool,
     pub(super) opened: Option<OpenedRemoteStream>,
     pub(super) release: Arc<tokio::sync::Notify>,
     pub(super) consumed: tokio::sync::oneshot::Sender<()>,
@@ -691,6 +728,7 @@ pub(super) struct BlockedWriteOpenTestIngress {
 impl BlockedWriteOpenTestIngress {
     pub(super) fn install(
         self,
+        startup: &mut ClientReliableReturnPlan,
         pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
         tx: mpsc::Sender<RelayAdditionalPathOpenResult>,
     ) {
@@ -701,14 +739,25 @@ impl BlockedWriteOpenTestIngress {
             generation
         };
         let key = self.key;
+        let startup_ordinal = self.startup_ordinal;
+        let startup_expected_instance =
+            startup_ordinal.and_then(|ordinal| startup.bound_instance(ordinal));
+        if let Some(ordinal) = startup_ordinal {
+            assert_eq!(
+                startup.begin_candidate_for_open(key, startup_expected_instance),
+                Some(ordinal),
+                "test ingress must own one actual unresolved startup candidate",
+            );
+        }
+        let insert_pending_task = self.insert_pending_task;
         let handle = tokio::spawn(async move {
             self.release.notified().await;
             tx.send(RelayAdditionalPathOpenResult {
                 key,
                 generation,
                 mode: ReliableRelayAttachMode::Recovery,
-                startup_ordinal: None,
-                startup_expected_instance: None,
+                startup_ordinal,
+                startup_expected_instance,
                 result: self.opened.ok_or(RuntimeError::RemoteReset(
                     crate::protocol::ResetReason::RemoteClosed,
                 )),
@@ -720,17 +769,19 @@ impl BlockedWriteOpenTestIngress {
             let _ = tx.reserve_many(tx.max_capacity()).await;
             let _ = self.consumed.send(());
         });
-        pending.insert(
-            key,
-            RelayAdditionalPathOpenTask {
-                generation: pending_generation,
-                startup_ordinal: None,
-                startup_expected_instance: None,
-                #[cfg(feature = "lab-diagnostics")]
-                lane: TrafficClass::Latency,
-                handle,
-            },
-        );
+        if insert_pending_task {
+            pending.insert(
+                key,
+                RelayAdditionalPathOpenTask {
+                    generation: pending_generation,
+                    startup_ordinal,
+                    startup_expected_instance,
+                    #[cfg(feature = "lab-diagnostics")]
+                    lane: TrafficClass::Latency,
+                    handle,
+                },
+            );
+        }
     }
 }
 
@@ -832,67 +883,6 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
         pending,
         result_tx,
     ))
-}
-
-/// Opens the exact unresolved frozen candidates once the contiguous response
-/// frontier reaches `h`. Stale exact instances settle as failed; a same-slot
-/// successor remains outside the startup ordinal space.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn spawn_reliable_relay_response_startup_path_opens(
-    context: &ClientPathContext,
-    spec: &ReliableRelayOpenSpec,
-    startup: &mut ClientReliableReturnPlan,
-    output_lane: TrafficClass,
-    stream_id: StreamId,
-    pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
-    result_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
-) -> Result<bool, RuntimeError> {
-    let frozen = startup.begin_unresolved_after_response_trigger();
-    let mut candidates = Vec::new();
-    for candidate in frozen {
-        let current_instance = context
-            .health()
-            .lock()
-            .expect("client path health lock")
-            .path_record(candidate.key)
-            .and_then(|record| record.path_instance_id());
-        let expected_instance = startup.bound_instance(candidate.ordinal);
-        if expected_instance.is_some() && current_instance != expected_instance
-            || pending.contains_key(&candidate.key)
-        {
-            startup.settle_failed(candidate.ordinal)?;
-            continue;
-        }
-        if let Some(current_instance) = current_instance
-            && !startup.bind_unresolved_slot(candidate.ordinal, current_instance)?
-        {
-            startup.settle_failed(candidate.ordinal)?;
-            continue;
-        }
-        candidates.push(RelayAdditionalPathOpenCandidate {
-            key: candidate.key,
-            startup_ordinal: Some(candidate.ordinal),
-            startup_expected_instance: startup.bound_instance(candidate.ordinal),
-        });
-    }
-    if candidates.is_empty() {
-        return Ok(false);
-    }
-    let spawned = spawn_reliable_relay_path_opens(
-        context,
-        spec,
-        output_lane,
-        ReliableRelayAttachMode::Startup,
-        stream_id,
-        candidates,
-        pending,
-        result_tx,
-    );
-    #[cfg(test)]
-    if spawned {
-        context.record_response_startup_open_round_for_test();
-    }
-    Ok(spawned)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1029,8 +1019,12 @@ fn spawn_reliable_relay_path_opens(
         let result_tx = result_tx.clone();
         let generation = next_relay_additional_path_open_generation();
         #[cfg(test)]
-        let fail_response_startup_open = matches!(mode, ReliableRelayAttachMode::Startup)
-            && context.response_startup_open_failure_for_test();
+        let fail_response_startup_open =
+            candidate.startup_ordinal.is_some() && context.response_startup_open_failure_for_test();
+        #[cfg(test)]
+        if candidate.startup_ordinal.is_some() {
+            context.record_response_startup_open_round_for_test();
+        }
         let handle = tokio::spawn(async move {
             #[cfg(test)]
             let result = if fail_response_startup_open {
@@ -1041,6 +1035,8 @@ fn spawn_reliable_relay_path_opens(
             #[cfg(not(test))]
             let result =
                 open_remote_stream_for_relay_path(&context, stream_id, &spec, lane, key).await;
+            // h withdraws the generation, not this future. Native settlement
+            // and terminal publication remain owned until logical termination.
             let message = RelayAdditionalPathOpenResult {
                 key,
                 generation,
@@ -1056,10 +1052,13 @@ fn spawn_reliable_relay_path_opens(
                 if let Ok(opened) = result {
                     #[cfg(feature = "lab-diagnostics")]
                     let lane = opened.stream().lane;
-                    opened.close().await;
+                    // If the logical owner closes during publication, transfer
+                    // cleanup instead of retaining an orphan task behind bounded
+                    // carrier commands.
+                    opened.retire_uncommitted();
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
-                        "relay_additional_path_open_orphan_closed",
+                        "relay_additional_path_open_orphan_retirement_queued",
                         format_args!(
                             "stream_id={} path_underlay={:?} path_index={} lane={:?}",
                             stream_id.0, key.underlay, key.index, lane,
@@ -1072,7 +1071,6 @@ fn spawn_reliable_relay_path_opens(
             key,
             RelayAdditionalPathOpenTask {
                 generation,
-                #[cfg(test)]
                 startup_ordinal: candidate.startup_ordinal,
                 #[cfg(test)]
                 startup_expected_instance: candidate.startup_expected_instance,

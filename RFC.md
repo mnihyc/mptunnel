@@ -1264,11 +1264,44 @@ state to `Finalized` with one immutable retained-ordinal set.
 
 Until a multipath plan is finalized, the responder admits fresh unique
 response offsets only below `h`. Data ACK does not refill this one-shot prefix.
-When the requester observes a contiguous response frontier at least `h`, it
-opens every still-unresolved frozen candidate at most once. After every
-candidate is accepted or has failed, it serializes the ordinals that are both
-accepted and still attached in strictly increasing order and publishes
-`STREAM_RETURN_PLAN_FINAL` on the current logical stream attachments.
+The requester may enroll frozen candidates at most once while ordinary demand
+or recovery requests additional capacity. It may finalize as soon as all frozen
+candidates have settled. When its contiguous response frontier reaches `h`,
+it MUST close the startup round without waiting for unfinished enrollment and
+MUST NOT start more `STARTUP` opens solely because the prefix completed. It
+serializes the ordinals that are both accepted and still attached in strictly
+increasing order and publishes `STREAM_RETURN_PLAN_FINAL` on the current
+logical stream attachments. Never-started or still-pending candidates are
+omitted from this round; omission is not evidence of path or carrier failure.
+
+Closing the round fences the exact generations of its unfinished `STARTUP`
+operations before later ordinary opens can commit on those path keys. It
+withdraws membership eligibility without cancelling their native open futures:
+an authenticated terminal outcome may already be parsed while native settlement
+is still pending. The logical stream retains ownership of these finite tasks,
+serves their terminal results, and retires late tentative acceptance through
+the existing ordered attachment cleanup. The retained task count is bounded by
+the frozen candidate count; logical termination or owner drop aborts remaining
+tasks. Withdrawal does not claim native cancellation or change existing open
+deadlines, carrier health, or unrelated `ORDINARY` work. A later demanded
+attachment uses explicit `ORDINARY` and cannot alter the retained set; closing
+startup is not a permanent path exclusion. Such an open can overlap an omitted
+startup on the same carrier and remain subject to its existing duplicate and
+ordered-retirement rules until that obsolete attempt settles.
+
+This closure separates the finite ghost-ownership receipt from optional
+capacity acquisition: a healthy committed attachment need not await a slow
+alternative to finish the current response. It preserves the responder's cap
+until FINAL is applied, its atomic omitted-output withdrawal, and the proof of
+application furnished by progress beyond `h`. Earlier closure may omit
+almost-completed enrollment and require a later ordinary open, so sustained
+aggregation still depends on the ordinary demand and recovery owners.
+
+A terminal declaration with `final_offset <= h` received ahead of missing
+response bytes does not trigger this contiguous-prefix closure. It forbids
+new startup work while already pending enrollments settle, after which FINAL
+can withdraw omitted outputs that might own the missing prefix. Full contiguous
+receipt through the terminal offset keeps its existing completion authority.
 
 The responder accepts the first finalization only when every retained ordinal
 is in range, strictly increasing, and enrolled by an exact accepted startup
@@ -4558,7 +4591,9 @@ A conforming implementation preserves all of the following:
     Before FINAL, fresh unique response offsets cannot exceed trigger_bytes and
     ACK cannot refill that prefix. FINAL may retain only sorted enrolled
     ordinals, atomically withdraws omitted enrolled outputs before removing the
-    ceiling, and is absorbing and idempotent only for an equal repetition.
+    ceiling, and is absorbing and idempotent only for an equal repetition. The
+    contiguous h frontier closes requester startup membership without awaiting
+    unfinished optional enrollment; its omission cannot declare a carrier failed.
 42. Kinds 44 through 48 are reserved and MUST be rejected as unknown under
     version 15.
 43. Stale requalification uses one finite cyclic exact-incarnation cursor and

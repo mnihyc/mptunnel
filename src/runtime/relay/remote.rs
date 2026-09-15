@@ -28,7 +28,6 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) enum ReliableRelayAttachMode {
-    Startup,
     Any,
     BulkStriping,
     Recovery,
@@ -73,9 +72,7 @@ impl ReliableRelayAttachInput {
         mode: ReliableRelayAttachMode,
     ) -> Self {
         let payload_bytes = match mode {
-            ReliableRelayAttachMode::Startup
-            | ReliableRelayAttachMode::Any
-            | ReliableRelayAttachMode::Recovery => {
+            ReliableRelayAttachMode::Any | ReliableRelayAttachMode::Recovery => {
                 reliable_relay_attach_payload_bytes(send_stream, selection_lane, mux_limits)
             }
             ReliableRelayAttachMode::BulkStriping => {

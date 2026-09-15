@@ -438,14 +438,12 @@ async fn exact_successor_cannot_inherit_a_frozen_startup_ordinal() {
         None,
     );
     assert!(startup.observe_response_frontier(58_400));
+    startup.omit_unfinished_candidates_at_response_trigger();
     assert_eq!(
-        startup.begin_unresolved_after_response_trigger(),
-        vec![ReliableRelayReturnCandidate {
-            key: frozen_key,
-            path_instance_id: Some(frozen),
-            ordinal: 1,
-        }],
+        startup.settlement(1),
+        Some(ReliableReturnCandidateSettlement::Omitted),
     );
+    assert_eq!(startup.prepare_final(&remotes), Some(&[0][..]));
 }
 
 #[tokio::test]
@@ -513,7 +511,10 @@ async fn pending_slot_request_open_binds_startup_and_finalizes_before_h() {
         !startup.observe_response_frontier(58_400),
         "an early immutable FINAL leaves no h-trigger work",
     );
-    assert!(startup.begin_unresolved_after_response_trigger().is_empty());
+    assert_eq!(
+        startup.begin_candidate_for_open(relay_key(UnderlayProtocol::Udp, 0), None),
+        None
+    );
 }
 
 #[tokio::test]
@@ -597,7 +598,7 @@ async fn recovery_open_on_a_frozen_pending_slot_keeps_its_startup_ordinal() {
 }
 
 #[tokio::test]
-async fn exact_h_opening_is_joined_and_delayed_fin_does_not_duplicate_it() {
+async fn exact_h_omits_opening_once_and_delayed_fin_preserves_completion() {
     let stream_id = StreamId(42);
     let opening_key = relay_key(UnderlayProtocol::Tcp, 0);
     let pending_key = relay_key(UnderlayProtocol::Udp, 0);
@@ -639,10 +640,13 @@ async fn exact_h_opening_is_joined_and_delayed_fin_does_not_duplicate_it() {
     assert!(!startup.observe_response_frontier(58_399));
     assert_eq!(startup.begin_candidate_for_open(pending_key, None), Some(1),);
     assert!(startup.observe_response_frontier(58_400));
-    assert!(
-        startup.begin_unresolved_after_response_trigger().is_empty(),
-        "the h wake joins the already-opening ordinal",
+    startup.omit_unfinished_candidates_at_response_trigger();
+    assert_eq!(
+        startup.settlement(1),
+        Some(ReliableReturnCandidateSettlement::Omitted)
     );
+    assert_eq!(startup.prepare_final(&remotes), Some(&[0][..]));
+    assert!(!startup.observe_response_frontier(58_400));
     startup.observe_response_terminal(58_400, 58_400);
     assert!(startup.is_done());
 }
@@ -700,7 +704,10 @@ async fn fin_before_missing_ghost_data_requires_final_settlement() {
         Some(ReliableReturnCandidateSettlement::Failed),
         "FIN forbids launching a never-opened slot",
     );
-    assert!(startup.begin_unresolved_after_response_trigger().is_empty());
+    assert_eq!(
+        startup.begin_candidate_for_open(never_opened_key, None),
+        None
+    );
     assert_eq!(startup.prepare_final(&remotes), None);
     startup
         .settle_failed(1)
@@ -769,17 +776,16 @@ async fn late_startup_failed_attempt_can_remain_in_flight_after_final_publicatio
         remotes.paths[0].instance(),
     )
     .expect("requester owns startup settlement");
-    assert!(startup.observe_response_frontier(58_400));
     assert_eq!(startup.begin_candidate_for_open(delayed_key, None), Some(1));
     // The real opener freezes this wire phase before publication. A completed
     // native write does not mean the independent carrier's peer has read it.
     let delayed_open = plan.wire(StreamAttachmentPhase::Startup, 1);
     assert!(startup.prepare_final(&remotes).is_none());
-    settle_client_return_plan_open_result(&mut startup, &remotes, delayed_key, Some(1), false)
-        .expect("a local open timeout settles only the attempted ordinal");
+    assert!(startup.observe_response_frontier(58_400));
+    startup.omit_unfinished_candidates_at_response_trigger();
     let retained = startup
         .prepare_final(&remotes)
-        .expect("all attempts settled")
+        .expect("h closes the exact retained subset before the old open settles")
         .to_vec();
     assert_eq!(retained, vec![0]);
     remotes
@@ -1622,4 +1628,176 @@ fn receive_hole_reinjection_requires_live_remote_and_buffered_gap() {
         &recv_stream,
         false
     ));
+}
+
+#[tokio::test]
+async fn withdrawn_startup_preserves_terminal_result_before_and_after_publication_wait() {
+    for native_result_ready in [false, true] {
+        let stream_id = StreamId(58_403);
+        let key = relay_key(UnderlayProtocol::Udp, 0);
+        let generation = next_relay_additional_path_open_generation();
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        result_tx
+            .send(RelayAdditionalPathOpenResult {
+                key,
+                generation: next_relay_additional_path_open_generation(),
+                mode: ReliableRelayAttachMode::Recovery,
+                startup_ordinal: None,
+                startup_expected_instance: None,
+                result: Err(RuntimeError::ReliablePathSessionClosed),
+            })
+            .await
+            .expect("fill bounded result channel");
+        let (native_done_tx, native_done_rx) = tokio::sync::oneshot::channel();
+        let (publishing_tx, publishing_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            native_done_rx.await.expect("complete native operation");
+            let _ = publishing_tx.send(());
+            result_tx
+                .send(RelayAdditionalPathOpenResult {
+                    key,
+                    generation,
+                    mode: ReliableRelayAttachMode::Recovery,
+                    startup_ordinal: Some(1),
+                    startup_expected_instance: None,
+                    result: Err(RuntimeError::RemoteReset(
+                        crate::protocol::ResetReason::RemoteClosed,
+                    )),
+                })
+                .await
+                .expect("preserve authenticated terminal publication");
+        });
+        let mut pending = HashMap::from([(
+            key,
+            RelayAdditionalPathOpenTask {
+                generation,
+                startup_ordinal: Some(1),
+                startup_expected_instance: None,
+                #[cfg(feature = "lab-diagnostics")]
+                lane: TrafficClass::Latency,
+                handle,
+            },
+        )]);
+        let mut native_done_tx = Some(native_done_tx);
+        let mut publishing_rx = Some(publishing_rx);
+        if native_result_ready {
+            native_done_tx.take().unwrap().send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), publishing_rx.take().unwrap())
+                .await
+                .expect("publisher reaches full channel")
+                .expect("publication started");
+        }
+        let mut withdrawn = WithdrawnStartupPathOpens::default();
+        withdraw_pending_startup_path_opens(stream_id, &mut pending, &mut withdrawn);
+        assert!(pending.is_empty());
+        assert_eq!(withdrawn.tasks.len(), 1);
+        assert!(
+            !withdrawn.tasks[0].is_finished(),
+            "h changes eligibility, not native/result lifetime"
+        );
+        if !native_result_ready {
+            native_done_tx
+                .take()
+                .unwrap()
+                .send(())
+                .expect("native operation survives withdrawal");
+            tokio::time::timeout(Duration::from_secs(1), publishing_rx.take().unwrap())
+                .await
+                .expect("post-withdraw publisher starts")
+                .expect("publication started");
+        }
+        let filler = result_rx
+            .recv()
+            .await
+            .expect("release original channel occupant");
+        assert!(matches!(
+            filler.result,
+            Err(RuntimeError::ReliablePathSessionClosed)
+        ));
+        let terminal = tokio::time::timeout(Duration::from_secs(1), result_rx.recv())
+            .await
+            .expect("terminal result survives full publication channel")
+            .expect("terminal result");
+        assert_eq!(terminal.generation, generation);
+        assert!(matches!(
+            terminal.terminal_error(),
+            Some(RuntimeError::RemoteReset(
+                crate::protocol::ResetReason::RemoteClosed
+            ))
+        ));
+        withdrawn
+            .tasks
+            .pop()
+            .unwrap()
+            .await
+            .expect("publisher completed without cancellation");
+    }
+}
+
+#[tokio::test]
+async fn withdrawn_startup_remains_owned_until_logical_drop_without_cancelling_ordinary() {
+    let stream_id = StreamId(58_404);
+    let startup_key = relay_key(UnderlayProtocol::Udp, 0);
+    let ordinary_key = relay_key(UnderlayProtocol::Tcp, 1);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let startup_handle = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    let startup_abort = startup_handle.abort_handle();
+    let ordinary_handle = tokio::spawn(std::future::pending::<()>());
+    let ordinary_abort = ordinary_handle.abort_handle();
+    let mut pending = HashMap::from([
+        (
+            startup_key,
+            RelayAdditionalPathOpenTask {
+                generation: next_relay_additional_path_open_generation(),
+                startup_ordinal: Some(1),
+                startup_expected_instance: None,
+                #[cfg(feature = "lab-diagnostics")]
+                lane: TrafficClass::Latency,
+                handle: startup_handle,
+            },
+        ),
+        (
+            ordinary_key,
+            RelayAdditionalPathOpenTask {
+                generation: next_relay_additional_path_open_generation(),
+                startup_ordinal: None,
+                startup_expected_instance: None,
+                #[cfg(feature = "lab-diagnostics")]
+                lane: TrafficClass::Latency,
+                handle: ordinary_handle,
+            },
+        ),
+    ]);
+    started_rx.await.expect("native task started");
+    let mut withdrawn = WithdrawnStartupPathOpens::default();
+    withdraw_pending_startup_path_opens(stream_id, &mut pending, &mut withdrawn);
+    assert_eq!(pending.len(), 1);
+    assert!(pending.contains_key(&ordinary_key));
+    assert_eq!(withdrawn.tasks.len(), 1);
+    assert!(!startup_abort.is_finished());
+    assert!(!ordinary_abort.is_finished());
+    withdraw_pending_startup_path_opens(stream_id, &mut pending, &mut withdrawn);
+    assert_eq!(
+        withdrawn.tasks.len(),
+        1,
+        "repeated prefix observation cannot duplicate ownership"
+    );
+    drop(withdrawn);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !startup_abort.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("logical-owner drop aborts the unfinished native task");
+    assert!(
+        !ordinary_abort.is_finished(),
+        "withdrawn lifetime does not own an ordinary attempt"
+    );
+    let ordinary = pending.remove(&ordinary_key).unwrap();
+    ordinary.handle.abort();
+    assert!(ordinary.handle.await.unwrap_err().is_cancelled());
 }

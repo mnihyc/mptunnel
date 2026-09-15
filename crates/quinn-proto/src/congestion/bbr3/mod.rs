@@ -2,6 +2,8 @@ mod max_filter;
 
 #[cfg(test)]
 mod tests_ack_cleanup;
+#[cfg(test)]
+mod tests_rate_evidence;
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
@@ -1825,20 +1827,28 @@ impl Bbr3 {
         if self.full_bw_now || !self.round_start {
             return;
         }
-        if let Some(rate_sample) = self.rs {
-            if rate_sample.is_app_limited {
-                return;
-            }
-            // Loss compensation changed max_bw/bw_latest into serviced-rate estimates. Keep the
-            // plateau baseline in that same unit; comparing raw delivery here would make a clean
-            // 1.25x probe look smaller solely because authorized erasure occurred. With a zero
-            // floor, model_delivery_rate is bit-for-bit the draft's raw sample.
-            let model_delivery_rate = self.model_delivery_rate(rate_sample);
-            if model_delivery_rate >= self.full_bw * FULL_BW_GROWTH {
-                self.reset_full_bw();
-                self.full_bw = model_delivery_rate;
-                return;
-            }
+        let Some(rate_sample) = self.rs else {
+            return;
+        };
+        // GenerateRateSample leaves delivery_rate at zero when the interval is
+        // rejected. Missing rate evidence must not count as a bandwidth plateau.
+        // ACK accounting, RTT updates and independent loss exits still run in
+        // update_model_and_state; only this estimator abstains.
+        if rate_sample.is_app_limited
+            || !rate_sample.delivery_rate.is_finite()
+            || rate_sample.delivery_rate <= 0.0
+        {
+            return;
+        }
+        // Loss compensation changed max_bw/bw_latest into serviced-rate estimates. Keep the
+        // plateau baseline in that same unit; comparing raw delivery here would make a clean
+        // 1.25x probe look smaller solely because authorized erasure occurred. With a zero
+        // floor, model_delivery_rate is bit-for-bit the draft's raw sample.
+        let model_delivery_rate = self.model_delivery_rate(rate_sample);
+        if model_delivery_rate >= self.full_bw * FULL_BW_GROWTH {
+            self.reset_full_bw();
+            self.full_bw = model_delivery_rate;
+            return;
         }
         self.full_bw_count += 1;
         self.full_bw_now = self.full_bw_count >= MAX_FULL_BW_COUNT;

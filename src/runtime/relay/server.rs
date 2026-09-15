@@ -2431,7 +2431,6 @@ where
         if !target_shutdown_requested
             && pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset)
         {
-            path_stream.finish_feedback_route();
             if enqueue_tcp_recv_progress(
                 path_stream,
                 &mut recv_stream,
@@ -2722,7 +2721,7 @@ where
         };
         let applied_peer_max_offset = response_product.lock().send_stream.peer_max_offset();
         request_ack_publication.record_feedback(
-            path_stream.service_feedback_route(applied_peer_max_offset),
+            path_stream.service_feedback_replies(applied_peer_max_offset),
             &mut recv_stream,
         );
         // Attachment replay can service feedback outside this actor. Observe
@@ -2802,14 +2801,13 @@ where
         }
         let request_feedback_path_snapshot =
             path_stream.request_feedback_path_snapshot(request_lane);
-        let feedback_route_capacity_wait =
-            arm_carrier_capacity_notifies(path_stream.feedback_route_capacity_notifies());
-        let has_feedback_route_capacity_wait = feedback_route_capacity_wait.is_some();
+        let feedback_reply_capacity_wait =
+            arm_carrier_capacity_notifies(path_stream.feedback_reply_capacity_notifies());
+        let has_feedback_reply_capacity_wait = feedback_reply_capacity_wait.is_some();
         request_ack_publication.record_feedback(
-            path_stream.service_feedback_route(applied_peer_max_offset),
+            path_stream.service_feedback_replies(applied_peer_max_offset),
             &mut recv_stream,
         );
-        let feedback_route_deadline = path_stream.feedback_route_deadline();
         let request_feedback_underlay = request_feedback_path_snapshot
             .map(|snapshot| snapshot.underlay)
             .or_else(|| path_stream.request_feedback_underlay())
@@ -3268,15 +3266,9 @@ where
         // ready during an upload. Fair polling keeps response progress from
         // being hidden behind an unbounded run of incoming STREAM_DATA.
         tokio::select! {
-        _ = async {
-            match feedback_route_deadline {
-                Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
-                None => std::future::pending().await,
-            }
-        } => { continue; }
         _ = async move {
-            if let Some(wait) = feedback_route_capacity_wait { wait.await; }
-        }, if has_feedback_route_capacity_wait => { continue; }
+            if let Some(wait) = feedback_reply_capacity_wait { wait.await; }
+        }, if has_feedback_reply_capacity_wait => { continue; }
         () = prepared_work_wait => {
             // Re-read C, source credit and error/terminal state under the owner.
             continue;
@@ -3531,9 +3523,6 @@ where
                     target_apply_error = applied.into_apply_error();
                     target_delivery.append_batch(ready_path_data.take_delivery())?;
                     target_receipt_pending = true;
-                    if pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset) {
-                        path_stream.finish_feedback_route();
-                    }
                 }
                 Frame::StreamAck {
                     stream_id: ack_stream_id,
@@ -3735,15 +3724,13 @@ where
                     #[cfg(not(feature = "lab-diagnostics"))]
                     let _ = (token, max_offset);
                     request_ack_publication.record_feedback(
-                        path_stream.service_feedback_route(peer_max_offset), &mut recv_stream,
+                        path_stream.service_feedback_replies(peer_max_offset), &mut recv_stream,
                     );
                 }
-                Frame::StreamFeedbackReceipt { stream_id: receipt_stream_id, token }
+                Frame::StreamFeedbackReceipt { stream_id: receipt_stream_id, .. }
                     if receipt_stream_id == stream_id => {
-                    request_ack_publication.record_feedback(
-                        path_stream.receive_feedback_receipt(token), &mut recv_stream,
-                    );
-                    request_ack_capacity_wait = None;
+                    // No local probe is outstanding; a legacy receipt changes
+                    // neither publication, byte ownership nor receive credit.
                 }
                 Frame::StreamMaxData {
                     stream_id: max_stream_id,
@@ -3761,7 +3748,7 @@ where
                     stream_id: fin_stream_id,
                     final_offset,
                 } if fin_stream_id == stream_id => {
-                    path_stream.finish_feedback_route();
+
                     receive_stream_fin(
                         &recv_stream,
                         &mut pending_remote_fin_offset,

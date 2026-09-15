@@ -377,6 +377,7 @@ pub(in crate::runtime) fn claim_prepared_request_data(
                 if current.frame != candidate.frame
                     || std::mem::discriminant(&current.cause)
                         != std::mem::discriminant(&candidate.cause)
+                    || !current.same_credit_frontier_authority(&candidate)
                 {
                     return None;
                 }

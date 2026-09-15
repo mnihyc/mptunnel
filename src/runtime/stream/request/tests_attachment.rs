@@ -69,7 +69,7 @@ fn opened_stream_at_with_command_capacity(
 }
 
 #[tokio::test]
-async fn client_confirmed_feedback_uses_exact_proof_and_expires_without_renewing_on_data() {
+async fn client_feedback_fanout_preserves_blocked_sibling_and_replacement() {
     use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
     use crate::mux::stream::ReliableRecvStream;
     use crate::transport::PathSpec;
@@ -83,15 +83,6 @@ async fn client_confirmed_feedback_uses_exact_proof_and_expires_without_renewing
             }
         }
         frames
-    }
-    fn probe(frames: &[Frame]) -> u64 {
-        frames
-            .iter()
-            .find_map(|frame| match frame {
-                Frame::StreamFeedbackProbe { token, .. } => Some(*token),
-                _ => None,
-            })
-            .expect("actual admitted proof marker")
     }
     let context = ClientPathContext::new(
         vec![
@@ -107,145 +98,112 @@ async fn client_confirmed_feedback_uses_exact_proof_and_expires_without_renewing
     let stream_id = StreamId(819);
     let (a, _a_input, mut a_commands) = opened_stream_at(stream_id, 0);
     let (mut remotes, _input) = ReliableRelayRemoteSet::new(a, 8);
-    let (b, _b_input, mut b_commands) = opened_stream_at(stream_id, 1);
+    let (b, _b_input, mut b_commands) = opened_stream_at_with_command_capacity(stream_id, 1, 1);
     remotes.attach(b);
-    for path in &remotes.paths {
-        context.install_relay_path_instance_for_test(path.instance());
-    }
     drain(&mut a_commands);
     drain(&mut b_commands);
     let mut received = ReliableRecvStream::new(stream_id, MuxLimits::default());
     let initial_max =
         received.max_data_offset_with_window(MuxLimits::default().max_stream_window_bytes);
     remotes.publish_max_data_with_context(&context, initial_max);
-    drain(&mut a_commands);
-    drain(&mut b_commands);
+    for commands in [&mut a_commands, &mut b_commands] {
+        assert_eq!(
+            drain(commands),
+            vec![Frame::StreamMaxData {
+                stream_id,
+                max_offset: initial_max
+            }]
+        );
+    }
     for generation in 1..=2 {
         received
             .receive_data(generation - 1, Bytes::from_static(b"x"))
             .unwrap();
-        remotes.publish_stream_ack_with_context(
+        let publication = remotes.publish_stream_ack_with_context(
             &context,
             generation,
             received.take_ack_update(),
             received.ack_frames(),
         );
-        if generation == 1 {
-            assert!(
-                drain(&mut a_commands)
-                    .iter()
-                    .all(|f| matches!(f, Frame::StreamAck { .. }))
-            );
-            assert!(
-                drain(&mut b_commands)
-                    .iter()
-                    .all(|f| matches!(f, Frame::StreamAck { .. }))
-            );
-            assert!(
-                remotes.feedback_deadline().is_none(),
-                "first ACK remains full fanout"
+        assert!(publication.ack.published && !publication.ack.pending);
+        for commands in [&mut a_commands, &mut b_commands] {
+            assert_eq!(
+                drain(commands),
+                received.ack_frames(),
+                "every live output publishes without local proof traffic"
             );
         }
     }
-    let a_token = probe(&drain(&mut a_commands));
-    let b_token = probe(&drain(&mut b_commands));
-    assert_ne!(a_token, b_token);
-    // No receipt-ingress parameter exists: the token identifies the local
-    // probed output, independently of the authenticated reply's carrier.
-    assert!(remotes.receive_feedback_receipt(&context, a_token));
-    assert!(
-        !remotes.receive_feedback_receipt(&context, b_token),
-        "late sibling cannot replace the winner"
-    );
+    let blocked_commands = match &remotes.paths[1].stream.output {
+        ReliablePathStreamOutput::Fixed(output) => output.commands().clone(),
+        _ => unreachable!("fixed request output"),
+    };
+    blocked_commands
+        .try_enqueue_admitted_frame(Frame::Ping { nonce: 7 }, TrafficClass::Control)
+        .unwrap();
     received.receive_data(2, Bytes::from_static(b"x")).unwrap();
-    let selected_ack = remotes.publish_stream_ack_with_context(
+    let publication = remotes.publish_stream_ack_with_context(
         &context,
         3,
         received.take_ack_update(),
         received.ack_frames(),
     );
-    assert!(!selected_ack.ack.pending);
-    let selected_max =
+    assert!(publication.ack.published && publication.ack.pending);
+    let latest_max =
         received.max_data_offset_with_window(MuxLimits::default().max_stream_window_bytes);
-    assert!(selected_max > initial_max);
-    let selected_credit = remotes.publish_max_data_with_context(&context, selected_max);
-    assert_eq!(
-        selected_credit.max_data.published_offset,
-        Some(selected_max)
-    );
-    assert!(!selected_credit.max_data.pending);
-    let validation_token = probe(&drain(&mut a_commands));
-    assert!(remotes.receive_feedback_receipt(&context, validation_token));
-    assert!(
-        remotes.feedback_deadline().is_some(),
-        "newer MAX must have a next-round wake before the actor waits"
-    );
+    let max = remotes.publish_max_data_with_context(&context, latest_max);
+    assert_eq!(max.max_data.published_offset, Some(latest_max));
+    assert!(max.max_data.pending);
+    let available = drain(&mut a_commands);
+    assert_eq!(available.len(), 2);
+    assert!(available.iter().any(|f| matches!(f, Frame::StreamAck { ranges, .. } if ranges == &vec![OffsetRange { start: 0, end: 3 }])));
+    assert!(available.contains(&Frame::StreamMaxData {
+        stream_id,
+        max_offset: latest_max
+    }));
     remotes.retry_pending_feedback_with_context(&context);
-    let expired_token = probe(&drain(&mut a_commands));
-    assert!(drain(&mut b_commands).is_empty());
-    assert!(!remotes.has_pending_stream_ack_publication());
-    assert!(!remotes.has_pending_max_data_publication());
     assert!(
-        !remotes.has_pending_feedback_publication(),
-        "skipped catch-up is not eligible capacity work"
+        drain(&mut a_commands).is_empty(),
+        "a blocked sibling cannot duplicate already published facts"
     );
-    let deadline = remotes.feedback_deadline().unwrap();
-    received.receive_data(3, Bytes::from_static(b"x")).unwrap();
-    remotes.publish_stream_ack_with_context(
-        &context,
-        4,
-        received.take_ack_update(),
-        received.ack_frames(),
-    );
-    assert_eq!(
-        remotes.feedback_deadline(),
-        Some(deadline),
-        "new DATA cannot renew the proof round"
-    );
-    drain(&mut a_commands);
-    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-    remotes.prepare_feedback_route(&context);
-    assert!(
-        remotes.has_pending_stream_ack_publication(),
-        "expiry makes skipped ACK debt eligible again"
-    );
-    assert!(
-        remotes.has_pending_max_data_publication(),
-        "expiry makes skipped MAX debt eligible again"
-    );
-    remotes.retry_pending_feedback_with_context(&context);
-    let catchup = drain(&mut b_commands);
-    assert!(
-        catchup
-            .iter()
-            .any(|f| matches!(f, Frame::StreamAck { ranges, .. }
-        if ranges == &vec![OffsetRange { start: 0, end: 4 }]))
-    );
-    assert!(catchup.iter().any(|frame| matches!(frame,
-        Frame::StreamMaxData { max_offset, .. } if *max_offset == selected_max)));
-    assert!(!remotes.receive_feedback_receipt(&context, expired_token));
-    let current_b = probe(&catchup);
+    assert!(remotes.has_pending_feedback_publication());
+    assert_eq!(drain(&mut b_commands), vec![Frame::Ping { nonce: 7 }]);
+    // The one-slot sibling admits current MAX and its retained ACK on separate turns.
+    let mut recovered = Vec::new();
+    for _ in 0..2 {
+        remotes.retry_pending_feedback_with_context(&context);
+        recovered.extend(drain(&mut b_commands));
+    }
+    assert_eq!(recovered.len(), 2);
+    assert!(recovered.contains(&Frame::StreamMaxData {
+        stream_id,
+        max_offset: latest_max
+    }));
+    assert!(recovered.iter().any(|f| matches!(f, Frame::StreamAck { ranges, .. } if ranges == &vec![OffsetRange { start: 0, end: 3 }])));
+    assert!(!remotes.has_pending_feedback_publication());
+    assert!(drain(&mut a_commands).is_empty());
+
     let old_b = remotes.paths[1].instance();
     remotes.remove_path_instance(old_b).unwrap();
     let (replacement, _replacement_input, mut replacement_commands) =
         opened_stream_at(stream_id, 1);
     remotes.attach(replacement);
     assert_ne!(remotes.paths[1].instance(), old_b);
-    assert!(
-        !remotes.receive_feedback_receipt(&context, current_b),
-        "key reuse cannot inherit a proof token"
-    );
-    drain(&mut a_commands);
-    drain(&mut replacement_commands);
-    remotes.finish_feedback_route();
     remotes.retry_pending_feedback_with_context(&context);
-    assert!(remotes.feedback_deadline().is_none());
+    let replay = drain(&mut replacement_commands);
+    assert!(replay.contains(&Frame::StreamMaxData {
+        stream_id,
+        max_offset: latest_max
+    }));
+    assert!(replay.iter().any(|f| matches!(f, Frame::StreamAck { ranges, .. } if ranges == &vec![OffsetRange { start: 0, end: 3 }])));
     assert!(
-        drain(&mut replacement_commands)
+        replay
             .iter()
-            .any(|f| matches!(f, Frame::StreamAck { .. })),
-        "terminal mode catches up a replacement without proof traffic"
+            .all(|f| !matches!(f, Frame::StreamFeedbackProbe { .. }))
     );
+    remotes.retry_pending_feedback_with_context(&context);
+    assert!(drain(&mut replacement_commands).is_empty());
+    assert!(drain(&mut a_commands).is_empty());
 }
 
 #[tokio::test]

@@ -42,7 +42,9 @@ pub(super) use delivery::{
     CarrierPathFlight, product_flights_have_recent_reinjection_overlap,
     release_carrier_path_flight_ranges,
 };
-pub(in crate::runtime) use delivery::{ResponseDataAckRecoveryCandidate, ResponseDataAckRelease};
+pub(in crate::runtime) use delivery::{
+    ResponseCreditFrontierProof, ResponseDataAckRecoveryCandidate, ResponseDataAckRelease,
+};
 pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 pub(in crate::runtime) use prepared::{ResponsePreparedNativeInputs, ResponsePreparedOutput};
@@ -293,7 +295,7 @@ impl ResponseStreamBinding {
                 original_data_in_flight_bytes: 0,
                 data_level_queue_bytes: 0,
                 feedback: Default::default(),
-                feedback_route: Default::default(),
+
                 applied_peer_max_offset: 0,
                 admitted_max_data_offset: 0,
                 next_requalification_probe_id: Some(1),

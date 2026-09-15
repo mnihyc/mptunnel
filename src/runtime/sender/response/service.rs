@@ -56,8 +56,8 @@ use crate::runtime::sender::{
     sender_reinjection_minimum_useful_attempt_bytes,
 };
 use crate::runtime::stream::response::{
-    ResponseAcquisitionOutputId, ResponseDispatchTarget, ResponseSenderPathTarget,
-    ResponseStreamBinding,
+    ResponseAcquisitionOutputId, ResponseCreditFrontierProof, ResponseDispatchTarget,
+    ResponseSenderPathTarget, ResponseStreamBinding,
 };
 use crate::runtime::stream::{
     ReliablePathStream, ReliablePathStreamOutput, RequalificationAttempt,
@@ -258,6 +258,7 @@ pub(in crate::runtime) struct StaleResponseRecoveryOutcome {
 pub(in crate::runtime) struct ResponsePreparedRecoveryCandidate {
     /// Speculative Latency authority; final admission excludes all prior copy debt.
     pub(in crate::runtime) early_completion_copy: bool,
+    pub(in crate::runtime) credit_frontier: Option<ResponseCreditFrontierProof>,
     pub(in crate::runtime) frame: Frame,
     pub(in crate::runtime) target: ResponseDispatchTarget,
     pub(in crate::runtime) cause: RelaySendCause,
@@ -271,9 +272,8 @@ pub(in crate::runtime) struct ResponsePreparedRecoveryObservation {
 }
 
 impl ServerResponseSenderService {
-    /// Cross only accepted, currently suppressed coverage, then evaluate the
-    /// first remaining exact assignment extent. Queued intent is a stop, not
-    /// receiver progress or authority to skip a younger prefix.
+    /// First offer a matured, credit-blocking contiguous frontier to a vacant
+    /// target. Otherwise preserve the ordinary accepted-coverage pipeline.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn next_prepared_recovery(
         &self,
@@ -285,21 +285,76 @@ impl ServerResponseSenderService {
         ready: &[ResponseAcquisitionOutputId],
         observed_at: Instant,
     ) -> ResponsePreparedRecoveryObservation {
-        let mux_limits = binding.mux_limits();
-        let (covered, next_deadline) = binding.prepared_recovery_coverage(observed_at);
-        let mut result = ResponsePreparedRecoveryObservation {
-            candidate: None,
-            next_deadline,
-        };
+        let (covered, mut next_deadline) = binding.prepared_recovery_coverage(observed_at);
         let retained = send_stream.retained_ranges_in_scope(OffsetRange {
             start: send_stream.data_ack_frontier(),
             end: send_stream.next_offset(),
         });
-        let Some(mut range) = offset_ranges_not_covered(&retained, &covered)
+        if send_stream.next_offset() == send_stream.peer_max_offset()
+            && let Some(range) = retained.first().copied()
+            && range.start == send_stream.data_ack_frontier()
+            && covered
+                .iter()
+                .any(|copy| copy.start <= range.start && copy.end > range.start)
+        {
+            let exceptional = self.prepared_recovery_for_range(
+                binding,
+                send_stream,
+                authoritative_ack,
+                lane,
+                targets,
+                ready,
+                observed_at,
+                range,
+                true,
+                next_deadline,
+            );
+            if exceptional.candidate.is_some() {
+                return exceptional;
+            }
+            next_deadline = exceptional.next_deadline;
+        }
+        let Some(range) = offset_ranges_not_covered(&retained, &covered)
             .first()
             .copied()
         else {
-            return result;
+            return ResponsePreparedRecoveryObservation {
+                candidate: None,
+                next_deadline,
+            };
+        };
+        self.prepared_recovery_for_range(
+            binding,
+            send_stream,
+            authoritative_ack,
+            lane,
+            targets,
+            ready,
+            observed_at,
+            range,
+            false,
+            next_deadline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepared_recovery_for_range(
+        &self,
+        binding: &ResponseStreamBinding,
+        send_stream: &ReliableSendStream,
+        authoritative_ack: &AuthoritativeStreamAckSnapshot,
+        lane: TrafficClass,
+        targets: &[ResponseSenderPathTarget],
+        ready: &[ResponseAcquisitionOutputId],
+        observed_at: Instant,
+        mut range: OffsetRange,
+        credit_frontier: bool,
+        next_deadline: Option<Instant>,
+    ) -> ResponsePreparedRecoveryObservation {
+        let mux_limits = binding.mux_limits();
+        let mut result = ResponsePreparedRecoveryObservation {
+            candidate: None,
+            next_deadline,
         };
         for queued in self.queue.queued_reinjection_ranges() {
             if queued.start <= range.start && queued.end > range.start {
@@ -382,11 +437,17 @@ impl ServerResponseSenderService {
                 .and_then(|snapshot| scheduler::score_path(snapshot, lane, 0))
                 .filter(|score| score.eta_ms.is_finite())
                 .map(|score| Duration::from_secs_f64(score.eta_ms.max(0.0) / 1_000.0));
-            let avoid = frontier
+            let mut avoid = frontier
                 .avoid
                 .iter()
                 .map(|identity| (identity.key, identity.incarnation))
                 .collect::<Vec<_>>();
+            if credit_frontier {
+                // A different physical output in an already occupied configured
+                // slot is not an executable rescue. Do not let it hide normal
+                // later recovery until final Apply discovers the same debt.
+                avoid.extend(binding.reinjection_avoid_outputs_for_frame(preview));
+            }
             let available = targets
                 .iter()
                 .filter(|target| {
@@ -434,7 +495,7 @@ impl ServerResponseSenderService {
                 })
                 .filter(|score| score.eta_ms.is_finite())
                 .map(|score| Duration::from_secs_f64(score.eta_ms.max(0.0) / 1_000.0));
-            let deadline = if proven {
+            let deadline = if proven && !credit_frontier {
                 timing
                     .target_deadline(completion, owner_completion, observed_at)
                     .unwrap_or(timing.fallback_at)
@@ -443,9 +504,10 @@ impl ServerResponseSenderService {
             };
             // Only a not-yet-due completion needs speculative authority.
             // Raw historical copy debt cannot grant traversal past a spent head.
-            let early_prefix = (deadline > observed_at && lane == TrafficClass::Latency)
-                .then(|| binding.uncopied_completion_prefix(scored))
-                .flatten();
+            let early_prefix =
+                (!credit_frontier && deadline > observed_at && lane == TrafficClass::Latency)
+                    .then(|| binding.uncopied_completion_prefix(scored))
+                    .flatten();
             if let Some(prefix) = early_prefix
                 && prefix.end < scored.end
             {
@@ -524,8 +586,31 @@ impl ServerResponseSenderService {
             } else {
                 RelaySendCause::response_completion_tail_reinjection(identity, snapshot)
             };
+            let credit_frontier = if credit_frontier {
+                let Some((start, end, _)) =
+                    crate::protocol::frame::reliable_stream_frame_extent(&frames[0])
+                else {
+                    return result;
+                };
+                let range = OffsetRange { start, end };
+                let Some(exact) = binding.live_owner_uniform_frontier(range) else {
+                    return result;
+                };
+                if exact.range != range || exact.owners != [owner] {
+                    return result;
+                }
+                Some(ResponseCreditFrontierProof {
+                    range,
+                    owner,
+                    owner_assignments: exact.owner_assignments,
+                    fallback_at: timing.fallback_at,
+                })
+            } else {
+                None
+            };
             result.candidate = Some(ResponsePreparedRecoveryCandidate {
                 early_completion_copy,
+                credit_frontier,
                 frame: frames[0].clone(),
                 target: ResponseDispatchTarget::from(&target),
                 cause,
@@ -551,12 +636,22 @@ impl ServerResponseSenderService {
             return Err(RuntimeError::SenderServiceBlocked);
         };
         let range = OffsetRange { start, end };
+        if candidate.credit_frontier.as_ref().is_some_and(|proof| {
+            candidate.early_completion_copy
+                || send_stream.next_offset() != send_stream.peer_max_offset()
+                || start != send_stream.data_ack_frontier()
+                || proof.range != range
+                || proof.fallback_at > Instant::now()
+        }) {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
         if (candidate.early_completion_copy
             && (candidate.lane != TrafficClass::Latency || binding.lane() != TrafficClass::Latency))
             || self.queue.has_queued_reinjection_overlap(&candidate.frame)
-            || binding
-                .reinjection_suppression_deadline(&candidate.frame)
-                .is_some()
+            || (candidate.credit_frontier.is_none()
+                && binding
+                    .reinjection_suppression_deadline(&candidate.frame)
+                    .is_some())
             || exact_contiguous_retransmission_frames(send_stream, range)
                 .is_none_or(|frames| frames.len() != 1 || frames[0] != candidate.frame)
             || response_reinjection_avoid_outputs(binding, &candidate.frame, candidate.cause)
@@ -578,6 +673,7 @@ impl ServerResponseSenderService {
             current_native_shape,
             ready,
             candidate.early_completion_copy,
+            candidate.credit_frontier.as_ref(),
         )?;
         self.optional_reinjection
             .record_reinjection(reliable_stream_frame_accounted_bytes(&candidate.frame));

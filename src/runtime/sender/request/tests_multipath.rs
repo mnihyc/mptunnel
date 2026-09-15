@@ -73,6 +73,15 @@ impl PreparedCompletionFixture {
             "tcp://127.0.0.1:10431?initial-srtt-s=1&initial-rate-mbps=200",
             "tcp://127.0.0.1:10432?initial-srtt-s=0.02&initial-rate-mbps=200",
         ]);
+        let initial_max_offset = context.mux_limits.max_stream_window_bytes;
+        Self::with_initial_credit(context, initial_max_offset, 4096)
+    }
+
+    fn with_initial_credit(
+        context: ClientPathContext,
+        initial_max_offset: u64,
+        original_bytes: usize,
+    ) -> Self {
         let stream_id = StreamId(431);
         let (commands, mut owner_receivers) = reliable_path_command_channels(8);
         let (mut remotes, input) =
@@ -82,9 +91,13 @@ impl PreparedCompletionFixture {
         context.install_relay_path_instance_for_test(owner);
         context.mark_tcp_path_open_success(0, Duration::from_secs(1), TrafficClass::Latency);
         let mut sender = super::super::RequestSenderService::new(stream_id);
-        let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+        let mut send_stream = ReliableSendStream::new_with_initial_max_offset(
+            stream_id,
+            context.mux_limits,
+            initial_max_offset,
+        );
         let original = send_stream
-            .send_data(Bytes::from(vec![0x5a; 4096]))
+            .send_data(Bytes::from(vec![0x5a; original_bytes]))
             .unwrap();
         sender
             .send_frame(
@@ -184,6 +197,9 @@ impl PreparedCompletionFixture {
         );
     }
 }
+
+#[path = "tests_credit_frontier.rs"]
+mod credit_frontier;
 
 #[tokio::test]
 async fn prepared_latency_completion_uses_real_ready_apply_once_and_refusal_spends_nothing() {

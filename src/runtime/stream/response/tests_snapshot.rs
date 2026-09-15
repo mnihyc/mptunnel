@@ -696,7 +696,7 @@ fn newer_switchable_product_rate_changes_scalar_ranking_without_rewriting_author
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
         feedback: Default::default(),
-        feedback_route: Default::default(),
+
         applied_peer_max_offset: 0,
         admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
@@ -1684,7 +1684,7 @@ fn sole_quic_output_retains_native_exploration_after_rate_expiry_without_shrinki
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
         feedback: Default::default(),
-        feedback_route: Default::default(),
+
         applied_peer_max_offset: 0,
         admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
@@ -1763,7 +1763,7 @@ fn partial_udp_product_epoch_survives_for_diagnostics_without_becoming_completio
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
         feedback: Default::default(),
-        feedback_route: Default::default(),
+
         applied_peer_max_offset: 0,
         admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
@@ -2049,7 +2049,7 @@ fn best_live_path_uses_completion_score_including_command_queue() {
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
         feedback: Default::default(),
-        feedback_route: Default::default(),
+
         applied_peer_max_offset: 0,
         admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
@@ -2092,7 +2092,7 @@ fn best_live_path_uses_peer_available_before_faster_backup() {
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
         feedback: Default::default(),
-        feedback_route: Default::default(),
+
         applied_peer_max_offset: 0,
         admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
@@ -2165,7 +2165,7 @@ fn response_source_admission_sums_only_the_exact_preferred_output_tier() {
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
         feedback: Default::default(),
-        feedback_route: Default::default(),
+
         applied_peer_max_offset: 0,
         admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),
@@ -2253,7 +2253,7 @@ fn closed_and_draining_outputs_are_excluded_from_new_product_selection() {
         original_data_in_flight_bytes: 0,
         data_level_queue_bytes: 0,
         feedback: Default::default(),
-        feedback_route: Default::default(),
+
         applied_peer_max_offset: 0,
         admitted_max_data_offset: 0,
         next_requalification_probe_id: Some(1),

@@ -16,7 +16,9 @@ use crate::model::requalification::StreamPathQualification;
 use crate::model::response::ResponsePathObservation;
 #[cfg(test)]
 use crate::protocol::PathId;
-use crate::protocol::{ConfiguredMemberSlot, Frame, PathUsage, StreamId, UnderlayProtocol};
+use crate::protocol::{
+    ConfiguredMemberSlot, Frame, PathUsage, SessionId, StreamId, UnderlayProtocol,
+};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::commands::{
@@ -28,7 +30,6 @@ use crate::runtime::stream::feedback::{
     StreamFeedbackPublication, StreamFeedbackPublicationCursor, StreamFeedbackService,
     StreamFeedbackState,
 };
-use crate::runtime::stream::feedback_route::StreamFeedbackRoute;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use crate::transport::RateHint;
 use std::sync::atomic::Ordering;
@@ -225,7 +226,6 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
     pub(super) data_level_queue_bytes: u64,
     /// Sole materialized latest ACK and receive-grant owner, shared by outputs.
     pub(super) feedback: StreamFeedbackState,
-    pub(super) feedback_route: StreamFeedbackRoute<ServerReinjectionOutputIdentity>,
     /// Actual peer credit applied by the logical actor, never a probe grant.
     pub(super) applied_peer_max_offset: u64,
     /// Greatest grant actually admitted, including an output later detached.
@@ -240,9 +240,9 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
 fn service_feedback(
     outputs: &mut ResponseStreamOutputs,
     stream_id: StreamId,
+    _session_id: SessionId,
     update_frames: Option<&[Frame]>,
 ) -> StreamFeedbackPublication {
-    prepare_feedback_route(outputs, Instant::now());
     let mut publication = StreamFeedbackPublication {
         ack_generation: outputs.feedback.ack_generation,
         ..Default::default()
@@ -255,10 +255,8 @@ fn service_feedback(
             entry.pending_feedback_receipt = None;
             continue;
         }
+        #[cfg(feature = "lab-diagnostics")]
         let identity = feedback_output_identity(entry);
-        let allow_facts = outputs
-            .feedback_route
-            .requires_output(identity, feedback_baseline_ready(entry));
         let receipt = entry
             .pending_feedback_receipt
             .filter(|(_, required)| *required <= outputs.applied_peer_max_offset)
@@ -269,26 +267,17 @@ fn service_feedback(
             update_frames,
             stream_id,
             &mut entry.published_max_data_offset,
-            StreamFeedbackService {
-                allow_facts,
-                probe: outputs.feedback_route.probe_for(identity),
-                receipt,
-            },
+            StreamFeedbackService { receipt },
             |frame| {
                 commands
                     .try_enqueue_admitted_frame(frame, TrafficClass::Control)
                     .is_ok()
             },
         );
-        if let Some(token) = attachment.probe_admitted {
-            outputs
-                .feedback_route
-                .record_probe_admission(identity, token);
-        }
         if attachment.receipt_admitted.is_some() {
             #[cfg(feature = "lab-diagnostics")]
-            super::super::feedback_route::lab_feedback_return(
-                outputs.feedback_route.diagnostic_scope(),
+            super::super::feedback::lab_feedback_return(
+                Some((_session_id, stream_id)),
                 "reply_admitted",
                 format_args!(
                     "output={:?} token={:?} required_max_offset={:?} applied_peer_max_offset={}",
@@ -315,51 +304,6 @@ fn feedback_output_identity(entry: &ResponseStreamOutputEntry) -> ServerReinject
     }
 }
 
-fn feedback_baseline_ready(entry: &ResponseStreamOutputEntry) -> bool {
-    entry.ack_publication.has_ack_baseline() && entry.published_max_data_offset > 0
-}
-
-fn prepare_feedback_route(outputs: &mut ResponseStreamOutputs, now: Instant) {
-    let live: Vec<_> = outputs
-        .entries
-        .iter()
-        .filter(|entry| !entry.commands.control_frame_admission_is_closed())
-        .map(feedback_output_identity)
-        .collect();
-    let entries = &outputs.entries;
-    outputs
-        .feedback_route
-        .prepare(&outputs.feedback, &live, now, |identity| {
-            let entry = entries
-                .iter()
-                .find(|entry| feedback_output_identity(entry) == identity)
-                .expect("live feedback identity comes from this binding");
-            if let Some(shape) = entry.native_scheduling_shape.filter(|shape| {
-                let scope = shape.stamp().scope();
-                scope.carrier_instance_id() == entry.path_instance_id
-                    && scope.direction() == crate::protocol::PathMetricDirection::ServerToClient
-                    && !shape.srtt().is_zero()
-            }) {
-                return crate::model::timing::transport_pto_from_ms(
-                    shape.srtt().as_secs_f64() * 1000.0,
-                    shape.rttvar().as_secs_f64() * 1000.0,
-                );
-            }
-            super::evidence::server_output_local_path_metrics(entry)
-                // Like the native controller, retain exact local RTT across
-                // idle periods. Rate freshness is a different authority; the
-                // frozen proof deadline estimates failure-detection delay,
-                // not current service quality or available capacity.
-                .filter(|metrics| metrics.metrics.srtt_us > 0)
-                .map_or_else(crate::model::timing::default_transport_pto, |metrics| {
-                    crate::model::timing::transport_pto_from_ms(
-                        f64::from(metrics.metrics.srtt_us) / 1000.0,
-                        f64::from(metrics.metrics.jitter_us) / 1000.0,
-                    )
-                })
-        });
-}
-
 fn feedback_status(outputs: &ResponseStreamOutputs) -> StreamFeedbackPublication {
     let generation = outputs.feedback.ack_generation;
     let mut publication = StreamFeedbackPublication {
@@ -370,12 +314,6 @@ fn feedback_status(outputs: &ResponseStreamOutputs) -> StreamFeedbackPublication
         (outputs.admitted_max_data_offset > 0).then_some(outputs.admitted_max_data_offset);
     for entry in &outputs.entries {
         if entry.commands.control_frame_admission_is_closed() {
-            continue;
-        }
-        if !outputs.feedback_route.requires_output(
-            feedback_output_identity(entry),
-            feedback_baseline_ready(entry),
-        ) {
             continue;
         }
         let ack_pending = entry.ack_publication.is_pending(generation);
@@ -456,11 +394,12 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         outputs.feedback.ack_generation = generation;
         outputs.feedback.cumulative_ack_frames = cumulative_frames;
-        #[cfg(feature = "lab-diagnostics")]
-        outputs
-            .feedback_route
-            .set_diagnostic_scope(self.session_id, stream_id);
-        service_feedback(&mut outputs, stream_id, Some(update_frames))
+        service_feedback(
+            &mut outputs,
+            stream_id,
+            self.session_id,
+            Some(update_frames),
+        )
     }
 
     pub(in crate::runtime) fn retry_pending_ack(
@@ -471,11 +410,7 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        #[cfg(feature = "lab-diagnostics")]
-        outputs
-            .feedback_route
-            .set_diagnostic_scope(self.session_id, stream_id);
-        service_feedback(&mut outputs, stream_id, None)
+        service_feedback(&mut outputs, stream_id, self.session_id, None)
     }
 
     /// Observe durable admitted credit and current exact-recipient ACK fences.
@@ -511,6 +446,7 @@ impl ResponseStreamBinding {
     /// its preceding ACK/MAX transactions. Captured reply identity never moves.
     pub(in crate::runtime) fn record_feedback_probe(
         &self,
+        _stream_id: StreamId,
         output: ServerReinjectionOutputIdentity,
         token: u64,
         required_max_offset: u64,
@@ -520,7 +456,7 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         #[cfg(feature = "lab-diagnostics")]
-        let diagnostic_scope = outputs.feedback_route.diagnostic_scope();
+        let diagnostic_scope = Some((self.session_id, _stream_id));
         if let Some(entry) = outputs.entries.iter_mut().find(|entry| {
             feedback_output_identity(entry) == output
                 && !entry.commands.control_frame_admission_is_closed()
@@ -529,7 +465,7 @@ impl ResponseStreamBinding {
             .is_none_or(|(previous, _)| token >= previous)
         {
             #[cfg(feature = "lab-diagnostics")]
-            super::super::feedback_route::lab_feedback_return(
+            super::super::feedback::lab_feedback_return(
                 diagnostic_scope,
                 "reply_bound",
                 format_args!(
@@ -541,7 +477,7 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(in crate::runtime) fn service_feedback_route(
+    pub(in crate::runtime) fn service_feedback_replies(
         &self,
         stream_id: StreamId,
         applied_peer_max_offset: u64,
@@ -552,49 +488,10 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         outputs.applied_peer_max_offset =
             outputs.applied_peer_max_offset.max(applied_peer_max_offset);
-        #[cfg(feature = "lab-diagnostics")]
-        outputs
-            .feedback_route
-            .set_diagnostic_scope(self.session_id, stream_id);
-        service_feedback(&mut outputs, stream_id, None)
+        service_feedback(&mut outputs, stream_id, self.session_id, None)
     }
 
-    pub(in crate::runtime) fn receive_feedback_receipt(
-        &self,
-        stream_id: StreamId,
-        token: u64,
-    ) -> StreamFeedbackPublication {
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        #[cfg(feature = "lab-diagnostics")]
-        outputs
-            .feedback_route
-            .set_diagnostic_scope(self.session_id, stream_id);
-        let now = Instant::now();
-        prepare_feedback_route(&mut outputs, now);
-        outputs.feedback_route.receive_receipt(token, now);
-        service_feedback(&mut outputs, stream_id, None)
-    }
-
-    pub(in crate::runtime) fn finish_feedback_route(&self) {
-        self.outputs
-            .lock()
-            .expect("server reliable stream binding lock")
-            .feedback_route
-            .finish();
-    }
-
-    pub(in crate::runtime) fn feedback_route_deadline(&self) -> Option<Instant> {
-        self.outputs
-            .lock()
-            .expect("server reliable stream binding lock")
-            .feedback_route
-            .next_deadline()
-    }
-
-    pub(in crate::runtime) fn feedback_route_capacity_notifies(
+    pub(in crate::runtime) fn feedback_reply_capacity_notifies(
         &self,
     ) -> Vec<std::sync::Arc<tokio::sync::Notify>> {
         let outputs = self
@@ -606,13 +503,9 @@ impl ResponseStreamBinding {
             .iter()
             .filter(|entry| {
                 !entry.commands.control_frame_admission_is_closed()
-                    && (outputs
-                        .feedback_route
-                        .probe_for(feedback_output_identity(entry))
-                        .is_some()
-                        || entry.pending_feedback_receipt.is_some_and(|(_, required)| {
-                            required <= outputs.applied_peer_max_offset
-                        }))
+                    && entry
+                        .pending_feedback_receipt
+                        .is_some_and(|(_, required)| required <= outputs.applied_peer_max_offset)
             })
             .map(|entry| entry.commands.capacity_notify())
             .collect()
@@ -634,10 +527,6 @@ impl ResponseStreamBinding {
             .iter()
             .filter(|entry| {
                 !entry.commands.control_frame_admission_is_closed()
-                    && outputs.feedback_route.requires_output(
-                        feedback_output_identity(entry),
-                        feedback_baseline_ready(entry),
-                    )
                     && entry.ack_publication.is_pending(generation)
             })
             .map(|entry| entry.commands.capacity_notify())
@@ -656,11 +545,7 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         outputs.feedback.max_data_offset = outputs.feedback.max_data_offset.max(max_offset);
-        #[cfg(feature = "lab-diagnostics")]
-        outputs
-            .feedback_route
-            .set_diagnostic_scope(self.session_id, stream_id);
-        service_feedback(&mut outputs, stream_id, None)
+        service_feedback(&mut outputs, stream_id, self.session_id, None)
     }
 
     pub(in crate::runtime) fn retry_pending_max_data(
@@ -671,11 +556,7 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        #[cfg(feature = "lab-diagnostics")]
-        outputs
-            .feedback_route
-            .set_diagnostic_scope(self.session_id, stream_id);
-        service_feedback(&mut outputs, stream_id, None)
+        service_feedback(&mut outputs, stream_id, self.session_id, None)
     }
 
     pub(in crate::runtime) fn has_pending_max_data_publication(&self) -> bool {
@@ -685,10 +566,6 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         outputs.entries.iter().any(|entry| {
             !entry.commands.control_frame_admission_is_closed()
-                && outputs.feedback_route.requires_output(
-                    feedback_output_identity(entry),
-                    feedback_baseline_ready(entry),
-                )
                 && entry.published_max_data_offset < outputs.feedback.max_data_offset
         })
     }
@@ -705,10 +582,6 @@ impl ResponseStreamBinding {
             .iter()
             .filter(|entry| {
                 !entry.commands.control_frame_admission_is_closed()
-                    && outputs.feedback_route.requires_output(
-                        feedback_output_identity(entry),
-                        feedback_baseline_ready(entry),
-                    )
                     && entry.published_max_data_offset < outputs.feedback.max_data_offset
             })
             .map(|entry| entry.commands.capacity_notify())
@@ -1070,9 +943,6 @@ impl ResponseStreamBinding {
         // remains available to every live successor.
         entry.ack_publication = StreamFeedbackPublicationCursor::default();
         entry.pending_feedback_receipt = None;
-        outputs
-            .feedback_route
-            .forget_output(feedback_output_identity(&entry));
         let output_incarnation = entry.incarnation;
         outputs.detaching.push(entry);
         self.clear_request_feedback_ingress_if(key, path_instance_id);

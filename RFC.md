@@ -1509,8 +1509,8 @@ Processing newly received unique Product bytes marks Data ACK state pending.
 Materializing the next publication advances one local generation. Before the
 serialized receive actor parks or yields its bounded cooperative turn, it MUST
 offer the latest pending generation independently to every currently eligible
-exact attachment under Section 8.4.1 (all live attachments without confirmed
-return selection). Several frames processed in that turn coalesce into the
+exact attachment with open control admission under Section 8.4.1. Several
+frames processed in that turn coalesce into the
 latest receive evidence; ACK publication never waits for an application read
 or another Product frame.
 
@@ -1627,81 +1627,60 @@ pending flush, so servicing another protocol event cannot replay accepted bytes.
 capacity and native congestion state are additional local constraints, not
 alternate MPP receive windows.
 
-### 8.4.1 Confirmed return service
+### 8.4.1 Independent return service
 
-Without live proof, ACK/MAX publication MUST independently serve every live
-exact attachment. An endpoint MAY reduce redundant subsequent publication to
-one confirmed output, using `STREAM_FEEDBACK_PROBE(stream_id, token, max_offset)`
-and `STREAM_FEEDBACK_RECEIPT(stream_id, token)`. First-generation feedback,
-each new attachment's complete ACK and meaningful receive-credit baseline,
-and terminal feedback MUST retain full fanout. Single-output or quiescent
-streams require no redundancy-reduction probe.
+ACK/MAX publication MUST independently serve every live exact attachment whose
+control admission remains open, in both stream directions. Each output retains
+its own actual publication fences. A blocked output MUST NOT suppress service
+on a sibling, and another output's accepted generation or MAX MUST NOT be
+borrowed as its own fence. First-generation, steady-state, new-attachment and
+terminal feedback follow the same independent publication rule. A single live
+output uses that same service without redundant copies.
 
-Discovery retains full fanout while offering at most one probe per exact output.
-An attempt captures the output incarnation, a non-reused stream-directional
-token, its current ACK generation and MAX offset, and a fixed deadline. The
-probe MUST use the same ordinary FIFO and native stream as preceding ACK/MAX,
-never a command bypass or QUIC repair stream. Once the captured ACK job and
-MAX admission fences are covered, the probe receives the next ordinary
-admission opportunity before newer feedback. Otherwise continuous feedback
-could starve its own validation. ACK/MAX remains immediate and pipelined;
-data service MUST NOT wait for a proof receipt.
+The receive owner retains one latest truthful ACK/MAX state. Advances processed
+within one cooperative turn coalesce before publication; an already-published
+unchanged generation creates no new periodic work. Each blocked exact output
+retains at most the finite unfinished ACK job and latest pending MAX defined in
+Sections 8.3 and 8.4. Newer generations MUST NOT restart an immutable unsent ACK
+tail. ACK chunks and pending MAX retain alternating successful service, so a
+large catch-up job cannot starve released receive credit. Queue-capacity and
+membership wakes retry only actual pending work. Closed control admission drops
+that output's pending publication ownership while preserving the attachment's
+existing lifecycle and flight obligations.
 
-Only the actual logical stream owner may reply, after applying preceding ACK
-transactions and real received MAX through the probe's required offset. A
-coalesced MAX input MUST be reconciled before this test. The probe's offset
-is a requirement, not a credit grant. Registry enqueue success, native write
-completion, Ping/Pong, or an unknown/closed stream does not constitute this
-proof. Retain at most one pending reply tuple per captured live reply output;
-do not retarget a tuple after waiting for its mailbox or output capacity.
-Replies use ordinary FIFO service, are single-copy, and do not elicit replies.
+Publication is a nonblocking offer to each carrier queue, not a wait for every
+carrier to transmit or acknowledge. Actual native admission, pacing, congestion
+control and FIFO service remain in force. Duplicate ACKs remain idempotent
+receipt facts, and repeated MAX values remain one shared monotone grant; they
+create no extra receive window, flight release or delivery attribution.
 
-The first timely receipt for an actually admitted current token selects the
-PROBED local output, not the receipt's ingress. The reply carrier is merely
-authenticated return service; the still-live exact probed incarnation and
-pending token supply proof authority. Other discovery tokens become obsolete.
-Subsequent rounds validate only the selected output. A receipt changes only
-feedback publication policy: it MUST NOT release data/flight, grant credit,
-requalify an attachment, or create delivery samples or progress-clock evidence.
+Historical proof of FIFO/logical-owner/reply service is not current one-way
+service evidence. Neither a transport-derived proof-validity interval nor a
+receipt for an older feedback cut permits suppressing newer ACK/MAX on other
+live attachments. This sender policy does not originate route-selection probes
+or retain exclusive-selection validation deadlines. Independent publication
+trades additional control traffic and processing for removal of that policy
+wait. Per-output catch-up can retain cumulative range work, so bounded pending
+storage does not imply negligible CPU, memory or shared-link cost.
 
-Selected validation is stop-and-wait for probes only: at most one round is
-outstanding, while ACK/MAX remains immediate and pipelined. When no round is
-outstanding, new feedback needing validation starts a deadline before marker
-admission, including when its output queue is blocked. Use the existing native
-PTO estimate from that exact local sender, or the existing default PTO when
-unavailable; retained native RTT does not require an available delivery-rate
-measurement. The round's deadline MUST NOT renew with further data, retries
-or changing RTT. New facts behind its marker update only the desired ACK/MAX
-cut; they do not start a separate successor deadline.
+`STREAM_FEEDBACK_PROBE(stream_id, token, max_offset)` and
+`STREAM_FEEDBACK_RECEIPT(stream_id, token)` remain valid wire messages. A probe
+received from a peer MUST retain its ordered logical-owner semantics. Only the
+actual logical stream owner may reply, after applying preceding ACK transactions
+and real received MAX through the probe's required offset. A coalesced MAX input
+MUST be reconciled before this test. The probe's offset is a requirement, not a
+credit grant. Registry enqueue success, native write completion, Ping/Pong, or
+an unknown/closed stream does not supply this authority.
 
-A timely current receipt completes that round. If the desired cut is newer
-than the proven cut, the owner MUST immediately prepare the next round with
-its own frozen native interval, before waiting for any later event. Otherwise
-the selected route may remain idle without a probe; first resumed work starts
-a new round. Expiry MUST be serviced during retained application writes, flush
-and shutdown, before accepting a simultaneously late receipt. Neither a
-duplicate nor an obsolete receipt can start or renew a validation round.
-
-Missing proof, exact output loss or closed admission restores full fanout for
-the latest AND all future feedback until new proof. Previously skipped outputs
-retain their actual fences and use Section 8.3 finite cumulative catch-up;
-another output's fence cannot be borrowed. Terminal processing invalidates
-selection and probe authority. Tokens MUST NOT wrap into an old receipt's
-identity; exhaustion leaves baseline fanout.
-
-This is proof of FIFO/logical-owner/reply service, not bandwidth or one-way
-quality. A timely incumbent need not be the fastest available output. Reducing
-healthy duplication deliberately adds failure-detection delay before alternate
-publication. After permanent loss of proof service, at most one outstanding
-pre-failure receipt can still validate selection; the next round cannot obtain
-new proof and must expire. With outstanding newer feedback, fallback eligibility
-is therefore bounded by the old round's remaining interval plus one new frozen
-interval and actual actor service. Without such newer feedback there is no
-publication obligation until work resumes. This is a route-liveness bound, not
-a separate deadline for every feedback fact. Actual alternate queue/transport
-service remains additional, so it is not a universal recovery bound. Native
-congestion control, ACK fact generation, receive credit and data-path eligibility
-are unchanged.
+Retain at most one pending reply tuple per captured live reply output. Do not
+retarget a tuple after waiting for mailbox or output capacity. Replies use the
+ordinary FIFO, are single-copy, and do not elicit replies. Exact attachment
+replacement, closure and terminal state retain their existing invalidation
+rules. A received receipt MUST NOT release data or flight, grant credit,
+requalify an attachment, select a feedback output, or create delivery samples
+or progress-clock evidence. With no locally originated token, it is ignored as
+having no actionable proof authority. Keeping peer-probe handling does not
+adopt a peer's optional return-selection policy for this endpoint's own facts.
 
 ### 8.5 Completion, detach, and reset
 
@@ -3758,6 +3737,8 @@ For a retained candidate range `r` and target `t`, define:
 - `S(s,r)`: no accepted ReinjectedData copy overlapping `r`, whose exact
   attachment remains in current Product membership, retains an unexpired
   immutable suppression deadline `D`;
+- `C(s,r)`: the exact current credit-blocking frontier has the matured
+  authority specified in Section 15.2.3;
 - `Q(s,r,t)`: the cause-specific retained service extent after the configured
   repair, path-flight, stream, and range bounds; and
 - `N(t)`: the exact queue/native reservation can commit.
@@ -3765,7 +3746,7 @@ For a retained candidate range `r` and target `t`, define:
 The final Product recovery authority and byte extent are:
 
 ```text
-A(s,r,t) = M(s,r) && T(s,r) && E(s,r,t) && V(s,r,d(t)) && S(s,r)
+A(s,r,t) = M(s,r) && T(s,r) && E(s,r,t) && V(s,r,d(t)) && (S(s,r) || C(s,r))
              && K_t > 0 && N(t)
 L(s,r,t) = min(K_t, bytes(r), Q(s,r,t))
 ```
@@ -3923,6 +3904,11 @@ the exact frontier-quantum carrier rank or enlarge the resulting live-owner
 commit.
 
 #### 15.2.1 Recovery service at an imminent acquisition
+
+Before ordinary coverage traversal, prepared acquisition considers the exact
+credit-blocking frontier opportunity in Section 15.2.3. If it cannot produce
+a currently committable action, ordinary uncovered recovery continues below;
+an ineligible covered head MUST NOT hide otherwise authorized later work.
 
 The actual contiguous Product ACK frontier moves only on positive Product
 receipt. A separate service query begins with exact retained outstanding
@@ -4139,9 +4125,12 @@ qualification, ordered-drain, port-hop, or incarnation changes alone MUST NOT
 move `D` or mint another publication owner in the same configured slot.
 
 While any overlapping accepted copy whose exact attachment remains in current
-Product membership has `now < D`, `S(s,r)` is false: duplicate recovery of that
-range is suppressed globally across the current target set, including a
-different otherwise-vacant configured slot. After every such `D` expires,
+Product membership has `now < D`, `S(s,r)` is false: ordinary duplicate recovery
+of that range is suppressed globally across the current target set, including
+a different otherwise-vacant configured slot. Only the exact matured
+credit-blocking frontier authority `C(s,r)` in Section 15.2.3 may bypass this
+same-range delay; it does not change `D` or vacate any occupied slot.
+After every such `D` expires,
 another eligible structurally vacant slot may be evaluated. Expiry only ends
 this global same-range suppression. It does not release `J_d(t)`, make the
 accepted copy's own slot vacant, or satisfy any other term of `A(s,r,t)`. Native
@@ -4437,6 +4426,59 @@ service. Every accepted recovery byte remains charged to exact Product
 recovery-work accounting. Exact retained ranges, configured-slot publication
 vacancy, queue, flight, distinct-output, target-capacity, and repeat-delay
 bounds continue to apply.
+
+#### 15.2.3 Credit-blocking frontier recovery
+
+An accepted copy's repeat interval limits duplicate traffic while native
+reliable delivery proceeds. That interval is not proof of useful service.
+When the copy and its Original share a constrained resource, global repeat
+suppression can leave an independent Ready output unused while an entire
+stream receive window waits behind their missing prefix. This profile permits
+one exact frontier quantum to use an otherwise-vacant output opportunity
+under the following current authority, symmetrically in both send directions.
+
+Let `X` be the unique Original assignment end, `M` the peer's currently applied
+maximum offset, and `F` the contiguous positive Product ACK frontier. `C(s,r)`
+requires all of:
+
+- `X == M`: no new unique byte fits the current grant. Staged source bytes
+  reserving the remaining grant (`M-X-U == 0`) are insufficient.
+- `r` is a positive retained prefix starting exactly at `F`, with one exact
+  live Original owner and the ordinary uniform current ownership boundary.
+- Every Original assignment participating in `r` has reached its retained
+  immutable owner fallback boundary. A pre-fallback loss comparison or the
+  separate early Latency completion authority cannot supply this proof.
+
+The query MAY consider this prefix despite accepted-copy suppression. For
+this query only, `H_s` is the retained prefix length rather than its portion
+outside suppressed coverage; `I_s`, common ranking quantum `Q_s^r`, `M_s`,
+exact target rank and final `F_t^r` still bound the action. It MUST NOT skip
+the current frontier or admit an unranked suffix. The selected target must
+be currently Ready and satisfy every ordinary eligibility, exact configured
+slot, Product resource, native and queue condition. Existing holders stay
+excluded. This authority changes only the global repeat-delay term of
+recovery; it does not supply native capacity or bypass stream flow control.
+
+Final Apply MUST revalidate the same current frontier, exhausted assignment
+credit, retained Original identity and matured immutable fallback proof
+atomically with exact flight publication. New MAX or frontier progress can
+withdraw this authority between observation and Apply. Refusal leaves normal
+uncovered recovery available. Each accepted copy occupies its existing exact
+slot and keeps its debt until the ordinary Product ACK or serialized attachment
+removal; neither this authority nor an expired deadline renews that slot.
+
+For an unchanged frontier quantum of size `q` and stable ownership with `v`
+otherwise-vacant configured slots, additional accepted Product copy bytes are
+bounded by `v*q`. This is not a one-extra-copy or total-wire bound. Native
+retransmission, a sequence of advancing frontiers and serialized attachment
+replacement retain their existing costs. Delayed ACK/MAX can cause unnecessary
+copies, and shared capacity can turn those copies into competing traffic.
+The scope intentionally permits ACK-paced recovery of successive frontier
+quanta rather than granting a whole-window speculative batch. No transport
+preference, inferred bottleneck identity, new timer, threshold or concurrency
+cap selects this authority. Its intended benefit is earlier contiguous
+delivery and released credit; comparative acceptance must include those
+events, ordinary service, latency and the additional traffic/resource cost.
 
 ### 15.3 Datagram retry
 

@@ -343,7 +343,12 @@ impl ReliablePathStream {
                             ) = (reply_output, &frame)
                                 && let ReliablePathStreamOutput::Switchable(binding) = &self.output
                             {
-                                binding.record_feedback_probe(output, *token, *max_offset);
+                                binding.record_feedback_probe(
+                                    self.stream_id,
+                                    output,
+                                    *token,
+                                    *max_offset,
+                                );
                             }
                             return Ok(frame);
                         }
@@ -555,47 +560,22 @@ impl ReliablePathStream {
         }
     }
 
-    pub(in crate::runtime) fn service_feedback_route(
+    pub(in crate::runtime) fn service_feedback_replies(
         &self,
         peer_max_offset: u64,
     ) -> StreamFeedbackPublication {
         match &self.output {
             ReliablePathStreamOutput::Switchable(binding) => {
-                binding.service_feedback_route(self.stream_id, peer_max_offset)
+                binding.service_feedback_replies(self.stream_id, peer_max_offset)
             }
             ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
         }
     }
 
-    pub(in crate::runtime) fn receive_feedback_receipt(
-        &self,
-        token: u64,
-    ) -> StreamFeedbackPublication {
+    pub(in crate::runtime) fn feedback_reply_capacity_notifies(&self) -> Vec<Arc<Notify>> {
         match &self.output {
             ReliablePathStreamOutput::Switchable(binding) => {
-                binding.receive_feedback_receipt(self.stream_id, token)
-            }
-            ReliablePathStreamOutput::Fixed(_) => StreamFeedbackPublication::default(),
-        }
-    }
-
-    pub(in crate::runtime) fn finish_feedback_route(&self) {
-        if let ReliablePathStreamOutput::Switchable(binding) = &self.output {
-            binding.finish_feedback_route();
-        }
-    }
-
-    pub(in crate::runtime) fn feedback_route_deadline(&self) -> Option<Instant> {
-        match &self.output {
-            ReliablePathStreamOutput::Switchable(binding) => binding.feedback_route_deadline(),
-            ReliablePathStreamOutput::Fixed(_) => None,
-        }
-    }
-
-    pub(in crate::runtime) fn feedback_route_capacity_notifies(&self) -> Vec<Arc<Notify>> {
-        match &self.output {
-            ReliablePathStreamOutput::Switchable(binding) => {
-                binding.feedback_route_capacity_notifies()
+                binding.feedback_reply_capacity_notifies()
             }
             ReliablePathStreamOutput::Fixed(_) => Vec::new(),
         }

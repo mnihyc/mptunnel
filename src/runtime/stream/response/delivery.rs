@@ -112,6 +112,16 @@ pub(in crate::runtime) struct ResponseDataAckRecoveryCandidate {
     pub(in crate::runtime) sent_at: Instant,
 }
 
+/// One prepared credit-frontier exception, revalidated with accepted-copy
+/// ownership. It carries no authority for a suffix or another acquisition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runtime) struct ResponseCreditFrontierProof {
+    pub(in crate::runtime) range: OffsetRange,
+    pub(in crate::runtime) owner: ServerReinjectionOutputIdentity,
+    pub(in crate::runtime) owner_assignments: Vec<(ServerReinjectionOutputIdentity, Instant)>,
+    pub(in crate::runtime) fallback_at: Instant,
+}
+
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct ResponseDataAckRelease {
     /// Outputs with exact, unambiguous OriginalData progress.
@@ -1368,6 +1378,7 @@ impl ResponseStreamBinding {
                 current_native_shape,
                 None,
                 false,
+                None,
                 || command.commit(),
             )
         };
@@ -1394,6 +1405,7 @@ impl ResponseStreamBinding {
         current_native_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
         ready: &ReliableWriterReadyGuard,
         early_completion_copy: bool,
+        credit_frontier: Option<&ResponseCreditFrontierProof>,
     ) -> Result<Instant, RuntimeError> {
         if ready.receipt().instance() != target.path_instance_id || !ready.receipt().is_current() {
             return Err(RuntimeError::SenderServiceBlocked);
@@ -1429,6 +1441,7 @@ impl ResponseStreamBinding {
             current_native_shape,
             Some(ready),
             early_completion_copy,
+            credit_frontier,
             || command.commit(),
         )
     }
@@ -1448,6 +1461,7 @@ impl ResponseStreamBinding {
         current_native_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
         ready: Option<&ReliableWriterReadyGuard>,
         early_completion_copy: bool,
+        credit_frontier: Option<&ResponseCreditFrontierProof>,
         commit_queue: impl FnOnce(),
     ) -> Result<Instant, RuntimeError> {
         // Lane publication also takes lane -> outputs. Retain that order and
@@ -1538,6 +1552,7 @@ impl ResponseStreamBinding {
             Some((accepted_at, suppression_interval)),
             true,
             early_completion_copy,
+            credit_frontier,
             ready,
         )?;
         commit_queue();
@@ -1657,6 +1672,7 @@ impl ResponseStreamBinding {
             false,
             false,
             None,
+            None,
         )
     }
 
@@ -1672,6 +1688,7 @@ impl ResponseStreamBinding {
         reinjection_suppression: Option<(Instant, Duration)>,
         enforce_stable_slot_vacancy: bool,
         early_completion_copy: bool,
+        credit_frontier: Option<&ResponseCreditFrontierProof>,
         ready: Option<&ReliableWriterReadyGuard>,
     ) -> Result<(), RuntimeError> {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
@@ -1700,7 +1717,7 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        if early_completion_copy {
+        if early_completion_copy || credit_frontier.is_some() {
             let frontier = reliable_live_owner_uniform_frontier(
                 range,
                 flights.range(..end).flat_map(|(start, entries)| {
@@ -1729,8 +1746,10 @@ impl ResponseStreamBinding {
             // Check and install the accepted copy under this SAME flight lock.
             // A concurrently accepted ordinary repair also spends early authority.
             if kind != CarrierWorkKind::ReinjectedData
-                || uncopied_completion_prefix(&flights, range) != Some(range)
-                || frontier.is_none_or(|frontier| {
+                || (early_completion_copy
+                    && (credit_frontier.is_some()
+                        || uncopied_completion_prefix(&flights, range) != Some(range)))
+                || frontier.as_ref().is_none_or(|frontier| {
                     frontier.range != range
                         || frontier.owners.len() != 1
                         || frontier.avoid.contains(&ServerReinjectionOutputIdentity {
@@ -1740,6 +1759,31 @@ impl ResponseStreamBinding {
                 })
             {
                 return Err(RuntimeError::SenderServiceBlocked);
+            }
+            if let Some(proof) = credit_frontier {
+                let frontier = frontier.expect("validated exact live frontier");
+                let now = Instant::now();
+                if proof.range != range
+                    || frontier.owners != [proof.owner]
+                    || frontier.owner_assignments != proof.owner_assignments
+                    || proof.fallback_at > now
+                    || flights.range(..end).any(|(start, entries)| {
+                        entries.iter().any(|flight| {
+                            *start < end
+                                && flight.end > offset
+                                && flight.kind.is_original_transmission()
+                                && outputs.entries.iter().any(|entry| {
+                                    entry.key == flight.key
+                                        && entry.incarnation == flight.output_incarnation
+                                })
+                                && (flight.key != proof.owner.key
+                                    || flight.output_incarnation != proof.owner.incarnation
+                                    || flight.owner_fallback_deadline.is_none_or(|at| at > now))
+                        })
+                    })
+                {
+                    return Err(RuntimeError::SenderServiceBlocked);
+                }
             }
         }
         if enforce_stable_slot_vacancy

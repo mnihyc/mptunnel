@@ -1725,13 +1725,13 @@ async fn server_feedback_probe_is_an_ordered_applied_state_boundary() {
         8,
         "following ACK cannot overtake the Probe cut"
     );
-    stream.service_feedback_route(peer.peer_max_offset());
+    stream.service_feedback_replies(peer.peer_max_offset());
     assert!(
         try_recv_reliable_path_command(&mut replies).is_none(),
         "required MAX is not probe-provided credit"
     );
     peer.update_max_offset(max_offset);
-    stream.service_feedback_route(peer.peer_max_offset());
+    stream.service_feedback_replies(peer.peer_max_offset());
     let command = try_recv_reliable_path_command(&mut replies).expect("owner-applied receipt");
     replies.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
     assert!(matches!(
@@ -1753,8 +1753,8 @@ async fn server_feedback_probe_is_an_ordered_applied_state_boundary() {
         replacement,
         TrafficClass::Throughput,
     );
-    binding.record_feedback_probe(captured, 10, 32);
-    stream.service_feedback_route(peer.peer_max_offset());
+    binding.record_feedback_probe(stream_id, captured, 10, 32);
+    stream.service_feedback_replies(peer.peer_max_offset());
     assert!(
         try_recv_reliable_path_command(&mut replacement_rx).is_none(),
         "captured old output cannot retarget its reply after replacement"

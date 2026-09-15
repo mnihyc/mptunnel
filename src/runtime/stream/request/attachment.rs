@@ -8,12 +8,10 @@ use super::super::feedback::{
     StreamFeedbackPublication, StreamFeedbackPublicationCursor, StreamFeedbackService,
     StreamFeedbackState,
 };
-use super::super::feedback_route::StreamFeedbackRoute;
 use crate::model::capacity::reliable_relay_buffer_len;
 #[cfg(test)]
 use crate::model::path::next_carrier_path_instance_id;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::protocol::{
     Frame, PathUsage, ResetReason, StreamAttachmentPhase, StreamId, StreamReturnPlan,
@@ -26,7 +24,6 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
 use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
-use smallvec::SmallVec;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::future::Future;
@@ -883,7 +880,8 @@ pub(in crate::runtime) struct ReliableRelayRemoteSet {
     next_instance_id: Option<u64>,
     membership_generation: u64,
     desired_feedback: StreamFeedbackState,
-    feedback_route: StreamFeedbackRoute<RelayPathInstance>,
+    #[cfg(feature = "lab-diagnostics")]
+    feedback_diagnostic_scope: Option<(crate::protocol::SessionId, StreamId)>,
     /// Applied only by the logical send owner, never by a probe or decoder.
     applied_peer_max_offset: u64,
     /// Immutable startup receipt retained until response bytes above `h` or a
@@ -1019,7 +1017,8 @@ impl ReliableRelayRemoteSet {
             next_instance_id: Some(0),
             membership_generation: 0,
             desired_feedback: StreamFeedbackState::default(),
-            feedback_route: StreamFeedbackRoute::default(),
+            #[cfg(feature = "lab-diagnostics")]
+            feedback_diagnostic_scope: None,
             applied_peer_max_offset: 0,
             desired_return_plan_final: None,
             pending_requalification_ack: None,
@@ -1269,9 +1268,12 @@ impl ReliableRelayRemoteSet {
     ) -> StreamFeedbackPublication {
         self.desired_feedback.max_data_offset =
             self.desired_feedback.max_data_offset.max(max_offset);
+        #[cfg(feature = "lab-diagnostics")]
         if let Some(context) = context {
-            self.prepare_feedback_route(context);
+            self.feedback_diagnostic_scope = Some((context.session_id, self.stream_id));
         }
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = context;
         self.service_pending_feedback(None)
     }
 
@@ -1283,7 +1285,6 @@ impl ReliableRelayRemoteSet {
     pub(in crate::runtime) fn has_pending_max_data_publication(&self) -> bool {
         self.paths.iter().any(|path| {
             !path.stream.request_control_frame_admission_is_closed()
-                && self.feedback_facts_required(path)
                 && path.published_max_data_offset < self.desired_feedback.max_data_offset
         })
     }
@@ -1329,9 +1330,12 @@ impl ReliableRelayRemoteSet {
         );
         self.desired_feedback.ack_generation = generation;
         self.desired_feedback.cumulative_ack_frames = cumulative_frames;
+        #[cfg(feature = "lab-diagnostics")]
         if let Some(context) = context {
-            self.prepare_feedback_route(context);
+            self.feedback_diagnostic_scope = Some((context.session_id, self.stream_id));
         }
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = context;
         self.service_pending_feedback(Some(&update_frames))
     }
 
@@ -1352,38 +1356,13 @@ impl ReliableRelayRemoteSet {
         &mut self,
         context: &ClientPathContext,
     ) -> StreamFeedbackPublication {
-        self.prepare_feedback_route(context);
-        self.service_pending_feedback(None)
-    }
-
-    /// Returns whether deadline ownership changed, invalidating an actor wait.
-    pub(in crate::runtime) fn prepare_feedback_route(
-        &mut self,
-        context: &ClientPathContext,
-    ) -> bool {
         #[cfg(feature = "lab-diagnostics")]
-        self.feedback_route
-            .set_diagnostic_scope(context.session_id, self.stream_id);
-        let previous = self.feedback_route.next_deadline();
-        let live: SmallVec<[RelayPathInstance; 4]> = self
-            .paths
-            .iter()
-            .filter(|path| !path.stream.request_control_frame_admission_is_closed())
-            .map(ReliableRelayRemotePath::instance)
-            .collect();
-        self.feedback_route
-            .prepare(&self.desired_feedback, &live, Instant::now(), |instance| {
-                transport_pto_from_snapshot(context.reliable_path_snapshot_for_instance(instance))
-            });
-        previous != self.feedback_route.next_deadline()
-    }
-
-    pub(in crate::runtime) fn feedback_deadline(&self) -> Option<Instant> {
-        self.feedback_route.next_deadline()
-    }
-
-    pub(in crate::runtime) fn finish_feedback_route(&mut self) {
-        self.feedback_route.finish();
+        {
+            self.feedback_diagnostic_scope = Some((context.session_id, self.stream_id));
+        }
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = context;
+        self.service_pending_feedback(None)
     }
 
     pub(in crate::runtime) fn observe_applied_peer_max_offset(&mut self, offset: u64) {
@@ -1412,8 +1391,8 @@ impl ReliableRelayRemoteSet {
         let result = path.feedback_receipt.observe(token, required_max_offset);
         #[cfg(feature = "lab-diagnostics")]
         if result.is_ok() && path.feedback_receipt.latest != previous {
-            super::super::feedback_route::lab_feedback_return(
-                self.feedback_route.diagnostic_scope(),
+            super::super::feedback::lab_feedback_return(
+                self.feedback_diagnostic_scope,
                 "reply_bound",
                 format_args!(
                     "output={:?} token={} required_max_offset={} applied_peer_max_offset={}",
@@ -1424,38 +1403,12 @@ impl ReliableRelayRemoteSet {
         result
     }
 
-    pub(in crate::runtime) fn receive_feedback_receipt(
-        &mut self,
-        context: &ClientPathContext,
-        token: u64,
-    ) -> bool {
-        self.prepare_feedback_route(context);
-        let accepted = self.feedback_route.receive_receipt(token, Instant::now());
-        if accepted {
-            // Arm newer work before the actor can await unrelated input or
-            // blocked application I/O; do not wait for another DATA event.
-            self.prepare_feedback_route(context);
-        }
-        accepted
-    }
-
-    fn feedback_facts_required(&self, path: &ReliableRelayRemotePath) -> bool {
-        self.feedback_route.requires_output(
-            path.instance(),
-            path.stream_ack_publication.has_ack_baseline()
-                && (path.published_max_data_offset > 0
-                    || self.desired_feedback.max_data_offset == 0),
-        )
-    }
-
     fn path_has_pending_feedback(&self, path: &ReliableRelayRemotePath) -> bool {
         !path.stream.request_control_frame_admission_is_closed()
-            && ((self.feedback_facts_required(path)
-                && (path
-                    .stream_ack_publication
-                    .is_pending(self.desired_feedback.ack_generation)
-                    || path.published_max_data_offset < self.desired_feedback.max_data_offset))
-                || self.feedback_route.probe_for(path.instance()).is_some()
+            && ((path
+                .stream_ack_publication
+                .is_pending(self.desired_feedback.ack_generation)
+                || path.published_max_data_offset < self.desired_feedback.max_data_offset)
                 || path
                     .feedback_receipt
                     .ready(self.applied_peer_max_offset)
@@ -1481,31 +1434,22 @@ impl ReliableRelayRemoteSet {
                 path.feedback_receipt = ClientFeedbackReceipt::default();
                 continue;
             }
+            #[cfg(feature = "lab-diagnostics")]
             let instance = path.instance();
-            let allow_facts = self.feedback_route.requires_output(
-                instance,
-                path.stream_ack_publication.has_ack_baseline()
-                    && (path.published_max_data_offset > 0 || state.max_data_offset == 0),
-            );
             let attachment = path.stream_ack_publication.service(
                 state,
                 update_frames,
                 stream_id,
                 &mut path.published_max_data_offset,
                 StreamFeedbackService {
-                    allow_facts,
-                    probe: self.feedback_route.probe_for(instance),
                     receipt: path.feedback_receipt.ready(self.applied_peer_max_offset),
                 },
                 |frame| path.stream.try_enqueue_request_control_frame(frame).is_ok(),
             );
-            if let Some(token) = attachment.probe_admitted {
-                self.feedback_route.record_probe_admission(instance, token);
-            }
             if let Some(token) = attachment.receipt_admitted {
                 #[cfg(feature = "lab-diagnostics")]
-                super::super::feedback_route::lab_feedback_return(
-                    self.feedback_route.diagnostic_scope(),
+                super::super::feedback::lab_feedback_return(
+                    self.feedback_diagnostic_scope,
                     "reply_admitted",
                     format_args!(
                         "output={:?} token={} required_max_offset={:?} applied_peer_max_offset={}",
@@ -1529,7 +1473,6 @@ impl ReliableRelayRemoteSet {
         generation != 0
             && self.paths.iter().any(|path| {
                 !path.stream.request_control_frame_admission_is_closed()
-                    && self.feedback_facts_required(path)
                     && path.stream_ack_publication.is_pending(generation)
             })
     }
@@ -1750,7 +1693,6 @@ impl ReliableRelayRemoteSet {
     }
 
     fn take_paths_for_close(&mut self) -> Vec<ReliableRelayRemotePath> {
-        self.feedback_route.finish();
         if !self.paths.is_empty() {
             self.membership_generation = self.membership_generation.wrapping_add(1);
         }
@@ -1805,7 +1747,6 @@ impl ReliableRelayRemoteSet {
         position: usize,
     ) -> Option<ReliableRelayRemotePath> {
         let mut path = self.paths.remove(position);
-        self.feedback_route.forget_output(path.instance());
         path.stop_input_forwarder();
         // Native teardown may remain asynchronous after membership withdrawal.
         // Its no-longer-serviceable feedback tail does not follow that lifetime.

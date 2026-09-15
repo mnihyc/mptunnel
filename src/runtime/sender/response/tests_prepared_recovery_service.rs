@@ -5,6 +5,328 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::stream::response::ResponseStreamAttachOutcome;
 
+struct CreditFrontierFixture {
+    binding: std::sync::Arc<ResponseStreamBinding>,
+    stream: ReliableSendStream,
+    sender: ServerResponseSenderService,
+    receivers: Vec<crate::runtime::path::commands::ReliablePathCommandReceivers>,
+    frames: [Frame; 2],
+}
+
+fn credit_frontier_fixture(max_offset: u64, age: Duration) -> CreditFrontierFixture {
+    let limits = MuxLimits::default();
+    let lane = TrafficClass::Throughput;
+    let (commands, receiver) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new_with_limits(
+        SessionId(55),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        commands,
+        lane,
+        limits,
+    );
+    let mut receivers = vec![receiver];
+    for id in 1..=2 {
+        let (commands, receiver) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(UnderlayProtocol::Tcp, PathId(id), commands, lane),
+            ResponseStreamAttachOutcome::Attached
+        );
+        receivers.push(receiver);
+    }
+    for (id, rate, rtt) in [
+        (0, 5_000_000.0, 100.0),
+        (1, 5_000_000.0, 6_000.0),
+        (2, 100_000_000.0, 10.0),
+    ] {
+        binding.set_output_product_model_for_test(
+            CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(id),
+            },
+            rate,
+            rtt,
+        );
+    }
+    let mut stream =
+        ReliableSendStream::new_with_initial_max_offset(StreamId(55), limits, max_offset);
+    let frames = [
+        stream.send_data(Bytes::from(vec![1; 4096])).unwrap(),
+        stream.send_data(Bytes::from(vec![2; 4096])).unwrap(),
+    ];
+    let owner = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    for frame in &frames {
+        binding.record_original_flight(owner, frame);
+    }
+    binding.age_original_flights_for_test(age);
+    binding.record_reinjected_flight(
+        CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        },
+        &frames[0],
+    );
+    CreditFrontierFixture {
+        binding,
+        stream,
+        sender: ServerResponseSenderService::new(SessionId(55), StreamId(55)),
+        receivers,
+        frames,
+    }
+}
+
+fn credit_frontier_target(binding: &ResponseStreamBinding, id: u16) -> ResponseAcquisitionOutputId {
+    binding
+        .sender_path_targets(TrafficClass::Throughput, 4096)
+        .iter()
+        .find(|target| target.observation.key.path_id == PathId(id))
+        .map(ResponseAcquisitionOutputId::from)
+        .unwrap()
+}
+
+#[test]
+fn prepared_credit_frontier_commits_covered_head_without_regranting_an_occupied_slot() {
+    let mut fixture = credit_frontier_fixture(8192, Duration::from_secs(10));
+    let identity = credit_frontier_target(&fixture.binding, 2);
+    let mut candidate = fixture
+        .sender
+        .next_prepared_recovery(
+            &fixture.binding,
+            &fixture.stream,
+            &AuthoritativeStreamAckSnapshot::default(),
+            TrafficClass::Throughput,
+            &fixture
+                .binding
+                .sender_path_targets(TrafficClass::Throughput, 4096),
+            &[identity],
+            Instant::now(),
+        )
+        .candidate
+        .expect("mature covered credit frontier has a vacant target");
+    assert_eq!(candidate.frame, fixture.frames[0]);
+    assert!(!candidate.early_completion_copy);
+    assert!(
+        fixture
+            .binding
+            .reinjection_suppression_deadline(&candidate.frame)
+            .is_some()
+    );
+    let proof = candidate.credit_frontier.take().unwrap();
+    let before = fixture.sender.optional_reinjection.reinjected_bytes();
+    let ready = fixture.receivers[2]
+        .writer_ready_boundary(identity.path_instance_id)
+        .unwrap();
+    assert!(
+        fixture
+            .sender
+            .commit_prepared_recovery(&fixture.binding, &fixture.stream, &candidate, ready, None)
+            .is_err(),
+        "normal Apply retains the global veto for this same covered frame"
+    );
+    assert!(ready.receipt().is_current());
+    assert_eq!(
+        fixture.sender.optional_reinjection.reinjected_bytes(),
+        before
+    );
+    candidate.credit_frontier = Some(proof);
+    fixture
+        .sender
+        .commit_prepared_recovery(&fixture.binding, &fixture.stream, &candidate, ready, None)
+        .unwrap();
+    assert!(!ready.receipt().is_current());
+    let ReliablePathCommand::SendFrame(sent) =
+        try_recv_reliable_path_command(&mut fixture.receivers[2]).unwrap()
+    else {
+        panic!("actual repair command");
+    };
+    assert_eq!(sent, fixture.frames[0]);
+    fixture.receivers[2].release_pending_command_bytes(
+        crate::protocol::frame::reliable_path_frame_pacing_bytes(&sent),
+    );
+    assert_eq!(
+        fixture.sender.optional_reinjection.reinjected_bytes() - before,
+        4096
+    );
+    assert_eq!(fixture.stream.next_offset(), 8192);
+    assert_eq!(fixture.stream.data_ack_frontier(), 0);
+    assert_eq!(fixture.stream.reinjection_bytes(), 8192);
+    let accepted = fixture.binding.accepted_reinjected_data_in_flight_bytes_at(
+        ServerReinjectionOutputIdentity {
+            key: identity.key,
+            incarnation: identity.incarnation,
+        },
+    );
+    assert_eq!(accepted, 4096);
+    let ready = fixture.receivers[2]
+        .writer_ready_boundary(identity.path_instance_id)
+        .unwrap();
+    assert!(
+        fixture
+            .sender
+            .commit_prepared_recovery(&fixture.binding, &fixture.stream, &candidate, ready, None)
+            .is_err()
+    );
+    assert!(ready.receipt().is_current());
+    assert_eq!(
+        fixture.sender.optional_reinjection.reinjected_bytes() - before,
+        4096
+    );
+    assert!(try_recv_reliable_path_command(&mut fixture.receivers[2]).is_none());
+}
+
+#[test]
+fn prepared_credit_frontier_revalidates_max_ack_and_exact_target_before_publication() {
+    for changed in ["max", "ack", "target", "owner"] {
+        let mut fixture = credit_frontier_fixture(8192, Duration::from_secs(10));
+        let identity = credit_frontier_target(&fixture.binding, 2);
+        let mut candidate = fixture
+            .sender
+            .next_prepared_recovery(
+                &fixture.binding,
+                &fixture.stream,
+                &AuthoritativeStreamAckSnapshot::default(),
+                TrafficClass::Throughput,
+                &fixture
+                    .binding
+                    .sender_path_targets(TrafficClass::Throughput, 4096),
+                &[identity],
+                Instant::now(),
+            )
+            .candidate
+            .unwrap();
+        match changed {
+            "max" => fixture.stream.update_max_offset(8193),
+            "ack" => {
+                let ranges = [OffsetRange {
+                    start: 0,
+                    end: 1024,
+                }];
+                fixture.stream.apply_ack(&ranges).unwrap();
+                fixture.binding.release_normalized_acked_ranges(&ranges);
+            }
+            "target" => candidate.target.incarnation += 1,
+            "owner" => {
+                candidate
+                    .credit_frontier
+                    .as_mut()
+                    .unwrap()
+                    .owner
+                    .incarnation += 1
+            }
+            _ => unreachable!(),
+        }
+        let before = fixture.sender.optional_reinjection.reinjected_bytes();
+        let ready = fixture.receivers[2]
+            .writer_ready_boundary(identity.path_instance_id)
+            .unwrap();
+        assert!(
+            fixture
+                .sender
+                .commit_prepared_recovery(
+                    &fixture.binding,
+                    &fixture.stream,
+                    &candidate,
+                    ready,
+                    None
+                )
+                .is_err(),
+            "{changed}"
+        );
+        assert!(
+            ready.receipt().is_current(),
+            "refusal preserves Ready: {changed}"
+        );
+        assert_eq!(
+            fixture.sender.optional_reinjection.reinjected_bytes(),
+            before,
+            "{changed}"
+        );
+        assert_eq!(
+            fixture.binding.accepted_reinjected_data_in_flight_bytes_at(
+                ServerReinjectionOutputIdentity {
+                    key: identity.key,
+                    incarnation: identity.incarnation
+                }
+            ),
+            0,
+            "{changed}"
+        );
+        assert!(try_recv_reliable_path_command(&mut fixture.receivers[2]).is_none());
+    }
+}
+
+#[test]
+fn prepared_credit_frontier_preserves_fallback_wake_and_normal_later_recovery() {
+    let young = credit_frontier_fixture(8192, Duration::ZERO);
+    let identity = credit_frontier_target(&young.binding, 2);
+    let now = Instant::now();
+    let stopped = young.sender.next_prepared_recovery(
+        &young.binding,
+        &young.stream,
+        &AuthoritativeStreamAckSnapshot::default(),
+        TrafficClass::Throughput,
+        &young
+            .binding
+            .sender_path_targets(TrafficClass::Throughput, 4096),
+        &[identity],
+        now,
+    );
+    assert!(stopped.candidate.is_none());
+    let fallback = stopped
+        .next_deadline
+        .expect("the covered head's original fallback arms a wake");
+    assert!(fallback > now);
+    assert!(
+        fallback
+            < young
+                .binding
+                .reinjection_suppression_deadline(&young.frames[0])
+                .unwrap(),
+        "the slow copy's suppression is not the only wake"
+    );
+
+    for max_offset in [8192, 8193] {
+        let mut fixture = credit_frontier_fixture(max_offset, Duration::from_secs(10));
+        // With no new credit, this target already holds the head. With one byte
+        // of credit, the exception is unavailable independently of staging U.
+        let target = if max_offset == 8192 { 1 } else { 2 };
+        let identity = credit_frontier_target(&fixture.binding, target);
+        let candidate = fixture
+            .sender
+            .next_prepared_recovery(
+                &fixture.binding,
+                &fixture.stream,
+                &AuthoritativeStreamAckSnapshot::default(),
+                TrafficClass::Throughput,
+                &fixture
+                    .binding
+                    .sender_path_targets(TrafficClass::Throughput, 4096),
+                &[identity],
+                Instant::now(),
+            )
+            .candidate
+            .expect("normal pipeline can still repair the uncovered second range");
+        assert_eq!(candidate.frame, fixture.frames[1]);
+        assert!(candidate.credit_frontier.is_none());
+        let ready = fixture.receivers[target as usize]
+            .writer_ready_boundary(identity.path_instance_id)
+            .unwrap();
+        fixture
+            .sender
+            .commit_prepared_recovery(&fixture.binding, &fixture.stream, &candidate, ready, None)
+            .unwrap();
+        let ReliablePathCommand::SendFrame(sent) =
+            try_recv_reliable_path_command(&mut fixture.receivers[target as usize]).unwrap()
+        else {
+            panic!("normal later repair");
+        };
+        assert_eq!(sent, fixture.frames[1]);
+    }
+}
+
 #[test]
 fn prepared_recovery_accepts_disjoint_due_quanta_without_ack_and_stops_at_young_assignment() {
     let lane = TrafficClass::Throughput;
@@ -310,6 +632,7 @@ fn prepared_latency_completion_uses_one_copy_before_fallback_without_changing_th
             .unwrap();
         let stale_proposal = ResponsePreparedRecoveryCandidate {
             early_completion_copy: true,
+            credit_frontier: None,
             frame: original.clone(),
             lane,
             target: ResponseDispatchTarget::from(&third_target),

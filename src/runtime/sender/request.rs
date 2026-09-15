@@ -285,10 +285,32 @@ pub(in crate::runtime) struct RequestPreparedRecoveryCandidate {
     pub(in crate::runtime) lane: TrafficClass,
     /// One earlier completion opportunity per byte, independently of loss.
     pub(in crate::runtime) early_completion_copy: bool,
+    /// Exact matured frontier authority, revalidated before bypassing only
+    /// another slot's accepted-copy suppression. It releases no old copy debt.
+    credit_frontier: Option<RequestCreditFrontierProof>,
     plan: RequestMultipathPlan,
 }
 
+struct RequestCreditFrontierProof {
+    range: OffsetRange,
+    owner: RelayPathInstance,
+    owner_assignments: Vec<(RelayPathInstance, Instant)>,
+    fallback_at: Instant,
+}
+
 impl RequestPreparedRecoveryCandidate {
+    fn same_credit_frontier_authority(&self, other: &Self) -> bool {
+        match (&self.credit_frontier, &other.credit_frontier) {
+            (None, None) => true,
+            (Some(before), Some(current)) => {
+                before.range == current.range
+                    && before.owner == current.owner
+                    && before.owner_assignments == current.owner_assignments
+            }
+            _ => false,
+        }
+    }
+
     pub(in crate::runtime) fn commit_with_current_native_shape<R>(
         &self,
         commands: &ReliablePathCommandSender,
@@ -358,7 +380,6 @@ pub(in crate::runtime) struct RelayRecvProgressSend {
     force_ack: bool,
     publish_max_data: bool,
     force_max_data: bool,
-    terminal: bool,
 }
 
 impl RelayRecvProgressSend {
@@ -373,7 +394,6 @@ impl RelayRecvProgressSend {
             force_ack: force_max_data,
             publish_max_data: true,
             force_max_data,
-            terminal: false,
         }
     }
 
@@ -386,7 +406,6 @@ impl RelayRecvProgressSend {
             // Once the final receive offset is contiguous, new receive credit
             // has no consumer and must not precede the terminal Data ACK.
             force_max_data: false,
-            terminal: true,
         }
     }
 
@@ -397,7 +416,6 @@ impl RelayRecvProgressSend {
             force_ack: true,
             publish_max_data: false,
             force_max_data: false,
-            terminal: false,
         }
     }
 }
@@ -910,7 +928,8 @@ impl RequestSenderService {
         model
     }
 
-    /// Candidate policy: continue only through accepted current suppression.
+    /// First offer a covered, matured frontier when unique assignment credit
+    /// is exhausted. If it cannot be offered, retain normal uncovered service.
     /// The caller captures Native outside Product and repeats this query under
     /// the selected Native fence before committing its exact queue reservation.
     #[allow(clippy::too_many_arguments)]
@@ -936,12 +955,84 @@ impl RequestSenderService {
             start: send_stream.data_ack_frontier(),
             end: send_stream.next_offset(),
         });
-        let Some(mut range) = offset_ranges_not_covered(&retained, &covered)
+        if send_stream.next_offset() == send_stream.peer_max_offset()
+            && let Some(range) = retained.first().copied().filter(|range| {
+                range.start == send_stream.data_ack_frontier()
+                    && covered
+                        .iter()
+                        .any(|copy| copy.start <= range.start && copy.end > range.start)
+            })
+        {
+            let exceptional = self.prepared_recovery_for_range(
+                context,
+                remotes,
+                send_stream,
+                sender_queue,
+                authoritative_ack,
+                lane,
+                inputs.clone(),
+                ready,
+                observed_at,
+                range,
+                true,
+            );
+            result.next_deadline = result
+                .next_deadline
+                .into_iter()
+                .chain(exceptional.next_deadline)
+                .min();
+            if exceptional.candidate.is_some() {
+                result.candidate = exceptional.candidate;
+                return result;
+            }
+        }
+        let Some(range) = offset_ranges_not_covered(&retained, &covered)
             .first()
             .copied()
         else {
             return result;
         };
+        let ordinary = self.prepared_recovery_for_range(
+            context,
+            remotes,
+            send_stream,
+            sender_queue,
+            authoritative_ack,
+            lane,
+            inputs,
+            ready,
+            observed_at,
+            range,
+            false,
+        );
+        result.candidate = ordinary.candidate;
+        result.next_deadline = result
+            .next_deadline
+            .into_iter()
+            .chain(ordinary.next_deadline)
+            .min();
+        result
+    }
+
+    /// One exact range query from the same captured Native observation. An
+    /// exceptional range cannot borrow the normal early-completion authority.
+    #[allow(clippy::too_many_arguments)]
+    fn prepared_recovery_for_range(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        sender_queue: &ReliableRelaySenderQueue,
+        authoritative_ack: &AuthoritativeStreamAckSnapshot,
+        lane: TrafficClass,
+        inputs: RequestRelayNativeInputs,
+        ready: &[RelayPathInstance],
+        observed_at: Instant,
+        mut range: OffsetRange,
+        credit_frontier: bool,
+    ) -> RequestPreparedRecoveryObservation {
+        let live = remotes.path_instances();
+        let mut result = RequestPreparedRecoveryObservation::default();
         for queued in sender_queue.queued_reinjection_ranges() {
             if queued.start <= range.start && queued.end > range.start {
                 return result;
@@ -1036,7 +1127,7 @@ impl RequestSenderService {
                 .gaps()
                 .iter()
                 .any(|gap| gap.start <= scored.start && gap.end >= scored.end);
-            let deadline = if proven {
+            let deadline = if proven && !credit_frontier {
                 timing
                     .target_deadline(
                         model.reinjection_completion,
@@ -1054,9 +1145,10 @@ impl RequestSenderService {
                         .map_or(deadline, |old| old.min(deadline)),
                 );
             }
-            let early_prefix = (deadline > observed_at && lane == TrafficClass::Latency)
-                .then(|| self.multipath.raw_uncopied_prefix(scored))
-                .flatten();
+            let early_prefix =
+                (!credit_frontier && deadline > observed_at && lane == TrafficClass::Latency)
+                    .then(|| self.multipath.raw_uncopied_prefix(scored))
+                    .flatten();
             let early_completion_copy = early_prefix.is_some();
             if let Some(prefix) = early_prefix {
                 if prefix.end < scored.end {
@@ -1143,6 +1235,25 @@ impl RequestSenderService {
             ) else {
                 return result;
             };
+            let credit_frontier = if credit_frontier {
+                let (start, end, _) = crate::protocol::frame::reliable_stream_frame_extent(&frame)
+                    .expect("recovery frame has a positive retained extent");
+                let range = OffsetRange { start, end };
+                let Some(exact) = self.multipath.live_owner_uniform_frontier(range, &live) else {
+                    return result;
+                };
+                if exact.range != range || exact.owners.len() != 1 {
+                    return result;
+                }
+                Some(RequestCreditFrontierProof {
+                    range,
+                    owner: exact.owners[0],
+                    owner_assignments: exact.owner_assignments,
+                    fallback_at: timing.fallback_at,
+                })
+            } else {
+                None
+            };
             result.candidate = Some(RequestPreparedRecoveryCandidate {
                 frame,
                 target: target.instance,
@@ -1150,6 +1261,7 @@ impl RequestSenderService {
                 cause,
                 lane,
                 early_completion_copy,
+                credit_frontier,
                 plan,
             });
             return result;
@@ -1181,9 +1293,10 @@ impl RequestSenderService {
                 .reinjection_avoid_instances(&candidate.frame, candidate.cause, remotes)
                 .contains(&target)
             || sender_queue.has_queued_reinjection_overlap(&candidate.frame)
-            || self
-                .reinjection_suppression_deadline_for_frame(&candidate.frame, remotes)
-                .is_some()
+            || (candidate.credit_frontier.is_none()
+                && self
+                    .reinjection_suppression_deadline_for_frame(&candidate.frame, remotes)
+                    .is_some())
         {
             return Err(RuntimeError::SenderServiceBlocked);
         }
@@ -1192,6 +1305,26 @@ impl RequestSenderService {
         else {
             return Err(RuntimeError::SenderServiceBlocked);
         };
+        if let Some(proof) = &candidate.credit_frontier {
+            let range = OffsetRange { start, end };
+            let frontier = self
+                .multipath
+                .live_owner_uniform_frontier(range, &remotes.path_instances());
+            if candidate.early_completion_copy
+                || range != proof.range
+                || start != send_stream.data_ack_frontier()
+                || send_stream.next_offset() != send_stream.peer_max_offset()
+                || Instant::now() < proof.fallback_at
+                || frontier.is_none_or(|frontier| {
+                    frontier.range != range
+                        || frontier.owners.as_slice() != [proof.owner]
+                        || frontier.owner_assignments != proof.owner_assignments
+                        || frontier.avoid.contains(&target)
+                })
+            {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+        }
         if candidate.early_completion_copy {
             let range = OffsetRange { start, end };
             let owner = self
@@ -2038,10 +2171,6 @@ impl RequestSenderService {
         progress: &mut ReliableRecvProgress,
         request: RelayRecvProgressSend,
     ) -> Result<StreamFeedbackPublication, RuntimeError> {
-        if request.terminal {
-            remotes.finish_feedback_route();
-        }
-        remotes.prepare_feedback_route(context);
         if !remotes.has_receive_feedback_output() {
             // Closed command admission is not attachment-removal authority.
             // Preserve cumulative feedback until the ordered carrier terminal

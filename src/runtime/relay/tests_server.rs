@@ -355,7 +355,7 @@ async fn server_data_ack_is_offered_before_first_target_write_completes() {
 }
 
 #[tokio::test]
-async fn server_confirmed_return_expiry_services_siblings_during_retained_write() {
+async fn server_feedback_fanout_retries_blocked_sibling_during_retained_write() {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
@@ -451,7 +451,7 @@ async fn server_confirmed_return_expiry_services_siblings_during_retained_write(
     );
     let (b_tx, mut b_rx) = reliable_path_command_channels(8);
     assert_eq!(
-        binding.attach(UnderlayProtocol::Tcp, PathId(1), b_tx, lane),
+        binding.attach(UnderlayProtocol::Tcp, PathId(1), b_tx.clone(), lane),
         ResponseStreamAttachOutcome::Attached
     );
     let (input_tx, input_rx) = mpsc::channel(1);
@@ -548,8 +548,7 @@ async fn server_confirmed_return_expiry_services_siblings_during_retained_write(
         drain(&mut a_rx);
         drain(&mut b_rx);
 
-        // An actual out-of-order receipt creates the second ACK generation
-        // and discovery probe without changing the production ACK cadence.
+        // An actual out-of-order receipt creates an ACK on each current output.
         input_tx
             .send(Ok(Frame::StreamData {
                 stream_id,
@@ -562,39 +561,35 @@ async fn server_confirmed_return_expiry_services_siblings_during_retained_write(
             binding.feedback_status().ack_generation == 2
         })
         .await;
-        let discovery = drain(&mut a_rx);
-        let token = discovery
-            .iter()
-            .find_map(|frame| match frame {
-                Frame::StreamFeedbackProbe {
-                    token, max_offset, ..
-                } => {
-                    assert_eq!(*max_offset, initial_grant + 1);
-                    Some(*token)
-                }
-                _ => None,
-            })
-            .expect("actual admitted discovery probe");
-        assert!(discovery.iter().any(|frame| matches!(
-            frame,
-            Frame::StreamAck { ranges, .. }
-                if ranges.contains(&OffsetRange { start: 2, end: 3 })
-        )));
-        drain(&mut b_rx);
-        assert!(binding.feedback_route_deadline().is_some());
-
-        // Confirm only the token actually admitted to A's ordinary command
-        // queue. The real actor consumes the receipt through its FIFO input.
+        for receiver in [&mut a_rx, &mut b_rx] {
+            let frames = drain(receiver);
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| matches!(frame, Frame::StreamAck { ranges, .. }
+                if ranges.contains(&OffsetRange { start: 2, end: 3 })))
+            );
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| !matches!(frame, Frame::StreamFeedbackProbe { .. }))
+            );
+        }
+        // Old-peer receipts remain valid input but carry no grant or route authority.
         input_tx
-            .send(Ok(Frame::StreamFeedbackReceipt { stream_id, token }))
+            .send(Ok(Frame::StreamFeedbackReceipt {
+                stream_id,
+                token: 73,
+            }))
             .await
-            .expect("return admitted discovery token");
-        drive_until(relay.as_mut(), || {
-            binding.feedback_route_deadline().is_none()
-        })
-        .await;
-        drain(&mut a_rx);
+            .unwrap();
+        drive_until(relay.as_mut(), || input_tx.capacity() == 1).await;
+        assert!(drain(&mut a_rx).is_empty());
         assert!(drain(&mut b_rx).is_empty());
+        for nonce in 0..8 {
+            b_tx.try_enqueue_admitted_frame(Frame::Ping { nonce }, TrafficClass::Control)
+                .unwrap();
+        }
 
         // Closing the receive gap creates generation 3. The one-byte target
         // still holds `a`, so writing the ready `bc` suffix really polls Pending.
@@ -612,41 +607,34 @@ async fn server_confirmed_return_expiry_services_siblings_during_retained_write(
         .await;
     })
     .await
-    .expect("actual DATA/probe/receipt setup reaches a pending target write");
+    .expect("actual DATA and blocked sibling reach a pending target write");
 
     assert_eq!(accepted.load(Ordering::Acquire), 1);
-    let selected = drain(&mut a_rx);
-    assert!(selected.iter().any(|frame| matches!(
-        frame,
+    let available = drain(&mut a_rx);
+    assert!(available.iter().any(|frame| matches!(frame,
         Frame::StreamAck { ranges, .. } if ranges == &vec![OffsetRange { start: 0, end: 3 }]
     )));
-    assert!(
-        drain(&mut b_rx).is_empty(),
-        "confirmed A initially skips its caught-up sibling"
+    assert_eq!(
+        drain(&mut b_rx),
+        (0..8)
+            .map(|nonce| Frame::Ping { nonce })
+            .collect::<Vec<_>>()
     );
-    let deadline = binding
-        .feedback_route_deadline()
-        .expect("fixed proof obligation");
-    let command = tokio::time::timeout(
-        deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(2),
-        async {
-            tokio::select! {
-                result = relay.as_mut() => panic!("blocked target must retain the Product: {result:?}"),
-                command = recv_reliable_path_command(&mut b_rx) => command.expect("expiry fallback ACK"),
-            }
-        },
-    ).await.expect("native proof deadline is serviced while target writing is pending");
+    let command = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = relay.as_mut() => panic!("blocked target must retain the Product: {result:?}"),
+            command = recv_reliable_path_command(&mut b_rx) => command.expect("capacity-retried ACK"),
+        }
+    }).await.expect("one sibling's actual capacity wake is serviced during the target write");
     b_rx.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
-    assert!(Instant::now() >= deadline);
-    assert!(matches!(
-        command,
-        ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. })
-            if ranges == vec![OffsetRange { start: 0, end: 3 }]
-    ));
+    assert!(
+        matches!(command, ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. })
+        if ranges == vec![OffsetRange { start: 0, end: 3 }])
+    );
     assert_eq!(
         accepted.load(Ordering::Acquire),
         1,
-        "expiry does not consume target data"
+        "feedback service does not consume target data"
     );
     assert_eq!(
         binding.feedback_status().max_data.published_offset,

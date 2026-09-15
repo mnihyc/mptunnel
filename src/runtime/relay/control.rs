@@ -1232,11 +1232,9 @@ where
             let stream_ack_generation = remotes.stream_ack_generation();
             let feedback_max_offset = remotes.feedback_max_data_offset();
             remotes.observe_applied_peer_max_offset(send_stream.peer_max_offset());
-            let feedback_route_changed = remotes.prepare_feedback_route(context);
             if request_membership_changed
                 || stream_ack_generation != observed_stream_ack_generation
                 || feedback_max_offset != observed_feedback_max_offset
-                || feedback_route_changed
             {
                 observed_stream_ack_generation = stream_ack_generation;
                 observed_feedback_max_offset = feedback_max_offset;
@@ -2240,16 +2238,7 @@ where
             // eligibility ends, without resetting it on ordinary select turns.
             send_buffer_updates.withdraw();
         }
-        let feedback_deadline = request_product
-            .lock()
-            .remotes
-            .feedback_deadline()
-            .map(tokio::time::Instant::from_std);
         tokio::select! {
-            _ = wait_for_optional_deadline(feedback_deadline), if feedback_deadline.is_some() => {
-                stream_ack_capacity_wait = None;
-                continue;
-            }
             () = &mut prepared_work_wait => {
                 // A real writer commit or source/eligibility change requires
                 // fresh Product state; it does not grant actor Data dispatch.
@@ -3447,14 +3436,10 @@ where
                                 }
                                 stream_ack_capacity_wait = None;
                             }
-                            Frame::StreamFeedbackReceipt {
-                                stream_id: receipt_stream_id, token,
-                            } if receipt_stream_id == stream_id => {
-                                // The token owns the probed local incarnation. This
-                                // receipt's reverse carrier is not proof authority.
-                                let mut product = request_product.lock();
-                                product.remotes.receive_feedback_receipt(context, token);
-                                stream_ack_capacity_wait = None;
+                            Frame::StreamFeedbackReceipt { stream_id: receipt_stream_id, .. }
+                                if receipt_stream_id == stream_id => {
+                                // We originate no selection probes. Legacy or unsolicited
+                                // receipts remain wire-compatible and carry no authority.
                             }
                             Frame::StreamRequalifyData {
                                 stream_id: received_stream_id,
@@ -3651,7 +3636,7 @@ where
                                     );
                                     tokio::pin!(write);
                                     loop {
-                                        let (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, feedback_deadline, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, mut prepared_work_wait) = {
+                                        let (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, mut prepared_work_wait) = {
                                         let mut product_guard = request_product.lock();
                                         if let Some(error) = product_guard.prepared.pending_error.take() {
                                             break Err(error);
@@ -3667,7 +3652,6 @@ where
                                         let applied_max = product_guard.send_stream.peer_max_offset();
                                         let remotes = &mut product_guard.remotes;
                                         remotes.observe_applied_peer_max_offset(applied_max);
-                                        remotes.prepare_feedback_route(context);
                                         if let Err(err) = drive_client_response_startup_control(
                                             &mut return_plan,
                                             stream_id,
@@ -3698,8 +3682,6 @@ where
                                             remotes.has_pending_feedback_publication();
                                         let has_stream_ack_capacity_wait =
                                             stream_ack_capacity_wait.is_some();
-                                        let feedback_deadline = remotes.feedback_deadline()
-                                            .map(tokio::time::Instant::from_std);
 
                                         let return_plan_final_pending =
                                             remotes.has_pending_return_plan_final_publication();
@@ -3723,12 +3705,11 @@ where
                                             product_guard.prepared.work_changed.clone().notified_owned(),
                                         );
                                         prepared_work_wait.as_mut().enable();
-                                        (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, feedback_deadline, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, prepared_work_wait)
+                                        (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, prepared_work_wait)
                                         };
                                         tokio::select! {
                                             biased;
                                             result = &mut write => break result,
-                                            _ = wait_for_optional_deadline(feedback_deadline), if feedback_deadline.is_some() => continue,
                                             () = &mut prepared_work_wait => continue,
                                             additional_path_open = additional_path_open_rx.recv() => {
                                                 let mut product_guard = request_product.lock();
@@ -4152,7 +4133,6 @@ where
                                 let mut product_guard = request_product.lock();
                                 let product = &mut *product_guard;
                                 let (sender, remotes) = (&mut product.sender, &mut product.remotes);
-                                remotes.finish_feedback_route();
                                 stream_ack_capacity_wait = None;
                                 state.progress.last_stream_at = Instant::now();
                                 return_plan.observe_response_terminal(

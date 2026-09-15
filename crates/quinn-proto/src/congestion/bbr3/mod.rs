@@ -1,5 +1,8 @@
 mod max_filter;
 
+#[cfg(test)]
+mod tests_ack_cleanup;
+
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
@@ -3132,15 +3135,15 @@ impl Controller for Bbr3 {
                 self.app_limited = Ord::max(self.delivered.saturating_add(self.inflight), 1);
             }
             for packets in self.packets.iter_mut() {
-                packets.retain(|&p| !p.stale);
-                for p in packets.iter_mut() {
-                    // Keep this ACK's snapshots for subsequent same-ACK ECN
-                    // processing. Only transport terminals retire live work;
-                    // younger delivery rounds do not invalidate its evidence.
-                    if p.acknowledged {
-                        p.stale = true;
+                packets.retain_mut(|p| {
+                    // Test the old stale bit before setting the new one: this
+                    // ACK's evidence must survive for same-ACK ECN processing.
+                    if p.stale {
+                        return false;
                     }
-                }
+                    p.stale = p.acknowledged;
+                    true
+                });
             }
             if self.ack_epoch_open {
                 if let Some(mut rate_sample) = self.rs {

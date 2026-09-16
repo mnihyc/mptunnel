@@ -4,6 +4,9 @@ use crate::runtime::sender::request::{
     RequestPreparedSource, RequestProductState, SharedRequestProduct,
 };
 
+#[path = "tests_reported_frontier.rs"]
+mod reported_frontier;
+
 struct CreditFrontierFixture {
     f: PreparedCompletionFixture,
     copy: RelayPathInstance,

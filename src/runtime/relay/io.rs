@@ -55,7 +55,59 @@ pub(in crate::runtime) struct AuthoritativeStreamAckSnapshot {
     gaps: Vec<OffsetRange>,
 }
 
+/// A scoped receiver report for one exact retained frontier quantum.
+///
+/// Only `AuthoritativeStreamAckSnapshot` constructs this evidence. Applied gap
+/// facts survive until positive Product ACK removes their bytes. A holder MUST
+/// still revalidate the exact retained frame and Original assignment identities
+/// at Apply: matching the stream/frontier here does not prove that an interior
+/// partial ACK left every byte outstanding. No native or timer fact grants this
+/// authority, and growing a disjoint ACK scope does not refresh its identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ReportedFrontierGap {
+    stream_id: StreamId,
+    range: OffsetRange,
+}
+
+impl ReportedFrontierGap {
+    pub(in crate::runtime) fn matches_frontier(
+        self,
+        send_stream: &ReliableSendStream,
+        range: OffsetRange,
+    ) -> bool {
+        self.stream_id == send_stream.stream_id()
+            && self.range == range
+            && range.start == send_stream.data_ack_frontier()
+    }
+}
+
 impl AuthoritativeStreamAckSnapshot {
+    /// Only the earliest normalized gap can contain the current retained head.
+    /// Unknown or unscoped positive receipt does not establish this predicate.
+    pub(in crate::runtime) fn reports_frontier(&self, send_stream: &ReliableSendStream) -> bool {
+        self.first_gap().is_some_and(|gap| {
+            gap.start <= send_stream.data_ack_frontier()
+                && gap.end > send_stream.data_ack_frontier()
+        })
+    }
+
+    pub(in crate::runtime) fn prove_frontier_gap(
+        &self,
+        send_stream: &ReliableSendStream,
+        range: OffsetRange,
+    ) -> Option<ReportedFrontierGap> {
+        (range.start == send_stream.data_ack_frontier()
+            && range.end > range.start
+            && range.end <= send_stream.next_offset()
+            && self
+                .first_gap()
+                .is_some_and(|gap| gap.start <= range.start && gap.end >= range.end))
+        .then_some(ReportedFrontierGap {
+            stream_id: send_stream.stream_id(),
+            range,
+        })
+    }
+
     pub(in crate::runtime) fn has_gaps(&self) -> bool {
         !self.gaps.is_empty()
     }

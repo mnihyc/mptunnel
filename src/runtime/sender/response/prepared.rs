@@ -412,14 +412,21 @@ pub(in crate::runtime) fn claim_prepared_response_data(
             // batch validity deadline is not the identity of that authority;
             // compare cause kind while retaining exact target/range checks.
             if current.frame != candidate.frame
-                || current
-                    .credit_frontier
-                    .as_ref()
-                    .map(|proof| (proof.range, proof.owner, &proof.owner_assignments))
-                    != candidate
-                        .credit_frontier
-                        .as_ref()
-                        .map(|proof| (proof.range, proof.owner, &proof.owner_assignments))
+                || current.credit_frontier.as_ref().map(|proof| {
+                    (
+                        proof.range,
+                        proof.owner,
+                        &proof.owner_assignments,
+                        proof.reported_gap,
+                    )
+                }) != candidate.credit_frontier.as_ref().map(|proof| {
+                    (
+                        proof.range,
+                        proof.owner,
+                        &proof.owner_assignments,
+                        proof.reported_gap,
+                    )
+                })
                 || std::mem::discriminant(&current.cause)
                     != std::mem::discriminant(&candidate.cause)
             {

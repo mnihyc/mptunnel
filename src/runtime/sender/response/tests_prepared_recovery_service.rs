@@ -5,6 +5,9 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::stream::response::ResponseStreamAttachOutcome;
 
+#[path = "tests_reported_frontier.rs"]
+mod reported_frontier;
+
 struct CreditFrontierFixture {
     binding: std::sync::Arc<ResponseStreamBinding>,
     stream: ReliableSendStream,

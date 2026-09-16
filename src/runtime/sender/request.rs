@@ -57,8 +57,8 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::relay::io::{
-    AuthoritativeStreamAckSnapshot, exact_contiguous_retransmission_frames, first_proven_ack_gap,
-    preserve_reinjection_frontier_quantum,
+    AuthoritativeStreamAckSnapshot, ReportedFrontierGap, exact_contiguous_retransmission_frames,
+    first_proven_ack_gap, preserve_reinjection_frontier_quantum,
 };
 #[cfg(test)]
 use crate::runtime::stream::ReliablePathStreamHandle;
@@ -291,11 +291,13 @@ pub(in crate::runtime) struct RequestPreparedRecoveryCandidate {
     plan: RequestMultipathPlan,
 }
 
+/// Mature covered frontier: exhausted credit, or an exact scoped receiver gap.
 struct RequestCreditFrontierProof {
     range: OffsetRange,
     owner: RelayPathInstance,
     owner_assignments: Vec<(RelayPathInstance, Instant)>,
     fallback_at: Instant,
+    reported_gap: Option<ReportedFrontierGap>,
 }
 
 impl RequestPreparedRecoveryCandidate {
@@ -306,6 +308,7 @@ impl RequestPreparedRecoveryCandidate {
                 before.range == current.range
                     && before.owner == current.owner
                     && before.owner_assignments == current.owner_assignments
+                    && before.reported_gap == current.reported_gap
             }
             _ => false,
         }
@@ -929,7 +932,8 @@ impl RequestSenderService {
     }
 
     /// First offer a covered, matured frontier when unique assignment credit
-    /// is exhausted. If it cannot be offered, retain normal uncovered service.
+    /// is exhausted or the receiver explicitly reports that exact missing head.
+    /// If it cannot be offered, retain normal uncovered service.
     /// The caller captures Native outside Product and repeats this query under
     /// the selected Native fence before committing its exact queue reservation.
     #[allow(clippy::too_many_arguments)]
@@ -955,7 +959,8 @@ impl RequestSenderService {
             start: send_stream.data_ack_frontier(),
             end: send_stream.next_offset(),
         });
-        if send_stream.next_offset() == send_stream.peer_max_offset()
+        if (send_stream.next_offset() == send_stream.peer_max_offset()
+            || authoritative_ack.reports_frontier(send_stream))
             && let Some(range) = retained.first().copied().filter(|range| {
                 range.start == send_stream.data_ack_frontier()
                     && covered
@@ -1245,11 +1250,21 @@ impl RequestSenderService {
                 if exact.range != range || exact.owners.len() != 1 {
                     return result;
                 }
+                let reported_gap = if send_stream.next_offset() == send_stream.peer_max_offset() {
+                    None
+                } else {
+                    let Some(proof) = authoritative_ack.prove_frontier_gap(send_stream, range)
+                    else {
+                        return result;
+                    };
+                    Some(proof)
+                };
                 Some(RequestCreditFrontierProof {
                     range,
                     owner: exact.owners[0],
                     owner_assignments: exact.owner_assignments,
                     fallback_at: timing.fallback_at,
+                    reported_gap,
                 })
             } else {
                 None
@@ -1313,7 +1328,10 @@ impl RequestSenderService {
             if candidate.early_completion_copy
                 || range != proof.range
                 || start != send_stream.data_ack_frontier()
-                || send_stream.next_offset() != send_stream.peer_max_offset()
+                || proof.reported_gap.map_or_else(
+                    || send_stream.next_offset() != send_stream.peer_max_offset(),
+                    |gap| !gap.matches_frontier(send_stream, range),
+                )
                 || Instant::now() < proof.fallback_at
                 || frontier.is_none_or(|frontier| {
                     frontier.range != range

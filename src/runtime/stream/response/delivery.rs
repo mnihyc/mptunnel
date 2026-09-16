@@ -112,14 +112,16 @@ pub(in crate::runtime) struct ResponseDataAckRecoveryCandidate {
     pub(in crate::runtime) sent_at: Instant,
 }
 
-/// One prepared credit-frontier exception, revalidated with accepted-copy
-/// ownership. It carries no authority for a suffix or another acquisition.
+/// One prepared mature-frontier exception, revalidated with accepted-copy
+/// ownership. Authority is exhausted credit or an exact scoped receiver gap;
+/// it carries no authority for a suffix or another acquisition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::runtime) struct ResponseCreditFrontierProof {
     pub(in crate::runtime) range: OffsetRange,
     pub(in crate::runtime) owner: ServerReinjectionOutputIdentity,
     pub(in crate::runtime) owner_assignments: Vec<(ServerReinjectionOutputIdentity, Instant)>,
     pub(in crate::runtime) fallback_at: Instant,
+    pub(in crate::runtime) reported_gap: Option<crate::runtime::relay::io::ReportedFrontierGap>,
 }
 
 #[derive(Debug, Default)]

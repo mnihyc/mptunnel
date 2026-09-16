@@ -272,8 +272,9 @@ pub(in crate::runtime) struct ResponsePreparedRecoveryObservation {
 }
 
 impl ServerResponseSenderService {
-    /// First offer a matured, credit-blocking contiguous frontier to a vacant
-    /// target. Otherwise preserve the ordinary accepted-coverage pipeline.
+    /// First offer a matured, covered contiguous frontier to a vacant target
+    /// when credit is exhausted or an applied receiver report proves that head
+    /// missing. Otherwise preserve the ordinary accepted-coverage pipeline.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn next_prepared_recovery(
         &self,
@@ -290,7 +291,8 @@ impl ServerResponseSenderService {
             start: send_stream.data_ack_frontier(),
             end: send_stream.next_offset(),
         });
-        if send_stream.next_offset() == send_stream.peer_max_offset()
+        if (send_stream.next_offset() == send_stream.peer_max_offset()
+            || authoritative_ack.reports_frontier(send_stream))
             && let Some(range) = retained.first().copied()
             && range.start == send_stream.data_ack_frontier()
             && covered
@@ -599,11 +601,21 @@ impl ServerResponseSenderService {
                 if exact.range != range || exact.owners != [owner] {
                     return result;
                 }
+                let reported_gap = if send_stream.next_offset() == send_stream.peer_max_offset() {
+                    None
+                } else {
+                    let Some(proof) = authoritative_ack.prove_frontier_gap(send_stream, range)
+                    else {
+                        return result;
+                    };
+                    Some(proof)
+                };
                 Some(ResponseCreditFrontierProof {
                     range,
                     owner,
                     owner_assignments: exact.owner_assignments,
                     fallback_at: timing.fallback_at,
+                    reported_gap,
                 })
             } else {
                 None
@@ -638,7 +650,10 @@ impl ServerResponseSenderService {
         let range = OffsetRange { start, end };
         if candidate.credit_frontier.as_ref().is_some_and(|proof| {
             candidate.early_completion_copy
-                || send_stream.next_offset() != send_stream.peer_max_offset()
+                || proof.reported_gap.map_or_else(
+                    || send_stream.next_offset() != send_stream.peer_max_offset(),
+                    |gap| !gap.matches_frontier(send_stream, range),
+                )
                 || start != send_stream.data_ack_frontier()
                 || proof.range != range
                 || proof.fallback_at > Instant::now()

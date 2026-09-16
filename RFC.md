@@ -3737,7 +3737,7 @@ For a retained candidate range `r` and target `t`, define:
 - `S(s,r)`: no accepted ReinjectedData copy overlapping `r`, whose exact
   attachment remains in current Product membership, retains an unexpired
   immutable suppression deadline `D`;
-- `C(s,r)`: the exact current credit-blocking frontier has the matured
+- `C(s,r)`: the exact current ordered frontier has the matured
   authority specified in Section 15.2.3;
 - `Q(s,r,t)`: the cause-specific retained service extent after the configured
   repair, path-flight, stream, and range bounds; and
@@ -3906,7 +3906,7 @@ commit.
 #### 15.2.1 Recovery service at an imminent acquisition
 
 Before ordinary coverage traversal, prepared acquisition considers the exact
-credit-blocking frontier opportunity in Section 15.2.3. If it cannot produce
+mature ordered-frontier opportunity in Section 15.2.3. If it cannot produce
 a currently committable action, ordinary uncovered recovery continues below;
 an ineligible covered head MUST NOT hide otherwise authorized later work.
 
@@ -4128,7 +4128,7 @@ While any overlapping accepted copy whose exact attachment remains in current
 Product membership has `now < D`, `S(s,r)` is false: ordinary duplicate recovery
 of that range is suppressed globally across the current target set, including
 a different otherwise-vacant configured slot. Only the exact matured
-credit-blocking frontier authority `C(s,r)` in Section 15.2.3 may bypass this
+ordered-frontier authority `C(s,r)` in Section 15.2.3 may bypass this
 same-range delay; it does not change `D` or vacate any occupied slot.
 After every such `D` expires,
 another eligible structurally vacant slot may be evaluated. Expiry only ends
@@ -4427,22 +4427,28 @@ recovery-work accounting. Exact retained ranges, configured-slot publication
 vacancy, queue, flight, distinct-output, target-capacity, and repeat-delay
 bounds continue to apply.
 
-#### 15.2.3 Credit-blocking frontier recovery
+#### 15.2.3 Credit-blocking or receiver-reported frontier recovery
 
 An accepted copy's repeat interval limits duplicate traffic while native
 reliable delivery proceeds. That interval is not proof of useful service.
 When the copy and its Original share a constrained resource, global repeat
 suppression can leave an independent Ready output unused while an entire
-stream receive window waits behind their missing prefix. This profile permits
-one exact frontier quantum to use an otherwise-vacant output opportunity
+stream receive window waits behind their missing prefix. An explicitly reported
+missing ordered head can also block an application while its unused grant is
+large: unused receive credit is not proof of ordered delivery. This profile
+permits one exact frontier quantum to use an otherwise-vacant output opportunity
 under the following current authority, symmetrically in both send directions.
 
 Let `X` be the unique Original assignment end, `M` the peer's currently applied
 maximum offset, and `F` the contiguous positive Product ACK frontier. `C(s,r)`
 requires all of:
 
-- `X == M`: no new unique byte fits the current grant. Staged source bytes
-  reserving the remaining grant (`M-X-U == 0`) are insufficient.
+- Either `X == M` (no new unique byte fits the current grant), or an already
+  applied, validated scoped Product ACK explicitly reports a gap covering every
+  byte of `r` at `F`. Staged source bytes reserving the remaining grant
+  (`M-X-U == 0`), an unscoped ACK, silence, or a gap beginning above `F` are
+  insufficient. The receiver-reported branch clips `r` to that actual gap;
+  it does not authorize an unknown earlier prefix or an unreported suffix.
 - `r` is a positive retained prefix starting exactly at `F`, with one exact
   live Original owner and the ordinary uniform current ownership boundary.
 - Every Original assignment participating in `r` has reached its retained
@@ -4459,11 +4465,18 @@ slot, Product resource, native and queue condition. Existing holders stay
 excluded. This authority changes only the global repeat-delay term of
 recovery; it does not supply native capacity or bypass stream flow control.
 
-Final Apply MUST revalidate the same current frontier, exhausted assignment
-credit, retained Original identity and matured immutable fallback proof
-atomically with exact flight publication. New MAX or frontier progress can
-withdraw this authority between observation and Apply. Refusal leaves normal
-uncovered recovery available. Each accepted copy occupies its existing exact
+Final Apply MUST revalidate the same current frontier, exact retained bytes,
+retained Original identity and matured immutable fallback proof atomically with
+exact flight publication. It MUST preserve which branch supplied authority.
+New MAX withdraws exhausted-credit authority; it does not erase an explicitly
+reported gap. Frontier progress or a positive ACK that clips any part of `r`
+withdraws the corresponding old range proof even if `F` itself is unchanged.
+The normal prepared callback repeats the exact query under its final Native /
+Product fence. A scoped negative fact remains valid until positive Product ACK
+removes it; carrying that fact cannot replace exact retained-frame and assignment
+revalidation. Growing unrelated ACK evidence is not a new identity or a reason to
+refresh an accepted copy's deadline. Refusal leaves normal uncovered recovery
+available. Each accepted copy occupies its existing exact
 slot and keeps its debt until the ordinary Product ACK or serialized attachment
 removal; neither this authority nor an expired deadline renews that slot.
 
@@ -4473,8 +4486,11 @@ bounded by `v*q`. This is not a one-extra-copy or total-wire bound. Native
 retransmission, a sequence of advancing frontiers and serialized attachment
 replacement retain their existing costs. Delayed ACK/MAX can cause unnecessary
 copies, and shared capacity can turn those copies into competing traffic.
-The scope intentionally permits ACK-paced recovery of successive frontier
-quanta rather than granting a whole-window speculative batch. No transport
+The scope intentionally permits frontier-paced recovery of successive quanta
+rather than granting a whole-window speculative batch. Receiver-reported heads
+with spare credit can consume additional native service and delay ordinary work;
+this cost requires comparative small-object, bulk, CPU and lifecycle acceptance,
+not merely a successful head-copy admission. No transport
 preference, inferred bottleneck identity, new timer, threshold or concurrency
 cap selects this authority. Its intended benefit is earlier contiguous
 delivery and released credit; comparative acceptance must include those

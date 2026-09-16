@@ -5,6 +5,11 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_CHUNK_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReliableSendStream {
     stream_id: StreamId,
@@ -484,6 +489,11 @@ impl ReliableSendStream {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_recovery_chunk_visits_for_test() -> usize {
+        RECOVERY_CHUNK_VISITS.with(|visits| visits.replace(0))
+    }
+
     pub fn retransmission_frames_for_ranges(
         &self,
         ranges: &[OffsetRange],
@@ -495,40 +505,53 @@ impl ReliableSendStream {
         let ranges = normalized_offset_ranges(ranges);
         let mut frames = Vec::new();
         let mut emitted_bytes = 0usize;
+        let (Some(first_range), Some(last_range)) = (ranges.first(), ranges.last()) else {
+            return frames;
+        };
+        // Unique source-cache chunks never overlap. One predecessor/successor
+        // seek excludes unrelated prefix and suffix storage. Keep the existing
+        // chunk-first merge for multiple requested ranges; do not add a tree
+        // lookup per range or change exact slice order and budget cut points.
+        let Some(first) = first_overlapping_reinjection_chunk(
+            &self.reinjection_cache,
+            first_range.start,
+            last_range.end,
+        ) else {
+            return frames;
+        };
         let mut range_index = 0usize;
-        for chunk in self.reinjection_cache.values() {
+        for chunk in self
+            .reinjection_cache
+            .range(first..last_range.end)
+            .map(|(_, chunk)| chunk)
+        {
+            #[cfg(test)]
+            RECOVERY_CHUNK_VISITS.with(|visits| visits.set(visits.get() + 1));
             while range_index < ranges.len() {
-                let range = ranges[range_index];
-                if range.end <= chunk.offset {
+                if ranges[range_index].end <= chunk.offset {
                     range_index += 1;
-                    continue;
+                } else {
+                    break;
                 }
-                break;
             }
-            let chunk_start = chunk.offset;
             let chunk_end = chunk.offset.saturating_add(chunk.payload.len() as u64);
-            let mut current_index = range_index;
-            while current_index < ranges.len() {
-                let range = ranges[current_index];
+            for range in &ranges[range_index..] {
                 if range.start >= chunk_end {
                     break;
                 }
-                if range.end > chunk_start {
-                    let start = range.start.max(chunk_start);
-                    let end = range.end.min(chunk_end);
-                    if !push_retransmission_slice(
+                if range.end > chunk.offset
+                    && !push_retransmission_slice(
                         &mut frames,
                         self.stream_id,
                         chunk,
-                        start,
-                        end,
+                        range.start.max(chunk.offset),
+                        range.end.min(chunk_end),
                         byte_limit,
                         &mut emitted_bytes,
-                    ) {
-                        return frames;
-                    }
+                    )
+                {
+                    return frames;
                 }
-                current_index += 1;
             }
         }
         frames
@@ -1338,6 +1361,10 @@ impl std::error::Error for StreamError {}
 #[cfg(test)]
 #[path = "tests_stream.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_recovery_seek.rs"]
+mod tests_recovery_seek;
 
 #[cfg(test)]
 #[path = "tests_recv_flow_control.rs"]

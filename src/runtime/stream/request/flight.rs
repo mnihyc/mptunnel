@@ -3,6 +3,8 @@
 //! Original and reinjected ranges remain keyed by exact attachment instance so
 //! Data ACK attribution cannot cross a reconnect boundary.
 
+mod index;
+use self::index::{FlightBuckets, FlightRangeIndex};
 use super::state::RequestProductQualificationReceipt;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::timing::{ReliableDataAckGapTiming, reliable_data_ack_gap_timing};
@@ -32,6 +34,14 @@ thread_local! {
     static ACK_RELEASE_FLIGHT_VISITS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static RECOVERY_LOOKUP_WORK: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn recovery_lookup_work(steps: usize) {
+    RECOVERY_LOOKUP_WORK.with(|work| work.set(work.get() + steps));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +63,9 @@ pub(in crate::runtime) struct RequestFlightLedger {
     // OriginalData identifies the ordered path; ReinjectedData remains a duplicate.
     // Exact attachment instances fence ACK evidence across path replacement.
     flights: BTreeMap<u64, Vec<RequestFlight>>,
+    // Only structural mutations invalidate a same-pass range index. Timing and
+    // evidence updates remain live reads; they do not change bucket geometry.
+    geometry_revision: u64,
     /// Exact un-DataACKed OriginalData bytes across this logical stream.
     ///
     /// The serialized request sender is the only mutation owner. Keeping this
@@ -77,6 +90,7 @@ pub(in crate::runtime) struct RequestFlightLedger {
 pub(in crate::runtime) struct RequestRecoveryOwnershipView {
     horizon: u64,
     paths: Vec<RequestRecoveryPathCoverage>,
+    index: FlightRangeIndex,
 }
 
 #[derive(Debug)]
@@ -168,6 +182,11 @@ fn append_recovery_coverage(ranges: &mut Vec<OffsetRange>, range: OffsetRange) {
 
 impl RequestFlightLedger {
     #[cfg(test)]
+    pub(in crate::runtime) fn take_recovery_lookup_work_for_test() -> usize {
+        RECOVERY_LOOKUP_WORK.with(|work| work.replace(0))
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn take_reinjection_debt_query_work_for_test() -> (usize, usize) {
         REINJECTION_DEBT_QUERY_WORK.with(|work| work.replace((0, 0)))
     }
@@ -211,7 +230,17 @@ impl RequestFlightLedger {
                 }
             }
         }
-        RequestRecoveryOwnershipView { horizon, paths }
+        let index = FlightRangeIndex::new(
+            &self.flights,
+            horizon,
+            self.geometry_revision,
+            std::ptr::from_ref(self) as usize,
+        );
+        RequestRecoveryOwnershipView {
+            horizon,
+            paths,
+            index,
+        }
     }
 
     /// Immutable accepted-copy coverage for one serialized recovery batch.
@@ -355,25 +384,71 @@ impl RequestFlightLedger {
         range: OffsetRange,
         actor_attached_instances: &[RelayPathInstance],
     ) -> Option<ReliableLiveOwnerFrontier<RelayPathInstance>> {
+        self.uniform_frontier_from_buckets(
+            range,
+            actor_attached_instances,
+            self.recovery_buckets(range, None),
+        )
+    }
+
+    fn recovery_buckets(
+        &self,
+        range: OffsetRange,
+        view: Option<&RequestRecoveryOwnershipView>,
+    ) -> FlightBuckets<'_> {
+        if let Some(view) = view
+            && view.index.matches(
+                range,
+                self.geometry_revision,
+                std::ptr::from_ref(self) as usize,
+            )
+        {
+            return FlightBuckets::Indexed {
+                flights: &self.flights,
+                starts: view.index.starts(range).into_iter(),
+            };
+        }
+        FlightBuckets::Prefix(self.flights.range(..range.end))
+    }
+
+    fn uniform_frontier_from_buckets(
+        &self,
+        range: OffsetRange,
+        actor_attached_instances: &[RelayPathInstance],
+        buckets: FlightBuckets<'_>,
+    ) -> Option<ReliableLiveOwnerFrontier<RelayPathInstance>> {
         reliable_live_owner_uniform_frontier(
             range,
-            self.flights
-                .range(..range.end)
-                .flat_map(|(start, flights)| {
-                    flights.iter().filter_map(move |flight| {
-                        (flight.end > range.start
-                            && actor_attached_instances.contains(&flight.instance))
-                        .then_some(ReliableFlightSpan {
-                            range: OffsetRange {
-                                start: *start,
-                                end: flight.end,
-                            },
-                            identity: flight.instance,
-                            kind: flight.kind,
-                            sent_at: flight.sent_at,
-                        })
+            buckets.flat_map(|(start, flights)| {
+                flights.iter().filter_map(move |flight| {
+                    (flight.end > range.start
+                        && actor_attached_instances.contains(&flight.instance))
+                    .then_some(ReliableFlightSpan {
+                        range: OffsetRange {
+                            start,
+                            end: flight.end,
+                        },
+                        identity: flight.instance,
+                        kind: flight.kind,
+                        sent_at: flight.sent_at,
                     })
-                }),
+                })
+            }),
+        )
+    }
+
+    /// Same exact canonical sweep, with unrelated prefix buckets skipped by
+    /// the current dispatch's max-end index. Clocks and records stay live.
+    pub(in crate::runtime) fn live_owner_uniform_frontier_in_view(
+        &self,
+        range: OffsetRange,
+        actor_attached_instances: &[RelayPathInstance],
+        view: &RequestRecoveryOwnershipView,
+    ) -> Option<ReliableLiveOwnerFrontier<RelayPathInstance>> {
+        self.uniform_frontier_from_buckets(
+            range,
+            actor_attached_instances,
+            self.recovery_buckets(range, Some(view)),
         )
     }
 
@@ -390,7 +465,25 @@ impl RequestFlightLedger {
     pub(in crate::runtime) fn observe_original_recovery_timing_for_range(
         &mut self,
         range: OffsetRange,
+        owner_snapshot: impl FnMut(RelayPathInstance) -> Option<PathSnapshot>,
+    ) -> Option<ReliableDataAckGapTiming> {
+        self.observe_recovery_timing_with_view(range, owner_snapshot, None)
+    }
+
+    pub(in crate::runtime) fn observe_original_recovery_timing_in_view(
+        &mut self,
+        range: OffsetRange,
+        view: &RequestRecoveryOwnershipView,
+        owner_snapshot: impl FnMut(RelayPathInstance) -> Option<PathSnapshot>,
+    ) -> Option<ReliableDataAckGapTiming> {
+        self.observe_recovery_timing_with_view(range, owner_snapshot, Some(view))
+    }
+
+    fn observe_recovery_timing_with_view(
+        &mut self,
+        range: OffsetRange,
         mut owner_snapshot: impl FnMut(RelayPathInstance) -> Option<PathSnapshot>,
+        view: Option<&RequestRecoveryOwnershipView>,
     ) -> Option<ReliableDataAckGapTiming> {
         if range.is_empty() {
             return None;
@@ -403,12 +496,12 @@ impl RequestFlightLedger {
         let mut covered_until = range.start;
         let mut seen = HashSet::new();
         let mut assignments = Vec::new();
-        for (start, flights) in self.flights.range(..range.end) {
+        for (start, flights) in self.recovery_buckets(range, view) {
             for flight in flights
                 .iter()
                 .filter(|flight| flight.kind.is_original_transmission() && flight.end > range.start)
             {
-                if *start > covered_until {
+                if start > covered_until {
                     return None;
                 }
                 covered_until = covered_until.max(flight.end.min(range.end));
@@ -571,6 +664,7 @@ impl RequestFlightLedger {
         let reinjection_suppression_deadline = reinjection_suppression_interval
             .and_then(|interval| sent_at.checked_add(interval))
             .or(reinjection_suppression_interval.map(|_| sent_at));
+        self.geometry_revision = self.geometry_revision.wrapping_add(1);
         self.flights.entry(offset).or_default().push(RequestFlight {
             instance,
             assignment_range: OffsetRange { start: offset, end },
@@ -625,6 +719,7 @@ impl RequestFlightLedger {
         if ranges.is_empty() || self.flights.is_empty() {
             return Vec::new();
         }
+        self.geometry_revision = self.geometry_revision.wrapping_add(1);
 
         // No flight starting at/after the largest normalized ACK end can
         // cover an acknowledged byte or affect its pre-release ambiguity.
@@ -762,6 +857,7 @@ impl RequestFlightLedger {
     }
 
     pub(in crate::runtime) fn drain_all(&mut self) -> Vec<RequestPathRelease> {
+        self.geometry_revision = self.geometry_revision.wrapping_add(1);
         let mut released = Vec::new();
         self.original_data_in_flight_bytes = 0;
         self.original_data_in_flight_bytes_by_instance.clear();
@@ -990,6 +1086,7 @@ impl RequestFlightLedger {
         owners
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn original_transmission_underlay_for_frame(
         &self,
         frame: &Frame,
@@ -1002,16 +1099,25 @@ impl RequestFlightLedger {
             .then_some(underlay)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn original_transmission_keys_for_frame_any_instance(
         &self,
         frame: &Frame,
+    ) -> Vec<RelayPathKey> {
+        self.original_keys_with_view(frame, None)
+    }
+
+    fn original_keys_with_view(
+        &self,
+        frame: &Frame,
+        view: Option<&RequestRecoveryOwnershipView>,
     ) -> Vec<RelayPathKey> {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
         let mut owner_keys = Vec::new();
-        for (offset, flights) in self.flights.range(..end) {
-            if *offset > start {
+        for (offset, flights) in self.recovery_buckets(OffsetRange { start, end }, view) {
+            if offset > start {
                 break;
             }
             for flight in flights {
@@ -1037,6 +1143,7 @@ impl RequestFlightLedger {
 
     /// Returns exact ownership and its latest send epoch in one ledger pass.
     /// The latest adjacent flight is conservative when an ACK gap spans writes.
+    #[cfg(test)]
     pub(in crate::runtime) fn unique_original_flight_for_frame(
         &self,
         frame: &Frame,
@@ -1063,9 +1170,41 @@ impl RequestFlightLedger {
             .map(|(owner, _)| owner)
     }
 
+    #[cfg(test)]
     fn unique_original_flight_for_range(
         &self,
         range: OffsetRange,
+    ) -> Option<(RelayPathInstance, Instant)> {
+        self.unique_original_flight_with_view(range, None)
+    }
+
+    /// The unique contiguous owner and the old whole-frame-underlay contract
+    /// remain separate facts; a union of adjacent Originals cannot impersonate
+    /// a single whole-frame underlay witness.
+    pub(in crate::runtime) fn original_frame_facts_with_view(
+        &self,
+        frame: &Frame,
+        view: Option<&RequestRecoveryOwnershipView>,
+    ) -> (
+        Option<(RelayPathInstance, Instant)>,
+        Option<UnderlayProtocol>,
+    ) {
+        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+            return (None, None);
+        };
+        let owner = self.unique_original_flight_with_view(OffsetRange { start, end }, view);
+        let keys = self.original_keys_with_view(frame, view);
+        let underlay = keys
+            .first()
+            .map(|key| key.underlay)
+            .filter(|underlay| keys.iter().all(|key| key.underlay == *underlay));
+        (owner, underlay)
+    }
+
+    fn unique_original_flight_with_view(
+        &self,
+        range: OffsetRange,
+        view: Option<&RequestRecoveryOwnershipView>,
     ) -> Option<(RelayPathInstance, Instant)> {
         if range.is_empty() {
             return None;
@@ -1073,7 +1212,7 @@ impl RequestFlightLedger {
         let mut owner = None;
         let mut latest_sent_at = None;
         let mut covered = Vec::new();
-        for (start, flights) in self.flights.range(..range.end) {
+        for (start, flights) in self.recovery_buckets(range, view) {
             for flight in flights {
                 if !flight.kind.is_original_transmission() || flight.end <= range.start {
                     continue;
@@ -1087,7 +1226,7 @@ impl RequestFlightLedger {
                         .map_or(flight.sent_at, |latest: Instant| latest.max(flight.sent_at)),
                 );
                 covered.push(OffsetRange {
-                    start: (*start).max(range.start),
+                    start: start.max(range.start),
                     end: flight.end.min(range.end),
                 });
             }

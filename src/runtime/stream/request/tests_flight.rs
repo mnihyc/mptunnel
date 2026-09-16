@@ -1,3 +1,6 @@
+#[path = "tests_recovery_index.rs"]
+mod recovery_index;
+
 use super::{RequestFlightLedger, RequestRecoveryOwnershipView};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::model::work::CarrierWorkKind;

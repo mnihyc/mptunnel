@@ -862,10 +862,11 @@ impl RequestSenderService {
             start: frontier,
             end: frontier.saturating_add(scoring_payload_bytes as u64),
         };
-        let Some(scoring_frontier) = self
-            .multipath
-            .live_owner_uniform_frontier(scoring_range, &attached_instances)
-        else {
+        let Some(scoring_frontier) = self.multipath.live_owner_uniform_frontier_in_view(
+            scoring_range,
+            &attached_instances,
+            ownership,
+        ) else {
             return RequestDataAckGapObservation::default();
         };
         if scoring_frontier.range != scoring_range
@@ -901,6 +902,7 @@ impl RequestSenderService {
                 scoring_payload_bytes,
                 &scoring_frontier.avoid,
                 recovery_observation,
+                ownership,
             );
         let exact_owner = uniform_frontier.owners[0];
         let owner_snapshot = model.original_path_timing;
@@ -1489,15 +1491,16 @@ impl RequestSenderService {
                         start: cursor,
                         end: cursor.saturating_add(extent as u64),
                     };
-                    let Some(timing) =
-                        self.multipath
-                            .observe_original_recovery_timing_for_range(scored, |_| {
-                                // The pure model verified one exact live owner
-                                // throughout this scored range. Preserve its same
-                                // native timing observation through the decision.
-                                model.original_path_timing
-                            })
-                    else {
+                    let Some(timing) = self.multipath.observe_original_recovery_timing_in_view(
+                        scored,
+                        &ownership,
+                        |_| {
+                            // The pure model verified one exact live owner
+                            // throughout this scored range. Preserve its same
+                            // native timing observation through the decision.
+                            model.original_path_timing
+                        },
+                    ) else {
                         break;
                     };
                     model.owner_recovery_timing = Some(timing);

@@ -1439,10 +1439,11 @@ impl RequestMultipathController {
         scoring_payload_bytes: usize,
         scoring_avoid: &[RelayPathInstance],
         recovery_observation: &OnceCell<RequestRelaySchedulingObservation>,
+        ownership: &RequestRecoveryOwnershipView,
     ) -> RequestDataAckGapObservation {
         let recovery_observation = recovery_observation
             .get_or_init(|| self.observe_data_ack_gap_reinjection(context, remotes));
-        self.data_ack_gap_reinjection_model_from_observation(
+        self.recovery_reinjection_model_from_observation(
             context,
             remotes,
             preview,
@@ -1451,6 +1452,8 @@ impl RequestMultipathController {
             Some((sender_queue, reinjection_debt_bytes, mux_limits)),
             scoring_avoid,
             recovery_observation,
+            false,
+            Some(ownership),
         )
     }
 
@@ -1520,6 +1523,7 @@ impl RequestMultipathController {
             scoring_avoid,
             recovery_observation,
             false,
+            None,
         )
     }
 
@@ -1548,6 +1552,7 @@ impl RequestMultipathController {
             scoring_avoid,
             recovery_observation,
             true,
+            None,
         )
     }
 
@@ -1563,18 +1568,15 @@ impl RequestMultipathController {
         scoring_avoid: &[RelayPathInstance],
         recovery_observation: &RequestRelaySchedulingObservation,
         early_completion_copy: bool,
+        ownership: Option<&RequestRecoveryOwnershipView>,
     ) -> RequestDataAckGapObservation {
-        let original_flight = self
+        let (original_flight, original_underlay) = self
             .request
             .flights
-            .unique_original_flight_for_frame(preview);
+            .original_frame_facts_with_view(preview, ownership);
         let original_path = original_flight
             .map(|(instance, _)| instance)
             .filter(|instance| remotes.contains_path_instance(*instance));
-        let original_underlay = self
-            .request
-            .flights
-            .original_transmission_underlay_for_frame(preview);
         // A replacement carrier with the same numeric path key must not lend
         // its RTT or congestion evidence to an older attachment's flight. The
         // owner and alternate below are both projected from this one immutable
@@ -1781,6 +1783,17 @@ impl RequestMultipathController {
             .live_owner_uniform_frontier(range, live_instances)
     }
 
+    pub(super) fn live_owner_uniform_frontier_in_view(
+        &self,
+        range: OffsetRange,
+        live_instances: &[RelayPathInstance],
+        view: &RequestRecoveryOwnershipView,
+    ) -> Option<ReliableLiveOwnerFrontier<RelayPathInstance>> {
+        self.request
+            .flights
+            .live_owner_uniform_frontier_in_view(range, live_instances, view)
+    }
+
     pub(super) fn live_copy_coverage(
         &self,
         live_instances: &[RelayPathInstance],
@@ -1811,6 +1824,17 @@ impl RequestMultipathController {
         self.request
             .flights
             .observe_original_recovery_timing_for_range(range, owner_snapshot)
+    }
+
+    pub(super) fn observe_original_recovery_timing_in_view(
+        &mut self,
+        range: OffsetRange,
+        view: &RequestRecoveryOwnershipView,
+        owner_snapshot: impl FnMut(RelayPathInstance) -> Option<PathSnapshot>,
+    ) -> Option<ReliableDataAckGapTiming> {
+        self.request
+            .flights
+            .observe_original_recovery_timing_in_view(range, view, owner_snapshot)
     }
 
     pub(super) fn tail_reinjection_owner_keys(

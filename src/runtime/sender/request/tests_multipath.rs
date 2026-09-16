@@ -201,6 +201,9 @@ impl PreparedCompletionFixture {
 #[path = "tests_credit_frontier.rs"]
 mod credit_frontier;
 
+#[path = "tests_recovery_projection.rs"]
+mod recovery_projection;
+
 #[tokio::test]
 async fn prepared_latency_completion_uses_real_ready_apply_once_and_refusal_spends_nothing() {
     let mut f = PreparedCompletionFixture::new();

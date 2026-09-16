@@ -79,6 +79,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_PROJECTION_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
 fn request_path_proof(path: &ReliableRelayRemotePath) -> Option<RelayPathProofEpoch> {
     path.path_proof_id.map(|proof_id| RelayPathProofEpoch {
         proof_id,
@@ -2439,6 +2444,8 @@ impl RequestMultipathController {
         observation: &RequestRelaySchedulingObservation,
         instance: RelayPathInstance,
     ) -> Option<PathSnapshot> {
+        #[cfg(test)]
+        RECOVERY_PROJECTION_CALLS.with(|calls| calls.set(calls.get() + 1));
         let path = observation.path_by_instance(instance)?;
         let request_state = RequestSchedulingState {
             operation: self.request.ack_clock_operation,

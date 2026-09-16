@@ -3135,6 +3135,12 @@ impl Controller for Bbr3 {
                 self.app_limited = Ord::max(self.delivered.saturating_add(self.inflight), 1);
             }
             for packets in self.packets.iter_mut() {
+                // Old stale prefix entries need no tail compaction. Do not pop
+                // newly acknowledged entries: this ACK's ECN callback still
+                // needs their snapshots until the next ACK cleanup epoch.
+                while packets.front().is_some_and(|packet| packet.stale) {
+                    let _ = packets.pop_front();
+                }
                 packets.retain_mut(|p| {
                     // Retire old evidence before marking this ACK's snapshots;
                     // they must remain available for same-ACK ECN processing.

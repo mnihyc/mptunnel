@@ -591,7 +591,7 @@ async fn bounded_ack_gap_uses_an_active_unmeasured_alternate() {
             RelaySendCause::PersistentAckGapReinjection,
             &[tcp],
             reliable_stream_frame_accounted_bytes(&frame),
-            Some(&recovery_observation),
+            Some((&recovery_observation).into()),
         )
         .expect("persistent repair must use its one immutable evidence batch");
     assert_eq!(remotes.paths[selected].instance(), udp);

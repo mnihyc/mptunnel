@@ -6,9 +6,8 @@
 
 use self::multipath::{
     RequestMultipathController, RequestMultipathPlan, RequestMultipathPlanError,
-    RequestRelayNativeCapture, RequestRelayNativeInputs,
+    RequestRecoveryBatchObservation, RequestRelayNativeCapture, RequestRelayNativeInputs,
 };
-use self::scheduling::RequestRelaySchedulingObservation;
 use super::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
 use super::work::{
     CarrierEmitMode, ClientReinjectionOutputIdentity, RelaySendCause, RelaySendOutcome,
@@ -827,7 +826,7 @@ impl RequestSenderService {
         preview_limit: usize,
         lane: TrafficClass,
         ownership: &RequestRecoveryOwnershipView,
-        recovery_observation: &OnceCell<RequestRelaySchedulingObservation>,
+        recovery_observation: &OnceCell<RequestRecoveryBatchObservation>,
     ) -> RequestDataAckGapObservation {
         let Some((frontier, horizon)) = first_proven_ack_gap(normalized_ranges) else {
             return RequestDataAckGapObservation::default();

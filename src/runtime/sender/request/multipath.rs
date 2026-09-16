@@ -82,6 +82,67 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 thread_local! {
     static RECOVERY_PROJECTION_CALLS: Cell<usize> = const { Cell::new(0) };
+    static RECOVERY_PROJECTION_UNCACHED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Scalars derived once from the existing captured Native observation and the
+/// unchanged Product debt/rate epochs of one synchronous gap-service pass.
+/// The caller never retains this batch across append, ACK, membership change,
+/// an await or a later service pass. It caches no queue/Ready/admission result.
+#[derive(Debug)]
+pub(super) struct RequestRecoveryBatchObservation {
+    observation: RequestRelaySchedulingObservation,
+    snapshots: Vec<Option<PathSnapshot>>,
+    #[cfg(test)]
+    uncached_for_test: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RecoveryObservation<'a> {
+    observation: &'a RequestRelaySchedulingObservation,
+    snapshots: Option<&'a [Option<PathSnapshot>]>,
+}
+
+impl<'a> From<&'a RequestRelaySchedulingObservation> for RecoveryObservation<'a> {
+    fn from(observation: &'a RequestRelaySchedulingObservation) -> Self {
+        Self {
+            observation,
+            snapshots: None,
+        }
+    }
+}
+
+impl RequestRecoveryBatchObservation {
+    fn view(&self) -> RecoveryObservation<'_> {
+        #[cfg(test)]
+        if self.uncached_for_test {
+            return (&self.observation).into();
+        }
+        RecoveryObservation {
+            observation: &self.observation,
+            snapshots: Some(&self.snapshots),
+        }
+    }
+}
+
+impl RecoveryObservation<'_> {
+    fn snapshot(
+        self,
+        controller: &RequestMultipathController,
+        instance: RelayPathInstance,
+    ) -> Option<PathSnapshot> {
+        if let Some(snapshots) = self.snapshots {
+            let position = self
+                .observation
+                .paths
+                .iter()
+                .position(|path| path.instance == instance)?;
+            snapshots[position]
+        } else {
+            controller
+                .request_reinjection_target_snapshot_from_observation(self.observation, instance)
+        }
+    }
 }
 
 fn request_path_proof(path: &ReliableRelayRemotePath) -> Option<RelayPathProofEpoch> {
@@ -1443,11 +1504,11 @@ impl RequestMultipathController {
         mux_limits: MuxLimits,
         scoring_payload_bytes: usize,
         scoring_avoid: &[RelayPathInstance],
-        recovery_observation: &OnceCell<RequestRelaySchedulingObservation>,
+        recovery_observation: &OnceCell<RequestRecoveryBatchObservation>,
         ownership: &RequestRecoveryOwnershipView,
     ) -> RequestDataAckGapObservation {
-        let recovery_observation = recovery_observation
-            .get_or_init(|| self.observe_data_ack_gap_reinjection(context, remotes));
+        let recovery_observation =
+            recovery_observation.get_or_init(|| self.observe_recovery_batch(context, remotes));
         self.recovery_reinjection_model_from_observation(
             context,
             remotes,
@@ -1456,10 +1517,49 @@ impl RequestMultipathController {
             scoring_payload_bytes,
             Some((sender_queue, reinjection_debt_bytes, mux_limits)),
             scoring_avoid,
-            recovery_observation,
+            recovery_observation.view(),
             false,
             Some(ownership),
         )
+    }
+
+    fn observe_recovery_batch(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+    ) -> RequestRecoveryBatchObservation {
+        let observation = self.observe_data_ack_gap_reinjection(context, remotes);
+        self.recovery_batch_from_observation(observation)
+    }
+
+    fn recovery_batch_from_observation(
+        &self,
+        observation: RequestRelaySchedulingObservation,
+    ) -> RequestRecoveryBatchObservation {
+        #[cfg(test)]
+        if RECOVERY_PROJECTION_UNCACHED.with(Cell::get) {
+            return RequestRecoveryBatchObservation {
+                observation,
+                snapshots: Vec::new(),
+                uncached_for_test: true,
+            };
+        }
+        let snapshots = observation
+            .paths
+            .iter()
+            .map(|path| {
+                self.request_reinjection_target_snapshot_from_observation(
+                    &observation,
+                    path.instance,
+                )
+            })
+            .collect();
+        RequestRecoveryBatchObservation {
+            observation,
+            snapshots,
+            #[cfg(test)]
+            uncached_for_test: false,
+        }
     }
 
     fn observe_data_ack_gap_reinjection(
@@ -1526,7 +1626,7 @@ impl RequestMultipathController {
             scoring_payload_bytes,
             service,
             scoring_avoid,
-            recovery_observation,
+            recovery_observation.into(),
             false,
             None,
         )
@@ -1555,7 +1655,7 @@ impl RequestMultipathController {
             scoring_payload_bytes,
             service,
             scoring_avoid,
-            recovery_observation,
+            recovery_observation.into(),
             true,
             None,
         )
@@ -1571,7 +1671,7 @@ impl RequestMultipathController {
         scoring_payload_bytes: usize,
         service: Option<(&ReliableRelaySenderQueue, usize, MuxLimits)>,
         scoring_avoid: &[RelayPathInstance],
-        recovery_observation: &RequestRelaySchedulingObservation,
+        recovery_observation: RecoveryObservation<'_>,
         early_completion_copy: bool,
         ownership: Option<&RequestRecoveryOwnershipView>,
     ) -> RequestDataAckGapObservation {
@@ -1587,12 +1687,8 @@ impl RequestMultipathController {
         // owner and alternate below are both projected from this one immutable
         // observation. The frontier is already part of the owner's exact
         // OriginalData debt, so only the alternate is charged the new copy.
-        let original_path_timing = original_path.and_then(|instance| {
-            self.request_reinjection_target_snapshot_from_observation(
-                recovery_observation,
-                instance,
-            )
-        });
+        let original_path_timing =
+            original_path.and_then(|instance| recovery_observation.snapshot(self, instance));
         let owner_completion = original_path_timing
             .and_then(|snapshot| scheduler::score_path(snapshot, lane, 0))
             .filter(|score| score.eta_ms.is_finite())
@@ -1619,14 +1715,10 @@ impl RequestMultipathController {
                     .stale_for_original_data(instance)
                 && ((!early_completion_copy
                     && !recovery_observation
+                        .observation
                         .path_by_instance(instance)
                         .is_some_and(|observed| observed.has_bulk_model_evidence))
-                    || self
-                        .request_reinjection_target_snapshot_from_observation(
-                            recovery_observation,
-                            instance,
-                        )
-                        .is_none())
+                    || recovery_observation.snapshot(self, instance).is_none())
         });
         let mut target_service_exhausted = false;
         let reinjection_path = loop {
@@ -1659,15 +1751,13 @@ impl RequestMultipathController {
             let instance = path.instance();
             if !early_completion_copy
                 && !recovery_observation
+                    .observation
                     .path_by_instance(instance)
                     .is_some_and(|observed| observed.has_bulk_model_evidence)
             {
                 break None;
             }
-            let Some(snapshot) = self.request_reinjection_target_snapshot_from_observation(
-                recovery_observation,
-                instance,
-            ) else {
+            let Some(snapshot) = recovery_observation.snapshot(self, instance) else {
                 break None;
             };
             let accepted_reinjection_bytes = self
@@ -3929,7 +4019,7 @@ impl RequestMultipathController {
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
         payload_bytes: usize,
-        recovery_observation: Option<&RequestRelaySchedulingObservation>,
+        recovery_observation: Option<RecoveryObservation<'_>>,
     ) -> Result<usize, RequestMultipathPlanError> {
         let ack_gap_reinjection = cause.is_ack_gap_reinjection();
         let completion_tail_target = cause.completion_tail_target();
@@ -3969,12 +4059,7 @@ impl RequestMultipathController {
             if cause.is_reinjection() {
                 recovery_observation.map_or_else(
                     || self.request_reinjection_target_snapshot(context, remotes, path),
-                    |observation| {
-                        self.request_reinjection_target_snapshot_from_observation(
-                            observation,
-                            path.instance(),
-                        )
-                    },
+                    |observation| observation.snapshot(self, path.instance()),
                 )
             } else {
                 context.reliable_path_snapshot_for_instance(path.instance())
@@ -3986,6 +4071,7 @@ impl RequestMultipathController {
                     || context.relay_path_instance_has_bulk_model_evidence(path.instance()),
                     |observation| {
                         observation
+                            .observation
                             .path_by_instance(path.instance())
                             .is_some_and(|observed| observed.has_bulk_model_evidence)
                     },

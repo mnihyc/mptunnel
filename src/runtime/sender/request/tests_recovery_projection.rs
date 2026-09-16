@@ -29,8 +29,8 @@ fn fragmented_pending_gap() -> PreparedCompletionFixture {
     fixture
 }
 
-#[test]
-fn recovery_projection_count_is_bounded_by_captured_paths_not_gap_fragments() {
+#[tokio::test]
+async fn recovery_projection_count_is_bounded_by_captured_paths_not_gap_fragments() {
     let mut fixture = fragmented_pending_gap();
     let now = Instant::now();
     RECOVERY_PROJECTION_CALLS.with(|calls| calls.set(0));

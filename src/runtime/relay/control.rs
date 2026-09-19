@@ -783,7 +783,6 @@ where
             None => std::future::pending::<RuntimeError>().await,
         }
     };
-    let retirement = context.session_retirement().wait();
     // The wrapper also owns cancellation cleanup: revoking prepared claims
     // and dropping committed output membership share the writer's domain.
     let execution_domain = context.execution_domain();
@@ -797,20 +796,24 @@ where
         #[cfg(test)]
         None,
     ));
-    tokio::pin!(retirement);
     tokio::pin!(terminal);
     tokio::pin!(active);
-    tokio::select! {
-        biased;
-        reason = &mut retirement => Err(RuntimeError::RemoteClosed(reason)),
-        error = &mut terminal => Err(error),
-        result = &mut active => {
-            if let Some(scope) = &terminal_scope {
-                scope.ensure_active()?;
+    // SESSION_CLOSE can publish during a ready inner poll. Recheck the sticky
+    // session reason after either outcome, with cancellation still domain-owned.
+    context
+        .complete_session_operation(async {
+            tokio::select! {
+                biased;
+                error = &mut terminal => Err(error),
+                result = &mut active => {
+                    if let Some(scope) = &terminal_scope {
+                        scope.ensure_active()?;
+                    }
+                    result
+                },
             }
-            result
-        },
-    }
+        })
+        .await
 }
 
 async fn relay_migrating_tcp_stream_active<S>(

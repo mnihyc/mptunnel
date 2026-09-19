@@ -292,8 +292,8 @@ impl ClientTcpPathSessionHandle {
             self.runtime.session_id,
             stream_id,
         )?;
-        let mut opened = self
-            .complete_session_operation(terminal.complete(self.open_stream_with_deadlines_active(
+        let mut opened = {
+            let opening = self.open_stream_with_deadlines_active(
                 stream_id,
                 target,
                 lane,
@@ -302,8 +302,11 @@ impl ClientTcpPathSessionHandle {
                 open_deadlines,
                 advertised_recv_max_offset,
                 &terminal,
-            )))
-            .await?;
+            );
+            tokio::pin!(opening);
+            self.complete_session_operation(terminal.complete(opening.as_mut()))
+                .await
+        }?;
         opened.carrier.terminal_owner = owner;
         Ok(opened)
     }

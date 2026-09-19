@@ -497,8 +497,8 @@ impl ClientUdpPathSessionHandle {
             self.runtime.session_id,
             stream_id,
         )?;
-        let result = terminal
-            .complete(self.open_stream_in_scope(
+        let result = {
+            let opening = self.open_stream_in_scope(
                 stream_id,
                 target,
                 lane,
@@ -507,8 +507,10 @@ impl ClientUdpPathSessionHandle {
                 open_deadline,
                 advertised_recv_max_offset,
                 &terminal,
-            ))
-            .await;
+            );
+            tokio::pin!(opening);
+            terminal.complete(opening.as_mut()).await
+        };
         self.runtime.state.session_lifecycle().ensure_active()?;
         let mut opened = result?;
         opened.terminal_owner = owner;

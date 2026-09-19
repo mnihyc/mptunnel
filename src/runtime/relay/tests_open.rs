@@ -478,22 +478,26 @@ async fn logical_terminal_survives_outer_deadline_discarding_raw_success() {
     }
     .guard_retirement();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let opening = scope.complete(relay_path_open_with_deadline(deadline, async move {
-        std::future::pending::<()>().await;
-        Ok(carrier)
-    }));
-    tokio::pin!(opening);
-    assert!(opening.as_mut().now_or_never().is_none());
-    // The raw accepted value is already in the operation. Neither publishing
-    // this reason nor expiry polls the owner; both are ready on its next poll.
-    publisher.publish_reset(stream_id, crate::protocol::ResetReason::RemoteClosed);
-    tokio::time::advance(Duration::from_secs(10)).await;
-    assert!(matches!(
-        opening.await,
-        Err(RuntimeError::RemoteReset(
-            crate::protocol::ResetReason::RemoteClosed
-        )),
-    ));
+    {
+        let operation = relay_path_open_with_deadline(deadline, async move {
+            std::future::pending::<()>().await;
+            Ok(carrier)
+        });
+        tokio::pin!(operation);
+        let opening = scope.complete(operation.as_mut());
+        tokio::pin!(opening);
+        assert!(opening.as_mut().now_or_never().is_none());
+        // The raw accepted value is already in the operation. Neither publishing
+        // this reason nor expiry polls the owner; both are ready on its next poll.
+        publisher.publish_reset(stream_id, crate::protocol::ResetReason::RemoteClosed);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(matches!(
+            opening.await,
+            Err(RuntimeError::RemoteReset(
+                crate::protocol::ResetReason::RemoteClosed
+            )),
+        ));
+    }
     assert!(matches!(
         try_recv_reliable_path_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id

@@ -421,15 +421,12 @@ async fn open_remote_stream_active(
         context.session_id,
         stream_id,
     )?;
-    let opened = terminal
-        .complete(open_remote_stream_in_scope(
-            context,
-            target,
-            lane,
-            stream_id,
-            terminal.clone(),
-        ))
-        .await?;
+    let opened = {
+        let opening =
+            open_remote_stream_in_scope(context, target, lane, stream_id, terminal.clone());
+        tokio::pin!(opening);
+        terminal.complete(opening.as_mut()).await
+    }?;
     Ok(opened.with_terminal_owner(owner))
 }
 
@@ -752,8 +749,9 @@ pub(in crate::runtime) async fn open_remote_stream_for_relay_path(
     };
     // This scope is owned outside both transport and outer attempt deadlines.
     // A deadline may drop a raw accepted result, but not its routed RESET.
+    tokio::pin!(opening);
     match &spec.terminal {
-        Some(terminal) => terminal.complete(opening).await,
+        Some(terminal) => terminal.complete(opening.as_mut()).await,
         None => opening.await,
     }
 }

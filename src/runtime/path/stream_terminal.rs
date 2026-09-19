@@ -3,6 +3,7 @@
 use crate::protocol::{ResetReason, SessionId, StreamId};
 use crate::runtime::error::RuntimeError;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
@@ -87,13 +88,14 @@ impl ClientStreamTerminalScope {
         }
     }
 
+    // The caller pins the operation once and drops it before transferring its
+    // logical owner. Borrowing avoids a second owned async operation envelope.
     pub(in crate::runtime) async fn complete<T>(
         &self,
-        operation: impl Future<Output = Result<T, RuntimeError>>,
+        mut operation: Pin<&mut impl Future<Output = Result<T, RuntimeError>>>,
     ) -> Result<T, RuntimeError> {
         let terminal = self.wait();
         tokio::pin!(terminal);
-        tokio::pin!(operation);
         tokio::select! {
             biased;
             error = &mut terminal => Err(error),
@@ -258,7 +260,9 @@ mod tests {
         let (scope, _owner) =
             ClientStreamTerminalScope::for_open(None, SessionId(313), StreamId(713)).unwrap();
         let publisher = scope.pending_input();
-        let waiting = scope.complete(std::future::pending::<Result<(), RuntimeError>>());
+        let operation = std::future::pending::<Result<(), RuntimeError>>();
+        tokio::pin!(operation);
+        let waiting = scope.complete(operation.as_mut());
         tokio::pin!(waiting);
         assert!(waiting.as_mut().now_or_never().is_none());
         publisher.publish_reset(StreamId(713), ResetReason::RemoteClosed);
@@ -266,10 +270,10 @@ mod tests {
             waiting.await,
             Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed))
         ));
+        let operation = async { Err::<(), _>(RuntimeError::PathOpenTimedOut) };
+        tokio::pin!(operation);
         assert!(matches!(
-            scope
-                .complete(async { Err::<(), _>(RuntimeError::PathOpenTimedOut) })
-                .await,
+            scope.complete(operation.as_mut()).await,
             Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed)),
         ));
     }

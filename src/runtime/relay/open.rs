@@ -405,9 +405,9 @@ pub(in crate::runtime) async fn open_remote_stream(
     target: TargetAddr,
     lane: TrafficClass,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    context
-        .complete_session_operation(open_remote_stream_active(context, target, lane))
-        .await
+    let opening = open_remote_stream_active(context, target, lane);
+    tokio::pin!(opening);
+    context.complete_session_operation(opening.as_mut()).await
 }
 
 async fn open_remote_stream_active(

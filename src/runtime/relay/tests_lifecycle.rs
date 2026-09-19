@@ -310,17 +310,19 @@ async fn accepted_result_keeps_routed_reset_across_obsolete_generation() {
         .guard_retirement();
         let accepted = OpenedRemoteStream::from_opened_carrier(accepted, 1, 0);
         let (tx, mut rx) = mpsc::channel(1);
-        tx.send(RelayAdditionalPathOpenResult {
-            key: relay_key(underlay, 1),
-            generation: next_relay_additional_path_open_generation(),
-            mode: ReliableRelayAttachMode::Recovery,
-            startup_ordinal: None,
-            startup_expected_instance: Some(next_carrier_path_instance_id()),
-            result: Ok(accepted),
-        })
-        .await
-        .ok()
-        .expect("raw success is published before a terminal arrives");
+        assert!(
+            tx.send(RelayAdditionalPathOpenResult {
+                key: relay_key(underlay, 1),
+                generation: next_relay_additional_path_open_generation(),
+                mode: ReliableRelayAttachMode::Recovery,
+                startup_ordinal: None,
+                startup_expected_instance: Some(next_carrier_path_instance_id()),
+                result: Ok(accepted),
+            })
+            .await
+            .is_ok(),
+            "raw success is published before a terminal arrives"
+        );
         publisher.publish_reset(stream_id, ResetReason::RemoteClosed);
         assert!(matches!(
             try_drain_completed_additional_path_opens(

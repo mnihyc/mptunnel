@@ -80,11 +80,10 @@ async fn precommit_terminal_survives_wrapper_custody_and_retires_without_attachm
     opened.terminal = Some(publisher.clone());
     opened.terminal_owner = owner;
     let (result_tx, mut result_rx) = mpsc::channel(1);
-    result_tx
-        .send(opened)
-        .await
-        .ok()
-        .expect("accepted result is held outside its original opener");
+    assert!(
+        result_tx.send(opened).await.is_ok(),
+        "accepted result is held outside its original opener"
+    );
     publisher.publish_reset(stream_id, ResetReason::RemoteClosed);
     let opened = result_rx.recv().await.unwrap();
     assert!(matches!(

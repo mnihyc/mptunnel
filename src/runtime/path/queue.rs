@@ -2091,6 +2091,10 @@ pub(in crate::runtime) fn reliable_path_receivers_closed(
 pub(in crate::runtime) async fn recv_reliable_path_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
+    // Keep the queued command inline: this receive path handles every data
+    // frame, while the extra custody handle belongs to the OPEN envelope.
+    // Boxing this branch would allocate for ordinary data as well as OPEN.
+    #[allow(clippy::large_enum_variant)]
     enum ReceivedCommand {
         Retirement(Option<ReliablePathRetirementCommand>),
         Queued(Option<QueuedReliablePathCommand>),

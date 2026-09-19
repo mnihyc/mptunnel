@@ -190,9 +190,9 @@ async fn retire_client_tcp_pending_open(
     stream_id: StreamId,
     error: RuntimeError,
 ) -> Result<(), RuntimeError> {
-    if !streams
+    if streams
         .get(&stream_id)
-        .is_some_and(|state| state.pending_open.is_some())
+        .is_none_or(|state| state.pending_open.is_none())
     {
         return Ok(());
     }

@@ -4014,6 +4014,7 @@ async fn two_initial_create_ordinals_share_one_actual_target_owner() {
     let port = registry.path_port();
     let session_id = SessionId(1701);
     let stream_id = StreamId(19);
+    let mut registrations = Vec::new();
     let mut outputs = Vec::new();
     for (ordinal, underlay) in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp]
         .into_iter()
@@ -4051,7 +4052,7 @@ async fn two_initial_create_ordinals_share_one_actual_target_owner() {
                     candidate_ordinal: ordinal as u8,
                 },
                 attachment: ServerStreamPathAttachment {
-                    path_registration: registration,
+                    path_registration: registration.clone(),
                     commands,
                     max_frame_payload_bytes: mux_limits.max_payload_bytes,
                 },
@@ -4080,6 +4081,22 @@ async fn two_initial_create_ordinals_share_one_actual_target_owner() {
             );
         }
         outputs.push(receivers);
+        // The carrier actor owns this lifetime. A Product attachment records
+        // exact identity but intentionally does not retain the registration.
+        registrations.push(registration);
+    }
+    let snapshot = port.management_snapshot();
+    assert_eq!(snapshot.paths.len(), 2);
+    for registration in &registrations {
+        assert!(
+            snapshot.paths.iter().any(|path| {
+                path.session_id == registration.session_id()
+                    && path.underlay == registration.underlay()
+                    && path.path_id == registration.path_id()
+                    && path.path_instance_id == registration.path_instance_id()
+            }),
+            "both actual carrier owners remain registered through target admission"
+        );
     }
     // The real target-owner producer remained unpolled for both CREATEs.
     let accepted = accepted_rx.recv().await.expect("exactly one target owner");
@@ -4110,4 +4127,5 @@ async fn two_initial_create_ordinals_share_one_actual_target_owner() {
             "one established target grants both live CREATE attachments"
         );
     }
+    drop(registrations);
 }

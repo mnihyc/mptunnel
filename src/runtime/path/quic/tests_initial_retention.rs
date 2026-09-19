@@ -1,6 +1,8 @@
 //! Full logical coordinator with two authenticated native QUIC carriers.
 use super::*;
-use crate::protocol::{StreamAttachmentPhase, StreamReturnPlan};
+use crate::protocol::{
+    PathMetricDirection, StreamAttachmentPhase, StreamReturnPlan, UnderlayProtocol,
+};
 use crate::runtime::relay::open::open_remote_stream_until;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -150,6 +152,28 @@ async fn retained_native_race(original_wins: bool) {
         },
         "repair ownership names the actual winning ordinary native request",
     );
+    // The logical opener publishes exactly one opening metrics frame, unlike
+    // the lower-level pending-open fixtures. Observe that producer before
+    // retirement; the strict DETACH/EOF checks below still reject extra frames.
+    let winner_recv = if original_wins {
+        &mut first_recv
+    } else {
+        &mut second_recv
+    };
+    let opening_metrics = tokio::time::timeout(
+        OPEN_OWNERSHIP_GUARD,
+        udp_path_read_frame(winner_recv, limits),
+    )
+    .await
+    .expect("accepted logical opener publishes its opening metrics")
+    .unwrap();
+    let Frame::PathMetrics { metrics } = opening_metrics else {
+        panic!("expected the winner's single opening metrics frame: {opening_metrics:?}");
+    };
+    assert_eq!(metrics.path_id, accepted[winner].registration.path_id());
+    assert_eq!(metrics.underlay, accepted[winner].registration.underlay());
+    assert_eq!(metrics.underlay, UnderlayProtocol::Udp);
+    assert_eq!(metrics.direction, PathMetricDirection::ClientToServer);
     opened.retire_uncommitted();
     tokio::join!(
         assert_ordered_detach(&mut first_recv, stream_id, limits),

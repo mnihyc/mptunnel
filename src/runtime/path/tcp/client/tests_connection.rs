@@ -17,6 +17,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[path = "tests_accepted_reset.rs"]
+mod accepted_reset;
+
 #[tokio::test]
 async fn tcp_open_preserves_terminal_reset_after_slot_replacement() {
     tokio::time::timeout(Duration::from_secs(2), async {

@@ -1283,3 +1283,6 @@ async fn accepted_zero_max_reset_survives_physical_commit_expiry() {
         "post-first-MAX RESET must survive physical commit expiry: reset_routed_before_expiry={reset_routed_before_expiry} expired_after_pong={expired_after_pong} returned_error={returned_error:?}",
     );
 }
+
+#[path = "tests_initial_retention.rs"]
+mod initial_retention;

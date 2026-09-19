@@ -350,3 +350,6 @@ async fn tcp_accepted_slot_reset_survives_real_carrier_replacement() {
         "routed RESET must survive accepted response custody: returned_error={returned_error:?} reopened_on_successor={reopened}"
     );
 }
+
+#[path = "tests_initial_retention.rs"]
+mod initial_retention;

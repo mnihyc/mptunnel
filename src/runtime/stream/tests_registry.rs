@@ -4005,3 +4005,98 @@ async fn late_frame_after_relay_exit_does_not_close_shared_carrier() {
         Ok(ServerStreamFrameRoute::Routed)
     ));
 }
+
+#[tokio::test]
+async fn two_initial_create_ordinals_share_one_actual_target_owner() {
+    let mux_limits = MuxLimits::default();
+    let (registry, mut accepted_rx) =
+        ServerReliableStreamRegistry::new_accepting(mux_limits.max_streams);
+    let port = registry.path_port();
+    let session_id = SessionId(1701);
+    let stream_id = StreamId(19);
+    let mut outputs = Vec::new();
+    for (ordinal, underlay) in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp]
+        .into_iter()
+        .enumerate()
+    {
+        let registration = port.register_test_carrier_path(
+            session_id,
+            underlay,
+            PathId(ordinal as u16),
+            ServerLocalPathProperties {
+                config_ordinal: ordinal,
+                ..ServerLocalPathProperties::default()
+            },
+        );
+        port.record_path_proof_success(
+            &registration,
+            PathProofObservation {
+                proof_id: 1,
+                elapsed: Duration::from_millis(1),
+                sent_at: Instant::now() - Duration::from_millis(1),
+            },
+        );
+        let (commands, mut receivers) = reliable_path_command_channels(8);
+        let outcome = port
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                initial_demand: StreamDemandHint::Latency,
+                return_plan: StreamReturnPlan {
+                    trigger_bytes: 58_400,
+                    candidate_total: 2,
+                    candidate_tier: crate::protocol::PathUsage::Available,
+                    phase: StreamAttachmentPhase::Create,
+                    candidate_ordinal: ordinal as u8,
+                },
+                attachment: ServerStreamPathAttachment {
+                    path_registration: registration,
+                    commands,
+                    max_frame_payload_bytes: mux_limits.max_payload_bytes,
+                },
+                mux_limits,
+            })
+            .await
+            .expect("matching CREATE remains one logical operation");
+        assert!(matches!(
+            (ordinal, outcome),
+            (0, ServerStreamOpenOutcome::New(TrafficClass::Latency))
+                | (1, ServerStreamOpenOutcome::Existing(TrafficClass::Latency))
+        ));
+        assert!(
+            matches!(try_recv_reliable_path_priority_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData { stream_id: id, max_offset: 0 })) if id == stream_id)
+        );
+        outputs.push(receivers);
+    }
+    // The real target-owner producer remained unpolled for both CREATEs.
+    let accepted = accepted_rx.recv().await.expect("exactly one target owner");
+    assert_eq!(accepted.stream().stream_id, stream_id);
+    assert!(
+        accepted_rx.try_recv().is_err(),
+        "second CREATE must not initiate another target connection"
+    );
+    assert_eq!(accepted.stream().capacity_notifies().len(), 2);
+    accepted.stream().publish_max_data(4096);
+    for output in &mut outputs {
+        let mut positive = false;
+        while let Some(command) = try_recv_reliable_path_priority_command(output) {
+            match command {
+                ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+                    stream_id: id,
+                    max_offset: 4096,
+                }) if id == stream_id => {
+                    positive = true;
+                    break;
+                }
+                ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => {}
+                _ => panic!("unexpected shared target grant"),
+            }
+        }
+        assert!(
+            positive,
+            "one established target grants both live CREATE attachments"
+        );
+    }
+}

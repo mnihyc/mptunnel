@@ -378,6 +378,66 @@ fn cold_quic_attachment_budget_covers_serialized_setup_exchanges() {
 }
 
 #[test]
+fn accepted_retirement_transfers_once_through_explicit_or_product_cleanup() {
+    for transfer_to_product in [false, true] {
+        let stream_id = StreamId(94);
+        let mux_limits = MuxLimits::default();
+        let (commands, mut receivers) = reliable_path_command_channels(4);
+        let (_frames_tx, frames_rx) = mpsc::channel(4);
+        let startup = crate::scheduler::PathSnapshot::new(
+            PathId(0),
+            UnderlayProtocol::Udp,
+            crate::runtime::path::model::default_path_srtt_ms(),
+            crate::runtime::path::model::default_path_rate_bps(),
+        );
+        let carrier = crate::runtime::path::OpenedReliableCarrierStream {
+            retirement: None,
+            stream_id,
+            path_instance_id: next_carrier_path_instance_id(),
+            max_offset: 0,
+            lane: TrafficClass::Throughput,
+            underlay: UnderlayProtocol::Udp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            portable_startup: startup,
+            startup,
+            startup_native_window: None,
+            startup_metrics: None,
+            commands,
+            mux_limits,
+            frames: frames_rx,
+        }
+        .guard_retirement();
+        assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+
+        if transfer_to_product {
+            let opened = OpenedRemoteStream::from_opened_carrier(carrier, 0, 0);
+            assert!(
+                try_recv_reliable_path_command(&mut receivers).is_none(),
+                "installing the pending Product owner must leave its carrier live",
+            );
+            drop(opened);
+        } else {
+            carrier
+                .retire_uncommitted()
+                .expect("explicit accepted retirement");
+        }
+
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+        ));
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut receivers),
+            Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+        ));
+        assert!(
+            try_recv_reliable_path_command(&mut receivers).is_none(),
+            "the transferred capability must not enqueue a second retirement",
+        );
+    }
+}
+
+#[test]
 fn dropped_pending_attachment_queues_detach_and_local_close() {
     let stream_id = StreamId(92);
     let (opened, mut receivers) = pending_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);

@@ -1946,7 +1946,8 @@ async fn open_client_udp_stream_on_connection(
     startup.peer_usage = runtime
         .state
         .peer_path_usage(UnderlayProtocol::Udp, runtime.path_index);
-    Ok(OpenedReliableCarrierStream {
+    let opened = OpenedReliableCarrierStream {
+        retirement: None,
         stream_id,
         path_instance_id: carrier.path_instance_id,
         max_offset,
@@ -1963,7 +1964,8 @@ async fn open_client_udp_stream_on_connection(
         commands,
         mux_limits: runtime.mux_limits,
         frames: frames_rx,
-    })
+    };
+    Ok(opened.guard_retirement())
 }
 
 async fn read_client_udp_stream_open_accept(

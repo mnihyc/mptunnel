@@ -264,19 +264,25 @@ pub(in crate::runtime) struct OpenedRemoteStream {
 
 impl OpenedRemoteStream {
     pub(in crate::runtime) fn from_opened_carrier(
-        carrier: crate::runtime::path::OpenedReliableCarrierStream,
+        mut carrier: crate::runtime::path::OpenedReliableCarrierStream,
         path_index: usize,
         advertised_recv_max_offset: u64,
     ) -> Self {
         let path_instance_id = carrier.path_instance_id;
-        Self {
+        let retirement = carrier.retirement.take();
+        let opened = Self {
             stream: Some(ReliablePathStream::from_opened_carrier(carrier)),
             path_index,
             path_instance_id,
             advertised_recv_max_offset,
             load_lease: None,
             startup: None,
+        };
+        if let Some(retirement) = retirement {
+            // The existing pending-wrapper Drop now owns exactly this cleanup.
+            retirement.disarm();
         }
+        opened
     }
 
     /// A concrete carrier open starts without scheduler ownership; its caller

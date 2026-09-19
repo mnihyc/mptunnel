@@ -405,6 +405,7 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
                     ),
                 );
                 let carrier = OpenedReliableCarrierStream {
+                    retirement: None,
                     stream_id,
                     path_instance_id: connection.path_instance_id,
                     max_offset,

@@ -17,6 +17,9 @@ use crate::transport::{
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+#[path = "tests_client_pending_open.rs"]
+mod pending_open;
+
 #[test]
 fn client_native_health_publication_rejects_stale_activation_before_mutation() {
     let instance = next_carrier_path_instance_id();

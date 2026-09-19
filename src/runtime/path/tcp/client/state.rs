@@ -82,6 +82,13 @@ impl ClientTcpPathConnection {
     }
 }
 
+#[cfg(test)]
+pub(in crate::runtime) struct ClientTcpNativeRetirementPause {
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) reached: tokio::sync::oneshot::Sender<CarrierPathInstanceId>,
+    pub(in crate::runtime) release: tokio::sync::oneshot::Receiver<()>,
+}
+
 #[derive(Clone)]
 pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) paths: Arc<Vec<PathSpec>>,
@@ -109,6 +116,9 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub,
     pub(in crate::runtime) endpoint_policy: Arc<ClientTcpEndpointPolicy>,
     pub(in crate::runtime) carrier_groups: Arc<ClientTcpCarrierGroups>,
+    #[cfg(test)]
+    pub(in crate::runtime) native_retirement_pause:
+        Arc<std::sync::Mutex<Option<ClientTcpNativeRetirementPause>>>,
 }
 
 impl ClientTcpPathSessionRuntime {

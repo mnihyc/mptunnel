@@ -804,6 +804,43 @@ impl ClientTcpPathSessionHandle {
         self.connection_instance_id().is_some()
     }
 
+    /// Holds one actual native-loss cleanup after readiness withdrawal. The
+    /// fixture owns `release`; dropping it also releases the actor's wait.
+    #[cfg(test)]
+    pub(in crate::runtime) fn pause_native_retirement_for_test(
+        &self,
+        expected_instance: CarrierPathInstanceId,
+    ) -> (
+        oneshot::Receiver<CarrierPathInstanceId>,
+        oneshot::Sender<()>,
+        ReliablePathCommandSender,
+    ) {
+        let commands = {
+            let member = self.member.lock().expect("TCP carrier member lock");
+            assert_eq!(self.connection_instance_id(), Some(expected_instance));
+            let current = member.current.as_ref().expect("ready TCP actor slot");
+            assert!(!current.terminal.load(Ordering::Acquire));
+            current.commands.clone()
+        };
+        let (reached, observed) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let mut pause = self
+            .runtime
+            .native_retirement_pause
+            .lock()
+            .expect("test native retirement pause lock");
+        assert!(
+            pause.is_none(),
+            "one exact native retirement pause per fixture"
+        );
+        *pause = Some(state::ClientTcpNativeRetirementPause {
+            path_instance_id: expected_instance,
+            reached,
+            release: released,
+        });
+        (observed, release, commands)
+    }
+
     pub(in crate::runtime) fn connection_remote_port(&self) -> Option<u16> {
         u16::try_from(self.ready_remote_port.load(Ordering::Acquire))
             .ok()

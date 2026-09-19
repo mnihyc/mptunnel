@@ -1110,3 +1110,167 @@ async fn accepted_open_cancellation_before_instance_commit_orders_detach() {
         "exactly one DETACH must be followed by native EOF: {eof:?}"
     );
 }
+
+#[tokio::test]
+async fn accepted_zero_max_reset_survives_physical_commit_expiry() {
+    let fixture = ClientOpenRaceFixture::new().await;
+    let accepted = fixture.establish_current().await;
+    let carrier = current_client_carrier(&fixture.session)
+        .await
+        .expect("established exact carrier");
+    let stream_id = StreamId(1280);
+    let nonce = 1280;
+    let limits = fixture.server_context.codec_limits;
+    let (mut reached, resume) = install_accepted_open_pause(&fixture.session);
+    let mut opening = spawn_test_open(&fixture.session, stream_id);
+    let (mut peer_send, mut peer_recv) = tokio::time::timeout(
+        OPEN_OWNERSHIP_GUARD,
+        read_test_stream_open(&accepted.connection, stream_id, limits),
+    )
+    .await
+    .expect("real OPEN and initial MAX arrive")
+    .expect("peer reads submitted request");
+    let parent_request_id = peer_send.request_stream_id();
+    udp_path_write_frame(
+        &mut peer_send,
+        &Frame::StreamMaxData {
+            stream_id,
+            max_offset: 0,
+        },
+        limits,
+    )
+    .await
+    .expect("real zero first MAX admits only the carrier attachment");
+    let (kind, instance) = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, reached.recv())
+        .await
+        .expect("accepted value reaches existing pre-commit pause")
+        .expect("accepted-open observer remains alive");
+    assert_eq!(kind, ClientUdpAcceptedOpenKind::Reliable);
+    assert_eq!(instance, carrier.path_instance_id);
+
+    let (_repair_send, mut repair_recv) = tokio::time::timeout(
+        OPEN_OWNERSHIP_GUARD,
+        accepted.connection.accept_bi(),
+    )
+    .await
+    .expect("accepted continuation submits its repair request")
+    .expect("peer accepts repair request");
+    assert_eq!(
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, udp_path_read_frame(&mut repair_recv, limits))
+            .await
+            .expect("real repair OPEN arrives")
+            .expect("peer reads repair OPEN"),
+        Frame::OpenStreamRepair {
+            stream_id,
+            parent_request_id,
+        },
+    );
+
+    // Keep the original caller and both peer halves alive. The real physical
+    // commit cannot succeed while this exact owner mutex remains held.
+    let owner = fixture.session.owner.connection.lock().await;
+    assert_eq!(
+        owner.as_ref().map(|slot| slot.carrier.path_instance_id),
+        Some(carrier.path_instance_id),
+    );
+    resume.notify_one();
+    assert!(
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, reached.recv())
+            .await
+            .expect("one-shot accepted pause exits before terminal injection")
+            .is_none(),
+        "the consumed hook closes its observer when the opener leaves the pause",
+    );
+    assert!(!opening.is_finished(), "actual physical commit remains pending");
+    udp_path_write_frame(
+        &mut peer_send,
+        &Frame::StreamReset {
+            stream_id,
+            reason: ResetReason::RemoteClosed,
+        },
+        limits,
+    )
+    .await
+    .expect("peer sends logical RESET after actual first MAX");
+    udp_path_write_frame(&mut peer_send, &Frame::Ping { nonce }, limits)
+        .await
+        .expect("peer sends ordered semantic-routing witness");
+    let first_reply = tokio::time::timeout(
+        OPEN_OWNERSHIP_GUARD,
+        udp_path_read_frame(&mut peer_recv, limits),
+    )
+    .await
+    .expect("Pong or correctly published early terminal arrives")
+    .expect("peer reads complete reply without cancelling its frame read");
+    let reset_routed_before_expiry = match first_reply {
+        Frame::Pong { nonce: replied } if replied == nonce => true,
+        // A corrected terminal handoff may settle before replying to Ping.
+        // This path still must return the exact RESET; it is not an expiry-loss
+        // witness and therefore does not advance the test clock.
+        Frame::StreamDetach { stream_id: detached } if detached == stream_id => false,
+        frame => panic!("unexpected pre-expiry witness: {frame:?}"),
+    };
+    let expired_after_pong = reset_routed_before_expiry && !opening.is_finished();
+    if expired_after_pong {
+        // The ordered Pong proves RESET passed through the ordinary actor;
+        // peer write completion alone would not establish raw queue admission.
+        // Advance only the original helper's ten-second deadline, as in the
+        // submitted-open expiry control, then restore real time immediately.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::resume();
+    }
+    let observed = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, &mut opening).await;
+    let returned_before_unlock = observed.is_ok();
+    drop(owner);
+    // Even an unexpected result is settled before the final conformance
+    // assertion. Never abort the opener to manufacture terminal loss.
+    let result = match observed {
+        Ok(joined) => joined.expect("original opening task join"),
+        Err(_) => tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opening)
+            .await
+            .expect("opening settles after fixture releases physical mutex")
+            .expect("original opening task join after mutex release"),
+    };
+    let returned_error = match result {
+        Ok(opened) => {
+            opened
+                .retire_uncommitted()
+                .expect("retire an unexpected exact accepted result");
+            None
+        }
+        Err(error) => Some(error),
+    };
+
+    if reset_routed_before_expiry {
+        assert_ordered_detach(&mut peer_recv, stream_id, limits).await;
+    } else {
+        let eof = tokio::time::timeout(
+            OPEN_OWNERSHIP_GUARD,
+            udp_path_read_frame(&mut peer_recv, limits),
+        )
+        .await
+        .expect("native EOF follows the already observed early DETACH");
+        assert!(eof.as_ref().is_err_and(super::super::super::io::udp_path_input_finished));
+    }
+    assert!(!carrier.connection.is_closed());
+    assert_eq!(
+        current_client_carrier(&fixture.session)
+            .await
+            .expect("same physical carrier remains installed")
+            .path_instance_id,
+        carrier.path_instance_id,
+    );
+    assert_real_sibling_exchange(&fixture, &accepted).await;
+    assert!(
+        returned_before_unlock,
+        "terminal result must settle independently of physical commit after its existing deadline",
+    );
+    assert!(
+        matches!(
+            returned_error.as_ref(),
+            Some(RuntimeError::RemoteReset(ResetReason::RemoteClosed))
+        ),
+        "post-first-MAX RESET must survive physical commit expiry: reset_routed_before_expiry={reset_routed_before_expiry} expired_after_pong={expired_after_pong} returned_error={returned_error:?}",
+    );
+}

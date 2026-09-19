@@ -456,6 +456,7 @@ impl ClientUdpPathSessionHandle {
 
     // The open boundary transfers the complete logical-stream ownership envelope.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(in crate::runtime) async fn open_stream(
         &self,
         stream_id: StreamId,
@@ -466,7 +467,49 @@ impl ClientUdpPathSessionHandle {
         open_deadline: tokio::time::Instant,
         advertised_recv_max_offset: u64,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
+        self.open_stream_scoped(stream_id, target, lane, initial_demand, return_plan,
+            open_deadline, advertised_recv_max_offset, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) async fn open_stream_scoped(
+        &self,
+        stream_id: StreamId,
+        target: TargetAddr,
+        lane: TrafficClass,
+        initial_demand: StreamDemandHint,
+        return_plan: crate::protocol::StreamReturnPlan,
+        open_deadline: tokio::time::Instant,
+        advertised_recv_max_offset: u64,
+        terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
+    ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
+        let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
+            terminal, self.runtime.session_id, stream_id,
+        )?;
+        let result = terminal.complete(self.open_stream_in_scope(
+            stream_id, target, lane, initial_demand, return_plan, open_deadline,
+            advertised_recv_max_offset, &terminal,
+        )).await;
+        self.runtime.state.session_lifecycle().ensure_active()?;
+        let mut opened = result?;
+        opened.terminal_owner = owner;
+        Ok(opened)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_stream_in_scope(
+        &self,
+        stream_id: StreamId,
+        target: TargetAddr,
+        lane: TrafficClass,
+        initial_demand: StreamDemandHint,
+        return_plan: crate::protocol::StreamReturnPlan,
+        open_deadline: tokio::time::Instant,
+        advertised_recv_max_offset: u64,
+        terminal: &crate::runtime::path::ClientStreamTerminalScope,
+    ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
         for attempt in 0..MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS {
+            terminal.ensure_active()?;
             let expected_path_instance_id = self
                 .runtime
                 .state
@@ -508,6 +551,7 @@ impl ClientUdpPathSessionHandle {
                     return_plan,
                     advertised_recv_max_offset,
                     self.runtime.clone(),
+                    terminal.pending_input(),
                     #[cfg(test)]
                     pending_open_events,
                 ),
@@ -1746,6 +1790,7 @@ async fn open_client_udp_stream_on_connection(
     return_plan: crate::protocol::StreamReturnPlan,
     advertised_recv_max_offset: u64,
     runtime: ClientUdpPathSessionRuntime,
+    terminal: crate::runtime::path::PendingStreamTerminal,
     #[cfg(test)] pending_open_events: Option<ClientUdpPendingOpenEvents>,
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
     // Validate this prerequisite before publishing an OPEN: a later local
@@ -1792,6 +1837,7 @@ async fn open_client_udp_stream_on_connection(
     let connection = carrier.connection.clone();
     let path_instance_id = carrier.path_instance_id;
     let retirement_commands = commands.clone();
+    let stream_terminal = terminal.clone();
     let (handoff, transferred) = oneshot::channel();
     let mut submitted = ClientUdpSubmittedOpen {
         ordinary: Some((send, recv)),
@@ -1915,6 +1961,7 @@ async fn open_client_udp_stream_on_connection(
                 stream_runtime.state.clone(),
                 receivers,
                 frames_tx.clone(),
+                Some(stream_terminal),
             ),
         );
         tokio::select! {
@@ -1940,6 +1987,7 @@ async fn open_client_udp_stream_on_connection(
         &runtime.state,
         path_id,
         runtime.codec_limits,
+        &terminal,
     )
     .await?;
     submitted.accept()?;
@@ -1954,6 +2002,8 @@ async fn open_client_udp_stream_on_connection(
         .peer_path_usage(UnderlayProtocol::Udp, runtime.path_index);
     let opened = OpenedReliableCarrierStream {
         retirement: None,
+        terminal: Some(terminal),
+        terminal_owner: None,
         stream_id,
         path_instance_id: carrier.path_instance_id,
         max_offset,
@@ -1974,6 +2024,7 @@ async fn open_client_udp_stream_on_connection(
     Ok(opened.guard_retirement())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_client_udp_stream_open_accept(
     recv: &mut UdpPathRecvStream,
     stream_id: StreamId,
@@ -1982,6 +2033,7 @@ async fn read_client_udp_stream_open_accept(
     state: &ClientPathState,
     path_id: PathId,
     codec_limits: CodecLimits,
+    terminal: &crate::runtime::path::PendingStreamTerminal,
 ) -> Result<u64, RuntimeError> {
     loop {
         match udp_path_read_frame(recv, codec_limits).await? {
@@ -1992,7 +2044,10 @@ async fn read_client_udp_stream_open_accept(
             Frame::StreamReset {
                 stream_id: reset_stream_id,
                 reason,
-            } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
+            } if reset_stream_id == stream_id => {
+                terminal.publish_reset(stream_id, reason);
+                return Err(RuntimeError::RemoteReset(reason));
+            }
             Frame::StreamDetach {
                 stream_id: detached_stream_id,
             } if detached_stream_id == stream_id => {

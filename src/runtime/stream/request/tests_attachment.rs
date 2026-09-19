@@ -69,6 +69,61 @@ fn opened_stream_at_with_command_capacity(
 }
 
 #[tokio::test]
+async fn precommit_terminal_survives_wrapper_custody_and_retires_without_attachment() {
+    use crate::runtime::path::ClientStreamTerminalScope;
+
+    let stream_id = StreamId(820);
+    let (scope, owner) = ClientStreamTerminalScope::for_open(None, SessionId(820), stream_id).unwrap();
+    let publisher = scope.pending_input();
+    let (mut opened, _frames, mut commands) = opened_stream(stream_id);
+    opened.terminal = Some(publisher.clone());
+    opened.terminal_owner = owner;
+    let (result_tx, mut result_rx) = mpsc::channel(1);
+    result_tx.send(opened).await.ok().expect("accepted result is held outside its original opener");
+    publisher.publish_reset(stream_id, ResetReason::RemoteClosed);
+    let opened = result_rx.recv().await.unwrap();
+    assert!(matches!(
+        ReliableRelayRemoteSet::try_new(opened, 4),
+        Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed)),
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut commands),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut commands),
+        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+    ));
+    assert!(try_recv_reliable_path_command(&mut commands).is_none());
+}
+
+#[tokio::test]
+async fn committed_input_keeps_max_before_reset_and_releases_its_linear_owner() {
+    use crate::runtime::path::ClientStreamTerminalScope;
+
+    let stream_id = StreamId(821);
+    let (scope, owner) = ClientStreamTerminalScope::for_open(None, SessionId(821), stream_id).unwrap();
+    let publisher = scope.pending_input();
+    let (mut opened, frames, _commands) = opened_stream(stream_id);
+    opened.terminal = Some(publisher.clone());
+    opened.terminal_owner = owner;
+    let (remotes, mut input) = ReliableRelayRemoteSet::try_new(opened, 4).unwrap();
+    assert!(scope.ensure_active().is_ok(), "the input owner inherits the initial scope lifetime");
+    let max = Frame::StreamMaxData { stream_id, max_offset: 8 };
+    frames.send(Ok(max.clone())).await.unwrap();
+    publisher.publish_reset(stream_id, ResetReason::RemoteClosed);
+    let reset = Frame::StreamReset { stream_id, reason: ResetReason::RemoteClosed };
+    frames.send(Ok(reset.clone())).await.unwrap();
+    assert!(scope.reset_error().is_none(), "committed native RESET uses the ordered input path");
+    let first = input.recv_frame().await.unwrap();
+    assert!(matches!(first.frame, Ok(frame) if frame == max));
+    let second = input.recv_frame().await.unwrap();
+    assert!(matches!(second.frame, Ok(frame) if frame == reset));
+    drop(remotes);
+    assert!(matches!(scope.ensure_active(), Err(RuntimeError::ReliablePathRetired)));
+}
+
+#[tokio::test]
 async fn client_feedback_fanout_preserves_blocked_sibling_and_replacement() {
     use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
     use crate::mux::stream::ReliableRecvStream;

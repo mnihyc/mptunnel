@@ -75,6 +75,7 @@ async fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
     let mut streams = HashMap::from([(
         stream_id,
         ClientTcpPathStreamState {
+            terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(3),
             frames,
             pending_open: None,

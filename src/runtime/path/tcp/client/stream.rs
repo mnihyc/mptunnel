@@ -81,6 +81,7 @@ impl Drop for ClientTcpOpenCancellation {
 }
 
 pub(in crate::runtime::path::tcp) struct ClientTcpPathStreamState {
+    pub(in crate::runtime::path::tcp) terminal: Option<crate::runtime::path::PendingStreamTerminal>,
     pub(in crate::runtime::path::tcp) open_attempt_id: ClientTcpOpenAttemptId,
     pub(in crate::runtime::path::tcp) frames: mpsc::Sender<Result<Frame, RuntimeError>>,
     pub(in crate::runtime::path::tcp) pending_open: Option<ClientTcpPendingOpen>,
@@ -95,6 +96,7 @@ pub(in crate::runtime::path::tcp) struct ClientTcpPendingOpen {
 }
 
 pub(in crate::runtime::path::tcp) struct ClientTcpOpenStreamRequest {
+    pub(in crate::runtime::path::tcp) terminal: Option<crate::runtime::path::PendingStreamTerminal>,
     pub(in crate::runtime::path::tcp) stream_id: StreamId,
     pub(in crate::runtime::path::tcp) attempt_id: ClientTcpOpenAttemptId,
     pub(in crate::runtime::path::tcp) target: TargetAddr,
@@ -174,6 +176,7 @@ pub(in crate::runtime::path::tcp) async fn open_client_tcp_stream_on_connection(
 ) -> Result<(), RuntimeError> {
     let ClientTcpOpenStreamRequest {
         stream_id,
+        terminal,
         attempt_id,
         target,
         lane,
@@ -200,6 +203,7 @@ pub(in crate::runtime::path::tcp) async fn open_client_tcp_stream_on_connection(
     streams.insert(
         stream_id,
         ClientTcpPathStreamState {
+            terminal,
             open_attempt_id: attempt_id,
             frames: frames_tx,
             pending_open: Some(ClientTcpPendingOpen {
@@ -406,6 +410,8 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
                 );
                 let carrier = OpenedReliableCarrierStream {
                     retirement: None,
+                    terminal: state.terminal.clone(),
+                    terminal_owner: None,
                     stream_id,
                     path_instance_id: connection.path_instance_id,
                     max_offset,
@@ -451,6 +457,9 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
             .await
         }
         Frame::StreamReset { stream_id, reason } => {
+            if let Some(terminal) = streams.get(&stream_id).and_then(|state| state.terminal.as_ref()) {
+                terminal.publish_reset(stream_id, reason);
+            }
             if streams
                 .get(&stream_id)
                 .is_some_and(|state| state.pending_open.is_some())

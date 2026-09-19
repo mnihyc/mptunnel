@@ -254,6 +254,8 @@ fn record_client_relay_attachment_commit_for_test(
 /// Keeping stream cleanup and scheduler load in one value makes cancellation,
 /// duplicate rejection, and attach-control failure the same rollback path.
 pub(in crate::runtime) struct OpenedRemoteStream {
+    terminal: Option<crate::runtime::path::PendingStreamTerminal>,
+    terminal_owner: Option<crate::runtime::path::ClientStreamTerminalOwner>,
     stream: Option<ReliablePathStream>,
     path_index: usize,
     path_instance_id: CarrierPathInstanceId,
@@ -270,7 +272,11 @@ impl OpenedRemoteStream {
     ) -> Self {
         let path_instance_id = carrier.path_instance_id;
         let retirement = carrier.retirement.take();
+        let terminal = carrier.terminal.take();
+        let terminal_owner = carrier.terminal_owner.take();
         let opened = Self {
+            terminal,
+            terminal_owner,
             stream: Some(ReliablePathStream::from_opened_carrier(carrier)),
             path_index,
             path_instance_id,
@@ -290,6 +296,8 @@ impl OpenedRemoteStream {
     #[cfg(test)]
     pub(in crate::runtime) fn pending(stream: ReliablePathStream, path_index: usize) -> Self {
         Self {
+            terminal: None,
+            terminal_owner: None,
             stream: Some(stream),
             path_index,
             path_instance_id: next_carrier_path_instance_id(),
@@ -297,6 +305,24 @@ impl OpenedRemoteStream {
             load_lease: None,
             startup: None,
         }
+    }
+
+    pub(in crate::runtime) fn terminal_scope(&self) -> Option<crate::runtime::path::ClientStreamTerminalScope> {
+        self.terminal.as_ref().and_then(|terminal| terminal.scope())
+    }
+
+    pub(in crate::runtime) fn terminal_error(&self) -> Option<RuntimeError> {
+        self.terminal_scope().and_then(|scope| scope.reset_error())
+    }
+
+    pub(in crate::runtime) fn with_terminal_owner(mut self, owner: Option<crate::runtime::path::ClientStreamTerminalOwner>) -> Self {
+        debug_assert!(self.terminal_owner.is_none());
+        self.terminal_owner = owner;
+        self
+    }
+
+    pub(in crate::runtime) fn take_terminal_owner(&mut self) -> Option<crate::runtime::path::ClientStreamTerminalOwner> {
+        self.terminal_owner.take()
     }
 
     pub(in crate::runtime) fn stream(&self) -> &ReliablePathStream {
@@ -878,6 +904,7 @@ impl Drop for ReliableRelayRemoteInput {
 }
 
 pub(in crate::runtime) struct ReliableRelayRemoteSet {
+    _terminal_owner: Option<crate::runtime::path::ClientStreamTerminalOwner>,
     stream_id: StreamId,
     pub(in crate::runtime) paths: Vec<ReliableRelayRemotePath>,
     frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
@@ -1008,14 +1035,23 @@ impl ReliableRelayRemoteSet {
             .collect()
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn new(
         opened: OpenedRemoteStream,
         frame_queue: usize,
     ) -> (Self, ReliableRelayRemoteInput) {
+        Self::try_new(opened, frame_queue).expect("test initial attachment commit")
+    }
+
+    pub(in crate::runtime) fn try_new(
+        mut opened: OpenedRemoteStream,
+        frame_queue: usize,
+    ) -> Result<(Self, ReliableRelayRemoteInput), RuntimeError> {
         let stream_id = opened.stream().stream_id;
         let (frames_tx, frames_rx) = mpsc::channel(frame_queue);
         let credit = Arc::new(ReliableRelayCreditIngress::new(stream_id));
         let mut set = Self {
+            _terminal_owner: opened.take_terminal_owner(),
             stream_id,
             paths: Vec::new(),
             frames_tx,
@@ -1030,11 +1066,9 @@ impl ReliableRelayRemoteSet {
             pending_requalification_ack: None,
             latest_requalification_ack: None,
         };
-        let outcome = set
-            .attach_opened(opened)
-            .expect("a fresh request stream owns attachment incarnation zero");
+        let outcome = set.attach_opened(opened)?;
         debug_assert_eq!(outcome, ReliableRelayAttachOutcome::Attached);
-        (
+        Ok((
             set,
             ReliableRelayRemoteInput {
                 frames_rx,
@@ -1042,7 +1076,7 @@ impl ReliableRelayRemoteSet {
                 pending_frame: None,
                 prefer_credit: true,
             },
-        )
+        ))
     }
 
     pub(in crate::runtime) fn stream_id(&self) -> StreamId {
@@ -1574,8 +1608,15 @@ impl ReliableRelayRemoteSet {
 
     fn attach_opened(
         &mut self,
-        opened: OpenedRemoteStream,
+        mut opened: OpenedRemoteStream,
     ) -> Result<ReliableRelayAttachOutcome, RuntimeError> {
+        if let Some(error) = opened.terminal_error() {
+            return Err(error);
+        }
+        // A direct low-level opener may own its own temporary scope. Keep it
+        // alive through commit, then close it outside the publication lock.
+        let _opening_owner = opened.take_terminal_owner();
+        let terminal = opened.terminal.clone();
         let path_index = opened.path_index();
         let underlay = opened.stream().underlay;
         let key = RelayPathKey {
@@ -1586,7 +1627,10 @@ impl ReliableRelayRemoteSet {
             return Ok(ReliableRelayAttachOutcome::RejectedDuplicate);
         }
         let attachment_id = self.allocate_attachment_incarnation()?;
-        Ok(self.commit_opened(opened, attachment_id))
+        match terminal {
+            Some(terminal) => terminal.commit(|| self.commit_opened(opened, attachment_id)),
+            None => Ok(self.commit_opened(opened, attachment_id)),
+        }
     }
 
     fn commit_opened(

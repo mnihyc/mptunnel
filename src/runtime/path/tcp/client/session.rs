@@ -1219,6 +1219,7 @@ async fn handle_disconnected_client_tcp_command(
         }
         ReliablePathCommand::OpenStream {
             stream_id,
+            terminal,
             attempt_id,
             observed_carrier_instance: _,
             target,
@@ -1275,6 +1276,7 @@ async fn handle_disconnected_client_tcp_command(
                     }
                     let open = ClientTcpOpenStreamRequest {
                         stream_id,
+                        terminal,
                         attempt_id,
                         target,
                         lane,

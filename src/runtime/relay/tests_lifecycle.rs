@@ -260,6 +260,82 @@ async fn restart_terminal_reset_survives_obsolete_open_generation() {
     }
 }
 
+#[tokio::test]
+async fn accepted_result_keeps_routed_reset_across_obsolete_generation() {
+    use crate::protocol::{ResetReason, SessionId};
+    use crate::runtime::path::{ClientStreamTerminalScope, OpenedReliableCarrierStream};
+
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let stream_id = StreamId(619);
+        let (scope, _owner) = ClientStreamTerminalScope::for_open(None, SessionId(619), stream_id).unwrap();
+        let publisher = scope.pending_input();
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let initial = OpenedRemoteStream::pending(
+            test_stream(stream_id, underlay, 0, commands, TrafficClass::Latency),
+            0,
+        );
+        let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(initial, 8);
+        let mut startup = singleton_return_plan(&remotes);
+        let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+        let mut last_progress = Instant::now();
+        let mut pending = HashMap::new();
+        let (commands, mut retired) = reliable_path_command_channels(8);
+        let (_frames_tx, frames_rx) = mpsc::channel(4);
+        let mux_limits = MuxLimits::default();
+        let snapshot = crate::scheduler::PathSnapshot::new(
+            PathId(1), underlay, crate::runtime::path::model::default_path_srtt_ms(),
+            crate::runtime::path::model::default_path_rate_bps(),
+        );
+        let accepted = OpenedReliableCarrierStream {
+            retirement: None,
+            terminal: Some(publisher.clone()),
+            terminal_owner: None,
+            stream_id,
+            path_instance_id: next_carrier_path_instance_id(),
+            max_offset: 0,
+            lane: TrafficClass::Latency,
+            underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            portable_startup: snapshot,
+            startup: snapshot,
+            startup_native_window: None,
+            startup_metrics: None,
+            commands,
+            mux_limits,
+            frames: frames_rx,
+        }.guard_retirement();
+        let accepted = OpenedRemoteStream::from_opened_carrier(accepted, 1, 0);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(RelayAdditionalPathOpenResult {
+            key: relay_key(underlay, 1),
+            generation: next_relay_additional_path_open_generation(),
+            mode: ReliableRelayAttachMode::Recovery,
+            startup_ordinal: None,
+            startup_expected_instance: Some(next_carrier_path_instance_id()),
+            result: Ok(accepted),
+        }).await.ok().expect("raw success is published before a terminal arrives");
+        publisher.publish_reset(stream_id, ResetReason::RemoteClosed);
+        assert!(matches!(
+            try_drain_completed_additional_path_opens(
+                stream_id, &mut startup, &mut remotes, &mut send_stream, false,
+                TrafficClass::Latency, &mut pending, &mut rx, &mut last_progress,
+            ),
+            Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed)),
+        ));
+        assert_eq!(remotes.paths.len(), 1, "terminal does not replace an independent carrier membership");
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut retired),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+        ));
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut retired),
+            Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+        ));
+        assert!(try_recv_reliable_path_command(&mut retired).is_none());
+        assert!(matches!(scope.reset_error(), Some(RuntimeError::RemoteReset(ResetReason::RemoteClosed))));
+    }
+}
+
 fn accepted_two_candidate_return_plan(
     stream_id: StreamId,
 ) -> (

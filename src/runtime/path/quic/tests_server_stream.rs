@@ -1800,6 +1800,7 @@ async fn client_quic_closed_product_recipient_preserves_ordered_terminal_writer(
             state,
             commands_rx,
             frames_tx,
+            None,
         ));
         assert_eq!(
             udp_path_read_frame(&mut server_recv, limits).await.unwrap(),
@@ -1920,6 +1921,7 @@ async fn client_quic_native_writer_delivers_reset_after_product_output_drop() {
                             state,
                             receivers,
                             frames_tx,
+                            None,
                         )
                         .await;
                     })
@@ -1996,6 +1998,7 @@ async fn client_quic_terminal_input_keeps_feedback_writer_until_owner_close() {
         state,
         commands_rx,
         frames_tx,
+        None,
     ));
 
     assert_eq!(
@@ -2080,6 +2083,7 @@ async fn client_quic_idle_writer_routes_both_requalification_frames() {
         state,
         commands_rx,
         frames_tx,
+        None,
     ));
 
     assert_eq!(
@@ -2160,6 +2164,7 @@ async fn client_quic_clean_eof_reports_attachment_failure_then_allows_detach() {
         state,
         commands_rx,
         frames_tx,
+        None,
     ));
 
     assert_eq!(

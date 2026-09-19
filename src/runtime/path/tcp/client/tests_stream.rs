@@ -47,6 +47,7 @@ async fn tcp_detach_distinguishes_pending_refusal_from_live_retirement() {
     let mut streams = HashMap::from([(
         pending_id,
         ClientTcpPathStreamState {
+            terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(30),
             frames: pending_frames,
             pending_open: Some(ClientTcpPendingOpen {
@@ -75,6 +76,7 @@ async fn tcp_detach_distinguishes_pending_refusal_from_live_retirement() {
     streams.insert(
         live_id,
         ClientTcpPathStreamState {
+            terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(31),
             frames: live_frames,
             pending_open: None,
@@ -98,6 +100,7 @@ fn stale_tcp_open_cancellation_cannot_remove_current_generation() {
     let mut streams = HashMap::from([(
         stream_id,
         ClientTcpPathStreamState {
+            terminal: None,
             open_attempt_id: current_attempt,
             frames,
             pending_open: None,
@@ -125,6 +128,7 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
     streams.insert(
         stream_id,
         ClientTcpPathStreamState {
+            terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(1),
             frames: frames_tx,
             pending_open: None,
@@ -183,6 +187,7 @@ async fn client_tcp_path_routes_inflight_receive_frames_to_live_stream() {
     streams.insert(
         stream_id,
         ClientTcpPathStreamState {
+            terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(2),
             frames: frames_tx,
             pending_open: None,
@@ -277,6 +282,7 @@ async fn client_tcp_idle_writer_routes_both_requalification_frames() {
     let mut streams = HashMap::from([(
         stream_id,
         ClientTcpPathStreamState {
+            terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(3),
             frames: frames_tx,
             pending_open: None,

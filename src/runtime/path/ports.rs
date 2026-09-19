@@ -1737,6 +1737,8 @@ impl ServerStreamPort {
 pub(in crate::runtime) struct OpenedReliableCarrierStream {
     // Drop this capability before commands/input can close their native actor.
     pub(in crate::runtime) retirement: Option<AcceptedReliableCarrierRetirement>,
+    pub(in crate::runtime) terminal: Option<super::PendingStreamTerminal>,
+    pub(in crate::runtime) terminal_owner: Option<super::ClientStreamTerminalOwner>,
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) max_offset: u64,

@@ -250,6 +250,7 @@ impl ClientTcpPathSessionHandle {
     }
 
     // The open boundary transfers the complete logical-stream ownership envelope.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) async fn open_stream_with_deadlines(
         &self,
@@ -261,16 +262,33 @@ impl ClientTcpPathSessionHandle {
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
-        self.complete_session_operation(self.open_stream_with_deadlines_active(
-            stream_id,
-            target,
-            lane,
-            initial_demand,
-            return_plan,
-            open_deadlines,
-            advertised_recv_max_offset,
-        ))
-        .await
+        self.open_stream_with_deadlines_scoped(stream_id, target, lane, initial_demand,
+            return_plan, open_deadlines, advertised_recv_max_offset, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) async fn open_stream_with_deadlines_scoped(
+        &self,
+        stream_id: StreamId,
+        target: TargetAddr,
+        lane: TrafficClass,
+        initial_demand: StreamDemandHint,
+        return_plan: crate::protocol::StreamReturnPlan,
+        open_deadlines: ClientTcpOpenDeadlines,
+        advertised_recv_max_offset: u64,
+        terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
+    ) -> Result<ClientTcpOpenedStream, RuntimeError> {
+        let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
+            terminal, self.runtime.session_id, stream_id,
+        )?;
+        let mut opened = self.complete_session_operation(terminal.complete(
+            self.open_stream_with_deadlines_active(
+                stream_id, target, lane, initial_demand, return_plan, open_deadlines,
+                advertised_recv_max_offset, &terminal,
+            )
+        )).await?;
+        opened.carrier.terminal_owner = owner;
+        Ok(opened)
     }
 
     // This private continuation deliberately mirrors the public ownership envelope.
@@ -284,9 +302,11 @@ impl ClientTcpPathSessionHandle {
         return_plan: crate::protocol::StreamReturnPlan,
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
+        terminal: &crate::runtime::path::ClientStreamTerminalScope,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
         let mut changes = self.runtime.carrier_groups.subscribe();
         loop {
+            terminal.ensure_active()?;
             let (session, observed_carrier_instance) = self
                 .wait_for_ready_session_slot(&mut changes, open_deadlines.setup)
                 .await?;
@@ -303,6 +323,7 @@ impl ClientTcpPathSessionHandle {
                 biased;
                 result = commands.send_control(ReliablePathCommand::OpenStream {
                     stream_id,
+                    terminal: Some(terminal.pending_input()),
                     attempt_id,
                     observed_carrier_instance,
                     target: target.clone(),
@@ -339,7 +360,11 @@ impl ClientTcpPathSessionHandle {
                 _ = wait_for_deadline() => return Err(RuntimeError::PathOpenTimedOut),
             };
             match response {
-                ClientTcpOpenResponse::Opened(opened) => {
+                ClientTcpOpenResponse::Opened(mut opened) => {
+                    // The response now leaves the cancellation guard's custody.
+                    // Preserve ordered retirement if a logical terminal or an
+                    // outer owner discards this accepted value before attach.
+                    opened.carrier = opened.carrier.guard_retirement();
                     cancellation.disarm();
                     if self
                         .try_commit_opened_stream(session.path_id, opened.carrier.path_instance_id)

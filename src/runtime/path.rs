@@ -25,6 +25,7 @@ mod selection;
 mod server_context;
 mod set;
 mod state;
+mod stream_terminal;
 pub(in crate::runtime) mod tcp;
 pub(in crate::runtime) mod traffic;
 pub(in crate::runtime) mod writer_boundary;
@@ -71,6 +72,9 @@ pub(in crate::runtime) use set::{ClientPathContext, ClientPathRuntimeOptions};
 pub(in crate::runtime) use state::RequestCapacityProbeCampaignBudget;
 pub(in crate::runtime) use state::{
     ClientPathState, ClientSessionProductFlowLease, RelayPathLoadLease,
+};
+pub(in crate::runtime) use stream_terminal::{
+    ClientStreamTerminalOwner, ClientStreamTerminalScope, PendingStreamTerminal,
 };
 #[cfg(test)]
 pub(in crate::runtime) use tcp::capacity::{

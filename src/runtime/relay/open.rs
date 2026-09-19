@@ -35,6 +35,7 @@ pub(in crate::runtime) struct ReliableRelayOpenSpec {
     pub(in crate::runtime) initial_demand: StreamDemandHint,
     return_plan: StreamReturnPlan,
     startup_plan: Option<Arc<ReliableRelayReturnPlan>>,
+    terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
 }
 
 impl ReliableRelayOpenSpec {
@@ -50,6 +51,7 @@ impl ReliableRelayOpenSpec {
                 candidate_ordinal: 0,
             },
             startup_plan: None,
+            terminal: None,
         }
     }
 
@@ -64,7 +66,13 @@ impl ReliableRelayOpenSpec {
             initial_demand: stream_demand_hint_for_traffic_class(initial_lane),
             return_plan,
             startup_plan: Some(startup_plan),
+            terminal: None,
         }
+    }
+
+    pub(in crate::runtime) fn with_terminal_scope(mut self, terminal: Option<crate::runtime::path::ClientStreamTerminalScope>) -> Self {
+        self.terminal = terminal;
+        self
     }
 
     pub(in crate::runtime) fn with_startup_plan(
@@ -405,8 +413,25 @@ async fn open_remote_stream_active(
     lane: TrafficClass,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     let stream_id = context.allocate_reliable_stream_id()?;
+    let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
+        None, context.session_id, stream_id,
+    )?;
+    let opened = terminal.complete(open_remote_stream_in_scope(
+        context, target, lane, stream_id, terminal.clone(),
+    )).await?;
+    Ok(opened.with_terminal_owner(owner))
+}
+
+async fn open_remote_stream_in_scope(
+    context: &ClientPathContext,
+    target: TargetAddr,
+    lane: TrafficClass,
+    stream_id: StreamId,
+    terminal: crate::runtime::path::ClientStreamTerminalScope,
+) -> Result<OpenedRemoteStream, RuntimeError> {
     let startup_plan = freeze_reliable_relay_return_plan(context, lane)?;
-    let base_spec = ReliableRelayOpenSpec::for_initial_plan(target, lane, startup_plan.clone());
+    let base_spec = ReliableRelayOpenSpec::for_initial_plan(target, lane, startup_plan.clone())
+        .with_terminal_scope(Some(terminal.clone()));
     let mut failed_ordinals = Vec::new();
     let mut last_retryable_error = None;
     let ranked_keys = context.ordered_reliable_path_keys(lane, PATH_OPEN_SCORE_BYTES);
@@ -418,6 +443,7 @@ async fn open_remote_stream_active(
             .unwrap_or(ranked_keys.len() + usize::from(candidate.ordinal))
     });
     for (position, candidate) in opening_candidates.iter().copied().enumerate() {
+        terminal.ensure_active()?;
         let Some(attempt) =
             reserve_reliable_initial_plan_attempt(context, stream_id, lane, candidate)
         else {
@@ -435,6 +461,7 @@ async fn open_remote_stream_active(
             has_unattempted_alternative,
         )
         .await;
+        terminal.ensure_active()?;
         let open = match open {
             Ok(mut opened) => {
                 match await_reliable_initial_target_acceptance(opened.stream_mut()).await {
@@ -610,7 +637,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
         .tcp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
-        .open_stream_with_deadlines(
+        .open_stream_with_deadlines_scoped(
             stream_id,
             spec.target.clone(),
             lane,
@@ -618,6 +645,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
             spec.return_plan(),
             open_deadlines,
             advertised_recv_max_offset,
+            spec.terminal.clone(),
         )
         .await?;
     let path_instance_id = opened.carrier.path_instance_id;
@@ -701,13 +729,21 @@ pub(in crate::runtime) async fn open_remote_stream_for_relay_path(
     lane: TrafficClass,
     key: RelayPathKey,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    match key.underlay {
-        UnderlayProtocol::Tcp => {
-            open_remote_stream_on_path(context, stream_id, spec, lane, key.index).await
+    let opening = async {
+        match key.underlay {
+            UnderlayProtocol::Tcp => {
+                open_remote_stream_on_path(context, stream_id, spec, lane, key.index).await
+            }
+            UnderlayProtocol::Udp => {
+                open_remote_stream_on_udp_path(context, stream_id, spec, lane, key.index).await
+            }
         }
-        UnderlayProtocol::Udp => {
-            open_remote_stream_on_udp_path(context, stream_id, spec, lane, key.index).await
-        }
+    };
+    // This scope is owned outside both transport and outer attempt deadlines.
+    // A deadline may drop a raw accepted result, but not its routed RESET.
+    match &spec.terminal {
+        Some(terminal) => terminal.complete(opening).await,
+        None => opening.await,
     }
 }
 
@@ -750,7 +786,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
         .udp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
-        .open_stream(
+        .open_stream_scoped(
             stream_id,
             spec.target.clone(),
             lane,
@@ -758,6 +794,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
             spec.return_plan(),
             open_deadline,
             advertised_recv_max_offset,
+            spec.terminal.clone(),
         )
         .await?;
     // The handle has already atomically committed this exact carrier owner.

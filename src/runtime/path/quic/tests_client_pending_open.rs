@@ -523,7 +523,9 @@ impl NativeReceiveBackpressure {
     }
 
     async fn release(mut self, limits: CodecLimits) {
-        for (index, (mut send, mut recv)) in self.peers.drain(..).enumerate() {
+        // All writers share connection credit. Freed credit may serve a
+        // different filler, so each real peer consumer must remain pollable.
+        futures::future::join_all(self.peers.drain(..).enumerate().map(|(index, (mut send, mut recv))| async move {
             for part in 0..2 {
                 assert_eq!(
                     udp_path_read_frame(&mut recv, limits).await.unwrap(),
@@ -537,7 +539,7 @@ impl NativeReceiveBackpressure {
             let eof = udp_path_read_frame(&mut recv, limits).await;
             assert!(eof.as_ref().is_err_and(super::super::super::io::udp_path_input_finished));
             send.cancel_pending_response();
-        }
+        })).await;
         for writer in self.writers.drain(..) {
             writer.await.unwrap().unwrap();
         }

@@ -271,6 +271,7 @@ impl ClientTcpPathSessionHandle {
             open_deadlines,
             advertised_recv_max_offset,
             None,
+            None,
         )
         .await
     }
@@ -286,7 +287,11 @@ impl ClientTcpPathSessionHandle {
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
         terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
+        initial: Option<crate::runtime::path::InitialOpenAttempt>,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
+        if let Some(initial) = &initial {
+            initial.validate(self.runtime.session_id, stream_id)?;
+        }
         let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
             terminal,
             self.runtime.session_id,
@@ -302,6 +307,7 @@ impl ClientTcpPathSessionHandle {
                 open_deadlines,
                 advertised_recv_max_offset,
                 &terminal,
+                initial.as_ref(),
             );
             tokio::pin!(opening);
             self.complete_session_operation(terminal.complete(opening.as_mut()))
@@ -323,6 +329,7 @@ impl ClientTcpPathSessionHandle {
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
         terminal: &crate::runtime::path::ClientStreamTerminalScope,
+        initial: Option<&crate::runtime::path::InitialOpenAttempt>,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
         let mut changes = self.runtime.carrier_groups.subscribe();
         loop {
@@ -333,6 +340,7 @@ impl ClientTcpPathSessionHandle {
             let commands = session.commands.clone();
             let (response_tx, response_rx) = oneshot::channel();
             let attempt_id = next_client_tcp_open_attempt_id();
+            let initial_backend = initial.map(|initial| initial.begin_backend()).transpose()?;
             let wait_for_deadline = || async {
                 tokio::time::sleep_until(open_deadlines.live).await;
                 if !self.session_slot_is_current(session.path_id) {
@@ -344,6 +352,7 @@ impl ClientTcpPathSessionHandle {
                 result = commands.send_control(ReliablePathCommand::OpenStream {
                     stream_id,
                     terminal: Some(terminal.pending_input()),
+                    initial: initial_backend.clone(),
                     attempt_id,
                     observed_carrier_instance,
                     target: target.clone(),
@@ -377,7 +386,15 @@ impl ClientTcpPathSessionHandle {
                     }
                     Err(_) => return Err(RuntimeError::ReliablePathSessionClosed),
                 },
-                _ = wait_for_deadline() => return Err(RuntimeError::PathOpenTimedOut),
+                error = async {
+                    match &initial_backend {
+                        Some(initial) => initial.expired().await,
+                        None => {
+                            wait_for_deadline().await;
+                            RuntimeError::PathOpenTimedOut
+                        }
+                    }
+                } => return Err(error),
             };
             match response {
                 ClientTcpOpenResponse::Opened(mut opened) => {

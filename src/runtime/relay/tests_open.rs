@@ -646,3 +646,93 @@ fn initial_open_retry_reuses_one_logical_stream_id() {
     assert_eq!(first_stream_id, second.stream_id);
     assert_ne!(first_key, second.key);
 }
+
+#[tokio::test(start_paused = true)]
+async fn stale_prepared_initial_successor_preserves_due_predecessor_decision() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:10132?max-tcp-carriers=1".parse().unwrap(),
+            "tcp://127.0.0.1:10133?max-tcp-carriers=1".parse().unwrap(),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    let key = |index| RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index,
+    };
+    let original_instance = next_carrier_path_instance_id();
+    let frozen_instance = RelayPathInstance {
+        key: key(1),
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 0,
+    };
+    context.install_relay_path_instance_for_test(frozen_instance);
+    let stream_id = context.allocate_reliable_stream_id().unwrap();
+    let acquisition = crate::runtime::path::InitialOpenAcquisition::new(
+        context.session_id,
+        stream_id,
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        2,
+    );
+    let original = acquisition
+        .launch_handle()
+        .begin(0, key(0), Duration::from_secs(10), true, None)
+        .unwrap()
+        .unwrap();
+    let backend = original.begin_backend().unwrap();
+    backend.bind(original_instance).unwrap();
+    backend.submitted().unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(backend.deadline().unwrap() > tokio::time::Instant::now());
+    let candidate = ReliableRelayReturnCandidate {
+        ordinal: 1,
+        key: key(1),
+        path_instance_id: Some(frozen_instance.path_instance_id),
+    };
+    let attempt = reserve_reliable_initial_plan_attempt(
+        &context,
+        stream_id,
+        TrafficClass::Latency,
+        candidate,
+    )
+    .unwrap();
+    context.install_relay_path_instance_for_test(RelayPathInstance {
+        path_instance_id: next_carrier_path_instance_id(),
+        ..frozen_instance
+    });
+    let (_abort, registration) = AbortHandle::new_pair();
+    let completion = open_initial_candidate(
+        &context,
+        attempt,
+        ReliableRelayOpenSpec::new(
+            TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
+            TrafficClass::Latency,
+        ),
+        TrafficClass::Latency,
+        candidate,
+        1,
+        false,
+        Some(0),
+        acquisition.launch_handle(),
+        registration,
+    )
+    .await;
+    assert!(matches!(
+        completion.result,
+        Err(RuntimeError::ReliablePathRetired)
+    ));
+    let predecessor =
+        acquisition.unstarted_predecessor(completion.candidate.ordinal, completion.predecessor);
+    assert_eq!(
+        predecessor,
+        Some(0),
+        "a reservation that never entered cannot orphan original Due ownership"
+    );
+    assert_eq!(acquisition.started_ordinals(), [0]);
+    // There is no candidate left. The same coordinator decision expires A;
+    // reserving stale B never granted A the logical deadline.
+    assert!(acquisition.expire(predecessor.unwrap()));
+    assert!(backend.deadline().unwrap() <= tokio::time::Instant::now());
+}

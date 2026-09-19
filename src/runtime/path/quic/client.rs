@@ -476,6 +476,7 @@ impl ClientUdpPathSessionHandle {
             open_deadline,
             advertised_recv_max_offset,
             None,
+            None,
         )
         .await
     }
@@ -491,7 +492,11 @@ impl ClientUdpPathSessionHandle {
         open_deadline: tokio::time::Instant,
         advertised_recv_max_offset: u64,
         terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
+        initial: Option<crate::runtime::path::InitialOpenAttempt>,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
+        if let Some(initial) = &initial {
+            initial.validate(self.runtime.session_id, stream_id)?;
+        }
         let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
             terminal,
             self.runtime.session_id,
@@ -507,6 +512,7 @@ impl ClientUdpPathSessionHandle {
                 open_deadline,
                 advertised_recv_max_offset,
                 &terminal,
+                initial.as_ref(),
             );
             tokio::pin!(opening);
             terminal.complete(opening.as_mut()).await
@@ -528,9 +534,11 @@ impl ClientUdpPathSessionHandle {
         open_deadline: tokio::time::Instant,
         advertised_recv_max_offset: u64,
         terminal: &crate::runtime::path::ClientStreamTerminalScope,
+        initial: Option<&crate::runtime::path::InitialOpenAttempt>,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
         for attempt in 0..MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS {
             terminal.ensure_active()?;
+            let initial_backend = initial.map(|initial| initial.begin_backend()).transpose()?;
             let expected_path_instance_id = self
                 .runtime
                 .state
@@ -555,15 +563,17 @@ impl ClientUdpPathSessionHandle {
                     }
                 };
             let path_instance_id = connection.path_instance_id;
+            if let Some(initial) = &initial_backend {
+                initial.bind(path_instance_id)?;
+            }
             #[cfg(test)]
             let pending_open_events = self
                 .pending_open_events
                 .lock()
                 .expect("pending QUIC open test observer lock")
                 .clone();
-            let result = tokio::time::timeout_at(
-                open_deadline,
-                open_client_udp_stream_on_connection(
+            let result = {
+                let opening = open_client_udp_stream_on_connection(
                     connection,
                     stream_id,
                     target.clone(),
@@ -573,13 +583,19 @@ impl ClientUdpPathSessionHandle {
                     advertised_recv_max_offset,
                     self.runtime.clone(),
                     terminal.pending_input(),
+                    initial_backend.as_ref(),
                     #[cfg(test)]
                     pending_open_events,
-                ),
-            )
-            .await
-            .map_err(|_| RuntimeError::PathOpenTimedOut)
-            .and_then(|result| result);
+                );
+                tokio::pin!(opening);
+                match &initial_backend {
+                    Some(initial) => initial.complete(opening.as_mut()).await,
+                    None => tokio::time::timeout_at(open_deadline, opening.as_mut())
+                        .await
+                        .map_err(|_| RuntimeError::PathOpenTimedOut)
+                        .and_then(|result| result),
+                }
+            };
             match result {
                 Ok(stream) => {
                     #[cfg(test)]
@@ -588,8 +604,12 @@ impl ClientUdpPathSessionHandle {
                         path_instance_id,
                     )
                     .await;
+                    let settlement_deadline = match &initial_backend {
+                        Some(initial) => initial.deadline()?,
+                        None => open_deadline,
+                    };
                     let committed = tokio::time::timeout_at(
-                        open_deadline,
+                        settlement_deadline,
                         self.try_commit_opened_instance(path_instance_id),
                     )
                     .await;
@@ -1812,6 +1832,7 @@ async fn open_client_udp_stream_on_connection(
     advertised_recv_max_offset: u64,
     runtime: ClientUdpPathSessionRuntime,
     terminal: crate::runtime::path::PendingStreamTerminal,
+    initial: Option<&crate::runtime::path::InitialOpenBackend>,
     #[cfg(test)] pending_open_events: Option<ClientUdpPendingOpenEvents>,
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
     // Validate this prerequisite before publishing an OPEN: a later local
@@ -2000,6 +2021,11 @@ async fn open_client_udp_stream_on_connection(
         }
     }));
     let path_id = PathId(runtime.path_index as u16);
+    // Both the submitted guard and its existing continuation owner are now
+    // installed. A rejected publication must still transfer ordered retirement.
+    if let Some(initial) = initial {
+        initial.submitted()?;
+    }
     let max_offset = read_client_udp_stream_open_accept(
         submitted.recv(),
         stream_id,
@@ -2009,6 +2035,7 @@ async fn open_client_udp_stream_on_connection(
         path_id,
         runtime.codec_limits,
         &terminal,
+        initial,
     )
     .await?;
     submitted.accept()?;
@@ -2055,13 +2082,19 @@ async fn read_client_udp_stream_open_accept(
     path_id: PathId,
     codec_limits: CodecLimits,
     terminal: &crate::runtime::path::PendingStreamTerminal,
+    initial: Option<&crate::runtime::path::InitialOpenBackend>,
 ) -> Result<u64, RuntimeError> {
     loop {
         match udp_path_read_frame(recv, codec_limits).await? {
             Frame::StreamMaxData {
                 stream_id: max_stream_id,
                 max_offset,
-            } if max_stream_id == stream_id => return Ok(max_offset),
+            } if max_stream_id == stream_id => {
+                if let Some(initial) = initial {
+                    initial.admission()?;
+                }
+                return Ok(max_offset);
+            }
             Frame::StreamReset {
                 stream_id: reset_stream_id,
                 reason,

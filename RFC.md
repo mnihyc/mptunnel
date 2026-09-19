@@ -1390,6 +1390,56 @@ because that logical work is slow. The endpoint's logical Product-open deadline
 still bounds the operation. A concrete attachment refusal or carrier failure
 MAY select another carrier, but every retry MUST reuse the same `StreamId`.
 
+Initial acquisition uses the caller's original absolute logical-open deadline
+`T` and the same frozen candidate order and per-attempt native budget `A_i`.
+At a candidate's actual entry, its nominal deadline is
+`S_i = min(start_i + A_i, T)`. Endpoint setup, native pair allocation, partial
+OPEN/MAX writes, and the initial TCP flush remain bounded by `S_i`.
+Only after complete local OPEN/MAX submission may an attempt awaiting its first
+MAX become eligible for retention. Submission is not evidence of transmission,
+peer receipt, or target establishment.
+
+At an eligible attempt's nominal deadline the logical acquisition coordinator
+owns the next-candidate decision. The submitted attempt remains pending while
+that decision is due; its backend MUST NOT independently retire it before the
+coordinator can arbitrate actual first MAX against actual successor entry.
+This scheduling interval remains bounded by `T`, logical cancellation, and
+terminal authority. It is not itself permission for an unpromoted late success.
+Only when the next frozen candidate actually enters its open operation may that
+exact submitted predecessor continue under `T`. Merely reserving a candidate or
+preparing an unpolled future does not extend the predecessor. Singleton and
+final candidates, incomplete submission, and unavailable successors retain their
+nominal bound. A promoted attempt cannot start fresh setup or native retries
+after its original `S_i`.
+
+Actual first MAX, including zero, and successor entry are serialized under one
+stream-scoped acquisition owner. A nominal decision observes the operation-wide
+admission sequence before reserving or constructing its successor. Any first
+MAX between that observation and actual successor entry fences that prepared
+launch, even if a retained publisher has already settled. A live admitted owner
+also suppresses new timer-driven acquisition. Positive credit still decides
+logical success.
+A first MAX observed after `S_i` without prior promotion is recorded and fences
+the prepared nominal launch, but that expired attempt cannot become a success
+under `T`. Once that exact admitted attempt settles with a concrete retryable
+failure, the coordinator MAY retry the next frozen candidate under its ordinary
+budget. Settlement cannot revive a previously fenced nominal launch and MUST
+NOT clear an authenticated logical or session terminal reason.
+
+The first accepted candidate with positive target credit wins only while its
+frozen physical instance and logical/session authority remain current. Every
+started loser owns its exact native retirement until custody transfers through
+the existing ordered DETACH-before-close path; no loser survives logical-owner
+drop as a selectable acquisition. Pending operations are local futures bounded
+by the frozen candidate count, not detached acquisition tasks. Losing or
+unstarted startup ordinals are omitted from the returned startup round, without
+publishing path failure. This policy can preserve useful work already submitted
+when another path becomes eligible, at the cost of overlapping native pairs,
+carrier entries, load leases, and duplicate CREATE/control traffic. The Due
+interval adds coordinator scheduling dependency at `S_i`; retained work can
+persist until `T`. Practical latency and resource benefit require whole-runtime
+measurement and do not follow from earlier copy or open admission alone.
+
 The receiver owns exactly one target-establishment operation for one
 `(SessionId, StreamId)`. The original target, initial demand, authenticated
 principal, and opening ingress remain immutable. A matching repeated

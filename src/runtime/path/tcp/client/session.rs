@@ -1220,6 +1220,7 @@ async fn handle_disconnected_client_tcp_command(
         ReliablePathCommand::OpenStream {
             stream_id,
             terminal,
+            initial,
             attempt_id,
             observed_carrier_instance: _,
             target,
@@ -1277,6 +1278,7 @@ async fn handle_disconnected_client_tcp_command(
                     let open = ClientTcpOpenStreamRequest {
                         stream_id,
                         terminal,
+                        initial,
                         attempt_id,
                         target,
                         lane,
@@ -1294,6 +1296,7 @@ async fn handle_disconnected_client_tcp_command(
                             .expect("published TCP carrier remains actor-owned"),
                         open,
                         &mut state.streams,
+                        &mut state.closed_streams,
                         runtime.stream_frame_queue,
                     )
                     .await;

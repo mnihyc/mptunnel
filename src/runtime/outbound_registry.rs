@@ -27,7 +27,7 @@ use crate::runtime::gateway::{ClientGatewayRuntime, GatewayFlowLease, GatewayRun
 use crate::runtime::path::AuthenticatedCarrierAvailability;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::product_lifecycle::{ProductFlowActivity, ProductFlowActivityIo};
-use crate::runtime::relay::open::{ReliableRelayOpenSpec, open_remote_stream};
+use crate::runtime::relay::open::{ReliableRelayOpenSpec, open_remote_stream_until};
 use crate::runtime::stream::OpenedRemoteStream;
 use crate::runtime::telemetry::{
     ObservedProductIo, ProductFlowCounter, ProductFlowLease as RuntimeProductFlowLease,
@@ -118,6 +118,15 @@ struct MppOutboundDnsTcpConnector {
     performance: MppPerformanceConfig,
 }
 
+fn mpp_initial_dns_error(error: RuntimeError) -> DnsBackendError {
+    match error {
+        RuntimeError::OutboundConnect(outbound::OutboundConnectError::ConnectTimeout) => {
+            DnsBackendError::Timeout
+        }
+        error => DnsBackendError::Failed(error.to_string()),
+    }
+}
+
 impl DnsTcpConnector for MppOutboundDnsTcpConnector {
     fn connect(&self, bootstrap: SocketAddr, timeout: Duration) -> DnsTcpConnectFuture {
         const DNS_MPP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
@@ -126,13 +135,14 @@ impl DnsTcpConnector for MppOutboundDnsTcpConnector {
         let performance = self.performance;
         Box::pin(async move {
             let target = TargetAddr::Ip(bootstrap);
-            let remote = tokio::time::timeout(
-                timeout,
-                open_remote_stream(&context, target.clone(), TrafficClass::Latency),
+            let deadline = tokio::time::Instant::now() + timeout;
+            let remote = tokio::time::timeout_at(
+                deadline,
+                open_remote_stream_until(&context, target.clone(), TrafficClass::Latency, deadline),
             )
             .await
             .map_err(|_| DnsBackendError::Timeout)?
-            .map_err(|error| DnsBackendError::Failed(error.to_string()))?;
+            .map_err(mpp_initial_dns_error)?;
             let (dns_side, relay_side) = tokio::io::duplex(DNS_MPP_RELAY_BUFFER_BYTES);
             tokio::spawn({
                 let context = context.clone();
@@ -1793,12 +1803,17 @@ impl RuntimeOutboundRegistry {
             target.port().get(),
         );
         let leaf = self.shell.require_leaf(member, Network::Tcp)?;
+        let deadline = tokio::time::Instant::now() + timeout;
         let probe = async {
             match leaf.as_ref() {
                 RuntimeOutboundLeaf::Mpp { context, .. } => {
-                    let opened =
-                        open_remote_stream(context, TargetAddr::Ip(address), TrafficClass::Latency)
-                            .await?;
+                    let opened = open_remote_stream_until(
+                        context,
+                        TargetAddr::Ip(address),
+                        TrafficClass::Latency,
+                        deadline,
+                    )
+                    .await?;
                     opened.close().await;
                     Ok(())
                 }
@@ -1819,9 +1834,11 @@ impl RuntimeOutboundRegistry {
                 }
             }
         };
-        tokio::time::timeout(timeout, probe).await.map_err(|_| {
-            RuntimeError::OutboundConnect(outbound::OutboundConnectError::ConnectTimeout)
-        })?
+        tokio::time::timeout_at(deadline, probe)
+            .await
+            .map_err(|_| {
+                RuntimeError::OutboundConnect(outbound::OutboundConnectError::ConnectTimeout)
+            })?
     }
 }
 
@@ -2320,8 +2337,11 @@ async fn open_mpp_tcp_target(
     traffic_class: TrafficClass,
     deadline: tokio::time::Instant,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    match tokio::time::timeout_at(deadline, open_remote_stream(context, target, traffic_class))
-        .await
+    match tokio::time::timeout_at(
+        deadline,
+        open_remote_stream_until(context, target, traffic_class, deadline),
+    )
+    .await
     {
         Ok(result) => result,
         Err(_) => Err(RuntimeError::OutboundConnect(

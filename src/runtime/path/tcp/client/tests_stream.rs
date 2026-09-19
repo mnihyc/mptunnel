@@ -51,6 +51,7 @@ async fn tcp_detach_distinguishes_pending_refusal_from_live_retirement() {
             open_attempt_id: ClientTcpOpenAttemptId(30),
             frames: pending_frames,
             pending_open: Some(ClientTcpPendingOpen {
+                initial: None,
                 response,
                 frames: Some(pending_frame_rx),
                 session_commands,

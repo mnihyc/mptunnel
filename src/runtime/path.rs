@@ -13,6 +13,7 @@ mod carrier_inventory;
 mod client_session;
 pub(super) mod commands;
 mod health;
+mod initial_open;
 pub(in crate::runtime) mod input;
 pub(super) mod model;
 pub(in crate::runtime) mod native_commitment;
@@ -40,6 +41,9 @@ pub(in crate::runtime) use commands::{CapacityProbeCommandTicket, RequestTcpCapa
 pub(in crate::runtime) use health::RequestCapacityReconciliationView;
 pub(in crate::runtime) use health::{
     ClientPathHealth, ClientPathHealthRecord, ClientPathRateDiagnostics,
+};
+pub(in crate::runtime) use initial_open::{
+    InitialOpenAcquisition, InitialOpenAttempt, InitialOpenBackend, InitialOpenLaunch,
 };
 pub(in crate::runtime) use model::{
     PacketPathAttachment, PacketPathSelectionInput, PathDeliveryStats, UdpPathCandidate,

@@ -1459,3 +1459,23 @@ async fn routed_dns_query_traverses_the_selected_socks_connector() {
     assert_eq!(resolution.addresses().as_ref(), &[IpAddr::V4(answer)]);
     proxy_task.await.expect("SOCKS task");
 }
+
+#[test]
+fn initial_dns_maps_logical_deadline_but_not_nominal_path_expiry() {
+    assert!(matches!(
+        mpp_initial_dns_error(RuntimeError::OutboundConnect(
+            outbound::OutboundConnectError::ConnectTimeout,
+        )),
+        DnsBackendError::Timeout
+    ));
+    assert!(matches!(
+        mpp_initial_dns_error(RuntimeError::PathOpenTimedOut),
+        DnsBackendError::Failed(_)
+    ));
+    assert!(matches!(
+        mpp_initial_dns_error(RuntimeError::RemoteReset(
+            crate::protocol::ResetReason::RemoteClosed
+        )),
+        DnsBackendError::Failed(_)
+    ));
+}

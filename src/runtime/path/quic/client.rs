@@ -384,7 +384,10 @@ struct ClientUdpPendingOpenTaskExit {
 impl Drop for ClientUdpPendingOpenTaskExit {
     fn drop(&mut self) {
         if let Some(events) = &self.events {
-            let _ = events.send((self.stream_id, ClientUdpPendingOpenEvent::ContinuationExited));
+            let _ = events.send((
+                self.stream_id,
+                ClientUdpPendingOpenEvent::ContinuationExited,
+            ));
         }
     }
 }
@@ -1747,11 +1750,14 @@ async fn open_client_udp_stream_on_connection(
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
     // Validate this prerequisite before publishing an OPEN: a later local
     // rejection must not leave a submitted pair without its retirement owner.
-    let native_rate_authority = carrier.connection.native_rate_authority().ok_or(
-        RuntimeError::Protocol("client QUIC stream opened before native rate authority binding"),
-    )?;
-    let ((mut send, recv), repair) =
-        carrier.connection.open_reliable_pair().await?;
+    let native_rate_authority =
+        carrier
+            .connection
+            .native_rate_authority()
+            .ok_or(RuntimeError::Protocol(
+                "client QUIC stream opened before native rate authority binding",
+            ))?;
+    let ((mut send, recv), repair) = carrier.connection.open_reliable_pair().await?;
     let parent_request_id = send.request_stream_id();
     send.set_traffic_class(lane)?;
     let open = Frame::OpenStream {

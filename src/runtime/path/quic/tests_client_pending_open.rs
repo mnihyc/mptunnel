@@ -36,7 +36,11 @@ async fn observe_until(
     .expect("actual continuation transition timeout");
 }
 
-async fn assert_ordered_detach(recv: &mut UdpPathRecvStream, stream_id: StreamId, limits: CodecLimits) {
+async fn assert_ordered_detach(
+    recv: &mut UdpPathRecvStream,
+    stream_id: StreamId,
+    limits: CodecLimits,
+) {
     assert_eq!(
         tokio::time::timeout(OPEN_OWNERSHIP_GUARD, udp_path_read_frame(recv, limits))
             .await
@@ -47,25 +51,33 @@ async fn assert_ordered_detach(recv: &mut UdpPathRecvStream, stream_id: StreamId
     let result = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, udp_path_read_frame(recv, limits))
         .await
         .expect("native request close timeout");
-    assert!(result.as_ref().is_err_and(super::super::super::io::udp_path_input_finished));
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(super::super::super::io::udp_path_input_finished)
+    );
 }
 
 async fn retire_unopened_peer_repair(accepted: &AcceptedTestCarrier, limits: CodecLimits) {
-    let (mut send, mut recv) = tokio::time::timeout(
-        OPEN_OWNERSHIP_GUARD,
-        accepted.connection.accept_bi(),
-    )
-    .await
-    .expect("unopened repair native request timeout")
-    .expect("accept allocated repair request");
+    let (mut send, mut recv) =
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, accepted.connection.accept_bi())
+            .await
+            .expect("unopened repair native request timeout")
+            .expect("accept allocated repair request");
     let frame = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, udp_path_read_frame(&mut recv, limits))
         .await
         .expect("unopened repair request releases without first MAX");
-    assert!(frame.is_err(), "no MPP repair OPEN was submitted: {frame:?}");
+    assert!(
+        frame.is_err(),
+        "no MPP repair OPEN was submitted: {frame:?}"
+    );
     send.cancel_pending_response();
 }
 
-async fn assert_real_sibling_exchange(fixture: &ClientOpenRaceFixture, accepted: &AcceptedTestCarrier) {
+async fn assert_real_sibling_exchange(
+    fixture: &ClientOpenRaceFixture,
+    accepted: &AcceptedTestCarrier,
+) {
     let carrier = current_client_carrier(&fixture.session)
         .await
         .expect("same live carrier");
@@ -80,13 +92,23 @@ async fn assert_real_sibling_exchange(fixture: &ClientOpenRaceFixture, accepted:
         udp_path_write_frame(&mut send, &Frame::Ping { nonce: 1200 }, limits)
             .await
             .expect("sibling request write");
-        assert_eq!(udp_path_read_frame(&mut peer_recv, limits).await.unwrap(), Frame::Ping { nonce: 1200 });
+        assert_eq!(
+            udp_path_read_frame(&mut peer_recv, limits).await.unwrap(),
+            Frame::Ping { nonce: 1200 }
+        );
         udp_path_write_frame(&mut peer_send, &Frame::Pong { nonce: 1200 }, limits)
             .await
             .expect("sibling response write");
-        assert_eq!(udp_path_read_frame(&mut recv, limits).await.unwrap(), Frame::Pong { nonce: 1200 });
-        super::super::super::io::udp_path_finish_stream(&mut send).await.unwrap();
-        super::super::super::io::udp_path_finish_stream(&mut peer_send).await.unwrap();
+        assert_eq!(
+            udp_path_read_frame(&mut recv, limits).await.unwrap(),
+            Frame::Pong { nonce: 1200 }
+        );
+        super::super::super::io::udp_path_finish_stream(&mut send)
+            .await
+            .unwrap();
+        super::super::super::io::udp_path_finish_stream(&mut peer_send)
+            .await
+            .unwrap();
         assert!(!carrier.connection.is_closed());
     })
     .await
@@ -115,7 +137,10 @@ async fn submitted_open_cancellation_orders_detach_before_native_close() {
     assert!(!opening.is_finished(), "first MAX remains withheld");
     opening.abort();
     assert!(
-        opening.await.err().is_some_and(|error| error.is_cancelled()),
+        opening
+            .await
+            .err()
+            .is_some_and(|error| error.is_cancelled()),
         "caller cancellation must be joined"
     );
 
@@ -135,7 +160,8 @@ async fn submitted_open_cancellation_orders_detach_before_native_close() {
     .await
     .expect("ordered native close follows DETACH");
     assert!(
-        eof.as_ref().is_err_and(super::super::super::io::udp_path_input_finished),
+        eof.as_ref()
+            .is_err_and(super::super::super::io::udp_path_input_finished),
         "retired request must finish after its DETACH: {eof:?}"
     );
     assert!(!carrier.connection.is_closed());
@@ -209,7 +235,10 @@ async fn submitted_open_repeated_cancellation_releases_pair_credit_and_one_conti
     )
     .await;
     let accepted = fixture.establish_current().await;
-    let instance = current_client_carrier(&fixture.session).await.unwrap().path_instance_id;
+    let instance = current_client_carrier(&fixture.session)
+        .await
+        .unwrap()
+        .path_instance_id;
     let limits = fixture.server_context.codec_limits;
     let mut events = observe_pending_opens(&fixture.session);
     for index in 0..3 {
@@ -223,18 +252,47 @@ async fn submitted_open_repeated_cancellation_releases_pair_credit_and_one_conti
         .expect("same-process repeated pair can obtain native credit")
         .unwrap();
         opening.abort();
-        assert!(opening.await.err().is_some_and(|error| error.is_cancelled()));
+        assert!(
+            opening
+                .await
+                .err()
+                .is_some_and(|error| error.is_cancelled())
+        );
         retire_unopened_peer_repair(&accepted, limits).await;
         assert_ordered_detach(&mut peer_recv, stream_id, limits).await;
         peer_send.cancel_pending_response();
         drop((peer_send, peer_recv));
         let mut observed = Vec::new();
-        observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
-        assert_eq!(observed.iter().filter(|event| **event == ClientUdpPendingOpenEvent::ContinuationStarted).count(), 1);
-        assert_eq!(observed.iter().filter(|event| **event == ClientUdpPendingOpenEvent::Retiring).count(), 1);
+        observe_until(
+            &mut events,
+            stream_id,
+            ClientUdpPendingOpenEvent::ContinuationExited,
+            &mut observed,
+        )
+        .await;
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| **event == ClientUdpPendingOpenEvent::ContinuationStarted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| **event == ClientUdpPendingOpenEvent::Retiring)
+                .count(),
+            1
+        );
         assert!(observed.contains(&ClientUdpPendingOpenEvent::RetirementFinished(true)));
         assert!(!observed.contains(&ClientUdpPendingOpenEvent::Accepted));
-        assert_eq!(current_client_carrier(&fixture.session).await.unwrap().path_instance_id, instance);
+        assert_eq!(
+            current_client_carrier(&fixture.session)
+                .await
+                .unwrap()
+                .path_instance_id,
+            instance
+        );
         assert_real_sibling_exchange(&fixture, &accepted).await;
     }
 }
@@ -259,13 +317,22 @@ async fn submitted_open_expiry_transfers_retirement_without_extending_deadline()
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(10)).await;
     tokio::time::resume();
-    let result = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opening).await.unwrap().unwrap();
+    let result = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opening)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(result, Err(RuntimeError::PathOpenTimedOut)));
     retire_unopened_peer_repair(&accepted, limits).await;
     assert_ordered_detach(&mut peer_recv, stream_id, limits).await;
     peer_send.cancel_pending_response();
     let mut observed = Vec::new();
-    observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
+    observe_until(
+        &mut events,
+        stream_id,
+        ClientUdpPendingOpenEvent::ContinuationExited,
+        &mut observed,
+    )
+    .await;
     assert!(observed.contains(&ClientUdpPendingOpenEvent::RetirementFinished(true)));
 }
 
@@ -284,26 +351,80 @@ async fn submitted_open_success_uses_one_continuation_and_preserves_two_phase_cr
     .await
     .unwrap()
     .unwrap();
-    udp_path_write_frame(&mut peer_send, &Frame::StreamMaxData { stream_id, max_offset: 0 }, limits).await.unwrap();
-    let mut opened = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opening).await.unwrap().unwrap().unwrap();
-    assert_eq!(opened.max_offset, 0, "zero is carrier admission, not target acceptance");
-    let (mut repair_send, mut repair_recv) = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, accepted.connection.accept_bi()).await.unwrap().unwrap();
+    udp_path_write_frame(
+        &mut peer_send,
+        &Frame::StreamMaxData {
+            stream_id,
+            max_offset: 0,
+        },
+        limits,
+    )
+    .await
+    .unwrap();
+    let mut opened = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opening)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        opened.max_offset, 0,
+        "zero is carrier admission, not target acceptance"
+    );
+    let (mut repair_send, mut repair_recv) =
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, accepted.connection.accept_bi())
+            .await
+            .unwrap()
+            .unwrap();
     assert!(matches!(
         tokio::time::timeout(OPEN_OWNERSHIP_GUARD, udp_path_read_frame(&mut repair_recv, limits)).await.unwrap().unwrap(),
         Frame::OpenStreamRepair { stream_id: repaired, .. } if repaired == stream_id
     ));
-    udp_path_write_frame(&mut peer_send, &Frame::StreamMaxData { stream_id, max_offset: 65_536 }, limits).await.unwrap();
+    udp_path_write_frame(
+        &mut peer_send,
+        &Frame::StreamMaxData {
+            stream_id,
+            max_offset: 65_536,
+        },
+        limits,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opened.frames.recv()).await.unwrap().unwrap().unwrap(),
-        Frame::StreamMaxData { stream_id, max_offset: 65_536 },
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opened.frames.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Frame::StreamMaxData {
+            stream_id,
+            max_offset: 65_536
+        },
     );
     assert_real_sibling_exchange(&fixture, &accepted).await;
     opened.retire_uncommitted().unwrap();
     assert_ordered_detach(&mut peer_recv, stream_id, limits).await;
     let mut observed = Vec::new();
-    observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
-    assert_eq!(observed.iter().filter(|event| **event == ClientUdpPendingOpenEvent::ContinuationStarted).count(), 1);
-    assert_eq!(observed.iter().filter(|event| **event == ClientUdpPendingOpenEvent::Accepted).count(), 1);
+    observe_until(
+        &mut events,
+        stream_id,
+        ClientUdpPendingOpenEvent::ContinuationExited,
+        &mut observed,
+    )
+    .await;
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| **event == ClientUdpPendingOpenEvent::ContinuationStarted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| **event == ClientUdpPendingOpenEvent::Accepted)
+            .count(),
+        1
+    );
     assert!(!observed.contains(&ClientUdpPendingOpenEvent::Retiring));
     repair_send.cancel_pending_response();
 }
@@ -319,26 +440,45 @@ async fn submitted_open_session_retirement_ends_waiting_continuation() {
     let context = fixture.context.clone();
     let session = fixture.session.clone();
     let opening = tokio::spawn(async move {
-        context.complete_session_operation(session.open_stream(
-            stream_id,
-            TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            TrafficClass::Latency,
-            StreamDemandHint::Latency,
-            Default::default(),
-            tokio::time::Instant::now() + Duration::from_secs(10),
-            65_536,
-        )).await
+        context
+            .complete_session_operation(session.open_stream(
+                stream_id,
+                TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                TrafficClass::Latency,
+                StreamDemandHint::Latency,
+                Default::default(),
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                65_536,
+            ))
+            .await
     });
     let (_peer_send, _peer_recv) = tokio::time::timeout(
         OPEN_OWNERSHIP_GUARD,
         read_test_stream_open(&accepted.connection, stream_id, limits),
-    ).await.unwrap().unwrap();
+    )
+    .await
+    .unwrap()
+    .unwrap();
     fixture.context.retire_session(CloseReason::PolicyRejected);
-    let result = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opening).await.unwrap().unwrap();
-    assert!(matches!(result, Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))));
+    let result = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opening)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
     let mut observed = Vec::new();
-    observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
-    tokio::time::timeout(OPEN_OWNERSHIP_GUARD, carrier.connection.wait_closed()).await.unwrap();
+    observe_until(
+        &mut events,
+        stream_id,
+        ClientUdpPendingOpenEvent::ContinuationExited,
+        &mut observed,
+    )
+    .await;
+    tokio::time::timeout(OPEN_OWNERSHIP_GUARD, carrier.connection.wait_closed())
+        .await
+        .unwrap();
     assert!(!observed.contains(&ClientUdpPendingOpenEvent::Accepted));
 }
 
@@ -353,10 +493,19 @@ async fn submitted_open_native_failure_cannot_leave_a_continuation() {
     let (_peer_send, _peer_recv) = tokio::time::timeout(
         OPEN_OWNERSHIP_GUARD,
         read_test_stream_open(&accepted.connection, stream_id, limits),
-    ).await.unwrap().unwrap();
+    )
+    .await
+    .unwrap()
+    .unwrap();
     accepted.connection.close();
     let mut observed = Vec::new();
-    observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
+    observe_until(
+        &mut events,
+        stream_id,
+        ClientUdpPendingOpenEvent::ContinuationExited,
+        &mut observed,
+    )
+    .await;
     // The public open may now own its existing bounded physical retry. Cancel
     // that caller rather than granting it a new server or changing its policy.
     opening.abort();
@@ -377,22 +526,40 @@ async fn parsed_open_reset_keeps_siblings_and_independent_native_retirement() {
         let (mut peer_send, mut peer_recv) = tokio::time::timeout(
             OPEN_OWNERSHIP_GUARD,
             read_test_stream_open(&accepted.connection, stream_id, limits),
-        ).await.unwrap().unwrap();
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let owner = fixture.session.owner.connection.lock().await;
-        udp_path_write_frame(&mut peer_send, &Frame::StreamReset {
-            stream_id,
-            reason: ResetReason::RemoteClosed,
-        }, limits).await.unwrap();
+        udp_path_write_frame(
+            &mut peer_send,
+            &Frame::StreamReset {
+                stream_id,
+                reason: ResetReason::RemoteClosed,
+            },
+            limits,
+        )
+        .await
+        .unwrap();
         let result = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, opening)
-            .await.expect("parsed RESET must return while physical owner is locked")
+            .await
+            .expect("parsed RESET must return while physical owner is locked")
             .unwrap();
-        assert!(matches!(result, Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed))));
+        assert!(matches!(
+            result,
+            Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed))
+        ));
         if close_native {
             // Closure happens after the logical result, while its independent
             // exact-owner observer still cannot acquire this mutex.
             accepted.connection.close();
-            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, carrier.connection.wait_closed()).await.unwrap();
-            assert_eq!(fixture.context.authenticated_carriers.snapshot().live_count, 1);
+            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, carrier.connection.wait_closed())
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.context.authenticated_carriers.snapshot().live_count,
+                1
+            );
         }
         drop(owner);
         if close_native {
@@ -400,20 +567,39 @@ async fn parsed_open_reset_keeps_siblings_and_independent_native_retirement() {
             tokio::time::timeout(OPEN_OWNERSHIP_GUARD, async {
                 loop {
                     if fixture.context.authenticated_carriers.snapshot().live_count == 0
-                        && fixture.context.peer_status.carrier_count(fixture.context.session_id) == 0 {
+                        && fixture
+                            .context
+                            .peer_status
+                            .carrier_count(fixture.context.session_id)
+                            == 0
+                    {
                         break;
                     }
                     tokio::task::yield_now().await;
                 }
-            }).await.expect("independent native observer releases exact physical registrations");
+            })
+            .await
+            .expect("independent native observer releases exact physical registrations");
         } else {
             retire_unopened_peer_repair(&accepted, limits).await;
             assert_ordered_detach(&mut peer_recv, stream_id, limits).await;
             assert_real_sibling_exchange(&fixture, &accepted).await;
-            assert_eq!(current_client_carrier(&fixture.session).await.unwrap().path_instance_id, carrier.path_instance_id);
+            assert_eq!(
+                current_client_carrier(&fixture.session)
+                    .await
+                    .unwrap()
+                    .path_instance_id,
+                carrier.path_instance_id
+            );
         }
         let mut observed = Vec::new();
-        observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
+        observe_until(
+            &mut events,
+            stream_id,
+            ClientUdpPendingOpenEvent::ContinuationExited,
+            &mut observed,
+        )
+        .await;
         assert!(!observed.contains(&ClientUdpPendingOpenEvent::Accepted));
     }
 }
@@ -445,20 +631,32 @@ impl NativeReceiveBackpressure {
         // the peer's accept queue, so these identities are unambiguous.
         for index in 0..BLOCKED_FILLER_COUNT {
             let (local, peer) = tokio::join!(
-                carrier.connection.open_bi(), accepted.connection.accept_bi(),
+                carrier.connection.open_bi(),
+                accepted.connection.accept_bi(),
             );
             let (mut send, recv) = local.unwrap();
             let (peer_send, mut peer_recv) = peer.unwrap();
-            let opener = Frame::Ping { nonce: index as u64 };
-            udp_path_write_frame(&mut send, &opener, limits).await.unwrap();
-            assert_eq!(udp_path_read_frame(&mut peer_recv, limits).await.unwrap(), opener);
+            let opener = Frame::Ping {
+                nonce: index as u64,
+            };
+            udp_path_write_frame(&mut send, &opener, limits)
+                .await
+                .unwrap();
+            assert_eq!(
+                udp_path_read_frame(&mut peer_recv, limits).await.unwrap(),
+                opener
+            );
             let observer = send.native_progress_observer_for_test().unwrap();
             assert!(observer.snapshot().unwrap().accepted_end < (BLOCKED_STREAM_WINDOW / 2) as u64);
             observers.push(observer);
             local_pairs.push((send, recv));
             peers.push((peer_send, peer_recv));
         }
-        let mut result = Self { writers: Vec::new(), peers, observers };
+        let mut result = Self {
+            writers: Vec::new(),
+            peers,
+            observers,
+        };
         let mut pending = Vec::new();
         for (index, (mut send, recv)) in local_pairs.into_iter().enumerate() {
             let (entered, observed) = tokio::sync::oneshot::channel();
@@ -467,11 +665,16 @@ impl NativeReceiveBackpressure {
                 let _recv = recv;
                 let write = async {
                     for part in 0..2 {
-                        udp_path_write_frame(&mut send, &Frame::StreamData {
-                            stream_id: StreamId(1300 + index as u64),
-                            offset: (part * BLOCKED_STREAM_WINDOW) as u64,
-                            payload: bytes::Bytes::from(vec![0x5a; BLOCKED_STREAM_WINDOW]),
-                        }, limits).await?;
+                        udp_path_write_frame(
+                            &mut send,
+                            &Frame::StreamData {
+                                stream_id: StreamId(1300 + index as u64),
+                                offset: (part * BLOCKED_STREAM_WINDOW) as u64,
+                                payload: bytes::Bytes::from(vec![0x5a; BLOCKED_STREAM_WINDOW]),
+                            },
+                            limits,
+                        )
+                        .await?;
                     }
                     super::super::super::io::udp_path_finish_stream(&mut send).await
                 };
@@ -479,15 +682,20 @@ impl NativeReceiveBackpressure {
                 let mut entered = Some(entered);
                 std::future::poll_fn(|cx| {
                     let result = write.as_mut().poll(cx);
-                    if result.is_pending() && let Some(entered) = entered.take() {
+                    if result.is_pending()
+                        && let Some(entered) = entered.take()
+                    {
                         let _ = entered.send(());
                     }
                     result
-                }).await
+                })
+                .await
             }));
         }
         for entered in pending {
-            entered.await.expect("each real unread native write becomes Pending");
+            entered
+                .await
+                .expect("each real unread native write becomes Pending");
         }
         result.wait_quiescent(&carrier.connection).await;
         result
@@ -497,17 +705,33 @@ impl NativeReceiveBackpressure {
         tokio::time::timeout(OPEN_OWNERSHIP_GUARD, async {
             let mut previous = None;
             loop {
-                assert!(!connection.is_closed(), "fixture needs live native backpressure");
+                assert!(
+                    !connection.is_closed(),
+                    "fixture needs live native backpressure"
+                );
                 assert!(self.writers.iter().all(|writer| !writer.is_finished()));
-                let progress: Vec<_> = self.observers.iter().map(|observer| observer.snapshot().unwrap()).collect();
+                let progress: Vec<_> = self
+                    .observers
+                    .iter()
+                    .map(|observer| observer.snapshot().unwrap())
+                    .collect();
                 // No accepted filler bytes remain before packet construction,
                 // and the native controller has no outstanding in-flight work.
                 // A Pending writer still below its initial stream credit is
                 // the discriminant from only filling each stream separately.
                 let offsets: Vec<_> = progress.iter().map(|value| value.accepted_end).collect();
-                if progress.iter().all(|value| value.first_unpacketized == value.accepted_end)
-                    && progress.iter().any(|value| value.accepted_end < BLOCKED_STREAM_WINDOW as u64)
-                    && connection.connection.native_controller_shape_snapshot().bytes_in_flight() == 0 {
+                if progress
+                    .iter()
+                    .all(|value| value.first_unpacketized == value.accepted_end)
+                    && progress
+                        .iter()
+                        .any(|value| value.accepted_end < BLOCKED_STREAM_WINDOW as u64)
+                    && connection
+                        .connection
+                        .native_controller_shape_snapshot()
+                        .bytes_in_flight()
+                        == 0
+                {
                     if previous.as_ref() == Some(&offsets) {
                         return;
                     }
@@ -519,27 +743,37 @@ impl NativeReceiveBackpressure {
                 // quiescent boundary; a just-received ACK alone is not enough.
                 tokio::task::yield_now().await;
             }
-        }).await.expect("unread peer bodies must reach real native backpressure after packet service settles");
+        })
+        .await
+        .expect(
+            "unread peer bodies must reach real native backpressure after packet service settles",
+        );
     }
 
     async fn release(mut self, limits: CodecLimits) {
         // All writers share connection credit. Freed credit may serve a
         // different filler, so each real peer consumer must remain pollable.
-        futures::future::join_all(self.peers.drain(..).enumerate().map(|(index, (mut send, mut recv))| async move {
-            for part in 0..2 {
-                assert_eq!(
-                    udp_path_read_frame(&mut recv, limits).await.unwrap(),
-                    Frame::StreamData {
-                        stream_id: StreamId(1300 + index as u64),
-                        offset: (part * BLOCKED_STREAM_WINDOW) as u64,
-                        payload: bytes::Bytes::from(vec![0x5a; BLOCKED_STREAM_WINDOW]),
-                    },
+        futures::future::join_all(self.peers.drain(..).enumerate().map(
+            |(index, (mut send, mut recv))| async move {
+                for part in 0..2 {
+                    assert_eq!(
+                        udp_path_read_frame(&mut recv, limits).await.unwrap(),
+                        Frame::StreamData {
+                            stream_id: StreamId(1300 + index as u64),
+                            offset: (part * BLOCKED_STREAM_WINDOW) as u64,
+                            payload: bytes::Bytes::from(vec![0x5a; BLOCKED_STREAM_WINDOW]),
+                        },
+                    );
+                }
+                let eof = udp_path_read_frame(&mut recv, limits).await;
+                assert!(
+                    eof.as_ref()
+                        .is_err_and(super::super::super::io::udp_path_input_finished)
                 );
-            }
-            let eof = udp_path_read_frame(&mut recv, limits).await;
-            assert!(eof.as_ref().is_err_and(super::super::super::io::udp_path_input_finished));
-            send.cancel_pending_response();
-        })).await;
+                send.cancel_pending_response();
+            },
+        ))
+        .await;
         for writer in self.writers.drain(..) {
             writer.await.unwrap().unwrap();
         }
@@ -547,7 +781,10 @@ impl NativeReceiveBackpressure {
 
     async fn join_after_native_end(mut self) {
         for writer in self.writers.drain(..) {
-            assert!(writer.await.unwrap().is_err(), "unread writes must end through native failure");
+            assert!(
+                writer.await.unwrap().is_err(),
+                "unread writes must end through native failure"
+            );
         }
         for (mut send, _recv) in self.peers.drain(..) {
             send.cancel_pending_response();
@@ -587,7 +824,8 @@ async fn blocked_submitted_retirement(end: BlockedRetirementEnd) {
             max_quic_concurrent_bidi_streams: 1 + 2 + BLOCKED_FILLER_COUNT,
             ..ResourceLimits::default()
         },
-    ).await;
+    )
+    .await;
     let accepted = fixture.establish_current().await;
     let carrier = current_client_carrier(&fixture.session).await.unwrap();
     let owner = Arc::downgrade(&fixture.session.owner);
@@ -598,62 +836,151 @@ async fn blocked_submitted_retirement(end: BlockedRetirementEnd) {
     let (mut peer_send, mut peer_recv) = tokio::time::timeout(
         OPEN_OWNERSHIP_GUARD,
         read_test_stream_open(&accepted.connection, stream_id, limits),
-    ).await.unwrap().unwrap();
-    let (mut repair_send, mut repair_recv) = tokio::time::timeout(
-        OPEN_OWNERSHIP_GUARD, accepted.connection.accept_bi(),
-    ).await.unwrap().unwrap();
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (mut repair_send, mut repair_recv) =
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, accepted.connection.accept_bi())
+            .await
+            .unwrap()
+            .unwrap();
     let fillers = tokio::time::timeout(
-        OPEN_OWNERSHIP_GUARD, NativeReceiveBackpressure::fill(&fixture, &accepted),
-    ).await.expect("fixed native-credit fixture setup");
-    assert!(!opening.is_finished(), "cancel the original live first-MAX owner");
+        OPEN_OWNERSHIP_GUARD,
+        NativeReceiveBackpressure::fill(&fixture, &accepted),
+    )
+    .await
+    .expect("fixed native-credit fixture setup");
+    assert!(
+        !opening.is_finished(),
+        "cancel the original live first-MAX owner"
+    );
     opening.abort();
-    assert!(opening.await.err().is_some_and(|error| error.is_cancelled()));
+    assert!(
+        opening
+            .await
+            .err()
+            .is_some_and(|error| error.is_cancelled())
+    );
     let mut observed = Vec::new();
-    observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::RetirementPending, &mut observed).await;
+    observe_until(
+        &mut events,
+        stream_id,
+        ClientUdpPendingOpenEvent::RetirementPending,
+        &mut observed,
+    )
+    .await;
     assert!(!observed.contains(&ClientUdpPendingOpenEvent::ContinuationExited));
     // This repair request never carried MPP OPEN. It must release now, while
     // the ordinary DETACH remains blocked, rather than joining its lifetime.
-    assert!(tokio::time::timeout(OPEN_OWNERSHIP_GUARD, udp_path_read_frame(&mut repair_recv, limits)).await.unwrap().is_err());
+    assert!(
+        tokio::time::timeout(
+            OPEN_OWNERSHIP_GUARD,
+            udp_path_read_frame(&mut repair_recv, limits)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
     repair_send.cancel_pending_response();
     drop((repair_send, repair_recv));
     fillers.wait_quiescent(&carrier.connection).await;
     while let Ok((id, event)) = events.try_recv() {
         assert_eq!(id, stream_id);
-        assert!(!matches!(event, ClientUdpPendingOpenEvent::RetirementFinished(_) | ClientUdpPendingOpenEvent::ContinuationExited), "retirement completed without peer credit or native retirement");
+        assert!(
+            !matches!(
+                event,
+                ClientUdpPendingOpenEvent::RetirementFinished(_)
+                    | ClientUdpPendingOpenEvent::ContinuationExited
+            ),
+            "retirement completed without peer credit or native retirement"
+        );
         observed.push(event);
     }
     match end {
         BlockedRetirementEnd::PeerReads => {
-            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, fillers.release(limits)).await.expect("peer reads return native flow credit");
+            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, fillers.release(limits))
+                .await
+                .expect("peer reads return native flow credit");
             assert_ordered_detach(&mut peer_recv, stream_id, limits).await;
-            observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
+            observe_until(
+                &mut events,
+                stream_id,
+                ClientUdpPendingOpenEvent::ContinuationExited,
+                &mut observed,
+            )
+            .await;
             assert!(observed.contains(&ClientUdpPendingOpenEvent::RetirementFinished(true)));
             assert_real_sibling_exchange(&fixture, &accepted).await;
-            assert_eq!(current_client_carrier(&fixture.session).await.unwrap().path_instance_id, carrier.path_instance_id);
+            assert_eq!(
+                current_client_carrier(&fixture.session)
+                    .await
+                    .unwrap()
+                    .path_instance_id,
+                carrier.path_instance_id
+            );
         }
         BlockedRetirementEnd::NativeClose => {
             accepted.connection.close();
-            observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
-            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, fillers.join_after_native_end()).await.unwrap();
+            observe_until(
+                &mut events,
+                stream_id,
+                ClientUdpPendingOpenEvent::ContinuationExited,
+                &mut observed,
+            )
+            .await;
+            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, fillers.join_after_native_end())
+                .await
+                .unwrap();
         }
         BlockedRetirementEnd::SessionRetirement => {
             fixture.context.retire_session(CloseReason::PolicyRejected);
-            observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
-            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, fillers.join_after_native_end()).await.unwrap();
+            observe_until(
+                &mut events,
+                stream_id,
+                ClientUdpPendingOpenEvent::ContinuationExited,
+                &mut observed,
+            )
+            .await;
+            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, fillers.join_after_native_end())
+                .await
+                .unwrap();
         }
         BlockedRetirementEnd::OwnerDrop => {
             drop(fixture);
-            assert!(owner.upgrade().is_none(), "retirement continuation must not own the physical owner Arc");
-            observe_until(&mut events, stream_id, ClientUdpPendingOpenEvent::ContinuationExited, &mut observed).await;
-            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, fillers.join_after_native_end()).await.unwrap();
+            assert!(
+                owner.upgrade().is_none(),
+                "retirement continuation must not own the physical owner Arc"
+            );
+            observe_until(
+                &mut events,
+                stream_id,
+                ClientUdpPendingOpenEvent::ContinuationExited,
+                &mut observed,
+            )
+            .await;
+            tokio::time::timeout(OPEN_OWNERSHIP_GUARD, fillers.join_after_native_end())
+                .await
+                .unwrap();
         }
     }
     peer_send.cancel_pending_response();
-    assert_eq!(observed.iter().filter(|event| **event == ClientUdpPendingOpenEvent::ContinuationStarted).count(), 1);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| **event == ClientUdpPendingOpenEvent::ContinuationStarted)
+            .count(),
+        1
+    );
     assert!(!observed.contains(&ClientUdpPendingOpenEvent::Accepted));
     if !matches!(end, BlockedRetirementEnd::PeerReads) {
-        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, carrier.connection.wait_closed()).await.unwrap();
-        assert!(!observed.contains(&ClientUdpPendingOpenEvent::RetirementFinished(true)), "native cancellation is not delivered DETACH");
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, carrier.connection.wait_closed())
+            .await
+            .unwrap();
+        assert!(
+            !observed.contains(&ClientUdpPendingOpenEvent::RetirementFinished(true)),
+            "native cancellation is not delivered DETACH"
+        );
     }
 }
 
@@ -715,18 +1042,19 @@ async fn accepted_open_cancellation_before_instance_commit_orders_detach() {
 
     // Keep both real peer halves alive. Reading the repair OPEN proves the
     // successful continuation owns the pair before we cancel its logical caller.
-    let (_repair_send, mut repair_recv) = tokio::time::timeout(
-        OPEN_OWNERSHIP_GUARD,
-        accepted.connection.accept_bi(),
-    )
-    .await
-    .expect("accepted continuation submits its repair request")
-    .expect("peer accepts repair request");
-    assert_eq!(
-        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, udp_path_read_frame(&mut repair_recv, limits))
+    let (_repair_send, mut repair_recv) =
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, accepted.connection.accept_bi())
             .await
-            .expect("real repair OPEN arrives")
-            .expect("peer reads repair OPEN"),
+            .expect("accepted continuation submits its repair request")
+            .expect("peer accepts repair request");
+    assert_eq!(
+        tokio::time::timeout(
+            OPEN_OWNERSHIP_GUARD,
+            udp_path_read_frame(&mut repair_recv, limits)
+        )
+        .await
+        .expect("real repair OPEN arrives")
+        .expect("peer reads repair OPEN"),
         Frame::OpenStreamRepair {
             stream_id,
             parent_request_id,
@@ -735,7 +1063,10 @@ async fn accepted_open_cancellation_before_instance_commit_orders_detach() {
     assert!(!opening.is_finished(), "physical commit remains paused");
     opening.abort();
     assert!(
-        opening.await.err().is_some_and(|error| error.is_cancelled()),
+        opening
+            .await
+            .err()
+            .is_some_and(|error| error.is_cancelled()),
         "join the cancelled original caller before observing retirement"
     );
 

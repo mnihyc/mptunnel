@@ -262,8 +262,17 @@ impl ClientTcpPathSessionHandle {
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
-        self.open_stream_with_deadlines_scoped(stream_id, target, lane, initial_demand,
-            return_plan, open_deadlines, advertised_recv_max_offset, None).await
+        self.open_stream_with_deadlines_scoped(
+            stream_id,
+            target,
+            lane,
+            initial_demand,
+            return_plan,
+            open_deadlines,
+            advertised_recv_max_offset,
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -279,14 +288,22 @@ impl ClientTcpPathSessionHandle {
         terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
         let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
-            terminal, self.runtime.session_id, stream_id,
+            terminal,
+            self.runtime.session_id,
+            stream_id,
         )?;
-        let mut opened = self.complete_session_operation(terminal.complete(
-            self.open_stream_with_deadlines_active(
-                stream_id, target, lane, initial_demand, return_plan, open_deadlines,
-                advertised_recv_max_offset, &terminal,
-            )
-        )).await?;
+        let mut opened = self
+            .complete_session_operation(terminal.complete(self.open_stream_with_deadlines_active(
+                stream_id,
+                target,
+                lane,
+                initial_demand,
+                return_plan,
+                open_deadlines,
+                advertised_recv_max_offset,
+                &terminal,
+            )))
+            .await?;
         opened.carrier.terminal_owner = owner;
         Ok(opened)
     }

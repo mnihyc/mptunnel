@@ -457,7 +457,10 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
             .await
         }
         Frame::StreamReset { stream_id, reason } => {
-            if let Some(terminal) = streams.get(&stream_id).and_then(|state| state.terminal.as_ref()) {
+            if let Some(terminal) = streams
+                .get(&stream_id)
+                .and_then(|state| state.terminal.as_ref())
+            {
                 terminal.publish_reset(stream_id, reason);
             }
             if streams

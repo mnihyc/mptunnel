@@ -267,7 +267,8 @@ async fn accepted_result_keeps_routed_reset_across_obsolete_generation() {
 
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
         let stream_id = StreamId(619);
-        let (scope, _owner) = ClientStreamTerminalScope::for_open(None, SessionId(619), stream_id).unwrap();
+        let (scope, _owner) =
+            ClientStreamTerminalScope::for_open(None, SessionId(619), stream_id).unwrap();
         let publisher = scope.pending_input();
         let (commands, _receivers) = reliable_path_command_channels(8);
         let initial = OpenedRemoteStream::pending(
@@ -283,7 +284,9 @@ async fn accepted_result_keeps_routed_reset_across_obsolete_generation() {
         let (_frames_tx, frames_rx) = mpsc::channel(4);
         let mux_limits = MuxLimits::default();
         let snapshot = crate::scheduler::PathSnapshot::new(
-            PathId(1), underlay, crate::runtime::path::model::default_path_srtt_ms(),
+            PathId(1),
+            underlay,
+            crate::runtime::path::model::default_path_srtt_ms(),
             crate::runtime::path::model::default_path_rate_bps(),
         );
         let accepted = OpenedReliableCarrierStream {
@@ -303,7 +306,8 @@ async fn accepted_result_keeps_routed_reset_across_obsolete_generation() {
             commands,
             mux_limits,
             frames: frames_rx,
-        }.guard_retirement();
+        }
+        .guard_retirement();
         let accepted = OpenedRemoteStream::from_opened_carrier(accepted, 1, 0);
         let (tx, mut rx) = mpsc::channel(1);
         tx.send(RelayAdditionalPathOpenResult {
@@ -313,16 +317,30 @@ async fn accepted_result_keeps_routed_reset_across_obsolete_generation() {
             startup_ordinal: None,
             startup_expected_instance: Some(next_carrier_path_instance_id()),
             result: Ok(accepted),
-        }).await.ok().expect("raw success is published before a terminal arrives");
+        })
+        .await
+        .ok()
+        .expect("raw success is published before a terminal arrives");
         publisher.publish_reset(stream_id, ResetReason::RemoteClosed);
         assert!(matches!(
             try_drain_completed_additional_path_opens(
-                stream_id, &mut startup, &mut remotes, &mut send_stream, false,
-                TrafficClass::Latency, &mut pending, &mut rx, &mut last_progress,
+                stream_id,
+                &mut startup,
+                &mut remotes,
+                &mut send_stream,
+                false,
+                TrafficClass::Latency,
+                &mut pending,
+                &mut rx,
+                &mut last_progress,
             ),
             Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed)),
         ));
-        assert_eq!(remotes.paths.len(), 1, "terminal does not replace an independent carrier membership");
+        assert_eq!(
+            remotes.paths.len(),
+            1,
+            "terminal does not replace an independent carrier membership"
+        );
         assert!(matches!(
             try_recv_reliable_path_command(&mut retired),
             Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
@@ -332,7 +350,10 @@ async fn accepted_result_keeps_routed_reset_across_obsolete_generation() {
             Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
         ));
         assert!(try_recv_reliable_path_command(&mut retired).is_none());
-        assert!(matches!(scope.reset_error(), Some(RuntimeError::RemoteReset(ResetReason::RemoteClosed))));
+        assert!(matches!(
+            scope.reset_error(),
+            Some(RuntimeError::RemoteReset(ResetReason::RemoteClosed))
+        ));
     }
 }
 

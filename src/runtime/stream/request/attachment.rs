@@ -307,7 +307,9 @@ impl OpenedRemoteStream {
         }
     }
 
-    pub(in crate::runtime) fn terminal_scope(&self) -> Option<crate::runtime::path::ClientStreamTerminalScope> {
+    pub(in crate::runtime) fn terminal_scope(
+        &self,
+    ) -> Option<crate::runtime::path::ClientStreamTerminalScope> {
         self.terminal.as_ref().and_then(|terminal| terminal.scope())
     }
 
@@ -315,13 +317,18 @@ impl OpenedRemoteStream {
         self.terminal_scope().and_then(|scope| scope.reset_error())
     }
 
-    pub(in crate::runtime) fn with_terminal_owner(mut self, owner: Option<crate::runtime::path::ClientStreamTerminalOwner>) -> Self {
+    pub(in crate::runtime) fn with_terminal_owner(
+        mut self,
+        owner: Option<crate::runtime::path::ClientStreamTerminalOwner>,
+    ) -> Self {
         debug_assert!(self.terminal_owner.is_none());
         self.terminal_owner = owner;
         self
     }
 
-    pub(in crate::runtime) fn take_terminal_owner(&mut self) -> Option<crate::runtime::path::ClientStreamTerminalOwner> {
+    pub(in crate::runtime) fn take_terminal_owner(
+        &mut self,
+    ) -> Option<crate::runtime::path::ClientStreamTerminalOwner> {
         self.terminal_owner.take()
     }
 

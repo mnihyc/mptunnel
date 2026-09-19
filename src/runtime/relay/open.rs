@@ -70,7 +70,10 @@ impl ReliableRelayOpenSpec {
         }
     }
 
-    pub(in crate::runtime) fn with_terminal_scope(mut self, terminal: Option<crate::runtime::path::ClientStreamTerminalScope>) -> Self {
+    pub(in crate::runtime) fn with_terminal_scope(
+        mut self,
+        terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
+    ) -> Self {
         self.terminal = terminal;
         self
     }
@@ -414,11 +417,19 @@ async fn open_remote_stream_active(
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     let stream_id = context.allocate_reliable_stream_id()?;
     let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
-        None, context.session_id, stream_id,
+        None,
+        context.session_id,
+        stream_id,
     )?;
-    let opened = terminal.complete(open_remote_stream_in_scope(
-        context, target, lane, stream_id, terminal.clone(),
-    )).await?;
+    let opened = terminal
+        .complete(open_remote_stream_in_scope(
+            context,
+            target,
+            lane,
+            stream_id,
+            terminal.clone(),
+        ))
+        .await?;
     Ok(opened.with_terminal_owner(owner))
 }
 

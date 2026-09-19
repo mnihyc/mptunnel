@@ -392,8 +392,8 @@ fn accepted_retirement_transfers_once_through_explicit_or_product_cleanup() {
         );
         let carrier = crate::runtime::path::OpenedReliableCarrierStream {
             retirement: None,
-                terminal: None,
-                terminal_owner: None,
+            terminal: None,
+            terminal_owner: None,
             stream_id,
             path_instance_id: next_carrier_path_instance_id(),
             max_offset: 0,
@@ -446,13 +446,15 @@ async fn logical_terminal_survives_outer_deadline_discarding_raw_success() {
     use futures::FutureExt;
 
     let stream_id = StreamId(95);
-    let (scope, _owner) = ClientStreamTerminalScope::for_open(None, SessionId(95), stream_id).unwrap();
+    let (scope, _owner) =
+        ClientStreamTerminalScope::for_open(None, SessionId(95), stream_id).unwrap();
     let publisher = scope.pending_input();
     let mux_limits = MuxLimits::default();
     let (commands, mut receivers) = reliable_path_command_channels(4);
     let (_frames_tx, frames_rx) = mpsc::channel(4);
     let startup = crate::scheduler::PathSnapshot::new(
-        PathId(0), UnderlayProtocol::Udp,
+        PathId(0),
+        UnderlayProtocol::Udp,
         crate::runtime::path::model::default_path_srtt_ms(),
         crate::runtime::path::model::default_path_rate_bps(),
     );
@@ -473,7 +475,8 @@ async fn logical_terminal_survives_outer_deadline_discarding_raw_success() {
         commands,
         mux_limits,
         frames: frames_rx,
-    }.guard_retirement();
+    }
+    .guard_retirement();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let opening = scope.complete(relay_path_open_with_deadline(deadline, async move {
         std::future::pending::<()>().await;
@@ -487,7 +490,9 @@ async fn logical_terminal_survives_outer_deadline_discarding_raw_success() {
     tokio::time::advance(Duration::from_secs(10)).await;
     assert!(matches!(
         opening.await,
-        Err(RuntimeError::RemoteReset(crate::protocol::ResetReason::RemoteClosed)),
+        Err(RuntimeError::RemoteReset(
+            crate::protocol::ResetReason::RemoteClosed
+        )),
     ));
     assert!(matches!(
         try_recv_reliable_path_command(&mut receivers),

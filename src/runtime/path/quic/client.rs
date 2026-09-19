@@ -467,8 +467,17 @@ impl ClientUdpPathSessionHandle {
         open_deadline: tokio::time::Instant,
         advertised_recv_max_offset: u64,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
-        self.open_stream_scoped(stream_id, target, lane, initial_demand, return_plan,
-            open_deadline, advertised_recv_max_offset, None).await
+        self.open_stream_scoped(
+            stream_id,
+            target,
+            lane,
+            initial_demand,
+            return_plan,
+            open_deadline,
+            advertised_recv_max_offset,
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -484,12 +493,22 @@ impl ClientUdpPathSessionHandle {
         terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
         let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
-            terminal, self.runtime.session_id, stream_id,
+            terminal,
+            self.runtime.session_id,
+            stream_id,
         )?;
-        let result = terminal.complete(self.open_stream_in_scope(
-            stream_id, target, lane, initial_demand, return_plan, open_deadline,
-            advertised_recv_max_offset, &terminal,
-        )).await;
+        let result = terminal
+            .complete(self.open_stream_in_scope(
+                stream_id,
+                target,
+                lane,
+                initial_demand,
+                return_plan,
+                open_deadline,
+                advertised_recv_max_offset,
+                &terminal,
+            ))
+            .await;
         self.runtime.state.session_lifecycle().ensure_active()?;
         let mut opened = result?;
         opened.terminal_owner = owner;

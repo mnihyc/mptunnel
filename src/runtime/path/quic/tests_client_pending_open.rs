@@ -1148,18 +1148,19 @@ async fn accepted_zero_max_reset_survives_physical_commit_expiry() {
     assert_eq!(kind, ClientUdpAcceptedOpenKind::Reliable);
     assert_eq!(instance, carrier.path_instance_id);
 
-    let (_repair_send, mut repair_recv) = tokio::time::timeout(
-        OPEN_OWNERSHIP_GUARD,
-        accepted.connection.accept_bi(),
-    )
-    .await
-    .expect("accepted continuation submits its repair request")
-    .expect("peer accepts repair request");
-    assert_eq!(
-        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, udp_path_read_frame(&mut repair_recv, limits))
+    let (_repair_send, mut repair_recv) =
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, accepted.connection.accept_bi())
             .await
-            .expect("real repair OPEN arrives")
-            .expect("peer reads repair OPEN"),
+            .expect("accepted continuation submits its repair request")
+            .expect("peer accepts repair request");
+    assert_eq!(
+        tokio::time::timeout(
+            OPEN_OWNERSHIP_GUARD,
+            udp_path_read_frame(&mut repair_recv, limits)
+        )
+        .await
+        .expect("real repair OPEN arrives")
+        .expect("peer reads repair OPEN"),
         Frame::OpenStreamRepair {
             stream_id,
             parent_request_id,
@@ -1181,7 +1182,10 @@ async fn accepted_zero_max_reset_survives_physical_commit_expiry() {
             .is_none(),
         "the consumed hook closes its observer when the opener leaves the pause",
     );
-    assert!(!opening.is_finished(), "actual physical commit remains pending");
+    assert!(
+        !opening.is_finished(),
+        "actual physical commit remains pending"
+    );
     udp_path_write_frame(
         &mut peer_send,
         &Frame::StreamReset {
@@ -1207,7 +1211,9 @@ async fn accepted_zero_max_reset_survives_physical_commit_expiry() {
         // A corrected terminal handoff may settle before replying to Ping.
         // This path still must return the exact RESET; it is not an expiry-loss
         // witness and therefore does not advance the test clock.
-        Frame::StreamDetach { stream_id: detached } if detached == stream_id => false,
+        Frame::StreamDetach {
+            stream_id: detached,
+        } if detached == stream_id => false,
         frame => panic!("unexpected pre-expiry witness: {frame:?}"),
     };
     let expired_after_pong = reset_routed_before_expiry && !opening.is_finished();
@@ -1251,7 +1257,10 @@ async fn accepted_zero_max_reset_survives_physical_commit_expiry() {
         )
         .await
         .expect("native EOF follows the already observed early DETACH");
-        assert!(eof.as_ref().is_err_and(super::super::super::io::udp_path_input_finished));
+        assert!(
+            eof.as_ref()
+                .is_err_and(super::super::super::io::udp_path_input_finished)
+        );
     }
     assert!(!carrier.connection.is_closed());
     assert_eq!(

@@ -56,7 +56,12 @@ impl ClientStreamTerminalScope {
     }
 
     pub(in crate::runtime) fn reset_error(&self) -> Option<RuntimeError> {
-        self.0.state.lock().expect("stream terminal lock").reason.map(RuntimeError::RemoteReset)
+        self.0
+            .state
+            .lock()
+            .expect("stream terminal lock")
+            .reason
+            .map(RuntimeError::RemoteReset)
     }
 
     pub(in crate::runtime) fn ensure_active(&self) -> Result<(), RuntimeError> {
@@ -147,8 +152,15 @@ impl PendingStreamTerminal {
 
     /// Install the ordinary ordered input owner while publication is fenced.
     /// The closure must be synchronous and must not access this scope again.
-    pub(in crate::runtime) fn commit<T>(&self, install: impl FnOnce() -> T) -> Result<T, RuntimeError> {
-        let scope = self.0.scope.upgrade().ok_or(RuntimeError::ReliablePathRetired)?;
+    pub(in crate::runtime) fn commit<T>(
+        &self,
+        install: impl FnOnce() -> T,
+    ) -> Result<T, RuntimeError> {
+        let scope = self
+            .0
+            .scope
+            .upgrade()
+            .ok_or(RuntimeError::ReliablePathRetired)?;
         let state = scope.state.lock().expect("stream terminal lock");
         if let Some(reason) = state.reason {
             return Err(RuntimeError::RemoteReset(reason));
@@ -168,10 +180,12 @@ mod tests {
 
     #[test]
     fn pending_terminal_is_exact_and_keeps_the_first_reason() {
-        let (scope, _owner) = ClientStreamTerminalScope::for_open(
-            None, SessionId(310), StreamId(710),
-        ).unwrap();
-        for (session, stream) in [(SessionId(311), StreamId(710)), (SessionId(310), StreamId(711))] {
+        let (scope, _owner) =
+            ClientStreamTerminalScope::for_open(None, SessionId(310), StreamId(710)).unwrap();
+        for (session, stream) in [
+            (SessionId(311), StreamId(710)),
+            (SessionId(310), StreamId(711)),
+        ] {
             assert!(matches!(
                 ClientStreamTerminalScope::for_open(Some(scope.clone()), session, stream),
                 Err(RuntimeError::Protocol("logical terminal scope mismatch")),
@@ -182,54 +196,80 @@ mod tests {
         assert!(scope.ensure_active().is_ok());
         publisher.publish_reset(StreamId(710), ResetReason::RemoteClosed);
         publisher.publish_reset(StreamId(710), ResetReason::TimedOut);
-        assert!(matches!(scope.reset_error(), Some(RuntimeError::RemoteReset(ResetReason::RemoteClosed))));
+        assert!(matches!(
+            scope.reset_error(),
+            Some(RuntimeError::RemoteReset(ResetReason::RemoteClosed))
+        ));
         let mut installed = false;
-        assert!(matches!(publisher.commit(|| installed = true), Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed))));
-        assert!(!installed, "a routed terminal forbids later input installation");
+        assert!(matches!(
+            publisher.commit(|| installed = true),
+            Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed))
+        ));
+        assert!(
+            !installed,
+            "a routed terminal forbids later input installation"
+        );
     }
 
     #[test]
     fn native_publisher_neither_owns_nor_revives_the_logical_stream() {
-        let (scope, owner) = ClientStreamTerminalScope::for_open(
-            None, SessionId(312), StreamId(712),
-        ).unwrap();
+        let (scope, owner) =
+            ClientStreamTerminalScope::for_open(None, SessionId(312), StreamId(712)).unwrap();
         let publisher = scope.pending_input();
         drop(owner);
         publisher.publish_reset(StreamId(712), ResetReason::RemoteClosed);
         assert!(scope.reset_error().is_none());
-        assert!(matches!(scope.ensure_active(), Err(RuntimeError::ReliablePathRetired)));
-        assert!(matches!(publisher.commit(|| ()), Err(RuntimeError::ReliablePathRetired)));
+        assert!(matches!(
+            scope.ensure_active(),
+            Err(RuntimeError::ReliablePathRetired)
+        ));
+        assert!(matches!(
+            publisher.commit(|| ()),
+            Err(RuntimeError::ReliablePathRetired)
+        ));
         drop(scope);
-        assert!(publisher.scope().is_none(), "a surviving native actor retains only weak custody");
+        assert!(
+            publisher.scope().is_none(),
+            "a surviving native actor retains only weak custody"
+        );
     }
 
     #[test]
     fn committed_attachment_does_not_silence_a_pending_sibling() {
-        let (scope, _owner) = ClientStreamTerminalScope::for_open(
-            None, SessionId(314), StreamId(714),
-        ).unwrap();
+        let (scope, _owner) =
+            ClientStreamTerminalScope::for_open(None, SessionId(314), StreamId(714)).unwrap();
         let attached = scope.pending_input();
         let pending = scope.pending_input();
         attached.commit(|| ()).unwrap();
         attached.publish_reset(StreamId(714), ResetReason::TimedOut);
-        assert!(scope.reset_error().is_none(), "committed input retains FIFO authority");
+        assert!(
+            scope.reset_error().is_none(),
+            "committed input retains FIFO authority"
+        );
         pending.publish_reset(StreamId(714), ResetReason::RemoteClosed);
-        assert!(matches!(scope.reset_error(), Some(RuntimeError::RemoteReset(ResetReason::RemoteClosed))));
+        assert!(matches!(
+            scope.reset_error(),
+            Some(RuntimeError::RemoteReset(ResetReason::RemoteClosed))
+        ));
     }
 
     #[tokio::test]
     async fn pending_terminal_wakes_an_existing_owner_and_overrides_ready_timeout() {
-        let (scope, _owner) = ClientStreamTerminalScope::for_open(
-            None, SessionId(313), StreamId(713),
-        ).unwrap();
+        let (scope, _owner) =
+            ClientStreamTerminalScope::for_open(None, SessionId(313), StreamId(713)).unwrap();
         let publisher = scope.pending_input();
         let waiting = scope.complete(std::future::pending::<Result<(), RuntimeError>>());
         tokio::pin!(waiting);
         assert!(waiting.as_mut().now_or_never().is_none());
         publisher.publish_reset(StreamId(713), ResetReason::RemoteClosed);
-        assert!(matches!(waiting.await, Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed))));
         assert!(matches!(
-            scope.complete(async { Err::<(), _>(RuntimeError::PathOpenTimedOut) }).await,
+            waiting.await,
+            Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed))
+        ));
+        assert!(matches!(
+            scope
+                .complete(async { Err::<(), _>(RuntimeError::PathOpenTimedOut) })
+                .await,
             Err(RuntimeError::RemoteReset(ResetReason::RemoteClosed)),
         ));
     }

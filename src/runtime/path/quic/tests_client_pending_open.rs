@@ -674,3 +674,106 @@ async fn submitted_open_blocked_retirement_exits_on_session_retirement() {
 async fn submitted_open_blocked_retirement_does_not_retain_physical_owner() {
     blocked_submitted_retirement(BlockedRetirementEnd::OwnerDrop).await;
 }
+
+#[tokio::test]
+async fn accepted_open_cancellation_before_instance_commit_orders_detach() {
+    let fixture = ClientOpenRaceFixture::new().await;
+    let accepted = fixture.establish_current().await;
+    let carrier = current_client_carrier(&fixture.session)
+        .await
+        .expect("established exact carrier");
+    let stream_id = StreamId(1270);
+    let limits = fixture.server_context.codec_limits;
+    let (mut reached, _resume) = install_accepted_open_pause(&fixture.session);
+    let opening = spawn_test_open(&fixture.session, stream_id);
+    let (mut peer_send, mut peer_recv) = tokio::time::timeout(
+        OPEN_OWNERSHIP_GUARD,
+        read_test_stream_open(&accepted.connection, stream_id, limits),
+    )
+    .await
+    .expect("real OPEN and initial MAX arrive")
+    .expect("peer reads submitted request");
+    let parent_request_id = peer_send.request_stream_id();
+    udp_path_write_frame(
+        &mut peer_send,
+        &Frame::StreamMaxData {
+            stream_id,
+            max_offset: 0,
+        },
+        limits,
+    )
+    .await
+    .expect("real first MAX admits this carrier attachment");
+    let (kind, instance) = tokio::time::timeout(OPEN_OWNERSHIP_GUARD, reached.recv())
+        .await
+        .expect("accepted value reaches existing pre-commit pause")
+        .expect("accepted-open observer remains alive");
+    assert_eq!(kind, ClientUdpAcceptedOpenKind::Reliable);
+    assert_eq!(instance, carrier.path_instance_id);
+
+    // Keep both real peer halves alive. Reading the repair OPEN proves the
+    // successful continuation owns the pair before we cancel its logical caller.
+    let (_repair_send, mut repair_recv) = tokio::time::timeout(
+        OPEN_OWNERSHIP_GUARD,
+        accepted.connection.accept_bi(),
+    )
+    .await
+    .expect("accepted continuation submits its repair request")
+    .expect("peer accepts repair request");
+    assert_eq!(
+        tokio::time::timeout(OPEN_OWNERSHIP_GUARD, udp_path_read_frame(&mut repair_recv, limits))
+            .await
+            .expect("real repair OPEN arrives")
+            .expect("peer reads repair OPEN"),
+        Frame::OpenStreamRepair {
+            stream_id,
+            parent_request_id,
+        },
+    );
+    assert!(!opening.is_finished(), "physical commit remains paused");
+    opening.abort();
+    assert!(
+        opening.await.err().is_some_and(|error| error.is_cancelled()),
+        "join the cancelled original caller before observing retirement"
+    );
+
+    let next = tokio::time::timeout(
+        OPEN_OWNERSHIP_GUARD,
+        udp_path_read_frame(&mut peer_recv, limits),
+    )
+    .await;
+    let detached = matches!(
+        &next,
+        Ok(Ok(Frame::StreamDetach { stream_id: detached })) if *detached == stream_id
+    );
+    let eof = if detached {
+        Some(
+            tokio::time::timeout(
+                OPEN_OWNERSHIP_GUARD,
+                udp_path_read_frame(&mut peer_recv, limits),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    // Check this even when the old path has already produced EOF: a missing
+    // DETACH must not be confused with physical failure or a dead sibling.
+    assert!(!carrier.connection.is_closed());
+    assert_eq!(
+        current_client_carrier(&fixture.session)
+            .await
+            .expect("same physical owner remains installed")
+            .path_instance_id,
+        carrier.path_instance_id,
+    );
+    assert_real_sibling_exchange(&fixture, &accepted).await;
+    assert!(
+        detached,
+        "accepted caller cancellation must retain DETACH before native EOF: {next:?}"
+    );
+    assert!(
+        matches!(eof, Some(Ok(Err(ref error))) if super::super::super::io::udp_path_input_finished(error)),
+        "exactly one DETACH must be followed by native EOF: {eof:?}"
+    );
+}

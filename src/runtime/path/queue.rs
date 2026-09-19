@@ -1293,6 +1293,8 @@ impl ReliablePathCommandSender {
         }
     }
 
+    /// Orders DETACH before native close for one peer-visible OPEN. The peer's
+    /// first MAX is not required when a fully submitted pending open withdraws.
     pub(in crate::runtime) fn retire_accepted_stream(
         &self,
         stream_id: StreamId,

@@ -1431,9 +1431,12 @@ frozen physical instance and logical/session authority remain current. Every
 started loser owns its exact native retirement until custody transfers through
 the existing ordered DETACH-before-close path; no loser survives logical-owner
 drop as a selectable acquisition. Pending operations are local futures bounded
-by the frozen candidate count, not detached acquisition tasks. Losing or
-unstarted startup ordinals are omitted from the returned startup round, without
-publishing path failure. This policy can preserve useful work already submitted
+by the frozen candidate count, not detached acquisition tasks. Started losing
+attempts and concretely rejected frozen candidates are settled as omitted
+startup ordinals, without publishing path failure. Merely unstarted candidates,
+including a nominal successor fenced before entry, retain their ordinary later
+`STARTUP` eligibility until the frozen round closes. This policy can preserve
+useful work already submitted
 when another path becomes eligible, at the cost of overlapping native pairs,
 carrier entries, load leases, and duplicate CREATE/control traffic. The Due
 interval adds coordinator scheduling dependency at `S_i`; retained work can

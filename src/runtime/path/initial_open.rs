@@ -1,7 +1,8 @@
 //! Initial-only submitted-open deadline custody; selection stays in relay/open.
 //!
-//! One logical owner arbitrates a nominal decision with actual first MAX and
-//! the next attempt's first poll. Native users retain weak, exact capabilities.
+//! One logical owner separates the original lifetime from an alternative-start
+//! decision and arbitrates actual first MAX with the next attempt's first poll.
+//! Native users retain weak, exact capabilities.
 
 #[cfg(test)]
 #[path = "tests_initial_open.rs"]
@@ -29,8 +30,12 @@ enum Phase {
 
 struct Slot {
     key: RelayPathKey,
+    // Immutable setup/unretained S, also inherited by later backend generations.
     nominal: Instant,
+    // Monotone alternative-start D; Setup and exhausted alternatives mask it.
+    decision: Instant,
     budget: Duration,
+    admission_budget: Duration,
     may_start_successor: bool,
     generation: u64,
     carrier: Option<CarrierPathInstanceId>,
@@ -160,30 +165,27 @@ impl Inner {
     ) -> Instant {
         if now >= self.deadline {
             slot.expire_at(self.deadline);
-        } else if now >= slot.nominal
-            && !slot.retained
-            && matches!(slot.phase, Phase::Setup | Phase::Submitted)
-        {
-            if slot.phase == Phase::Submitted && slot.may_start_successor {
+        } else if slot.phase == Phase::Setup && now >= slot.nominal {
+            // Early retention can precede another backend generation. Its
+            // new pair allocation/partial writes still own the original S.
+            slot.expire_at(slot.nominal);
+            *observation = Some(slot.observation(ordinal, "expired"));
+        } else if slot.phase == Phase::Submitted && !slot.retained {
+            if slot.may_start_successor && now >= slot.decision {
                 slot.phase = Phase::DecisionDue;
-            } else {
+                *observation = Some(slot.observation(ordinal, "decision_due"));
+            } else if now >= slot.nominal {
                 slot.expire_at(slot.nominal);
+                *observation = Some(slot.observation(ordinal, "expired"));
             }
-            *observation = Some(slot.observation(
-                ordinal,
-                if slot.phase == Phase::DecisionDue {
-                    "decision_due"
-                } else {
-                    "expired"
-                },
-            ));
         }
         match slot.phase {
             Phase::Expired | Phase::Settled => {
                 slot.terminal_deadline.expect("terminal initial deadline")
             }
             Phase::DecisionDue => self.deadline,
-            _ if slot.retained => self.deadline,
+            Phase::Submitted | Phase::Admitted if slot.retained => self.deadline,
+            Phase::Submitted if slot.may_start_successor => slot.decision,
             _ => slot.nominal,
         }
     }
@@ -226,7 +228,7 @@ impl InitialOpenAcquisition {
         self.0.changed.notified()
     }
 
-    pub(in crate::runtime) fn nominal(&self, ordinal: u8) -> Option<Instant> {
+    pub(in crate::runtime) fn decision_deadline(&self, ordinal: u8) -> Option<Instant> {
         self.0
             .state
             .lock()
@@ -234,13 +236,18 @@ impl InitialOpenAcquisition {
             .slots
             .get(usize::from(ordinal))
             .and_then(Option::as_ref)
-            .filter(|slot| {
-                matches!(
-                    slot.phase,
-                    Phase::Setup | Phase::Submitted | Phase::DecisionDue | Phase::Expired
-                )
+            .and_then(|slot| match slot.phase {
+                Phase::Setup => Some(slot.nominal),
+                Phase::Submitted | Phase::DecisionDue if !slot.retained => {
+                    Some(if slot.may_start_successor {
+                        slot.decision
+                    } else {
+                        slot.nominal
+                    })
+                }
+                Phase::Expired => slot.terminal_deadline,
+                _ => None,
             })
-            .map(|slot| slot.nominal)
     }
 
     pub(in crate::runtime) fn has_admission(&self) -> bool {
@@ -256,13 +263,16 @@ impl InitialOpenAcquisition {
 
     pub(in crate::runtime) fn expire_unsubmitted(&self, ordinal: u8) -> bool {
         let mut state = self.0.state.lock().expect("initial open lock");
+        let now = Instant::now();
         let observation = state
             .slots
             .get_mut(usize::from(ordinal))
             .and_then(Option::as_mut)
-            .filter(|slot| matches!(slot.phase, Phase::Setup | Phase::Expired))
+            .filter(|slot| {
+                matches!(slot.phase, Phase::Setup | Phase::Expired) && now >= slot.nominal
+            })
             .map(|slot| {
-                slot.expire_at(slot.nominal.min(Instant::now()));
+                slot.expire_at(slot.nominal);
                 slot.observation(ordinal, "setup_expired")
             });
         drop(state);
@@ -276,21 +286,30 @@ impl InitialOpenAcquisition {
         expired
     }
 
-    pub(in crate::runtime) fn expire(&self, ordinal: u8) -> bool {
+    /// Finite reservation traversal found no actual successor. Consume that
+    /// opportunity without shortening the original's unretained lifetime S.
+    /// Return true only when S already expired and cancellation is warranted.
+    pub(in crate::runtime) fn exhaust_successors(&self, ordinal: u8) -> bool {
         let mut state = self.0.state.lock().expect("initial open lock");
-        let observation = if let Some(slot) = state
+        let mut observation = None;
+        let expired = if let Some(slot) = state
             .slots
             .get_mut(usize::from(ordinal))
             .and_then(Option::as_mut)
             && !matches!(slot.phase, Phase::Settled | Phase::Admitted)
         {
-            slot.expire_at(slot.nominal.min(Instant::now()));
-            Some(slot.observation(ordinal, "coordinator_expired"))
+            slot.may_start_successor = false;
+            if slot.phase == Phase::DecisionDue {
+                slot.phase = Phase::Submitted;
+            }
+            observation = Some(slot.observation(ordinal, "alternatives_exhausted"));
+            self.0
+                .update_deadline(ordinal, slot, Instant::now(), &mut observation);
+            slot.phase == Phase::Expired
         } else {
-            None
+            false
         };
         drop(state);
-        let expired = observation.is_some();
         if let Some(observation) = observation {
             self.0.event(observation);
         }
@@ -393,6 +412,7 @@ impl InitialOpenLaunch {
         ordinal: u8,
         key: RelayPathKey,
         budget: Duration,
+        admission_budget: Duration,
         may_start_successor: bool,
         predecessor: Option<u8>,
     ) -> Result<Option<InitialOpenAttempt>, RuntimeError> {
@@ -459,12 +479,25 @@ impl InitialOpenLaunch {
                 slot.retained = true;
                 slot.phase = Phase::Submitted;
                 previous_observation = Some(slot.observation(previous, "retained"));
+            } else if matches!(slot.phase, Phase::Setup | Phase::Submitted) {
+                // A new backend can re-enter Setup before S while a nominal
+                // successor is only prepared. Revalidate full submission at
+                // actual entry; neither its reservation nor old D promotes it.
+                drop(state);
+                if let Some(observation) = previous_observation {
+                    inner.event(observation);
+                    inner.changed.notify_waiters();
+                }
+                return Ok(None);
             }
         }
+        let nominal = (now + budget).min(inner.deadline);
         let slot = Slot {
             key,
-            nominal: (now + budget).min(inner.deadline),
+            nominal,
+            decision: nominal,
             budget,
+            admission_budget,
             may_start_successor,
             generation: 0,
             carrier: None,
@@ -605,12 +638,18 @@ impl InitialOpenAttempt {
             .ok_or(RuntimeError::Protocol(
                 "initial backend generation exhausted",
             ))?;
+        let deadline_changed = slot.phase != Phase::Setup;
         slot.carrier = None;
         slot.phase = Phase::Setup;
         slot.terminal_deadline = None;
+        let generation = slot.generation;
+        drop(state);
+        if deadline_changed {
+            inner.changed.notify_waiters();
+        }
         Ok(InitialOpenBackend {
             attempt: self.clone(),
-            generation: slot.generation,
+            generation,
         })
     }
 }
@@ -672,11 +711,19 @@ impl InitialOpenBackend {
 
     pub(in crate::runtime) fn submitted(&self) -> Result<(), RuntimeError> {
         self.with_slot(|_inner, slot, _, observation| {
-            if Instant::now() >= slot.nominal
-                || slot.phase != Phase::Setup
-                || slot.carrier.is_none()
-            {
+            let now = Instant::now();
+            if now >= slot.nominal || slot.phase != Phase::Setup || slot.carrier.is_none() {
                 return Err(RuntimeError::PathOpenTimedOut);
+            }
+            // Transport/path setup and both local OPEN/MAX writes are complete.
+            // Price only the remaining admission exchange when another frozen
+            // candidate can compete. D contracts, while the original setup and
+            // unretained lifetime S remains fixed. A later backend cannot
+            // restart the stored decision, and Setup masks it until submission.
+            if slot.may_start_successor {
+                slot.decision = now
+                    .checked_add(slot.admission_budget)
+                    .map_or(slot.decision, |deadline| slot.decision.min(deadline));
             }
             slot.phase = Phase::Submitted;
             *observation = Some(slot.observation(self.attempt.ordinal, "submitted"));

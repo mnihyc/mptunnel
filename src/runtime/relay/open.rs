@@ -12,7 +12,8 @@ use crate::model::capacity::{
 };
 use crate::model::path::RelayPathKey;
 use crate::model::timing::{
-    path_open_pto, path_open_serialized_exchanges, path_open_timeout, transport_pto_from_snapshot,
+    path_open_pto, path_open_pto_multiplier, path_open_serialized_exchanges,
+    transport_pto_from_snapshot,
 };
 use crate::protocol::{
     Frame, PathMetrics, PathUsage, StreamAttachmentPhase, StreamDemandHint, StreamId,
@@ -600,18 +601,20 @@ async fn open_initial_candidate(
         }) {
             return Err(RuntimeError::ReliablePathRetired);
         }
-        let budget =
-            reliable_initial_open_timeout(context, candidate.key, has_unattempted_alternative);
         // This runs on the owned attempt's first poll. Reservation alone never
         // promotes its predecessor; a published MAX can still fence this entry.
-        let Some(initial) = launch.begin(
-            candidate.ordinal,
-            candidate.key,
-            budget,
-            has_unattempted_alternative,
-            predecessor,
-        )?
-        else {
+        let Some(initial) = ({
+            let (budget, admission_budget) =
+                reliable_initial_open_budgets(context, candidate.key, has_unattempted_alternative);
+            launch.begin(
+                candidate.ordinal,
+                candidate.key,
+                budget,
+                admission_budget,
+                has_unattempted_alternative,
+                predecessor,
+            )?
+        }) else {
             return Ok(None);
         };
         spec.initial = Some(initial.clone());
@@ -731,8 +734,8 @@ async fn open_submitted_initial_candidates(
                     }
                 }
                 Ok(None) => {
-                    // MAX won before this prepared future entered. It never
-                    // launched and must remain available after a real refusal.
+                    // MAX or renewed predecessor setup fenced this prepared
+                    // future. It never launched and remains available later.
                     next_position = next_position.min(position);
                     if frontier == Some(candidate.ordinal) {
                         frontier = unstarted_predecessor;
@@ -781,8 +784,8 @@ async fn open_submitted_initial_candidates(
             return Ok(opened.with_startup(startup_plan, ordinal, failed_ordinals));
         }
 
-        let nominal = frontier.and_then(|ordinal| acquisition.nominal(ordinal));
-        let due = nominal.is_some_and(|at| at <= tokio::time::Instant::now());
+        let decision = frontier.and_then(|ordinal| acquisition.decision_deadline(ordinal));
+        let due = decision.is_some_and(|at| at <= tokio::time::Instant::now());
         if !acquisition.has_admission() && (frontier.is_none() || due) {
             if due
                 && let Some(previous) = frontier
@@ -831,7 +834,7 @@ async fn open_submitted_initial_candidates(
                 ));
                 frontier = Some(candidate.ordinal);
             } else if let Some(previous) = predecessor
-                && acquisition.expire(previous)
+                && acquisition.exhaust_successors(previous)
                 && let Some(cancellation) = &cancellations[usize::from(previous)]
             {
                 cancellation.abort();
@@ -844,16 +847,16 @@ async fn open_submitted_initial_candidates(
             );
         }
 
-        let nominal = if acquisition.has_admission() {
+        let decision = if acquisition.has_admission() {
             None
         } else {
-            frontier.and_then(|ordinal| acquisition.nominal(ordinal))
+            frontier.and_then(|ordinal| acquisition.decision_deadline(ordinal))
         };
         tokio::select! {
             biased;
             completion = running.next() => ready = completion,
             _ = &mut changed => {},
-            _ = tokio::time::sleep_until(nominal.unwrap_or(deadline)) => {},
+            _ = tokio::time::sleep_until(decision.unwrap_or(deadline)) => {},
         }
     }
 }
@@ -948,15 +951,26 @@ pub(in crate::runtime) fn reliable_initial_open_timeout(
     key: RelayPathKey,
     has_unattempted_alternative: bool,
 ) -> Duration {
+    reliable_initial_open_budgets(context, key, has_unattempted_alternative).0
+}
+
+/// Freeze whole setup and remaining admission allowances from the same basis.
+/// The latter can only contract a submitted attempt's alternative-start decision.
+fn reliable_initial_open_budgets(
+    context: &ClientPathContext,
+    key: RelayPathKey,
+    has_unattempted_alternative: bool,
+) -> (Duration, Duration) {
     let snapshot = context.reliable_path_snapshot(key);
     let rtt_is_observed =
         key.underlay == UnderlayProtocol::Udp && context.reliable_path_rtt_is_observed(key);
-    if has_unattempted_alternative {
-        path_open_pto(snapshot, rtt_is_observed)
-            .saturating_mul(path_open_serialized_exchanges(snapshot))
+    let pto = path_open_pto(snapshot, rtt_is_observed);
+    let exchanges = if has_unattempted_alternative {
+        path_open_serialized_exchanges(snapshot)
     } else {
-        path_open_timeout(snapshot, rtt_is_observed)
-    }
+        path_open_pto_multiplier(snapshot)
+    };
+    (pto.saturating_mul(exchanges), pto)
 }
 
 pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(

@@ -4064,10 +4064,21 @@ async fn two_initial_create_ordinals_share_one_actual_target_owner() {
             (0, ServerStreamOpenOutcome::New(TrafficClass::Latency))
                 | (1, ServerStreamOpenOutcome::Existing(TrafficClass::Latency))
         ));
-        assert!(
-            matches!(try_recv_reliable_path_priority_command(&mut receivers),
-            Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData { stream_id: id, max_offset: 0 })) if id == stream_id)
-        );
+        if ordinal == 0 {
+            assert!(
+                matches!(try_recv_reliable_path_priority_command(&mut receivers),
+                Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData { stream_id: id, max_offset: 0 })) if id == stream_id),
+                "New queues zero before publishing the target owner",
+            );
+        } else {
+            // Existing returns to the carrier's direct zero-admission producer
+            // (TCP stream.open / QUIC write_udp_stream_accept). That native
+            // response is not a registry command. No shared credit exists yet.
+            assert!(
+                try_recv_reliable_path_priority_command(&mut receivers).is_none(),
+                "Existing must not fabricate a queued grant before the target owner runs"
+            );
+        }
         outputs.push(receivers);
     }
     // The real target-owner producer remained unpolled for both CREATEs.

@@ -62,6 +62,12 @@ async fn retained_native_race(original_wins: bool) {
         );
     }
     let limits = fixture.server_context.codec_limits;
+    let mut events: Vec<_> = fixture
+        .context
+        .udp_sessions
+        .iter()
+        .map(observe_pending_opens)
+        .collect();
     let mut submitted = FuturesUnordered::new();
     for (index, carrier) in accepted.iter().enumerate() {
         submitted.push(submitted_request(&carrier.connection, index, limits));
@@ -106,7 +112,7 @@ async fn retained_native_race(original_wins: bool) {
             index,
         )
     };
-    let (result, (_first_send, mut first_recv, _second_send, mut second_recv, stream_id, winner)) =
+    let (result, (first_send, mut first_recv, second_send, mut second_recv, stream_id, winner)) =
         tokio::time::timeout(OPEN_OWNERSHIP_GUARD, async {
             tokio::join!(&mut opening, peers)
         })
@@ -115,13 +121,85 @@ async fn retained_native_race(original_wins: bool) {
     let opened = result.expect("actual accepted candidate wins");
     assert_eq!(opened.path_index(), winner);
     assert_eq!(opened.stream().stream_id, stream_id);
+    let parent_request_id = if original_wins {
+        first_send.request_stream_id()
+    } else {
+        second_send.request_stream_id()
+    };
+    // Acceptance transfers the repair pair to the ordinary continuation. Its
+    // real producer always submits this repair OPEN; only the loser stayed
+    // unopened. Observe the exact parent before requesting winner retirement.
+    let (mut repair_send, mut repair_recv) = tokio::time::timeout(
+        OPEN_OWNERSHIP_GUARD,
+        accepted[winner].connection.accept_bi(),
+    )
+    .await
+    .expect("accepted continuation exposes its repair request")
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            OPEN_OWNERSHIP_GUARD,
+            udp_path_read_frame(&mut repair_recv, limits)
+        )
+        .await
+        .expect("accepted repair OPEN arrives")
+        .unwrap(),
+        Frame::OpenStreamRepair {
+            stream_id,
+            parent_request_id
+        },
+        "repair ownership names the actual winning ordinary native request",
+    );
     opened.retire_uncommitted();
     tokio::join!(
         assert_ordered_detach(&mut first_recv, stream_id, limits),
         assert_ordered_detach(&mut second_recv, stream_id, limits),
     );
-    for carrier in &accepted {
-        retire_unopened_peer_repair(carrier, limits).await;
+    let repair_end = tokio::time::timeout(
+        OPEN_OWNERSHIP_GUARD,
+        udp_path_read_frame(&mut repair_recv, limits),
+    )
+    .await
+    .expect("accepted repair request ends with its ordinary owner");
+    assert!(
+        repair_end
+            .as_ref()
+            .is_err_and(super::super::super::super::io::udp_path_input_finished),
+        "accepted repair must finish after its exact OPEN, without another MPP frame: {repair_end:?}"
+    );
+    repair_send.cancel_pending_response();
+    for (index, carrier) in accepted.iter().enumerate() {
+        if index != winner {
+            retire_unopened_peer_repair(carrier, limits).await;
+        }
+        let mut observed = Vec::new();
+        observe_until(
+            &mut events[index],
+            stream_id,
+            ClientUdpPendingOpenEvent::ContinuationExited,
+            &mut observed,
+        )
+        .await;
+        let count = |expected| observed.iter().filter(|event| **event == expected).count();
+        assert_eq!(count(ClientUdpPendingOpenEvent::Submitted), 1);
+        assert_eq!(count(ClientUdpPendingOpenEvent::ContinuationStarted), 1);
+        assert_eq!(count(ClientUdpPendingOpenEvent::ContinuationExited), 1);
+        assert_eq!(
+            count(ClientUdpPendingOpenEvent::Accepted),
+            usize::from(index == winner)
+        );
+        assert_eq!(
+            count(ClientUdpPendingOpenEvent::Retiring),
+            usize::from(index != winner)
+        );
+        assert_eq!(
+            count(ClientUdpPendingOpenEvent::RetirementFinished(true)),
+            usize::from(index != winner)
+        );
+        assert_eq!(
+            count(ClientUdpPendingOpenEvent::RetirementFinished(false)),
+            0
+        );
     }
     for (session, identity) in fixture.context.udp_sessions.iter().zip(identities) {
         let current = current_client_carrier(session).await.unwrap();

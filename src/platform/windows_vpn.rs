@@ -28,7 +28,7 @@ use futures::stream::FuturesUnordered;
 use std::fmt;
 use std::io;
 use std::net::IpAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -304,6 +304,8 @@ pub(crate) async fn prepare_windows_vpn(
     .map_err(WindowsVpnPrepareError::WintunConfig)?;
     let prepared_device = WindowsWintunDeviceFactory::create(&wintun, &request.managed)
         .map_err(WindowsVpnPrepareError::Wintun)?;
+    let tunnel_interface_index = NonZeroU32::new(prepared_device.interface_index())
+        .expect("prepared Wintun interface index is nonzero");
     let plan = ProcessVpnPlan::build(
         &request.managed,
         &environment,
@@ -323,7 +325,10 @@ pub(crate) async fn prepare_windows_vpn(
 
     let (packet_devices, worker_ready) =
         ManagedPacketDeviceProvider::new(prepared_device.into_device());
-    let protector = Arc::new(WindowsNativeSocketBinder::new(environment));
+    let protector = Arc::new(WindowsNativeSocketBinder::new_for_vpn(
+        environment,
+        tunnel_interface_index,
+    ));
     let prepared_carriers: Arc<dyn CarrierNetworkProvider> = Arc::new(prepared_carriers);
     let carrier_network: Arc<dyn CarrierNetworkProvider> = Arc::new(
         ProtectedCarrierNetworkProvider::new(prepared_carriers, protector.clone()),

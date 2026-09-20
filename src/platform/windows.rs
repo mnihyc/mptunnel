@@ -4,13 +4,16 @@
 //! must provide an explicit architecture-matched path.
 
 use crate::platform::ManagedVpnConfig;
-use crate::platform::ProcessVpnEnvironment;
+use crate::platform::{
+    ProcessVpnEnvironment, snapshot_process_vpn_environment_excluding_interface,
+};
 use crate::transport::{HostSocketHandle, HostSocketProtectionRequest, HostSocketProtector};
 use std::fmt;
 use std::io;
 use std::net::IpAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tun_rs::DeviceBuilder;
 use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToGuid;
 use windows_sys::Win32::Networking::WinSock::{
@@ -355,7 +358,7 @@ impl std::error::Error for WindowsWintunCreateError {
 }
 
 /// Binds every process-created native socket to the pre-VPN Windows egress
-/// interface selected by the immutable route snapshot.
+/// interface selected by the generation route snapshot.
 ///
 /// This is a generation-boundary socket option, not a packet-path callback.
 /// Exact bootstrap/carrier routes remain part of the host transaction; this
@@ -364,15 +367,61 @@ impl std::error::Error for WindowsWintunCreateError {
 #[derive(Debug, Clone)]
 pub struct WindowsNativeSocketBinder {
     environment: Arc<ProcessVpnEnvironment>,
+    current_environment: Arc<RwLock<Arc<ProcessVpnEnvironment>>>,
+    tunnel_interface_index: Option<NonZeroU32>,
 }
 
 impl WindowsNativeSocketBinder {
     pub fn new(environment: Arc<ProcessVpnEnvironment>) -> Self {
-        Self { environment }
+        Self {
+            current_environment: Arc::new(RwLock::new(environment.clone())),
+            environment,
+            tunnel_interface_index: None,
+        }
+    }
+
+    pub(crate) fn new_for_vpn(
+        environment: Arc<ProcessVpnEnvironment>,
+        tunnel_interface_index: NonZeroU32,
+    ) -> Self {
+        Self {
+            current_environment: Arc::new(RwLock::new(environment.clone())),
+            environment,
+            tunnel_interface_index: Some(tunnel_interface_index),
+        }
     }
 
     pub fn environment(&self) -> &Arc<ProcessVpnEnvironment> {
         &self.environment
+    }
+
+    fn current_environment(&self) -> Arc<ProcessVpnEnvironment> {
+        self.current_environment
+            .read()
+            .expect("Windows native route snapshot lock is not poisoned")
+            .clone()
+    }
+
+    fn refresh_environment(&self) -> io::Result<()> {
+        let refreshed = snapshot_process_vpn_environment_excluding_interface(
+            self.tunnel_interface_index.map(NonZeroU32::get),
+        )
+        .map_err(|error| {
+            io::Error::other(format!("refresh native Windows route snapshot: {error}"))
+        })?;
+        *self
+            .current_environment
+            .write()
+            .expect("Windows native route snapshot lock is not poisoned") = Arc::new(refreshed);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn replace_environment_for_test(&self, environment: Arc<ProcessVpnEnvironment>) {
+        *self
+            .current_environment
+            .write()
+            .expect("Windows native route snapshot lock is not poisoned") = environment;
     }
 
     fn interface_index_for(
@@ -380,9 +429,9 @@ impl WindowsNativeSocketBinder {
         remote_address: IpAddr,
         bound_source: Option<IpAddr>,
     ) -> io::Result<u32> {
+        let environment = self.current_environment();
         if let Some(source) = bound_source.filter(|source| !source.is_unspecified()) {
-            return self
-                .environment
+            return environment
                 .native_networks()
                 .iter()
                 .filter(|network| network.directly_connected() && network.prefix().contains(&source))
@@ -397,7 +446,7 @@ impl WindowsNativeSocketBinder {
                     )
                 });
         }
-        self.environment
+        environment
             .native_route_for_address(remote_address)
             .map(|route| route.interface_index().get())
             .ok_or_else(|| {
@@ -427,8 +476,58 @@ impl HostSocketProtector for WindowsNativeSocketBinder {
             .map(|address| address.ip())
             .filter(|source| source.is_ipv4() == address.is_ipv4());
         let interface_index = self.interface_index_for(address, bound_source)?;
-        apply_windows_unicast_interface(socket.as_raw_socket(), address, interface_index)
+        match apply_windows_unicast_interface(socket.as_raw_socket(), address, interface_index) {
+            Ok(()) => Ok(()),
+            Err(first_error) if stale_interface_binding_error(&first_error) => {
+                // A process-managed VPN captures the native route table before
+                // its tunnel interface exists.  If the physical adapter is
+                // replaced later, the saved interface index can be invalid for
+                // a newly-created socket.  Refresh only after that concrete
+                // binding failure; healthy socket creation remains unchanged.
+                let first_kind = first_error.kind();
+                let first_text = first_error.to_string();
+                self.refresh_environment().map_err(|refresh_error| {
+                    io::Error::new(
+                        first_kind,
+                        format!(
+                            "native Windows interface binding failed ({first_text}); route refresh failed: {refresh_error}"
+                        ),
+                    )
+                })?;
+                let refreshed_index = self.interface_index_for(address, bound_source)?;
+                apply_windows_unicast_interface(
+                    socket.as_raw_socket(),
+                    address,
+                    refreshed_index,
+                )
+                .map_err(|retry_error| {
+                    io::Error::new(
+                        retry_error.kind(),
+                        format!(
+                            "native Windows interface binding failed after route refresh: {retry_error}"
+                        ),
+                    )
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
+}
+
+fn stale_interface_binding_error(error: &io::Error) -> bool {
+    // WinSock errors that identify a removed or no-longer-routable native
+    // interface.  Unsupported socket options and unrelated descriptor errors
+    // must remain fail-closed without a route-table query.
+    matches!(
+        error.raw_os_error(),
+        Some(
+            10022 // WSAEINVAL
+                | 10049 // WSAEADDRNOTAVAIL
+                | 10050 // WSAENETDOWN
+                | 10051 // WSAENETUNREACH
+                | 10065 // WSAEHOSTUNREACH
+        )
+    )
 }
 
 fn apply_windows_unicast_interface(

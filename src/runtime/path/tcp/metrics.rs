@@ -5,7 +5,10 @@
 
 use crate::model::advisory_score::{DirectionalTimingEpoch, DirectionalTimingEpochIssuer};
 use crate::model::capacity::PATH_OPEN_SCORE_BYTES;
-use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::protocol::{
+    PATH_METRIC_APPROXIMATE_LOSS, PATH_METRIC_APPROXIMATE_PACING, PATH_METRIC_APPROXIMATE_QUALITY,
+    PATH_METRIC_APPROXIMATE_RATE, PathId, PathMetricDirection, PathMetrics, UnderlayProtocol,
+};
 use crate::runtime::path::model::{metric_epoch_now, ratio_to_ppm};
 use crate::transport::tcp_telemetry::{
     TcpNativeLossCounters, TcpNativeSnapshot, TcpTelemetrySocket,
@@ -53,6 +56,11 @@ pub(in crate::runtime) struct TcpNativeObservation {
     inflight_hi_bytes: Option<u64>,
     delivery_rate_bps: Option<u64>,
     pacing_rate_bps: Option<u64>,
+    /// Windows TCP_INFO substitutes derived from BytesOut/Cwnd/RTT. These
+    /// values are diagnostic only and never become native delivery authority.
+    approximate_delivery_rate_bps: Option<u64>,
+    approximate_pacing_rate_bps: Option<u64>,
+    approximate_loss_ppm: Option<u32>,
     newly_acked_bytes: Option<u64>,
     retransmission_advanced: Option<bool>,
     #[cfg(any(test, feature = "lab-diagnostics"))]
@@ -124,6 +132,54 @@ impl TcpNativeObservation {
 
     pub(in crate::runtime) fn pacing_rate_bps(self) -> Option<u64> {
         self.pacing_rate_bps
+    }
+
+    pub(in crate::runtime) fn approximate_delivery_rate_bps(self) -> Option<u64> {
+        self.approximate_delivery_rate_bps.filter(|rate| *rate > 0)
+    }
+
+    pub(in crate::runtime) fn approximate_pacing_rate_bps(self) -> Option<u64> {
+        self.approximate_pacing_rate_bps.filter(|rate| *rate > 0)
+    }
+
+    pub(in crate::runtime) fn approximate_loss_ppm(self) -> Option<u32> {
+        self.approximate_loss_ppm
+    }
+
+    pub(in crate::runtime) fn has_approximate_sample(self) -> bool {
+        self.approximate_delivery_rate_bps.is_some()
+            || self.approximate_pacing_rate_bps.is_some()
+            || self.approximate_loss_ppm.is_some()
+    }
+
+    /// Adds a platform-substitute diagnostic sample without changing any
+    /// native-observation or scheduling provenance bits.
+    pub(in crate::runtime) fn apply_diagnostic_fallback(self, metrics: &mut PathMetrics) {
+        let mut applied = false;
+        if let Some(rate) = self.approximate_delivery_rate_bps() {
+            metrics.delivery_rate_bps = rate;
+            metrics.approximate_metrics |=
+                PATH_METRIC_APPROXIMATE_RATE | PATH_METRIC_APPROXIMATE_QUALITY;
+            applied = true;
+        }
+        if let Some(rate) = self.approximate_pacing_rate_bps() {
+            metrics.pacing_rate_bps = rate;
+            metrics.approximate_metrics |= PATH_METRIC_APPROXIMATE_PACING;
+            applied = true;
+        }
+        if let Some(loss_ppm) = self.approximate_loss_ppm() {
+            metrics.loss_ppm = loss_ppm;
+            metrics.approximate_metrics |= PATH_METRIC_APPROXIMATE_LOSS;
+            metrics.loss_observed = false;
+            applied = true;
+        }
+        if applied {
+            // The substitute value is diagnostic only. It cannot inherit the
+            // prior native/receipt epoch's authority or pacing provenance.
+            metrics.rate_valid_for_us = 0;
+            metrics.rate_observed = false;
+            metrics.pacing_rate_observed = false;
+        }
     }
 
     pub(in crate::runtime) fn newly_acked_bytes(self) -> Option<u64> {
@@ -247,6 +303,7 @@ impl TcpNativeObservation {
             has_ack_derived_data_sample: false,
             data_sample_count: 0,
             data_sample_bytes: 0,
+            approximate_metrics: 0,
         })
     }
 }
@@ -379,6 +436,8 @@ pub(in crate::runtime) struct TcpSenderMetricTracker {
     native_delivery: crate::runtime::path::traffic::NativeDeliveryTracker,
     bytes_acked_baseline: Option<u64>,
     previous_bytes_acked: Option<u64>,
+    previous_bytes_transmitted: Option<u64>,
+    previous_observed_at: Instant,
     previous_retransmission_counter: Option<u64>,
     delivery_window_floor_bytes: u64,
     loss: Option<TcpLossTracker>,
@@ -406,6 +465,8 @@ impl TcpSenderMetricTracker {
             native_delivery: crate::runtime::path::traffic::NativeDeliveryTracker::default(),
             bytes_acked_baseline: baseline.bytes_acked,
             previous_bytes_acked: baseline.bytes_acked,
+            previous_bytes_transmitted: baseline.bytes_transmitted,
+            previous_observed_at: Instant::now(),
             previous_retransmission_counter: baseline.retransmission_counter,
             delivery_window_floor_bytes,
             loss: baseline.loss.map(|previous| TcpLossTracker {
@@ -446,6 +507,7 @@ impl TcpSenderMetricTracker {
         direction: PathMetricDirection,
         current: TcpNativeSnapshot,
     ) -> TcpNativeObservation {
+        let observed_at = Instant::now();
         let (srtt_us, rttvar_us) = current
             .rtt
             .map(|rtt| (Some(rtt.srtt_us), rtt.rttvar_us))
@@ -503,6 +565,64 @@ impl TcpSenderMetricTracker {
         if current.bytes_acked.is_some() {
             self.previous_bytes_acked = current.bytes_acked;
         }
+        let retransmitted_bytes = match (
+            self.previous_retransmission_counter,
+            current.retransmission_counter,
+        ) {
+            (Some(previous), Some(current)) => Some(current.saturating_sub(previous)),
+            _ => None,
+        };
+        let approximate_delivery_rate_bps = current
+            .bytes_acked
+            .is_none()
+            .then(|| {
+                self.previous_bytes_transmitted
+                    .zip(current.bytes_transmitted)
+            })
+            .flatten()
+            .and_then(|(previous, current)| {
+                let delta = current.saturating_sub(previous);
+                let elapsed = observed_at.saturating_duration_since(self.previous_observed_at);
+                (delta > 0 && !elapsed.is_zero()).then(|| {
+                    (delta as f64 * 8.0 / elapsed.as_secs_f64())
+                        .round()
+                        .clamp(1.0, u64::MAX as f64) as u64
+                })
+            });
+        let approximate_pacing_rate_bps = current
+            .bytes_acked
+            .is_none()
+            .then(|| current.flight)
+            .flatten()
+            .and_then(|flight| {
+                current.rtt.and_then(|rtt| {
+                    (flight.inflight_limit_bytes > 0 && rtt.srtt_us > 0).then(|| {
+                        (flight.inflight_limit_bytes as u128)
+                            .saturating_mul(8)
+                            .saturating_mul(1_000_000)
+                            .checked_div(u128::from(rtt.srtt_us))
+                            .unwrap_or(0)
+                            .min(u128::from(u64::MAX)) as u64
+                    })
+                })
+            });
+        let approximate_loss_ppm = current
+            .bytes_acked
+            .is_none()
+            .then(|| {
+                self.previous_bytes_transmitted
+                    .zip(current.bytes_transmitted)
+            })
+            .flatten()
+            .zip(retransmitted_bytes)
+            .and_then(|((previous, current), retransmitted)| {
+                let transmitted = current.saturating_sub(previous);
+                (transmitted > 0).then(|| ratio_to_ppm(retransmitted as f64 / transmitted as f64))
+            });
+        if current.bytes_transmitted.is_some() {
+            self.previous_bytes_transmitted = current.bytes_transmitted;
+        }
+        self.previous_observed_at = observed_at;
         let retransmission_advanced = match (
             self.previous_retransmission_counter,
             current.retransmission_counter,
@@ -536,6 +656,9 @@ impl TcpSenderMetricTracker {
                 .pacing_rate_bytes_per_second
                 .filter(|rate| *rate != u64::MAX)
                 .map(bytes_per_second_to_bits),
+            approximate_delivery_rate_bps,
+            approximate_pacing_rate_bps,
+            approximate_loss_ppm,
             newly_acked_bytes,
             retransmission_advanced,
             #[cfg(any(test, feature = "lab-diagnostics"))]

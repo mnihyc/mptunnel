@@ -842,7 +842,29 @@ async fn run_client_tcp_path_session_active(
             return;
         }
         if drop_connection {
+            #[cfg(test)]
+            let retiring_instance = state
+                .connection
+                .as_ref()
+                .expect("native-failed TCP connection")
+                .path_instance_id;
             retire_failed_client_tcp_connection(runtime, state, carrier_readiness);
+            #[cfg(test)]
+            {
+                // Pause only the selected physical owner's actual cleanup,
+                // without holding the hook lock or native connection alive.
+                let pause = runtime
+                    .native_retirement_pause
+                    .lock()
+                    .expect("test native retirement pause lock")
+                    .take_if(|pause| pause.path_instance_id == retiring_instance);
+                if let Some(pause) = pause {
+                    let _ = pause.reached.send(retiring_instance);
+                    // Fixture cancellation drops the sender and releases this
+                    // await just as explicit completion does.
+                    let _ = pause.release.await;
+                }
+            }
             actor_terminal.finish();
             return;
         }
@@ -1219,6 +1241,8 @@ async fn handle_disconnected_client_tcp_command(
         }
         ReliablePathCommand::OpenStream {
             stream_id,
+            terminal,
+            initial,
             attempt_id,
             observed_carrier_instance: _,
             target,
@@ -1275,6 +1299,8 @@ async fn handle_disconnected_client_tcp_command(
                     }
                     let open = ClientTcpOpenStreamRequest {
                         stream_id,
+                        terminal,
+                        initial,
                         attempt_id,
                         target,
                         lane,
@@ -1292,6 +1318,7 @@ async fn handle_disconnected_client_tcp_command(
                             .expect("published TCP carrier remains actor-owned"),
                         open,
                         &mut state.streams,
+                        &mut state.closed_streams,
                         runtime.stream_frame_queue,
                     )
                     .await;

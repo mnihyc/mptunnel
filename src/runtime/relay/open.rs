@@ -12,7 +12,8 @@ use crate::model::capacity::{
 };
 use crate::model::path::RelayPathKey;
 use crate::model::timing::{
-    path_open_pto, path_open_serialized_exchanges, path_open_timeout, transport_pto_from_snapshot,
+    path_open_pto, path_open_pto_multiplier, path_open_serialized_exchanges,
+    transport_pto_from_snapshot,
 };
 use crate::protocol::{
     Frame, PathMetrics, PathUsage, StreamAttachmentPhase, StreamDemandHint, StreamId,
@@ -26,6 +27,9 @@ use crate::runtime::stream::{
     OpenedRemoteStream, ReliablePathStream, ReliableRelayReturnCandidate, ReliableRelayReturnPlan,
 };
 use crate::scheduler::{TrafficClass, stream_demand_hint_for_traffic_class};
+use futures::future::{AbortHandle, AbortRegistration, Abortable};
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +39,8 @@ pub(in crate::runtime) struct ReliableRelayOpenSpec {
     pub(in crate::runtime) initial_demand: StreamDemandHint,
     return_plan: StreamReturnPlan,
     startup_plan: Option<Arc<ReliableRelayReturnPlan>>,
+    terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
+    initial: Option<crate::runtime::path::InitialOpenAttempt>,
 }
 
 impl ReliableRelayOpenSpec {
@@ -50,6 +56,8 @@ impl ReliableRelayOpenSpec {
                 candidate_ordinal: 0,
             },
             startup_plan: None,
+            terminal: None,
+            initial: None,
         }
     }
 
@@ -64,7 +72,17 @@ impl ReliableRelayOpenSpec {
             initial_demand: stream_demand_hint_for_traffic_class(initial_lane),
             return_plan,
             startup_plan: Some(startup_plan),
+            terminal: None,
+            initial: None,
         }
+    }
+
+    pub(in crate::runtime) fn with_terminal_scope(
+        mut self,
+        terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
+    ) -> Self {
+        self.terminal = terminal;
+        self
     }
 
     pub(in crate::runtime) fn with_startup_plan(
@@ -271,12 +289,16 @@ async fn open_reliable_initial_attempt(
         stream_id,
         load_lease,
     } = attempt;
+    let (open_deadline, _open_timeout) = match &spec.initial {
+        Some(initial) => initial.timing()?,
+        None => {
+            let timeout = reliable_initial_open_timeout(context, key, has_unattempted_alternative);
+            (tokio::time::Instant::now() + timeout, timeout)
+        }
+    };
     match key.underlay {
         UnderlayProtocol::Tcp => {
-            let open_timeout =
-                reliable_initial_open_timeout(context, key, has_unattempted_alternative);
-            let open_deadlines =
-                ClientTcpOpenDeadlines::fixed(tokio::time::Instant::now() + open_timeout);
+            let open_deadlines = ClientTcpOpenDeadlines::fixed(open_deadline);
             match open_remote_stream_on_preselected_tcp_path(
                 context,
                 stream_id,
@@ -302,7 +324,7 @@ async fn open_reliable_initial_attempt(
                             stream_id.0,
                             key.index,
                             lane,
-                            open_timeout.as_millis(),
+                            _open_timeout.as_millis(),
                         ),
                     );
                     Err(RuntimeError::PathOpenTimedOut)
@@ -311,12 +333,8 @@ async fn open_reliable_initial_attempt(
             }
         }
         UnderlayProtocol::Udp => {
-            let open_timeout =
-                reliable_initial_open_timeout(context, key, has_unattempted_alternative);
-            let open_deadline = tokio::time::Instant::now() + open_timeout;
-            match relay_path_open_with_deadline(
-                open_deadline,
-                open_remote_stream_on_preselected_udp_path(
+            let result = {
+                let opening = open_remote_stream_on_preselected_udp_path(
                     context,
                     stream_id,
                     spec,
@@ -328,10 +346,17 @@ async fn open_reliable_initial_attempt(
                         lane,
                         context.mux_limits,
                     ),
-                ),
-            )
-            .await
-            {
+                );
+                tokio::pin!(opening);
+                // The initial-only backend owns setup and submitted phases.
+                // An independent S_i wrapper would destroy DecisionDue.
+                if spec.initial.is_some() {
+                    opening.await
+                } else {
+                    relay_path_open_with_deadline(open_deadline, opening.as_mut()).await
+                }
+            };
+            match result {
                 Ok(opened) => Ok(opened.with_load_lease(load_lease)),
                 Err(RuntimeError::PathOpenTimedOut) => {
                     #[cfg(feature = "lab-diagnostics")]
@@ -342,7 +367,7 @@ async fn open_reliable_initial_attempt(
                             stream_id.0,
                             key.index,
                             lane,
-                            open_timeout.as_millis(),
+                            _open_timeout.as_millis(),
                         ),
                     );
                     Err(RuntimeError::PathOpenTimedOut)
@@ -389,24 +414,66 @@ async fn await_reliable_initial_target_acceptance(
     }
 }
 
+#[cfg(test)]
 pub(in crate::runtime) async fn open_remote_stream(
     context: &ClientPathContext,
     target: TargetAddr,
     lane: TrafficClass,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    context
-        .complete_session_operation(open_remote_stream_active(context, target, lane))
-        .await
+    let opening = open_remote_stream_active(context, target, lane, None);
+    tokio::pin!(opening);
+    context.complete_session_operation(opening.as_mut()).await
+}
+
+pub(in crate::runtime) async fn open_remote_stream_until(
+    context: &ClientPathContext,
+    target: TargetAddr,
+    lane: TrafficClass,
+    deadline: tokio::time::Instant,
+) -> Result<OpenedRemoteStream, RuntimeError> {
+    let opening = open_remote_stream_active(context, target, lane, Some(deadline));
+    tokio::pin!(opening);
+    context.complete_session_operation(opening.as_mut()).await
 }
 
 async fn open_remote_stream_active(
     context: &ClientPathContext,
     target: TargetAddr,
     lane: TrafficClass,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     let stream_id = context.allocate_reliable_stream_id()?;
+    let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
+        None,
+        context.session_id,
+        stream_id,
+    )?;
+    let opened = {
+        let opening = open_remote_stream_in_scope(
+            context,
+            target,
+            lane,
+            stream_id,
+            terminal.clone(),
+            deadline,
+        );
+        tokio::pin!(opening);
+        terminal.complete(opening.as_mut()).await
+    }?;
+    Ok(opened.with_terminal_owner(owner))
+}
+
+async fn open_remote_stream_in_scope(
+    context: &ClientPathContext,
+    target: TargetAddr,
+    lane: TrafficClass,
+    stream_id: StreamId,
+    terminal: crate::runtime::path::ClientStreamTerminalScope,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<OpenedRemoteStream, RuntimeError> {
     let startup_plan = freeze_reliable_relay_return_plan(context, lane)?;
-    let base_spec = ReliableRelayOpenSpec::for_initial_plan(target, lane, startup_plan.clone());
+    let base_spec = ReliableRelayOpenSpec::for_initial_plan(target, lane, startup_plan.clone())
+        .with_terminal_scope(Some(terminal.clone()));
     let mut failed_ordinals = Vec::new();
     let mut last_retryable_error = None;
     let ranked_keys = context.ordered_reliable_path_keys(lane, PATH_OPEN_SCORE_BYTES);
@@ -417,7 +484,21 @@ async fn open_remote_stream_active(
             .position(|key| *key == candidate.key)
             .unwrap_or(ranked_keys.len() + usize::from(candidate.ordinal))
     });
+    if let Some(deadline) = deadline {
+        return open_submitted_initial_candidates(
+            context,
+            stream_id,
+            lane,
+            terminal,
+            startup_plan,
+            base_spec,
+            opening_candidates,
+            deadline,
+        )
+        .await;
+    }
     for (position, candidate) in opening_candidates.iter().copied().enumerate() {
+        terminal.ensure_active()?;
         let Some(attempt) =
             reserve_reliable_initial_plan_attempt(context, stream_id, lane, candidate)
         else {
@@ -435,6 +516,7 @@ async fn open_remote_stream_active(
             has_unattempted_alternative,
         )
         .await;
+        terminal.ensure_active()?;
         let open = match open {
             Ok(mut opened) => {
                 match await_reliable_initial_target_acceptance(opened.stream_mut()).await {
@@ -481,6 +563,302 @@ async fn open_remote_stream_active(
         }
     }
     Err(last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
+}
+
+struct InitialCandidateCompletion {
+    position: usize,
+    predecessor: Option<u8>,
+    candidate: ReliableRelayReturnCandidate,
+    result: Result<Option<OpenedRemoteStream>, RuntimeError>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_initial_candidate(
+    context: &ClientPathContext,
+    attempt: ReliableInitialOpenAttempt,
+    mut spec: ReliableRelayOpenSpec,
+    lane: TrafficClass,
+    candidate: ReliableRelayReturnCandidate,
+    position: usize,
+    has_unattempted_alternative: bool,
+    predecessor: Option<u8>,
+    launch: crate::runtime::path::InitialOpenLaunch,
+    cancellation: AbortRegistration,
+) -> InitialCandidateCompletion {
+    let opening = async {
+        context.ensure_session_active()?;
+        if let Some(terminal) = &spec.terminal {
+            terminal.ensure_active()?;
+        }
+        if candidate.path_instance_id.is_some_and(|frozen| {
+            context
+                .health()
+                .lock()
+                .expect("client path health lock")
+                .path_record(candidate.key)
+                .and_then(|record| record.path_instance_id())
+                != Some(frozen)
+        }) {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        // This runs on the owned attempt's first poll. Reservation alone never
+        // promotes its predecessor; a published MAX can still fence this entry.
+        let Some(initial) = ({
+            let (budget, admission_budget) =
+                reliable_initial_open_budgets(context, candidate.key, has_unattempted_alternative);
+            launch.begin(
+                candidate.ordinal,
+                candidate.key,
+                budget,
+                admission_budget,
+                has_unattempted_alternative,
+                predecessor,
+            )?
+        }) else {
+            return Ok(None);
+        };
+        spec.initial = Some(initial.clone());
+        let mut opened = {
+            let opening = open_reliable_initial_attempt(
+                context,
+                attempt,
+                &spec,
+                lane,
+                has_unattempted_alternative,
+            );
+            tokio::pin!(opening);
+            initial.complete(opening.as_mut()).await
+        }?;
+        if let Err(error) = await_reliable_initial_target_acceptance(opened.stream_mut()).await {
+            opened.retire_uncommitted();
+            return Err(error);
+        }
+        Ok(Some(opened))
+    };
+    tokio::pin!(opening);
+    let result = Abortable::new(opening.as_mut(), cancellation)
+        .await
+        .unwrap_or(Err(RuntimeError::PathOpenTimedOut));
+    InitialCandidateCompletion {
+        position,
+        predecessor,
+        candidate,
+        result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_submitted_initial_candidates(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    lane: TrafficClass,
+    terminal: crate::runtime::path::ClientStreamTerminalScope,
+    startup_plan: Arc<ReliableRelayReturnPlan>,
+    base_spec: ReliableRelayOpenSpec,
+    candidates: Vec<ReliableRelayReturnCandidate>,
+    deadline: tokio::time::Instant,
+) -> Result<OpenedRemoteStream, RuntimeError> {
+    let acquisition = crate::runtime::path::InitialOpenAcquisition::new(
+        context.session_id,
+        stream_id,
+        deadline,
+        startup_plan.candidates().len(),
+    );
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "initial_acquisition_owner",
+        format_args!(
+            "session_id={} stream_id={} target={:?} candidates={}",
+            context.session_id.0,
+            stream_id.0,
+            base_spec.target,
+            candidates.len(),
+        ),
+    );
+    let mut running = FuturesUnordered::new();
+    let mut cancellations: Vec<Option<AbortHandle>> =
+        (0..startup_plan.candidates().len()).map(|_| None).collect();
+    let mut ready: Option<InitialCandidateCompletion> = None;
+    let mut frontier = None;
+    let mut next_position = 0;
+    let mut failed_ordinals = Vec::new();
+    let mut last_retryable_error = None;
+
+    loop {
+        // Register before observing shared phases: notify_waiters does not
+        // retain a permit for a waiter that has not yet been registered.
+        let changed = acquisition.changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        context.ensure_session_active()?;
+        terminal.ensure_active()?;
+        if tokio::time::Instant::now() >= deadline {
+            // Distinct from a path's nominal S_i. Existing Product/DNS wrappers
+            // preserve their logical timeout mapping for this existing variant.
+            return Err(RuntimeError::OutboundConnect(
+                crate::outbound::OutboundConnectError::ConnectTimeout,
+            ));
+        }
+
+        let mut winner = None;
+        while let Some(completion) = ready
+            .take()
+            .or_else(|| running.next().now_or_never().flatten())
+        {
+            let InitialCandidateCompletion {
+                position,
+                predecessor,
+                candidate,
+                result,
+            } = completion;
+            let unstarted_predecessor =
+                acquisition.unstarted_predecessor(candidate.ordinal, predecessor);
+            cancellations[usize::from(candidate.ordinal)] = None;
+            let result = match result {
+                Ok(Some(opened))
+                    if candidate
+                        .path_instance_id
+                        .is_some_and(|expected| opened.path_instance_id() != expected) =>
+                {
+                    opened.retire_uncommitted();
+                    Err(RuntimeError::ReliablePathRetired)
+                }
+                result => result,
+            };
+            match result {
+                Ok(Some(opened)) => {
+                    if winner.is_none() {
+                        winner = Some((candidate.ordinal, opened));
+                    } else {
+                        opened.retire_uncommitted();
+                    }
+                }
+                Ok(None) => {
+                    // MAX or renewed predecessor setup fenced this prepared
+                    // future. It never launched and remains available later.
+                    next_position = next_position.min(position);
+                    if frontier == Some(candidate.ordinal) {
+                        frontier = unstarted_predecessor;
+                    }
+                }
+                Err(error) => {
+                    acquisition.settle(candidate.ordinal);
+                    if !failed_ordinals.contains(&candidate.ordinal) {
+                        failed_ordinals.push(candidate.ordinal);
+                    }
+                    if frontier == Some(candidate.ordinal) {
+                        frontier = unstarted_predecessor;
+                    }
+                    if matches!(
+                        error,
+                        RuntimeError::ReliablePathAttachmentRefused
+                            | RuntimeError::ReliablePathRetired
+                    ) || relay_path_open_error_is_retryable(candidate.key.underlay, &error)
+                    {
+                        last_retryable_error = Some(error);
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        context.ensure_session_active()?;
+        terminal.ensure_active()?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RuntimeError::OutboundConnect(
+                crate::outbound::OutboundConnectError::ConnectTimeout,
+            ));
+        }
+        if let Some((ordinal, opened)) = winner {
+            context.ensure_session_active()?;
+            terminal.ensure_active()?;
+            acquisition.winner(ordinal);
+            for loser in acquisition.started_ordinals() {
+                if loser != ordinal && !failed_ordinals.contains(&loser) {
+                    failed_ordinals.push(loser);
+                }
+            }
+            // Dropping locally owned futures transfers verified native cleanup
+            // synchronously; no blocked losing DETACH delays the winner.
+            drop(running);
+            return Ok(opened.with_startup(startup_plan, ordinal, failed_ordinals));
+        }
+
+        let decision = frontier.and_then(|ordinal| acquisition.decision_deadline(ordinal));
+        let due = decision.is_some_and(|at| at <= tokio::time::Instant::now());
+        if !acquisition.has_admission() && (frontier.is_none() || due) {
+            if due
+                && let Some(previous) = frontier
+                && acquisition.expire_unsubmitted(previous)
+            {
+                if let Some(cancellation) = &cancellations[usize::from(previous)] {
+                    cancellation.abort();
+                }
+                // Poll that cancellation and release its exact resources
+                // before preparing another attempt.
+                continue;
+            }
+            let predecessor = due.then_some(frontier).flatten();
+            // Observe admission before reservation/future construction. The
+            // first-poll launch revalidates this operation-wide decision.
+            let launch = acquisition.launch_handle();
+            let mut prepared = None;
+            while let Some(candidate) = candidates.get(next_position).copied() {
+                let position = next_position;
+                next_position += 1;
+                let Some(attempt) =
+                    reserve_reliable_initial_plan_attempt(context, stream_id, lane, candidate)
+                else {
+                    if !failed_ordinals.contains(&candidate.ordinal) {
+                        failed_ordinals.push(candidate.ordinal);
+                    }
+                    continue;
+                };
+                prepared = Some((position, candidate, attempt));
+                break;
+            }
+            if let Some((position, candidate, attempt)) = prepared {
+                let (cancellation, registration) = AbortHandle::new_pair();
+                cancellations[usize::from(candidate.ordinal)] = Some(cancellation);
+                running.push(open_initial_candidate(
+                    context,
+                    attempt,
+                    base_spec.for_creation_ordinal(candidate.ordinal),
+                    lane,
+                    candidate,
+                    position,
+                    next_position < candidates.len(),
+                    predecessor,
+                    launch,
+                    registration,
+                ));
+                frontier = Some(candidate.ordinal);
+            } else if let Some(previous) = predecessor
+                && acquisition.exhaust_successors(previous)
+                && let Some(cancellation) = &cancellations[usize::from(previous)]
+            {
+                cancellation.abort();
+                continue;
+            }
+        }
+        if running.is_empty() {
+            return Err(
+                last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context))
+            );
+        }
+
+        let decision = if acquisition.has_admission() {
+            None
+        } else {
+            frontier.and_then(|ordinal| acquisition.decision_deadline(ordinal))
+        };
+        tokio::select! {
+            biased;
+            completion = running.next() => ready = completion,
+            _ = &mut changed => {},
+            _ = tokio::time::sleep_until(decision.unwrap_or(deadline)) => {},
+        }
+    }
 }
 
 pub(in crate::runtime) async fn open_remote_stream_on_path(
@@ -573,15 +951,26 @@ pub(in crate::runtime) fn reliable_initial_open_timeout(
     key: RelayPathKey,
     has_unattempted_alternative: bool,
 ) -> Duration {
+    reliable_initial_open_budgets(context, key, has_unattempted_alternative).0
+}
+
+/// Freeze whole setup and remaining admission allowances from the same basis.
+/// The latter can only contract a submitted attempt's alternative-start decision.
+fn reliable_initial_open_budgets(
+    context: &ClientPathContext,
+    key: RelayPathKey,
+    has_unattempted_alternative: bool,
+) -> (Duration, Duration) {
     let snapshot = context.reliable_path_snapshot(key);
     let rtt_is_observed =
         key.underlay == UnderlayProtocol::Udp && context.reliable_path_rtt_is_observed(key);
-    if has_unattempted_alternative {
-        path_open_pto(snapshot, rtt_is_observed)
-            .saturating_mul(path_open_serialized_exchanges(snapshot))
+    let pto = path_open_pto(snapshot, rtt_is_observed);
+    let exchanges = if has_unattempted_alternative {
+        path_open_serialized_exchanges(snapshot)
     } else {
-        path_open_timeout(snapshot, rtt_is_observed)
-    }
+        path_open_pto_multiplier(snapshot)
+    };
+    (pto.saturating_mul(exchanges), pto)
 }
 
 pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
@@ -610,7 +999,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
         .tcp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
-        .open_stream_with_deadlines(
+        .open_stream_with_deadlines_scoped(
             stream_id,
             spec.target.clone(),
             lane,
@@ -618,6 +1007,8 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
             spec.return_plan(),
             open_deadlines,
             advertised_recv_max_offset,
+            spec.terminal.clone(),
+            spec.initial.clone(),
         )
         .await?;
     let path_instance_id = opened.carrier.path_instance_id;
@@ -701,13 +1092,22 @@ pub(in crate::runtime) async fn open_remote_stream_for_relay_path(
     lane: TrafficClass,
     key: RelayPathKey,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    match key.underlay {
-        UnderlayProtocol::Tcp => {
-            open_remote_stream_on_path(context, stream_id, spec, lane, key.index).await
+    let opening = async {
+        match key.underlay {
+            UnderlayProtocol::Tcp => {
+                open_remote_stream_on_path(context, stream_id, spec, lane, key.index).await
+            }
+            UnderlayProtocol::Udp => {
+                open_remote_stream_on_udp_path(context, stream_id, spec, lane, key.index).await
+            }
         }
-        UnderlayProtocol::Udp => {
-            open_remote_stream_on_udp_path(context, stream_id, spec, lane, key.index).await
-        }
+    };
+    // This scope is owned outside both transport and outer attempt deadlines.
+    // A deadline may drop a raw accepted result, but not its routed RESET.
+    tokio::pin!(opening);
+    match &spec.terminal {
+        Some(terminal) => terminal.complete(opening.as_mut()).await,
+        None => opening.await,
     }
 }
 
@@ -750,7 +1150,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
         .udp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
-        .open_stream(
+        .open_stream_scoped(
             stream_id,
             spec.target.clone(),
             lane,
@@ -758,6 +1158,8 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
             spec.return_plan(),
             open_deadline,
             advertised_recv_max_offset,
+            spec.terminal.clone(),
+            spec.initial.clone(),
         )
         .await?;
     // The handle has already atomically committed this exact carrier owner.

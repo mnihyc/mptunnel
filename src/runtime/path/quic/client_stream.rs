@@ -32,6 +32,7 @@ pub(super) async fn run_client_udp_stream(
     state: Arc<ClientPathState>,
     mut commands: ReliablePathCommandReceivers,
     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
+    terminal: Option<crate::runtime::path::PendingStreamTerminal>,
 ) {
     let commitment = match send.bind_native_commitment() {
         Ok(commitment) => commitment,
@@ -83,6 +84,7 @@ pub(super) async fn run_client_udp_stream(
                 &state,
                 &mut path_proofs,
                 &frames,
+                terminal.as_ref(),
             )
             .await
             {
@@ -145,6 +147,7 @@ pub(super) async fn run_client_udp_stream(
                     &state,
                     &mut path_proofs,
                     &frames,
+                    terminal.as_ref(),
                 ).await {
                     let _ = frames.send(Err(err)).await;
                     return;
@@ -232,6 +235,7 @@ async fn handle_client_udp_stream_input(
     state: &ClientPathState,
     path_proofs: &mut PathProofTracker,
     frames: &mpsc::Sender<Result<Frame, RuntimeError>>,
+    terminal: Option<&crate::runtime::path::PendingStreamTerminal>,
 ) -> Result<(), RuntimeError> {
     match input? {
         Frame::Ping { nonce } => {
@@ -307,6 +311,11 @@ async fn handle_client_udp_stream_input(
             stream_id: received_stream_id,
             ..
         }) if received_stream_id == stream_id => {
+            if let Frame::StreamReset { reason, .. } = &frame
+                && let Some(terminal) = terminal
+            {
+                terminal.publish_reset(stream_id, *reason);
+            }
             // Product retirement closes its input before ordered FIN/detach
             // work drains. Late input must not cancel that independent writer.
             let _ = frames.send(Ok(frame)).await;

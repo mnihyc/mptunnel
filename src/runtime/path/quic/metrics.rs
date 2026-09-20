@@ -385,6 +385,7 @@ fn path_metrics_from_quic_path(
         has_ack_derived_data_sample: rate_observed || metrics.ack_derived_data_seen,
         data_sample_count: qualified_rate_epoch.map_or(0, |sample| sample.sample_count),
         data_sample_bytes: qualified_rate_epoch.map_or(0, |sample| sample.sample_bytes),
+        approximate_metrics: 0,
     }
 }
 

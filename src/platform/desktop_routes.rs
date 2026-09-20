@@ -380,6 +380,15 @@ fn route_metrics_equal(_left: &Route, _right: &Route) -> bool {
 /// policy explicitly and construct [`ProcessVpnEnvironment`] itself.
 pub fn snapshot_process_vpn_environment()
 -> Result<ProcessVpnEnvironment, SystemProcessMutationError> {
+    snapshot_process_vpn_environment_excluding_interface(None)
+}
+
+/// Captures native routes while ignoring a currently-owned process VPN
+/// interface.  A refresh happens after activation, so the capture interface
+/// must not become the new native egress selected for protected sockets.
+pub(crate) fn snapshot_process_vpn_environment_excluding_interface(
+    excluded_interface_index: Option<u32>,
+) -> Result<ProcessVpnEnvironment, SystemProcessMutationError> {
     let mut manager = RouteManager::new().map_err(|source| SystemProcessMutationError::Io {
         action: "open native route manager",
         source,
@@ -402,6 +411,9 @@ pub fn snapshot_process_vpn_environment()
         let Some(interface_index) = route.if_index().filter(|index| *index != 0) else {
             continue;
         };
+        if excluded_interface_index == Some(interface_index) {
+            continue;
+        }
         let Ok(prefix) = IpNet::new(route.destination(), route.prefix()) else {
             continue;
         };

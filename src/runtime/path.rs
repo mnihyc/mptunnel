@@ -13,6 +13,7 @@ mod carrier_inventory;
 mod client_session;
 pub(super) mod commands;
 mod health;
+mod initial_open;
 pub(in crate::runtime) mod input;
 pub(super) mod model;
 pub(in crate::runtime) mod native_commitment;
@@ -25,6 +26,7 @@ mod selection;
 mod server_context;
 mod set;
 mod state;
+mod stream_terminal;
 pub(in crate::runtime) mod tcp;
 pub(in crate::runtime) mod traffic;
 pub(in crate::runtime) mod writer_boundary;
@@ -39,6 +41,9 @@ pub(in crate::runtime) use commands::{CapacityProbeCommandTicket, RequestTcpCapa
 pub(in crate::runtime) use health::RequestCapacityReconciliationView;
 pub(in crate::runtime) use health::{
     ClientPathHealth, ClientPathHealthRecord, ClientPathRateDiagnostics,
+};
+pub(in crate::runtime) use initial_open::{
+    InitialOpenAcquisition, InitialOpenAttempt, InitialOpenBackend, InitialOpenLaunch,
 };
 pub(in crate::runtime) use model::{
     PacketPathAttachment, PacketPathSelectionInput, PathDeliveryStats, UdpPathCandidate,
@@ -71,6 +76,9 @@ pub(in crate::runtime) use set::{ClientPathContext, ClientPathRuntimeOptions};
 pub(in crate::runtime) use state::RequestCapacityProbeCampaignBudget;
 pub(in crate::runtime) use state::{
     ClientPathState, ClientSessionProductFlowLease, RelayPathLoadLease,
+};
+pub(in crate::runtime) use stream_terminal::{
+    ClientStreamTerminalOwner, ClientStreamTerminalScope, PendingStreamTerminal,
 };
 #[cfg(test)]
 pub(in crate::runtime) use tcp::capacity::{

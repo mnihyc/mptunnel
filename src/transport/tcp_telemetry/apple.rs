@@ -8,6 +8,8 @@ use tokio::net::TcpStream;
 
 const TCP_CONNECTION_INFO_MIN_BYTES: usize =
     offset_of!(libc::tcp_connection_info, tcpi_rttvar) + size_of::<u32>();
+const TCP_CONNECTION_INFO_TRANSMISSION_BYTES: usize =
+    offset_of!(libc::tcp_connection_info, tcpi_txbytes) + size_of::<u64>();
 const TCP_CONNECTION_INFO_RETRANSMISSION_BYTES: usize =
     offset_of!(libc::tcp_connection_info, tcpi_txretransmitbytes) + size_of::<u64>();
 const XNU_UNBOUNDED_SSTHRESH_BYTES: u32 = 65_535 << 14;
@@ -80,6 +82,10 @@ fn snapshot_from_connection_info(
         flight,
         notsent_bytes: None,
         bytes_acked: None,
+        // XNU exports cumulative transmitted bytes but no cumulative ACK
+        // counter. Runtime marks the resulting rate/loss as diagnostic.
+        bytes_transmitted: (available >= TCP_CONNECTION_INFO_TRANSMISSION_BYTES)
+            .then_some(info.tcpi_txbytes),
         // XNU reports retransmitted bytes; only counter advancement crosses
         // the platform boundary.
         retransmission_counter: (available >= TCP_CONNECTION_INFO_RETRANSMISSION_BYTES)

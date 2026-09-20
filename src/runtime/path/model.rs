@@ -16,8 +16,9 @@ use crate::model::service_rate::{
 use crate::model::timing::{transport_pto_from_ms, transport_pto_from_snapshot};
 use crate::mux::MuxLimits;
 use crate::protocol::{
-    PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics, PathUsage,
-    UnderlayProtocol,
+    PATH_METRIC_APPROXIMATE_LOSS, PATH_METRIC_APPROXIMATE_PACING, PATH_METRIC_APPROXIMATE_QUALITY,
+    PATH_METRIC_APPROXIMATE_RATE, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection,
+    PathMetrics, PathUsage, UnderlayProtocol,
 };
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::health::ClientPathHealthRecord;
@@ -919,7 +920,7 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
     let unobserved_wire_placeholder_bps = portable_startup_rate()
         .expect("portable PATH_METRICS placeholder is representable")
         .get() as f64;
-    let wire_delivery_rate_bps = if carrier_rate_selected {
+    let base_wire_delivery_rate_bps = if carrier_rate_selected {
         snapshot.carrier_delivery_rate_bps
     } else if product_rate_selected {
         snapshot.product_progress_rate_bps
@@ -935,6 +936,17 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
     }
     .unwrap_or(unobserved_wire_placeholder_bps)
     .max(1.0);
+    // Windows exposes BytesOut but not a cumulative ACK counter. Preserve its
+    // useful transmit estimate for diagnosis while keeping it outside the
+    // measured-rate epoch consumed by scheduler authority.
+    let approximate_rate_bps = (snapshot.underlay == UnderlayProtocol::Tcp
+        && !carrier_rate_selected)
+        .then_some(observation.carrier_approximate_delivery_rate_bps)
+        .flatten();
+    let wire_delivery_rate_bps = approximate_rate_bps
+        .map(|rate| rate as f64)
+        .unwrap_or(base_wire_delivery_rate_bps)
+        .max(1.0);
     let (rate_observed_at, rate_expires_at, data_sample_count, data_sample_bytes) =
         if native_authority_selected {
             // Native C0/Bop is endpoint-local central authority, not a
@@ -986,18 +998,28 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
         .map(|expires_at| duration_micros_u64(expires_at.saturating_duration_since(now)))
         .unwrap_or(0)
         .min(PATH_METRICS_MAX_RATE_VALID_FOR_US);
-    let metric_age_us = rate_observed_at
-        .map(|observed_at| duration_micros_u32(now.saturating_duration_since(observed_at)))
-        .unwrap_or(0);
+    let metric_age_us = if approximate_rate_bps.is_some() {
+        observation.carrier_approximate_age_us
+    } else {
+        rate_observed_at
+            .map(|observed_at| duration_micros_u32(now.saturating_duration_since(observed_at)))
+            .unwrap_or(0)
+    };
     let pacing_rate_observed = has_rate_epoch
         && carrier_rate_selected
         && !observation.explicit_carrier_capacity_proof
         && !native_authority_selected
         && observation.carrier_pacing_rate_bps.is_some();
+    let approximate_pacing_rate_bps = (snapshot.underlay == UnderlayProtocol::Tcp
+        && !pacing_rate_observed)
+        .then_some(observation.carrier_approximate_pacing_rate_bps)
+        .flatten();
     let pacing_rate_bps = if pacing_rate_observed {
         observation
             .carrier_pacing_rate_bps
             .unwrap_or(wire_delivery_rate_bps)
+    } else if let Some(rate) = approximate_pacing_rate_bps {
+        rate as f64
     } else {
         wire_delivery_rate_bps
     };
@@ -1008,6 +1030,10 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
     let diagnostic_loss_rate = observation
         .carrier_loss_rate
         .or(observation.measured_loss_rate);
+    let approximate_loss_ppm = (diagnostic_loss_rate.is_none()
+        && snapshot.underlay == UnderlayProtocol::Tcp)
+        .then_some(observation.carrier_approximate_loss_ppm)
+        .flatten();
     let diagnostic_ecn_rate = (snapshot.underlay == UnderlayProtocol::Udp)
         .then_some(observation.carrier_ecn_rate)
         .flatten();
@@ -1027,6 +1053,7 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
         pacing_rate_observed,
         loss_ppm: diagnostic_loss_rate
             .map(|rate| (rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u32)
+            .or(approximate_loss_ppm)
             .unwrap_or(0),
         ecn_ppm: diagnostic_ecn_rate
             .map(|rate| (rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u32)
@@ -1046,6 +1073,18 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
         has_ack_derived_data_sample,
         data_sample_count,
         data_sample_bytes,
+        approximate_metrics: (approximate_rate_bps
+            .is_some()
+            .then_some(PATH_METRIC_APPROXIMATE_RATE | PATH_METRIC_APPROXIMATE_QUALITY)
+            .unwrap_or(0))
+            | (approximate_pacing_rate_bps
+                .is_some()
+                .then_some(PATH_METRIC_APPROXIMATE_PACING)
+                .unwrap_or(0))
+            | (approximate_loss_ppm
+                .is_some()
+                .then_some(PATH_METRIC_APPROXIMATE_LOSS)
+                .unwrap_or(0)),
     }
 }
 
@@ -1389,6 +1428,12 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) carrier_ecn_rate: Option<f64>,
     pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_pacing_rate_bps: Option<f64>,
+    /// Platform-substitute TCP diagnostics. They are deliberately separate
+    /// from carrier delivery authority so the scheduler cannot consume them.
+    pub(in crate::runtime) carrier_approximate_delivery_rate_bps: Option<u64>,
+    pub(in crate::runtime) carrier_approximate_pacing_rate_bps: Option<u64>,
+    pub(in crate::runtime) carrier_approximate_loss_ppm: Option<u32>,
+    pub(in crate::runtime) carrier_approximate_age_us: u32,
     pub(in crate::runtime) carrier_bytes_in_flight: u64,
     pub(in crate::runtime) carrier_bytes_in_flight_observed: bool,
     pub(in crate::runtime) carrier_queue_bytes: u64,
@@ -1449,6 +1494,10 @@ impl Default for ClientPathObservation {
             carrier_ecn_rate: None,
             carrier_delivery_rate_bps: None,
             carrier_pacing_rate_bps: None,
+            carrier_approximate_delivery_rate_bps: None,
+            carrier_approximate_pacing_rate_bps: None,
+            carrier_approximate_loss_ppm: None,
+            carrier_approximate_age_us: 0,
             carrier_bytes_in_flight: 0,
             carrier_bytes_in_flight_observed: false,
             carrier_queue_bytes: 0,

@@ -1,6 +1,10 @@
 //! Wire-codec contract tests for the current clean-break wire version.
 
 use super::*;
+use crate::protocol::{
+    PATH_METRIC_APPROXIMATE_LOSS, PATH_METRIC_APPROXIMATE_PACING, PATH_METRIC_APPROXIMATE_QUALITY,
+    PATH_METRIC_APPROXIMATE_RATE,
+};
 
 #[test]
 fn repair_open_roundtrip_has_only_exact_parent_and_product_identity() {
@@ -25,7 +29,7 @@ fn round_trip(frame: Frame) {
 }
 
 #[test]
-fn stream_feedback_v15_has_exact_stream_token_and_credit_fence_layout() {
+fn stream_feedback_v16_has_exact_stream_token_and_credit_fence_layout() {
     let stream_id = StreamId(0x0102_0304_0506_0708);
     let token = 0x1112_1314_1516_1718;
     let max_offset = 0x2122_2324_2526_2728;
@@ -44,7 +48,7 @@ fn stream_feedback_v15_has_exact_stream_token_and_credit_fence_layout() {
         let wire = encode_frame(&frame, CodecLimits::default()).unwrap();
         assert_eq!(wire.len(), FRAME_HEADER_LEN + payload_len);
         assert_eq!(encoded_frame_capacity_hint(&frame), wire.len());
-        assert_eq!(&wire[..6], &[b'M', b'P', b'T', b'F', 15, kind]);
+        assert_eq!(&wire[..6], &[b'M', b'P', b'T', b'F', 16, kind]);
         assert_eq!(&wire[6..10], &(payload_len as u32).to_be_bytes());
         assert_eq!(&wire[10..18], &stream_id.0.to_be_bytes());
         assert_eq!(&wire[18..26], &token.to_be_bytes());
@@ -168,6 +172,7 @@ fn peer_status_metrics(
         has_ack_derived_data_sample: true,
         data_sample_count: 9,
         data_sample_bytes: 512 * 1024,
+        approximate_metrics: 0,
     }
 }
 
@@ -255,7 +260,7 @@ fn stream_frames_round_trip() {
 }
 
 #[test]
-fn open_stream_v15_canonically_carries_return_plan() {
+fn open_stream_v16_canonically_carries_return_plan() {
     let frame = Frame::OpenStream {
         stream_id: StreamId(0x0102_0304_0506_0708),
         target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
@@ -273,7 +278,7 @@ fn open_stream_v15_canonically_carries_return_plan() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 15, 7, 0, 0, 0, 28, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            b'M', b'P', b'T', b'F', 16, 7, 0, 0, 0, 28, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
             187, 2, 0, 0, 0, 0, 0, 0, 228, 32, 4, 0, 0, 2,
         ]
     );
@@ -312,7 +317,7 @@ fn open_stream_creation_and_enrollment_have_distinct_wire_authority() {
 }
 
 #[test]
-fn stream_return_plan_final_v15_has_canonical_kind_and_count() {
+fn stream_return_plan_final_v16_has_canonical_kind_and_count() {
     let frame = Frame::StreamReturnPlanFinal {
         stream_id: StreamId(0x0102_0304_0506_0708),
         retained_ordinals: vec![0, 2, 7],
@@ -321,7 +326,7 @@ fn stream_return_plan_final_v15_has_canonical_kind_and_count() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 15, 49, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 3, 0, 2, 7,
+            b'M', b'P', b'T', b'F', 16, 49, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 3, 0, 2, 7,
         ]
     );
     assert_eq!(
@@ -458,7 +463,7 @@ fn decoder_rejects_unknown_path_usage() {
 }
 
 #[test]
-fn decoder_rejects_old_frames_after_v15_wire_cut() {
+fn decoder_rejects_old_frames_after_v16_wire_cut() {
     for version in [9, 10, 11, 12, 13, 14] {
         let mut encoded =
             encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
@@ -599,6 +604,33 @@ fn path_metrics_v11_rate_authority_budget_is_bounded_canonically() {
             Err(CodecError::InvalidPathMetrics)
         );
     }
+}
+
+#[test]
+fn path_metrics_preserve_approximate_diagnostic_provenance() {
+    let mut metrics = peer_status_metrics(
+        8,
+        UnderlayProtocol::Tcp,
+        PathMetricDirection::ServerToClient,
+    );
+    metrics.approximate_metrics = PATH_METRIC_APPROXIMATE_RATE
+        | PATH_METRIC_APPROXIMATE_PACING
+        | PATH_METRIC_APPROXIMATE_LOSS
+        | PATH_METRIC_APPROXIMATE_QUALITY;
+    let wire = encode_frame(&Frame::PathMetrics { metrics }, CodecLimits::default())
+        .expect("encode approximate diagnostic provenance");
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(wire.clone()), CodecLimits::default())
+            .expect("decode approximate diagnostic provenance"),
+        Frame::PathMetrics { metrics }
+    );
+
+    let mut invalid = wire;
+    *invalid.last_mut().expect("provenance byte") = 0x80;
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(invalid), CodecLimits::default()),
+        Err(CodecError::InvalidPathMetrics)
+    );
 }
 
 #[test]
@@ -874,6 +906,7 @@ fn control_frames_round_trip_auth_and_path_metrics() {
             has_ack_derived_data_sample: true,
             data_sample_count: 9,
             data_sample_bytes: 512 * 1024,
+            approximate_metrics: 0,
         },
     });
 }
@@ -1002,7 +1035,7 @@ fn peer_status_frames_round_trip_with_bounded_fixed_entries() {
     };
     let encoded = encode_frame(&response, CodecLimits::default()).expect("encode");
     assert_eq!(encoded[5], 37);
-    assert_eq!(encoded.len(), FRAME_HEADER_LEN + 11 + 4 * 143);
+    assert_eq!(encoded.len(), FRAME_HEADER_LEN + 11 + 4 * 144);
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode"),
         response
@@ -1131,7 +1164,7 @@ fn peer_status_response_limit_follows_the_configured_frame_size() {
     );
     assert_eq!(
         peer_status_response_path_limit(CodecLimits {
-            max_frame_bytes: fixed_bytes + 143,
+            max_frame_bytes: fixed_bytes + 144,
             ..CodecLimits::default()
         }),
         1

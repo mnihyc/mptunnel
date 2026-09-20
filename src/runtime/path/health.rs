@@ -113,8 +113,17 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     carrier_timing_epochs: DirectionalTimingEpochIssuer,
     pub(in crate::runtime) carrier_loss_rate: Option<f64>,
     pub(in crate::runtime) carrier_ecn_rate: Option<f64>,
+    /// Monotonic receipt times for retained native loss/ECN observations.
+    /// An unavailable same-instance poll retains the prior value and age;
+    /// a physical/native epoch reset clears both.
+    carrier_loss_observed_at: Option<Instant>,
+    carrier_ecn_observed_at: Option<Instant>,
     pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_pacing_rate_bps: Option<f64>,
+    pub(in crate::runtime) carrier_approximate_delivery_rate_bps: Option<u64>,
+    pub(in crate::runtime) carrier_approximate_pacing_rate_bps: Option<u64>,
+    pub(in crate::runtime) carrier_approximate_loss_ppm: Option<u32>,
+    carrier_approximate_observed_at: Option<Instant>,
     pub(in crate::runtime) carrier_bytes_in_flight: u64,
     pub(in crate::runtime) carrier_bytes_in_flight_observed: bool,
     pub(in crate::runtime) carrier_queue_bytes: u64,
@@ -262,8 +271,14 @@ impl Default for ClientPathHealthRecord {
             carrier_timing_epochs: DirectionalTimingEpochIssuer::default(),
             carrier_loss_rate: None,
             carrier_ecn_rate: None,
+            carrier_loss_observed_at: None,
+            carrier_ecn_observed_at: None,
             carrier_delivery_rate_bps: None,
             carrier_pacing_rate_bps: None,
+            carrier_approximate_delivery_rate_bps: None,
+            carrier_approximate_pacing_rate_bps: None,
+            carrier_approximate_loss_ppm: None,
+            carrier_approximate_observed_at: None,
             carrier_bytes_in_flight: 0,
             carrier_bytes_in_flight_observed: false,
             carrier_queue_bytes: 0,
@@ -520,6 +535,14 @@ impl ClientPathHealthRecord {
 
     pub(in crate::runtime) fn path_instance_id(&self) -> Option<CarrierPathInstanceId> {
         self.path_instance_id
+    }
+
+    pub(in crate::runtime) fn carrier_loss_observed_at(&self) -> Option<Instant> {
+        self.carrier_loss_observed_at
+    }
+
+    pub(in crate::runtime) fn carrier_ecn_observed_at(&self) -> Option<Instant> {
+        self.carrier_ecn_observed_at
     }
 
     #[cfg(test)]
@@ -867,9 +890,28 @@ impl ClientPathHealthRecord {
         if let Some(queue_bytes) = observation.queue_bytes() {
             self.carrier_queue_bytes = queue_bytes;
         }
-        self.carrier_loss_rate = observation
-            .loss_ppm()
-            .map(|loss_ppm| f64::from(loss_ppm) / 1_000_000.0);
+        match observation.loss_ppm() {
+            Some(loss_ppm) => {
+                self.carrier_loss_rate = Some(f64::from(loss_ppm) / 1_000_000.0);
+                self.carrier_loss_observed_at = Some(now);
+            }
+            None => {
+                self.carrier_loss_rate = None;
+                self.carrier_loss_observed_at = None;
+            }
+        }
+        if observation.has_approximate_sample() {
+            if let Some(rate) = observation.approximate_delivery_rate_bps() {
+                self.carrier_approximate_delivery_rate_bps = Some(rate);
+            }
+            if let Some(rate) = observation.approximate_pacing_rate_bps() {
+                self.carrier_approximate_pacing_rate_bps = Some(rate);
+            }
+            if let Some(loss_ppm) = observation.approximate_loss_ppm() {
+                self.carrier_approximate_loss_ppm = Some(loss_ppm);
+            }
+            self.carrier_approximate_observed_at = Some(now);
+        }
         if let Some(app_limited) = observation.app_limited() {
             self.carrier_current_app_limited = Some(app_limited);
         }
@@ -962,6 +1004,13 @@ impl ClientPathHealthRecord {
         } else {
             0
         };
+        let carrier_approximate_age_us = self
+            .carrier_approximate_observed_at
+            .map(|observed_at| {
+                u32::try_from(now.saturating_duration_since(observed_at).as_micros())
+                    .unwrap_or(u32::MAX)
+            })
+            .unwrap_or(0);
         ClientPathObservation {
             native_delivery: self.native_delivery,
             state,
@@ -1038,6 +1087,10 @@ impl ClientPathHealthRecord {
             .then_some(self.native_authority_pacing_rate_bps)
             .flatten()
             .or(fresh_carrier_pacing),
+            carrier_approximate_delivery_rate_bps: self.carrier_approximate_delivery_rate_bps,
+            carrier_approximate_pacing_rate_bps: self.carrier_approximate_pacing_rate_bps,
+            carrier_approximate_loss_ppm: self.carrier_approximate_loss_ppm,
+            carrier_approximate_age_us,
             carrier_bytes_in_flight: self.carrier_bytes_in_flight,
             carrier_bytes_in_flight_observed: self.carrier_bytes_in_flight_observed,
             carrier_queue_bytes: self.carrier_queue_bytes,
@@ -1579,6 +1632,7 @@ impl ClientPathHealthRecord {
         if !self.accepts_liveness_sample(path_instance_id) {
             return;
         }
+        let observed_at = Instant::now();
         if metrics.controller_path_epoch < self.native_capacity_epoch {
             // The connection's controller epoch is monotonic. A late poll from
             // an older epoch has no authority to relabel either capacity or
@@ -1607,11 +1661,13 @@ impl ClientPathHealthRecord {
             // `Some(0)` is an observed zero. `None` is an unavailable partial
             // capability and must not erase an earlier same-instance sample.
             self.carrier_loss_rate = Some(f64::from(loss_ppm) / 1_000_000.0);
+            self.carrier_loss_observed_at = Some(observed_at);
         }
         if let Some(ecn_ppm) = metrics.ecn_ppm {
             // ECN has the same partial-capability semantics as native loss:
             // retain a same-instance observation across unavailable polls.
             self.carrier_ecn_rate = Some(f64::from(ecn_ppm) / 1_000_000.0);
+            self.carrier_ecn_observed_at = Some(observed_at);
         }
         match (
             metrics.last_delivery_sample_at,
@@ -1684,13 +1740,13 @@ impl ClientPathHealthRecord {
         if !self.accepts_liveness_sample(path_instance_id) {
             return;
         }
+        let observed_at = Instant::now();
         let scope = shape.stamp().scope();
         if scope.carrier_instance_id() != path_instance_id
             || scope.direction() != PathMetricDirection::ClientToServer
         {
             return;
         }
-
         self.native_authority_stamp = Some(shape.stamp());
         self.native_delivery = metrics.native_delivery;
         self.native_authority_basis = Some(shape.basis());
@@ -1715,9 +1771,11 @@ impl ClientPathHealthRecord {
         }
         if let Some(loss_ppm) = metrics.loss_ppm {
             self.carrier_loss_rate = Some(f64::from(loss_ppm) / 1_000_000.0);
+            self.carrier_loss_observed_at = Some(observed_at);
         }
         if let Some(ecn_ppm) = metrics.ecn_ppm {
             self.carrier_ecn_rate = Some(f64::from(ecn_ppm) / 1_000_000.0);
+            self.carrier_ecn_observed_at = Some(observed_at);
         }
         self.carrier_bytes_in_flight = shape.bytes_in_flight();
         self.carrier_bytes_in_flight_observed = true;
@@ -1805,6 +1863,12 @@ impl ClientPathHealthRecord {
         self.carrier_timing = None;
         self.carrier_loss_rate = None;
         self.carrier_ecn_rate = None;
+        self.carrier_loss_observed_at = None;
+        self.carrier_ecn_observed_at = None;
+        self.carrier_approximate_delivery_rate_bps = None;
+        self.carrier_approximate_pacing_rate_bps = None;
+        self.carrier_approximate_loss_ppm = None;
+        self.carrier_approximate_observed_at = None;
         self.carrier_bytes_in_flight = 0;
         self.carrier_bytes_in_flight_observed = false;
         self.carrier_queue_bytes = 0;

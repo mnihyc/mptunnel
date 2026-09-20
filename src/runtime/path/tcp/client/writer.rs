@@ -1007,6 +1007,8 @@ async fn handle_connected_client_tcp_command(
         }
         ReliablePathCommand::OpenStream {
             stream_id,
+            terminal,
+            initial,
             attempt_id,
             observed_carrier_instance,
             target,
@@ -1022,6 +1024,8 @@ async fn handle_connected_client_tcp_command(
                 open_deadlines.for_carrier_instance(observed_carrier_instance, carrier_instance);
             let open = ClientTcpOpenStreamRequest {
                 stream_id,
+                terminal,
+                initial,
                 attempt_id,
                 target,
                 lane,
@@ -1032,8 +1036,14 @@ async fn handle_connected_client_tcp_command(
                 session_commands,
                 response,
             };
-            open_client_tcp_stream_on_connection(connection, open, streams, stream_frame_queue)
-                .await?;
+            open_client_tcp_stream_on_connection(
+                connection,
+                open,
+                streams,
+                closed_streams,
+                stream_frame_queue,
+            )
+            .await?;
             connection.record_outbound_activity();
             Ok(())
         }

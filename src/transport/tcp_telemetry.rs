@@ -45,6 +45,10 @@ pub(crate) struct TcpNativeSnapshot {
     pub(crate) flight: Option<TcpNativeFlight>,
     pub(crate) notsent_bytes: Option<u32>,
     pub(crate) bytes_acked: Option<u64>,
+    /// Monotonic bytes handed to the TCP sender. Windows exposes this as
+    /// `BytesOut` and XNU as `tcpi_txbytes`; it is a transmit estimate, not a
+    /// receiver ACK counter.
+    pub(crate) bytes_transmitted: Option<u64>,
     /// Opaque monotonic retransmission evidence for this exact socket.
     ///
     /// Platforms report either segments or bytes, so only advancement is
@@ -62,6 +66,7 @@ impl TcpNativeSnapshot {
             || self.flight.is_some()
             || self.notsent_bytes.is_some()
             || self.bytes_acked.is_some()
+            || self.bytes_transmitted.is_some()
             || self.retransmission_counter.is_some()
             || self.loss.is_some()
             || self.pacing_rate_bytes_per_second.is_some()

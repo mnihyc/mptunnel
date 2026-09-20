@@ -706,6 +706,11 @@
     return stale ? "~" + formatted : formatted;
   }
 
+  function formatDiagnosticMetric(value, formatter, stale, approximate) {
+    const formatted = formatOptionalMetric(value, formatter, stale);
+    return formatted === "-" ? formatted : formatted + (approximate ? "*" : "");
+  }
+
   function formatOptionalFlag(value) {
     if (!metricAvailable(value)) return "-";
     return value ? "yes" : "no";
@@ -730,6 +735,16 @@
     return Math.max(0, finiteNumber(path.pacing_age_ms)) + statusResidenceMs();
   }
 
+  function effectivePathLossAgeMs(path) {
+    if (!metricAvailable(path.loss_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.loss_age_ms)) + statusResidenceMs();
+  }
+
+  function effectivePathEcnAgeMs(path) {
+    if (!metricAvailable(path.ecn_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.ecn_age_ms)) + statusResidenceMs();
+  }
+
   function peerResultResidenceMs(result) {
     if (result && result === state.peerResult && state.peerResultReceivedAt > 0) {
       return Math.max(0, Date.now() - state.peerResultReceivedAt);
@@ -746,6 +761,16 @@
     if (!metricAvailable(path.metric_age_us)) return null;
     return Math.max(0, finiteNumber(path.metric_age_us) / 1000) +
       peerResultResidenceMs(result);
+  }
+
+  function effectivePeerLossAgeMs(path, result) {
+    if (!metricAvailable(path.loss_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.loss_age_ms)) + peerResultResidenceMs(result);
+  }
+
+  function effectivePeerEcnAgeMs(path, result) {
+    if (!metricAvailable(path.ecn_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.ecn_age_ms)) + peerResultResidenceMs(result);
   }
 
   function metricIsStale(ageMs, horizonMs) {
@@ -793,17 +818,23 @@
         }
         current.set(key, point);
       }
-      const rate = point ? point.rate : null;
+      const approximateRate = path.delivery_rate_approximate === true;
+      const rate = point ? point.rate : (
+        approximateRate && metricAvailable(path.delivery_rate_bps)
+          ? finiteNumber(path.delivery_rate_bps)
+          : null
+      );
       return {
         group: group, rate: rate,
         delta: point ? point.delta : null,
         elapsedMs: point ? point.elapsedMs : null,
         direction: sample ? sample.direction : path.direction,
+        approximate: approximateRate || path.quality_approximate === true,
         stale: snapshotStale || Boolean(point &&
           (now - point.observedAt >= staleAfterMs() || point.elapsedMs > staleAfterMs())),
         // Serialization only. RTT/2 is not one-way delay on asymmetric paths.
         etaMs: rate > 0 ? QUALITY_PAYLOAD_BYTES * 8 / rate * 1000 : null,
-        sharePpm: null, shareApproximate: false, peers: 0
+        sharePpm: null, shareApproximate: approximateRate, peers: 0
       };
     });
     // Retain only the currently displayed carrier identities, not hopping history.
@@ -823,7 +854,7 @@
       // Normalize by the native sampling interval. Comparing a one-second
       // byte delta to a three-second delta would invent an allocation bias.
       quality.sharePpm = quality.rate * 1000000 / group.totalRate;
-      quality.shareApproximate = group.count > 1; // Independent sample windows.
+      quality.shareApproximate = quality.shareApproximate || group.count > 1; // Independent sample windows.
       quality.stale = quality.stale || group.stale;
       quality.peers = group.count;
     });
@@ -834,13 +865,19 @@
     const cell = createElement("div");
     const arrow = quality.direction === "server_to_client" ? "↓ " : "↑ ";
     cell.append(createElement("span", "cell-primary",
-      arrow + formatOptionalMetric(quality.rate, formatBitRate, quality.stale)));
-    cell.append(createElement("span", "cell-secondary", "E " + formatOptionalMetric(
-      path.delivery_rate_observed === true ? path.delivery_rate_bps : null, formatBitRate, rateStale)));
-    cell.append(createElement("span", "cell-secondary", "P " + formatOptionalMetric(
-      path.pacing_rate_bps, formatBitRate, pacingStale)));
+      arrow + formatDiagnosticMetric(quality.rate, formatBitRate, quality.stale, quality.approximate)));
+    cell.append(createElement("span", "cell-secondary", "E " + formatDiagnosticMetric(
+      path.delivery_rate_observed === true || path.delivery_rate_approximate === true
+        ? path.delivery_rate_bps
+        : null,
+      formatBitRate,
+      rateStale,
+      path.delivery_rate_approximate === true
+    )));
+    cell.append(createElement("span", "cell-secondary", "P " + formatDiagnosticMetric(
+      path.pacing_rate_bps, formatBitRate, pacingStale, path.pacing_rate_approximate === true)));
     cell.title = [
-      "Native ACK delivery / E: retained estimate / P: native pacing",
+      "Delivery / E: retained estimate / P: pacing",
       "Delivery direction: " + directionLabel(quality.direction),
       "Estimate direction: " + directionLabel(path.direction),
       "Estimate source: " + (path.delivery_rate_source ? titleCase(path.delivery_rate_source) : "-"),
@@ -855,7 +892,12 @@
   function nativeQualityCell(path, quality) {
     const cell = createElement("div");
     cell.append(createElement("span", "cell-primary",
-      formatOptionalMetric(quality.sharePpm, formatPpm, quality.stale || quality.shareApproximate)));
+      formatDiagnosticMetric(
+        quality.sharePpm,
+        formatPpm,
+        quality.stale || quality.shareApproximate,
+        quality.approximate || path.quality_approximate === true
+      )));
     cell.append(createElement("span", "cell-secondary",
       formatOptionalMetric(quality.delta === null ? null : quality.delta.toString(), formatBytes, quality.stale) +
       " / " + formatOptionalMetric(quality.elapsedMs, formatDuration, quality.stale)));
@@ -864,7 +906,7 @@
     }, quality.stale);
     cell.append(createElement("span", "cell-secondary", serialization === "-" ? "-" : "64K / " + serialization));
     cell.title = [
-      "Share of measured native ACK rates / bytes and interval / 64 KiB serialization",
+      "Share of delivery rates / bytes and interval / 64 KiB serialization",
       "Measured paths: " + formatCount(quality.peers),
       "Counter direction: " + directionLabel(quality.direction),
       "Share normalizes byte deltas by their intervals; independent sample windows make multi-path shares approximate",
@@ -1945,6 +1987,14 @@
       path.freshness_horizon_ms
     );
     const snapshotStale = statusResidenceMs() >= staleAfterMs();
+    // Older peers do not carry independent loss/ECN clocks. Their measured
+    // bundle age is the safe fallback; local native records have exact ages.
+    const lossStale = snapshotStale ||
+      metricIsStale(effectivePathLossAgeMs(path), path.freshness_horizon_ms) ||
+      (!metricAvailable(path.loss_age_ms) && rateStale);
+    const ecnStale = snapshotStale ||
+      metricIsStale(effectivePathEcnAgeMs(path), path.freshness_horizon_ms) ||
+      (!metricAvailable(path.ecn_age_ms) && rateStale);
     const row = createElement("tr");
     appendCell(row, "State", stateIndicator(pathEffectiveState(path)));
 
@@ -2031,12 +2081,15 @@
     appendCell(row, "Rate", nativeRateCell(path, qualityValueObject, rateStale, pacingStale));
 
     const loss = createElement("div");
-    loss.append(createElement("span", "cell-primary", formatOptionalMetric(path.loss_ppm, formatPpm, snapshotStale)));
-    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, snapshotStale)));
+    loss.append(createElement("span", "cell-primary", formatDiagnosticMetric(
+      path.loss_ppm, formatPpm, lossStale, path.loss_approximate === true
+    )));
+    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, ecnStale)));
     loss.title = [
       "Loss / ECN",
       "Loss source: " + (path.loss_source ? titleCase(path.loss_source) : "-"),
-      "Evidence: " + (snapshotStale ? "stale" : "current")
+      "Loss evidence: " + (lossStale ? "stale" : "current"),
+      "ECN evidence: " + (ecnStale ? "stale" : "current")
     ].join("\n");
     appendCell(row, "Loss", loss);
 
@@ -2287,6 +2340,12 @@
     const effectiveAgeMs = effectivePeerMetricAgeMs(path, result);
     const rateStale = metricIsStale(effectiveAgeMs, path.freshness_horizon_ms);
     const snapshotStale = peerResultResidenceMs(result) >= staleAfterMs();
+    const lossStale = snapshotStale ||
+      metricIsStale(effectivePeerLossAgeMs(path, result), path.freshness_horizon_ms) ||
+      (!metricAvailable(path.loss_age_ms) && rateStale);
+    const ecnStale = snapshotStale ||
+      metricIsStale(effectivePeerEcnAgeMs(path, result), path.freshness_horizon_ms) ||
+      (!metricAvailable(path.ecn_age_ms) && rateStale);
     const portStale = path.active_port_retired || snapshotStale;
     const row = createElement("tr");
     appendCell(row, "State", stateIndicator(path.state));
@@ -2350,14 +2409,18 @@
     appendCell(row, "Rate", nativeRateCell(path, qualityValueObject, rateStale, rateStale));
 
     const loss = createElement("div");
-    loss.append(createElement("span", "cell-primary", formatOptionalMetric(path.loss_ppm, formatPpm, snapshotStale)));
-    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, snapshotStale)));
+    loss.append(createElement("span", "cell-primary", formatDiagnosticMetric(
+      path.loss_ppm, formatPpm, lossStale, path.loss_approximate === true
+    )));
+    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, ecnStale)));
     loss.title = [
       "Loss / ECN",
       "Loss source: " + (path.loss_source ? titleCase(path.loss_source) : "-"),
       "ECN source: " + (path.ecn_source ? titleCase(path.ecn_source) : "-"),
       "Loss observed: " + formatOptionalFlag(path.loss_observed),
-      "ECN observed: " + formatOptionalFlag(path.ecn_observed)
+      "ECN observed: " + formatOptionalFlag(path.ecn_observed),
+      "Loss evidence: " + (lossStale ? "stale" : "current"),
+      "ECN evidence: " + (ecnStale ? "stale" : "current")
     ].join("\n");
     appendCell(row, "Loss", loss);
 

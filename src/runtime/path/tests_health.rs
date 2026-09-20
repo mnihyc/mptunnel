@@ -22,6 +22,7 @@ fn request_tcp_native_observation(path_index: usize) -> TcpNativeObservation {
         }),
         notsent_bytes: Some(0),
         bytes_acked: Some(100),
+        bytes_transmitted: None,
         retransmission_counter: Some(0),
         loss: Some(TcpNativeLossCounters {
             retransmits: 0,
@@ -1275,6 +1276,12 @@ fn quic_native_congestion_remains_diagnostic_without_becoming_product_feedback()
     metrics.loss_ppm = Some(125_000);
     metrics.ecn_ppm = Some(25_000);
     record.mark_quic_path_metrics(instance, metrics);
+    let loss_observed_at = record
+        .carrier_loss_observed_at()
+        .expect("native loss observation timestamp");
+    let ecn_observed_at = record
+        .carrier_ecn_observed_at()
+        .expect("native ECN observation timestamp");
 
     let observation = record.observation_at(Instant::now());
     assert_eq!(observation.carrier_loss_rate, Some(0.125));
@@ -1311,6 +1318,8 @@ fn quic_native_congestion_remains_diagnostic_without_becoming_product_feedback()
     let retained_observation = record.observation_at(Instant::now());
     assert_eq!(retained_observation.carrier_loss_rate, Some(0.125));
     assert_eq!(retained_observation.carrier_ecn_rate, Some(0.025));
+    assert_eq!(record.carrier_loss_observed_at(), Some(loss_observed_at));
+    assert_eq!(record.carrier_ecn_observed_at(), Some(ecn_observed_at));
     let retained_published = path_metrics_from_snapshot(
         path_snapshot(&path, 0, retained_observation),
         retained_observation,
@@ -1320,6 +1329,16 @@ fn quic_native_congestion_remains_diagnostic_without_becoming_product_feedback()
     assert_eq!(retained_published.loss_ppm, 125_000);
     assert!(retained_published.ecn_observed);
     assert_eq!(retained_published.ecn_ppm, 25_000);
+
+    // A native controller epoch is the only boundary that may revoke a
+    // retained diagnostic and its freshness clock when a partial poll has no
+    // loss/ECN value.
+    metrics.controller_path_epoch = 2;
+    record.mark_quic_path_metrics(instance, metrics);
+    assert_eq!(record.carrier_loss_rate, None);
+    assert_eq!(record.carrier_ecn_rate, None);
+    assert_eq!(record.carrier_loss_observed_at(), None);
+    assert_eq!(record.carrier_ecn_observed_at(), None);
 
     let unknown_instance = crate::model::path::next_carrier_path_instance_id();
     let mut unknown = ClientPathHealthRecord::default();
@@ -1419,6 +1438,7 @@ fn tcp_transport_state_retains_non_app_limited_ack_window_without_data_ack_autho
         }),
         notsent_bytes: Some(4_096),
         bytes_acked: Some(100),
+        bytes_transmitted: None,
         retransmission_counter: Some(0),
         loss: Some(TcpNativeLossCounters {
             retransmits: 0,
@@ -1430,6 +1450,7 @@ fn tcp_transport_state_retains_non_app_limited_ack_window_without_data_ack_autho
     };
     let current = TcpNativeSnapshot {
         bytes_acked: Some(100 + 1024 * 1024),
+        bytes_transmitted: None,
         ..baseline
     };
     let observation = TcpSenderMetricTracker::new(baseline).observe(
@@ -1469,6 +1490,7 @@ fn tcp_transport_state_retains_non_app_limited_ack_window_without_data_ack_autho
             rttvar_us: Some(500_000),
         }),
         bytes_acked: current.bytes_acked.map(|bytes| bytes + 512 * 1024),
+        bytes_transmitted: None,
         delivery_rate_bytes_per_second: Some(1_000_000),
         pacing_rate_bytes_per_second: Some(2_000_000),
         app_limited: Some(true),
@@ -1517,6 +1539,7 @@ fn tcp_transport_state_retains_non_app_limited_ack_window_without_data_ack_autho
         bytes_acked: app_limited_current
             .bytes_acked
             .map(|bytes| bytes + 512 * 1024),
+        bytes_transmitted: None,
         ..app_limited_current
     };
     let app_limited_shrink = TcpSenderMetricTracker::new(app_limited_current).observe(
@@ -1568,6 +1591,7 @@ fn qualifying_tcp_epoch_without_pacing_clears_prior_epoch_pacing() {
         }),
         notsent_bytes: Some(0),
         bytes_acked: Some(100),
+        bytes_transmitted: None,
         retransmission_counter: Some(0),
         loss: Some(TcpNativeLossCounters {
             retransmits: 0,
@@ -1579,6 +1603,7 @@ fn qualifying_tcp_epoch_without_pacing_clears_prior_epoch_pacing() {
     };
     let first_snapshot = TcpNativeSnapshot {
         bytes_acked: Some(100 + 1024 * 1024),
+        bytes_transmitted: None,
         ..baseline
     };
     let first = TcpSenderMetricTracker::new(baseline).observe(
@@ -1595,6 +1620,7 @@ fn qualifying_tcp_epoch_without_pacing_clears_prior_epoch_pacing() {
 
     let second_snapshot = TcpNativeSnapshot {
         bytes_acked: first_snapshot.bytes_acked.map(|bytes| bytes + 64 * 1024),
+        bytes_transmitted: None,
         delivery_rate_bytes_per_second: Some(10_000_000),
         // Linux uses this sentinel when the current native pacing value is
         // unavailable; it must not inherit the preceding sample's value.
@@ -1632,6 +1658,7 @@ fn first_tcp_ack_after_a_stale_gap_starts_a_new_native_evidence_epoch() {
         }),
         notsent_bytes: Some(0),
         bytes_acked: Some(100),
+        bytes_transmitted: None,
         retransmission_counter: Some(0),
         delivery_rate_bytes_per_second: Some(2_000_000),
         pacing_rate_bytes_per_second: Some(3_000_000),
@@ -1640,6 +1667,7 @@ fn first_tcp_ack_after_a_stale_gap_starts_a_new_native_evidence_epoch() {
     };
     let current = TcpNativeSnapshot {
         bytes_acked: Some(100 + 4_096),
+        bytes_transmitted: None,
         ..baseline
     };
     let observation = TcpSenderMetricTracker::new(baseline).observe(

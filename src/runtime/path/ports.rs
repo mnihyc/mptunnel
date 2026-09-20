@@ -1735,6 +1735,10 @@ impl ServerStreamPort {
 
 /// Accepted client carrier state before product-stream ownership begins.
 pub(in crate::runtime) struct OpenedReliableCarrierStream {
+    // Drop this capability before commands/input can close their native actor.
+    pub(in crate::runtime) retirement: Option<AcceptedReliableCarrierRetirement>,
+    pub(in crate::runtime) terminal: Option<super::PendingStreamTerminal>,
+    pub(in crate::runtime) terminal_owner: Option<super::ClientStreamTerminalOwner>,
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) max_offset: u64,
@@ -1758,10 +1762,51 @@ pub(in crate::runtime) struct OpenedReliableCarrierStream {
 }
 
 impl OpenedReliableCarrierStream {
+    /// Carries ordered retirement across physical commit and raw result custody.
+    pub(in crate::runtime) fn guard_retirement(mut self) -> Self {
+        debug_assert!(self.retirement.is_none());
+        self.retirement = Some(AcceptedReliableCarrierRetirement {
+            commands: Some(self.commands.clone()),
+            stream_id: self.stream_id,
+        });
+        self
+    }
+
     /// Retires a peer-accepted client stream that lost exact carrier ownership
     /// before Product attachment commit.
-    pub(in crate::runtime) fn retire_uncommitted(self) -> Result<(), RuntimeError> {
-        self.commands.retire_accepted_stream(self.stream_id)
+    pub(in crate::runtime) fn retire_uncommitted(mut self) -> Result<(), RuntimeError> {
+        match self.retirement.take() {
+            Some(retirement) => retirement.retire(),
+            None => self.commands.retire_accepted_stream(self.stream_id),
+        }
+    }
+}
+
+/// Linear cleanup ownership until the pending Product wrapper is installed.
+/// This capability carries no logical terminal result or native read obligation.
+pub(in crate::runtime) struct AcceptedReliableCarrierRetirement {
+    commands: Option<ReliablePathCommandSender>,
+    stream_id: StreamId,
+}
+
+impl AcceptedReliableCarrierRetirement {
+    pub(in crate::runtime) fn disarm(mut self) {
+        drop(self.commands.take());
+    }
+
+    fn retire(mut self) -> Result<(), RuntimeError> {
+        self.commands
+            .take()
+            .expect("accepted retirement owns its command capability")
+            .retire_accepted_stream(self.stream_id)
+    }
+}
+
+impl Drop for AcceptedReliableCarrierRetirement {
+    fn drop(&mut self) {
+        if let Some(commands) = self.commands.take() {
+            let _ = commands.retire_accepted_stream(self.stream_id);
+        }
     }
 }
 

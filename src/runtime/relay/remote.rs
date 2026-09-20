@@ -211,6 +211,9 @@ impl ReliableRelayAttachPlan {
         } = completion;
         match result {
             Ok(opened) => {
+                if let Some(error) = opened.terminal_error() {
+                    return Err(error);
+                }
                 if startup_expected_instance
                     .is_some_and(|expected| opened.path_instance_id() != expected)
                 {

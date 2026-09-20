@@ -48,6 +48,7 @@ fn response_metrics(key: CarrierPathKey) -> PathMetrics {
         has_ack_derived_data_sample: true,
         data_sample_count: 1,
         data_sample_bytes: u64::MAX,
+        approximate_metrics: 0,
     }
 }
 

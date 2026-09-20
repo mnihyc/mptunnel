@@ -1390,6 +1390,92 @@ because that logical work is slow. The endpoint's logical Product-open deadline
 still bounds the operation. A concrete attachment refusal or carrier failure
 MAY select another carrier, but every retry MUST reuse the same `StreamId`.
 
+Initial acquisition uses the caller's original absolute logical-open deadline
+`T` and the same frozen candidate order. At a candidate's actual entry, freeze
+its whole cold-setup allowance `A_i` and one path-open PTO `P_i` from the same
+existing timing basis, observed-RTT treatment and bootstrap floor. Its initial
+unretained deadline is the immutable `S_i = min(start_i + A_i, T)`; its
+alternative-decision deadline initially is `D_i = S_i`. Endpoint setup, native
+pair allocation, partial OPEN/MAX writes, and the initial TCP flush retain `S_i`.
+
+For an exact backend with an unattempted alternative, complete local OPEN/MAX
+submission at `u_i` MUST contract only the shared alternative-start decision to
+`D_i := min(D_i, u_i + P_i)`. Transport establishment and authenticated path join
+have completed at this boundary; one carrier-admission exchange remains. QUIC
+request response headers may still be pending, but outgoing OPEN/MAX data does
+not wait for those headers before submission. This decision prices remaining
+work before an alternative can compete. It does not assert that one PTO bounds
+native recovery, remote service or admission latency. Positive target credit
+remains a separate logical phase.
+
+Only the exact current generation and bound carrier may publish this complete
+submission. Repeated or stale callbacks MUST NOT restart or extend the decision.
+A later backend generation inherits both immutable `S_i` and already contracted
+absolute `D_i`; neither clock slides or restarts. Setup and partial writes use
+`S_i`, masking `D_i` until that current generation fully submits. This setup
+bound also applies when an earlier generation had gained retention: old
+submission cannot extend a new partial operation to `T`. After full submission
+before `S_i`, the current generation may again use its ordinal's actual-successor
+retention authority. Singleton and final attempts do not contract their lifetime
+because no alternative can create additional service. Only after full submission
+may an attempt awaiting its first MAX become eligible for retention.
+Submission is not evidence of transmission, peer receipt or target establishment.
+
+At an eligible attempt's `D_i` the logical acquisition coordinator
+owns the next-candidate decision. The submitted attempt remains pending while
+that decision is due; its backend MUST NOT independently retire it before the
+coordinator can arbitrate actual first MAX against actual successor entry.
+This scheduling interval remains bounded by `T`, logical cancellation, and
+terminal authority. It is not itself permission for an unpromoted late success.
+Only when the next frozen candidate actually enters its open operation may that
+exact submitted predecessor continue under `T`. Merely reserving a candidate or
+preparing an unpolled future does not extend the predecessor. A prepared launch
+MUST revalidate current full submission; renewed setup fences that preparation
+without consuming its ordinal or retaining its load lease. If finite reservation
+traversal finds no available successor, or all prepared successors fail before
+actual entry, the coordinator consumes the early decision and waits on `S_i`.
+It MUST NOT cancel the original at `D_i` or repeatedly select that consumed
+decision. Singleton and final candidates, incomplete submission, and unavailable
+successors retain `S_i`. A promoted attempt cannot start fresh setup or native
+retries after `S_i`.
+
+Actual first MAX, including zero, and successor entry are serialized under one
+stream-scoped acquisition owner. A nominal decision observes the operation-wide
+admission sequence before reserving or constructing its successor. Any first
+MAX between that observation and actual successor entry fences that prepared
+launch, even if a retained publisher has already settled. A live admitted owner
+also suppresses new timer-driven acquisition. Positive credit still decides
+logical success.
+A first MAX between `D_i` and `S_i` retains its ordinary authority even without
+an actual successor. It suppresses the prepared launch and may settle under
+`S_i`; the early decision is not an expiry of the original attempt.
+A first MAX observed after `S_i` without prior promotion is recorded and fences
+the prepared nominal launch, but that expired attempt cannot become a success
+under `T`. Once that exact admitted attempt settles with a concrete retryable
+failure, the coordinator MAY retry the next frozen candidate under its ordinary
+budget. Settlement cannot revive a previously fenced nominal launch and MUST
+NOT clear an authenticated logical or session terminal reason.
+
+The first accepted candidate with positive target credit wins only while its
+frozen physical instance and logical/session authority remain current. Every
+started loser owns its exact native retirement until custody transfers through
+the existing ordered DETACH-before-close path; no loser survives logical-owner
+drop as a selectable acquisition. Pending operations are local futures bounded
+by the frozen candidate count, not detached acquisition tasks. Started losing
+attempts and concretely rejected frozen candidates are settled as omitted
+startup ordinals, without publishing path failure. Merely unstarted candidates,
+including a nominal successor fenced before entry, retain their ordinary later
+`STARTUP` eligibility until the frozen round closes. This policy can preserve
+useful work already submitted when another path becomes eligible, at the cost
+of overlapping native pairs,
+carrier entries, load leases, and duplicate CREATE/control traffic. Contracting
+the decision after submission may incur these costs earlier and more often;
+the original fully submitted attempt remains able to win under `S_i`, or under
+`T` only through actual successor retention. The Due interval adds coordinator
+scheduling dependency at `D_i`; retained work can
+persist until `T`. Practical latency and resource benefit require whole-runtime
+measurement and do not follow from earlier copy or open admission alone.
+
 The receiver owns exactly one target-establishment operation for one
 `(SessionId, StreamId)`. The original target, initial demand, authenticated
 principal, and opening ingress remain immutable. A matching repeated
@@ -2639,6 +2725,18 @@ numeric values may remain diagnostic. Because endpoints do not share a
 monotonic clock, this field is a remaining diagnostic horizon beginning at receipt,
 not a cross-host absolute deadline; transport time cannot increase the
 advertised duration.
+
+The management projection exposes `loss_age_ms` and `ecn_age_ms` when the
+local carrier has an actual native observation clock for those values. A
+partial same-carrier poll that reports no loss or ECN value retains the
+previous value and its observation age; a native carrier epoch reset clears
+both. These fields are diagnostic freshness metadata and do not grant
+scheduling, recovery, or Product-delivery authority. Peer advisory rows may
+only expose the age of the shared `PATH_METRICS` bundle, because this wire
+record has no independent loss/ECN timestamp; a management client therefore
+marks those values stale conservatively from the available bundle horizon.
+No `PATH_METRICS` wire-format change is implied by this management-only
+projection.
 
 The receiving peer MUST NOT install, reconstruct, refresh, or downshift a local
 advisory rate or NativeOperational value from this detached record; only the

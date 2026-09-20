@@ -17,6 +17,9 @@ use crate::transport::{
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+#[path = "tests_client_pending_open.rs"]
+mod pending_open;
+
 #[test]
 fn client_native_health_publication_rejects_stale_activation_before_mutation() {
     let instance = next_carrier_path_instance_id();
@@ -175,6 +178,14 @@ impl ClientOpenRaceFixture {
         provider: Arc<dyn CarrierNetworkProvider>,
         limits: ResourceLimits,
     ) -> Self {
+        Self::new_with_path_count(provider, limits, 1).await
+    }
+
+    async fn new_with_path_count(
+        provider: Arc<dyn CarrierNetworkProvider>,
+        limits: ResourceLimits,
+        path_count: usize,
+    ) -> Self {
         let shared_secret = SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret");
         let security = ServerSecurityConfig::for_test(shared_secret.clone());
@@ -213,12 +224,14 @@ impl ClientOpenRaceFixture {
             metadata: PathMetadata::default(),
         };
         let context = ClientPathContext::new_with_carrier_network(
-            vec![ClientPathConfig {
-                name: "path-1".to_string(),
-                spec: client_path,
-                security: client_security,
-                tls: crate::transport::encrypted::test_client_tls_config(),
-            }],
+            (0..path_count)
+                .map(|index| ClientPathConfig {
+                    name: format!("path-{}", index + 1),
+                    spec: client_path.clone(),
+                    security: client_security.clone(),
+                    tls: crate::transport::encrypted::test_client_tls_config(),
+                })
+                .collect(),
             limits,
             None,
             0,

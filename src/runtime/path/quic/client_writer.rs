@@ -1,7 +1,7 @@
 //! Client QUIC reliable-stream command writer.
 
 use super::io::{
-    UdpPathSendStream, flush_udp_frame_batch_with_path_proofs,
+    UdpPathRecvStream, UdpPathSendStream, flush_udp_frame_batch_with_path_proofs,
     flush_udp_frame_batch_with_path_proofs_interlocked, udp_path_finish_stream,
 };
 #[cfg(feature = "lab-diagnostics")]
@@ -12,10 +12,11 @@ use crate::protocol::codec::CodecLimits;
 use crate::protocol::{Frame, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
-    ReliablePathCommand, ReliablePathCommandReceivers, reliable_path_command_pending_bytes,
-    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
-    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
-    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
+    ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
+    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
+    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
+    reliable_path_frame_requires_capacity_command, try_coalesce_reliable_path_writer_run,
+    try_recv_reliable_path_command,
 };
 use crate::runtime::path::input::{CarrierInputRoute, PendingMailboxFrame};
 use crate::runtime::path::proof::PathProofTracker;
@@ -23,6 +24,72 @@ use crate::runtime::sender::PreparedOriginalClaim;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+/// Drains the existing retirement transaction for a completely submitted OPEN.
+/// No native input is parsed after the pending logical owner has withdrawn.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn retire_submitted_client_udp_stream(
+    (mut send, _recv): (UdpPathSendStream, UdpPathRecvStream),
+    stream_id: StreamId,
+    path_instance_id: CarrierPathInstanceId,
+    codec_limits: CodecLimits,
+    mux_limits: MuxLimits,
+    mut commands: ReliablePathCommandReceivers,
+    frames: mpsc::Sender<Result<Frame, RuntimeError>>,
+    #[cfg(test)] events: Option<super::client::ClientUdpPendingOpenEvents>,
+) -> Result<(), RuntimeError> {
+    commands.bind_native_commitment(send.bind_native_commitment()?)?;
+    // This closed, empty receiver satisfies the ordinary writer interface.
+    // carrier_input_open=false prevents every input poll; no reader is spawned.
+    let (unused, mut carrier_frames) = mpsc::channel(1);
+    drop(unused);
+    let mut pending_frames = Vec::new();
+    let mut path_proofs = PathProofTracker::from_limits(mux_limits);
+    let mut deferred_input = None;
+    while let Some(command) = recv_reliable_path_command(&mut commands).await {
+        let drain = drain_client_udp_stream_commands(
+            command,
+            &mut commands,
+            &mut send,
+            stream_id,
+            path_instance_id,
+            codec_limits,
+            mux_limits,
+            &mut pending_frames,
+            &mut path_proofs,
+            &mut carrier_frames,
+            &frames,
+            &mut deferred_input,
+            false,
+        );
+        #[cfg(test)]
+        let closed = {
+            use std::future::Future;
+            let mut drain = std::pin::pin!(drain);
+            let mut pending_reported = false;
+            std::future::poll_fn(|cx| {
+                let result = drain.as_mut().poll(cx);
+                if result.is_pending() && !pending_reported {
+                    pending_reported = true;
+                    if let Some(events) = &events {
+                        let _ = events.send((
+                            stream_id,
+                            super::client::ClientUdpPendingOpenEvent::RetirementPending,
+                        ));
+                    }
+                }
+                result
+            })
+            .await?
+        };
+        #[cfg(not(test))]
+        let closed = drain.await?;
+        if closed {
+            return Ok(());
+        }
+    }
+    Err(RuntimeError::ReliablePathSessionClosed)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_client_udp_stream_commands(

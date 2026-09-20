@@ -126,6 +126,9 @@ pub(super) fn opened_test_relay_stream_with_native_source(
     (
         OpenedRemoteStream::from_opened_carrier(
             OpenedReliableCarrierStream {
+                retirement: None,
+                terminal: None,
+                terminal_owner: None,
                 stream_id,
                 path_instance_id,
                 max_offset: MuxLimits::default().max_stream_window_bytes,

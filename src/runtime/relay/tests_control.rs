@@ -1645,6 +1645,174 @@ async fn sticky_session_terminal_at_relay_entry_preempts_without_polling_a_satur
     ));
 }
 
+#[tokio::test]
+async fn sticky_session_terminal_wins_when_ready_local_read_publishes_pending_reset() {
+    use crate::model::path::{RelayPathInstance, next_carrier_path_instance_id};
+    use crate::protocol::ResetReason;
+    use crate::runtime::path::{
+        ClientStreamTerminalScope, OpenedReliableCarrierStream, PendingStreamTerminal,
+    };
+    use std::future::Future;
+
+    struct TerminalOnRead {
+        context: ClientPathContext,
+        pending: PendingStreamTerminal,
+        stream_id: StreamId,
+        session_first: bool,
+        published: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for TerminalOnRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            assert!(
+                buf.remaining() > 0,
+                "actual source read has admission credit"
+            );
+            assert!(!self.published.swap(true, Ordering::AcqRel));
+            if self.session_first {
+                self.context.retire_session(CloseReason::PolicyRejected);
+            }
+            self.pending
+                .publish_reset(self.stream_id, ResetReason::RemoteClosed);
+            if !self.session_first {
+                self.context.retire_session(CloseReason::PolicyRejected);
+            }
+            Poll::Ready(Err(std::io::Error::other("ready local read terminates")))
+        }
+    }
+
+    impl AsyncWrite for TerminalOnRead {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    for session_first in [false, true] {
+        let endpoint = "127.0.0.1:9".parse().unwrap();
+        let context = ClientPathContext::new(
+            vec!["tcp://127.0.0.1:9".parse::<PathSpec>().unwrap()],
+            test_security(),
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        let stream_id = StreamId(610);
+        let limits = context.mux_limits;
+        let (scope, owner) =
+            ClientStreamTerminalScope::for_open(None, context.session_id, stream_id).unwrap();
+        // The initial input commits normally. A different still-pending
+        // attachment retains logical terminal authority across that commit.
+        let pending = scope.pending_input();
+        let (commands, mut receivers) = reliable_path_command_channels(32);
+        let (_frames_tx, frames_rx) = mpsc::channel(4);
+        let snapshot = crate::scheduler::PathSnapshot::new(
+            PathId(0),
+            UnderlayProtocol::Tcp,
+            crate::runtime::path::model::default_path_srtt_ms(),
+            crate::runtime::path::model::default_path_rate_bps(),
+        );
+        let carrier = OpenedReliableCarrierStream {
+            retirement: None,
+            terminal: Some(scope.pending_input()),
+            terminal_owner: owner,
+            stream_id,
+            path_instance_id: next_carrier_path_instance_id(),
+            max_offset: limits.max_stream_window_bytes,
+            lane: TrafficClass::Latency,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            portable_startup: snapshot,
+            startup: snapshot,
+            startup_native_window: None,
+            startup_metrics: None,
+            commands,
+            mux_limits: limits,
+            frames: frames_rx,
+        }
+        .guard_retirement();
+        let opened = OpenedRemoteStream::from_opened_carrier(carrier, 0, 0);
+        context.install_relay_path_instance_for_test(RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            path_instance_id: opened.path_instance_id(),
+            attachment_id: 0,
+        });
+        let published = Arc::new(AtomicBool::new(false));
+        let local = TerminalOnRead {
+            context: context.clone(),
+            pending,
+            stream_id,
+            session_first,
+            published: published.clone(),
+        };
+        let mut relay = Box::pin(relay_migrating_tcp_stream(
+            local,
+            &context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec::new(TargetAddr::Ip(endpoint), TrafficClass::Latency),
+            opened,
+            None,
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(1), std::future::poll_fn(|cx| {
+            let published_before = published.load(Ordering::Acquire);
+            let result = relay.as_mut().poll(cx);
+            if !published_before && published.load(Ordering::Acquire) {
+                assert!(result.is_ready(), "the actual publication poll must settle, not wait for another session-select poll");
+            }
+            result
+        })).await.expect("existing relay-control containment budget");
+        assert!(published.load(Ordering::Acquire));
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+            ),
+            "sticky session wins after ready settlement: session_first={session_first}"
+        );
+        assert!(
+            matches!(
+                scope.reset_error(),
+                Some(RuntimeError::RemoteReset(ResetReason::RemoteClosed))
+            ),
+            "the pending attachment actually published the competing stream terminal"
+        );
+        let mut reset_closes = 0;
+        while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
+            if matches!(command, ReliablePathCommand::ResetAndCloseStream { stream_id: id, .. } if id == stream_id)
+            {
+                reset_closes += 1;
+            }
+        }
+        assert_eq!(
+            reset_closes, 1,
+            "active I/O-failure cleanup completes once inside its existing domain envelope"
+        );
+    }
+}
+
 async fn assert_absolute_retention_timeout(
     relay: &mut tokio::task::JoinHandle<Result<PathDeliveryStats, RuntimeError>>,
 ) {

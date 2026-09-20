@@ -768,13 +768,21 @@ pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
     context: &ClientPathContext,
     performance: MppPerformanceConfig,
     spec: ReliableRelayOpenSpec,
-    remote: OpenedRemoteStream,
+    mut remote: OpenedRemoteStream,
     idle_timeout: Option<std::time::Duration>,
 ) -> Result<PathDeliveryStats, RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let retirement = context.session_retirement().wait();
+    let terminal_scope = remote.terminal_scope();
+    let _terminal_owner = remote.take_terminal_owner();
+    let spec = spec.with_terminal_scope(terminal_scope.clone());
+    let terminal = async {
+        match &terminal_scope {
+            Some(scope) => scope.wait().await,
+            None => std::future::pending::<RuntimeError>().await,
+        }
+    };
     // The wrapper also owns cancellation cleanup: revoking prepared claims
     // and dropping committed output membership share the writer's domain.
     let execution_domain = context.execution_domain();
@@ -788,13 +796,24 @@ where
         #[cfg(test)]
         None,
     ));
-    tokio::pin!(retirement);
+    tokio::pin!(terminal);
     tokio::pin!(active);
-    tokio::select! {
-        biased;
-        reason = &mut retirement => Err(RuntimeError::RemoteClosed(reason)),
-        result = &mut active => result,
-    }
+    // SESSION_CLOSE can publish during a ready inner poll. Recheck the sticky
+    // session reason after either outcome, with cancellation still domain-owned.
+    context
+        .complete_session_operation(async {
+            tokio::select! {
+                biased;
+                error = &mut terminal => Err(error),
+                result = &mut active => {
+                    if let Some(scope) = &terminal_scope {
+                        scope.ensure_active()?;
+                    }
+                    result
+                },
+            }
+        })
+        .await
 }
 
 async fn relay_migrating_tcp_stream_active<S>(
@@ -836,7 +855,7 @@ where
         context.mux_limits,
     );
     let (remotes, mut remote_input) =
-        ReliableRelayRemoteSet::new(remote, reliable_stream_frame_queue(context.mux_limits));
+        ReliableRelayRemoteSet::try_new(remote, reliable_stream_frame_queue(context.mux_limits))?;
     let opening_instance = remotes.paths[0].instance();
     let mut return_plan =
         ClientReliableReturnPlan::from_initial_open(opened_startup, opening_instance)?;

@@ -1817,6 +1817,7 @@ mod packet_metric_authority_tests {
             has_ack_derived_data_sample: false,
             data_sample_count: 0,
             data_sample_bytes: 0,
+            approximate_metrics: 0,
         };
         let live = PathMetrics {
             rate_valid_for_us: 1_000_000,
@@ -1829,6 +1830,7 @@ mod packet_metric_authority_tests {
             has_ack_derived_data_sample: true,
             data_sample_count: 8,
             data_sample_bytes: 128 * 1024,
+            approximate_metrics: 0,
             ..startup
         };
         (startup, live)

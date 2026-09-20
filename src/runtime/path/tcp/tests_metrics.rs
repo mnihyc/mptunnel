@@ -14,6 +14,7 @@ fn snapshot() -> TcpNativeSnapshot {
         }),
         notsent_bytes: Some(4_096),
         bytes_acked: Some(100),
+        bytes_transmitted: None,
         retransmission_counter: Some(10),
         loss: Some(TcpNativeLossCounters {
             retransmits: 10,
@@ -91,6 +92,7 @@ fn native_tcp_metrics_are_post_handshake_and_keep_kernel_units_explicit() {
             inflight_hi_bytes: Some(20 * 1_460),
         }),
         bytes_acked: baseline.bytes_acked.map(|value| value + 300_000),
+        bytes_transmitted: None,
         retransmission_counter: Some(12),
         notsent_bytes: Some(8_192),
         loss: Some(TcpNativeLossCounters {
@@ -128,6 +130,61 @@ fn native_tcp_metrics_are_post_handshake_and_keep_kernel_units_explicit() {
 }
 
 #[test]
+fn windows_transmit_fallback_is_diagnostic_and_explicitly_approximate() {
+    let baseline = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            srtt_us: 20_000,
+            rttvar_us: None,
+        }),
+        flight: Some(TcpNativeFlight {
+            bytes_in_flight: Some(8 * 1_460),
+            inflight_limit_bytes: 64 * 1_460,
+            inflight_hi_bytes: Some(64 * 1_460),
+        }),
+        bytes_acked: None,
+        bytes_transmitted: Some(1_000_000),
+        retransmission_counter: Some(10_000),
+        ..TcpNativeSnapshot::default()
+    };
+    let mut tracker = TcpSenderMetricTracker::new(baseline);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let current = TcpNativeSnapshot {
+        bytes_transmitted: Some(1_100_000),
+        retransmission_counter: Some(10_100),
+        ..baseline
+    };
+    let observation = tracker.observe(PathId(4), PathMetricDirection::ServerToClient, current);
+
+    assert!(observation.complete_path_metrics().is_none());
+    assert!(observation.approximate_delivery_rate_bps().is_some());
+    assert!(observation.approximate_pacing_rate_bps().is_some());
+    assert!(observation.approximate_loss_ppm().is_some());
+
+    let mut metrics = crate::runtime::path::tcp::capacity::request_tcp_capacity_receipt_metrics(
+        PathId(4),
+        1_024,
+        1_000_000,
+        None,
+        None,
+    );
+    observation.apply_diagnostic_fallback(&mut metrics);
+    assert_ne!(
+        metrics.approximate_metrics & crate::protocol::PATH_METRIC_APPROXIMATE_RATE,
+        0
+    );
+    assert_ne!(
+        metrics.approximate_metrics & crate::protocol::PATH_METRIC_APPROXIMATE_PACING,
+        0
+    );
+    assert_ne!(
+        metrics.approximate_metrics & crate::protocol::PATH_METRIC_APPROXIMATE_LOSS,
+        0
+    );
+    assert!(!metrics.rate_observed);
+    assert!(!metrics.pacing_rate_observed);
+}
+
+#[test]
 fn slow_start_cwnd_growth_does_not_move_the_delivery_epoch_floor() {
     let baseline = snapshot();
     let current = TcpNativeSnapshot {
@@ -137,6 +194,7 @@ fn slow_start_cwnd_growth_does_not_move_the_delivery_epoch_floor() {
             ..baseline.flight.expect("flight baseline")
         }),
         bytes_acked: baseline.bytes_acked.map(|value| value + 64 * 1024),
+        bytes_transmitted: None,
         app_limited: Some(false),
         ..baseline
     };
@@ -159,6 +217,7 @@ fn repeated_native_poll_without_ack_progress_has_no_fresh_bytes() {
     let baseline = snapshot();
     let current = TcpNativeSnapshot {
         bytes_acked: baseline.bytes_acked.map(|value| value + 300_000),
+        bytes_transmitted: None,
         app_limited: Some(false),
         ..baseline
     };
@@ -289,6 +348,7 @@ fn positive_sender_interval_records_measured_zero_loss() {
             data_segments_out: baseline.loss.expect("loss baseline").data_segments_out + 20,
         }),
         bytes_acked: baseline.bytes_acked.map(|value| value + 30_000),
+        bytes_transmitted: None,
         ..baseline
     };
     let metrics = TcpSenderMetricTracker::new(baseline)
@@ -315,6 +375,7 @@ fn native_loss_counters_remain_valid_across_u32_wrap() {
             data_segments_out: 9,
         }),
         bytes_acked: baseline.bytes_acked.map(|value| value + 30_000),
+        bytes_transmitted: None,
         ..baseline
     };
     let metrics = TcpSenderMetricTracker::new(baseline)

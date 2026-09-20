@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
 // RFC 8305's default keeps a blackholed family from monopolizing setup without
 // opening every resolver answer in one socket/TLS burst.
@@ -180,6 +180,8 @@ pub(in crate::runtime) struct ClientUdpPathSessionHandle {
         Arc<std::sync::Mutex<Option<ClientUdpRetryableOpenFailureTestHook>>>,
     #[cfg(test)]
     accepted_open_hook: Arc<std::sync::Mutex<Option<ClientUdpAcceptedOpenTestHook>>>,
+    #[cfg(test)]
+    pending_open_events: Arc<std::sync::Mutex<Option<ClientUdpPendingOpenEvents>>>,
 }
 
 /// Durable, coalescing wake source for configured QUIC carrier ownership.
@@ -356,6 +358,40 @@ struct ClientUdpAcceptedOpenTestHook {
     resume: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClientUdpPendingOpenEvent {
+    Submitted,
+    ContinuationStarted,
+    Accepted,
+    Retiring,
+    RetirementPending,
+    RetirementFinished(bool),
+    ContinuationExited,
+}
+
+#[cfg(test)]
+pub(super) type ClientUdpPendingOpenEvents =
+    mpsc::UnboundedSender<(StreamId, ClientUdpPendingOpenEvent)>;
+
+#[cfg(test)]
+struct ClientUdpPendingOpenTaskExit {
+    stream_id: StreamId,
+    events: Option<ClientUdpPendingOpenEvents>,
+}
+
+#[cfg(test)]
+impl Drop for ClientUdpPendingOpenTaskExit {
+    fn drop(&mut self) {
+        if let Some(events) = &self.events {
+            let _ = events.send((
+                self.stream_id,
+                ClientUdpPendingOpenEvent::ContinuationExited,
+            ));
+        }
+    }
+}
+
 impl std::fmt::Debug for ClientUdpPathSessionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientUdpPathSessionHandle")
@@ -380,6 +416,8 @@ impl ClientUdpPathSessionHandle {
             retryable_open_failure_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             accepted_open_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            pending_open_events: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -418,6 +456,7 @@ impl ClientUdpPathSessionHandle {
 
     // The open boundary transfers the complete logical-stream ownership envelope.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(in crate::runtime) async fn open_stream(
         &self,
         stream_id: StreamId,
@@ -428,7 +467,78 @@ impl ClientUdpPathSessionHandle {
         open_deadline: tokio::time::Instant,
         advertised_recv_max_offset: u64,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
+        self.open_stream_scoped(
+            stream_id,
+            target,
+            lane,
+            initial_demand,
+            return_plan,
+            open_deadline,
+            advertised_recv_max_offset,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) async fn open_stream_scoped(
+        &self,
+        stream_id: StreamId,
+        target: TargetAddr,
+        lane: TrafficClass,
+        initial_demand: StreamDemandHint,
+        return_plan: crate::protocol::StreamReturnPlan,
+        open_deadline: tokio::time::Instant,
+        advertised_recv_max_offset: u64,
+        terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
+        initial: Option<crate::runtime::path::InitialOpenAttempt>,
+    ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
+        if let Some(initial) = &initial {
+            initial.validate(self.runtime.session_id, stream_id)?;
+        }
+        let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
+            terminal,
+            self.runtime.session_id,
+            stream_id,
+        )?;
+        let result = {
+            let opening = self.open_stream_in_scope(
+                stream_id,
+                target,
+                lane,
+                initial_demand,
+                return_plan,
+                open_deadline,
+                advertised_recv_max_offset,
+                &terminal,
+                initial.as_ref(),
+            );
+            tokio::pin!(opening);
+            terminal.complete(opening.as_mut()).await
+        };
+        self.runtime.state.session_lifecycle().ensure_active()?;
+        let mut opened = result?;
+        opened.terminal_owner = owner;
+        Ok(opened)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_stream_in_scope(
+        &self,
+        stream_id: StreamId,
+        target: TargetAddr,
+        lane: TrafficClass,
+        initial_demand: StreamDemandHint,
+        return_plan: crate::protocol::StreamReturnPlan,
+        open_deadline: tokio::time::Instant,
+        advertised_recv_max_offset: u64,
+        terminal: &crate::runtime::path::ClientStreamTerminalScope,
+        initial: Option<&crate::runtime::path::InitialOpenAttempt>,
+    ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
         for attempt in 0..MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS {
+            terminal.ensure_active()?;
+            let initial_backend = initial.map(|initial| initial.begin_backend()).transpose()?;
             let expected_path_instance_id = self
                 .runtime
                 .state
@@ -453,9 +563,17 @@ impl ClientUdpPathSessionHandle {
                     }
                 };
             let path_instance_id = connection.path_instance_id;
-            let result = tokio::time::timeout_at(
-                open_deadline,
-                open_client_udp_stream_on_connection(
+            if let Some(initial) = &initial_backend {
+                initial.bind(path_instance_id)?;
+            }
+            #[cfg(test)]
+            let pending_open_events = self
+                .pending_open_events
+                .lock()
+                .expect("pending QUIC open test observer lock")
+                .clone();
+            let result = {
+                let opening = open_client_udp_stream_on_connection(
                     connection,
                     stream_id,
                     target.clone(),
@@ -464,11 +582,20 @@ impl ClientUdpPathSessionHandle {
                     return_plan,
                     advertised_recv_max_offset,
                     self.runtime.clone(),
-                ),
-            )
-            .await
-            .map_err(|_| RuntimeError::PathOpenTimedOut)
-            .and_then(|result| result);
+                    terminal.pending_input(),
+                    initial_backend.as_ref(),
+                    #[cfg(test)]
+                    pending_open_events,
+                );
+                tokio::pin!(opening);
+                match &initial_backend {
+                    Some(initial) => initial.complete(opening.as_mut()).await,
+                    None => tokio::time::timeout_at(open_deadline, opening.as_mut())
+                        .await
+                        .map_err(|_| RuntimeError::PathOpenTimedOut)
+                        .and_then(|result| result),
+                }
+            };
             match result {
                 Ok(stream) => {
                     #[cfg(test)]
@@ -477,8 +604,12 @@ impl ClientUdpPathSessionHandle {
                         path_instance_id,
                     )
                     .await;
+                    let settlement_deadline = match &initial_backend {
+                        Some(initial) => initial.deadline()?,
+                        None => open_deadline,
+                    };
                     let committed = tokio::time::timeout_at(
-                        open_deadline,
+                        settlement_deadline,
                         self.try_commit_opened_instance(path_instance_id),
                     )
                     .await;
@@ -497,6 +628,12 @@ impl ClientUdpPathSessionHandle {
                     return Err(RuntimeError::ReliablePathRetired);
                 }
                 Err(source) => {
+                    // Parsed Product terminal authority cannot wait behind
+                    // independent physical-owner reconciliation. Every live
+                    // carrier already has an exact native-close observer.
+                    if matches!(source, RuntimeError::RemoteReset(_)) {
+                        return Err(source);
+                    }
                     #[cfg(test)]
                     if client_udp_error_disposition(&source)
                         == ClientUdpErrorDisposition::CarrierLifetime
@@ -1630,6 +1767,58 @@ async fn run_client_udp_control_stream(
     }
 }
 
+type ClientUdpNativePair = (UdpPathSendStream, UdpPathRecvStream);
+
+struct ClientUdpSubmittedOpenHandoff {
+    ordinary: ClientUdpNativePair,
+    // Only successful first-MAX acceptance transfers its unopened repair pair.
+    // Absence means that only the submitted ordinary request may retire.
+    accepted_repair: Option<ClientUdpNativePair>,
+}
+
+/// Owns only a fully submitted OPEN/MAX, before first-MAX acceptance.
+///
+/// Cancellation transfers the ordinary pair once to its already-created
+/// continuation. The unopened repair pair retains normal immediate native Drop;
+/// it has no MPP repair OPEN whose ordering could require retention.
+struct ClientUdpSubmittedOpen {
+    ordinary: Option<ClientUdpNativePair>,
+    repair: Option<ClientUdpNativePair>,
+    handoff: Option<oneshot::Sender<ClientUdpSubmittedOpenHandoff>>,
+}
+
+impl ClientUdpSubmittedOpen {
+    fn recv(&mut self) -> &mut UdpPathRecvStream {
+        &mut self.ordinary.as_mut().expect("submitted ordinary pair").1
+    }
+
+    fn accept(mut self) -> Result<(), RuntimeError> {
+        let ordinary = self.ordinary.take().expect("submitted ordinary pair");
+        let repair = self.repair.take().expect("unopened repair pair");
+        self.handoff
+            .take()
+            .expect("one submitted-open handoff")
+            .send(ClientUdpSubmittedOpenHandoff {
+                ordinary,
+                accepted_repair: Some(repair),
+            })
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
+    }
+}
+
+impl Drop for ClientUdpSubmittedOpen {
+    fn drop(&mut self) {
+        if let (Some(ordinary), Some(handoff)) = (self.ordinary.take(), self.handoff.take()) {
+            // No task creation or I/O in Drop. If the exact native/session
+            // lifetime already ended, the rejected message drops its pair.
+            let _ = handoff.send(ClientUdpSubmittedOpenHandoff {
+                ordinary,
+                accepted_repair: None,
+            });
+        }
+    }
+}
+
 // This is the single wire-open ownership envelope; grouping it would only move
 // validation away from the protocol construction site.
 #[allow(clippy::too_many_arguments)]
@@ -1642,9 +1831,20 @@ async fn open_client_udp_stream_on_connection(
     return_plan: crate::protocol::StreamReturnPlan,
     advertised_recv_max_offset: u64,
     runtime: ClientUdpPathSessionRuntime,
+    terminal: crate::runtime::path::PendingStreamTerminal,
+    initial: Option<&crate::runtime::path::InitialOpenBackend>,
+    #[cfg(test)] pending_open_events: Option<ClientUdpPendingOpenEvents>,
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
-    let ((mut send, mut recv), (mut repair_send, repair_recv)) =
-        carrier.connection.open_reliable_pair().await?;
+    // Validate this prerequisite before publishing an OPEN: a later local
+    // rejection must not leave a submitted pair without its retirement owner.
+    let native_rate_authority =
+        carrier
+            .connection
+            .native_rate_authority()
+            .ok_or(RuntimeError::Protocol(
+                "client QUIC stream opened before native rate authority binding",
+            ))?;
+    let ((mut send, recv), repair) = carrier.connection.open_reliable_pair().await?;
     let parent_request_id = send.request_stream_id();
     send.set_traffic_class(lane)?;
     let open = Frame::OpenStream {
@@ -1666,34 +1866,102 @@ async fn open_client_udp_stream_on_connection(
         runtime.codec_limits,
     )
     .await?;
-    let path_id = PathId(runtime.path_index as u16);
-    let max_offset = read_client_udp_stream_open_accept(
-        &mut recv,
-        stream_id,
-        runtime.path_index,
-        carrier.path_instance_id,
-        &runtime.state,
-        path_id,
-        runtime.codec_limits,
-    )
-    .await?;
     let (commands, mut receivers) = reliable_path_command_channels(udp_path_command_queue(
         runtime.mux_limits,
         runtime.codec_limits,
     ));
-    let commands =
-        commands.with_native_rate_authority(carrier.connection.native_rate_authority().ok_or(
-            RuntimeError::Protocol(
-                "client QUIC stream opened before native rate authority binding",
-            ),
-        )?);
+    let commands = commands.with_native_rate_authority(native_rate_authority);
     let stream_frame_queue =
         udp_reliable_stream_frame_queue(runtime.codec_limits, runtime.mux_limits);
     let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);
-    let repair_commands = receivers.take_repair_receiver(stream_id);
     let stream_runtime = runtime.clone();
     let execution_domain = stream_runtime.state.execution_domain();
+    let connection = carrier.connection.clone();
+    let path_instance_id = carrier.path_instance_id;
+    let retirement_commands = commands.clone();
+    let stream_terminal = terminal.clone();
+    let (handoff, transferred) = oneshot::channel();
+    let mut submitted = ClientUdpSubmittedOpen {
+        ordinary: Some((send, recv)),
+        repair: Some(repair),
+        handoff: Some(handoff),
+    };
+    #[cfg(test)]
+    if let Some(events) = &pending_open_events {
+        let _ = events.send((stream_id, ClientUdpPendingOpenEvent::Submitted));
+    }
     tokio::spawn(execution_domain.wrap(async move {
+        #[cfg(test)]
+        let _exit = ClientUdpPendingOpenTaskExit {
+            stream_id,
+            events: pending_open_events.clone(),
+        };
+        #[cfg(test)]
+        if let Some(events) = &pending_open_events {
+            let _ = events.send((stream_id, ClientUdpPendingOpenEvent::ContinuationStarted));
+        }
+        let transferred = tokio::select! {
+            biased;
+            _ = stream_runtime.state.session_retirement().wait() => return,
+            _ = connection.wait_closed() => return,
+            result = transferred => match result {
+                Ok(transferred) => transferred,
+                Err(_) => return,
+            },
+        };
+        let ((send, recv), (mut repair_send, repair_recv)) = match transferred.accepted_repair {
+            Some(repair) => {
+                #[cfg(test)]
+                if let Some(events) = &pending_open_events {
+                    let _ = events.send((stream_id, ClientUdpPendingOpenEvent::Accepted));
+                }
+                (transferred.ordinary, repair)
+            }
+            None => {
+                let ordinary = transferred.ordinary;
+                #[cfg(test)]
+                if let Some(events) = &pending_open_events {
+                    let _ = events.send((stream_id, ClientUdpPendingOpenEvent::Retiring));
+                }
+                if retirement_commands.retire_accepted_stream(stream_id).is_err() {
+                    return;
+                }
+                drop(retirement_commands);
+                let registration = ordinary.0.native_source_registration();
+                let retirement = super::driven::run_ordinary_source(
+                    registration,
+                    super::client_writer::retire_submitted_client_udp_stream(
+                        ordinary,
+                        stream_id,
+                        path_instance_id,
+                        stream_runtime.codec_limits,
+                        stream_runtime.mux_limits,
+                        receivers,
+                        frames_tx,
+                        #[cfg(test)]
+                        pending_open_events.clone(),
+                    ),
+                );
+                tokio::pin!(retirement);
+                tokio::select! {
+                    biased;
+                    _ = stream_runtime.state.session_retirement().wait() => {}
+                    _ = connection.wait_closed() => {}
+                    result = &mut retirement => {
+                        #[cfg(test)]
+                        if let Some(events) = &pending_open_events {
+                            let success = matches!(result, Ok(Ok(())));
+                            let _ = events.send((stream_id, ClientUdpPendingOpenEvent::RetirementFinished(success)));
+                        }
+                        #[cfg(not(test))]
+                        let _ = result;
+                    }
+                }
+                return;
+            }
+        };
+        drop(retirement_commands);
+        let repair_commands = receivers.take_repair_receiver(stream_id);
         let repair = async {
             repair_send.set_repair_priority()?;
             udp_path_write_frame(
@@ -1728,13 +1996,14 @@ async fn open_client_udp_stream_on_connection(
                 recv,
                 stream_id,
                 stream_runtime.path_index,
-                carrier.path_instance_id,
+                path_instance_id,
                 stream_runtime.codec_limits,
                 stream_runtime.mux_limits,
                 stream_frame_queue,
                 stream_runtime.state.clone(),
                 receivers,
                 frames_tx.clone(),
+                Some(stream_terminal),
             ),
         );
         tokio::select! {
@@ -1751,6 +2020,25 @@ async fn open_client_udp_stream_on_connection(
             }
         }
     }));
+    let path_id = PathId(runtime.path_index as u16);
+    // Both the submitted guard and its existing continuation owner are now
+    // installed. A rejected publication must still transfer ordered retirement.
+    if let Some(initial) = initial {
+        initial.submitted()?;
+    }
+    let max_offset = read_client_udp_stream_open_accept(
+        submitted.recv(),
+        stream_id,
+        runtime.path_index,
+        carrier.path_instance_id,
+        &runtime.state,
+        path_id,
+        runtime.codec_limits,
+        &terminal,
+        initial,
+    )
+    .await?;
+    submitted.accept()?;
     let mut startup = path_startup_snapshot_for_instance(
         runtime.path(),
         PathId(runtime.path_index as u16),
@@ -1760,7 +2048,10 @@ async fn open_client_udp_stream_on_connection(
     startup.peer_usage = runtime
         .state
         .peer_path_usage(UnderlayProtocol::Udp, runtime.path_index);
-    Ok(OpenedReliableCarrierStream {
+    let opened = OpenedReliableCarrierStream {
+        retirement: None,
+        terminal: Some(terminal),
+        terminal_owner: None,
         stream_id,
         path_instance_id: carrier.path_instance_id,
         max_offset,
@@ -1777,9 +2068,11 @@ async fn open_client_udp_stream_on_connection(
         commands,
         mux_limits: runtime.mux_limits,
         frames: frames_rx,
-    })
+    };
+    Ok(opened.guard_retirement())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_client_udp_stream_open_accept(
     recv: &mut UdpPathRecvStream,
     stream_id: StreamId,
@@ -1788,17 +2081,27 @@ async fn read_client_udp_stream_open_accept(
     state: &ClientPathState,
     path_id: PathId,
     codec_limits: CodecLimits,
+    terminal: &crate::runtime::path::PendingStreamTerminal,
+    initial: Option<&crate::runtime::path::InitialOpenBackend>,
 ) -> Result<u64, RuntimeError> {
     loop {
         match udp_path_read_frame(recv, codec_limits).await? {
             Frame::StreamMaxData {
                 stream_id: max_stream_id,
                 max_offset,
-            } if max_stream_id == stream_id => return Ok(max_offset),
+            } if max_stream_id == stream_id => {
+                if let Some(initial) = initial {
+                    initial.admission()?;
+                }
+                return Ok(max_offset);
+            }
             Frame::StreamReset {
                 stream_id: reset_stream_id,
                 reason,
-            } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
+            } if reset_stream_id == stream_id => {
+                terminal.publish_reset(stream_id, reason);
+                return Err(RuntimeError::RemoteReset(reason));
+            }
             Frame::StreamDetach {
                 stream_id: detached_stream_id,
             } if detached_stream_id == stream_id => {

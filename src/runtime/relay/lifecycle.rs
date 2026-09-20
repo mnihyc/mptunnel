@@ -696,6 +696,7 @@ impl RelayAdditionalPathOpenResult {
         // another attachment attempt has replaced the one carrying it.
         match &self.result {
             Err(RuntimeError::RemoteReset(reason)) => Some(RuntimeError::RemoteReset(*reason)),
+            Ok(opened) => opened.terminal_error(),
             _ => None,
         }
     }

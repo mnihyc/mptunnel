@@ -378,6 +378,189 @@ fn cold_quic_attachment_budget_covers_serialized_setup_exchanges() {
 }
 
 #[test]
+fn initial_setup_and_admission_share_existing_pto_evidence_and_floor() {
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let address = if underlay == UnderlayProtocol::Tcp {
+            "tcp://127.0.0.1:11095"
+        } else {
+            "quic://127.0.0.1:11095"
+        };
+        let path = address.parse::<PathSpec>().unwrap();
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).unwrap();
+        let key = RelayPathKey { underlay, index: 0 };
+        for observed in [false, true] {
+            if observed {
+                // Existing probe-success producer supplies the same below-floor
+                // sample to both carriers; TCP keeps its existing bootstrap rule.
+                match underlay {
+                    UnderlayProtocol::Tcp => {
+                        context.mark_tcp_path_probe_success(0, Duration::from_millis(180))
+                    }
+                    UnderlayProtocol::Udp => {
+                        context.mark_udp_path_probe_success(0, Duration::from_millis(180))
+                    }
+                }
+            }
+            let snapshot = context.reliable_path_snapshot(key);
+            let rtt_observed =
+                underlay == UnderlayProtocol::Udp && context.reliable_path_rtt_is_observed(key);
+            let (setup, admission) = reliable_initial_open_budgets(&context, key, true);
+            assert_eq!(admission, path_open_pto(snapshot, rtt_observed));
+            assert_eq!(
+                setup,
+                admission.saturating_mul(path_open_serialized_exchanges(snapshot))
+            );
+            if underlay == UnderlayProtocol::Tcp {
+                assert!(admission >= crate::model::timing::default_transport_pto());
+            }
+            let (terminal, terminal_basis) = reliable_initial_open_budgets(&context, key, false);
+            assert_eq!(terminal_basis, admission);
+            assert_eq!(
+                terminal,
+                crate::model::timing::path_open_timeout(snapshot, rtt_observed)
+            );
+            assert_eq!(
+                reliable_initial_open_timeout(&context, key, false),
+                terminal
+            );
+        }
+    }
+}
+
+#[test]
+fn accepted_retirement_transfers_once_through_explicit_or_product_cleanup() {
+    for transfer_to_product in [false, true] {
+        let stream_id = StreamId(94);
+        let mux_limits = MuxLimits::default();
+        let (commands, mut receivers) = reliable_path_command_channels(4);
+        let (_frames_tx, frames_rx) = mpsc::channel(4);
+        let startup = crate::scheduler::PathSnapshot::new(
+            PathId(0),
+            UnderlayProtocol::Udp,
+            crate::runtime::path::model::default_path_srtt_ms(),
+            crate::runtime::path::model::default_path_rate_bps(),
+        );
+        let carrier = crate::runtime::path::OpenedReliableCarrierStream {
+            retirement: None,
+            terminal: None,
+            terminal_owner: None,
+            stream_id,
+            path_instance_id: next_carrier_path_instance_id(),
+            max_offset: 0,
+            lane: TrafficClass::Throughput,
+            underlay: UnderlayProtocol::Udp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            portable_startup: startup,
+            startup,
+            startup_native_window: None,
+            startup_metrics: None,
+            commands,
+            mux_limits,
+            frames: frames_rx,
+        }
+        .guard_retirement();
+        assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+
+        if transfer_to_product {
+            let opened = OpenedRemoteStream::from_opened_carrier(carrier, 0, 0);
+            assert!(
+                try_recv_reliable_path_command(&mut receivers).is_none(),
+                "installing the pending Product owner must leave its carrier live",
+            );
+            drop(opened);
+        } else {
+            carrier
+                .retire_uncommitted()
+                .expect("explicit accepted retirement");
+        }
+
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+        ));
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut receivers),
+            Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+        ));
+        assert!(
+            try_recv_reliable_path_command(&mut receivers).is_none(),
+            "the transferred capability must not enqueue a second retirement",
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn logical_terminal_survives_outer_deadline_discarding_raw_success() {
+    use crate::protocol::SessionId;
+    use crate::runtime::path::{ClientStreamTerminalScope, OpenedReliableCarrierStream};
+    use futures::FutureExt;
+
+    let stream_id = StreamId(95);
+    let (scope, _owner) =
+        ClientStreamTerminalScope::for_open(None, SessionId(95), stream_id).unwrap();
+    let publisher = scope.pending_input();
+    let mux_limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let (_frames_tx, frames_rx) = mpsc::channel(4);
+    let startup = crate::scheduler::PathSnapshot::new(
+        PathId(0),
+        UnderlayProtocol::Udp,
+        crate::runtime::path::model::default_path_srtt_ms(),
+        crate::runtime::path::model::default_path_rate_bps(),
+    );
+    let carrier = OpenedReliableCarrierStream {
+        retirement: None,
+        terminal: Some(publisher.clone()),
+        terminal_owner: None,
+        stream_id,
+        path_instance_id: next_carrier_path_instance_id(),
+        max_offset: 0,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Udp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+        portable_startup: startup,
+        startup,
+        startup_native_window: None,
+        startup_metrics: None,
+        commands,
+        mux_limits,
+        frames: frames_rx,
+    }
+    .guard_retirement();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    {
+        let operation = relay_path_open_with_deadline(deadline, async move {
+            std::future::pending::<()>().await;
+            Ok(carrier)
+        });
+        tokio::pin!(operation);
+        let opening = scope.complete(operation.as_mut());
+        tokio::pin!(opening);
+        assert!(opening.as_mut().now_or_never().is_none());
+        // The raw accepted value is already in the operation. Neither publishing
+        // this reason nor expiry polls the owner; both are ready on its next poll.
+        publisher.publish_reset(stream_id, crate::protocol::ResetReason::RemoteClosed);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(matches!(
+            opening.await,
+            Err(RuntimeError::RemoteReset(
+                crate::protocol::ResetReason::RemoteClosed
+            )),
+        ));
+    }
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut receivers),
+        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+    ));
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+}
+
+#[test]
 fn dropped_pending_attachment_queues_detach_and_local_close() {
     let stream_id = StreamId(92);
     let (opened, mut receivers) = pending_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
@@ -513,4 +696,233 @@ fn initial_open_retry_reuses_one_logical_stream_id() {
     .expect("second candidate");
     assert_eq!(first_stream_id, second.stream_id);
     assert_ne!(first_key, second.key);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_prepared_initial_successor_preserves_due_predecessor_decision() {
+    for early_decision in [false, true] {
+        let context = ClientPathContext::new(
+            vec![
+                "tcp://127.0.0.1:10132?max-tcp-carriers=1".parse().unwrap(),
+                "tcp://127.0.0.1:10133?max-tcp-carriers=1".parse().unwrap(),
+            ],
+            security(),
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        let key = |index| RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index,
+        };
+        let original_instance = next_carrier_path_instance_id();
+        let frozen_instance = RelayPathInstance {
+            key: key(1),
+            path_instance_id: next_carrier_path_instance_id(),
+            attachment_id: 0,
+        };
+        context.install_relay_path_instance_for_test(frozen_instance);
+        let stream_id = context.allocate_reliable_stream_id().unwrap();
+        let acquisition = crate::runtime::path::InitialOpenAcquisition::new(
+            context.session_id,
+            stream_id,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            2,
+        );
+        let original = acquisition
+            .launch_handle()
+            .begin(
+                0,
+                key(0),
+                Duration::from_secs(10),
+                if early_decision {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(10)
+                },
+                true,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let backend = original.begin_backend().unwrap();
+        backend.bind(original_instance).unwrap();
+        backend.submitted().unwrap();
+        tokio::time::advance(if early_decision {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(10)
+        })
+        .await;
+        assert!(backend.deadline().unwrap() > tokio::time::Instant::now());
+        let candidate = ReliableRelayReturnCandidate {
+            ordinal: 1,
+            key: key(1),
+            path_instance_id: Some(frozen_instance.path_instance_id),
+        };
+        let attempt = reserve_reliable_initial_plan_attempt(
+            &context,
+            stream_id,
+            TrafficClass::Latency,
+            candidate,
+        )
+        .unwrap();
+        context.install_relay_path_instance_for_test(RelayPathInstance {
+            path_instance_id: next_carrier_path_instance_id(),
+            ..frozen_instance
+        });
+        let (_abort, registration) = AbortHandle::new_pair();
+        let completion = open_initial_candidate(
+            &context,
+            attempt,
+            ReliableRelayOpenSpec::new(
+                TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
+                TrafficClass::Latency,
+            ),
+            TrafficClass::Latency,
+            candidate,
+            1,
+            false,
+            Some(0),
+            acquisition.launch_handle(),
+            registration,
+        )
+        .await;
+        assert!(matches!(
+            completion.result,
+            Err(RuntimeError::ReliablePathRetired)
+        ));
+        let predecessor =
+            acquisition.unstarted_predecessor(completion.candidate.ordinal, completion.predecessor);
+        assert_eq!(
+            predecessor,
+            Some(0),
+            "a reservation that never entered cannot orphan original Due ownership"
+        );
+        assert_eq!(acquisition.started_ordinals(), [0]);
+        assert!(
+            reserve_reliable_initial_plan_attempt(
+                &context,
+                stream_id,
+                TrafficClass::Latency,
+                candidate
+            )
+            .is_none(),
+            "the sole remaining frozen instance cannot be reserved"
+        );
+        // A stale reservation neither grants T nor cancels before original S.
+        assert_eq!(
+            acquisition.exhaust_successors(predecessor.unwrap()),
+            !early_decision
+        );
+        if early_decision {
+            let original_deadline = original.timing().unwrap().0;
+            assert_eq!(backend.deadline().unwrap(), original_deadline);
+            assert_eq!(acquisition.decision_deadline(0), Some(original_deadline));
+            tokio::time::advance(original_deadline - tokio::time::Instant::now()).await;
+        }
+        assert!(backend.deadline().unwrap() <= tokio::time::Instant::now());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn renewed_setup_fence_releases_prepared_load_and_keeps_ordinal_available() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:10134?max-tcp-carriers=1".parse().unwrap(),
+            "tcp://127.0.0.1:10135?max-tcp-carriers=1".parse().unwrap(),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    let key = |index| RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index,
+    };
+    let frozen_instance = RelayPathInstance {
+        key: key(1),
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 0,
+    };
+    context.install_relay_path_instance_for_test(frozen_instance);
+    let stream_id = context.allocate_reliable_stream_id().unwrap();
+    let pto = crate::model::timing::default_transport_pto();
+    let setup = pto.saturating_mul(path_open_serialized_exchanges(None));
+    let acquisition = crate::runtime::path::InitialOpenAcquisition::new(
+        context.session_id,
+        stream_id,
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        2,
+    );
+    let original = acquisition
+        .launch_handle()
+        .begin(0, key(0), setup, pto, true, None)
+        .unwrap()
+        .unwrap();
+    let backend = original.begin_backend().unwrap();
+    backend.bind(next_carrier_path_instance_id()).unwrap();
+    backend.submitted().unwrap();
+    tokio::time::advance(pto).await;
+    let launch = acquisition.launch_handle();
+    let candidate = ReliableRelayReturnCandidate {
+        ordinal: 1,
+        key: key(1),
+        path_instance_id: Some(frozen_instance.path_instance_id),
+    };
+    let attempt = reserve_reliable_initial_plan_attempt(
+        &context,
+        stream_id,
+        TrafficClass::Latency,
+        candidate,
+    )
+    .unwrap();
+    assert_eq!(context.health().lock().unwrap().tcp[1].active_flows, 1);
+    let retry = original.begin_backend().unwrap();
+    let (_abort, registration) = AbortHandle::new_pair();
+    let completion = open_initial_candidate(
+        &context,
+        attempt,
+        ReliableRelayOpenSpec::new(
+            TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
+            TrafficClass::Latency,
+        ),
+        TrafficClass::Latency,
+        candidate,
+        1,
+        false,
+        Some(0),
+        launch,
+        registration,
+    )
+    .await;
+    assert!(matches!(completion.result, Ok(None)));
+    assert_eq!(context.health().lock().unwrap().tcp[1].active_flows, 0);
+    assert_eq!(acquisition.started_ordinals(), [0]);
+    assert_eq!(
+        acquisition.unstarted_predecessor(candidate.ordinal, completion.predecessor),
+        Some(0)
+    );
+    assert_eq!(
+        acquisition.decision_deadline(0),
+        Some(original.timing().unwrap().0)
+    );
+    let reserved_again = reserve_reliable_initial_plan_attempt(
+        &context,
+        stream_id,
+        TrafficClass::Latency,
+        candidate,
+    )
+    .unwrap();
+    retry.bind(next_carrier_path_instance_id()).unwrap();
+    retry.submitted().unwrap();
+    assert!(
+        acquisition
+            .launch_handle()
+            .begin(1, key(1), setup, pto, false, Some(0))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(acquisition.started_ordinals(), [0, 1]);
+    drop(reserved_again);
+    assert_eq!(context.health().lock().unwrap().tcp[1].active_flows, 0);
 }

@@ -1,6 +1,6 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, ConfiguredMemberSlot, DatagramFlowId, DatagramId, Frame,
-    IpPacketId, IpTunnelId, NativeDeliverySnapshot, OffsetRange,
+    IpPacketId, IpTunnelId, NativeDeliverySnapshot, OffsetRange, PATH_METRIC_APPROXIMATE_MASK,
     PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics, PathUsage,
     PeerPathState, PeerPathStatus, PeerStatusCode, ResetReason, SessionId, StreamAttachmentPhase,
     StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr, UnderlayProtocol,
@@ -9,10 +9,13 @@ use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 15;
+// Version 16 adds explicit diagnostic provenance to PATH_METRICS. Keeping the
+// clean-break version visible prevents a v15 peer from silently decoding a
+// packet whose fixed-width metric payload has a different shape.
+const VERSION: u8 = 16;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
-const PATH_METRICS_ENCODED_LEN: usize = 116;
+const PATH_METRICS_ENCODED_LEN: usize = 117;
 const PEER_PATH_STATUS_ENCODED_LEN: usize = 2 + PATH_METRICS_ENCODED_LEN + 25;
 const PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN: usize = 11;
 
@@ -1174,6 +1177,7 @@ fn encode_path_metrics(out: &mut Vec<u8>, metrics: PathMetrics) {
     put_u8(out, u8::from(metrics.has_ack_derived_data_sample));
     put_u32(out, metrics.data_sample_count);
     put_u64(out, metrics.data_sample_bytes);
+    put_u8(out, metrics.approximate_metrics);
 }
 
 fn encode_native_delivery(out: &mut Vec<u8>, sample: Option<NativeDeliverySnapshot>) {
@@ -1240,10 +1244,12 @@ fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecErro
         has_ack_derived_data_sample: decode_bool(reader.get_u8()?)?,
         data_sample_count: reader.get_u32()?,
         data_sample_bytes: reader.get_u64()?,
+        approximate_metrics: reader.get_u8()?,
     };
     if metrics.rate_valid_for_us > PATH_METRICS_MAX_RATE_VALID_FOR_US
         || (!metrics.rate_observed && metrics.rate_valid_for_us != 0)
         || (metrics.pacing_rate_observed && !metrics.rate_observed)
+        || (metrics.approximate_metrics & !PATH_METRIC_APPROXIMATE_MASK) != 0
     {
         return Err(CodecError::InvalidPathMetrics);
     }

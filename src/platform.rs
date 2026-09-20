@@ -35,6 +35,8 @@ pub use config::{
     LinuxSocketMarkError, LinuxVpnConfig, ManagedVpnConfig, ManagedVpnConfigError, RouteMode,
 };
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) use desktop_routes::snapshot_process_vpn_environment_excluding_interface;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use desktop_routes::{
     SystemProcessHostNetworkBackend, SystemProcessMutationError, SystemProcessRollbackToken,
     snapshot_process_vpn_environment,

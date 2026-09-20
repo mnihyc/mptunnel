@@ -292,10 +292,11 @@ pub(crate) fn persistent_congestion_pto_backoff_multiplier() -> u32 {
 }
 
 pub(crate) fn path_open_serialized_exchanges(_path: Option<PathSnapshot>) -> u32 {
-    // Both carriers perform three serialized network exchanges before a new
-    // product stream is usable: transport establishment, authenticated path
-    // join, and product stream acceptance. QUIC removes TCP head-of-line
-    // recovery; it does not remove these application handshakes.
+    // A cold carrier covers transport establishment, authenticated path join,
+    // and product carrier admission. Full local OPEN/MAX submission establishes
+    // completion of the first two phases, so initial acquisition can price its
+    // remaining admission decision separately. Positive target credit remains
+    // distinct from this carrier-admission exchange.
     3
 }
 

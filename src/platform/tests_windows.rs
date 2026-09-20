@@ -53,6 +53,35 @@ fn explicit_source_binding_selects_its_native_interface() {
 }
 
 #[test]
+fn refreshed_route_snapshot_follows_a_replaced_native_interface() {
+    let old_default = route(AddressFamily::Ipv4, 7);
+    let new_default = route(AddressFamily::Ipv4, 11);
+    let old_environment = Arc::new(
+        ProcessVpnEnvironment::new([old_default], vec![]).expect("old native environment"),
+    );
+    let new_environment = Arc::new(
+        ProcessVpnEnvironment::new([new_default], vec![]).expect("new native environment"),
+    );
+    let binder = WindowsNativeSocketBinder::new(old_environment);
+
+    assert_eq!(
+        binder
+            .interface_index_for("203.0.113.42".parse().expect("remote"), None)
+            .expect("old route"),
+        7
+    );
+    // This is the boundary that the live protection retry updates after a
+    // stale IP_UNICAST_IF/IPV6_UNICAST_IF application reports a route error.
+    binder.replace_environment_for_test(new_environment);
+    assert_eq!(
+        binder
+            .interface_index_for("203.0.113.42".parse().expect("remote"), None)
+            .expect("refreshed route"),
+        11
+    );
+}
+
+#[test]
 fn interface_socket_options_use_windows_required_byte_order() {
     let index = 0x0102_0304;
     let (level, option, encoded) =

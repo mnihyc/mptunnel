@@ -227,6 +227,8 @@ pub(in crate::runtime) enum ReliablePathCommand {
     },
     OpenStream {
         stream_id: StreamId,
+        terminal: Option<super::PendingStreamTerminal>,
+        initial: Option<super::InitialOpenBackend>,
         attempt_id: ClientTcpOpenAttemptId,
         observed_carrier_instance: u64,
         target: TargetAddr,

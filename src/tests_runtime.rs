@@ -1904,23 +1904,46 @@ async fn pre_model_red_tcp_sibling_session_close_interrupts_a_backpressured_acto
 #[tokio::test(flavor = "multi_thread")]
 async fn tcp_native_carrier_loss_preserves_the_session_and_allows_reconnect() {
     let (path, first_server) = spawn_server_path(OutboundConfig::Direct).await;
-    let client = ClientPathContext::new(vec![path.clone()], security(), ResourceLimits::default())
-        .expect("client context");
+    let provider = Arc::new(CountingCarrierNetworkProvider::default());
+    let client = ClientPathContext::new_with_carrier_network(
+        vec![crate::config::ClientPathConfig {
+            name: "path-1".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: path.clone(),
+            security: security(),
+        }],
+        ResourceLimits::default(),
+        None,
+        0,
+        provider.clone(),
+    )
+    .expect("client context");
     client.tcp_sessions[0]
         .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(5))
         .await
         .expect("prepare first TCP carrier");
+    let first_instance = client.tcp_sessions[0]
+        .connection_instance_id()
+        .expect("first authenticated TCP instance");
+    let session_id = client.session_id;
+    let (retiring, release_retirement, old_commands) =
+        client.tcp_sessions[0].pause_native_retirement_for_test(first_instance);
     assert_eq!(client.authenticated_carriers.snapshot().live_count, 1);
+    assert_eq!(provider.socket_count(), 1);
 
     first_server.abort();
     let _ = first_server.await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while client.tcp_sessions[0].is_connection_ready() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("native loss withdraws only the failed carrier");
+    let withdrawal_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    assert_eq!(
+        tokio::time::timeout_at(withdrawal_deadline, retiring)
+            .await
+            .expect("native loss reaches readiness-cleared cleanup")
+            .expect("actual native retirement owner"),
+        first_instance
+    );
+    assert!(!client.tcp_sessions[0].is_connection_ready());
+    assert!(!client.tcp_sessions[0].can_establish());
+    assert_eq!(client.tcp_carrier_groups.occupied(0), Some(1));
     client
         .ensure_session_active()
         .expect("native carrier loss is not SESSION_CLOSE");
@@ -1929,10 +1952,98 @@ async fn tcp_native_carrier_loss_preserves_the_session_and_allows_reconnect() {
     let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
     let replacement_server =
         spawn_notified_server_path(path, 7, OutboundConfig::Direct, accepted_tx).await;
-    client.tcp_sessions[0]
-        .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(5))
+    let now = tokio::time::Instant::now();
+    let mut retry = vec![
+        crate::runtime::path::tcp::group::ClientTcpMemberRetry::new(now);
+        client.tcp_sessions.len()
+    ];
+    assert_eq!(old_commands.control_queue_len_for_test(), 0);
+    tokio::time::timeout_at(
+        withdrawal_deadline,
+        client.tcp_carrier_groups.reconcile(
+            &client,
+            crate::config::DEFAULT_PATH_PROBE_INTERVAL,
+            &mut retry,
+        ),
+    )
+    .await
+    .expect("production reconciliation waits for terminal actor ownership");
+    assert_eq!(old_commands.control_queue_len_for_test(), 0);
+    assert_eq!(provider.socket_count(), 1);
+    assert_eq!(
+        accepted_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+    assert!(!client.tcp_sessions[0].can_establish());
+    assert_eq!(client.tcp_carrier_groups.occupied(0), Some(1));
+    client.ensure_session_active().expect("no logical terminal");
+
+    // Readiness loss alone is insufficient for the one-attempt primitive:
+    // prove a real command selects the held, nonterminal old actor and loses
+    // only its response when that actor settles. This is not a retry policy.
+    let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut changes = client.tcp_carrier_groups.subscribe();
+    {
+        use std::future::Future;
+        let premature = client.tcp_sessions[0].prepare_connection(reconnect_deadline);
+        tokio::pin!(premature);
+        tokio::time::timeout_at(
+            reconnect_deadline,
+            std::future::poll_fn(|cx| {
+                assert!(premature.as_mut().poll(cx).is_pending());
+                match old_commands.control_queue_len_for_test() {
+                    0 => std::task::Poll::Pending,
+                    1 => std::task::Poll::Ready(()),
+                    count => panic!("one premature Prepare owns one command, got {count}"),
+                }
+            }),
+        )
         .await
-        .expect("reconnect after carrier-local native loss");
+        .expect("the one Prepare future actually enqueues on the old actor");
+        assert_eq!(old_commands.control_queue_len_for_test(), 1);
+        drop(release_retirement);
+        assert!(matches!(
+            tokio::time::timeout_at(reconnect_deadline, premature)
+                .await
+                .expect("old actor drops its queued response before the deadline"),
+            Err(RuntimeError::ReliablePathSessionClosed)
+        ));
+    }
+    client
+        .ensure_session_active()
+        .expect("one retiring actor does not retire its logical SessionId");
+    tokio::time::timeout_at(reconnect_deadline, async {
+        loop {
+            changes
+                .changed()
+                .await
+                .expect("durable actor settlement wake");
+            if client.tcp_sessions[0].can_establish()
+                && client.tcp_carrier_groups.occupied(0) == Some(0)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("terminal publication releases the exact physical reservation");
+    tokio::time::timeout_at(
+        reconnect_deadline,
+        client.tcp_carrier_groups.reconcile(
+            &client,
+            crate::config::DEFAULT_PATH_PROBE_INTERVAL,
+            &mut retry,
+        ),
+    )
+    .await
+    .expect("one normal reconciliation establishes the replacement");
+    let replacement_instance = client.tcp_sessions[0]
+        .connection_instance_id()
+        .expect("replacement is authenticated and ready");
+    assert_ne!(replacement_instance, first_instance);
+    assert_eq!(client.session_id, session_id);
+    assert_eq!(provider.socket_count(), 2);
+    assert_eq!(client.tcp_carrier_groups.occupied(0), Some(1));
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
             .await
@@ -3156,6 +3267,7 @@ fn server_test_bulk_path_metrics(path_id: PathId, delivery_rate_bps: u64) -> Pat
         has_ack_derived_data_sample: true,
         data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         data_sample_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2,
+        approximate_metrics: 0,
     }
 }
 

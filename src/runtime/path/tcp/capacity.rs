@@ -606,6 +606,7 @@ fn portable_tcp_receipt_metrics(path_id: PathId, direction: PathMetricDirection)
         has_ack_derived_data_sample: false,
         data_sample_count: 0,
         data_sample_bytes: 0,
+        approximate_metrics: 0,
     }
 }
 

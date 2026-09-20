@@ -16,12 +16,13 @@ use super::schema::{
     peer_status_code_name, underlay_name,
 };
 use super::snapshot::{SessionInventory, TelemetryAggregate, unix_millis};
-#[cfg(test)]
 use crate::model::capacity::RELIABLE_INITIAL_RTT;
-#[cfg(test)]
 use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::product::Network;
-use crate::protocol::{PathMetricDirection, PeerPathState, TargetAddr, UnderlayProtocol};
+use crate::protocol::{
+    PATH_METRIC_APPROXIMATE_LOSS, PATH_METRIC_APPROXIMATE_PACING, PATH_METRIC_APPROXIMATE_QUALITY,
+    PATH_METRIC_APPROXIMATE_RATE, PathMetricDirection, PeerPathState, TargetAddr, UnderlayProtocol,
+};
 use crate::runtime::path::model::{ClientPathObservation, path_snapshot};
 use crate::runtime::path::{
     AuthenticatedCarrierAvailability, ClientPathContext, ClientPathHealth, ClientPathHealthRecord,
@@ -453,6 +454,20 @@ pub(super) fn peer_status_result(
                         )
                     });
                 let latency_observed = path.metrics.srtt_us > 0;
+                // Peer PATH_METRICS has one age clock for its diagnostic
+                // bundle. Use it only when that bundle carries an observed
+                // rate as well as loss/ECN; otherwise we cannot claim a
+                // meaningful age for the retained diagnostic value.
+                let diagnostic_age_ms = (path.metrics.rate_observed && path.metrics.loss_observed)
+                    .then_some(u64::from(path.metrics.metric_age_us) / 1_000);
+                let ecn_age_ms = (path.metrics.rate_observed && path.metrics.ecn_observed)
+                    .then_some(u64::from(path.metrics.metric_age_us) / 1_000);
+                let approximate_rate =
+                    path.metrics.approximate_metrics & PATH_METRIC_APPROXIMATE_RATE != 0;
+                let approximate_pacing =
+                    path.metrics.approximate_metrics & PATH_METRIC_APPROXIMATE_PACING != 0;
+                let approximate_loss =
+                    path.metrics.approximate_metrics & PATH_METRIC_APPROXIMATE_LOSS != 0;
                 ManagementPeerPathStatus {
                     native_delivery: path.native_delivery.map(Into::into),
                     state: peer_path_state_name(path.state),
@@ -478,21 +493,41 @@ pub(super) fn peer_status_result(
                     latency_source: "peer_advisory",
                     delivery_rate_bps: Some(path.metrics.delivery_rate_bps.to_string()),
                     delivery_rate_observed: path.metrics.rate_observed,
-                    delivery_rate_source: "peer_advisory",
-                    delivery_rate_scope: "advisory",
-                    pacing_rate_bps: path
-                        .metrics
-                        .pacing_rate_observed
+                    delivery_rate_approximate: approximate_rate,
+                    quality_approximate: path.metrics.approximate_metrics
+                        & PATH_METRIC_APPROXIMATE_QUALITY
+                        != 0,
+                    delivery_rate_source: if approximate_rate {
+                        "tcp_info_bytes_out"
+                    } else {
+                        "peer_advisory"
+                    },
+                    delivery_rate_scope: if approximate_rate {
+                        "diagnostic"
+                    } else {
+                        "advisory"
+                    },
+                    pacing_rate_bps: (path.metrics.pacing_rate_observed || approximate_pacing)
                         .then(|| path.metrics.pacing_rate_bps.to_string()),
-                    pacing_rate_source: path
-                        .metrics
-                        .pacing_rate_observed
-                        .then_some("peer_advisory"),
-                    loss_ppm: path.metrics.loss_observed.then_some(path.metrics.loss_ppm),
+                    pacing_rate_approximate: approximate_pacing,
+                    pacing_rate_source: if approximate_pacing {
+                        Some("tcp_info_cwnd_rtt")
+                    } else {
+                        path.metrics.pacing_rate_observed.then_some("peer_advisory")
+                    },
+                    loss_ppm: (path.metrics.loss_observed || approximate_loss)
+                        .then_some(path.metrics.loss_ppm),
+                    loss_approximate: approximate_loss,
                     ecn_ppm: path.metrics.ecn_observed.then_some(path.metrics.ecn_ppm),
+                    loss_age_ms: diagnostic_age_ms,
+                    ecn_age_ms,
                     loss_observed: path.metrics.loss_observed,
                     ecn_observed: path.metrics.ecn_observed,
-                    loss_source: path.metrics.loss_observed.then_some("peer_advisory"),
+                    loss_source: if approximate_loss {
+                        Some("tcp_info_bytes_retrans")
+                    } else {
+                        path.metrics.loss_observed.then_some("peer_advisory")
+                    },
                     ecn_source: path.metrics.ecn_observed.then_some("peer_advisory"),
                     bytes_in_flight: path
                         .metrics
@@ -809,6 +844,32 @@ fn client_path_status(
     let ecn = (underlay == UnderlayProtocol::Udp)
         .then_some(observation.carrier_ecn_rate)
         .flatten();
+    let loss_age_ms = age_ms(now, record.carrier_loss_observed_at());
+    let ecn_age_ms = age_ms(now, record.carrier_ecn_observed_at());
+    let approximate_rate = observation.carrier_approximate_delivery_rate_bps;
+    let approximate_pacing = observation.carrier_approximate_pacing_rate_bps;
+    let approximate_loss = observation.carrier_approximate_loss_ppm;
+    let display_rate_bps = approximate_rate
+        .map(|rate| rate as f64)
+        .unwrap_or(rate.delivery_rate_bps);
+    let display_pacing_bps = approximate_pacing
+        .map(|rate| rate as f64)
+        .or_else(|| pacing.map(|(rate, _)| rate));
+    let display_loss_ppm = loss
+        .map(|(loss, _)| fraction_to_ppm(loss))
+        .or(approximate_loss);
+    let display_loss_age_ms = approximate_loss
+        .is_some()
+        .then(|| u64::from(observation.carrier_approximate_age_us) / 1_000)
+        .or(loss_age_ms);
+    let approximate_age_ms = approximate_rate
+        .or(approximate_pacing.map(|_| 0))
+        .or(approximate_loss.map(|_| 0))
+        .map(|_| u64::from(observation.carrier_approximate_age_us) / 1_000);
+    let approximate_horizon_ms = approximate_rate
+        .or(approximate_pacing)
+        .or(approximate_loss.map(|_| 0))
+        .and_then(|_| client_approximate_freshness_horizon_ms(observation));
     summary.add_path(
         snapshot,
         observation.manual_disabled,
@@ -851,17 +912,39 @@ fn client_path_status(
             .or(observation.measured_jitter_ms)
             .or_else(|| spec.metadata.initial_jitter_ms.map(f64::from)),
         latency_source: Some(client_latency_source(spec, observation)),
-        delivery_rate_bps: Some((rate.delivery_rate_bps.round() as u64).to_string()),
-        delivery_rate_observed: Some(rate.observed_at.is_some()),
-        delivery_rate_source: Some(rate.source),
-        delivery_rate_scope: Some(rate.scope),
-        pacing_rate_bps: pacing.map(|(rate, _)| (rate.round() as u64).to_string()),
-        pacing_rate_source: pacing.map(|_| "native_carrier"),
-        loss_ppm: loss.map(|(loss, _)| fraction_to_ppm(loss)),
+        delivery_rate_bps: Some((display_rate_bps.round() as u64).to_string()),
+        delivery_rate_observed: Some(approximate_rate.is_none() && rate.observed_at.is_some()),
+        delivery_rate_approximate: Some(approximate_rate.is_some()),
+        quality_approximate: Some(approximate_rate.is_some()),
+        delivery_rate_source: Some(if approximate_rate.is_some() {
+            "tcp_info_bytes_out"
+        } else {
+            rate.source
+        }),
+        delivery_rate_scope: Some(if approximate_rate.is_some() {
+            "diagnostic"
+        } else {
+            rate.scope
+        }),
+        pacing_rate_bps: display_pacing_bps.map(|rate| (rate.round() as u64).to_string()),
+        pacing_rate_approximate: Some(approximate_pacing.is_some()),
+        pacing_rate_source: display_pacing_bps.map(|_| {
+            if approximate_pacing.is_some() {
+                "tcp_info_cwnd_rtt"
+            } else {
+                "native_carrier"
+            }
+        }),
+        loss_ppm: display_loss_ppm,
+        loss_approximate: Some(approximate_loss.is_some()),
         ecn_ppm: ecn.map(fraction_to_ppm),
+        loss_age_ms: display_loss_age_ms,
+        ecn_age_ms,
         loss_observed: Some(loss.is_some()),
         ecn_observed: Some(ecn.is_some()),
-        loss_source: loss.map(|(_, source)| source),
+        loss_source: loss
+            .map(|(_, source)| source)
+            .or_else(|| approximate_loss.map(|_| "tcp_info_bytes_retrans")),
         ecn_source: ecn.map(|_| "native_carrier"),
         queue_bytes: observation
             .carrier_queue_bytes_observed
@@ -878,10 +961,13 @@ fn client_path_status(
         active_latency_sensitive_flows: snapshot.active_latency_sensitive_flows,
         delivery_samples: rate.samples,
         data_sample_bytes: rate.sample_bytes.map(|bytes| bytes.to_string()),
-        last_delivery_age_ms: age_ms(now, rate.observed_at),
-        pacing_age_ms: pacing.and_then(|(_, observed_at)| age_ms(now, Some(observed_at))),
-        freshness_horizon_ms: rate.freshness_horizon_ms,
-        metric_age_scope: rate.observed_at.map(|_| "delivery"),
+        last_delivery_age_ms: approximate_age_ms.or_else(|| age_ms(now, rate.observed_at)),
+        pacing_age_ms: approximate_age_ms
+            .or_else(|| pacing.and_then(|(_, observed_at)| age_ms(now, Some(observed_at)))),
+        freshness_horizon_ms: approximate_horizon_ms.or(rate.freshness_horizon_ms),
+        metric_age_scope: approximate_age_ms
+            .map(|_| "transport_diagnostic")
+            .or_else(|| rate.observed_at.map(|_| "delivery")),
         native_delivery_observed: Some(rate_diagnostics.carrier_delivery_samples > 0),
         product_delivery_observed: Some(rate_diagnostics.product_delivery_samples > 0),
         ack_derived_data_observed: Some(
@@ -937,12 +1023,18 @@ fn collect_server(
             latency_source: None,
             delivery_rate_bps: None,
             delivery_rate_observed: None,
+            delivery_rate_approximate: None,
+            quality_approximate: None,
             delivery_rate_source: None,
             delivery_rate_scope: None,
             pacing_rate_bps: None,
+            pacing_rate_approximate: None,
             pacing_rate_source: None,
             loss_ppm: None,
+            loss_approximate: None,
             ecn_ppm: None,
+            loss_age_ms: None,
+            ecn_age_ms: None,
             loss_observed: None,
             ecn_observed: None,
             loss_source: None,
@@ -1002,6 +1094,16 @@ fn collect_server(
         let metrics = path.metrics;
         let carrier_rate_sample = path.carrier_delivery_rate_sample;
         let metric_source = server_metric_source(path.source);
+        let approximate_rate = metrics
+            .is_some_and(|metrics| metrics.approximate_metrics & PATH_METRIC_APPROXIMATE_RATE != 0);
+        let approximate_pacing = metrics.is_some_and(|metrics| {
+            metrics.approximate_metrics & PATH_METRIC_APPROXIMATE_PACING != 0
+        });
+        let approximate_loss = metrics
+            .is_some_and(|metrics| metrics.approximate_metrics & PATH_METRIC_APPROXIMATE_LOSS != 0);
+        let approximate_quality = metrics.is_some_and(|metrics| {
+            metrics.approximate_metrics & PATH_METRIC_APPROXIMATE_QUALITY != 0
+        });
         let rate_source = if carrier_rate_sample.is_some() {
             Some("native_carrier")
         } else {
@@ -1019,7 +1121,28 @@ fn collect_server(
                 metrics
                     .filter(|_| measured_at)
                     .map(|metrics| u64::from(metrics.metric_age_us) / 1_000)
+            })
+            .or_else(|| {
+                metrics
+                    .filter(|_| approximate_rate || approximate_pacing || approximate_loss)
+                    .map(|metrics| u64::from(metrics.metric_age_us) / 1_000)
             });
+        // Server-side PathMetrics carries a single age for the measured
+        // delivery bundle. It is a conservative diagnostic age for loss/ECN
+        // when those observations travelled with that measured bundle; exact
+        // local-carrier ages are exposed from ClientPathHealthRecord below.
+        let loss_age_ms = metrics
+            .filter(|metrics| metrics.rate_observed && metrics.loss_observed)
+            .map(|metrics| u64::from(metrics.metric_age_us) / 1_000)
+            .or_else(|| {
+                approximate_loss
+                    .then_some(metrics)
+                    .flatten()
+                    .map(|metrics| u64::from(metrics.metric_age_us) / 1_000)
+            });
+        let ecn_age_ms = metrics
+            .filter(|metrics| metrics.rate_observed && metrics.ecn_observed)
+            .map(|metrics| u64::from(metrics.metric_age_us) / 1_000);
         let configured_path = context
             .configured_path_names
             .get(path.configured_index)
@@ -1059,9 +1182,17 @@ fn collect_server(
                 .or_else(|| metrics.map(|metrics| metrics.delivery_rate_bps.to_string())),
             delivery_rate_observed: metrics
                 .map(|metrics| carrier_rate_sample.is_some() || metrics.rate_observed),
-            delivery_rate_source: metrics.and(rate_source),
+            delivery_rate_approximate: metrics.map(|_| approximate_rate),
+            quality_approximate: metrics.map(|_| approximate_quality),
+            delivery_rate_source: metrics.and(if approximate_rate {
+                Some("tcp_info_bytes_out")
+            } else {
+                rate_source
+            }),
             delivery_rate_scope: metrics.map(|_| {
-                if path.source == Some("peer_hint") {
+                if approximate_rate {
+                    "diagnostic"
+                } else if path.source == Some("peer_hint") {
                     "advisory"
                 } else {
                     "path_capacity"
@@ -1075,29 +1206,38 @@ fn collect_server(
                         .is_none()
                         .then(|| {
                             metrics
-                                .filter(|metrics| metrics.pacing_rate_observed)
+                                .filter(|metrics| {
+                                    metrics.pacing_rate_observed || approximate_pacing
+                                })
                                 .map(|metrics| metrics.pacing_rate_bps.to_string())
                         })
                         .flatten()
                 }),
+            pacing_rate_approximate: metrics.map(|_| approximate_pacing),
             pacing_rate_source: if let Some(sample) = carrier_rate_sample {
                 sample.pacing_rate_bps.map(|_| "native_carrier")
+            } else if approximate_pacing {
+                Some("tcp_info_cwnd_rtt")
             } else {
                 metrics
                     .filter(|metrics| metrics.pacing_rate_observed)
                     .and(rate_source)
             },
             loss_ppm: metrics
-                .filter(|metrics| metrics.loss_observed)
+                .filter(|metrics| metrics.loss_observed || approximate_loss)
                 .map(|metrics| metrics.loss_ppm),
+            loss_approximate: metrics.map(|_| approximate_loss),
             ecn_ppm: metrics
                 .filter(|metrics| metrics.ecn_observed)
                 .map(|metrics| metrics.ecn_ppm),
+            loss_age_ms,
+            ecn_age_ms,
             loss_observed: metrics.map(|metrics| metrics.loss_observed),
             ecn_observed: metrics.map(|metrics| metrics.ecn_observed),
             loss_source: metrics
                 .filter(|metrics| metrics.loss_observed)
-                .and(metric_source),
+                .and(metric_source)
+                .or_else(|| approximate_loss.then_some("tcp_info_bytes_retrans")),
             ecn_source: metrics
                 .filter(|metrics| metrics.ecn_observed)
                 .and(metric_source),
@@ -1402,6 +1542,27 @@ fn client_rate_freshness_horizon_ms(
     )
 }
 
+fn client_approximate_freshness_horizon_ms(observation: ClientPathObservation) -> Option<u64> {
+    let srtt_ms = observation
+        .carrier_srtt_ms
+        .or(observation.measured_srtt_ms)
+        .unwrap_or(RELIABLE_INITIAL_RTT.as_secs_f64() * 1_000.0)
+        .max(0.001);
+    let rttvar_ms = observation
+        .carrier_rttvar_ms
+        .or(observation.measured_jitter_ms)
+        .unwrap_or(srtt_ms / 8.0)
+        .max(0.0);
+    Some(
+        transport_rate_sample_freshness_horizon(
+            Duration::from_secs_f64(srtt_ms / 1_000.0),
+            Duration::from_secs_f64(rttvar_ms / 1_000.0),
+        )
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64,
+    )
+}
+
 fn client_latency_source(spec: &PathSpec, observation: ClientPathObservation) -> &'static str {
     if observation.carrier_srtt_ms.is_some() || observation.carrier_rttvar_ms.is_some() {
         "native_carrier"
@@ -1619,6 +1780,7 @@ mod tests {
             has_ack_derived_data_sample: true,
             data_sample_count: 0,
             data_sample_bytes: 0,
+            approximate_metrics: 0,
         }
     }
 

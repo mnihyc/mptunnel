@@ -250,6 +250,7 @@ impl ClientTcpPathSessionHandle {
     }
 
     // The open boundary transfers the complete logical-stream ownership envelope.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) async fn open_stream_with_deadlines(
         &self,
@@ -261,7 +262,7 @@ impl ClientTcpPathSessionHandle {
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
-        self.complete_session_operation(self.open_stream_with_deadlines_active(
+        self.open_stream_with_deadlines_scoped(
             stream_id,
             target,
             lane,
@@ -269,8 +270,51 @@ impl ClientTcpPathSessionHandle {
             return_plan,
             open_deadlines,
             advertised_recv_max_offset,
-        ))
+            None,
+            None,
+        )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) async fn open_stream_with_deadlines_scoped(
+        &self,
+        stream_id: StreamId,
+        target: TargetAddr,
+        lane: TrafficClass,
+        initial_demand: StreamDemandHint,
+        return_plan: crate::protocol::StreamReturnPlan,
+        open_deadlines: ClientTcpOpenDeadlines,
+        advertised_recv_max_offset: u64,
+        terminal: Option<crate::runtime::path::ClientStreamTerminalScope>,
+        initial: Option<crate::runtime::path::InitialOpenAttempt>,
+    ) -> Result<ClientTcpOpenedStream, RuntimeError> {
+        if let Some(initial) = &initial {
+            initial.validate(self.runtime.session_id, stream_id)?;
+        }
+        let (terminal, owner) = crate::runtime::path::ClientStreamTerminalScope::for_open(
+            terminal,
+            self.runtime.session_id,
+            stream_id,
+        )?;
+        let mut opened = {
+            let opening = self.open_stream_with_deadlines_active(
+                stream_id,
+                target,
+                lane,
+                initial_demand,
+                return_plan,
+                open_deadlines,
+                advertised_recv_max_offset,
+                &terminal,
+                initial.as_ref(),
+            );
+            tokio::pin!(opening);
+            self.complete_session_operation(terminal.complete(opening.as_mut()))
+                .await
+        }?;
+        opened.carrier.terminal_owner = owner;
+        Ok(opened)
     }
 
     // This private continuation deliberately mirrors the public ownership envelope.
@@ -284,15 +328,19 @@ impl ClientTcpPathSessionHandle {
         return_plan: crate::protocol::StreamReturnPlan,
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
+        terminal: &crate::runtime::path::ClientStreamTerminalScope,
+        initial: Option<&crate::runtime::path::InitialOpenAttempt>,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
         let mut changes = self.runtime.carrier_groups.subscribe();
         loop {
+            terminal.ensure_active()?;
             let (session, observed_carrier_instance) = self
                 .wait_for_ready_session_slot(&mut changes, open_deadlines.setup)
                 .await?;
             let commands = session.commands.clone();
             let (response_tx, response_rx) = oneshot::channel();
             let attempt_id = next_client_tcp_open_attempt_id();
+            let initial_backend = initial.map(|initial| initial.begin_backend()).transpose()?;
             let wait_for_deadline = || async {
                 tokio::time::sleep_until(open_deadlines.live).await;
                 if !self.session_slot_is_current(session.path_id) {
@@ -303,6 +351,8 @@ impl ClientTcpPathSessionHandle {
                 biased;
                 result = commands.send_control(ReliablePathCommand::OpenStream {
                     stream_id,
+                    terminal: Some(terminal.pending_input()),
+                    initial: initial_backend.clone(),
                     attempt_id,
                     observed_carrier_instance,
                     target: target.clone(),
@@ -336,10 +386,22 @@ impl ClientTcpPathSessionHandle {
                     }
                     Err(_) => return Err(RuntimeError::ReliablePathSessionClosed),
                 },
-                _ = wait_for_deadline() => return Err(RuntimeError::PathOpenTimedOut),
+                error = async {
+                    match &initial_backend {
+                        Some(initial) => initial.expired().await,
+                        None => {
+                            wait_for_deadline().await;
+                            RuntimeError::PathOpenTimedOut
+                        }
+                    }
+                } => return Err(error),
             };
             match response {
-                ClientTcpOpenResponse::Opened(opened) => {
+                ClientTcpOpenResponse::Opened(mut opened) => {
+                    // The response now leaves the cancellation guard's custody.
+                    // Preserve ordered retirement if a logical terminal or an
+                    // outer owner discards this accepted value before attach.
+                    opened.carrier = opened.carrier.guard_retirement();
                     cancellation.disarm();
                     if self
                         .try_commit_opened_stream(session.path_id, opened.carrier.path_instance_id)
@@ -740,6 +802,43 @@ impl ClientTcpPathSessionHandle {
     #[cfg(test)]
     pub(in crate::runtime) fn is_connection_ready(&self) -> bool {
         self.connection_instance_id().is_some()
+    }
+
+    /// Holds one actual native-loss cleanup after readiness withdrawal. The
+    /// fixture owns `release`; dropping it also releases the actor's wait.
+    #[cfg(test)]
+    pub(in crate::runtime) fn pause_native_retirement_for_test(
+        &self,
+        expected_instance: CarrierPathInstanceId,
+    ) -> (
+        oneshot::Receiver<CarrierPathInstanceId>,
+        oneshot::Sender<()>,
+        ReliablePathCommandSender,
+    ) {
+        let commands = {
+            let member = self.member.lock().expect("TCP carrier member lock");
+            assert_eq!(self.connection_instance_id(), Some(expected_instance));
+            let current = member.current.as_ref().expect("ready TCP actor slot");
+            assert!(!current.terminal.load(Ordering::Acquire));
+            current.commands.clone()
+        };
+        let (reached, observed) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let mut pause = self
+            .runtime
+            .native_retirement_pause
+            .lock()
+            .expect("test native retirement pause lock");
+        assert!(
+            pause.is_none(),
+            "one exact native retirement pause per fixture"
+        );
+        *pause = Some(state::ClientTcpNativeRetirementPause {
+            path_instance_id: expected_instance,
+            reached,
+            release: released,
+        });
+        (observed, release, commands)
     }
 
     pub(in crate::runtime) fn connection_remote_port(&self) -> Option<u16> {

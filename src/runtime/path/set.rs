@@ -589,6 +589,8 @@ impl ClientPathContext {
                     ip_tunnels: ip_tunnels.clone(),
                     endpoint_policy,
                     carrier_groups: tcp_carrier_groups.clone(),
+                    #[cfg(test)]
+                    native_retirement_pause: Default::default(),
                 })
             })
             .collect::<Vec<_>>();

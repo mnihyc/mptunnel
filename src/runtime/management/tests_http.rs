@@ -359,7 +359,10 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("function pathQualities(paths, result, tableKey)"));
     assert!(DASHBOARD_JS.contains("QUALITY_PAYLOAD_BYTES * 8 / rate * 1000"));
     assert!(DASHBOARD_JS.contains("quality.sharePpm = quality.rate * 1000000 / group.totalRate;"));
-    assert!(DASHBOARD_JS.contains("quality.shareApproximate = group.count > 1;"));
+    assert!(
+        DASHBOARD_JS
+            .contains("quality.shareApproximate = quality.shareApproximate || group.count > 1;")
+    );
     assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.lastReceivedAt)"));
     assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.peerResultReceivedAt)"));
     assert!(DASHBOARD_JS.contains("Math.max(0, generatedAt - receivedAt)"));

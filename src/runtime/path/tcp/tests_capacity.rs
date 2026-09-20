@@ -473,6 +473,7 @@ fn request_tcp_proof_metrics(path_index: usize) -> PathMetrics {
         has_ack_derived_data_sample: true,
         data_sample_count: 1,
         data_sample_bytes: 256 * 1024,
+        approximate_metrics: 0,
     }
 }
 

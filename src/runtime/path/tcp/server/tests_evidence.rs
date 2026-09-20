@@ -45,6 +45,7 @@ fn baseline_metrics() -> PathMetrics {
         has_ack_derived_data_sample: false,
         data_sample_count: 0,
         data_sample_bytes: 0,
+        approximate_metrics: 0,
     }
 }
 

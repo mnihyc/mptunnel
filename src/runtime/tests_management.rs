@@ -774,6 +774,7 @@ fn server_tcp_app_limited_refresh_preserves_frozen_rate_and_pacing_provenance() 
                 has_ack_derived_data_sample: false,
                 data_sample_count: 0,
                 data_sample_bytes: 0,
+                approximate_metrics: 0,
             },
             false,
             Some(crate::runtime::path::CarrierDeliveryRateSample {
@@ -962,6 +963,7 @@ fn peer_status_projects_local_path_identity_for_a_draining_authenticated_assignm
                 has_ack_derived_data_sample: false,
                 data_sample_count: 0,
                 data_sample_bytes: 0,
+                approximate_metrics: 0,
             },
         }],
         local_paths: std::collections::BTreeMap::from([(

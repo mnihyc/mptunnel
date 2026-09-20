@@ -144,6 +144,19 @@ impl Default for StreamReturnPlan {
 /// values so an untrusted peer cannot manufacture unbounded rate authority.
 pub const PATH_METRICS_MAX_RATE_VALID_FOR_US: u64 = 64_424_584_425;
 
+/// Diagnostic provenance bits for values that are useful on hosts whose TCP
+/// API does not expose the Linux ACK/pacing/loss counters. These bits never
+/// grant scheduling or delivery authority; they only tell a management or
+/// peer-diagnosis consumer why a value is present.
+pub const PATH_METRIC_APPROXIMATE_RATE: u8 = 1 << 0;
+pub const PATH_METRIC_APPROXIMATE_PACING: u8 = 1 << 1;
+pub const PATH_METRIC_APPROXIMATE_LOSS: u8 = 1 << 2;
+pub const PATH_METRIC_APPROXIMATE_QUALITY: u8 = 1 << 3;
+pub const PATH_METRIC_APPROXIMATE_MASK: u8 = PATH_METRIC_APPROXIMATE_RATE
+    | PATH_METRIC_APPROXIMATE_PACING
+    | PATH_METRIC_APPROXIMATE_LOSS
+    | PATH_METRIC_APPROXIMATE_QUALITY;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathMetrics {
     pub path_id: PathId,
@@ -187,6 +200,9 @@ pub struct PathMetrics {
     pub has_ack_derived_data_sample: bool,
     pub data_sample_count: u32,
     pub data_sample_bytes: u64,
+    /// Bitmask of diagnostic values derived from a platform substitute rather
+    /// than the native metric named by the field. This is explicitly advisory.
+    pub approximate_metrics: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

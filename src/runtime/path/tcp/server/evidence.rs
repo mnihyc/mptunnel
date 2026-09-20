@@ -512,6 +512,9 @@ fn project_tcp_delivery_rate_sample(
     sample: CarrierDeliveryRateSample,
     now: Instant,
 ) {
+    // A qualified ACK epoch supersedes any platform-substitute diagnostic
+    // value retained from an earlier partial poll.
+    metrics.approximate_metrics = 0;
     let qualified_epoch =
         sample.sample_count > 0 && sample.sample_bytes > 0 && sample.observed_at <= now;
     metrics.delivery_rate_bps = sample.delivery_rate_bps.max(1);
@@ -554,15 +557,20 @@ fn merge_local_tcp_metrics(
     }
     let mut metrics = current?;
     observation.apply_transport_shape(&mut metrics);
+    observation.apply_diagnostic_fallback(&mut metrics);
     metrics.metric_epoch = metric_epoch_now();
-    metrics.metric_age_us = 0;
+    if observation.has_approximate_sample() {
+        metrics.metric_age_us = 0;
+    }
     // A partial shape observation is not a new rate epoch. The retained typed
     // sample, when present, is projected immediately by the caller with its
     // original deadline.
     metrics.rate_valid_for_us = 0;
     metrics.rate_observed = false;
     metrics.pacing_rate_observed = false;
-    metrics.pacing_rate_bps = metrics.delivery_rate_bps;
+    if metrics.approximate_metrics == 0 {
+        metrics.pacing_rate_bps = metrics.delivery_rate_bps;
+    }
     Some(metrics)
 }
 

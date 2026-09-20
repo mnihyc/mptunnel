@@ -66,6 +66,7 @@ fn local_timing_metrics(
         has_ack_derived_data_sample: true,
         data_sample_count: 1,
         data_sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
+        approximate_metrics: 0,
     };
     ServerPathMetricsEntry {
         metrics,

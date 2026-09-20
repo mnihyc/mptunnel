@@ -32,6 +32,7 @@ fn remote_metrics() -> PathMetrics {
         has_ack_derived_data_sample: true,
         data_sample_count: 8,
         data_sample_bytes: 512 * 1024,
+        approximate_metrics: 0,
     }
 }
 
@@ -125,6 +126,7 @@ fn remote_ack_reachability_without_sample_volume_is_not_rate_capacity() {
     let observation = remote_path_metrics_observation(PathMetrics {
         data_sample_count: 0,
         data_sample_bytes: 0,
+        approximate_metrics: 0,
         ..metrics
     })
     .expect("same-direction peer advisory");

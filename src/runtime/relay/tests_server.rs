@@ -2304,6 +2304,7 @@ fn record_server_delivery_evidence_with_srtt(
             has_ack_derived_data_sample: true,
             data_sample_count: 1,
             data_sample_bytes: 65_536,
+            approximate_metrics: 0,
         },
         ServerPathMetricsSource::LocalSender,
     );
@@ -4359,6 +4360,7 @@ fn live_tail_reinjection_timer_uses_blocking_original_snapshot() {
         has_ack_derived_data_sample: true,
         data_sample_count: 1,
         data_sample_bytes: 65_536,
+        approximate_metrics: 0,
     };
     let fast_alternate_metrics = PathMetrics {
         path_id: fast_alternate.path_id,

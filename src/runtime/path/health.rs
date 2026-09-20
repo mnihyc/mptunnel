@@ -120,6 +120,10 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     carrier_ecn_observed_at: Option<Instant>,
     pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_pacing_rate_bps: Option<f64>,
+    pub(in crate::runtime) carrier_approximate_delivery_rate_bps: Option<u64>,
+    pub(in crate::runtime) carrier_approximate_pacing_rate_bps: Option<u64>,
+    pub(in crate::runtime) carrier_approximate_loss_ppm: Option<u32>,
+    carrier_approximate_observed_at: Option<Instant>,
     pub(in crate::runtime) carrier_bytes_in_flight: u64,
     pub(in crate::runtime) carrier_bytes_in_flight_observed: bool,
     pub(in crate::runtime) carrier_queue_bytes: u64,
@@ -271,6 +275,10 @@ impl Default for ClientPathHealthRecord {
             carrier_ecn_observed_at: None,
             carrier_delivery_rate_bps: None,
             carrier_pacing_rate_bps: None,
+            carrier_approximate_delivery_rate_bps: None,
+            carrier_approximate_pacing_rate_bps: None,
+            carrier_approximate_loss_ppm: None,
+            carrier_approximate_observed_at: None,
             carrier_bytes_in_flight: 0,
             carrier_bytes_in_flight_observed: false,
             carrier_queue_bytes: 0,
@@ -892,6 +900,18 @@ impl ClientPathHealthRecord {
                 self.carrier_loss_observed_at = None;
             }
         }
+        if observation.has_approximate_sample() {
+            if let Some(rate) = observation.approximate_delivery_rate_bps() {
+                self.carrier_approximate_delivery_rate_bps = Some(rate);
+            }
+            if let Some(rate) = observation.approximate_pacing_rate_bps() {
+                self.carrier_approximate_pacing_rate_bps = Some(rate);
+            }
+            if let Some(loss_ppm) = observation.approximate_loss_ppm() {
+                self.carrier_approximate_loss_ppm = Some(loss_ppm);
+            }
+            self.carrier_approximate_observed_at = Some(now);
+        }
         if let Some(app_limited) = observation.app_limited() {
             self.carrier_current_app_limited = Some(app_limited);
         }
@@ -984,6 +1004,13 @@ impl ClientPathHealthRecord {
         } else {
             0
         };
+        let carrier_approximate_age_us = self
+            .carrier_approximate_observed_at
+            .map(|observed_at| {
+                u32::try_from(now.saturating_duration_since(observed_at).as_micros())
+                    .unwrap_or(u32::MAX)
+            })
+            .unwrap_or(0);
         ClientPathObservation {
             native_delivery: self.native_delivery,
             state,
@@ -1060,6 +1087,10 @@ impl ClientPathHealthRecord {
             .then_some(self.native_authority_pacing_rate_bps)
             .flatten()
             .or(fresh_carrier_pacing),
+            carrier_approximate_delivery_rate_bps: self.carrier_approximate_delivery_rate_bps,
+            carrier_approximate_pacing_rate_bps: self.carrier_approximate_pacing_rate_bps,
+            carrier_approximate_loss_ppm: self.carrier_approximate_loss_ppm,
+            carrier_approximate_age_us,
             carrier_bytes_in_flight: self.carrier_bytes_in_flight,
             carrier_bytes_in_flight_observed: self.carrier_bytes_in_flight_observed,
             carrier_queue_bytes: self.carrier_queue_bytes,
@@ -1834,6 +1865,10 @@ impl ClientPathHealthRecord {
         self.carrier_ecn_rate = None;
         self.carrier_loss_observed_at = None;
         self.carrier_ecn_observed_at = None;
+        self.carrier_approximate_delivery_rate_bps = None;
+        self.carrier_approximate_pacing_rate_bps = None;
+        self.carrier_approximate_loss_ppm = None;
+        self.carrier_approximate_observed_at = None;
         self.carrier_bytes_in_flight = 0;
         self.carrier_bytes_in_flight_observed = false;
         self.carrier_queue_bytes = 0;

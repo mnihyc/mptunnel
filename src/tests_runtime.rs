@@ -3267,6 +3267,7 @@ fn server_test_bulk_path_metrics(path_id: PathId, delivery_rate_bps: u64) -> Pat
         has_ack_derived_data_sample: true,
         data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         data_sample_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2,
+        approximate_metrics: 0,
     }
 }
 

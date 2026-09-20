@@ -69,6 +69,7 @@ fn snapshot_from_tcp_info(info: &TCP_INFO_v0) -> Option<TcpNativeSnapshot> {
         notsent_bytes: None,
         // BytesOut counts transmitted bytes, not cumulatively acknowledged bytes.
         bytes_acked: None,
+        bytes_transmitted: Some(u64::from(info.BytesOut)),
         // Windows reports retransmitted bytes rather than Linux-style segments.
         retransmission_counter: Some(u64::from(info.BytesRetrans)),
         loss: None,

@@ -81,6 +81,7 @@ fn native_quic_test_metrics(path_id: PathId) -> PathMetrics {
         has_ack_derived_data_sample: true,
         data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         data_sample_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
+        approximate_metrics: 0,
     }
 }
 

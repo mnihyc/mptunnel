@@ -93,6 +93,7 @@ pub(super) fn parse_tcp_info_prefix(bytes: &[u8], returned: usize) -> Option<Tcp
         flight,
         pacing_rate_bytes_per_second: (available >= 112).then(|| u64_at(104)),
         bytes_acked: (available >= 128).then(|| u64_at(120)),
+        bytes_transmitted: None,
         notsent_bytes: (available >= 148).then(|| u32_at(144)),
         // `tcpi_total_retrans` is a segment counter. Keep it independent from
         // the later data-segments-out field needed to calculate a loss ratio.

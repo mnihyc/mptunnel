@@ -453,6 +453,14 @@ pub(super) fn peer_status_result(
                         )
                     });
                 let latency_observed = path.metrics.srtt_us > 0;
+                // Peer PATH_METRICS has one age clock for its diagnostic
+                // bundle. Use it only when that bundle carries an observed
+                // rate as well as loss/ECN; otherwise we cannot claim a
+                // meaningful age for the retained diagnostic value.
+                let diagnostic_age_ms = (path.metrics.rate_observed && path.metrics.loss_observed)
+                    .then_some(u64::from(path.metrics.metric_age_us) / 1_000);
+                let ecn_age_ms = (path.metrics.rate_observed && path.metrics.ecn_observed)
+                    .then_some(u64::from(path.metrics.metric_age_us) / 1_000);
                 ManagementPeerPathStatus {
                     native_delivery: path.native_delivery.map(Into::into),
                     state: peer_path_state_name(path.state),
@@ -490,6 +498,8 @@ pub(super) fn peer_status_result(
                         .then_some("peer_advisory"),
                     loss_ppm: path.metrics.loss_observed.then_some(path.metrics.loss_ppm),
                     ecn_ppm: path.metrics.ecn_observed.then_some(path.metrics.ecn_ppm),
+                    loss_age_ms: diagnostic_age_ms,
+                    ecn_age_ms,
                     loss_observed: path.metrics.loss_observed,
                     ecn_observed: path.metrics.ecn_observed,
                     loss_source: path.metrics.loss_observed.then_some("peer_advisory"),
@@ -809,6 +819,8 @@ fn client_path_status(
     let ecn = (underlay == UnderlayProtocol::Udp)
         .then_some(observation.carrier_ecn_rate)
         .flatten();
+    let loss_age_ms = age_ms(now, record.carrier_loss_observed_at());
+    let ecn_age_ms = age_ms(now, record.carrier_ecn_observed_at());
     summary.add_path(
         snapshot,
         observation.manual_disabled,
@@ -859,6 +871,8 @@ fn client_path_status(
         pacing_rate_source: pacing.map(|_| "native_carrier"),
         loss_ppm: loss.map(|(loss, _)| fraction_to_ppm(loss)),
         ecn_ppm: ecn.map(fraction_to_ppm),
+        loss_age_ms,
+        ecn_age_ms,
         loss_observed: Some(loss.is_some()),
         ecn_observed: Some(ecn.is_some()),
         loss_source: loss.map(|(_, source)| source),
@@ -943,6 +957,8 @@ fn collect_server(
             pacing_rate_source: None,
             loss_ppm: None,
             ecn_ppm: None,
+            loss_age_ms: None,
+            ecn_age_ms: None,
             loss_observed: None,
             ecn_observed: None,
             loss_source: None,
@@ -1020,6 +1036,16 @@ fn collect_server(
                     .filter(|_| measured_at)
                     .map(|metrics| u64::from(metrics.metric_age_us) / 1_000)
             });
+        // Server-side PathMetrics carries a single age for the measured
+        // delivery bundle. It is a conservative diagnostic age for loss/ECN
+        // when those observations travelled with that measured bundle; exact
+        // local-carrier ages are exposed from ClientPathHealthRecord below.
+        let loss_age_ms = metrics
+            .filter(|metrics| metrics.rate_observed && metrics.loss_observed)
+            .map(|metrics| u64::from(metrics.metric_age_us) / 1_000);
+        let ecn_age_ms = metrics
+            .filter(|metrics| metrics.rate_observed && metrics.ecn_observed)
+            .map(|metrics| u64::from(metrics.metric_age_us) / 1_000);
         let configured_path = context
             .configured_path_names
             .get(path.configured_index)
@@ -1093,6 +1119,8 @@ fn collect_server(
             ecn_ppm: metrics
                 .filter(|metrics| metrics.ecn_observed)
                 .map(|metrics| metrics.ecn_ppm),
+            loss_age_ms,
+            ecn_age_ms,
             loss_observed: metrics.map(|metrics| metrics.loss_observed),
             ecn_observed: metrics.map(|metrics| metrics.ecn_observed),
             loss_source: metrics

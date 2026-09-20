@@ -301,6 +301,10 @@ pub(super) struct ManagementPathStatus {
     pub(super) pacing_rate_source: Option<&'static str>,
     pub(super) loss_ppm: Option<u32>,
     pub(super) ecn_ppm: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) loss_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ecn_age_ms: Option<u64>,
     pub(super) loss_observed: Option<bool>,
     pub(super) ecn_observed: Option<bool>,
     pub(super) loss_source: Option<&'static str>,
@@ -426,6 +430,8 @@ pub(super) struct ManagementPeerPathStatus {
     pub(super) pacing_rate_source: Option<&'static str>,
     pub(super) loss_ppm: Option<u32>,
     pub(super) ecn_ppm: Option<u32>,
+    pub(super) loss_age_ms: Option<u64>,
+    pub(super) ecn_age_ms: Option<u64>,
     pub(super) loss_observed: bool,
     pub(super) ecn_observed: bool,
     pub(super) loss_source: Option<&'static str>,

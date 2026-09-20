@@ -1275,6 +1275,12 @@ fn quic_native_congestion_remains_diagnostic_without_becoming_product_feedback()
     metrics.loss_ppm = Some(125_000);
     metrics.ecn_ppm = Some(25_000);
     record.mark_quic_path_metrics(instance, metrics);
+    let loss_observed_at = record
+        .carrier_loss_observed_at()
+        .expect("native loss observation timestamp");
+    let ecn_observed_at = record
+        .carrier_ecn_observed_at()
+        .expect("native ECN observation timestamp");
 
     let observation = record.observation_at(Instant::now());
     assert_eq!(observation.carrier_loss_rate, Some(0.125));
@@ -1311,6 +1317,8 @@ fn quic_native_congestion_remains_diagnostic_without_becoming_product_feedback()
     let retained_observation = record.observation_at(Instant::now());
     assert_eq!(retained_observation.carrier_loss_rate, Some(0.125));
     assert_eq!(retained_observation.carrier_ecn_rate, Some(0.025));
+    assert_eq!(record.carrier_loss_observed_at(), Some(loss_observed_at));
+    assert_eq!(record.carrier_ecn_observed_at(), Some(ecn_observed_at));
     let retained_published = path_metrics_from_snapshot(
         path_snapshot(&path, 0, retained_observation),
         retained_observation,
@@ -1320,6 +1328,16 @@ fn quic_native_congestion_remains_diagnostic_without_becoming_product_feedback()
     assert_eq!(retained_published.loss_ppm, 125_000);
     assert!(retained_published.ecn_observed);
     assert_eq!(retained_published.ecn_ppm, 25_000);
+
+    // A native controller epoch is the only boundary that may revoke a
+    // retained diagnostic and its freshness clock when a partial poll has no
+    // loss/ECN value.
+    metrics.controller_path_epoch = 2;
+    record.mark_quic_path_metrics(instance, metrics);
+    assert_eq!(record.carrier_loss_rate, None);
+    assert_eq!(record.carrier_ecn_rate, None);
+    assert_eq!(record.carrier_loss_observed_at(), None);
+    assert_eq!(record.carrier_ecn_observed_at(), None);
 
     let unknown_instance = crate::model::path::next_carrier_path_instance_id();
     let mut unknown = ClientPathHealthRecord::default();

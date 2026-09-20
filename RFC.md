@@ -2726,6 +2726,18 @@ monotonic clock, this field is a remaining diagnostic horizon beginning at recei
 not a cross-host absolute deadline; transport time cannot increase the
 advertised duration.
 
+The management projection exposes `loss_age_ms` and `ecn_age_ms` when the
+local carrier has an actual native observation clock for those values. A
+partial same-carrier poll that reports no loss or ECN value retains the
+previous value and its observation age; a native carrier epoch reset clears
+both. These fields are diagnostic freshness metadata and do not grant
+scheduling, recovery, or Product-delivery authority. Peer advisory rows may
+only expose the age of the shared `PATH_METRICS` bundle, because this wire
+record has no independent loss/ECN timestamp; a management client therefore
+marks those values stale conservatively from the available bundle horizon.
+No `PATH_METRICS` wire-format change is implied by this management-only
+projection.
+
 The receiving peer MUST NOT install, reconstruct, refresh, or downshift a local
 advisory rate or NativeOperational value from this detached record; only the
 producer's exact local evidence owner may publish such local authority. The

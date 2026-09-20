@@ -730,6 +730,16 @@
     return Math.max(0, finiteNumber(path.pacing_age_ms)) + statusResidenceMs();
   }
 
+  function effectivePathLossAgeMs(path) {
+    if (!metricAvailable(path.loss_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.loss_age_ms)) + statusResidenceMs();
+  }
+
+  function effectivePathEcnAgeMs(path) {
+    if (!metricAvailable(path.ecn_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.ecn_age_ms)) + statusResidenceMs();
+  }
+
   function peerResultResidenceMs(result) {
     if (result && result === state.peerResult && state.peerResultReceivedAt > 0) {
       return Math.max(0, Date.now() - state.peerResultReceivedAt);
@@ -746,6 +756,16 @@
     if (!metricAvailable(path.metric_age_us)) return null;
     return Math.max(0, finiteNumber(path.metric_age_us) / 1000) +
       peerResultResidenceMs(result);
+  }
+
+  function effectivePeerLossAgeMs(path, result) {
+    if (!metricAvailable(path.loss_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.loss_age_ms)) + peerResultResidenceMs(result);
+  }
+
+  function effectivePeerEcnAgeMs(path, result) {
+    if (!metricAvailable(path.ecn_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.ecn_age_ms)) + peerResultResidenceMs(result);
   }
 
   function metricIsStale(ageMs, horizonMs) {
@@ -1945,6 +1965,14 @@
       path.freshness_horizon_ms
     );
     const snapshotStale = statusResidenceMs() >= staleAfterMs();
+    // Older peers do not carry independent loss/ECN clocks. Their measured
+    // bundle age is the safe fallback; local native records have exact ages.
+    const lossStale = snapshotStale ||
+      metricIsStale(effectivePathLossAgeMs(path), path.freshness_horizon_ms) ||
+      (!metricAvailable(path.loss_age_ms) && rateStale);
+    const ecnStale = snapshotStale ||
+      metricIsStale(effectivePathEcnAgeMs(path), path.freshness_horizon_ms) ||
+      (!metricAvailable(path.ecn_age_ms) && rateStale);
     const row = createElement("tr");
     appendCell(row, "State", stateIndicator(pathEffectiveState(path)));
 
@@ -2031,12 +2059,13 @@
     appendCell(row, "Rate", nativeRateCell(path, qualityValueObject, rateStale, pacingStale));
 
     const loss = createElement("div");
-    loss.append(createElement("span", "cell-primary", formatOptionalMetric(path.loss_ppm, formatPpm, snapshotStale)));
-    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, snapshotStale)));
+    loss.append(createElement("span", "cell-primary", formatOptionalMetric(path.loss_ppm, formatPpm, lossStale)));
+    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, ecnStale)));
     loss.title = [
       "Loss / ECN",
       "Loss source: " + (path.loss_source ? titleCase(path.loss_source) : "-"),
-      "Evidence: " + (snapshotStale ? "stale" : "current")
+      "Loss evidence: " + (lossStale ? "stale" : "current"),
+      "ECN evidence: " + (ecnStale ? "stale" : "current")
     ].join("\n");
     appendCell(row, "Loss", loss);
 
@@ -2287,6 +2316,12 @@
     const effectiveAgeMs = effectivePeerMetricAgeMs(path, result);
     const rateStale = metricIsStale(effectiveAgeMs, path.freshness_horizon_ms);
     const snapshotStale = peerResultResidenceMs(result) >= staleAfterMs();
+    const lossStale = snapshotStale ||
+      metricIsStale(effectivePeerLossAgeMs(path, result), path.freshness_horizon_ms) ||
+      (!metricAvailable(path.loss_age_ms) && rateStale);
+    const ecnStale = snapshotStale ||
+      metricIsStale(effectivePeerEcnAgeMs(path, result), path.freshness_horizon_ms) ||
+      (!metricAvailable(path.ecn_age_ms) && rateStale);
     const portStale = path.active_port_retired || snapshotStale;
     const row = createElement("tr");
     appendCell(row, "State", stateIndicator(path.state));
@@ -2350,14 +2385,16 @@
     appendCell(row, "Rate", nativeRateCell(path, qualityValueObject, rateStale, rateStale));
 
     const loss = createElement("div");
-    loss.append(createElement("span", "cell-primary", formatOptionalMetric(path.loss_ppm, formatPpm, snapshotStale)));
-    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, snapshotStale)));
+    loss.append(createElement("span", "cell-primary", formatOptionalMetric(path.loss_ppm, formatPpm, lossStale)));
+    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, ecnStale)));
     loss.title = [
       "Loss / ECN",
       "Loss source: " + (path.loss_source ? titleCase(path.loss_source) : "-"),
       "ECN source: " + (path.ecn_source ? titleCase(path.ecn_source) : "-"),
       "Loss observed: " + formatOptionalFlag(path.loss_observed),
-      "ECN observed: " + formatOptionalFlag(path.ecn_observed)
+      "ECN observed: " + formatOptionalFlag(path.ecn_observed),
+      "Loss evidence: " + (lossStale ? "stale" : "current"),
+      "ECN evidence: " + (ecnStale ? "stale" : "current")
     ].join("\n");
     appendCell(row, "Loss", loss);
 

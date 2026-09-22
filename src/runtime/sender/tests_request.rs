@@ -4809,6 +4809,76 @@ async fn retained_frontier_suppresses_new_target_until_accepted_copy_deadline() 
 }
 
 #[tokio::test]
+async fn prepared_request_capacity_wait_keeps_retired_attachment_identity() {
+    use crate::runtime::path::prepared::PreparedOriginalRegistration;
+
+    let stream_id = StreamId(718);
+    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10718"]);
+    let limits = context.mux_limits;
+    let (carrier, mut receivers) = reliable_path_command_channels(1);
+    let commands = carrier.for_new_attachment(stream_id);
+    let (opened, _input) =
+        opened_request_stream_with_retained_input(stream_id, 0, commands.clone());
+    let (remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 1);
+    let proof = try_recv_reliable_path_priority_command(&mut receivers).unwrap();
+    assert!(matches!(
+        proof,
+        ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+    let instance = remotes.paths[0].instance();
+    let product = SharedRequestProduct::new(RequestProductState {
+        sender_queue: ReliableRelaySenderQueue::default(),
+        sender: RequestSenderService::new(stream_id),
+        send_stream: ReliableSendStream::new(stream_id, limits),
+        last_send_ack: Default::default(),
+        remotes,
+        prepared: RequestPreparedSource::new(TrafficClass::Throughput, 1024),
+    });
+    let registration = PreparedOriginalRegistration::new(
+        product.downgrade(),
+        context,
+        stream_id,
+        instance,
+        commands.clone(),
+        TrafficClass::Throughput,
+    );
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from_static(b"old"),
+            },
+            TrafficClass::Throughput,
+        )
+        .unwrap();
+    assert!(!commands.can_enqueue_lane_now(TrafficClass::Throughput));
+    registration.notify(); // Must enter the full-queue deferred publisher.
+    commands.retire_accepted_stream(stream_id).unwrap();
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { .. }))
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut receivers),
+        Some(ReliablePathCommand::CloseStream(_))
+    ));
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none()); // Releases old payload capacity.
+    // The waiting publisher may already own the released permit before its
+    // future is polled again. Released payload debt is the boundary here.
+    assert_eq!(commands.pending_bytes(), 0);
+    assert!(
+        try_recv_reliable_path_command(&mut receivers).is_none(),
+        "capacity wake must not republish old work without its fence"
+    );
+    assert!(commands.can_enqueue_lane_now(TrafficClass::Throughput));
+    assert_eq!(commands.pending_bytes(), 0);
+    registration.notify(); // Immediate publisher must preserve the same fence.
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+}
+
+#[tokio::test]
 async fn prepared_request_deferred_notice_wakes_before_poll_and_does_not_retain_source() {
     let stream_id = StreamId(719);
     let context =

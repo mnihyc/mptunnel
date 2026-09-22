@@ -789,6 +789,124 @@ fn pending_fin_is_enqueued_before_attachment_publish() {
     ));
 }
 
+#[tokio::test]
+async fn retired_attachment_discards_old_fin_data_and_fresh_attach_replays_fin() {
+    let stream_id = StreamId(154);
+    let mux_limits = MuxLimits::default();
+    let (carrier, mut receivers) = reliable_path_command_channels(8);
+    let old_commands = carrier.for_new_attachment(stream_id);
+    let (_old_frames_tx, old_frames_rx) = mpsc::channel(1);
+    let old = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: mux_limits.max_stream_window_bytes,
+            lane: TrafficClass::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                old_commands.clone(),
+                mux_limits,
+            ),
+            frames: old_frames_rx.into(),
+        },
+        0,
+    );
+    let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(old, 4);
+
+    // The initial proof is attachment setup, not the old Product work under
+    // test. Drain it before queueing the stale DATA and FIN.
+    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    }
+
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    send_stream
+        .send_data(Bytes::from_static(b"request"))
+        .expect("request data");
+    let final_offset = send_stream.next_offset();
+    old_commands
+        .send_stream_ordered_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from_static(b"request"),
+            },
+            TrafficClass::Throughput,
+        )
+        .await
+        .expect("queue old attachment data");
+    remotes.paths[0]
+        .stream
+        .try_enqueue_request_control_frame(Frame::StreamFin {
+            stream_id,
+            final_offset,
+        })
+        .expect("queue old attachment FIN");
+    assert!(old_commands.pending_bytes() > 0);
+
+    let old_instance = remotes.paths[0].instance();
+    assert!(remotes.retire_path_instance(old_instance));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: received }))
+            if received == stream_id
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut receivers),
+        Some(ReliablePathCommand::CloseStream(received)) if received == stream_id
+    ));
+    assert!(
+        try_recv_reliable_path_command(&mut receivers).is_none(),
+        "retired attachment DATA and FIN must be discarded before replacement"
+    );
+    assert_eq!(carrier.pending_bytes(), 0);
+
+    let fresh_commands = carrier.for_new_attachment(stream_id);
+    let (_fresh_frames_tx, fresh_frames_rx) = mpsc::channel(1);
+    let fresh = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: mux_limits.max_stream_window_bytes,
+            lane: TrafficClass::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(1),
+                fresh_commands.clone(),
+                mux_limits,
+            ),
+            frames: fresh_frames_rx.into(),
+        },
+        1,
+    );
+    send_request_attach_control_frames(fresh.stream(), Some(final_offset))
+        .expect("queue replacement FIN through the attachment helper");
+    assert_eq!(
+        remotes
+            .try_attach_candidate(fresh)
+            .expect("replacement attachment identity"),
+        ReliableRelayAttachOutcome::Attached
+    );
+
+    let replay = try_recv_reliable_path_priority_command(&mut receivers)
+        .expect("replacement attachment must replay the terminal FIN");
+    assert!(matches!(
+        replay,
+        ReliablePathCommand::SendFrame(Frame::StreamFin {
+            stream_id: received,
+            final_offset: received_offset,
+        }) if received == stream_id && received_offset == final_offset
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&replay));
+    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    }
+    assert_eq!(carrier.pending_bytes(), 0);
+}
+
 #[test]
 fn attachment_scoring_uses_bounded_demand_quanta() {
     let mux_limits = MuxLimits::default();

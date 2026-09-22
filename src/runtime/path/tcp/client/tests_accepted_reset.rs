@@ -351,5 +351,204 @@ async fn tcp_accepted_slot_reset_survives_real_carrier_replacement() {
     );
 }
 
+#[tokio::test]
+async fn tcp_accepted_stream_detach_reopens_same_id_on_live_carrier() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("TCP test listener");
+    let address = listener.local_addr().expect("test address");
+    let secret = SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+        .expect("test shared secret");
+    let server = crate::runtime::node::server::new_identity_runtime(
+        Vec::new(),
+        OutboundConfig::Direct,
+        crate::config::DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        ServerSecurityConfig::for_test(secret.clone()),
+        MppPerformanceConfig::default(),
+        ResourceLimits::default(),
+    );
+    let context = ClientPathContext::new(
+        vec![
+            format!("tcp://{address}?max-tcp-carriers=1")
+                .parse()
+                .expect("real TCP path"),
+        ],
+        ClientSecurityConfig::for_test(secret),
+        ResourceLimits::default(),
+    )
+    .expect("client TCP context");
+    let handle = &context.tcp_sessions[0];
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(10);
+    let (ready, (mut peer, _path_id)) = tokio::time::timeout(PEER_GUARD, async {
+        tokio::join!(
+            handle.prepare_connection(deadline()),
+            accept_authenticated_peer(&listener, &server.paths, context.session_id)
+        )
+    })
+    .await
+    .expect("authenticate real TCP carrier");
+    ready.expect("initial carrier ready");
+    let carrier_instance = handle
+        .connection_instance_id()
+        .expect("live carrier identity");
+
+    let stream_id = StreamId(1500);
+    let accept_max = context.mux_limits.max_stream_window_bytes;
+    let (old_result, ()) = tokio::time::timeout(PEER_GUARD, async {
+        tokio::join!(
+            handle.open_stream_with_deadlines(
+                stream_id,
+                TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
+                TrafficClass::Latency,
+                StreamDemandHint::Latency,
+                Default::default(),
+                ClientTcpOpenDeadlines::fixed(deadline()),
+                context.mux_limits.max_stream_window_bytes,
+            ),
+            async {
+                peer_read_open_and_max(&mut peer, stream_id).await;
+                peer.write_frame(&Frame::StreamMaxData {
+                    stream_id,
+                    max_offset: accept_max,
+                })
+                .await
+                .expect("peer accepts initial attachment");
+                peer.flush().await.expect("flush initial acceptance");
+            },
+        )
+    })
+    .await
+    .expect("initial OPEN/MAX acceptance");
+    let old = old_result.expect("initial stream accepted");
+    assert_eq!(old.carrier.path_instance_id, carrier_instance);
+
+    let sibling_id = StreamId(1501);
+    let (sibling_result, ()) = tokio::time::timeout(PEER_GUARD, async {
+        tokio::join!(
+            handle.open_stream_with_deadlines(
+                sibling_id,
+                TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
+                TrafficClass::Latency,
+                StreamDemandHint::Latency,
+                Default::default(),
+                ClientTcpOpenDeadlines::fixed(deadline()),
+                context.mux_limits.max_stream_window_bytes,
+            ),
+            async {
+                peer_read_open_and_max(&mut peer, sibling_id).await;
+                peer.write_frame(&Frame::StreamMaxData {
+                    stream_id: sibling_id,
+                    max_offset: accept_max,
+                })
+                .await
+                .expect("peer accepts sibling attachment");
+                peer.flush().await.expect("flush sibling acceptance");
+            },
+        )
+    })
+    .await
+    .expect("sibling OPEN/MAX acceptance");
+    let sibling = sibling_result.expect("sibling stream accepted");
+    assert_eq!(sibling.carrier.path_instance_id, carrier_instance);
+
+    // Keep the old command capability so a late duplicate retirement can be
+    // issued after the replacement is live. The real peer must see DETACH
+    // exactly once for the old attachment.
+    let old_commands = old.carrier.commands.clone();
+    old.carrier
+        .retire_uncommitted()
+        .expect("retire accepted predecessor");
+    assert_eq!(
+        tokio::time::timeout(PEER_GUARD, peer.read_frame())
+            .await
+            .expect("predecessor DETACH guard")
+            .expect("predecessor carrier remains readable"),
+        Frame::StreamDetach { stream_id }
+    );
+
+    let (replacement_result, ()) = tokio::time::timeout(PEER_GUARD, async {
+        tokio::join!(
+            handle.open_stream_with_deadlines(
+                stream_id,
+                TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
+                TrafficClass::Latency,
+                StreamDemandHint::Latency,
+                Default::default(),
+                ClientTcpOpenDeadlines::fixed(deadline()),
+                context.mux_limits.max_stream_window_bytes,
+            ),
+            async {
+                peer_read_open_and_max(&mut peer, stream_id).await;
+                peer.write_frame(&Frame::StreamMaxData {
+                    stream_id,
+                    max_offset: accept_max,
+                })
+                .await
+                .expect("peer accepts same-ID replacement");
+                peer.flush().await.expect("flush same-ID acceptance");
+            },
+        )
+    })
+    .await
+    .expect("same-ID replacement OPEN/MAX acceptance");
+    let replacement = replacement_result.expect("same-ID replacement accepted");
+    assert_eq!(replacement.carrier.path_instance_id, carrier_instance);
+    assert_eq!(handle.connection_instance_id(), Some(carrier_instance));
+
+    // A late retirement from the predecessor must not detach the live
+    // replacement. Its data and the sibling's data both reach the same peer.
+    old_commands
+        .retire_accepted_stream(stream_id)
+        .expect("late predecessor retirement is admitted");
+    let replacement_data = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: Bytes::from_static(b"replacement"),
+    };
+    replacement
+        .carrier
+        .commands
+        .try_enqueue_admitted_frame(replacement_data.clone(), TrafficClass::Latency)
+        .expect("queue replacement data");
+    assert_eq!(
+        tokio::time::timeout(PEER_GUARD, peer.read_frame())
+            .await
+            .expect("replacement data guard")
+            .expect("replacement peer remains readable"),
+        replacement_data
+    );
+    let sibling_data = Frame::StreamData {
+        stream_id: sibling_id,
+        offset: 0,
+        payload: Bytes::from_static(b"sibling"),
+    };
+    sibling
+        .carrier
+        .commands
+        .try_enqueue_admitted_frame(sibling_data.clone(), TrafficClass::Latency)
+        .expect("queue sibling data");
+    assert_eq!(
+        tokio::time::timeout(PEER_GUARD, peer.read_frame())
+            .await
+            .expect("sibling data guard")
+            .expect("sibling peer remains readable"),
+        sibling_data
+    );
+
+    replacement
+        .carrier
+        .retire_uncommitted()
+        .expect("retire replacement once");
+    sibling
+        .carrier
+        .retire_uncommitted()
+        .expect("retire sibling once");
+    handle
+        .runtime
+        .state
+        .session_lifecycle()
+        .retire(CloseReason::Normal);
+}
+
 #[path = "tests_initial_retention.rs"]
 mod initial_retention;

@@ -337,7 +337,7 @@ impl ClientTcpPathSessionHandle {
             let (session, observed_carrier_instance) = self
                 .wait_for_ready_session_slot(&mut changes, open_deadlines.setup)
                 .await?;
-            let commands = session.commands.clone();
+            let commands = session.commands.for_new_attachment(stream_id);
             let (response_tx, response_rx) = oneshot::channel();
             let attempt_id = next_client_tcp_open_attempt_id();
             let initial_backend = initial.map(|initial| initial.begin_backend()).transpose()?;

@@ -522,7 +522,7 @@ async fn open_remote_stream_in_scope(
                 match await_reliable_initial_target_acceptance(opened.stream_mut()).await {
                     Ok(()) => Ok(opened),
                     Err(err) => {
-                        opened.close().await;
+                        opened.retire_uncommitted();
                         Err(err)
                     }
                 }
@@ -541,7 +541,7 @@ async fn open_remote_stream_in_scope(
                 // The frozen physical owner disappeared while its open was in
                 // flight. A same-slot successor is ordinary later topology;
                 // it cannot inherit this candidate's startup ordinal.
-                opened.close().await;
+                opened.retire_uncommitted();
                 failed_ordinals.push(candidate.ordinal);
                 last_retryable_error = Some(RuntimeError::ReliablePathRetired);
             }

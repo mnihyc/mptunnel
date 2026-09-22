@@ -577,10 +577,10 @@ fn dropped_pending_attachment_queues_detach_and_local_close() {
 }
 
 #[tokio::test]
-async fn explicitly_closed_pending_attachment_detaches_before_local_close() {
+async fn explicitly_retired_pending_attachment_detaches_before_local_close() {
     let stream_id = StreamId(93);
     let (opened, mut receivers) = pending_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
-    opened.close().await;
+    opened.retire_uncommitted();
 
     assert!(matches!(
         recv_reliable_path_command(&mut receivers).await,

@@ -1511,6 +1511,12 @@ attachment-selection path. After it expires, the same live carrier MAY own a
 fresh attachment incarnation; a successor carrier instance bypasses it
 immediately.
 
+Retiring an attachment MUST fence queued and reserved work from that attachment
+without marking the logical stream terminal. The fence MUST remain effective
+while that old work exists, including reservations committed after retirement.
+A repeated retirement of the old attachment MUST NOT detach its replacement.
+Logical reset and final stream closure retain their separate terminal authority.
+
 ### 8.2 Offset mapping and delivery
 
 `STREAM_DATA(stream_id, offset, payload)` maps its bytes to:

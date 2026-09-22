@@ -415,8 +415,8 @@ impl OpenedRemoteStream {
         )
     }
 
-    /// A stream that never commits to a remote set must release both the peer
-    /// binding and the local carrier actor entry.
+    /// Terminally closes a completed logical stream, such as a health probe.
+    /// Rejected attachment candidates must use `retire_uncommitted` instead.
     pub(in crate::runtime) async fn close(mut self) {
         drop(self.load_lease.take());
         if let Some(stream) = self.stream.as_ref() {

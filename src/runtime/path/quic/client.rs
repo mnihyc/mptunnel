@@ -1870,7 +1870,9 @@ async fn open_client_udp_stream_on_connection(
         runtime.mux_limits,
         runtime.codec_limits,
     ));
-    let commands = commands.with_native_rate_authority(native_rate_authority);
+    let commands = commands
+        .with_native_rate_authority(native_rate_authority)
+        .for_new_attachment(stream_id);
     let stream_frame_queue =
         udp_reliable_stream_frame_queue(runtime.codec_limits, runtime.mux_limits);
     let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);

@@ -611,6 +611,208 @@ async fn control_close_discards_stale_stream_data_and_releases_queue_bytes() {
 }
 
 #[tokio::test]
+async fn attachment_retirement_allows_reopen_and_keeps_old_work_fenced() {
+    let queue = 4;
+    let stream_id = StreamId(22);
+    let (carrier, mut receivers) = reliable_path_command_channels(queue);
+    let old = carrier.for_new_attachment(stream_id);
+    old.try_enqueue_admitted_frame(stream_data_frame(22, 64), TrafficClass::Throughput)
+        .unwrap();
+    let crossing = old
+        .try_reserve_admitted_frame(stream_data_frame(22, 32), TrafficClass::Throughput)
+        .unwrap();
+    old.retire_accepted_stream(stream_id).unwrap();
+    assert_attachment_retirement(&mut receivers, stream_id);
+
+    let fresh = carrier.for_new_attachment(stream_id);
+    let (open, _response) = attachment_test_open(&fresh, stream_id);
+    fresh.send_control(open).await.unwrap();
+    assert!(
+        matches!(
+            try_recv_reliable_path_command(&mut receivers),
+            Some(ReliablePathCommand::OpenStream { stream_id: id, .. }) if id == stream_id
+        ),
+        "attachment retirement must not make a legal same-ID OPEN terminal"
+    );
+
+    // A reservation can outlive more unrelated retirements than all queue lanes
+    // can hold. A bounded recent-token cache cannot protect this old work.
+    for id in 100..100 + queue * super::reliable_path_writer_lane_count() + 2 {
+        let id = StreamId(id as u64);
+        let other = carrier.for_new_attachment(id);
+        other.retire_accepted_stream(id).unwrap();
+        assert_attachment_retirement(&mut receivers, id);
+    }
+    crossing.commit();
+    fresh
+        .try_enqueue_admitted_frame(stream_data_frame(22, 16), TrafficClass::Throughput)
+        .unwrap();
+    let frame = try_recv_reliable_path_command(&mut receivers).expect("fresh data survives");
+    assert!(
+        matches!(&frame, ReliablePathCommand::SendFrame(Frame::StreamData { payload, .. }) if payload.len() == 16)
+    );
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&frame));
+    assert_eq!(
+        carrier.pending_bytes(),
+        0,
+        "both old queue charges are released"
+    );
+
+    old.retire_accepted_stream(stream_id).unwrap();
+    fresh
+        .try_enqueue_admitted_frame(stream_data_frame(22, 8), TrafficClass::Throughput)
+        .unwrap();
+    let frame =
+        try_recv_reliable_path_command(&mut receivers).expect("late old retirement is idempotent");
+    assert!(
+        matches!(&frame, ReliablePathCommand::SendFrame(Frame::StreamData { payload, .. }) if payload.len() == 8)
+    );
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&frame));
+    assert_eq!(carrier.pending_bytes(), 0);
+
+    // Logical completion still wins, including when reported by a retired owner.
+    old.send_stream_ordered_close(stream_id, TrafficClass::Throughput)
+        .await
+        .unwrap();
+    assert!(
+        matches!(try_recv_reliable_path_command(&mut receivers), Some(ReliablePathCommand::CloseStream(id)) if id == stream_id)
+    );
+    let (open, _response) = attachment_test_open(&fresh, stream_id);
+    fresh.send_control(open).await.unwrap();
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+}
+
+#[tokio::test]
+async fn retired_attachment_reset_remains_logical_and_fences_replacement() {
+    let stream_id = StreamId(23);
+    let (carrier, mut receivers) = reliable_path_command_channels(2);
+    let old = carrier.for_new_attachment(stream_id);
+    old.retire_accepted_stream(stream_id).unwrap();
+    assert_attachment_retirement(&mut receivers, stream_id);
+    let fresh = carrier.for_new_attachment(stream_id);
+    let (open, _response) = attachment_test_open(&fresh, stream_id);
+    fresh.send_control(open).await.unwrap();
+    old.reset_accepted_stream(stream_id, ResetReason::Refused)
+        .unwrap();
+    let reset =
+        try_recv_reliable_path_command(&mut receivers).expect("logical reset retains priority");
+    assert!(
+        matches!(reset, ReliablePathCommand::ResetAndCloseStream { stream_id: id, reason: ResetReason::Refused } if id == stream_id)
+    );
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&reset));
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert_eq!(carrier.pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn attachment_retirement_fences_split_repair_before_local_close() {
+    let stream_id = StreamId(25);
+    let (carrier, mut receivers) = reliable_path_command_channels(2);
+    let attachment = carrier.for_new_attachment(stream_id);
+    let mut repair = receivers.take_repair_receiver(stream_id);
+    attachment
+        .try_enqueue_reinjection_frame(stream_data_frame(25, 64), TrafficClass::Throughput)
+        .unwrap();
+    attachment.retire_accepted_stream(stream_id).unwrap();
+    assert!(
+        matches!(try_recv_reliable_path_command(&mut receivers), Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id)
+    );
+
+    // The ordinary writer has not consumed local CloseStream yet, so the
+    // repair receiver's close watch alone cannot fence this queued payload.
+    let receive = repair.recv();
+    tokio::pin!(receive);
+    assert!(futures::poll!(&mut receive).is_pending());
+    assert_eq!(
+        carrier.pending_bytes(),
+        0,
+        "retired repair work was discarded"
+    );
+    assert!(
+        matches!(try_recv_reliable_path_command(&mut receivers), Some(ReliablePathCommand::CloseStream(id)) if id == stream_id)
+    );
+    assert!(receive.await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn attachment_retirement_drain_releases_old_work_and_stops_repair() {
+    let stream_id = StreamId(24);
+    let (carrier, mut receivers) = reliable_path_command_channels(2);
+    let attachment = carrier.for_new_attachment(stream_id);
+    let mut repair = receivers.take_repair_receiver(stream_id);
+    let crossing = attachment
+        .try_reserve_admitted_frame(stream_data_frame(24, 32), TrafficClass::Throughput)
+        .unwrap();
+    attachment
+        .try_enqueue_reinjection_frame(stream_data_frame(24, 64), TrafficClass::Throughput)
+        .unwrap();
+    attachment.begin_path_drain();
+    attachment.retire_accepted_stream(stream_id).unwrap();
+    attachment.retire_accepted_stream(stream_id).unwrap();
+    receivers.close_for_path_drain();
+    crossing.commit();
+    assert!(
+        matches!(recv_reliable_path_command_during_drain(&mut receivers).await, Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id)
+    );
+    assert!(
+        matches!(recv_reliable_path_command_during_drain(&mut receivers).await, Some(ReliablePathCommand::CloseStream(id)) if id == stream_id)
+    );
+    assert!(
+        recv_reliable_path_command_during_drain(&mut receivers)
+            .await
+            .is_none()
+    );
+    assert!(repair.recv().await.unwrap().is_none());
+    drop(repair);
+    assert_eq!(carrier.pending_bytes(), 0);
+}
+
+fn assert_attachment_retirement(
+    receivers: &mut super::ReliablePathCommandReceivers,
+    stream_id: StreamId,
+) {
+    assert!(
+        matches!(try_recv_reliable_path_command(receivers), Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id)
+    );
+    assert!(
+        matches!(try_recv_reliable_path_command(receivers), Some(ReliablePathCommand::CloseStream(id)) if id == stream_id)
+    );
+}
+
+fn attachment_test_open(
+    commands: &super::ReliablePathCommandSender,
+    stream_id: StreamId,
+) -> (
+    ReliablePathCommand,
+    tokio::sync::oneshot::Receiver<crate::runtime::path::commands::ClientTcpOpenResponse>,
+) {
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    (
+        ReliablePathCommand::OpenStream {
+            stream_id,
+            terminal: None,
+            initial: None,
+            attempt_id: crate::runtime::path::commands::ClientTcpOpenAttemptId(stream_id.0),
+            observed_carrier_instance: 7,
+            target: TargetAddr::Domain {
+                host: "reattach.example".to_string(),
+                port: 443,
+            },
+            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::throughput(),
+            return_plan: Default::default(),
+            advertised_recv_max_offset: 0,
+            open_deadlines: crate::runtime::path::commands::ClientTcpOpenDeadlines::fixed(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
+            session_commands: commands.clone(),
+            response,
+        },
+        receiver,
+    )
+}
+
+#[tokio::test]
 async fn server_datagram_retirement_discards_only_preaccepted_same_flow_work() {
     let retired_flow = DatagramFlowId(30);
     let sibling_flow = DatagramFlowId(31);

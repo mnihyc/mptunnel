@@ -49,6 +49,7 @@ pub(in crate::runtime) struct ReliablePathCommandSender {
     data: mpsc::Sender<QueuedReliablePathCommand>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     native_rate_authority: Option<Arc<NativeCarrierRateAuthorityHandle>>,
+    attachment: Option<Arc<ReliablePathAttachmentFence>>,
 }
 
 pub(in crate::runtime) struct ReliablePathCommandReceivers {
@@ -60,7 +61,7 @@ pub(in crate::runtime) struct ReliablePathCommandReceivers {
     // or logical stream. Refused claims leave the same idle epoch current.
     writer_ready: Option<ReliableWriterReadyGuard>,
     retirement: mpsc::UnboundedReceiver<ReliablePathRetirementCommand>,
-    pending_retirement_close: Option<StreamId>,
+    pending_retirement_close: Option<(StreamId, bool)>,
     control: mpsc::Receiver<QueuedReliablePathCommand>,
     priority: mpsc::Receiver<QueuedReliablePathCommand>,
     reinjection: Option<mpsc::Receiver<QueuedReliablePathCommand>>,
@@ -206,7 +207,10 @@ impl ReliablePathCommandQueueSnapshot {
 /// datagram-flow limits bound outstanding retirements.
 #[derive(Debug, Clone)]
 enum ReliablePathRetirementCommand {
-    RetireAcceptedStream(StreamId),
+    RetireAcceptedStream {
+        stream_id: StreamId,
+        attachment: Option<Arc<ReliablePathAttachmentFence>>,
+    },
     ResetAcceptedStream {
         stream_id: StreamId,
         reason: ResetReason,
@@ -216,6 +220,15 @@ enum ReliablePathRetirementCommand {
         flow_id: DatagramFlowId,
         _fence: Arc<ReliablePathDatagramRetirementFence>,
     },
+}
+
+/// One client attachment's lifetime, retained by every reservation and queued
+/// command from that attempt. Unlike a bounded ID cache, the fence cannot expire
+/// while an older reservation still owns work. Logical terminal state is separate.
+#[derive(Debug)]
+struct ReliablePathAttachmentFence {
+    stream_id: StreamId,
+    retired: AtomicBool,
 }
 
 /// Per-flow admission fence shared by queue reservations and the authoritative
@@ -254,6 +267,7 @@ pub(in crate::runtime) struct ReliablePathFrameReservation<'a> {
     datagram_retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
     accounted_bytes: Option<usize>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
+    attachment: Option<Arc<ReliablePathAttachmentFence>>,
     #[cfg(feature = "lab-diagnostics")]
     lane: TrafficClass,
     #[cfg(feature = "lab-diagnostics")]
@@ -286,6 +300,7 @@ impl ReliablePathFrameReservation<'_> {
                     ),
                     accounted_bytes,
                     self.metrics.clone(),
+                    self.attachment.take(),
                 )
                 .with_datagram_retirement(self.datagram_retirement.take()),
             );
@@ -568,6 +583,7 @@ struct QueuedReliablePathCommand {
     accounted_bytes: usize,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     datagram_retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
+    attachment: Option<Arc<ReliablePathAttachmentFence>>,
 }
 
 impl QueuedReliablePathCommand {
@@ -575,12 +591,14 @@ impl QueuedReliablePathCommand {
         command: ReliablePathCommand,
         accounted_bytes: usize,
         metrics: Arc<ReliablePathCommandQueueMetrics>,
+        attachment: Option<Arc<ReliablePathAttachmentFence>>,
     ) -> Self {
         Self {
             command: Some(command),
             accounted_bytes,
             metrics,
             datagram_retirement: None,
+            attachment,
         }
     }
 
@@ -596,6 +614,21 @@ impl QueuedReliablePathCommand {
         self.datagram_retirement
             .as_ref()
             .is_some_and(|retirement| retirement.retired.load(Ordering::Acquire))
+    }
+
+    fn retired_attachment_work(&self) -> bool {
+        // These commands terminate the logical stream even when its original
+        // attachment has already retired. Attachment-local retirement uses the
+        // separate carrier-owned lane and never creates one of these envelopes.
+        if matches!(
+            self.command(),
+            ReliablePathCommand::CloseStream(_) | ReliablePathCommand::ResetAndCloseStream { .. }
+        ) {
+            return false;
+        }
+        self.attachment
+            .as_ref()
+            .is_some_and(|attachment| attachment.retired.load(Ordering::Acquire))
     }
 
     fn into_parts(mut self) -> (ReliablePathCommand, usize) {
@@ -934,7 +967,7 @@ impl ReliablePathCommandReceivers {
         {
             return None;
         }
-        if queued.retired_server_datagram_work() {
+        if queued.retired_server_datagram_work() || queued.retired_attachment_work() {
             // The flow-scoped retirement command overtakes bounded work. Drop
             // only older work carrying its exact fence; the envelope returns
             // its queue-byte charge and unrelated Product work remains live.
@@ -957,14 +990,31 @@ impl ReliablePathCommandReceivers {
             ReliablePathCommand::ResetAndCloseStream { stream_id, .. }
             | ReliablePathCommand::CloseStream(stream_id) => {
                 self.closed_streams.insert(*stream_id);
-                if let Some((owner, closed)) = &self.repair_owner
-                    && owner == stream_id
-                {
-                    closed.send_replace(true);
-                }
+                self.notify_stream_closed(*stream_id);
             }
             _ => {}
         }
+    }
+
+    fn notify_stream_closed(&self, stream_id: StreamId) {
+        if let Some((owner, closed)) = &self.repair_owner
+            && owner == &stream_id
+        {
+            closed.send_replace(true);
+        }
+    }
+
+    fn take_retirement_close(&mut self) -> Option<ReliablePathCommand> {
+        let (stream_id, terminal) = self.pending_retirement_close.take()?;
+        let command = ReliablePathCommand::CloseStream(stream_id);
+        if terminal {
+            // Legacy unbound owners have no attachment identity with which to
+            // distinguish old queued work, so retain their existing fence.
+            self.record_terminal_command(&command);
+        } else {
+            self.notify_stream_closed(stream_id);
+        }
+        Some(command)
     }
 
     pub(in crate::runtime) fn release_pending_command_bytes(&self, bytes: usize) {
@@ -1045,6 +1095,9 @@ impl ReliablePathRepairReceiver {
                     None => return Ok(None),
                 },
             };
+            if queued.retired_attachment_work() {
+                continue;
+            }
             match queued.command() {
                 ReliablePathCommand::SendFrame(
                     Frame::StreamData { stream_id, .. }
@@ -1087,6 +1140,17 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
+    /// Bind before publishing OPEN so pending cleanup and accepted Product work
+    /// retain the same attachment lifetime. Carrier-level senders stay unbound.
+    pub(in crate::runtime) fn for_new_attachment(&self, stream_id: StreamId) -> Self {
+        let mut sender = self.clone();
+        sender.attachment = Some(Arc::new(ReliablePathAttachmentFence {
+            stream_id,
+            retired: AtomicBool::new(false),
+        }));
+        sender
+    }
+
     pub(in crate::runtime) fn native_commitment(&self) -> Option<NativeOperationCommitment> {
         self.metrics
             .native_commitment
@@ -1113,6 +1177,7 @@ impl ReliablePathCommandSender {
                         ReliablePathCommand::PreparedOriginal(work),
                         0,
                         self.metrics.clone(),
+                        self.attachment.clone(),
                     ));
                 }
             }
@@ -1123,6 +1188,7 @@ impl ReliablePathCommandSender {
                 };
                 let queue = queue.clone();
                 let metrics = self.metrics.clone();
+                let attachment = self.attachment.clone();
                 let wait: PreparedOriginalWait = Box::pin(async move {
                     tokio::select! {
                         biased;
@@ -1130,7 +1196,9 @@ impl ReliablePathCommandSender {
                         permit = queue.reserve_owned() => {
                             if let Ok(permit) = permit
                                 && metrics.lifecycle.admits_new_command(true) {
-                                permit.send(QueuedReliablePathCommand::new(ReliablePathCommand::PreparedOriginal(work), 0, metrics));
+                                permit.send(QueuedReliablePathCommand::new(
+                                    ReliablePathCommand::PreparedOriginal(work), 0, metrics, attachment,
+                                ));
                             }
                         }
                     }
@@ -1300,10 +1368,20 @@ impl ReliablePathCommandSender {
         stream_id: StreamId,
     ) -> Result<(), RuntimeError> {
         self.ensure_new_command_admitted(false)?;
+        if self
+            .attachment
+            .as_ref()
+            .is_some_and(|attachment| attachment.stream_id != stream_id)
+        {
+            return Err(RuntimeError::Protocol(
+                "retirement attachment identity mismatch",
+            ));
+        }
         self.retirement
-            .send(ReliablePathRetirementCommand::RetireAcceptedStream(
+            .send(ReliablePathRetirementCommand::RetireAcceptedStream {
                 stream_id,
-            ))
+                attachment: self.attachment.clone(),
+            })
             .map_err(|_| RuntimeError::ReliablePathSessionClosed)
     }
 
@@ -1371,6 +1449,7 @@ impl ReliablePathCommandSender {
                     command,
                     0,
                     self.metrics.clone(),
+                    self.attachment.clone(),
                 ));
                 #[cfg(test)]
                 if let Some(stream_id) = accepted_open_stream {
@@ -1427,7 +1506,12 @@ impl ReliablePathCommandSender {
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         let requires_product_admission = reliable_path_command_requires_product_admission(&command);
         self.metrics.add_pending_bytes(pending_bytes);
-        let queued = QueuedReliablePathCommand::new(command, pending_bytes, self.metrics.clone());
+        let queued = QueuedReliablePathCommand::new(
+            command,
+            pending_bytes,
+            self.metrics.clone(),
+            self.attachment.clone(),
+        );
         let permit = match self
             .reserve_command_queue(&self.priority, requires_product_admission)
             .await
@@ -1480,7 +1564,12 @@ impl ReliablePathCommandSender {
         let started = Instant::now();
         let requires_product_admission = reliable_path_command_requires_product_admission(&command);
         self.metrics.add_pending_bytes(pending_bytes);
-        let queued = QueuedReliablePathCommand::new(command, pending_bytes, self.metrics.clone());
+        let queued = QueuedReliablePathCommand::new(
+            command,
+            pending_bytes,
+            self.metrics.clone(),
+            self.attachment.clone(),
+        );
         let result = match self
             .reserve_command_queue(queue, requires_product_admission)
             .await
@@ -1629,6 +1718,7 @@ impl ReliablePathCommandSender {
             ReliablePathCommand::SendTcpCapacityProbe(probe),
             pending_bytes,
             self.metrics.clone(),
+            self.attachment.clone(),
         ));
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
@@ -1798,6 +1888,7 @@ impl ReliablePathCommandSender {
             datagram_retirement,
             accounted_bytes: Some(bytes),
             metrics: self.metrics.clone(),
+            attachment: self.attachment.clone(),
             #[cfg(feature = "lab-diagnostics")]
             lane,
             #[cfg(feature = "lab-diagnostics")]
@@ -1998,6 +2089,7 @@ pub(in crate::runtime) fn reliable_path_command_channels(
             data: data_tx,
             metrics: metrics.clone(),
             native_rate_authority: None,
+            attachment: None,
         },
         ReliablePathCommandReceivers {
             prepared_waits: prepared_waits_rx,
@@ -2151,7 +2243,9 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
         };
         match received {
             ReceivedCommand::Retirement(Some(command)) => {
-                return Some(begin_reliable_path_retirement(receivers, command));
+                if let Some(command) = begin_reliable_path_retirement(receivers, command) {
+                    return Some(command);
+                }
             }
             ReceivedCommand::Queued(Some(command)) => {
                 if let Some(command) = receivers.take_live_queued_command(command) {
@@ -2176,14 +2270,14 @@ pub(in crate::runtime) async fn recv_reliable_path_command_during_drain(
             .expect("path drain must close command admission first")
         {
             ReliablePathCommandDrainPhase::Retirement => {
-                if let Some(stream_id) = receivers.pending_retirement_close.take() {
-                    let command = ReliablePathCommand::CloseStream(stream_id);
-                    receivers.record_terminal_command(&command);
+                if let Some(command) = receivers.take_retirement_close() {
                     return Some(command);
                 }
                 match receivers.retirement.recv().await {
                     Some(command) => {
-                        return Some(begin_reliable_path_retirement(receivers, command));
+                        if let Some(command) = begin_reliable_path_retirement(receivers, command) {
+                            return Some(command);
+                        }
                     }
                     None => {
                         receivers.path_drain_phase = Some(ReliablePathCommandDrainPhase::Control);
@@ -2403,13 +2497,14 @@ fn recv_ready_priority_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
     loop {
-        if let Some(stream_id) = receivers.pending_retirement_close.take() {
-            let command = ReliablePathCommand::CloseStream(stream_id);
-            receivers.record_terminal_command(&command);
+        if let Some(command) = receivers.take_retirement_close() {
             return Some(command);
         }
         if let Ok(command) = receivers.retirement.try_recv() {
-            return Some(begin_reliable_path_retirement(receivers, command));
+            if let Some(command) = begin_reliable_path_retirement(receivers, command) {
+                return Some(command);
+            }
+            continue;
         }
         let queued = receivers
             .control
@@ -2426,11 +2521,21 @@ fn recv_ready_priority_command(
 fn begin_reliable_path_retirement(
     receivers: &mut ReliablePathCommandReceivers,
     command: ReliablePathRetirementCommand,
-) -> ReliablePathCommand {
+) -> Option<ReliablePathCommand> {
     let command = match command {
-        ReliablePathRetirementCommand::RetireAcceptedStream(stream_id) => {
+        ReliablePathRetirementCommand::RetireAcceptedStream {
+            stream_id,
+            attachment,
+        } => {
+            if attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.retired.swap(true, Ordering::AcqRel))
+            {
+                // An older handle must not detach a replacement on this carrier.
+                return None;
+            }
             debug_assert!(receivers.pending_retirement_close.is_none());
-            receivers.pending_retirement_close = Some(stream_id);
+            receivers.pending_retirement_close = Some((stream_id, attachment.is_none()));
             ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id })
         }
         ReliablePathRetirementCommand::ResetAcceptedStream { stream_id, reason } => {
@@ -2447,7 +2552,7 @@ fn begin_reliable_path_retirement(
         }
     };
     receivers.record_terminal_command(&command);
-    command
+    Some(command)
 }
 
 pub(in crate::runtime) fn reliable_path_command_pending_bytes(

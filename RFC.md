@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 15
+# MPTunnel Multipath Proxy Protocol (MPP) Version 16
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 15: its wire format, carrier profiles,
+This document specifies MPP version 16: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,9 +21,11 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 15 is identified by the frame header in Section 12. A peer MUST
+Wire version 16 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
-compatibility mode.
+compatibility mode. Client and server endpoints in one session MUST be upgraded
+to this version as a coordinated pair; a v15 endpoint rejects the first v16
+MPP frame and this implementation has no rolling-upgrade negotiation.
 
 In formulas over nonnegative quantities,
 `clamp(x, low, high) = min(max(x, low), high)` and
@@ -2679,15 +2681,28 @@ loss_observed:u8, ecn_observed:u8, bytes_in_flight_observed:u8,
 queue_observed:u8, bytes_in_flight:u64, queue_bytes:u64,
 inflight_limit_bytes:u64, inflight_hi_bytes:u64, confidence_ppm:u32,
 app_limited:u8, has_ack_derived_data_sample:u8, data_sample_count:u32,
-data_sample_bytes:u64
+data_sample_bytes:u64, approximate_metrics:u8
 ```
 
-The fixed `PATH_METRICS` record is 116 bytes. Offsets 24, 53, 64, and 65 from
+The trailing `approximate_metrics` byte is a diagnostic provenance bitmask:
+`0x01` (`APPROXIMATE_RATE`) marks a substituted delivery-rate estimate,
+`0x02` (`APPROXIMATE_PACING`) marks a substituted pacing-rate estimate,
+`0x04` (`APPROXIMATE_LOSS`) marks a substituted loss estimate, and `0x08`
+(`APPROXIMATE_QUALITY`) marks an approximate delivery-quality interpretation
+associated with a substituted rate. The current Windows TCP fallback sets
+`APPROXIMATE_RATE | APPROXIMATE_QUALITY` for its transmitted-byte rate
+estimate, `APPROXIMATE_PACING` for its flight/RTT pacing estimate, and
+`APPROXIMATE_LOSS` for its retransmission estimate. Unknown bits are invalid.
+These bits are advisory provenance only: they never grant scheduling, delivery,
+admission, liveness, or native-controller authority. A zero mask asserts no
+substitute provenance; it does not turn an absent metric into measured zero.
+
+The fixed `PATH_METRICS` record is 117 bytes. Offsets 24, 53, 64, and 65 from
 the record start are respectively `rate_observed`, `pacing_rate_observed`,
 `bytes_in_flight_observed`, and `queue_observed`; the corresponding flight and
 queue 64-bit values begin at offsets 66 and 74. A peer-status path entry is
-exactly `state:u8`, then `usage:u8`, then the 116-byte `PATH_METRICS` record,
-then the 25-byte native delivery counter defined below: 143 bytes total.
+exactly `state:u8`, then `usage:u8`, then the 117-byte `PATH_METRICS` record,
+then the 25-byte native delivery counter defined below: 144 bytes total.
 
 The native delivery counter is `direction:u8, epoch:u64, sampled_at_us:u64,
 acked_bytes:u64`. Direction zero means absence and MUST have all three
@@ -2828,7 +2843,7 @@ answers on the same carrier with
 `PEER_STATUS_RESPONSE(request_id, code, paths)`, where `code` is `OK`,
 `DISABLED`, or `UNAVAILABLE`. A non-`OK` response contains no paths.
 
-Each path entry uses the exact 143-byte order defined in Section 11.1: local
+Each path entry uses the exact 144-byte order defined in Section 11.1: local
 `state:u8`, directional `usage:u8`, one `PATH_METRICS` record, then one native
 delivery counter. Usage direction and measured sender direction are independent.
 A response:
@@ -2853,7 +2868,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        15
+4      version        16
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -2898,7 +2913,7 @@ frames.
 | 34 | `PATH_CAPACITY_FINISH` | `path_id:u16, measurement_id:u64, payload_bytes:u64` |
 | 35 | `PATH_CAPACITY_RECEIPT` | `path_id:u16, measurement_id:u64, received_payload_bytes:u64` |
 | 36 | `PEER_STATUS_REQUEST` | `request_id:u64` |
-| 37 | `PEER_STATUS_RESPONSE` | `request_id:u64, code:u8, count:u16, paths[count]`, each path `state:u8, usage:u8, PATH_METRICS:116B, native_delivery:25B` |
+| 37 | `PEER_STATUS_RESPONSE` | `request_id:u64, code:u8, count:u16, paths[count]`, each path `state:u8, usage:u8, PATH_METRICS:117B, native_delivery:25B` |
 | 38 | `OPEN_IP_TUNNEL` | `tunnel_id:u64` |
 | 39 | `IP_TUNNEL_READY` | `tunnel_id:u64, mtu:u16, address_count:u8, addresses[address_count]` |
 | 40 | `IP_PACKET` | `tunnel_id:u64, packet_id:u64, length:u32, bytes` |
@@ -2921,7 +2936,7 @@ server-to-client only and requires a matching `PATH_DRAIN`.
 
 Kind50 is QUIC-only and client-to-server, valid only as the first frame of the
 companion request defined in Section6.2. It carries neither a destination nor
-Product admission authority. Unsupported versions are rejected; wire15 does
+Product admission authority. Unsupported versions are rejected; wire16 does
 not silently fall back to the wire11 single-ordering-stream mapping.
 
 Kinds 38 through 41 are valid only when the endpoint has enabled the IP packet
@@ -4751,7 +4766,7 @@ A conforming implementation preserves all of the following:
     contiguous h frontier closes requester startup membership without awaiting
     unfinished optional enrollment; its omission cannot declare a carrier failed.
 42. Kinds 44 through 48 are reserved and MUST be rejected as unknown under
-    version 15.
+    version 16.
 43. Stale requalification uses one finite cyclic exact-incarnation cursor and
     at most one pending proof and one stream-owned ACK publication per
     direction. The ACK carrier is authenticated return service only; the exact

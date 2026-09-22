@@ -251,6 +251,14 @@ attachments apply only when that policy is selected.
 MPP security and named carrier paths belong to each MPP inbound/outbound
 rather than to a global path role.
 
+### MPP wire-version upgrade
+
+MPTUNNEL 0.6.0 speaks MPP wire version 16. Upgrade each client and server in a
+session as one coordinated pair, verify `mptunnel --version` reports `0.6.0` at
+both endpoints, and only then enable traffic. A v15 endpoint rejects the first
+v16 MPP frame. This release has no capability negotiation or rolling
+compatibility mode, so keep mixed-version endpoints out of the same session.
+
 Every TOML duration key ends in `_s` and uses seconds. Whole seconds may be
 written as TOML integers and sub-second values as decimals, such as
 `fallback_s = 0.05`. The one security exception is

@@ -138,6 +138,11 @@ is optional so peers can instead use TLS 1.3 TCP and public QUIC Initials. The
 QUIC and TLS-fallback certificate name defaults to `mptunnel.example`;
 `--tls-server-name` remains available as an override.
 
+MPTUNNEL 0.6.0 uses MPP wire version 16. Upgrade the client and server as one
+coordinated pair before sending traffic and verify that both binaries report
+`0.6.0` with `--version`. A v15 endpoint rejects the first v16 MPP frame; this
+release has no capability negotiation or rolling compatibility mode.
+
 For persistent operation, copy `examples/client.toml` or
 `examples/server.toml` to `config.toml`, replace the placeholders, and validate
 before startup:

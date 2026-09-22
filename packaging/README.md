@@ -65,6 +65,11 @@ separate raw 32-byte endpoint key. The flag is optional so both peers can
 instead use TLS TCP and public QUIC Initials. Do not reuse an MPP client
 credential as this endpoint-wide key.
 
+MPTUNNEL 0.6.0 uses MPP wire version 16. Upgrade the client and server
+together, verify `./mptunnel --version` reports `0.6.0` on both endpoints, and
+then enable traffic. A v15 endpoint rejects the first v16 MPP frame; there is
+no capability negotiation or rolling compatibility mode.
+
 For a persistent setup, copy `examples/client.toml` or
 `examples/server.toml`, replace every placeholder, supply the referenced TLS
 certificate files, and validate before starting:

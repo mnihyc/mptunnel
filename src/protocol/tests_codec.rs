@@ -476,6 +476,17 @@ fn decoder_rejects_old_frames_after_v16_wire_cut() {
 }
 
 #[test]
+fn decoder_explicitly_rejects_v15_frames_after_v16_wire_cut() {
+    let mut encoded =
+        encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
+    encoded[4] = 15;
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
+        Err(CodecError::UnsupportedVersion(15))
+    );
+}
+
+#[test]
 fn path_metrics_v11_presence_bits_distinguish_absence_from_observed_zero() {
     let mut absent = peer_status_metrics(
         7,

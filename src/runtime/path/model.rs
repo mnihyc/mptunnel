@@ -1073,18 +1073,19 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
         has_ack_derived_data_sample,
         data_sample_count,
         data_sample_bytes,
-        approximate_metrics: (approximate_rate_bps
-            .is_some()
-            .then_some(PATH_METRIC_APPROXIMATE_RATE | PATH_METRIC_APPROXIMATE_QUALITY)
-            .unwrap_or(0))
-            | (approximate_pacing_rate_bps
-                .is_some()
-                .then_some(PATH_METRIC_APPROXIMATE_PACING)
-                .unwrap_or(0))
-            | (approximate_loss_ppm
-                .is_some()
-                .then_some(PATH_METRIC_APPROXIMATE_LOSS)
-                .unwrap_or(0)),
+        approximate_metrics: (if approximate_rate_bps.is_some() {
+            PATH_METRIC_APPROXIMATE_RATE | PATH_METRIC_APPROXIMATE_QUALITY
+        } else {
+            0
+        }) | (if approximate_pacing_rate_bps.is_some() {
+            PATH_METRIC_APPROXIMATE_PACING
+        } else {
+            0
+        }) | (if approximate_loss_ppm.is_some() {
+            PATH_METRIC_APPROXIMATE_LOSS
+        } else {
+            0
+        }),
     }
 }
 

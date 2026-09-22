@@ -592,7 +592,7 @@ impl TcpSenderMetricTracker {
         let approximate_pacing_rate_bps = current
             .bytes_acked
             .is_none()
-            .then(|| current.flight)
+            .then_some(current.flight)
             .flatten()
             .and_then(|flight| {
                 current.rtt.and_then(|rtt| {

@@ -72,7 +72,7 @@ impl ServerIpTunnelCarrier for RetiredTestCarrier {
     fn close(&self, _tunnel_id: IpTunnelId, _reason: CloseReason) {}
 }
 
-fn server_context() -> (
+pub(super) fn server_context() -> (
     crate::runtime::path::ServerPathContext,
     ServerSecurityConfig,
 ) {
@@ -106,7 +106,7 @@ fn session_reference_count(
         .map_or(0, |session| session.reference_count)
 }
 
-fn plan(security: &ServerSecurityConfig) -> TunL3AddressPlan {
+pub(super) fn plan(security: &ServerSecurityConfig) -> TunL3AddressPlan {
     TunL3AddressPlan::compile(
         TunL3ServerSpec {
             interface_name: Some("test-tun".to_string()),
@@ -127,7 +127,7 @@ fn plan(security: &ServerSecurityConfig) -> TunL3AddressPlan {
     .expect("address plan")
 }
 
-fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Bytes {
+pub(super) fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Bytes {
     let mut packet = vec![
         0x45,
         0,

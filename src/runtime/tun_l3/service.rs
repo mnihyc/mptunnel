@@ -1,5 +1,9 @@
 //! Transport-neutral server packet ownership and dispatch.
 
+#[cfg(test)]
+#[path = "tests_native_registry.rs"]
+mod tests_native_registry;
+
 use super::flow::PacketFlowTable;
 use super::{IpPacketQueueBudget, IpPacketQueuePermit};
 use crate::model::carrier_rate_authority::{CarrierRateAuthorityBasis, CarrierRateAuthorityStamp};
@@ -945,8 +949,9 @@ fn evaluate_server_carrier(
         return ServerIpCarrierEvaluation::Unavailable;
     };
     if status.eligibility_epoch != Some(eligibility_epoch)
-        || status.native_scheduling_shape.map(|shape| shape.stamp())
-            != apply.native_scheduling_shape.map(|shape| shape.stamp())
+        || (attachment.key.underlay == UnderlayProtocol::Tcp
+            && status.native_scheduling_shape.map(|shape| shape.stamp())
+                != apply.native_scheduling_shape.map(|shape| shape.stamp()))
     {
         return ServerIpCarrierEvaluation::Stale;
     }
@@ -966,10 +971,9 @@ fn evaluate_server_carrier(
                 }
                 Err(_) => return ServerIpCarrierEvaluation::Unavailable,
             };
-            if apply.native_scheduling_shape.map(|shape| shape.stamp()) != Some(live_shape.stamp())
-            {
-                return ServerIpCarrierEvaluation::Stale;
-            }
+            // Registry status supplies structural policy, fenced by its exact
+            // eligibility epoch. Native supplies the current scheduling shape;
+            // a lagging advisory projection is not another Native authority.
             (
                 server_native_packet_snapshot(&status, &attachment, live_shape),
                 Some(live_shape.stamp()),
@@ -1023,123 +1027,129 @@ fn apply_server_ip_dispatch(
     let structural_apply = |current_authority_shape: Option<
         crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot,
     >| {
-        plan.attachment.apply_authority.commit_if_current(
-            plan.eligibility_epoch,
-            native_stamp,
-            |_current_registry_shape| {
-                let (native_retention_limit_bytes, flowlet_timeout) = match native_stamp {
-                    Some(stamp) => {
-                        let Some(shape) = current_authority_shape.filter(|shape| {
-                            shape.stamp() == stamp
-                                && shape.stamp().scope().carrier_instance_id()
-                                    == plan.attachment.key.path_instance_id
-                                && shape.stamp().scope().direction()
-                                    == PathMetricDirection::ServerToClient
-                        }) else {
-                            return Ok(ServerIpDispatchApply {
-                                outcome: ServerIpDispatchOutcome::Stale,
-                                expiry: None,
-                            });
-                        };
-                        let snapshot =
-                            server_native_packet_snapshot(&plan.status, &plan.attachment, shape);
-                        if crate::scheduler::score_path(
-                            snapshot,
-                            crate::scheduler::TrafficClass::RealtimeDatagram,
-                            payload.len(),
-                        )
-                        .is_none()
-                        {
-                            return Ok(ServerIpDispatchApply {
-                                outcome: ServerIpDispatchOutcome::Stale,
-                                expiry: None,
-                            });
-                        }
-                        (
-                            Some(
-                                shape
-                                    .congestion_window()
-                                    .max(u64::from(shape.current_mtu())),
-                            ),
-                            crate::model::timing::transport_pto_from_snapshot(Some(snapshot)),
-                        )
-                    }
-                    None if current_authority_shape.is_none() => (None, plan.flowlet_timeout),
-                    None => {
+        let commit_packet = || {
+            let (native_retention_limit_bytes, flowlet_timeout) = match native_stamp {
+                Some(stamp) => {
+                    let Some(shape) = current_authority_shape.filter(|shape| {
+                        shape.stamp() == stamp
+                            && shape.stamp().scope().carrier_instance_id()
+                                == plan.attachment.key.path_instance_id
+                            && shape.stamp().scope().direction()
+                                == PathMetricDirection::ServerToClient
+                    }) else {
+                        return Ok(ServerIpDispatchApply {
+                            outcome: ServerIpDispatchOutcome::Stale,
+                            expiry: None,
+                        });
+                    };
+                    let snapshot =
+                        server_native_packet_snapshot(&plan.status, &plan.attachment, shape);
+                    if crate::scheduler::score_path(
+                        snapshot,
+                        crate::scheduler::TrafficClass::RealtimeDatagram,
+                        payload.len(),
+                    )
+                    .is_none()
+                    {
                         return Ok(ServerIpDispatchApply {
                             outcome: ServerIpDispatchOutcome::Stale,
                             expiry: None,
                         });
                     }
-                };
+                    (
+                        Some(
+                            shape
+                                .congestion_window()
+                                .max(u64::from(shape.current_mtu())),
+                        ),
+                        crate::model::timing::transport_pto_from_snapshot(Some(snapshot)),
+                    )
+                }
+                None if current_authority_shape.is_none() => (None, plan.flowlet_timeout),
+                None => {
+                    return Ok(ServerIpDispatchApply {
+                        outcome: ServerIpDispatchOutcome::Stale,
+                        expiry: None,
+                    });
+                }
+            };
 
-                let mut state = inner.state.lock().expect("server IP tunnel lock");
-                let Some(tunnel) = state.tunnels.get_mut(principal) else {
-                    return Ok(ServerIpDispatchApply {
-                        outcome: ServerIpDispatchOutcome::Stale,
+            let mut state = inner.state.lock().expect("server IP tunnel lock");
+            let Some(tunnel) = state.tunnels.get_mut(principal) else {
+                return Ok(ServerIpDispatchApply {
+                    outcome: ServerIpDispatchOutcome::Stale,
+                    expiry: None,
+                });
+            };
+            if tunnel.session_owner.is_retired()
+                || tunnel.tunnel_id != plan.tunnel_id
+                || tunnel.generation != plan.tunnel_generation
+                || tunnel.dispatch_generation != plan.dispatch_generation
+                || !tunnel
+                    .attachments
+                    .get(&plan.attachment.key)
+                    .is_some_and(|attachment| {
+                        attachment.attachment_generation == plan.attachment.attachment_generation
+                            && Arc::ptr_eq(&attachment.carrier, &plan.attachment.carrier)
+                    })
+            {
+                return Ok(ServerIpDispatchApply {
+                    outcome: ServerIpDispatchOutcome::Stale,
+                    expiry: None,
+                });
+            }
+            let outcome = plan.attachment.carrier.try_send_packet(
+                plan.tunnel_id,
+                packet_id,
+                payload,
+                budget_permit,
+                native_retention_limit_bytes,
+            )?;
+            match outcome {
+                IpTunnelPacketSendOutcome::Accepted => {
+                    tunnel.flows.bind(
+                        flow.clone(),
+                        plan.attachment.key,
+                        Instant::now(),
+                        flowlet_timeout,
+                    );
+                    tunnel.advance_dispatch_generation();
+                    Ok(ServerIpDispatchApply {
+                        outcome: ServerIpDispatchOutcome::Accepted,
                         expiry: None,
-                    });
-                };
-                if tunnel.session_owner.is_retired()
-                    || tunnel.tunnel_id != plan.tunnel_id
-                    || tunnel.generation != plan.tunnel_generation
-                    || tunnel.dispatch_generation != plan.dispatch_generation
-                    || !tunnel
-                        .attachments
-                        .get(&plan.attachment.key)
-                        .is_some_and(|attachment| {
-                            attachment.attachment_generation
-                                == plan.attachment.attachment_generation
-                                && Arc::ptr_eq(&attachment.carrier, &plan.attachment.carrier)
-                        })
-                {
-                    return Ok(ServerIpDispatchApply {
-                        outcome: ServerIpDispatchOutcome::Stale,
-                        expiry: None,
-                    });
+                    })
                 }
-                let outcome = plan.attachment.carrier.try_send_packet(
-                    plan.tunnel_id,
-                    packet_id,
-                    payload,
-                    budget_permit,
-                    native_retention_limit_bytes,
-                )?;
-                match outcome {
-                    IpTunnelPacketSendOutcome::Accepted => {
-                        tunnel.flows.bind(
-                            flow.clone(),
-                            plan.attachment.key,
-                            Instant::now(),
-                            flowlet_timeout,
-                        );
-                        tunnel.advance_dispatch_generation();
-                        Ok(ServerIpDispatchApply {
-                            outcome: ServerIpDispatchOutcome::Accepted,
-                            expiry: None,
-                        })
-                    }
-                    IpTunnelPacketSendOutcome::Full => Ok(ServerIpDispatchApply {
-                        outcome: ServerIpDispatchOutcome::Full,
-                        expiry: None,
-                    }),
-                    IpTunnelPacketSendOutcome::Retired => {
-                        let expiry = remove_server_ip_attachment(
-                            tunnel,
-                            plan.attachment.key,
-                            plan.attachment.attachment_generation,
-                            &inner.next_retention_epoch,
-                            inner.session_retention_timeout,
-                        )
-                        .map(|retention| server_ip_tunnel_expiry(principal, tunnel, retention));
-                        Ok(ServerIpDispatchApply {
-                            outcome: ServerIpDispatchOutcome::Retired,
-                            expiry,
-                        })
-                    }
+                IpTunnelPacketSendOutcome::Full => Ok(ServerIpDispatchApply {
+                    outcome: ServerIpDispatchOutcome::Full,
+                    expiry: None,
+                }),
+                IpTunnelPacketSendOutcome::Retired => {
+                    let expiry = remove_server_ip_attachment(
+                        tunnel,
+                        plan.attachment.key,
+                        plan.attachment.attachment_generation,
+                        &inner.next_retention_epoch,
+                        inner.session_retention_timeout,
+                    )
+                    .map(|retention| server_ip_tunnel_expiry(principal, tunnel, retention));
+                    Ok(ServerIpDispatchApply {
+                        outcome: ServerIpDispatchOutcome::Retired,
+                        expiry,
+                    })
                 }
-            },
-        )
+            }
+        };
+        match native_stamp {
+            Some(_) => plan
+                .attachment
+                .apply_authority
+                .commit_native_packet_if_eligible(plan.eligibility_epoch, commit_packet),
+            None => plan.attachment.apply_authority.commit_if_current(
+                plan.eligibility_epoch,
+                None,
+                |_| commit_packet(),
+            ),
+        }
     };
 
     match (native_authority, native_stamp) {

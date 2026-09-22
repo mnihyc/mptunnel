@@ -623,6 +623,28 @@ impl ServerCarrierPathApplyAuthority {
         }
         Some(commit(state.native_scheduling_shape))
     }
+
+    /// Structural fence for a Native IP-packet transfer already enclosed by
+    /// `commit_with_current_scheduling_shape`. That outer owner validates the
+    /// exact Native scope/activation/controller/revision and supplies current
+    /// capacity through queue acceptance. Its registry projection is advisory
+    /// and may lag; it must not replace the live Native authority.
+    ///
+    /// Keep the general stamp-bearing apply contract above for all other users.
+    pub(in crate::runtime) fn commit_native_packet_if_eligible<R>(
+        &self,
+        expected_eligibility_epoch: u64,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self
+            .inner
+            .lock()
+            .expect("server carrier apply-authority lock");
+        if state.eligibility_epoch != Some(expected_eligibility_epoch) {
+            return None;
+        }
+        Some(commit())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -377,6 +377,48 @@ struct ServerUdpIpTunnelCarrier {
     native_rate_authority: Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>,
 }
 
+/// Actual packet admission/retention owner without a transport writer or socket.
+#[cfg(test)]
+pub(in crate::runtime) struct NativePacketTestQueue {
+    carrier: Arc<ServerUdpIpTunnelCarrier>,
+    packets: mpsc::UnboundedReceiver<QueuedUdpIpPacket>,
+    _close: mpsc::UnboundedReceiver<ServerUdpIpTunnelClose>,
+}
+
+#[cfg(test)]
+impl NativePacketTestQueue {
+    pub(in crate::runtime) fn new(
+        authority: Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>,
+    ) -> Self {
+        let (packets, receive) = mpsc::unbounded_channel();
+        let (close, receive_close) = mpsc::unbounded_channel();
+        Self {
+            carrier: Arc::new(ServerUdpIpTunnelCarrier {
+                packets,
+                close,
+                ready: AtomicBool::new(true),
+                pending_bytes: Arc::new(AtomicUsize::new(0)),
+                native_rate_authority: authority,
+            }),
+            packets: receive,
+            _close: receive_close,
+        }
+    }
+
+    pub(in crate::runtime) fn carrier(&self) -> Arc<dyn ServerIpTunnelCarrier> {
+        self.carrier.clone()
+    }
+
+    pub(in crate::runtime) fn pending_bytes(&self) -> usize {
+        self.carrier.pending_bytes.load(Ordering::Acquire)
+    }
+
+    pub(in crate::runtime) fn pop(&mut self) -> Option<(IpTunnelId, IpPacketId, Bytes)> {
+        let packet = self.packets.try_recv().ok()?;
+        Some((packet.tunnel_id, packet.packet_id, packet.payload))
+    }
+}
+
 impl ServerIpTunnelCarrier for ServerUdpIpTunnelCarrier {
     fn try_send_packet(
         &self,

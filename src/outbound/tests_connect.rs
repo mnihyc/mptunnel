@@ -421,6 +421,7 @@ async fn socks5_udp_outbound_builds_udp_association() {
     let credentials = ProxyCredentials::new("alice".to_string(), "udp-password".to_string())
         .expect("credentials");
     let expected_auth = socks5::username_password_request(&credentials);
+    let (release_control, control_released) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         let mut greeting = [0u8; 3];
@@ -462,6 +463,7 @@ async fn socks5_udp_outbound_builds_udp_association() {
         let response =
             ingress_socks5::udp_datagram(&response_target, b"pong").expect("response packet");
         relay.send_to(&response, peer).await.expect("relay send");
+        control_released.await.expect("client consumed response");
     });
 
     let config = OutboundConfig::Socks5(ProxyConfig::new(proxy, Some(credentials)));
@@ -474,7 +476,131 @@ async fn socks5_udp_outbound_builds_udp_association() {
     let len = socket.recv(&mut buf).await.expect("recv");
 
     assert_eq!(&buf[..len], b"pong");
+    release_control.send(()).expect("release proxy control");
     server.await.expect("server");
+}
+
+async fn socks5_udp_association_with_control_eof() -> (Socks5UdpAssociation, UdpSocket) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+    let proxy = ProxyConfig::new(
+        listener
+            .local_addr()
+            .expect("proxy address")
+            .to_string()
+            .parse()
+            .expect("proxy endpoint"),
+        None,
+    );
+    let target = TargetAddr::Domain {
+        host: "example.com".to_string(),
+        port: 53,
+    };
+    let server = async {
+        let (mut control, _) = listener.accept().await.expect("proxy accept");
+        let mut greeting = [0; 3];
+        control.read_exact(&mut greeting).await.expect("greeting");
+        assert_eq!(greeting, socks5::no_auth_greeting());
+        control.write_all(&[0x05, 0x00]).await.expect("method");
+        let mut request = [0; 10];
+        control
+            .read_exact(&mut request)
+            .await
+            .expect("associate request");
+        assert_eq!(
+            request.as_slice(),
+            socks5::udp_associate_request("0.0.0.0:0".parse().expect("client endpoint"))
+                .expect("expected association")
+        );
+        let relay = UdpSocket::bind("127.0.0.1:0").await.expect("relay bind");
+        control
+            .write_all(&ingress_socks5::connect_reply(
+                ingress_socks5::Socks5Reply::Succeeded,
+                relay.local_addr().expect("relay address"),
+            ))
+            .await
+            .expect("associate reply");
+        (control, relay)
+    };
+    let config = OutboundConfig::Socks5(proxy);
+    let dns = static_dns_runtime([]);
+    let ((mut control, relay), opened) = tokio::join!(
+        server,
+        connect_udp(&config, &dns, &target, Duration::from_secs(2)),
+    );
+    let OutboundUdpSocket::Socks5(mut association) = opened.expect("association opens") else {
+        panic!("expected SOCKS5 association");
+    };
+
+    // Prove normal bidirectional UDP while the same control connection is live.
+    association.send(b"live-request").await.expect("live send");
+    let mut packet = [0; 512];
+    let (len, peer) = relay.recv_from(&mut packet).await.expect("proxy datagram");
+    let (datagram, consumed) =
+        ingress_socks5::parse_udp_datagram(&packet[..len]).expect("request datagram");
+    assert_eq!(consumed, len);
+    assert_eq!(datagram.target, target);
+    assert_eq!(&datagram.payload[..], b"live-request");
+    relay
+        .send_to(
+            &ingress_socks5::udp_datagram(&target, b"live-response").expect("response"),
+            peer,
+        )
+        .await
+        .expect("proxy response");
+    let mut response = [0; 32];
+    let len = association.recv(&mut response).await.expect("live receive");
+    assert_eq!(&response[..len], b"live-response");
+
+    control.shutdown().await.expect("proxy sends control FIN");
+    let mut probe = [0; 1];
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            association._control.peek(&mut probe)
+        )
+        .await
+        .expect("control FIN arrives")
+        .expect("control peek"),
+        0,
+        "observe actual control EOF without consuming it before testing UDP"
+    );
+    // Keep the shared UDP endpoint bound: no ICMP failure may mask lost control ownership.
+    (association, relay)
+}
+
+#[tokio::test]
+async fn socks5_udp_control_eof_terminates_receive() {
+    let (mut association, _relay) = socks5_udp_association_with_control_eof().await;
+    let mut response = [0; 32];
+    let receive = association.recv(&mut response);
+    tokio::pin!(receive);
+    let outcome = futures::poll!(&mut receive);
+    assert!(
+        matches!(outcome, Poll::Ready(Err(OutboundConnectError::Io(ref error)))
+            if error.kind() == std::io::ErrorKind::UnexpectedEof),
+        "control EOF must terminate a receive even while the UDP endpoint is open: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn socks5_udp_control_eof_terminates_send() {
+    let (mut association, relay) = socks5_udp_association_with_control_eof().await;
+    let send = association.send(b"expired-request");
+    tokio::pin!(send);
+    let outcome = futures::poll!(&mut send);
+    assert!(
+        matches!(outcome, Poll::Ready(Err(OutboundConnectError::Io(ref error)))
+            if error.kind() == std::io::ErrorKind::UnexpectedEof),
+        "control EOF must reject a send to the expired association: {outcome:?}"
+    );
+    let mut packet = [0; 512];
+    assert_eq!(
+        relay
+            .try_recv_from(&mut packet)
+            .expect_err("no expired datagram")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[tokio::test]

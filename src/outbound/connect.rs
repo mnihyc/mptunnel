@@ -775,12 +775,20 @@ impl Socks5UdpAssociation {
     pub(crate) async fn send(&mut self, payload: &[u8]) -> Result<usize, OutboundConnectError> {
         let packet = socks5_udp::udp_datagram(&self.target, payload)
             .map_err(OutboundConnectError::Socks5UdpPacket)?;
-        self.relay.send(&packet).await?;
+        tokio::select! {
+            biased;
+            error = socks5_udp_control_error(&self._control) => return Err(error),
+            sent = self.relay.send(&packet) => { sent?; }
+        }
         Ok(payload.len())
     }
 
     pub(crate) async fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, OutboundConnectError> {
-        let len = self.relay.recv(&mut self.recv_buffer).await?;
+        let len = tokio::select! {
+            biased;
+            error = socks5_udp_control_error(&self._control) => return Err(error),
+            received = self.relay.recv(&mut self.recv_buffer) => received?,
+        };
         let datagram = socks5_udp::parse_udp_datagram_parts(&self.recv_buffer[..len])
             .map_err(OutboundConnectError::Socks5UdpPacket)?;
         if datagram.consumed != len {
@@ -801,6 +809,21 @@ impl Socks5UdpAssociation {
         }
         buffer[..payload.len()].copy_from_slice(payload);
         Ok(payload.len())
+    }
+}
+
+async fn socks5_udp_control_error(control: &TcpStream) -> OutboundConnectError {
+    // The control connection owns the UDP association. Peeking keeps unexpected
+    // control data terminal across retries without consuming anything on cancellation.
+    let mut probe = [0; 1];
+    match control.peek(&mut probe).await {
+        Ok(0) => std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "SOCKS5 UDP proxy closed the control connection",
+        )
+        .into(),
+        Ok(_) => OutboundConnectError::InvalidProxyResponse,
+        Err(error) => error.into(),
     }
 }
 

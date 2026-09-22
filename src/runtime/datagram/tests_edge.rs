@@ -192,6 +192,187 @@ fn native_udp_edge_test_product_flow(target: &TargetAddr) -> OpenedProductFlow {
     OpenedProductFlow::native_udp_for_test(scope, &telemetry)
 }
 
+async fn accept_socks5_udp_edge_control(
+    listener: &tokio::net::TcpListener,
+    relay: &UdpSocket,
+) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut control, _) = listener.accept().await.expect("proxy accepts control");
+    let mut greeting = [0; 3];
+    control
+        .read_exact(&mut greeting)
+        .await
+        .expect("proxy greeting");
+    assert_eq!(greeting, crate::outbound::socks5::no_auth_greeting());
+    control
+        .write_all(&[0x05, 0x00])
+        .await
+        .expect("proxy method");
+    let mut request = [0; 10];
+    control
+        .read_exact(&mut request)
+        .await
+        .expect("UDP associate");
+    assert_eq!(
+        request.as_slice(),
+        crate::outbound::socks5::udp_associate_request(
+            "0.0.0.0:0".parse().expect("unspecified client")
+        )
+        .expect("expected association")
+    );
+    control
+        .write_all(&crate::ingress::socks5::connect_reply(
+            crate::ingress::socks5::Socks5Reply::Succeeded,
+            relay.local_addr().expect("shared UDP endpoint"),
+        ))
+        .await
+        .expect("UDP association reply");
+    control
+}
+
+#[tokio::test]
+async fn socks5_udp_control_eof_releases_lane_and_reopens() {
+    use crate::config::ProductPolicyConfig;
+    use crate::outbound::{OutboundConfig, ProxyConfig};
+    use crate::product::{
+        EgressAction, InitialDemand, RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId,
+    };
+    use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy listener");
+        let relay = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("shared UDP relay");
+        let outbound = OutboundId::parse("socks-proxy").expect("outbound");
+        let registry = RuntimeOutboundRegistry::compile(
+            [RuntimeOutboundLeaf::Local {
+                id: outbound.clone(),
+                config: OutboundConfig::Socks5(ProxyConfig::new(
+                    listener
+                        .local_addr()
+                        .expect("proxy address")
+                        .to_string()
+                        .parse()
+                        .expect("endpoint"),
+                    None,
+                )),
+                connect_timeout: Duration::from_secs(2),
+                native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+            }],
+            &[],
+            crate::runtime::outbound_registry::test_dns_generation(),
+        )
+        .expect("native registry");
+        let admission = registry.product_admission().clone();
+        let policy = ProductPolicyConfig {
+            generation: 1,
+            routes: vec![RouteRuleSpec::new(
+                RuleId::parse("proxy-route").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow(
+                    EgressAction::Outbound(outbound),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )],
+        };
+        let router = ClientIngressRouter::new(&policy, registry).expect("router");
+        let target = TargetAddr::Ip("203.0.113.20:53".parse().expect("UDP target"));
+        let ClientRoute::Open(plan) = router
+            .route_udp(
+                &target,
+                "127.0.0.1:41000".parse().expect("local peer"),
+                PrincipalId::parse("anonymous").expect("principal"),
+                InboundId::parse("socks-local").expect("inbound"),
+            )
+            .expect("UDP route")
+        else {
+            panic!("UDP route must open");
+        };
+        let limits = edge_test_mux_limits(2);
+        let (completion_tx, mut completion_rx) = mpsc::channel(udp_edge_completion_queue(limits));
+        let mut lanes = Vec::new();
+        let mut next_lane_id = 0;
+        for payload in [b"a".as_slice(), b"b".as_slice()] {
+            assert!(
+                dispatch_udp_edge_request(
+                    &mut lanes,
+                    &mut next_lane_id,
+                    &plan,
+                    limits,
+                    &completion_tx,
+                    UdpEdgeRequest {
+                        target: target.clone(),
+                        payload: Bytes::copy_from_slice(payload),
+                        ttl_ms: 1_000,
+                        metadata: 9_u8,
+                    },
+                )
+                .is_ok(),
+                "fresh datagram must open/reuse available lane"
+            );
+            let mut control = accept_socks5_udp_edge_control(&listener, &relay).await;
+            let mut packet = [0; 512];
+            let (len, peer) = relay.recv_from(&mut packet).await.expect("proxied request");
+            let (request, consumed) =
+                crate::ingress::socks5::parse_udp_datagram(&packet[..len]).expect("request packet");
+            assert_eq!(consumed, len);
+            assert_eq!(request.target, target);
+            assert_eq!(&request.payload[..], payload);
+            relay
+                .send_to(
+                    &crate::ingress::socks5::udp_datagram(&target, payload)
+                        .expect("proxy response"),
+                    peer,
+                )
+                .await
+                .expect("proxy response send");
+            let mut sent = false;
+            let mut received = false;
+            while !sent || !received {
+                let completion = completion_rx.recv().await.expect("UDP completion");
+                finish_udp_edge_completion(&mut lanes, &completion);
+                match completion {
+                    UdpEdgeCompletion::Sent { result: Ok(()), .. } => sent = true,
+                    UdpEdgeCompletion::Received { payload: reply, .. } => {
+                        assert_eq!(&reply[..], payload);
+                        received = true;
+                    }
+                    _ => panic!("unexpected UDP completion"),
+                }
+            }
+            assert_eq!(admission.snapshot().live_flows, 1);
+            control.shutdown().await.expect("proxy sends control FIN");
+            let mut probe = [0; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), control.read(&mut probe))
+                    .await
+                    .expect("control EOF must retire lane and close client socket")
+                    .expect("client control EOF"),
+                0
+            );
+            wait_for_all_lane_tasks_to_finish(&lanes).await;
+            let snapshot = admission.snapshot();
+            assert_eq!(snapshot.live_flows, 0);
+            assert_eq!(snapshot.concurrent_work, 0);
+            assert!(snapshot.principals.is_empty());
+            assert!(snapshot.outbounds.is_empty());
+            assert!(snapshot.targets.is_empty());
+        }
+        assert_eq!(
+            next_lane_id, 2,
+            "the second request used a fresh association"
+        );
+        close_udp_edge_lanes(lanes).await;
+    })
+    .await
+    .expect("bounded control retirement/reopen scenario");
+}
+
 struct BlockingTerminalNativeUdpIo {
     recv_entered: Option<oneshot::Sender<()>>,
     recv_release: Arc<(Mutex<bool>, Condvar)>,

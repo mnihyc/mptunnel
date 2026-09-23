@@ -1,0 +1,1241 @@
+{
+  "adaptation": {
+    "conditions": {
+      "capacity_reversal_assignment": {
+        "per_protocol_rates_mbps": {
+          "QUIC": 200,
+          "TCP": 500
+        },
+        "protocol_by_link": {
+          "46": "QUIC",
+          "47": "TCP"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        }
+      },
+      "configured_capacity_sum_mbps": 700,
+      "configured_rates_mbps_by_link": {
+        "46": 500,
+        "47": 200
+      },
+      "duration_s": 60,
+      "identity_swap_semantics": {
+        "identity_swapped_protocol_by_link": {
+          "46": "TCP",
+          "47": "QUIC"
+        },
+        "identity_swapped_rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        },
+        "normal_protocol_by_link": {
+          "46": "QUIC",
+          "47": "TCP"
+        },
+        "preserved_per_protocol_rates_mbps": {
+          "QUIC": 500,
+          "TCP": 200
+        }
+      },
+      "identity_swapped_assignment": {
+        "46": "TCP",
+        "47": "QUIC"
+      },
+      "loaded_offers_per_mixed_row": 125,
+      "normal_assignment": {
+        "46": "QUIC",
+        "47": "TCP"
+      }
+    },
+    "rows": [
+      {
+        "case": "01-normal-mixed-down",
+        "condition": "normal-mixed",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "down",
+        "duration_s": 60,
+        "goodput_mbps": 279.4913512370229,
+        "loaded_offers": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 0.4960878570564091,
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 500,
+          "47": 200
+        },
+        "variant": "published052"
+      },
+      {
+        "case": "02-normal-mixed-down",
+        "condition": "normal-mixed",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "down",
+        "duration_s": 60,
+        "goodput_mbps": 309.78693515762353,
+        "loaded_offers": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 0.2420847350731492,
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 500,
+          "47": 200
+        },
+        "variant": "candidate"
+      },
+      {
+        "case": "03-normal-mixed-up",
+        "condition": "normal-mixed",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "up",
+        "duration_s": 60,
+        "goodput_mbps": 243.981,
+        "loaded_offers": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 1.973163,
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 500,
+          "47": 200
+        },
+        "variant": "candidate"
+      },
+      {
+        "case": "04-normal-mixed-up",
+        "condition": "normal-mixed",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "up",
+        "duration_s": 60,
+        "goodput_mbps": 258.483,
+        "loaded_offers": {
+          "budget_misses": 3,
+          "failures": 1,
+          "late_successes": 2,
+          "offered": 125,
+          "successful_full_body": 124
+        },
+        "maximum_delivery_gap_s": 2.27731,
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 500,
+          "47": 200
+        },
+        "variant": "published052"
+      },
+      {
+        "case": "05-capacity-reversal-down",
+        "condition": "capacity-reversal",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "down",
+        "duration_s": 60,
+        "goodput_mbps": 295.8736347220011,
+        "loaded_offers": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 0.76492342306301,
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        },
+        "variant": "published052"
+      },
+      {
+        "case": "06-capacity-reversal-down",
+        "condition": "capacity-reversal",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "down",
+        "duration_s": 60,
+        "goodput_mbps": 302.1971327123596,
+        "loaded_offers": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 1.0546461739577353,
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        },
+        "variant": "candidate"
+      },
+      {
+        "case": "07-capacity-reversal-up",
+        "condition": "capacity-reversal",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "up",
+        "duration_s": 60,
+        "goodput_mbps": 450.617,
+        "loaded_offers": {
+          "budget_misses": 1,
+          "failures": 0,
+          "late_successes": 1,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 1.146051,
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        },
+        "variant": "candidate"
+      },
+      {
+        "case": "08-capacity-reversal-up",
+        "condition": "capacity-reversal",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "up",
+        "duration_s": 60,
+        "goodput_mbps": 435.624,
+        "loaded_offers": {
+          "budget_misses": 10,
+          "failures": 1,
+          "late_successes": 9,
+          "offered": 125,
+          "successful_full_body": 124
+        },
+        "maximum_delivery_gap_s": 1.53284,
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        },
+        "variant": "published052"
+      },
+      {
+        "case": "09-identity-swap-down",
+        "condition": "identity-swap",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "down",
+        "duration_s": 60,
+        "goodput_mbps": 242.67177353986008,
+        "loaded_offers": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 0.7476967629045248,
+        "protocol_by_link": {
+          "46": "tcp",
+          "47": "quic"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        },
+        "variant": "published052"
+      },
+      {
+        "case": "10-identity-swap-down",
+        "condition": "identity-swap",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "down",
+        "duration_s": 60,
+        "goodput_mbps": 226.12420055817663,
+        "loaded_offers": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 0.3197827059775591,
+        "protocol_by_link": {
+          "46": "tcp",
+          "47": "quic"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        },
+        "variant": "candidate"
+      },
+      {
+        "case": "11-identity-swap-up",
+        "condition": "identity-swap",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "up",
+        "duration_s": 60,
+        "goodput_mbps": 415.512,
+        "loaded_offers": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 0.786737,
+        "protocol_by_link": {
+          "46": "tcp",
+          "47": "quic"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        },
+        "variant": "candidate"
+      },
+      {
+        "case": "12-identity-swap-up",
+        "condition": "identity-swap",
+        "configured_capacity_ceiling_mbps": 700,
+        "direction": "up",
+        "duration_s": 60,
+        "goodput_mbps": 349.659,
+        "loaded_offers": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 125,
+          "successful_full_body": 125
+        },
+        "maximum_delivery_gap_s": 0.951047,
+        "protocol_by_link": {
+          "46": "tcp",
+          "47": "quic"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 500
+        },
+        "variant": "published052"
+      }
+    ],
+    "scope": "one measured run per binary and exact cell"
+  },
+  "competitive": {
+    "conditions": {
+      "bulk": "time-limited HTTP body read",
+      "configured_random_loss": "none",
+      "delay_ms": {
+        "down": 70,
+        "up": 30
+      },
+      "duration_s": 40,
+      "echo": {
+        "payload_bytes": 64,
+        "sequential_period_ms": 500,
+        "timeout_ms": 3000
+      },
+      "endpoint_cpu_quota": 4,
+      "initial_jitter_ms": {
+        "down": 20,
+        "up": 5
+      },
+      "native_tcp_controller_observation": "BBR was reported by the three MPTUNNEL mixed TCP carriers; it is a socket readback, not a configured override.",
+      "nominal_jitter_clear_s": 8,
+      "other_settings": {
+        "Hysteria2": "2.10.0, Brutal, configured 500/100 Mbps",
+        "Xray": "26.3.27, VMess/TCP, user cipher security:auto, TCP transport, no configured mux or TLS"
+      },
+      "router_cpu_quota": 2,
+      "shared_bottleneck_mbps": {
+        "down": 500,
+        "up": 100
+      }
+    },
+    "figure": {
+      "path": "assets/performance/competitive-v0.6.0.png",
+      "svg_path": "assets/performance/competitive-v0.6.0.svg"
+    },
+    "rows": [
+      {
+        "artifact_sha256": "72c6bd109f871c6ce96451529b32a72b3c8a397ae6b1762dc0fe8c1b364485d1",
+        "case": "fc01-candidate-quic",
+        "client_process_cpu_s_per_delivered_GiB": 17.58697043429164,
+        "echo_failures": 0,
+        "echo_offered": 80,
+        "echo_p95_ms": 153.64876296371222,
+        "echo_successful": 80,
+        "goodput_mbps": 343.36130721119247,
+        "maximum_delivery_gap_s": 0.09452396025881171,
+        "quiet_fixed_offer_phase": "unavailable",
+        "server_process_cpu_s_per_delivered_GiB": 25.098332984641655,
+        "source_revision": "1e8abedfce9d626d9e7b87211dbdd7d8f33c6290",
+        "system": "quic",
+        "variant": "candidate"
+      },
+      {
+        "artifact_sha256": "04f7804159ef1d798de12a817d73aab4b9040ebe45fc62e223000c5c59e987fe",
+        "case": "fc02-h2-h2",
+        "client_process_cpu_s_per_delivered_GiB": 22.05857614167296,
+        "echo_failures": 0,
+        "echo_offered": 79,
+        "echo_p95_ms": 426.7179099842906,
+        "echo_successful": 79,
+        "goodput_mbps": 366.62892095037614,
+        "maximum_delivery_gap_s": 4.282132309861481,
+        "quiet_fixed_offer_phase": "unavailable",
+        "server_process_cpu_s_per_delivered_GiB": 20.529821926862382,
+        "source_revision": null,
+        "system": "h2",
+        "variant": "h2"
+      },
+      {
+        "artifact_sha256": "72c6bd109f871c6ce96451529b32a72b3c8a397ae6b1762dc0fe8c1b364485d1",
+        "case": "fc03-candidate-mixed",
+        "client_process_cpu_s_per_delivered_GiB": 12.971118060840336,
+        "echo_failures": 0,
+        "echo_offered": 69,
+        "echo_p95_ms": 797.1496959216893,
+        "echo_successful": 69,
+        "goodput_mbps": 406.31193074059377,
+        "maximum_delivery_gap_s": 0.5064643654040992,
+        "quiet_fixed_offer_phase": "unavailable",
+        "server_process_cpu_s_per_delivered_GiB": 22.64288885022149,
+        "source_revision": "1e8abedfce9d626d9e7b87211dbdd7d8f33c6290",
+        "system": "mixed",
+        "variant": "candidate"
+      },
+      {
+        "artifact_sha256": "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed",
+        "case": "fc05-xray-xray",
+        "client_process_cpu_s_per_delivered_GiB": 2.512452822854915,
+        "echo_failures": 0,
+        "echo_offered": 80,
+        "echo_p95_ms": 122.05745838582516,
+        "echo_successful": 80,
+        "goodput_mbps": 286.33431256886996,
+        "maximum_delivery_gap_s": 0.1057354942895472,
+        "quiet_fixed_offer_phase": "unavailable",
+        "server_process_cpu_s_per_delivered_GiB": 1.192477608459497,
+        "source_revision": null,
+        "system": "xray",
+        "variant": "xray"
+      },
+      {
+        "artifact_sha256": null,
+        "case": "fc07-raw-tcp-direct",
+        "client_process_cpu_s_per_delivered_GiB": null,
+        "echo_failures": 0,
+        "echo_offered": 80,
+        "echo_p95_ms": 121.89946696162224,
+        "echo_successful": 80,
+        "goodput_mbps": 294.8169724202677,
+        "maximum_delivery_gap_s": 0.10027531534433365,
+        "quiet_fixed_offer_phase": "unavailable",
+        "server_process_cpu_s_per_delivered_GiB": null,
+        "source_revision": null,
+        "system": "raw",
+        "variant": "raw"
+      }
+    ],
+    "scope": "five single observations, one per system; no quiet fixed-offer phase"
+  },
+  "description": "Curated direct observations for the identified MPTUNNEL 0.6.0 development build and published MPTUNNEL 0.5.2; no pooling, interpolation, or significance analysis.",
+  "limits": [
+    "The candidate observations use the source revision and artifact identified in measured_candidate; the published reference is identified in published_reference.",
+    "Each named matrix/competitive cell is a single observation; tables are descriptive and do not establish a universal ranking or no-downgrade guarantee.",
+    "Configured capacity sums are network settings, not offered application rates. Offer counts and capacity rates are different quantities.",
+    "CPU values are sampled product-process CPU divided by whole-probe delivered GiB; direct TCP has no Product process CPU entry. RSS is sampled residency.",
+    "The curated data retains stated conditions and observed row outcomes; it does not replace raw measurement records."
+  ],
+  "measured_candidate": {
+    "artifact_sha256": "72c6bd109f871c6ce96451529b32a72b3c8a397ae6b1762dc0fe8c1b364485d1",
+    "source_revision": "1e8abedfce9d626d9e7b87211dbdd7d8f33c6290",
+    "version": "mptunnel 0.6.0"
+  },
+  "ordinary": {
+    "conditions": {
+      "active_protocols": "TCP+QUIC mixed configuration",
+      "configured_loss_percent": 0,
+      "directional_delay_ms": {
+        "client_egress": 30,
+        "server_egress": 70
+      },
+      "duration_s": 25,
+      "fixed_offer_schedule": {
+        "body_bytes": 100000,
+        "loaded": 55,
+        "period_s": 0.5,
+        "quiet_after": 25,
+        "quiet_before": 25,
+        "response_budget_s": 2.5
+      },
+      "jitter_ms": 0,
+      "single_active_link_mbps": 500
+    },
+    "independent_link_upload": {
+      "conditions": {
+        "active_protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "configured_capacity_sum_mbps": 400,
+        "configured_loss_percent": {
+          "client": 0,
+          "server": 0
+        },
+        "controller": "no controller override in original config; artifact native defaults; published/local build differences remain separate",
+        "delay_ms_client_egress": 70,
+        "delay_ms_server_egress": 30,
+        "duration_s": 40,
+        "fixed_offer_schedule": {
+          "body_bytes": 100000,
+          "budget_s": 2.5,
+          "counts": [
+            25,
+            85,
+            25
+          ],
+          "durations_s": [
+            15,
+            45,
+            15
+          ],
+          "period_s": 0.5
+        },
+        "jitter_ms": 0,
+        "outage": {
+          "chain": "INPUT",
+          "client_source_ports": [
+            7443,
+            18444
+          ],
+          "nominal_begin_s": 30,
+          "nominal_end_s": 33,
+          "protocol": "udp",
+          "server_destination_ports": [
+            7443,
+            18444
+          ],
+          "trigger": "existing collector elapsed predicate, applies both links; missed interval is not replayed"
+        },
+        "qos": {
+          "link": 46,
+          "logical_side": "server",
+          "nominal_begin_s": 15,
+          "nominal_end_s": 25,
+          "physical_side": "client",
+          "rate_mbps": 10,
+          "trigger": "first observed epoch3/4; restore at next observed epoch outside3/4"
+        },
+        "rates_mbps_by_link": {
+          "46": 200,
+          "47": 200
+        },
+        "topology": "independent",
+        "cpu_measurement_basis": "sampled process user/kernel counter seconds divided by whole-probe delivered GiB; process counters, not total-machine CPU"
+      },
+      "rows": [
+        {
+          "case": "fm-15-independent-aggregate-up-published052",
+          "configured_ceiling_mbps": 400,
+          "goodput_mbps": 257.36,
+          "loaded_offers": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0,
+            "offered": 85,
+            "successful_full_body": 85
+          },
+          "maximum_delivery_gap_s": 0.66178,
+          "variant": "published052",
+          "client_cpu_user_kernel_s_per_delivered_gib": [
+            22.07801242236025,
+            6.79
+          ],
+          "server_cpu_user_kernel_s_per_delivered_gib": [
+            10.963,
+            8.562
+          ]
+        },
+        {
+          "case": "fm-16-independent-aggregate-up-candidate",
+          "configured_ceiling_mbps": 400,
+          "goodput_mbps": 213.118,
+          "loaded_offers": {
+            "budget_misses": 11,
+            "failures": 5,
+            "late_successes": 6,
+            "offered": 85,
+            "successful_full_body": 80
+          },
+          "maximum_delivery_gap_s": 1.771382,
+          "variant": "candidate",
+          "client_cpu_user_kernel_s_per_delivered_gib": [
+            33.45047189728959,
+            7.909194864479316
+          ],
+          "server_cpu_user_kernel_s_per_delivered_gib": [
+            13.752,
+            9.218
+          ]
+        }
+      ],
+      "scope": "one published052/current development-build pair, one observation per exact cell"
+    },
+    "rows": [
+      {
+        "case": "09-healthy-mixed-down",
+        "configured_capacity_ceiling_mbps": 500,
+        "delivered_bytes": 1283155996,
+        "direction": "download",
+        "goodput_mbps": 410.5680829151751,
+        "loaded": {
+          "budget_misses": 23,
+          "failures": 6,
+          "late_successes": 17,
+          "offered": 55,
+          "successful_full_body": 49
+        },
+        "maximum_delivery_gap_s": 0.8919728361070156,
+        "quiet_after": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 25,
+          "successful_full_body": 25
+        },
+        "quiet_before": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 25,
+          "successful_full_body": 25
+        },
+        "variant": "published052"
+      },
+      {
+        "case": "10-healthy-mixed-down",
+        "configured_capacity_ceiling_mbps": 500,
+        "delivered_bytes": 1270929552,
+        "direction": "download",
+        "goodput_mbps": 406.6750613406449,
+        "loaded": {
+          "budget_misses": 7,
+          "failures": 0,
+          "late_successes": 7,
+          "offered": 55,
+          "successful_full_body": 55
+        },
+        "maximum_delivery_gap_s": 0.8397516831755638,
+        "quiet_after": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 25,
+          "successful_full_body": 25
+        },
+        "quiet_before": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 25,
+          "successful_full_body": 25
+        },
+        "variant": "candidate"
+      },
+      {
+        "case": "11-healthy-mixed-up",
+        "configured_capacity_ceiling_mbps": 500,
+        "delivered_bytes": 1486094336,
+        "direction": "upload",
+        "goodput_mbps": 444.374,
+        "loaded": {
+          "budget_misses": 1,
+          "failures": 0,
+          "late_successes": 1,
+          "offered": 55,
+          "successful_full_body": 55
+        },
+        "maximum_delivery_gap_s": 0.592327,
+        "quiet_after": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 25,
+          "successful_full_body": 25
+        },
+        "quiet_before": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 25,
+          "successful_full_body": 25
+        },
+        "variant": "candidate"
+      },
+      {
+        "case": "12-healthy-mixed-up",
+        "configured_capacity_ceiling_mbps": 500,
+        "delivered_bytes": 1474691072,
+        "direction": "upload",
+        "goodput_mbps": 446.404,
+        "loaded": {
+          "budget_misses": 10,
+          "failures": 0,
+          "late_successes": 10,
+          "offered": 55,
+          "successful_full_body": 55
+        },
+        "maximum_delivery_gap_s": 1.194375,
+        "quiet_after": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 25,
+          "successful_full_body": 25
+        },
+        "quiet_before": {
+          "budget_misses": 0,
+          "failures": 0,
+          "late_successes": 0,
+          "offered": 25,
+          "successful_full_body": 25
+        },
+        "variant": "published052"
+      }
+    ],
+    "scope": "one measured run per binary and exact cell"
+  },
+  "published_reference": {
+    "artifact_sha256": "78a4078e9759ad1c8b9737c6c30b9a7a571458b97c34f73593ac205ee1abb8b6",
+    "source_revision": "0c34a24dffdea94adf79939cd19d421c9ff2e70b",
+    "version": "mptunnel 0.5.2"
+  },
+  "schema": "mptunnel.performance.publication-observations.v1",
+  "sustained": {
+    "conditions": {
+      "event_schedule": [
+        {
+          "at_s": 0,
+          "client": [
+            30,
+            3,
+            0.1
+          ],
+          "kind": "baseline-impairment",
+          "seed": 20260915,
+          "server": [
+            70,
+            10,
+            0.3
+          ]
+        },
+        {
+          "at_s": 20,
+          "client": [
+            43,
+            4,
+            0.096
+          ],
+          "kind": "variable",
+          "seed": 20260917,
+          "server": [
+            86,
+            11,
+            1.462
+          ]
+        },
+        {
+          "at_s": 45,
+          "client": [
+            32,
+            5,
+            0.109
+          ],
+          "kind": "variable",
+          "seed": 20260919,
+          "server": [
+            66,
+            13,
+            0.231
+          ]
+        },
+        {
+          "at_s": 60,
+          "client": [
+            90,
+            20,
+            2
+          ],
+          "kind": "spike",
+          "seed": 20260921,
+          "server": [
+            180,
+            40,
+            5
+          ]
+        },
+        {
+          "at_s": 63,
+          "client": [
+            32,
+            5,
+            0.109
+          ],
+          "kind": "spike-recovery",
+          "seed": 20260923,
+          "server": [
+            66,
+            13,
+            0.231
+          ]
+        },
+        {
+          "at_s": 70,
+          "client": [
+            21,
+            1,
+            0.101
+          ],
+          "kind": "variable",
+          "seed": 20260925,
+          "server": [
+            73,
+            13,
+            1.918
+          ]
+        },
+        {
+          "at_s": 95,
+          "client": [
+            28,
+            8,
+            0.256
+          ],
+          "kind": "variable",
+          "seed": 20260927,
+          "server": [
+            57,
+            6,
+            1.369
+          ]
+        },
+        {
+          "at_s": 120,
+          "client": [
+            33,
+            5,
+            0.428
+          ],
+          "kind": "variable",
+          "seed": 20260929,
+          "server": [
+            91,
+            4,
+            1.083
+          ]
+        },
+        {
+          "at_s": 145,
+          "client": [
+            29,
+            2,
+            0.402
+          ],
+          "kind": "variable",
+          "seed": 20260931,
+          "server": [
+            65,
+            10,
+            0.656
+          ]
+        },
+        {
+          "at_s": 149,
+          "client": [
+            90,
+            20,
+            2
+          ],
+          "kind": "spike",
+          "seed": 20260933,
+          "server": [
+            180,
+            40,
+            5
+          ]
+        },
+        {
+          "at_s": 152,
+          "client": [
+            29,
+            2,
+            0.402
+          ],
+          "kind": "spike-recovery",
+          "seed": 20260935,
+          "server": [
+            65,
+            10,
+            0.656
+          ]
+        },
+        {
+          "at_s": 170,
+          "client": [
+            24,
+            3,
+            0.055
+          ],
+          "kind": "variable",
+          "seed": 20260937,
+          "server": [
+            64,
+            9,
+            0.468
+          ]
+        },
+        {
+          "at_s": 195,
+          "client": [
+            47,
+            6,
+            0.144
+          ],
+          "kind": "variable",
+          "seed": 20260939,
+          "server": [
+            66,
+            3,
+            0.467
+          ]
+        },
+        {
+          "at_s": 220,
+          "client": [
+            44,
+            4,
+            0.125
+          ],
+          "kind": "variable",
+          "seed": 20260941,
+          "server": [
+            80,
+            11,
+            1.36
+          ]
+        },
+        {
+          "at_s": 232,
+          "client": [
+            90,
+            20,
+            2
+          ],
+          "kind": "spike",
+          "seed": 20260943,
+          "server": [
+            180,
+            40,
+            5
+          ]
+        },
+        {
+          "at_s": 235,
+          "client": [
+            44,
+            4,
+            0.125
+          ],
+          "kind": "spike-recovery",
+          "seed": 20260945,
+          "server": [
+            80,
+            11,
+            1.36
+          ]
+        },
+        {
+          "at_s": 245,
+          "client": [
+            31,
+            7,
+            0.174
+          ],
+          "kind": "variable",
+          "seed": 20260947,
+          "server": [
+            77,
+            5,
+            0.746
+          ]
+        },
+        {
+          "at_s": 270,
+          "client": [
+            30,
+            3,
+            0.1
+          ],
+          "kind": "baseline-recovery",
+          "seed": 20260949,
+          "server": [
+            70,
+            10,
+            0.3
+          ]
+        }
+      ],
+      "schedule_clock": "original before-probe launch anchor; then schedule worker, then loaded small producer, then original bulk launch",
+      "schedule_scope": "recorded transitions changeQUIC46 only; TCP47 retains baseline directional impairment"
+    },
+    "rows": [
+      {
+        "bidirectional_wire_per_delivered_byte": 1.7145604911475905,
+        "case": "fs-05-published052-mixed-down",
+        "direction": "down",
+        "duration_s": 300,
+        "fixed_offers": {
+          "after": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          },
+          "before": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          },
+          "during": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          }
+        },
+        "forward_wire_per_delivered_byte": 1.6726344208865862,
+        "goodput_mbps": 255.11424220329883,
+        "maximum_delivery_gap_s": 0.46584314992651343,
+        "profile": {
+          "client": {
+            "parameters": [
+              30,
+              3,
+              0.1
+            ],
+            "seed": 20260916
+          },
+          "server": {
+            "parameters": [
+              70,
+              10,
+              0.3
+            ],
+            "seed": 20260915
+          }
+        },
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 500,
+          "47": 200
+        },
+        "variant": "published052"
+      },
+      {
+        "bidirectional_wire_per_delivered_byte": 1.7760932097880897,
+        "case": "fs-06-candidate-mixed-down",
+        "direction": "down",
+        "duration_s": 300,
+        "fixed_offers": {
+          "after": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          },
+          "before": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          },
+          "during": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          }
+        },
+        "forward_wire_per_delivered_byte": 1.7318485656619969,
+        "goodput_mbps": 225.6102838893641,
+        "maximum_delivery_gap_s": 0.5269530317746103,
+        "profile": {
+          "client": {
+            "parameters": [
+              30,
+              3,
+              0.1
+            ],
+            "seed": 20260916
+          },
+          "server": {
+            "parameters": [
+              70,
+              10,
+              0.3
+            ],
+            "seed": 20260915
+          }
+        },
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 500,
+          "47": 200
+        },
+        "variant": "candidate"
+      },
+      {
+        "bidirectional_wire_per_delivered_byte": 1.2581000495148722,
+        "case": "fs-07-candidate-mixed-up",
+        "direction": "up",
+        "duration_s": 300,
+        "fixed_offers": {
+          "after": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          },
+          "before": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          },
+          "during": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          }
+        },
+        "forward_wire_per_delivered_byte": 1.2389348316119395,
+        "goodput_mbps": 387.239,
+        "maximum_delivery_gap_s": 1.736583,
+        "profile": {
+          "client": {
+            "parameters": [
+              30,
+              3,
+              0.1
+            ],
+            "seed": 20260916
+          },
+          "server": {
+            "parameters": [
+              70,
+              10,
+              0.3
+            ],
+            "seed": 20260915
+          }
+        },
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 500,
+          "47": 200
+        },
+        "variant": "candidate"
+      },
+      {
+        "bidirectional_wire_per_delivered_byte": 1.4439655766797244,
+        "case": "fs-08-published052-mixed-up",
+        "direction": "up",
+        "duration_s": 300,
+        "fixed_offers": {
+          "after": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          },
+          "before": {
+            "budget_misses": 0,
+            "failures": 0,
+            "late_successes": 0
+          },
+          "during": {
+            "budget_misses": 15,
+            "failures": 9,
+            "late_successes": 6
+          }
+        },
+        "forward_wire_per_delivered_byte": 1.420563448682366,
+        "goodput_mbps": 266.282,
+        "maximum_delivery_gap_s": 1.954623,
+        "profile": {
+          "client": {
+            "parameters": [
+              30,
+              3,
+              0.1
+            ],
+            "seed": 20260916
+          },
+          "server": {
+            "parameters": [
+              70,
+              10,
+              0.3
+            ],
+            "seed": 20260915
+          }
+        },
+        "protocol_by_link": {
+          "46": "quic",
+          "47": "tcp"
+        },
+        "rates_mbps_by_link": {
+          "46": 500,
+          "47": 200
+        },
+        "variant": "published052"
+      }
+    ],
+    "scope": "one 300-second observation per binary and exact cell"
+  }
+}

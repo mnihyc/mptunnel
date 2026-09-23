@@ -1,269 +1,155 @@
 # Performance
 
-MPTUNNEL can combine the capacity of independent links within one connection.
-Paths sharing a bottleneck share its capacity. Throughput and latency also depend
-on direction, packet loss, reordering, transport recovery and available CPU.
+MPTUNNEL lets one connection use several paths. The useful questions are how
+much capacity those paths add, what happens when one slows down, and how the
+tunnel behaves while your other applications are using it.
 
-## MPTUNNEL 0.6.0 observations
+These experiments show those behaviors: a transfer over independent links,
+a comparison on a shared connection, and longer transfers with changing
+network conditions.
 
-These one-run Linux observations use the MPTUNNEL 0.6.0 development build
-from source `1e8abedf` and the published MPTUNNEL 0.5.2 build. Exact source and
-artifact digests are recorded in the [observation data](assets/performance/current-observations.json).
-Each exact condition has one observation per binary; these results are descriptive,
-not a repeatability claim or universal ranking.
+## One connection, two links
 
-### Ordinary mixed transfers
+A single download crosses two independent **200 Mbps** links: one carries TCP,
+the other QUIC. We slow the QUIC link to **10 Mbps**, restore it, then introduce
+a brief UDP outage. The TCP link stays available throughout.
 
-The ordinary rows use one shared 500 Mbps physical link, 70 ms server-side and 30 ms
-client-side delay, and no configured jitter or loss. Each 25-second transfer has
-25 quiet HTTP offers before and after, plus 55 loaded offers at a 500 ms interval;
-each offer requests a 100 kB body with a 2.5-second response budget. The 500 Mbps
-configured path capacity is not an offered application rate. Download goodput is
-ordered body delivery; upload goodput is target-confirmed bytes including final
-settlement.
+[![A download using two independent links, with QUIC restriction and outage marked on the timeline](assets/performance/independent-paths.svg)](assets/performance/independent-paths.svg)
 
-| Direction | 0.6.0 goodput, Mbps | 0.5.2 goodput, Mbps | Loaded offers: 0.6.0 | Loaded offers: 0.5.2 |
-| --- | ---: | ---: | --- | --- |
-| Download | 406.7 | 410.6 | 55/55 full bodies; 0 failures; 7 late | 49/55 full bodies; 6 failures; 17 late |
-| Upload | 444.4 | 446.4 | 55/55 full bodies; 0 failures; 1 late | 55/55 full bodies; 0 failures; 10 late |
+With both links available, the download exceeds either link's individual
+capacity. When QUIC slows down or goes offline, the same download continues
+over the remaining carrier. After recovery, it uses the added capacity again.
+The second panel shows the response time of small requests alongside the
+transfer.
 
-A late offer completed but exceeded its scheduled response budget. Failures and
-late completions are reported separately from transfer goodput.
+Across the 40-second download, the application received **268 Mbps** on average;
+all **80 small echo requests** completed. The longest pause between body reads
+was **0.79 seconds**. A short burst after the restriction lifts is buffered data
+reaching the application, so it can exceed the link rates on the chart.
 
-### Independent-link upload during a QoS change and UDP outage
+We also fetch 100 kB HTTP responses on a fixed schedule alongside each transfer:
 
-This separate 40-second upload uses two independent 200 Mbps paths, QUIC on link
-46 and TCP on link 47, with mirrored 30/70 ms directional delay and no configured
-jitter or random loss. Link 46 is shaped to 10 Mbps from the first observed epoch
-in nominal seconds 15–25; UDP is blocked at the endpoints for nominal seconds
-30–33. The loaded phase schedules 85 fixed HTTP offers alongside the upload.
+| Transfer | Average speed | HTTP responses completed | Completed late |
+| --- | ---: | ---: | ---: |
+| Download | 268 Mbps | 80 / 85 | 3 |
+| Upload | 213 Mbps | 80 / 85 | 6 |
 
-| Build | Upload goodput, Mbps | Full-body offers | Failed offers | Late offers | Budget misses |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 0.6.0 development | 213.1 | 80 / 85 | 5 | 6 | 11 |
-| 0.5.2 published | 257.4 | 85 / 85 | 0 | 0 | 0 |
+Five HTTP requests failed during each impaired transfer. A late response took
+more than its 2.5-second budget. All 25 requests before and after each transfer
+completed on time. [Both directions and the earlier-version comparisons](PERFORMANCE_DETAILS.md#independent-link-download-during-a-qos-change-and-udp-outage)
+are included in the complete results.
 
-Client process CPU per delivered GiB in this pair was 33.450 s user and 7.909 s kernel for 0.6.0, versus 22.078 s user and 6.790 s kernel for 0.5.2. These sampled-counter quotients are not total-machine CPU. This one paired observation is specific to that independent-link upload and its scheduled impairment; it does not predict behavior in other rows.
+This is where multipath is useful: a long transfer can draw on separate
+bottlenecks and retain another way forward when one transport is restricted.
+TCP and QUIC sharing one physical bottleneck still share its total capacity.
 
-### Mixed traffic with link assignment changes
+## Speed and responsiveness
 
-These 60-second mixed-traffic rows use two links with 500 and 200 Mbps configured
-rates and 125 loaded HTTP offers per row. Normal assignment places QUIC/500 on
-link 46 and TCP/200 on link 47. Capacity reversal keeps those physical protocol
-assignments but changes the rates to QUIC/200 and TCP/500. Identity swap keeps
-QUIC at 500 Mbps and TCP at 200 Mbps while exchanging the physical link IDs:
-TCP moves from 47 to 46, and QUIC moves from 46 to 47. The 700 Mbps sum is
-configured path capacity, not an offer count or an application rate.
+Here every system uses the same **500 Mbps download / 100 Mbps upload**
+connection. A download runs for 40 seconds while small echo requests measure
+responsiveness. The link starts with jitter, which clears about eight to nine seconds
+into each run.
 
-| Assignment | Direction | 0.6.0 goodput, Mbps | 0.5.2 goodput, Mbps | Full-body offers, 0.6.0 / 0.5.2 | Late offers, 0.6.0 / 0.5.2 |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Normal | Download | 309.8 | 279.5 | 125 / 125 | 0 / 0 |
-| Normal | Upload | 244.0 | 258.5 | 125 / 124 | 0 / 2 |
-| Capacity reversed | Download | 302.2 | 295.9 | 125 / 125 | 0 / 0 |
-| Capacity reversed | Upload | 450.6 | 435.6 | 125 / 124 | 1 / 9 |
-| Physical link identities swapped | Download | 226.1 | 242.7 | 125 / 125 | 0 / 0 |
-| Physical link identities swapped | Upload | 415.5 | 349.7 | 125 / 125 | 0 / 0 |
+<a href="assets/performance/shared-link-tradeoffs.svg">
+<picture>
+  <source media="(max-width: 600px)" srcset="assets/performance/shared-link-tradeoffs-narrow.svg">
+  <img src="assets/performance/shared-link-tradeoffs.svg" alt="Download speed and loaded response latency for MPTUNNEL, Hysteria2, Xray and direct TCP">
+</picture>
+</a>
 
-These are separate one-run observations. Results vary by direction and link
-assignment, so they do not establish a general winner.
+MPTUNNEL's TCP+QUIC mode delivered the most data over this interval, at
+**406 Mbps**. QUIC alone delivered **343 Mbps** with a **154 ms** response p95,
+compared with **797 ms** for TCP+QUIC. Hysteria2 delivered **367 Mbps** with
+**427 ms** p95. Xray and direct TCP had the lowest response p95, both **122 ms**.
 
-### Five-minute mixed transfers
+For bulk transfers, throughput matters; for browsing or interactive work
+alongside a download, response time matters too. These results make that choice
+visible. Mixing transports offers additional delivery options and also adds
+scheduling and recovery work.
 
-The sustained mixed rows run for 300 seconds with a 500 Mbps QUIC path and a
-200 Mbps TCP path. The QUIC path receives scheduled variable delay, jitter and
-loss updates, including three-second impairment spikes at nominal seconds 60,
-149 and 232; TCP stays on its baseline profile. The baseline is 70 ms delay
-with 10 ms jitter and 0.3% loss on server egress, and 30 ms delay with 3 ms
-jitter and 0.1% loss on client egress. The [observation data](assets/performance/current-observations.json)
-records the complete schedule. Each direction was measured once per artifact.
+<details>
+<summary>Follow each download and response over time</summary>
 
-| Direction | 0.6.0 goodput, Mbps | 0.5.2 goodput, Mbps | 0.6.0 bidirectional wire / byte | 0.5.2 bidirectional wire / byte |
-| --- | ---: | ---: | ---: | ---: |
-| Download | 225.6 | 255.1 | 1.776 | 1.715 |
-| Upload | 387.2 | 266.3 | 1.258 | 1.444 |
+[![Per-second download delivery and individual echo response times for all five systems](assets/performance/shared-link-timeline.svg)](assets/performance/shared-link-timeline.svg)
 
-Wire per byte is combined endpoint egress divided by delivered application bytes;
-it includes control, feedback and retransmission traffic and is not a pure
-protocol-overhead percentage.
+The timelines include startup, the change in jitter and every echo attempt.
+The shaded band spans the recorded jitter changes across the five runs.
+The curves show why the 40-second average differs from the speed reached later
+in a transfer. All echo attempts completed; the sequential probe made 69–80 attempts
+per system because it waits for each reply before sending the next request.
 
-### Shared-link comparison
+</details>
 
-The figure compares one 40-second observation per system on a shared 500 Mbps
-down / 100 Mbps up link, with 70/30 ms directional delay. Initial jitter is
-20 ms downstream and 5 ms upstream, cleared at a nominal 8 seconds; the figure
-marks the separate per-run clear-command intervals. No random loss was configured.
-The bulk test is a time-limited HTTP body read. The echo test sends sequential
-64-byte exchanges at a nominal 500 ms interval with a 3-second timeout, so the
-number of offers depends on how quickly each prior exchange completes.
+## CPU and memory on a VPS
 
-[![Bulk delivery and sequential echo timing across five transports](assets/performance/competitive-v0.6.0.png)](assets/performance/competitive-v0.6.0.png)
+Multipath delivery does extra work to schedule, track and recover data across
+carriers. On a small VPS, CPU can become a limit before network bandwidth does.
+The shared-link experiment above measured the following process CPU costs:
 
-| System | Goodput, Mbps | Successful echo p95, ms | Echo successes / attempts | Process CPU, client / server s/GiB |
-| --- | ---: | ---: | ---: | ---: |
-| MPTUNNEL QUIC | 343.4 | 154 | 80 / 80 | 17.6 / 25.1 |
-| Hysteria2 | 366.6 | 427 | 79 / 79 | 22.1 / 20.5 |
-| MPTUNNEL TCP+QUIC | 406.3 | 797 | 69 / 69 | 13.0 / 22.6 |
-| Xray VMess/TCP | 286.3 | 122 | 80 / 80 | 2.5 / 1.2 |
-| Direct TCP | 294.8 | 122 | 80 / 80 | — |
-
-This comparison uses Hysteria2 2.10.0 with Brutal configured at 500/100 Mbps,
-and Xray 26.3.27 with VMess/TCP, user cipher `security: auto`, TCP transport,
-and no configured mux or TLS. The three MPTUNNEL mixed TCP carriers reported
-BBR in socket readbacks; this was an observed native controller, not a config
-override. Endpoint quotas were four CPUs and the router quota was two CPUs.
-CPU values are sampled process counters divided by whole-probe delivered GiB;
-they are not total-machine CPU or CPU per aligned time window. Direct TCP has
-no tunnel-process CPU measurement. One run per system cannot rank behavior on
-other routes or workloads.
-
-## Historical v0.5.0 measurements
-
-The measurements below use optimized Linux builds of MPTUNNEL 0.5.0, with the
-standard 20% sender-policy defaults. Each configuration was measured once in
-isolated containers. [Measurement data](assets/performance/measurements.json)
-accompanies the timing plots. These observations describe the stated conditions,
-rather than a guaranteed speed on every Internet connection.
-
-### Healthy TCP, QUIC and mixed service
-
-One shared 500 Mbps link has 70 ms downstream and 30 ms upstream delay, without
-injected loss or jitter. TCP uses three carriers, QUIC one; mixed uses both on
-the same link. Each workload offers traffic for 25 seconds.
-
-| Transport | Download, Mbps | Upload, Mbps | First download body, s | Longest download gap, s | Loaded echo p95 / maximum, ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| TCP | 424.2 | 437.9 | 0.480 | 0.395 | 323 / 354 |
-| QUIC | 350.6 | 416.2 | 0.409 | 0.101 | 125 / 210 |
-| TCP+QUIC | 418.9 | 437.4 | 0.477 | 0.836 | 438 / 500 |
-
-[![TCP, QUIC and mixed download, echo latency and upload timing](assets/performance/healthy.svg)](assets/performance/healthy.svg)
-
-QUIC has lower loaded echo latency here, while TCP and mixed deliver more
-throughput. Combining transports on this shared link does not add physical
-capacity. Each download completes all 50 actual echo requests without failure;
-each upload confirms every accepted byte through final settlement.
-
-The tunnel processes are already running when each application starts.
-First-body timing includes proxy setup, stream attachment and the first
-application bytes. Echo is a concurrent 64-byte TCP exchange whose latency
-includes loaded-network effects. Upload has no concurrent echo measurement.
-
-### Independent links with QUIC restriction
-
-Three TCP carriers use one 200 Mbps link and one QUIC carrier uses another
-200 Mbps link. Each 40-second workload has 70 ms delay in its transfer direction
-and 30 ms on the return path. Thus upload uses 70 ms upstream and 30 ms downstream.
-QUIC's transfer rate is restricted to 10 Mbps at nominal seconds 15–25, followed
-by a UDP blackhole at seconds 30–33.
-
-| Nominal phase | Download, Mbps | Upload confirmations, Mbps |
+| System | Client CPU seconds / GiB | Server CPU seconds / GiB |
 | --- | ---: | ---: |
-| Healthy, 5–15 s | 341.5 | 286.7 |
-| QUIC restricted, 15–25 s | 151.2 | 132.2 |
-| Rate restored, 25–30 s | 423.6 | 387.3 |
-| UDP outage, 30–33 s | 187.4 | 226.2 |
-| Recovery, 33–40 s | 320.3 | 287.7 |
+| MPTUNNEL QUIC | 17.6 | 25.1 |
+| MPTUNNEL TCP+QUIC | 13.0 | 22.6 |
+| Hysteria2 | 22.1 | 20.5 |
+| Xray VMess/TCP | 2.5 | 1.2 |
 
-[![Mixed download, echo latency and upload confirmations during QUIC restriction and outage](assets/performance/independent-links.svg)](assets/performance/independent-links.svg)
+Lower is better. These values count process CPU time per delivered GiB;
+client and server costs are separate. Xray used substantially less CPU in this
+comparison. Direct TCP has no tunnel process to measure.
 
-Restriction reduces useful delivery despite the independent TCP link. These are
-phase averages, not a guarantee of continuous service: whole-workload download
-is 275.8 Mbps, with a longest body-read gap of 1.272 s. All 80 echo requests
-complete, with p95 of 330 ms and a maximum of 492 ms.
+Memory also grows with data in flight. For example, **1 Gbps at 100 ms RTT**
+requires roughly **12.5 MB** in flight to fill the link. Recovery and reordering
+need additional retained data. The [resource guide](OPERATIONS.md#resource-envelopes)
+explains the available limits, and the
+[memory measurements](PERFORMANCE_DETAILS.md#cpu-memory-and-traffic) report sampled
+process residency for the earlier test set.
 
-Upload confirms all 1,341,980,672 accepted bytes in 41.85 s, averaging 256.5 Mbps.
-Its longest confirmation gap is 0.760 s. The extra elapsed time includes setup
-and final settlement. Restored-phase rates include catch-up delivery of buffered
-data; a short application-delivery or confirmation interval can exceed nominal
-physical capacity. Restoring a link does not immediately restore its full
-aggregate contribution. The plots retain these recovery intervals in both directions.
+## Browsing alongside transfers, and longer runs
 
-### Loss and recovery
+On a healthy shared 500 Mbps link, ordinary TCP+QUIC transfers delivered
+**407 Mbps down** and **444 Mbps up**. All 55 loaded HTTP requests completed in
+each direction; seven download-side and one upload-side request exceeded the
+2.5-second response budget. These requests each fetched a 100 kB body on a fixed
+schedule, so a slow response did not reduce the number of requests offered.
 
-A QUIC download uses a 500 Mbps link with 70/30 ms directional delay. Downstream
-random loss is 20% until nominal profile time 20 seconds, then clears; upstream
-loss is zero. The clearing command for the active downstream link runs between
-20.109 and 20.207 s on the separate profile clock. The plotted guide is nominal
-probe time, not an exact packet-level boundary.
+Five-minute TCP+QUIC transfers used separate 500 Mbps QUIC and 200 Mbps TCP
+links, with changing loss and jitter on QUIC. Download averaged **226 Mbps**;
+upload averaged **387 Mbps**. Combined endpoint traffic was **1.776 bytes per
+downloaded byte** and **1.258 bytes per uploaded byte**, including acknowledgements,
+control messages and recovery traffic.
 
-[![QUIC download and loaded echo timing during loss and after it clears](assets/performance/loss-recovery.svg)](assets/performance/loss-recovery.svg)
+The [complete measurements](PERFORMANCE_DETAILS.md) cover both directions,
+reversed link capacities, swapped physical links, the loss/recovery scenarios
+and comparisons with MPTUNNEL 0.5.2.
 
-Whole-workload download is 326.4 Mbps. First body arrives in 1.181 s and the
-longest subsequent body-read gap is 0.626 s. All 80 echoes complete, with p95
-of 269 ms and a maximum of 452 ms. Delivery over seconds 30–40 averages
-351.2 Mbps. The figure shows startup and recovery alongside throughput.
+## Setup and data
 
-### Reordering and other transports
+The two main demonstrations use a Linux MPTUNNEL 0.6.0 development build
+(`1e8abedf`), with one run per configuration. The release and measurement source
+identities are separate; exact measurement hashes are in the data files.
 
-The shared routed link provides 500 Mbps downstream and 100 Mbps upstream,
-with 70/30 ms delay. Initial directional jitter is 20/5 ms and clears nominally
-at eight seconds. Each product runs a 40-second download with concurrent echo.
-Hysteria2 uses version 2.10.0 with Brutal configured for 500/100 Mbps; Xray uses
-version 26.3.27 with VMess/TCP.
+For the shared-link comparison, endpoint containers have four CPU cores and
+the router has two. Directional delay is 70/30 ms; initial jitter is 20/5 ms.
+Hysteria2 2.10.0 uses Brutal at 500/100 Mbps. Xray 26.3.27 uses VMess over TCP
+with `security: auto`, without mux or TLS. MPTUNNEL uses one QUIC carrier and,
+in mixed mode, three TCP carriers with native BBR. No random loss is injected.
 
-| Product | Download, Mbps | First body, s | Longest bulk gap, s | Echo p95 / maximum, ms | Successful / attempted echoes |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| MPTUNNEL QUIC | 328.2 | 0.501 | 0.109 | 152 / 237 | 80 / 80 |
-| MPTUNNEL TCP+QUIC | 408.8 | 0.511 | 0.312 | 369 / 377 | 80 / 80 |
-| Hysteria2 | 366.6 | 0.468 | 1.512 | 412 / 747 | 79 / 79 |
-| Xray VMess/TCP | 288.8 | 0.496 | 0.108 | 126 / 221 | 80 / 80 |
+Download speed counts bytes delivered in order to the application. Upload speed
+counts target-confirmed bytes through final settlement. Loaded response p95
+is the response time met by 95% of successful echo requests. Echo points are
+placed at the start of each request. The independent-link
+chart marks the impairment windows; scheduled times and recorded command
+timings are in its data file.
 
-[![Download and echo timing for MPTUNNEL, Hysteria2 and Xray through reordering](assets/performance/reordering.svg)](assets/performance/reordering.svg)
+- [Measurements and test conditions](assets/performance/current-observations.json)
+- [Independent-link time series](assets/performance/independent-paths-series.json)
+- [Shared-link time series](assets/performance/shared-link-series.json)
+- [Complete benchmark tables and earlier measurements](PERFORMANCE_DETAILS.md)
+- [Earlier raw series](assets/performance/measurements.json)
+- [Figure renderer](assets/performance/render.py)
 
-During seconds 20–40, MPTUNNEL QUIC averages 343.4 Mbps, mixed 451.1 Mbps,
-Hysteria2 464.0 Mbps and Xray 471.5 Mbps. QUIC's lower late throughput is a
-material cost in this profile. Mixed approaches the other transports' late
-throughput, while its late median echo latency is 343 ms, compared with
-112 ms for Hysteria2 and 104 ms for Xray. Whole averages alone hide these
-throughput and responsiveness differences.
+To regenerate the main figures with Python and Matplotlib:
 
-All actual echoes complete without failure. The sequential probe starts its
-next request only after the preceding one completes, so 79 attempts does not
-mean a missing reply. No random loss is configured, but Hysteria2 records
-14,197 downstream router queue drops; the other three runs record none.
-Identical configured conditions do not imply identical realized loss or a
-universal product ranking.
-
-### CPU, memory and traffic
-
-Transport work has a material CPU and memory cost. Healthy mixed download uses
-100.9%/54.7% server/client CPU over matched process sampling intervals of about
-25.1 seconds, where 100% is one core. Its peak server/client RSS is
-106,172/51,604 KiB. These are interval CPU measurements and sampled residency,
-not evidence about indefinite memory retention.
-
-The reordering cohort has a different CPU measure: final sampled process-lifetime
-averages. MPTUNNEL QUIC records 95.6%/63.2% server/client, with peak RSS of
-155,184/40,028 KiB. Xray records 4.3%/8.1% and 37,164/37,360 KiB. These lifetime
-averages are not interchangeable with the interval measurements above or CPU
-per delivered byte.
-
-For healthy mixed service, sampled combined endpoint egress divided by application
-bytes is 1.115 for download and 1.062 for upload. Sampling boundaries differ from
-the application window, and framing, acknowledgements, retransmissions and
-recovery copies are not individually separated. These quotients are not exact
-overhead percentages.
-
-High-bandwidth, high-RTT paths also need sufficient flow-control and retention
-windows. Approximate bandwidth-delay product as `rate_bps × RTT_seconds / 8`.
-A 64 MiB window covers about 537 ms at 1 Gbps. Larger windows can support more
-in-flight data but increase memory exposure. See the
-[reference configuration](../examples/config.reference.toml) and
-[operations guide](OPERATIONS.md) for sizing options.
-
-### Reading the measurements
-
-Download goodput counts ordered application-body delivery. Duration-limited
-HTTP downloads intentionally stop before the full 8 GiB object completes.
-Upload goodput counts target-sink confirmation arrival, including final settlement;
-a catch-up confirmation bin can exceed the physical link rate without implying
-that new bytes reached the target at that instantaneous rate.
-
-Plots preserve raw one-second bins and every actual echo attempt. Shaded phases
-are nominal probe time; collection and shaping commands have separate timestamps.
-Boundary bins are approximate intervention windows. Loaded latency, startup,
-gaps and recovery accompany throughput because each affects ordinary use.
-
-The measurements use one Linux host. Native platform builds and tests are
-available through [CI](https://github.com/mnihyc/mptunnel/actions/workflows/ci.yml),
-but they do not establish identical performance on Windows, macOS or Android.
+```bash
+python3 docs/assets/performance/render.py
+```

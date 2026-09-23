@@ -4,87 +4,72 @@
 [![Release Build](https://github.com/mnihyc/mptunnel/actions/workflows/release.yml/badge.svg)](https://github.com/mnihyc/mptunnel/actions/workflows/release.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-MPTUNNEL is an encrypted multipath proxy and tunnel for everyday Internet use.
-It lets one application connection use several independent TCP and QUIC paths,
-chooses paths from live latency and delivery evidence, and keeps the connection
-alive when a path disappears.
+**One connection. Multiple paths. TCP and QUIC together.**
 
-It provides the daily-use surface expected from a modern proxy: SOCKS5, HTTP
-CONNECT, a single-port mixed SOCKS5/HTTP CONNECT listener, TCP/UDP port
-forwarding, TUN, routing, DNS policy, outbound selection,
-balancing, persistent configuration, live management, and connection
-diagnostics.
+MPTUNNEL is an encrypted proxy and tunnel that carries a single application
+connection over several network paths. Combine independent links for more
+capacity, use TCP and QUIC together, and recover undelivered data over another
+carrier when a path fails.
 
-SOCKS5, HTTP CONNECT, mixed proxy, port forwarding, TUN, and MPP listeners use
-the ordinary L4 routing model. Experimental `tun-l3` and `mpp-l3` inbounds
-instead carry complete IP packets, with server-owned address pools and
-per-principal allocations. L3 can use TCP and QUIC together while host routes,
-DNS, firewall policy, forwarding, and NAT remain under operator control. A
-configuration cannot mix L4 and L3 inbound protocols.
-
-## Contents
-
-- [Why MPTUNNEL?](#why-mptunnel)
-- [Performance](#performance)
-- [Quick start](#quick-start)
-- [Configuration and operation](#configuration-and-operation)
-- [Platform support](#platform-support)
-- [Security](#security)
-- [Release assets](#release-assets)
-- [Documentation](#documentation)
+[**Get started**](#quick-start) · [**Download**](../../releases/latest) ·
+[**Performance**](docs/PERFORMANCE.md) · [**Configuration**](examples/config.reference.toml)
 
 ## Why MPTUNNEL?
 
-Xray/V2Ray routes or balances separate connections across outbounds. Hysteria2
-carries proxy streams within one QUIC session and supports transparent UDP
-port hopping. MPTUNNEL addresses the gap between them: one application flow
-can use several independent TCP and QUIC carriers at the same time.
+A download, upload or long-lived connection can use more than one path without
+changes to the application. MPTUNNEL handles path selection and delivers the
+bytes back in order at the other end.
 
-| Within one logical flow | Xray/V2Ray | Hysteria2 | **MPTUNNEL** |
-| --- | ---: | ---: | ---: |
-| Multiple independent paths | — | — | ✓ |
-| TCP + QUIC together | — | — | ✓ |
-| Upload/download path ranking | — | — | ✓ |
-| Independent-carrier failover | — | — | ✓ |
-
-Beyond its daily-use proxy, forwarding, TUN, routing, and DNS surface,
-MPTUNNEL's advantage is inside the flow: it can add independent link capacity,
-rank paths from live latency and delivery evidence, choose differently for
-upload and download, and move undelivered ranges to a surviving carrier.
+- **Combine links within one connection.** Spread a transfer across independent
+  paths instead of assigning the entire connection to just one.
+- **Adapt in both directions.** Choose paths using live delivery and latency
+  measurements; upload and download can use different combinations.
+- **Recover across transports.** Move undelivered data to a surviving TCP or
+  QUIC carrier when another carrier stops making progress.
+- **Use it with your existing applications.** SOCKS5, HTTP CONNECT, a mixed
+  proxy listener, TCP/UDP forwarding and TUN share routing and DNS controls.
 
 ```text
-SOCKS5 / HTTP CONNECT / mixed proxy / port forward / TUN-L4
-                       |
-             routing, DNS, outbounds
-                       |
-                one MPP flow
-                       |
-        live ranking + Data ACK + reinjection
-              /             |             \
-        TCP path A      QUIC path B     TCP path C
-
-TUN-L3 packet device -> authenticated IP packets -> the same carrier set
+                         ┌── TCP path ──┐
+Your app ── MPTUNNEL ────┤              ├──── MPTUNNEL ── Destination
+                         └── QUIC path ─┘
+                           one connection
 ```
 
-![MPTUNNEL management dashboard with live charts, path health, peer paths, inbound connections, and outbound services](docs/assets/dashboard.png)
+Independent paths can add capacity. TCP and QUIC on the same physical link
+share its bandwidth, while giving the tunnel different transport options.
 
-## Performance
+<a name="performance"></a>
 
-MPTUNNEL combines independent link capacity within one connection. TCP and QUIC
-on the same physical link share that link's capacity.
+## See it in action
 
-In controlled Linux measurements, a shared 500 Mbps link delivered 419 Mbps
-mixed download and 437 Mbps upload. Loaded echo p95 during mixed download was
-438 ms. With two independent 200 Mbps links and QUIC restricted to 10 Mbps,
-ordered download averaged 151 Mbps and upload confirmations averaged 132 Mbps
-during the restricted phase. The plots show startup, pauses and subsequent recovery.
+The [performance guide](docs/PERFORMANCE.md) follows a transfer as one path
+slows down and goes offline, then compares download speed, responsiveness and
+CPU cost with Hysteria2, Xray and direct TCP.
 
-[![Mixed download, echo latency and upload through QUIC restriction and outage](docs/assets/performance/independent-links.svg)](docs/assets/performance/independent-links.svg)
+<a href="docs/PERFORMANCE.md#speed-and-responsiveness">
+<picture>
+  <source media="(max-width: 600px)" srcset="docs/assets/performance/shared-link-tradeoffs-narrow.svg">
+  <img src="docs/assets/performance/shared-link-tradeoffs.svg" alt="Download speed and response latency on a shared 500 Mbps connection">
+</picture>
+</a>
 
-The [performance guide](docs/PERFORMANCE.md) includes TCP, QUIC and mixed results,
-loss/reordering scenarios, matched Hysteria2/Xray measurements, timing plots and
-CPU/memory costs. It also shows the throughput and loaded-latency tradeoffs.
-Results depend on network conditions, direction and available processing capacity.
+In this 40-second Linux download, TCP+QUIC delivered **406 Mbps**;
+QUIC alone delivered **343 Mbps**, with 95% of small echo requests answered
+within **154 ms** during the download. The two modes offer different balances
+of speed and responsiveness.
+[See the setup, full timelines and results](docs/PERFORMANCE.md#speed-and-responsiveness).
+
+## Know what your tunnel is doing
+
+The built-in dashboard shows live traffic, path health, peer paths and active
+connections. Inspect which carriers are working and manage routing, DNS and
+configuration from the same interface.
+
+![MPTUNNEL dashboard showing live traffic, path health and connections](docs/assets/dashboard.png)
+
+Enable the authenticated local dashboard using the
+[management setup](docs/OPERATIONS.md#management-api).
 
 ## Quick start
 
@@ -118,6 +103,10 @@ mptunnel --credential-secret-file ./mpp-credential.key \
   --outbound-protocol direct
 ```
 
+Copy the two shared key files and `server-cert.pem` securely to the client.
+Keep `server-key.pem` on the server. Replace `server.example.com` with your
+server's address and allow both TCP and UDP on port 7443.
+
 Start the client:
 
 ```bash
@@ -131,17 +120,15 @@ mptunnel --credential-secret-file ./mpp-credential.key \
   --path quic://server.example.com:7443
 ```
 
-The shared transport key replaces the TCP TLS handshake with PSK-gated Noise
-and prevents public QUIC Initial packets from eliciting a certificate flight.
-It is not an MPP client credential. Shipped configurations enable it; the field
-is optional so peers can instead use TLS 1.3 TCP and public QUIC Initials. The
-QUIC and TLS-fallback certificate name defaults to `mptunnel.example`;
-`--tls-server-name` remains available as an override.
+Point an application at SOCKS5 `127.0.0.1:1080` or HTTP proxy `127.0.0.1:8080`:
 
-MPTUNNEL 0.6.0 uses MPP wire version 16. Upgrade the client and server as one
-coordinated pair before sending traffic and verify that both binaries report
-`0.6.0` with `--version`. A v15 endpoint rejects the first v16 MPP frame; this
-release has no capability negotiation or rolling compatibility mode.
+```bash
+curl --proxy socks5h://127.0.0.1:1080 https://example.com
+```
+
+**Upgrading to 0.6.0:** upgrade both client and server together. This release
+uses MPP wire version 16 and requires matching peers; see the
+[upgrade instructions](docs/OPERATIONS.md#mpp-wire-version-upgrade).
 
 For persistent operation, copy `examples/client.toml` or
 `examples/server.toml` to `config.toml`, replace the placeholders, and validate
@@ -154,129 +141,39 @@ mptunnel --config ./config.toml
 
 ## Configuration and operation
 
-The same configuration is available through TOML, the simple CLI surface, and supported
-authenticated runtime updates. Successful runtime updates are written
-atomically to `config.toml`; invalid or interrupted updates leave the active
-generation and last valid file unchanged.
+Start from [client.toml](examples/client.toml) and
+[server.toml](examples/server.toml), then use the
+[annotated reference](examples/config.reference.toml) for the complete configuration.
 
-Every TOML secret, certificate, and key uses one byte-material table:
-`{ from = "file", path = "..." }` reads exact file bytes;
-`{ from = "env", var = "MPTUNNEL_NAME_FILE" }` reads the file whose path is in
-that environment variable; `{ from = "hex", value = "..." }` and
-`{ from = "base64", value = "..." }` decode strict inline encodings; and
-`{ from = "raw", value = "..." }` supplies UTF-8 bytes. `{ value = "..." }`
-is shorthand for the raw form.
-Inline encodings are not encryption and remain stored in the configuration.
-Material bytes are exact: file content, decoded inline content, and raw UTF-8
-are never trimmed. Consumer-specific size, UTF-8, or PEM validation follows.
-Relative material paths—including a relative path read from an environment
-variable—resolve beside the selected TOML document.
+| I want to… | Start here |
+| --- | --- |
+| Route applications or domains through different outbounds | [Routing and DNS configuration](docs/OPERATIONS.md#config-and-validation) |
+| Run TUN or forward TCP/UDP ports | [Configuration reference](examples/config.reference.toml) |
+| Configure multiple paths or port hopping | [Path policy](docs/OPERATIONS.md#path-policy-and-status) |
+| Inspect traffic or update a running configuration | [Dashboard and management API](docs/OPERATIONS.md#management-api) |
+| Size buffers and memory for a VPS | [Resource envelopes](docs/OPERATIONS.md#resource-envelopes) |
+| Run as a service and collect logs | [Runtime supervision](docs/OPERATIONS.md#runtime-supervision) |
 
-Every configurable resource has a canonical `name`. References use the
-resource noun (`outbound`, `balancer`, `dns_policy`); `_id` fields identify
-protocol credentials, principals, or signed artifacts. `target` means an
-application destination; a listen address accepts local traffic; an `endpoint`
-is a proxy connector or MPP carrier URI. A DNS server defines how and where to
-send DNS messages. A DNS policy selects servers, address families, security,
-limits, cache behavior, named exact-name `override_records`, and at most one
-named `synthetic_capture`. Policy selection is explicit: a route-selected DNS
-policy wins, otherwise exact and longest-suffix DNS rules precede the default.
-Within that policy an attached override record wins, captured DNS may then use
-its attached synthetic capture, and only then are its servers queried. Ordinary
-dial-time resolution never synthesizes an address. A recovered synthetic
-address retains the policy and capture that issued it; a route may omit
-`dns_policy`, but cannot silently replace that policy with another.
-
-Fixed-target listeners use `tcp-forward`, `udp-forward`, or `mixed-forward`;
-the mixed form binds both transports on the same addresses and sends them to
-one target.
-Domain-capable SOCKS5/HTTP/MPP outbounds can receive a domain unchanged.
-`[routing].target_resolution` makes the ownership explicit: `as-is` never
-resolves during routing, `route-only` resolves only for route/ACL evidence but
-keeps the hostname for a domain-capable outbound, and `full-resolve` passes
-authorized literal IPs. Omission retains the historical demand-driven
-behavior. MPP carrier endpoint DNS is separate from application-target DNS.
-Ranged carrier endpoints use syntax such as
-`quic://server.example:20000-40000`.
-
-All L4 inbounds, including local listeners and `protocol = "mpp"`, use one
-ordered, first-match `[[routing.rules]]` table. A normal rule names one
-`outbound` or `balancer`; no separate allow action is required. Explicit
-`decision = "allow-restricted"` authorizes a narrowly matched private or
-special-use destination, while `reject` and `drop` are terminal. Omitted
-`inbounds` or `principal_ids` means any; scalar `"*"` is the equivalent explicit
-spelling. If no rule matches, traffic is rejected—MPTUNNEL never silently uses
-the first outbound.
-
-`protocol = "mpp-l3"` is the distinct server-side packet service used with a
-`tun-l3` client. It does not enter L4 routing, application-target DNS, L4 flow
-admission, or target outbounds. Carrier endpoint DNS and `max_dns_work` remain
-available. Every definition is validated, but runtime starts only DNS policies
-reachable from `[dns].default`, DNS rules, or route `dns_policy`, and outbounds
-reachable from routes, active DNS servers, balancers, or a `tun-l3` inbound.
-Unused definitions make no network or system changes.
-
-Logging starts with the running version, configuration source, safe inbound and
-outbound inventory, bound listeners, runtime readiness, and shutdown. The
-default UTC text format is readable at a terminal; newline-delimited JSON,
-append-only files, and sanitized opt-in flow summaries are also supported.
-Set `level = "debug"` to see one correlated trace whose inbound, routing,
-optional balancer, and outbound records repeat the same accepted-request
-context. It includes the principal, requested destination, a typed local or MPP
-carrier peer, the exact route, and each configured outbound destination,
-protocol, attempt, and result. Server-side MPP records also identify the
-opening session and ingress carrier/path; reliable MPP outbound records include
-their independently selected underlay and path. UDP is traced per logical
-association; packets and per-packet MPP path choices are not logged.
-One bounded background HTTPS check reports the newest published GitHub release
-without delaying startup or forwarding; an available update includes its
-release-page URL.
-
-The opt-in loopback management endpoint exposes only the authenticated v4 API
-under `/api/v4/` and provides live health, paths, sessions,
-connections, traffic, DNS, balancers, configuration state, and bounded
-controls. Its embedded dashboard stores a successfully authenticated token in
-same-origin `localStorage` until **Forget token** is selected or authentication
-fails.
-
-See [the reference configuration](examples/config.reference.toml) and
-[operations guide](docs/OPERATIONS.md).
+Experimental L3 packet tunneling is also available through `tun-l3` and
+`mpp-l3`, with server-managed address pools. See the
+[L3 setup and host networking requirements](docs/OPERATIONS.md#config-and-validation).
 
 ## Platform support
 
-| Platform | Proxy | TUN | Backend |
-| --- | ---: | ---: | --- |
-| Linux amd64/arm64 | ✓ | ✓ | Native |
-| Windows amd64/arm64 | ✓ | ✓ | Wintun |
-| macOS amd64/arm64 | ✓ | ✓ | NE |
-| Android arm64/x86_64 | ✓ | ✓ | `VpnService` |
+| Platform | Proxy | TUN integration |
+| --- | --- | --- |
+| Linux amd64 / arm64 | ✓ | Native |
+| Windows amd64 / arm64 | ✓ | Wintun |
+| macOS amd64 / arm64 | ✓ | Signed Network Extension host required |
+| Android arm64 / x86_64 | ✓ | Host app with `VpnService` required |
 
-Linux is the primary performance platform. Windows builds and tests natively
-in GitHub Actions. macOS product VPN requires a signed Network Extension host;
-Android embedding requires a host application.
+Run `mptunnel platform` to check host capabilities. Android releases include
+both the command-line binary and a JNI library for embedding.
 
-The protocol and scheduler are portable. Platform-specific code is used only
-for a beneficial host facility, with a neutral fallback wherever the operation
-can remain correct. Run `mptunnel platform` for the current host report.
+<a name="release-assets"></a>
 
-## Security
-
-The shipped profile uses PSK-gated Noise for TCP and private QUIC Initial keys
-before QUIC's inner TLS/HTTP/3 handshake; carrier 0-RTT is disabled. Public and
-wrong-secret probes receive no TCP handshake response and cannot elicit or
-decrypt a QUIC certificate flight. Omitting the optional transport secret uses
-TLS 1.3 TCP with no ALPN and public QUIC Initials instead. MPP client
-credentials stay separate and still authorize individual peers after carrier
-protection.
-
-This removes simple plaintext protocol markers, but it is not an
-indistinguishability or cover-service claim. A source-aware active observer may
-still fingerprint QUIC packet shape and version, Noise ephemeral keys, timing,
-or response behavior. MPP is a new custom protocol without an independent
-security audit. Use high-entropy credentials, protect key/token files, keep the
-management listener on loopback, and read [SECURITY.md](SECURITY.md).
-
-## Release assets
+<details>
+<summary>Release archive names and contents</summary>
 
 Each immutable release publishes:
 
@@ -297,13 +194,23 @@ library under `arm64-v8a/libmptunnel.so` or `x86_64/libmptunnel.so`.
 tag-specific download URLs. GitHub supplies each asset digest. Published tags
 and assets are never replaced; corrections use a new release.
 
+</details>
+
+## Security
+
+Connections are encrypted and peers authenticate with shared credentials.
+The shipped configuration also uses a separate transport key to gate TCP and
+QUIC handshakes. Keep key files private and the management listener on loopback.
+MPTUNNEL's custom protocol has not had an independent security audit; see
+[the security model](SECURITY.md) for deployment guidance and reporting issues.
+
 ## Documentation
 
-- [Operations](docs/OPERATIONS.md)
-- [Reference configuration](examples/config.reference.toml)
-- [Performance evidence](docs/PERFORMANCE.md)
-- [Protocol specification](RFC.md)
-- [Architecture](docs/ARCHITECTURE.md)
+- [Operations and troubleshooting](docs/OPERATIONS.md)
+- [Configuration reference](examples/config.reference.toml)
+- [Performance and comparisons](docs/PERFORMANCE.md)
+- [Protocol specification](RFC.md) and [architecture](docs/ARCHITECTURE.md)
+- [Release packages](packaging/README.md) and [latest downloads](../../releases/latest)
 - [Contributing](CONTRIBUTING.md)
 
 Licensed under the [Apache License 2.0](LICENSE).

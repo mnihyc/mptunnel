@@ -199,6 +199,7 @@ def _add_accessible_svg_header(path: Path, title: str, description: str) -> None
         + "</desc>"
     )
     content = content[: root_match.start()] + root + accessible_nodes + content[root_match.end() :]
+    content = "\n".join(line.rstrip() for line in content.splitlines()) + "\n"
     path.write_text(content, encoding="utf-8")
 
 

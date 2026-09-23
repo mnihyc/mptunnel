@@ -1000,9 +1000,12 @@ async fn server_quic_drains_exact_ack_without_consuming_deferred_probe_slot() {
 
 #[tokio::test]
 async fn server_quic_live_attachment_requalifies_without_replacement() {
-    tokio::time::timeout(Duration::from_secs(1), async {
+    let mut awaiting_stage = "opening local QUIC fixture";
+    let mut actor_tasks = tokio::task::JoinSet::new();
+    let completion = tokio::time::timeout(Duration::from_secs(1), async {
         let stream_id = StreamId(415);
         let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+        awaiting_stage = "draining initial zero-credit admission";
         fixture.drain_zero_credit_admission().await;
         let binding = match &fixture.accepted.stream().output {
             ReliablePathStreamOutput::Switchable(binding) => binding.clone(),
@@ -1057,7 +1060,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
         );
 
         let mut product_stream = fixture.accepted.take_stream();
-        let actor = tokio::spawn(run_server_udp_reliable_stream_loop(
+        actor_tasks.spawn(run_server_udp_reliable_stream_loop(
             fixture.server_send.take().expect("server QUIC sender"),
             fixture.server_recv.take().expect("server QUIC receiver"),
             ServerUdpReliableStreamLoop {
@@ -1076,6 +1079,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
             },
         ));
         let client_recv = fixture.client_recv.as_mut().expect("client QUIC receiver");
+        awaiting_stage = "reading the queued response requalification probe";
         let (probe_id, offset, payload_bytes) = loop {
             let frame = udp_path_read_frame(client_recv, fixture.context.codec_limits)
                 .await
@@ -1092,6 +1096,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
             }
         };
         let client_send = fixture.client_send.as_mut().expect("client QUIC sender");
+        awaiting_stage = "writing the exact response-probe ACK";
         udp_path_write_frame(
             client_send,
             &Frame::StreamRequalifyAck {
@@ -1104,6 +1109,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
         )
         .await
         .expect("return exact response probe ACK");
+        awaiting_stage = "waiting for the probe ACK to advance the attachment";
         while binding.response_requalification_deadline().is_some() {
             tokio::task::yield_now().await;
         }
@@ -1133,16 +1139,19 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
         let fresh_range =
             OffsetRange::new(offset, offset + payload.len() as u64).expect("fresh range");
         binding.record_original_flight(initial.key, &fresh);
+        awaiting_stage = "queueing fresh OriginalData on the same attachment";
         fixture
             .commands_tx
             .send_stream_ordered_frame(fresh.clone(), TrafficClass::Throughput)
             .await
             .expect("send fresh data on same attachment");
+        awaiting_stage = "reading fresh OriginalData from the same QUIC attachment";
         while udp_path_read_frame(client_recv, fixture.context.codec_limits)
             .await
             .expect("read fresh data")
             != fresh
         {}
+        awaiting_stage = "writing the fresh OriginalData ACK";
         udp_path_write_frame(
             client_send,
             &Frame::StreamAck {
@@ -1154,6 +1163,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
         )
         .await
         .expect("return fresh ACK");
+        awaiting_stage = "routing the fresh ACK into Product state";
         let Frame::StreamAck { ranges, .. } =
             product_stream.recv_frame().await.expect("route fresh ACK")
         else {
@@ -1166,6 +1176,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
                 .as_slice(),
             &[identity]
         );
+        awaiting_stage = "verifying the original carrier and connection identity";
         assert!(!binding.output_is_stale(identity), "restores Qualified");
         let final_state = binding
             .sender_path_targets(TrafficClass::Throughput, 64)
@@ -1180,11 +1191,19 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
             &fixture._server_connection.write_activity_notify()
         ));
         assert!(!fixture._server_connection.is_closed());
-        actor.abort();
-        let _ = actor.await;
+        awaiting_stage = "stopping the server QUIC writer actor";
+        actor_tasks.abort_all();
+        while actor_tasks.join_next().await.is_some() {}
     })
-    .await
-    .expect("live same-carrier requalification must finish within one second");
+    .await;
+
+    if completion.is_err() {
+        actor_tasks.abort_all();
+        while actor_tasks.join_next().await.is_some() {}
+    }
+    completion.unwrap_or_else(|_| {
+        panic!("live same-carrier test exceeded one second while awaiting {awaiting_stage}");
+    });
 }
 
 #[tokio::test]

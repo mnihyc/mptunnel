@@ -4054,8 +4054,52 @@ async fn server_runtime_binds_udp_path_and_relays_direct_udp_datagram() {
 
 #[tokio::test]
 async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
-    let (first_target_addr, first_target) = spawn_udp_echo_target().await;
-    let (second_target_addr, second_target) = spawn_udp_echo_target().await;
+    let first_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("first target bind");
+    let first_target_addr = first_socket.local_addr().expect("first target address");
+    let second_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("second target bind");
+    let second_target_addr = second_socket.local_addr().expect("second target address");
+    let case_id = format!(
+        "udp-demux-{}-{}-{}",
+        std::process::id(),
+        first_target_addr.port(),
+        second_target_addr.port(),
+    );
+    let spawn_observed_target = |socket: UdpSocket,
+                                 target: SocketAddr,
+                                 label: &'static str,
+                                 case_id: String| {
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 16];
+            let (len, peer) = socket.recv_from(&mut buffer).await.expect("target receive");
+            eprintln!(
+                "udp_demux_target case_id={} label={} phase=received target={} peer={} payload_bytes={} payload={:?}",
+                case_id,
+                label,
+                target,
+                peer,
+                len,
+                &buffer[..len],
+            );
+            assert_eq!(&buffer[..len], b"ping");
+            let sent = socket.send_to(b"pong", peer).await.expect("target echo");
+            eprintln!(
+                "udp_demux_target case_id={} label={} phase=echo_sent target={} peer={} payload_bytes={}",
+                case_id, label, target, peer, sent,
+            );
+        })
+    };
+    let first_target =
+        spawn_observed_target(first_socket, first_target_addr, "first", case_id.clone());
+    let second_target =
+        spawn_observed_target(second_socket, second_target_addr, "second", case_id.clone());
+    eprintln!(
+        "udp_demux_test case_id={} first_target={} second_target={}",
+        case_id, first_target_addr, second_target_addr,
+    );
     let path = reserve_udp_path().await;
     let server = tokio::spawn(run_server(
         vec![path.clone()],
@@ -4091,13 +4135,22 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
     );
     let (first_response, second_response) = tokio::join!(first, second);
 
-    assert_eq!(
-        first_response.expect("first response"),
-        Bytes::from_static(b"pong")
+    eprintln!(
+        "udp_demux_result case_id={} first_target={} first_result={:?}; second_target={} second_result={:?}",
+        case_id, first_target_addr, first_response, second_target_addr, second_response,
     );
-    assert_eq!(
-        second_response.expect("second response"),
-        Bytes::from_static(b"pong")
+    let first_ok = matches!(
+        &first_response,
+        Ok(response) if response.as_ref() == b"pong"
+    );
+    let second_ok = matches!(
+        &second_response,
+        Ok(response) if response.as_ref() == b"pong"
+    );
+    assert!(
+        first_ok && second_ok,
+        "case_id={case_id} first_target={first_target_addr} first_result={first_response:?}; \
+         second_target={second_target_addr} second_result={second_response:?}",
     );
     server.abort();
     let _ = server.await;

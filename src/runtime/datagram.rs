@@ -232,9 +232,35 @@ async fn client_udp_datagram_round_trip_with_limits(
     let setup_started_at = tokio::time::Instant::now();
     let product_deadline = setup_started_at + Duration::from_millis(u64::from(ttl_ms));
     let open_deadline = (setup_started_at + UDP_PATH_HANDSHAKE_TIMEOUT).min(product_deadline);
+    #[cfg(test)]
+    let diagnostic_target = target.clone();
+    #[cfg(test)]
+    let phase = |phase: &str| {
+        eprintln!(
+            "udp_demux_phase pid={} target={} flow_id=0 datagram_id=0 phase={} payload_bytes={} ttl_ms={} elapsed_us={} open_remaining_us={} product_remaining_us={}",
+            std::process::id(),
+            diagnostic_target.authority(),
+            phase,
+            payload_len,
+            ttl_ms,
+            setup_started_at.elapsed().as_micros(),
+            open_deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_micros(),
+            product_deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_micros(),
+        );
+    };
+    #[cfg(test)]
+    phase("begin");
     if open_deadline <= tokio::time::Instant::now() {
+        #[cfg(test)]
+        phase("open_deadline_before_start");
         return Err(RuntimeError::DatagramResponseTimedOut);
     }
+    #[cfg(test)]
+    phase("open_start");
     let open = quic_session::UdpDatagramClientSession::open_with_provider(
         path,
         0,
@@ -248,14 +274,29 @@ async fn client_udp_datagram_round_trip_with_limits(
     .await;
     let mut session = match open {
         Err(RuntimeError::PathOpenTimedOut) if open_deadline == product_deadline => {
+            #[cfg(test)]
+            phase("open_deadline");
             return Err(RuntimeError::DatagramResponseTimedOut);
         }
-        result => result?,
+        Err(error) => {
+            #[cfg(test)]
+            phase("open_error");
+            return Err(error);
+        }
+        Ok(session) => {
+            #[cfg(test)]
+            phase("open_complete");
+            session
+        }
     };
     if tokio::time::Instant::now() >= product_deadline {
+        #[cfg(test)]
+        phase("deadline_after_open_before_send");
         return Err(RuntimeError::DatagramResponseTimedOut);
     }
-    session
+    #[cfg(test)]
+    phase("send_start");
+    let send = session
         .send_to(
             target,
             DatagramFlowId(0),
@@ -264,23 +305,38 @@ async fn client_udp_datagram_round_trip_with_limits(
             product_deadline,
             product_deadline,
         )
-        .await
-        .map_err(|err| match err {
-            policy::DatagramPathSendError::Runtime(source) => source,
-            policy::DatagramPathSendError::UdpPathOpen(source) => source,
-            policy::DatagramPathSendError::PayloadLimitExceeded { limit } => {
-                RuntimeError::Datagram(DatagramError::PayloadTooLarge {
-                    actual: payload_len,
-                    limit,
-                })
-            }
-            policy::DatagramPathSendError::Timeout => RuntimeError::DatagramResponseTimedOut,
-        })?;
+        .await;
+    #[cfg(test)]
+    phase(match &send {
+        Ok(()) => "send_complete",
+        Err(policy::DatagramPathSendError::Timeout) => "send_deadline",
+        Err(_) => "send_error",
+    });
+    send.map_err(|err| match err {
+        policy::DatagramPathSendError::Runtime(source) => source,
+        policy::DatagramPathSendError::UdpPathOpen(source) => source,
+        policy::DatagramPathSendError::PayloadLimitExceeded { limit } => {
+            RuntimeError::Datagram(DatagramError::PayloadTooLarge {
+                actual: payload_len,
+                limit,
+            })
+        }
+        policy::DatagramPathSendError::Timeout => RuntimeError::DatagramResponseTimedOut,
+    })?;
+    #[cfg(test)]
+    phase("receive_start");
     let response = loop {
-        let frame = tokio::time::timeout_at(product_deadline, session.next_frame())
-            .await
-            .map_err(|_| RuntimeError::DatagramResponseTimedOut)??;
+        let next_frame = tokio::time::timeout_at(product_deadline, session.next_frame()).await;
+        #[cfg(test)]
+        phase(match &next_frame {
+            Err(_) => "receive_deadline",
+            Ok(Err(_)) => "receive_error",
+            Ok(Ok(_)) => "receive_frame",
+        });
+        let frame = next_frame.map_err(|_| RuntimeError::DatagramResponseTimedOut)??;
         if let DatagramSessionEvent::Received(response) = session.handle_frame(frame).await? {
+            #[cfg(test)]
+            phase("response_frame_received");
             session
                 .acknowledge(response.flow_id, response.datagram_id)
                 .await?;
@@ -288,5 +344,7 @@ async fn client_udp_datagram_round_trip_with_limits(
         }
     };
     session.close().await?;
+    #[cfg(test)]
+    phase("complete");
     Ok(response)
 }

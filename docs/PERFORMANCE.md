@@ -17,80 +17,105 @@ continuing through a slowdown, and serving small requests during a large downloa
 They also compare throughput, latency and CPU cost with Hysteria2, Xray and direct
 TCP. Each figure names the carrier set and network conditions used.
 
-## One connection, two links
+<a name="one-connection-two-links"></a>
+
+## Aggregation across independent links
 
 A single download uses **3 TCP carriers on one 200 Mbps link** and **1 QUIC
-carrier on a separate 200 Mbps link**. The two links have independent bandwidth
-limits. We slow the QUIC link to **10 Mbps**, restore it, then introduce a brief
-UDP outage. The TCP link stays available throughout.
+carrier on a separate 200 Mbps link**. Each link has its own bandwidth limit,
+giving a combined capacity of 400 Mbps.
 
-[![A download using two independent links, with QUIC restriction and outage marked on the timeline](assets/performance/independent-paths.svg)](assets/performance/independent-paths.svg)
+**Before impairment, the application receives 312 Mbps on average over seconds
+0–15**, including startup. This exceeds the configured 200 Mbps capacity of either
+individual link. The dashed line in the chart marks that configured limit.
 
-With both links available, the download exceeds either link's individual
-capacity. When QUIC slows down or goes offline, the same download continues
-over the TCP carriers. After recovery, it uses the added capacity again.
-The second panel shows the response time of small requests alongside the
-transfer.
+## Delivery through restriction and interruption
 
-Across the 40-second download, the application received **268 Mbps** on average;
-all **80 small echo requests** completed. The longest pause between body reads
-was **0.79 seconds**. A short burst after the restriction lifts is buffered data
-reaching the application, so it can exceed the link rates on the chart.
+The same run then restricts the QUIC link to **10 Mbps**, restores its capacity,
+and briefly blocks UDP. The TCP link remains available throughout. These phases
+measure delivery as service changes:
 
-We also fetch 100 kB HTTP responses on a fixed schedule alongside each transfer:
+| Condition | Application download rate | Measurement interval |
+| --- | ---: | --- |
+| Both links at 200 Mbps | 312 Mbps | 0–15 s, including startup |
+| QUIC restricted to 10 Mbps | 159 Mbps | 16–25 s, wholly within the restriction |
+| UDP blocked; TCP available | 184 Mbps | 32–33 s, the one full bin inside the block |
 
-| Transfer | Average speed | HTTP responses completed | Completed late |
+The recorded UDP block runs from **31.05 to 33.63 seconds**. Four 64-byte echo requests
+start and finish within it, taking **223–234 ms** each; a fifth starts inside and
+replies just after the block ends. The application continues receiving the bulk
+download during this interruption.
+
+[![Application download rate and echo latency, with separate baseline, QUIC restriction and UDP block periods](assets/performance/independent-paths.svg)](assets/performance/independent-paths.svg)
+
+The short spike after QUIC's capacity is restored is buffered data reaching the
+application; it can exceed the link rates momentarily. The longest pause between
+body reads across the entire run is **0.79 seconds**, at **24.57–25.36 seconds**,
+near restoration from the restriction. It is not a measurement of UDP failover time.
+
+Across the full 40 seconds, download averages **268 Mbps** and all **80 small
+echo requests** complete. A separate fixed-schedule probe fetches 100 kB HTTP
+responses alongside each transfer:
+
+| Transfer | Whole-run average | HTTP responses completed | Completed late |
 | --- | ---: | ---: | ---: |
 | Download | 268 Mbps | 80 / 85 | 3 |
 | Upload | 213 Mbps | 80 / 85 | 6 |
 
-Five HTTP requests failed during each impaired transfer. A late response took
+Five HTTP requests fail during each impaired transfer. A late response takes
 more than its 2.5-second budget. All 25 requests before and after each transfer
-completed on time. [Both directions and the earlier-version comparisons](PERFORMANCE_DETAILS.md#independent-link-download-during-a-qos-change-and-udp-outage)
+complete on time. [Both directions and the earlier-version comparisons](PERFORMANCE_DETAILS.md#independent-link-download-during-a-qos-change-and-udp-outage)
 are included in the complete results.
 
-Here aggregation lets one application use more capacity than either link supplies
-alone, while retaining another way forward when one transport is restricted.
+<a name="speed-and-responsiveness"></a>
 
-## Speed and responsiveness
+## Throughput and latency on one bottleneck
 
 Here all carriers in a run pass through one **500 Mbps download / 100 Mbps
-upload** bandwidth limit: a shared bottleneck. Each system is tested separately
-on that network. MPTUNNEL uses **3 TCP + 1 QUIC carriers** in the mixed case and
-**1 QUIC carrier** in the QUIC-only case. These are two example configurations;
-you can choose other carrier counts and combinations.
+upload** bandwidth limit. Each system is tested separately on that network.
+MPTUNNEL uses **3 TCP + 1 QUIC carriers** in the mixed case and **1 QUIC carrier**
+in the QUIC-only case. These are two example configurations; carrier counts and
+combinations are configurable.
 
-A download runs for 40 seconds while small echo requests measure responsiveness.
-The link starts with jitter, which clears about eight to nine seconds into each run.
+A download runs for 40 seconds while 64-byte echo requests measure responsiveness.
+The link starts with jitter. Recorded commands remove it between **8.08 and
+9.22 seconds** across the five runs, separating two measurement periods:
+
+| System | Download, 0–8 s | Echo p95, 0–8 s | Download, 10–40 s | Echo p95, 10–40 s |
+| --- | ---: | ---: | ---: | ---: |
+| MPTUNNEL · 3 TCP + 1 QUIC | 241 Mbps | 197 ms | 453 Mbps | 823 ms |
+| MPTUNNEL · 1 QUIC | 269 Mbps | 248 ms | 367 Mbps | 118 ms |
+| Hysteria2 | 49 Mbps | 932 ms | 467 Mbps | 117 ms |
+| Xray VMess/TCP | 8 Mbps | 196 ms | 379 Mbps | 122 ms |
+| Direct TCP | 139 Mbps | 127 ms | 354 Mbps | 117 ms |
+
+Seconds **0–8 include startup and initial jitter**. Seconds **10–40 follow jitter
+removal**; transport recovery may continue into this interval. Hysteria2 delivers
+the most data in the later interval. Mixed MPTUNNEL delivers more than its single
+QUIC carrier in that interval, with higher echo latency.
+
+[![Per-second application download rate and every echo attempt for all five systems](assets/performance/shared-link-timeline.svg)](assets/performance/shared-link-timeline.svg)
+
+The curves retain startup, the transition and every echo attempt. The shaded
+band spans the recorded jitter changes. All echo attempts complete; the sequential
+probe makes 69–80 attempts per system because it waits for each reply before
+sending the next request.
+
+<details>
+<summary>Whole-run comparison: all 40 seconds, including startup and jitter removal</summary>
 
 <a href="assets/performance/shared-link-tradeoffs.svg">
 <picture>
   <source media="(max-width: 600px)" srcset="assets/performance/shared-link-tradeoffs-narrow.svg">
-  <img src="assets/performance/shared-link-tradeoffs.svg" alt="Download speed and loaded response latency for MPTUNNEL, Hysteria2, Xray and direct TCP">
+  <img src="assets/performance/shared-link-tradeoffs.svg" alt="Whole-run download averages and echo p95 over 40 seconds, including startup and jitter removal">
 </picture>
 </a>
 
-MPTUNNEL's 3 TCP + 1 QUIC set delivered the most data over this interval, at
-**406 Mbps**. The single QUIC carrier delivered **343 Mbps** with a **154 ms**
-response p95, compared with **797 ms** for the mixed set. Hysteria2 delivered
-**367 Mbps** with **427 ms** p95. Xray and direct TCP had the lowest response p95,
-both **122 ms**.
-
-For bulk transfers, throughput matters; for browsing or interactive work
-alongside a download, response time matters too. Here the mixed set delivered
-more bulk data while small requests took longer. The timing curves below show
-both effects as conditions change.
-
-<details>
-<summary>Follow each download and response over time</summary>
-
-[![Per-second download delivery and individual echo response times for all five systems](assets/performance/shared-link-timeline.svg)](assets/performance/shared-link-timeline.svg)
-
-The timelines include startup, the change in jitter and every echo attempt.
-The shaded band spans the recorded jitter changes across the five runs.
-The curves show why the 40-second average differs from the speed reached later
-in a transfer. All echo attempts completed; the sequential probe made 69–80 attempts
-per system because it waits for each reply before sending the next request.
+Over the entire run, mixed MPTUNNEL delivers **406 Mbps** with **797 ms** echo p95;
+one QUIC carrier delivers **343 Mbps** with **154 ms** p95. Hysteria2 delivers
+**367 Mbps** with **427 ms** p95. Xray and direct TCP both have **122 ms** p95.
+These summaries combine the two conditions and their transition; the table and
+curves above show how delivery and latency change within the run.
 
 </details>
 
@@ -120,8 +145,9 @@ process residency for the earlier test set.
 
 ## Browsing alongside transfers, and longer runs
 
-On a healthy 500 Mbps link shared by its carriers, MPTUNNEL's 3 TCP + 1 QUIC set
-delivered **407 Mbps down** and **444 Mbps up**. All 55 loaded HTTP requests completed in
+In separate 25-second runs without configured jitter or loss, MPTUNNEL's
+3 TCP + 1 QUIC set delivered **407 Mbps down** and **444 Mbps up** on a 500 Mbps
+link shared by its carriers. All 55 loaded HTTP requests completed in
 each direction; seven download-side and one upload-side request exceeded the
 2.5-second response budget. These requests each fetched a 100 kB body on a fixed
 schedule, so a slow response did not reduce the number of requests offered.
@@ -150,11 +176,21 @@ with `security: auto`, without mux or TLS. MPTUNNEL uses one QUIC carrier and,
 in mixed mode, three TCP carriers with native BBR. No random loss is injected.
 
 Download speed counts bytes delivered in order to the application. Upload speed
-counts target-confirmed bytes through final settlement. Loaded response p95
-is the response time met by 95% of successful echo requests. Echo points are
-placed at the start of each request. The independent-link
-chart marks the impairment windows; scheduled times and recorded command
-timings are in its data file.
+counts target-confirmed bytes through final settlement. Phase download means use
+all complete one-second bins in the named interval, with no smoothing or peak
+selection. For the independent-link run, boundary bins that overlap restriction
+commands are excluded from the phase table. The UDP interval uses recorded
+transition event points; the data does not contain every body-read timestamp
+needed to calculate an outage-only maximum delivery gap.
+
+For the shared-link table, all systems use the same intervals: **[0, 8) seconds**
+and **[10, 40) seconds** from each probe start. Seconds 8–10 remain visible in the
+curves. Echoes belong to the interval in which the request starts; replies after
+its end remain included. Response p95 is the nearest-rank 95th percentile of
+successful replies. The early window contains 16 echoes per system except
+Hysteria2 (15); the later window contains 60 except mixed MPTUNNEL (49). One mixed
+reply finishes at 40.17 seconds and remains included. Echo points on the chart
+use request start times.
 
 - [Measurements and test conditions](assets/performance/current-observations.json)
 - [Independent-link time series](assets/performance/independent-paths-series.json)

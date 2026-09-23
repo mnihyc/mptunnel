@@ -2,15 +2,15 @@
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
 <svg xmlns:xlink="http://www.w3.org/1999/xlink" width="748.8pt" height="626.4pt" viewBox="0 0 748.8 626.4" xmlns="http://www.w3.org/2000/svg" version="1.1" role="img" aria-labelledby="figure-title figure-description">
-<title id="figure-title">Speed and response time through a download</title>
-<desc id="figure-description">Two time-series panels compare MPTUNNEL TCP+QUIC with 3 TCP carriers and 1 QUIC carrier, MPTUNNEL QUIC with 1 QUIC carrier, Hysteria2, Xray VMess/TCP and direct TCP. Each product has its own 40-second run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, the product download and echo probes shared the link. The first panel shows all forty one-second download delivery bins; the second shows every echo latency at its request start time. The shaded band spans the recorded jitter-clear commands across the five runs. The dashed horizontal line is configured capacity, 500 Mbps. All echo requests succeeded. Each system has its own capture, starting at time zero.</desc>
- <title>Speed and response time through a download</title>
+<title id="figure-title">Download goodput and echo latency</title>
+<desc id="figure-description">Two time-series panels compare MPTUNNEL TCP+QUIC with 3 TCP carriers and 1 QUIC carrier, MPTUNNEL QUIC with 1 QUIC carrier, Hysteria2, Xray VMess/TCP and direct TCP. Each product has its own 40-second run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, the product download and echo probes shared the link. The first panel shows all forty one-second download delivery bins; the second shows every echo latency at its request start time. These full-run traces include startup; jitter clears around 8–9 seconds. The shaded band spans the recorded jitter-clear commands across the five runs. The dashed horizontal line is configured capacity, 500 Mbps. All echo requests succeeded. Each system has its own capture, starting at time zero.</desc>
+ <title>Download goodput and echo latency</title>
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:title>Speed and response time through a download</dc:title>
-    <dc:description>Two time-series panels compare MPTUNNEL TCP+QUIC with 3 TCP carriers and 1 QUIC carrier, MPTUNNEL QUIC with 1 QUIC carrier, Hysteria2, Xray VMess/TCP and direct TCP. Each product has its own 40-second run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, the product download and echo probes shared the link. The first panel shows all forty one-second download delivery bins; the second shows every echo latency at its request start time. The shaded band spans the recorded jitter-clear commands across the five runs. The dashed horizontal line is configured capacity, 500 Mbps. All echo requests succeeded. Each system has its own capture, starting at time zero.</dc:description>
+    <dc:title>Download goodput and echo latency</dc:title>
+    <dc:description>Two time-series panels compare MPTUNNEL TCP+QUIC with 3 TCP carriers and 1 QUIC carrier, MPTUNNEL QUIC with 1 QUIC carrier, Hysteria2, Xray VMess/TCP and direct TCP. Each product has its own 40-second run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, the product download and echo probes shared the link. The first panel shows all forty one-second download delivery bins; the second shows every echo latency at its request start time. These full-run traces include startup; jitter clears around 8–9 seconds. The shaded band spans the recorded jitter-clear commands across the five runs. The dashed horizontal line is configured capacity, 500 Mbps. All echo requests succeeded. Each system has its own capture, starting at time zero.</dc:description>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -1384,10 +1384,10 @@ L 726.336 551.232
    </g>
   </g>
   <g id="text_31">
-   <text style="font-weight: 600; font-size: 19px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #192b3a" x="29.952" y="25.056" transform="rotate(-0 29.952 25.056)">Speed and response time through a download</text>
+   <text style="font-weight: 600; font-size: 19px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #192b3a" x="29.952" y="25.056" transform="rotate(-0 29.952 25.056)">Download goodput and echo latency</text>
   </g>
   <g id="text_32">
-   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="29.952" y="49.4856" transform="rotate(-0 29.952 49.4856)">Separate product runs · same physical link: 500 down / 100 up Mbps · jitter clears after startup</text>
+   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="29.952" y="49.4856" transform="rotate(-0 29.952 49.4856)">Separate product runs · shared 500/100 Mbps bottleneck · 40 s includes startup · jitter clears by ~8–9 s</text>
   </g>
   <g id="text_33">
    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #52616d" x="29.952" y="604.476" transform="rotate(-0 29.952 604.476)">Linux · one 40 s run per system · MPTUNNEL 0.6.0-dev (1e8abedf)</text>

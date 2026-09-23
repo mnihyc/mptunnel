@@ -2,15 +2,15 @@
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
 <svg xmlns:xlink="http://www.w3.org/1999/xlink" width="489.6pt" height="604.8pt" viewBox="0 0 489.6 604.8" xmlns="http://www.w3.org/2000/svg" version="1.1" role="img" aria-labelledby="figure-title figure-description">
-<title id="figure-title">Download speed and responsiveness</title>
-<desc id="figure-description">Two aligned horizontal bar charts compare download throughput, where higher is better, and loaded reply 95th-percentile latency, where lower is better. They show five single observations, each from a separate 40-second product run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, that product's bulk download and small requests share the link. MPTUNNEL TCP+QUIC used 3 TCP carriers plus 1 QUIC carrier; MPTUNNEL QUIC used 1 QUIC carrier. The dashed line marks the configured 500 Mbps download capacity. MPTUNNEL TCP+QUIC: 406.3 Mbps download throughput and 797.1 ms loaded reply p95; Hysteria2: 366.6 Mbps download throughput and 426.7 ms loaded reply p95; MPTUNNEL QUIC: 343.4 Mbps download throughput and 153.6 ms loaded reply p95; Direct TCP: 294.8 Mbps download throughput and 121.9 ms loaded reply p95; Xray VMess/TCP: 286.3 Mbps download throughput and 122.1 ms loaded reply p95. This narrow version stacks the two panels vertically.</desc>
- <title>Download speed and responsiveness</title>
+<title id="figure-title">Download goodput and responsiveness</title>
+<desc id="figure-description">Two aligned horizontal bar charts compare download throughput, where higher is better, and loaded reply 95th-percentile latency, where lower is better. They show five single observations, each summarizing a separate 40-second product run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. The full-run download averages include startup, and the configured jitter was cleared after about 8–9 seconds, so these are run summaries rather than steady-state capacity rankings. Within each run, that product's bulk download and small requests share the link. MPTUNNEL TCP+QUIC used 3 TCP carriers plus 1 QUIC carrier; MPTUNNEL QUIC used 1 QUIC carrier. The dashed line marks the configured 500 Mbps download capacity. MPTUNNEL TCP+QUIC: 406.3 Mbps download throughput and 797.1 ms loaded reply p95; Hysteria2: 366.6 Mbps download throughput and 426.7 ms loaded reply p95; MPTUNNEL QUIC: 343.4 Mbps download throughput and 153.6 ms loaded reply p95; Direct TCP: 294.8 Mbps download throughput and 121.9 ms loaded reply p95; Xray VMess/TCP: 286.3 Mbps download throughput and 122.1 ms loaded reply p95. This narrow version stacks the two panels vertically.</desc>
+ <title>Download goodput and responsiveness</title>
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:title>Download speed and responsiveness</dc:title>
-    <dc:description>Two aligned horizontal bar charts compare download throughput, where higher is better, and loaded reply 95th-percentile latency, where lower is better. They show five single observations, each from a separate 40-second product run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, that product's bulk download and small requests share the link. MPTUNNEL TCP+QUIC used 3 TCP carriers plus 1 QUIC carrier; MPTUNNEL QUIC used 1 QUIC carrier. The dashed line marks the configured 500 Mbps download capacity. MPTUNNEL TCP+QUIC: 406.3 Mbps download throughput and 797.1 ms loaded reply p95; Hysteria2: 366.6 Mbps download throughput and 426.7 ms loaded reply p95; MPTUNNEL QUIC: 343.4 Mbps download throughput and 153.6 ms loaded reply p95; Direct TCP: 294.8 Mbps download throughput and 121.9 ms loaded reply p95; Xray VMess/TCP: 286.3 Mbps download throughput and 122.1 ms loaded reply p95. This narrow version stacks the two panels vertically.</dc:description>
+    <dc:title>Download goodput and responsiveness</dc:title>
+    <dc:description>Two aligned horizontal bar charts compare download throughput, where higher is better, and loaded reply 95th-percentile latency, where lower is better. They show five single observations, each summarizing a separate 40-second product run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. The full-run download averages include startup, and the configured jitter was cleared after about 8–9 seconds, so these are run summaries rather than steady-state capacity rankings. Within each run, that product's bulk download and small requests share the link. MPTUNNEL TCP+QUIC used 3 TCP carriers plus 1 QUIC carrier; MPTUNNEL QUIC used 1 QUIC carrier. The dashed line marks the configured 500 Mbps download capacity. MPTUNNEL TCP+QUIC: 406.3 Mbps download throughput and 797.1 ms loaded reply p95; Hysteria2: 366.6 Mbps download throughput and 426.7 ms loaded reply p95; MPTUNNEL QUIC: 343.4 Mbps download throughput and 153.6 ms loaded reply p95; Direct TCP: 294.8 Mbps download throughput and 121.9 ms loaded reply p95; Xray VMess/TCP: 286.3 Mbps download throughput and 122.1 ms loaded reply p95. This narrow version stacks the two panels vertically.</dc:description>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -34,78 +34,78 @@ z
   </g>
   <g id="axes_1">
    <g id="patch_2">
-    <path d="M 186.048 315.130065
-L 472.464 315.130065
-L 472.464 160.272
-L 186.048 160.272
+    <path d="M 186.048 327.762581
+L 472.464 327.762581
+L 472.464 181.44
+L 186.048 181.44
 z
 " style="fill: #ffffff"/>
    </g>
    <g id="matplotlib.axis_1">
     <g id="xtick_1">
      <g id="line2d_1">
-      <path d="M 186.048 315.130065
-L 186.048 160.272
-" clip-path="url(#pe2ea8d9e48)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 186.048 327.762581
+L 186.048 181.44
+" clip-path="url(#p589c7497ee)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_2"/>
      <g id="text_1">
-      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="186.048" y="331.324174" transform="rotate(-0 186.048 331.324174)">0</text>
+      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="186.048" y="343.95669" transform="rotate(-0 186.048 343.95669)">0</text>
      </g>
     </g>
     <g id="xtick_2">
      <g id="line2d_3">
-      <path d="M 237.193714 315.130065
-L 237.193714 160.272
-" clip-path="url(#pe2ea8d9e48)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 237.193714 327.762581
+L 237.193714 181.44
+" clip-path="url(#p589c7497ee)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_4"/>
      <g id="text_2">
-      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="237.193714" y="331.324174" transform="rotate(-0 237.193714 331.324174)">100</text>
+      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="237.193714" y="343.95669" transform="rotate(-0 237.193714 343.95669)">100</text>
      </g>
     </g>
     <g id="xtick_3">
      <g id="line2d_5">
-      <path d="M 288.339429 315.130065
-L 288.339429 160.272
-" clip-path="url(#pe2ea8d9e48)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 288.339429 327.762581
+L 288.339429 181.44
+" clip-path="url(#p589c7497ee)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_6"/>
      <g id="text_3">
-      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="288.339429" y="331.324174" transform="rotate(-0 288.339429 331.324174)">200</text>
+      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="288.339429" y="343.95669" transform="rotate(-0 288.339429 343.95669)">200</text>
      </g>
     </g>
     <g id="xtick_4">
      <g id="line2d_7">
-      <path d="M 339.485143 315.130065
-L 339.485143 160.272
-" clip-path="url(#pe2ea8d9e48)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 339.485143 327.762581
+L 339.485143 181.44
+" clip-path="url(#p589c7497ee)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_8"/>
      <g id="text_4">
-      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="339.485143" y="331.324174" transform="rotate(-0 339.485143 331.324174)">300</text>
+      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="339.485143" y="343.95669" transform="rotate(-0 339.485143 343.95669)">300</text>
      </g>
     </g>
     <g id="xtick_5">
      <g id="line2d_9">
-      <path d="M 390.630857 315.130065
-L 390.630857 160.272
-" clip-path="url(#pe2ea8d9e48)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 390.630857 327.762581
+L 390.630857 181.44
+" clip-path="url(#p589c7497ee)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_10"/>
      <g id="text_5">
-      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="390.630857" y="331.324174" transform="rotate(-0 390.630857 331.324174)">400</text>
+      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="390.630857" y="343.95669" transform="rotate(-0 390.630857 343.95669)">400</text>
      </g>
     </g>
     <g id="xtick_6">
      <g id="line2d_11">
-      <path d="M 441.776571 315.130065
-L 441.776571 160.272
-" clip-path="url(#pe2ea8d9e48)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 441.776571 327.762581
+L 441.776571 181.44
+" clip-path="url(#p589c7497ee)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_12"/>
      <g id="text_6">
-      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="441.776571" y="331.324174" transform="rotate(-0 441.776571 331.324174)">500</text>
+      <text style="font-size: 12.1px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52616d" x="441.776571" y="343.95669" transform="rotate(-0 441.776571 343.95669)">500</text>
      </g>
     </g>
    </g>
@@ -113,117 +113,117 @@ L 441.776571 160.272
     <g id="ytick_1">
      <g id="line2d_13"/>
      <g id="text_7">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(38.358547 174.925219)">MPTUNNEL TCP+QUIC</text>
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(11.690578 188.922485)">4 carriers: 3 TCP + 1 QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(38.358547 195.213919)">MPTUNNEL TCP+QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(11.690578 209.211185)">4 carriers: 3 TCP + 1 QUIC</text>
      </g>
     </g>
     <g id="ytick_2">
      <g id="line2d_14"/>
      <g id="text_8">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="211.712052" transform="rotate(-0 176.048 211.712052)">Hysteria2</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="230.30653" transform="rotate(-0 176.048 230.30653)">Hysteria2</text>
      </g>
     </g>
     <g id="ytick_3">
      <g id="line2d_15"/>
      <g id="text_9">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(71.999172 236.401228)">MPTUNNEL QUIC</text>
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(87.850734 250.398493)">1 QUIC carrier</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(71.999172 253.301486)">MPTUNNEL QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(87.850734 267.298751)">1 QUIC carrier</text>
      </g>
     </g>
     <g id="ytick_4">
      <g id="line2d_16"/>
      <g id="text_10">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="273.18806" transform="rotate(-0 176.048 273.18806)">Direct TCP</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="288.394097" transform="rotate(-0 176.048 288.394097)">Direct TCP</text>
      </g>
     </g>
     <g id="ytick_5">
      <g id="line2d_17"/>
      <g id="text_11">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="303.926064" transform="rotate(-0 176.048 303.926064)">Xray VMess/TCP</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="317.437881" transform="rotate(-0 176.048 317.437881)">Xray VMess/TCP</text>
      </g>
     </g>
    </g>
    <g id="line2d_18">
-    <path d="M 186.048 315.130065
-L 186.048 160.272
-" clip-path="url(#pe2ea8d9e48)" style="fill: none; stroke: #586875; stroke-linecap: square"/>
+    <path d="M 186.048 327.762581
+L 186.048 181.44
+" clip-path="url(#p589c7497ee)" style="fill: none; stroke: #586875; stroke-linecap: square"/>
    </g>
    <g id="line2d_19">
-    <path d="M 441.776571 315.130065
-L 441.776571 160.272
-" clip-path="url(#pe2ea8d9e48)" style="fill: none; stroke-dasharray: 5.6,4.2; stroke-dashoffset: 0; stroke: #586875; stroke-width: 1.4"/>
+    <path d="M 441.776571 327.762581
+L 441.776571 181.44
+" clip-path="url(#p589c7497ee)" style="fill: none; stroke-dasharray: 5.6,4.2; stroke-dashoffset: 0; stroke: #586875; stroke-width: 1.4"/>
    </g>
    <g id="patch_3">
-    <path d="M 186.048 315.130065
-L 472.464 315.130065
+    <path d="M 186.048 327.762581
+L 472.464 327.762581
 " style="fill: none; stroke: #aab4bc; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
    </g>
    <g id="patch_4">
-    <path d="M 186.048 167.311003
-L 393.859139 167.311003
-L 393.859139 185.139045
-L 186.048 185.139045
+    <path d="M 186.048 188.091026
+L 393.859139 188.091026
+L 393.859139 204.936421
+L 186.048 204.936421
 z
-" clip-path="url(#pe2ea8d9e48)" style="fill: #176b9a"/>
+" clip-path="url(#p589c7497ee)" style="fill: #176b9a"/>
    </g>
    <g id="patch_5">
-    <path d="M 186.048 198.049007
-L 373.56298 198.049007
-L 373.56298 215.877049
-L 186.048 215.877049
+    <path d="M 186.048 217.13481
+L 373.56298 217.13481
+L 373.56298 233.980204
+L 186.048 233.980204
 z
-" clip-path="url(#pe2ea8d9e48)" style="fill: #d58b24"/>
+" clip-path="url(#p589c7497ee)" style="fill: #d58b24"/>
    </g>
    <g id="patch_6">
-    <path d="M 186.048 228.787011
-L 361.662593 228.787011
-L 361.662593 246.615053
-L 186.048 246.615053
+    <path d="M 186.048 246.178593
+L 361.662593 246.178593
+L 361.662593 263.023988
+L 186.048 263.023988
 z
-" clip-path="url(#pe2ea8d9e48)" style="fill: #238c83"/>
+" clip-path="url(#p589c7497ee)" style="fill: #238c83"/>
    </g>
    <g id="patch_7">
-    <path d="M 186.048 259.525015
-L 336.834246 259.525015
-L 336.834246 277.353058
-L 186.048 277.353058
+    <path d="M 186.048 275.222377
+L 336.834246 275.222377
+L 336.834246 292.067771
+L 186.048 292.067771
 z
-" clip-path="url(#pe2ea8d9e48)" style="fill: #77838e"/>
+" clip-path="url(#p589c7497ee)" style="fill: #77838e"/>
    </g>
    <g id="patch_8">
-    <path d="M 186.048 290.263019
-L 332.495729 290.263019
-L 332.495729 308.091062
-L 186.048 308.091062
+    <path d="M 186.048 304.26616
+L 332.495729 304.26616
+L 332.495729 321.111554
+L 186.048 321.111554
 z
-" clip-path="url(#pe2ea8d9e48)" style="fill: #795a9b"/>
+" clip-path="url(#p589c7497ee)" style="fill: #795a9b"/>
    </g>
    <g id="text_12">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="399.014627" y="179.619055" transform="rotate(-0 399.014627 179.619055)">406.3</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="399.014627" y="199.907755" transform="rotate(-0 399.014627 199.907755)">406.3</text>
    </g>
    <g id="text_13">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="378.718468" y="210.357059" transform="rotate(-0 378.718468 210.357059)">366.6</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="378.718468" y="228.951538" transform="rotate(-0 378.718468 228.951538)">366.6</text>
    </g>
    <g id="text_14">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="366.818081" y="241.095064" transform="rotate(-0 366.818081 241.095064)">343.4</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="366.818081" y="257.995322" transform="rotate(-0 366.818081 257.995322)">343.4</text>
    </g>
    <g id="text_15">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="341.989734" y="271.833068" transform="rotate(-0 341.989734 271.833068)">294.8</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="341.989734" y="287.039105" transform="rotate(-0 341.989734 287.039105)">294.8</text>
    </g>
    <g id="text_16">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="337.651217" y="302.571072" transform="rotate(-0 337.651217 302.571072)">286.3</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="337.651217" y="316.082888" transform="rotate(-0 337.651217 316.082888)">286.3</text>
    </g>
    <g id="text_17">
-    <text style="font-weight: 600; font-size: 13px; font-family: 'DejaVu Sans'; fill: #243847" transform="translate(186.048 135.613281)">Download throughput</text>
-    <text style="font-weight: 600; font-size: 13px; font-family: 'DejaVu Sans'; fill: #243847" transform="translate(186.048 150.272)">Mbps · higher is better</text>
+    <text style="font-weight: 600; font-size: 13px; font-family: 'DejaVu Sans'; fill: #243847" transform="translate(186.048 156.781281)">Download throughput</text>
+    <text style="font-weight: 600; font-size: 13px; font-family: 'DejaVu Sans'; fill: #243847" transform="translate(186.048 171.44)">Mbps · higher is better</text>
    </g>
   </g>
   <g id="axes_2">
    <g id="patch_9">
     <path d="M 186.048 544.32
 L 472.464 544.32
-L 472.464 389.461935
-L 186.048 389.461935
+L 472.464 397.997419
+L 186.048 397.997419
 z
 " style="fill: #ffffff"/>
    </g>
@@ -231,8 +231,8 @@ z
     <g id="xtick_7">
      <g id="line2d_20">
       <path d="M 186.048 544.32
-L 186.048 389.461935
-" clip-path="url(#p1540b8bd47)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+L 186.048 397.997419
+" clip-path="url(#p70202093c9)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_21"/>
      <g id="text_18">
@@ -242,8 +242,8 @@ L 186.048 389.461935
     <g id="xtick_8">
      <g id="line2d_22">
       <path d="M 246.987574 544.32
-L 246.987574 389.461935
-" clip-path="url(#p1540b8bd47)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+L 246.987574 397.997419
+" clip-path="url(#p70202093c9)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_23"/>
      <g id="text_19">
@@ -253,8 +253,8 @@ L 246.987574 389.461935
     <g id="xtick_9">
      <g id="line2d_24">
       <path d="M 307.927149 544.32
-L 307.927149 389.461935
-" clip-path="url(#p1540b8bd47)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+L 307.927149 397.997419
+" clip-path="url(#p70202093c9)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_25"/>
      <g id="text_20">
@@ -264,8 +264,8 @@ L 307.927149 389.461935
     <g id="xtick_10">
      <g id="line2d_26">
       <path d="M 368.866723 544.32
-L 368.866723 389.461935
-" clip-path="url(#p1540b8bd47)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+L 368.866723 397.997419
+" clip-path="url(#p70202093c9)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_27"/>
      <g id="text_21">
@@ -275,8 +275,8 @@ L 368.866723 389.461935
     <g id="xtick_11">
      <g id="line2d_28">
       <path d="M 429.806298 544.32
-L 429.806298 389.461935
-" clip-path="url(#p1540b8bd47)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
+L 429.806298 397.997419
+" clip-path="url(#p70202093c9)" style="fill: none; stroke: #e5e9ed; stroke-width: 0.8; stroke-linecap: square"/>
      </g>
      <g id="line2d_29"/>
      <g id="text_22">
@@ -288,40 +288,40 @@ L 429.806298 389.461935
     <g id="ytick_6">
      <g id="line2d_30"/>
      <g id="text_23">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(38.358547 404.115155)">MPTUNNEL TCP+QUIC</text>
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(11.690578 418.112421)">4 carriers: 3 TCP + 1 QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(38.358547 411.771338)">MPTUNNEL TCP+QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(11.690578 425.768604)">4 carriers: 3 TCP + 1 QUIC</text>
      </g>
     </g>
     <g id="ytick_7">
      <g id="line2d_31"/>
      <g id="text_24">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="440.901987" transform="rotate(-0 176.048 440.901987)">Hysteria2</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="446.86395" transform="rotate(-0 176.048 446.86395)">Hysteria2</text>
      </g>
     </g>
     <g id="ytick_8">
      <g id="line2d_32"/>
      <g id="text_25">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(71.999172 465.591163)">MPTUNNEL QUIC</text>
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(87.850734 479.588429)">1 QUIC carrier</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(71.999172 469.858905)">MPTUNNEL QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(87.850734 483.856171)">1 QUIC carrier</text>
      </g>
     </g>
     <g id="ytick_9">
      <g id="line2d_33"/>
      <g id="text_26">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="502.377995" transform="rotate(-0 176.048 502.377995)">Direct TCP</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="504.951516" transform="rotate(-0 176.048 504.951516)">Direct TCP</text>
      </g>
     </g>
     <g id="ytick_10">
      <g id="line2d_34"/>
      <g id="text_27">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="533.115999" transform="rotate(-0 176.048 533.115999)">Xray VMess/TCP</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="533.9953" transform="rotate(-0 176.048 533.9953)">Xray VMess/TCP</text>
      </g>
     </g>
    </g>
    <g id="line2d_35">
     <path d="M 186.048 544.32
-L 186.048 389.461935
-" clip-path="url(#p1540b8bd47)" style="fill: none; stroke: #586875; stroke-linecap: square"/>
+L 186.048 397.997419
+" clip-path="url(#p70202093c9)" style="fill: none; stroke: #586875; stroke-linecap: square"/>
    </g>
    <g id="patch_10">
     <path d="M 186.048 544.32
@@ -329,89 +329,92 @@ L 472.464 544.32
 " style="fill: none; stroke: #aab4bc; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
    </g>
    <g id="patch_11">
-    <path d="M 186.048 396.500938
-L 428.937816 396.500938
-L 428.937816 414.328981
-L 186.048 414.328981
+    <path d="M 186.048 404.648446
+L 428.937816 404.648446
+L 428.937816 421.49384
+L 186.048 421.49384
 z
-" clip-path="url(#p1540b8bd47)" style="fill: #176b9a"/>
+" clip-path="url(#p70202093c9)" style="fill: #176b9a"/>
    </g>
    <g id="patch_12">
-    <path d="M 186.048 427.238942
-L 316.068039 427.238942
-L 316.068039 445.066985
-L 186.048 445.066985
+    <path d="M 186.048 433.692229
+L 316.068039 433.692229
+L 316.068039 450.537623
+L 186.048 450.537623
 z
-" clip-path="url(#p1540b8bd47)" style="fill: #d58b24"/>
+" clip-path="url(#p70202093c9)" style="fill: #d58b24"/>
    </g>
    <g id="patch_13">
-    <path d="M 186.048 457.976947
-L 232.864451 457.976947
-L 232.864451 475.804989
-L 186.048 475.804989
+    <path d="M 186.048 462.736012
+L 232.864451 462.736012
+L 232.864451 479.581407
+L 186.048 479.581407
 z
-" clip-path="url(#p1540b8bd47)" style="fill: #238c83"/>
+" clip-path="url(#p70202093c9)" style="fill: #238c83"/>
    </g>
    <g id="patch_14">
-    <path d="M 186.048 488.714951
-L 223.190508 488.714951
-L 223.190508 506.542993
-L 186.048 506.542993
+    <path d="M 186.048 491.779796
+L 223.190508 491.779796
+L 223.190508 508.62519
+L 186.048 508.62519
 z
-" clip-path="url(#p1540b8bd47)" style="fill: #77838e"/>
+" clip-path="url(#p70202093c9)" style="fill: #77838e"/>
    </g>
    <g id="patch_15">
-    <path d="M 186.048 519.452955
-L 223.238648 519.452955
-L 223.238648 537.280997
-L 186.048 537.280997
+    <path d="M 186.048 520.823579
+L 223.238648 520.823579
+L 223.238648 537.668974
+L 186.048 537.668974
 z
-" clip-path="url(#p1540b8bd47)" style="fill: #795a9b"/>
+" clip-path="url(#p70202093c9)" style="fill: #795a9b"/>
    </g>
    <g id="text_28">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="434.093304" y="408.808991" transform="rotate(-0 434.093304 408.808991)">797.1</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="434.093304" y="416.465174" transform="rotate(-0 434.093304 416.465174)">797.1</text>
    </g>
    <g id="text_29">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="321.223527" y="439.546995" transform="rotate(-0 321.223527 439.546995)">426.7</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="321.223527" y="445.508958" transform="rotate(-0 321.223527 445.508958)">426.7</text>
    </g>
    <g id="text_30">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="238.019939" y="470.284999" transform="rotate(-0 238.019939 470.284999)">153.6</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="238.019939" y="474.552741" transform="rotate(-0 238.019939 474.552741)">153.6</text>
    </g>
    <g id="text_31">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="228.345996" y="501.023003" transform="rotate(-0 228.345996 501.023003)">121.9</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="228.345996" y="503.596524" transform="rotate(-0 228.345996 503.596524)">121.9</text>
    </g>
    <g id="text_32">
-    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="228.394136" y="531.761007" transform="rotate(-0 228.394136 531.761007)">122.1</text>
+    <text style="font-size: 12.3px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #243847" x="228.394136" y="532.640308" transform="rotate(-0 228.394136 532.640308)">122.1</text>
    </g>
    <g id="text_33">
-    <text style="font-weight: 600; font-size: 13px; font-family: 'DejaVu Sans'; fill: #243847" transform="translate(186.048 364.803217)">Loaded reply p95</text>
-    <text style="font-weight: 600; font-size: 13px; font-family: 'DejaVu Sans'; fill: #243847" transform="translate(186.048 379.461935)">ms · lower is better</text>
+    <text style="font-weight: 600; font-size: 13px; font-family: 'DejaVu Sans'; fill: #243847" transform="translate(186.048 373.338701)">Loaded reply p95</text>
+    <text style="font-weight: 600; font-size: 13px; font-family: 'DejaVu Sans'; fill: #243847" transform="translate(186.048 387.997419)">ms · lower is better</text>
    </g>
   </g>
   <g id="text_34">
-   <text style="font-weight: 600; font-size: 19.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #192b3a" x="26.928" y="34.170553" transform="rotate(-0 26.928 34.170553)">Download speed and responsiveness</text>
+   <text style="font-weight: 600; font-size: 19.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #192b3a" x="26.928" y="34.170553" transform="rotate(-0 26.928 34.170553)">Download goodput and responsiveness</text>
   </g>
   <g id="text_35">
-   <text style="font-size: 11.7px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="26.928" y="62.717372" transform="rotate(-0 26.928 62.717372)">Separate product runs · same physical link: 500 down / 100 up Mbps</text>
+   <text style="font-size: 11.7px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="26.928" y="62.717372" transform="rotate(-0 26.928 62.717372)">Separate product runs · shared bottleneck: 500 down / 100 up Mbps</text>
+  </g>
+  <g id="text_36">
+   <text style="font-size: 11.7px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="26.928" y="80.861372" transform="rotate(-0 26.928 80.861372)">40 s whole-run averages include startup · jitter clears by ~8–9 s</text>
   </g>
   <g id="legend_1">
    <g id="line2d_36">
-    <path d="M 202.438969 102.371419
-L 214.408969 102.371419
-L 226.378969 102.371419
+    <path d="M 202.438969 110.838619
+L 214.408969 110.838619
+L 226.378969 110.838619
 " style="fill: none; stroke-dasharray: 5.6,4.2; stroke-dashoffset: 0; stroke: #586875; stroke-width: 1.4"/>
    </g>
-   <g id="text_36">
-    <text style="font-size: 11.4px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="232.648969" y="106.361419" transform="rotate(-0 232.648969 106.361419)">Configured download capacity: 500 Mbps</text>
+   <g id="text_37">
+    <text style="font-size: 11.4px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="232.648969" y="114.828619" transform="rotate(-0 232.648969 114.828619)">Configured download capacity: 500 Mbps</text>
    </g>
   </g>
  </g>
  <defs>
-  <clipPath id="pe2ea8d9e48">
-   <rect x="186.048" y="160.272" width="286.416" height="154.858065"/>
+  <clipPath id="p589c7497ee">
+   <rect x="186.048" y="181.44" width="286.416" height="146.322581"/>
   </clipPath>
-  <clipPath id="p1540b8bd47">
-   <rect x="186.048" y="389.461935" width="286.416" height="154.858065"/>
+  <clipPath id="p70202093c9">
+   <rect x="186.048" y="397.997419" width="286.416" height="146.322581"/>
   </clipPath>
  </defs>
 </svg>

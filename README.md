@@ -4,7 +4,7 @@
 [![Release Build](https://github.com/mnihyc/mptunnel/actions/workflows/release.yml/badge.svg)](https://github.com/mnihyc/mptunnel/actions/workflows/release.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Multipath tunneling for your existing applications.**
+**Encrypted multipath tunneling over TCP and QUIC.**
 
 MPTUNNEL is an encrypted proxy and tunnel that combines TCP and QUIC connections
 to carry your traffic. Even a single download or upload can use several of these
@@ -14,7 +14,7 @@ another connection when one stops making progress.
 [**Get started**](#quick-start) · [**Download**](../../releases/latest) ·
 [**Performance**](docs/PERFORMANCE.md) · [**Configuration**](examples/config.reference.toml)
 
-## Why MPTUNNEL?
+## Multipath transport
 
 A fast Internet link does not always mean a fast application connection.
 Individual connections can encounter rate limits, loss or congestion, and the
@@ -54,32 +54,51 @@ to choose carriers and their usage policies.
 
 <a name="performance"></a>
 
-## See it in action
+## Performance evaluation
 
-In the [two-link demonstration](docs/PERFORMANCE.md#one-connection-two-links),
-one download uses three TCP carriers on a 200 Mbps link and one QUIC carrier
-on a separate 200 Mbps link. It averages **268 Mbps** through a slowdown and
-brief UDP outage, using capacity beyond either individual link.
+### Aggregation across independent links
 
-The comparison below asks a different question: how much speed and responsiveness
-does each tunnel provide on **one 500 Mbps download / 100 Mbps upload link**?
-Each system runs separately. MPTUNNEL is measured with **3 TCP + 1 QUIC carriers**
-and with **1 QUIC carrier**.
+One download uses **3 TCP carriers on a 200 Mbps link** and **1 QUIC carrier on
+another 200 Mbps link**. Before any impairment, it averages **312 Mbps over the
+first 15 seconds**, including startup. The application uses more bandwidth than
+either link's 200 Mbps limit, from a combined capacity of 400 Mbps.
 
-<a href="docs/PERFORMANCE.md#speed-and-responsiveness">
-<picture>
-  <source media="(max-width: 600px)" srcset="docs/assets/performance/shared-link-tradeoffs-narrow.svg">
-  <img src="docs/assets/performance/shared-link-tradeoffs.svg" alt="Download speed and response latency with each system using the same 500 Mbps bandwidth limit">
-</picture>
-</a>
+### Delivery during a QUIC interruption
 
-Over these 40-second Linux downloads, the mixed set delivered **406 Mbps**, with
-95% of small echo requests answered within **797 ms**. The single QUIC carrier
-delivered **343 Mbps** with a **154 ms** response p95. The
-[performance guide](docs/PERFORMANCE.md#speed-and-responsiveness) follows delivery
-and response times throughout each run and compares CPU cost alongside throughput.
+Later in the same transfer, UDP is blocked for **2.6 seconds** while the TCP link
+remains available. Application delivery continues: the one full second inside
+the recorded block delivers **184 Mbps**, and four small echo requests sent and
+answered within the block complete in **223–234 ms**.
 
-## Know what your tunnel is doing
+[![Download delivery and echo latency across the initial aggregation period, QUIC slowdown and UDP interruption](docs/assets/performance/independent-paths.svg)](docs/PERFORMANCE.md#one-connection-two-links)
+
+The full timeline also includes a **10 Mbps restriction on QUIC** before the
+interruption. [Per-phase results and concurrent HTTP outcomes](docs/PERFORMANCE.md#one-connection-two-links)
+explain each condition separately.
+
+### Throughput and latency on one Internet link
+
+Here each system runs separately on the same **500 Mbps download / 100 Mbps
+upload** bottleneck. All carriers within a run share that capacity. The link starts
+with jitter, which is removed between seconds 8 and 10.
+
+| System | 0–8 s<br>Mbps | 10–40 s<br>Mbps | Echo p95<br>10–40 s, ms |
+| --- | ---: | ---: | ---: |
+| MPTUNNEL<br>3 TCP + 1 QUIC | 241 | 453 | 823 |
+| MPTUNNEL<br>1 QUIC | 269 | 367 | 118 |
+| Hysteria2 | 49 | 467 | 117 |
+| Xray VMess/TCP | 8 | 379 | 122 |
+| Direct TCP | 139 | 354 | 117 |
+
+After jitter removal, mixed MPTUNNEL delivers more data than its single QUIC
+carrier, with longer response times under load. Hysteria2 has the highest
+throughput in that interval.
+
+These are single Linux runs using a MPTUNNEL 0.6.0 development build. The
+[performance guide](docs/PERFORMANCE.md#speed-and-responsiveness) provides the full
+timing curves, CPU costs, request counts and controller settings.
+
+## Traffic monitoring and management
 
 The built-in dashboard shows live traffic, path health, peer paths and active
 connections. Inspect which carriers are working and manage routing, DNS and

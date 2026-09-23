@@ -32,7 +32,7 @@ DEFAULT_SHARED_DATA = FIGURE_DIR / "shared-link-series.json"
 DEFAULT_SHARED_TIMELINE_SVG = FIGURE_DIR / "shared-link-timeline.svg"
 DEFAULT_SHARED_TIMELINE_PNG = FIGURE_DIR / "shared-link-timeline.png"
 
-TITLE = "Download speed and responsiveness"
+TITLE = "Download goodput and responsiveness"
 EXPECTED_SYSTEMS = {"mixed", "h2", "quic", "xray", "raw"}
 SYSTEM_LABELS = {
     "mixed": "MPTUNNEL TCP+QUIC",
@@ -184,10 +184,12 @@ def _accessible_description(rows: list[dict[str, Any]]) -> str:
     return (
         "Two aligned horizontal bar charts compare download throughput, where higher is better, "
         "and loaded reply 95th-percentile latency, where lower is better. They show five "
-        "single observations, each from a separate 40-second product run against the same "
+        "single observations, each summarizing a separate 40-second product run against the same "
         "physical 500 Mbps down, 100 Mbps up link limit; the products did not compete "
-        "simultaneously. Within each run, that product's bulk download and small requests "
-        "share the link. MPTUNNEL TCP+QUIC used 3 TCP carriers plus 1 QUIC carrier; "
+        "simultaneously. The full-run download averages include startup, and the configured "
+        "jitter was cleared after about 8–9 seconds, so these are run summaries rather than "
+        "steady-state capacity rankings. Within each run, that product's bulk download and "
+        "small requests share the link. MPTUNNEL TCP+QUIC used 3 TCP carriers plus 1 QUIC carrier; "
         "MPTUNNEL QUIC used 1 QUIC carrier. The dashed line marks the configured 500 Mbps "
         "download capacity. "
         + measurements
@@ -229,7 +231,7 @@ def render_narrow_tradeoffs(rows: list[dict[str, Any]], svg_path: Path) -> None:
         2,
         1,
         sharey=True,
-        gridspec_kw={"left": 0.38, "right": 0.965, "bottom": 0.10, "top": 0.735, "hspace": 0.48},
+        gridspec_kw={"left": 0.38, "right": 0.965, "bottom": 0.10, "top": 0.700, "hspace": 0.48},
     )
     fig.text(
         0.055,
@@ -244,7 +246,16 @@ def render_narrow_tradeoffs(rows: list[dict[str, Any]], svg_path: Path) -> None:
     fig.text(
         0.055,
         0.911,
-        "Separate product runs · same physical link: 500 down / 100 up Mbps",
+        "Separate product runs · shared bottleneck: 500 down / 100 up Mbps",
+        ha="left",
+        va="top",
+        fontsize=11.7,
+        color="#435563",
+    )
+    fig.text(
+        0.055,
+        0.881,
+        "40 s whole-run averages include startup · jitter clears by ~8–9 s",
         ha="left",
         va="top",
         fontsize=11.7,
@@ -309,7 +320,7 @@ def render_narrow_tradeoffs(rows: list[dict[str, Any]], svg_path: Path) -> None:
     fig.legend(
         handles=[capacity_handle],
         loc="upper right",
-        bbox_to_anchor=(0.965, 0.846),
+        bbox_to_anchor=(0.965, 0.832),
         frameon=False,
         handlelength=2.1,
         handletextpad=0.55,
@@ -501,13 +512,13 @@ def render_independent_paths(
     average = observation["average"]
 
     matplotlib.rcParams["svg.hashsalt"] = "mptunnel-independent-paths-v1"
-    title = "One download across two links"
+    title = "Aggregation and recovery over two links"
     description = (
         "The upper time series shows all forty raw one-second bins of aggregate application download throughput, "
         "including startup. It combines 3 TCP carriers on one 200 Mbps link with 1 QUIC carrier on another "
         "200 Mbps link. The dashed horizontal line is the configured 200 Mbps capacity of one link; it is a "
         "setting reference, not a separately measured TCP throughput series. The TCP link remains configured "
-        "at 200 Mbps while the QUIC link is shaped. "
+        "at 200 Mbps while the QUIC link is shaped. The original 0–15 seconds are the baseline period. "
         f"The shaded QUIC command window spans {qos_start:.2f}–{qos_end:.2f} seconds. The shaded UDP block "
         f"runs between recorded transition points at {outage_start:.2f} and {outage_end:.2f} seconds. The lower "
         f"panel plots all eighty successful concurrent echo replies; their measured p95 is {echo_p95:.1f} ms. "
@@ -518,7 +529,7 @@ def render_independent_paths(
         2,
         1,
         sharex=True,
-        gridspec_kw={"left": 0.14, "right": 0.965, "bottom": 0.16, "top": 0.765, "hspace": 0.34},
+        gridspec_kw={"left": 0.14, "right": 0.965, "bottom": 0.16, "top": 0.72, "hspace": 0.34},
     )
     fig.text(
         0.035,
@@ -533,7 +544,16 @@ def render_independent_paths(
     fig.text(
         0.035,
         0.910,
-        "3 TCP carriers: one 200 Mbps link · 1 QUIC carrier: the other 200 Mbps link",
+        "3 TCP carriers on one 200 Mbps link · 1 QUIC carrier on another",
+        ha="left",
+        va="top",
+        fontsize=12.0,
+        color="#435563",
+    )
+    fig.text(
+        0.035,
+        0.878,
+        "0–15 s is baseline · shaded bands mark QUIC restriction and UDP outage",
         ha="left",
         va="top",
         fontsize=12.0,
@@ -644,7 +664,7 @@ def render_independent_paths(
     fig.legend(
         handles=legend_handles,
         loc="upper right",
-        bbox_to_anchor=(0.965, 0.864),
+        bbox_to_anchor=(0.965, 0.827),
         frameon=False,
         ncol=3,
         columnspacing=1.35,
@@ -723,7 +743,7 @@ def render(
         1,
         2,
         sharey=True,
-        gridspec_kw={"left": 0.245, "right": 0.965, "bottom": 0.205, "top": 0.765, "wspace": 0.19},
+        gridspec_kw={"left": 0.245, "right": 0.965, "bottom": 0.205, "top": 0.715, "wspace": 0.19},
     )
     throughput_ax, latency_ax = axes
     fig.text(
@@ -739,7 +759,16 @@ def render(
     fig.text(
         0.035,
         0.910,
-        "Separate product runs · same physical link: 500 down / 100 up Mbps",
+        "Separate product runs · shared bottleneck: 500 down / 100 up Mbps",
+        ha="left",
+        va="top",
+        fontsize=12.3,
+        color="#435563",
+    )
+    fig.text(
+        0.035,
+        0.878,
+        "40 s whole-run averages include startup · jitter clears by ~8–9 s",
         ha="left",
         va="top",
         fontsize=12.3,
@@ -812,7 +841,7 @@ def render(
     fig.legend(
         handles=[capacity_handle],
         loc="upper right",
-        bbox_to_anchor=(0.965, 0.867),
+        bbox_to_anchor=(0.965, 0.842),
         frameon=False,
         handlelength=2.5,
         handletextpad=0.7,
@@ -895,13 +924,13 @@ def render_shared_timeline() -> None:
         max_latency = max(max_latency, *(_number(a["latency_ms"], "echo latency") for a in attempts))
 
     matplotlib.rcParams["svg.hashsalt"] = "mptunnel-shared-link-timeline-v1"
-    title = "Speed and response time through a download"
+    title = "Download goodput and echo latency"
     fig, axes = plt.subplots(2, 1, figsize=(10.4, 8.7), sharex=True,
                              gridspec_kw={"height_ratios": [1.1, 1]}, facecolor="white")
     fig.subplots_adjust(left=0.115, right=0.97, top=0.76, bottom=0.12, hspace=0.38)
     fig.text(0.04, 0.96, title, fontsize=19, fontweight="semibold", color="#192B3A")
     fig.text(0.04, 0.921,
-             "Separate product runs · same physical link: 500 down / 100 up Mbps · jitter clears after startup",
+             "Separate product runs · shared 500/100 Mbps bottleneck · 40 s includes startup · jitter clears by ~8–9 s",
              fontsize=11.5, color="#435563")
     handles = [Line2D([0], [0], color=colors[s], lw=2, marker=markers[s],
                       markersize=4, label=SYSTEM_CHART_LABELS[s]) for s in order]
@@ -950,7 +979,8 @@ def render_shared_timeline() -> None:
         "100 Mbps up link limit; the products did not compete simultaneously. Within each run, "
         "the product download and echo probes shared the link. The first panel shows all forty one-second download "
         "delivery bins; the second shows every echo latency at its request start time. "
-        "The shaded band spans the recorded jitter-clear commands across the five runs. "
+        "These full-run traces include startup; jitter clears around 8–9 seconds. The shaded band spans "
+        "the recorded jitter-clear commands across the five runs. "
         "The dashed horizontal line is configured capacity, 500 Mbps. "
         "All echo requests succeeded. Each system has its own capture, starting at time zero."
     )

@@ -3986,7 +3986,7 @@ async fn udp_datagram_path_relays_direct_udp_target() {
 
 #[tokio::test]
 async fn udp_datagram_path_relays_upstream_socks5_udp_target() {
-    let (proxy, proxy_task) = spawn_socks5_udp_proxy_once().await;
+    let (proxy, release_control, proxy_task) = spawn_socks5_udp_proxy_once().await;
     let (path, server) = spawn_udp_server_path(OutboundConfig::Socks5(
         crate::outbound::ProxyConfig::new(proxy, None),
     ))
@@ -4008,6 +4008,9 @@ async fn udp_datagram_path_relays_upstream_socks5_udp_target() {
     .expect("round trip");
 
     assert_eq!(response, Bytes::from_static(b"pong"));
+    release_control
+        .send(())
+        .expect("release proxy control after completed round trip");
     server.abort();
     let _ = server.await;
     proxy_task.await.expect("proxy join");

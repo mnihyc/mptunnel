@@ -421,7 +421,11 @@ async fn spawn_udp_reordered_echo_target() -> (
     (addr, slow_received, release_slow, handle)
 }
 
-async fn spawn_socks5_udp_proxy_once() -> (Endpoint, tokio::task::JoinHandle<()>) {
+async fn spawn_socks5_udp_proxy_once() -> (
+    Endpoint,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
     let proxy: Endpoint = listener
         .local_addr()
@@ -429,6 +433,7 @@ async fn spawn_socks5_udp_proxy_once() -> (Endpoint, tokio::task::JoinHandle<()>
         .to_string()
         .parse()
         .expect("proxy endpoint");
+    let (release_control, control_released) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("proxy accept");
         let mut greeting = [0u8; 3];
@@ -478,8 +483,10 @@ async fn spawn_socks5_udp_proxy_once() -> (Endpoint, tokio::task::JoinHandle<()>
             .send_to(&response, peer)
             .await
             .expect("udp relay send");
+        // SOCKS5 control EOF invalidates the association; keep it live through the client round trip.
+        let _ = control_released.await;
     });
-    (proxy, handle)
+    (proxy, release_control, handle)
 }
 
 async fn spawn_server_path(

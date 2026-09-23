@@ -2,15 +2,15 @@
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
 <svg xmlns:xlink="http://www.w3.org/1999/xlink" width="590.4pt" height="590.4pt" viewBox="0 0 590.4 590.4" xmlns="http://www.w3.org/2000/svg" version="1.1" role="img" aria-labelledby="figure-title figure-description">
-<title id="figure-title">One download, two paths</title>
-<desc id="figure-description">The upper time series shows all forty raw one-second bins of aggregate application download throughput, including startup. The dashed horizontal line is the configured 200 Mbps capacity of one link; it is a setting reference, not a separately measured TCP throughput series. The blue transfer combines the QUIC and TCP paths, and the TCP path remains configured at 200 Mbps while the QUIC link is shaped. The shaded QUIC command window spans 15.44–25.66 seconds. The shaded UDP block runs between recorded transition points at 31.05 and 33.63 seconds. The lower panel plots all eighty successful concurrent echo replies; their measured p95 is 326.5 ms. Whole-transfer aggregate download average: 267.7 Mbps. Measured build: MPTUNNEL 0.6.0, source 1e8abedf.</desc>
- <title>One download, two paths</title>
+<title id="figure-title">One download across two links</title>
+<desc id="figure-description">The upper time series shows all forty raw one-second bins of aggregate application download throughput, including startup. It combines 3 TCP carriers on one 200 Mbps link with 1 QUIC carrier on another 200 Mbps link. The dashed horizontal line is the configured 200 Mbps capacity of one link; it is a setting reference, not a separately measured TCP throughput series. The TCP link remains configured at 200 Mbps while the QUIC link is shaped. The shaded QUIC command window spans 15.44–25.66 seconds. The shaded UDP block runs between recorded transition points at 31.05 and 33.63 seconds. The lower panel plots all eighty successful concurrent echo replies; their measured p95 is 326.5 ms. Whole-transfer aggregate download average: 267.7 Mbps. Measured build: MPTUNNEL 0.6.0, source 1e8abedf.</desc>
+ <title>One download across two links</title>
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:title>One download, two paths</dc:title>
-    <dc:description>The upper time series shows all forty raw one-second bins of aggregate application download throughput, including startup. The dashed horizontal line is the configured 200 Mbps capacity of one link; it is a setting reference, not a separately measured TCP throughput series. The blue transfer combines the QUIC and TCP paths, and the TCP path remains configured at 200 Mbps while the QUIC link is shaped. The shaded QUIC command window spans 15.44–25.66 seconds. The shaded UDP block runs between recorded transition points at 31.05 and 33.63 seconds. The lower panel plots all eighty successful concurrent echo replies; their measured p95 is 326.5 ms. Whole-transfer aggregate download average: 267.7 Mbps. Measured build: MPTUNNEL 0.6.0, source 1e8abedf.</dc:description>
+    <dc:title>One download across two links</dc:title>
+    <dc:description>The upper time series shows all forty raw one-second bins of aggregate application download throughput, including startup. It combines 3 TCP carriers on one 200 Mbps link with 1 QUIC carrier on another 200 Mbps link. The dashed horizontal line is the configured 200 Mbps capacity of one link; it is a setting reference, not a separately measured TCP throughput series. The TCP link remains configured at 200 Mbps while the QUIC link is shaped. The shaded QUIC command window spans 15.44–25.66 seconds. The shaded UDP block runs between recorded transition points at 31.05 and 33.63 seconds. The lower panel plots all eighty successful concurrent echo replies; their measured p95 is 326.5 ms. Whole-transfer aggregate download average: 267.7 Mbps. Measured build: MPTUNNEL 0.6.0, source 1e8abedf.</dc:description>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -601,10 +601,10 @@ z
    </g>
   </g>
   <g id="text_25">
-   <text style="font-weight: 600; font-size: 19px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #192b3a" x="20.664" y="36.872231" transform="rotate(-0 20.664 36.872231)">One download, two paths</text>
+   <text style="font-weight: 600; font-size: 19px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #192b3a" x="20.664" y="36.872231" transform="rotate(-0 20.664 36.872231)">One download across two links</text>
   </g>
   <g id="text_26">
-   <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="20.664" y="62.254125" transform="rotate(-0 20.664 62.254125)">Two independent 200 Mbps links · TCP stays available</text>
+   <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="20.664" y="62.254125" transform="rotate(-0 20.664 62.254125)">3 TCP carriers: one 200 Mbps link · 1 QUIC carrier: the other 200 Mbps link</text>
   </g>
   <g id="text_27">
    <text style="font-size: 11.2px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #52616d" x="20.664" y="567.61905" transform="rotate(-0 20.664 567.61905)">Linux · MPTUNNEL 0.6.0-dev (1e8abedf) · 40 s download</text>

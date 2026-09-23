@@ -41,6 +41,13 @@ SYSTEM_LABELS = {
     "xray": "Xray VMess/TCP",
     "raw": "Direct TCP",
 }
+SYSTEM_CHART_LABELS = {
+    "mixed": "MPTUNNEL TCP+QUIC\n4 carriers: 3 TCP + 1 QUIC",
+    "h2": "Hysteria2",
+    "quic": "MPTUNNEL QUIC\n1 QUIC carrier",
+    "xray": "Xray VMess/TCP",
+    "raw": "Direct TCP",
+}
 SYSTEM_COLORS = {
     "mixed": "#176B9A",
     "h2": "#D58B24",
@@ -177,8 +184,12 @@ def _accessible_description(rows: list[dict[str, Any]]) -> str:
     return (
         "Two aligned horizontal bar charts compare download throughput, where higher is better, "
         "and loaded reply 95th-percentile latency, where lower is better. They show five "
-        "single observations while a bulk download and small requests share a 500 Mbps down, "
-        "100 Mbps up link. The dashed line marks the configured 500 Mbps download capacity. "
+        "single observations, each from a separate 40-second product run against the same "
+        "physical 500 Mbps down, 100 Mbps up link limit; the products did not compete "
+        "simultaneously. Within each run, that product's bulk download and small requests "
+        "share the link. MPTUNNEL TCP+QUIC used 3 TCP carriers plus 1 QUIC carrier; "
+        "MPTUNNEL QUIC used 1 QUIC carrier. The dashed line marks the configured 500 Mbps "
+        "download capacity. "
         + measurements
         + "."
     )
@@ -206,7 +217,7 @@ def _add_accessible_svg_header(path: Path, title: str, description: str) -> None
 def render_narrow_tradeoffs(rows: list[dict[str, Any]], svg_path: Path) -> None:
     """Render a stacked SVG variant that stays legible in narrow page columns."""
     ordered = sorted(rows, key=lambda row: row["goodput_mbps"], reverse=True)
-    labels = [SYSTEM_LABELS[row["system"]] for row in ordered]
+    labels = [SYSTEM_CHART_LABELS[row["system"]] for row in ordered]
     colors = [SYSTEM_COLORS[row["system"]] for row in ordered]
     y = list(range(len(ordered)))
     throughput = [row["goodput_mbps"] for row in ordered]
@@ -233,7 +244,7 @@ def render_narrow_tradeoffs(rows: list[dict[str, Any]], svg_path: Path) -> None:
     fig.text(
         0.055,
         0.911,
-        "500 Mbps down / 100 Mbps up · downloading with small requests alongside",
+        "Separate product runs · same physical link: 500 down / 100 up Mbps",
         ha="left",
         va="top",
         fontsize=11.7,
@@ -490,12 +501,13 @@ def render_independent_paths(
     average = observation["average"]
 
     matplotlib.rcParams["svg.hashsalt"] = "mptunnel-independent-paths-v1"
-    title = "One download, two paths"
+    title = "One download across two links"
     description = (
         "The upper time series shows all forty raw one-second bins of aggregate application download throughput, "
-        "including startup. The dashed horizontal line is the configured 200 Mbps capacity of one link; it is "
-        "a setting reference, not a separately measured TCP throughput series. The blue transfer combines the "
-        "QUIC and TCP paths, and the TCP path remains configured at 200 Mbps while the QUIC link is shaped. "
+        "including startup. It combines 3 TCP carriers on one 200 Mbps link with 1 QUIC carrier on another "
+        "200 Mbps link. The dashed horizontal line is the configured 200 Mbps capacity of one link; it is a "
+        "setting reference, not a separately measured TCP throughput series. The TCP link remains configured "
+        "at 200 Mbps while the QUIC link is shaped. "
         f"The shaded QUIC command window spans {qos_start:.2f}–{qos_end:.2f} seconds. The shaded UDP block "
         f"runs between recorded transition points at {outage_start:.2f} and {outage_end:.2f} seconds. The lower "
         f"panel plots all eighty successful concurrent echo replies; their measured p95 is {echo_p95:.1f} ms. "
@@ -521,7 +533,7 @@ def render_independent_paths(
     fig.text(
         0.035,
         0.910,
-        "Two independent 200 Mbps links · TCP stays available",
+        "3 TCP carriers: one 200 Mbps link · 1 QUIC carrier: the other 200 Mbps link",
         ha="left",
         va="top",
         fontsize=12.0,
@@ -691,7 +703,7 @@ def render(
     conditions, input_rows = validate_observations(document)
     comparison = document["competitive"]
     rows = sorted(input_rows, key=lambda row: row["goodput_mbps"], reverse=True)
-    labels = [SYSTEM_LABELS[row["system"]] for row in rows]
+    labels = [SYSTEM_CHART_LABELS[row["system"]] for row in rows]
     colors = [SYSTEM_COLORS[row["system"]] for row in rows]
     y = list(range(len(rows)))
     throughput = [row["goodput_mbps"] for row in rows]
@@ -727,7 +739,7 @@ def render(
     fig.text(
         0.035,
         0.910,
-        "500 Mbps down / 100 Mbps up  ·  downloading while small requests run",
+        "Separate product runs · same physical link: 500 down / 100 up Mbps",
         ha="left",
         va="top",
         fontsize=12.3,
@@ -888,10 +900,11 @@ def render_shared_timeline() -> None:
                              gridspec_kw={"height_ratios": [1.1, 1]}, facecolor="white")
     fig.subplots_adjust(left=0.115, right=0.97, top=0.76, bottom=0.12, hspace=0.38)
     fig.text(0.04, 0.96, title, fontsize=19, fontweight="semibold", color="#192B3A")
-    fig.text(0.04, 0.921, "500 Mbps down / 100 Mbps up · jitter clears after startup",
+    fig.text(0.04, 0.921,
+             "Separate product runs · same physical link: 500 down / 100 up Mbps · jitter clears after startup",
              fontsize=11.5, color="#435563")
     handles = [Line2D([0], [0], color=colors[s], lw=2, marker=markers[s],
-                      markersize=4, label=SYSTEM_LABELS[s]) for s in order]
+                      markersize=4, label=SYSTEM_CHART_LABELS[s]) for s in order]
     fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.04, 0.898),
                ncol=3, frameon=False, fontsize=10.5, handlelength=1.5, columnspacing=1.6)
     clear_start = min(row["jitter_clear"]["union_s"][0] for row in series.values())
@@ -931,8 +944,11 @@ def render_shared_timeline() -> None:
     fig.text(0.04, 0.035, "Linux · one 40 s run per system · MPTUNNEL 0.6.0-dev (1e8abedf)",
              fontsize=10.5, color="#52616D")
     description = (
-        "Two time-series panels compare MPTUNNEL TCP+QUIC, MPTUNNEL QUIC, Hysteria2, "
-        "Xray VMess/TCP and direct TCP. The first shows all forty one-second download "
+        "Two time-series panels compare MPTUNNEL TCP+QUIC with 3 TCP carriers and 1 QUIC "
+        "carrier, MPTUNNEL QUIC with 1 QUIC carrier, Hysteria2, Xray VMess/TCP and direct TCP. "
+        "Each product has its own 40-second run against the same physical 500 Mbps down, "
+        "100 Mbps up link limit; the products did not compete simultaneously. Within each run, "
+        "the product download and echo probes shared the link. The first panel shows all forty one-second download "
         "delivery bins; the second shows every echo latency at its request start time. "
         "The shaded band spans the recorded jitter-clear commands across the five runs. "
         "The dashed horizontal line is configured capacity, 500 Mbps. "

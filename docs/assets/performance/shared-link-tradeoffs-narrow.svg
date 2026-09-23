@@ -3,14 +3,14 @@
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
 <svg xmlns:xlink="http://www.w3.org/1999/xlink" width="489.6pt" height="604.8pt" viewBox="0 0 489.6 604.8" xmlns="http://www.w3.org/2000/svg" version="1.1" role="img" aria-labelledby="figure-title figure-description">
 <title id="figure-title">Download speed and responsiveness</title>
-<desc id="figure-description">Two aligned horizontal bar charts compare download throughput, where higher is better, and loaded reply 95th-percentile latency, where lower is better. They show five single observations while a bulk download and small requests share a 500 Mbps down, 100 Mbps up link. The dashed line marks the configured 500 Mbps download capacity. MPTUNNEL TCP+QUIC: 406.3 Mbps download throughput and 797.1 ms loaded reply p95; Hysteria2: 366.6 Mbps download throughput and 426.7 ms loaded reply p95; MPTUNNEL QUIC: 343.4 Mbps download throughput and 153.6 ms loaded reply p95; Direct TCP: 294.8 Mbps download throughput and 121.9 ms loaded reply p95; Xray VMess/TCP: 286.3 Mbps download throughput and 122.1 ms loaded reply p95. This narrow version stacks the two panels vertically.</desc>
+<desc id="figure-description">Two aligned horizontal bar charts compare download throughput, where higher is better, and loaded reply 95th-percentile latency, where lower is better. They show five single observations, each from a separate 40-second product run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, that product's bulk download and small requests share the link. MPTUNNEL TCP+QUIC used 3 TCP carriers plus 1 QUIC carrier; MPTUNNEL QUIC used 1 QUIC carrier. The dashed line marks the configured 500 Mbps download capacity. MPTUNNEL TCP+QUIC: 406.3 Mbps download throughput and 797.1 ms loaded reply p95; Hysteria2: 366.6 Mbps download throughput and 426.7 ms loaded reply p95; MPTUNNEL QUIC: 343.4 Mbps download throughput and 153.6 ms loaded reply p95; Direct TCP: 294.8 Mbps download throughput and 121.9 ms loaded reply p95; Xray VMess/TCP: 286.3 Mbps download throughput and 122.1 ms loaded reply p95. This narrow version stacks the two panels vertically.</desc>
  <title>Download speed and responsiveness</title>
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
     <dc:title>Download speed and responsiveness</dc:title>
-    <dc:description>Two aligned horizontal bar charts compare download throughput, where higher is better, and loaded reply 95th-percentile latency, where lower is better. They show five single observations while a bulk download and small requests share a 500 Mbps down, 100 Mbps up link. The dashed line marks the configured 500 Mbps download capacity. MPTUNNEL TCP+QUIC: 406.3 Mbps download throughput and 797.1 ms loaded reply p95; Hysteria2: 366.6 Mbps download throughput and 426.7 ms loaded reply p95; MPTUNNEL QUIC: 343.4 Mbps download throughput and 153.6 ms loaded reply p95; Direct TCP: 294.8 Mbps download throughput and 121.9 ms loaded reply p95; Xray VMess/TCP: 286.3 Mbps download throughput and 122.1 ms loaded reply p95. This narrow version stacks the two panels vertically.</dc:description>
+    <dc:description>Two aligned horizontal bar charts compare download throughput, where higher is better, and loaded reply 95th-percentile latency, where lower is better. They show five single observations, each from a separate 40-second product run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, that product's bulk download and small requests share the link. MPTUNNEL TCP+QUIC used 3 TCP carriers plus 1 QUIC carrier; MPTUNNEL QUIC used 1 QUIC carrier. The dashed line marks the configured 500 Mbps download capacity. MPTUNNEL TCP+QUIC: 406.3 Mbps download throughput and 797.1 ms loaded reply p95; Hysteria2: 366.6 Mbps download throughput and 426.7 ms loaded reply p95; MPTUNNEL QUIC: 343.4 Mbps download throughput and 153.6 ms loaded reply p95; Direct TCP: 294.8 Mbps download throughput and 121.9 ms loaded reply p95; Xray VMess/TCP: 286.3 Mbps download throughput and 122.1 ms loaded reply p95. This narrow version stacks the two panels vertically.</dc:description>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -113,7 +113,8 @@ L 441.776571 160.272
     <g id="ytick_1">
      <g id="line2d_13"/>
      <g id="text_7">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="180.974048" transform="rotate(-0 176.048 180.974048)">MPTUNNEL TCP+QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(38.358547 174.925219)">MPTUNNEL TCP+QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(11.690578 188.922485)">4 carriers: 3 TCP + 1 QUIC</text>
      </g>
     </g>
     <g id="ytick_2">
@@ -125,7 +126,8 @@ L 441.776571 160.272
     <g id="ytick_3">
      <g id="line2d_15"/>
      <g id="text_9">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="242.450056" transform="rotate(-0 176.048 242.450056)">MPTUNNEL QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(71.999172 236.401228)">MPTUNNEL QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(87.850734 250.398493)">1 QUIC carrier</text>
      </g>
     </g>
     <g id="ytick_4">
@@ -286,7 +288,8 @@ L 429.806298 389.461935
     <g id="ytick_6">
      <g id="line2d_30"/>
      <g id="text_23">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="410.163983" transform="rotate(-0 176.048 410.163983)">MPTUNNEL TCP+QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(38.358547 404.115155)">MPTUNNEL TCP+QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(11.690578 418.112421)">4 carriers: 3 TCP + 1 QUIC</text>
      </g>
     </g>
     <g id="ytick_7">
@@ -298,7 +301,8 @@ L 429.806298 389.461935
     <g id="ytick_8">
      <g id="line2d_32"/>
      <g id="text_25">
-      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #263746" x="176.048" y="471.639991" transform="rotate(-0 176.048 471.639991)">MPTUNNEL QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(71.999172 465.591163)">MPTUNNEL QUIC</text>
+      <text style="font-size: 12.5px; font-family: 'DejaVu Sans'; fill: #263746" transform="translate(87.850734 479.588429)">1 QUIC carrier</text>
      </g>
     </g>
     <g id="ytick_9">
@@ -388,7 +392,7 @@ z
    <text style="font-weight: 600; font-size: 19.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #192b3a" x="26.928" y="34.170553" transform="rotate(-0 26.928 34.170553)">Download speed and responsiveness</text>
   </g>
   <g id="text_35">
-   <text style="font-size: 11.7px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="26.928" y="62.717372" transform="rotate(-0 26.928 62.717372)">500 Mbps down / 100 Mbps up · downloading with small requests alongside</text>
+   <text style="font-size: 11.7px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="26.928" y="62.717372" transform="rotate(-0 26.928 62.717372)">Separate product runs · same physical link: 500 down / 100 up Mbps</text>
   </g>
   <g id="legend_1">
    <g id="line2d_36">

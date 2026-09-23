@@ -1,24 +1,34 @@
 # Performance
 
-MPTUNNEL lets one connection use several paths. The useful questions are how
-much capacity those paths add, what happens when one slows down, and how the
-tunnel behaves while your other applications are using it.
+MPTUNNEL combines the service available from several TCP and/or QUIC
+**carriers**—the transport connections between its peers. A single application
+transfer can use several carriers, while other applications share the same MPP
+session. Carrier sets are configurable: TCP-only, QUIC-only or mixed, with a few
+connections or tens.
 
-These experiments show those behaviors: a transfer over independent links,
-a comparison on a shared connection, and longer transfers with changing
-network conditions.
+The network underneath those carriers determines the available capacity. Carriers
+on one Internet link share its bandwidth ceiling; parallel connections can still
+help use that bandwidth when individual connections are limited. Carriers routed
+over independent links can draw on each link's capacity. Both are aggregation;
+they give the tunnel different resources to work with.
+
+These experiments show what that means for a transfer: using two links,
+continuing through a slowdown, and serving small requests during a large download.
+They also compare throughput, latency and CPU cost with Hysteria2, Xray and direct
+TCP. Each figure names the carrier set and network conditions used.
 
 ## One connection, two links
 
-A single download crosses two independent **200 Mbps** links: one carries TCP,
-the other QUIC. We slow the QUIC link to **10 Mbps**, restore it, then introduce
-a brief UDP outage. The TCP link stays available throughout.
+A single download uses **3 TCP carriers on one 200 Mbps link** and **1 QUIC
+carrier on a separate 200 Mbps link**. The two links have independent bandwidth
+limits. We slow the QUIC link to **10 Mbps**, restore it, then introduce a brief
+UDP outage. The TCP link stays available throughout.
 
 [![A download using two independent links, with QUIC restriction and outage marked on the timeline](assets/performance/independent-paths.svg)](assets/performance/independent-paths.svg)
 
 With both links available, the download exceeds either link's individual
 capacity. When QUIC slows down or goes offline, the same download continues
-over the remaining carrier. After recovery, it uses the added capacity again.
+over the TCP carriers. After recovery, it uses the added capacity again.
 The second panel shows the response time of small requests alongside the
 transfer.
 
@@ -39,16 +49,19 @@ more than its 2.5-second budget. All 25 requests before and after each transfer
 completed on time. [Both directions and the earlier-version comparisons](PERFORMANCE_DETAILS.md#independent-link-download-during-a-qos-change-and-udp-outage)
 are included in the complete results.
 
-This is where multipath is useful: a long transfer can draw on separate
-bottlenecks and retain another way forward when one transport is restricted.
-TCP and QUIC sharing one physical bottleneck still share its total capacity.
+Here aggregation lets one application use more capacity than either link supplies
+alone, while retaining another way forward when one transport is restricted.
 
 ## Speed and responsiveness
 
-Here every system uses the same **500 Mbps download / 100 Mbps upload**
-connection. A download runs for 40 seconds while small echo requests measure
-responsiveness. The link starts with jitter, which clears about eight to nine seconds
-into each run.
+Here all carriers in a run pass through one **500 Mbps download / 100 Mbps
+upload** bandwidth limit: a shared bottleneck. Each system is tested separately
+on that network. MPTUNNEL uses **3 TCP + 1 QUIC carriers** in the mixed case and
+**1 QUIC carrier** in the QUIC-only case. These are two example configurations;
+you can choose other carrier counts and combinations.
+
+A download runs for 40 seconds while small echo requests measure responsiveness.
+The link starts with jitter, which clears about eight to nine seconds into each run.
 
 <a href="assets/performance/shared-link-tradeoffs.svg">
 <picture>
@@ -57,15 +70,16 @@ into each run.
 </picture>
 </a>
 
-MPTUNNEL's TCP+QUIC mode delivered the most data over this interval, at
-**406 Mbps**. QUIC alone delivered **343 Mbps** with a **154 ms** response p95,
-compared with **797 ms** for TCP+QUIC. Hysteria2 delivered **367 Mbps** with
-**427 ms** p95. Xray and direct TCP had the lowest response p95, both **122 ms**.
+MPTUNNEL's 3 TCP + 1 QUIC set delivered the most data over this interval, at
+**406 Mbps**. The single QUIC carrier delivered **343 Mbps** with a **154 ms**
+response p95, compared with **797 ms** for the mixed set. Hysteria2 delivered
+**367 Mbps** with **427 ms** p95. Xray and direct TCP had the lowest response p95,
+both **122 ms**.
 
 For bulk transfers, throughput matters; for browsing or interactive work
-alongside a download, response time matters too. These results make that choice
-visible. Mixing transports offers additional delivery options and also adds
-scheduling and recovery work.
+alongside a download, response time matters too. Here the mixed set delivered
+more bulk data while small requests took longer. The timing curves below show
+both effects as conditions change.
 
 <details>
 <summary>Follow each download and response over time</summary>
@@ -88,8 +102,8 @@ The shared-link experiment above measured the following process CPU costs:
 
 | System | Client CPU seconds / GiB | Server CPU seconds / GiB |
 | --- | ---: | ---: |
-| MPTUNNEL QUIC | 17.6 | 25.1 |
-| MPTUNNEL TCP+QUIC | 13.0 | 22.6 |
+| MPTUNNEL 1 QUIC | 17.6 | 25.1 |
+| MPTUNNEL 3 TCP + 1 QUIC | 13.0 | 22.6 |
 | Hysteria2 | 22.1 | 20.5 |
 | Xray VMess/TCP | 2.5 | 1.2 |
 
@@ -106,15 +120,16 @@ process residency for the earlier test set.
 
 ## Browsing alongside transfers, and longer runs
 
-On a healthy shared 500 Mbps link, ordinary TCP+QUIC transfers delivered
-**407 Mbps down** and **444 Mbps up**. All 55 loaded HTTP requests completed in
+On a healthy 500 Mbps link shared by its carriers, MPTUNNEL's 3 TCP + 1 QUIC set
+delivered **407 Mbps down** and **444 Mbps up**. All 55 loaded HTTP requests completed in
 each direction; seven download-side and one upload-side request exceeded the
 2.5-second response budget. These requests each fetched a 100 kB body on a fixed
 schedule, so a slow response did not reduce the number of requests offered.
 
-Five-minute TCP+QUIC transfers used separate 500 Mbps QUIC and 200 Mbps TCP
-links, with changing loss and jitter on QUIC. Download averaged **226 Mbps**;
-upload averaged **387 Mbps**. Combined endpoint traffic was **1.776 bytes per
+Five-minute transfers used one QUIC carrier on a 500 Mbps link and three TCP
+carriers on a separate 200 Mbps link, with changing loss and jitter on QUIC.
+Download averaged **226 Mbps**; upload averaged **387 Mbps**.
+Combined endpoint traffic was **1.776 bytes per
 downloaded byte** and **1.258 bytes per uploaded byte**, including acknowledgements,
 control messages and recovery traffic.
 

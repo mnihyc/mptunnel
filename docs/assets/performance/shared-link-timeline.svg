@@ -3,14 +3,14 @@
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
 <svg xmlns:xlink="http://www.w3.org/1999/xlink" width="748.8pt" height="626.4pt" viewBox="0 0 748.8 626.4" xmlns="http://www.w3.org/2000/svg" version="1.1" role="img" aria-labelledby="figure-title figure-description">
 <title id="figure-title">Speed and response time through a download</title>
-<desc id="figure-description">Two time-series panels compare MPTUNNEL TCP+QUIC, MPTUNNEL QUIC, Hysteria2, Xray VMess/TCP and direct TCP. The first shows all forty one-second download delivery bins; the second shows every echo latency at its request start time. The shaded band spans the recorded jitter-clear commands across the five runs. The dashed horizontal line is configured capacity, 500 Mbps. All echo requests succeeded. Each system has its own capture, starting at time zero.</desc>
+<desc id="figure-description">Two time-series panels compare MPTUNNEL TCP+QUIC with 3 TCP carriers and 1 QUIC carrier, MPTUNNEL QUIC with 1 QUIC carrier, Hysteria2, Xray VMess/TCP and direct TCP. Each product has its own 40-second run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, the product download and echo probes shared the link. The first panel shows all forty one-second download delivery bins; the second shows every echo latency at its request start time. The shaded band spans the recorded jitter-clear commands across the five runs. The dashed horizontal line is configured capacity, 500 Mbps. All echo requests succeeded. Each system has its own capture, starting at time zero.</desc>
  <title>Speed and response time through a download</title>
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
     <dc:title>Speed and response time through a download</dc:title>
-    <dc:description>Two time-series panels compare MPTUNNEL TCP+QUIC, MPTUNNEL QUIC, Hysteria2, Xray VMess/TCP and direct TCP. The first shows all forty one-second download delivery bins; the second shows every echo latency at its request start time. The shaded band spans the recorded jitter-clear commands across the five runs. The dashed horizontal line is configured capacity, 500 Mbps. All echo requests succeeded. Each system has its own capture, starting at time zero.</dc:description>
+    <dc:description>Two time-series panels compare MPTUNNEL TCP+QUIC with 3 TCP carriers and 1 QUIC carrier, MPTUNNEL QUIC with 1 QUIC carrier, Hysteria2, Xray VMess/TCP and direct TCP. Each product has its own 40-second run against the same physical 500 Mbps down, 100 Mbps up link limit; the products did not compete simultaneously. Within each run, the product download and echo probes shared the link. The first panel shows all forty one-second download delivery bins; the second shows every echo latency at its request start time. The shaded band spans the recorded jitter-clear commands across the five runs. The dashed horizontal line is configured capacity, 500 Mbps. All echo requests succeeded. Each system has its own capture, starting at time zero.</dc:description>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -1387,16 +1387,16 @@ L 726.336 551.232
    <text style="font-weight: 600; font-size: 19px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #192b3a" x="29.952" y="25.056" transform="rotate(-0 29.952 25.056)">Speed and response time through a download</text>
   </g>
   <g id="text_32">
-   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="29.952" y="49.4856" transform="rotate(-0 29.952 49.4856)">500 Mbps down / 100 Mbps up · jitter clears after startup</text>
+   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #435563" x="29.952" y="49.4856" transform="rotate(-0 29.952 49.4856)">Separate product runs · same physical link: 500 down / 100 up Mbps · jitter clears after startup</text>
   </g>
   <g id="text_33">
    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #52616d" x="29.952" y="604.476" transform="rotate(-0 29.952 604.476)">Linux · one 40 s run per system · MPTUNNEL 0.6.0-dev (1e8abedf)</text>
   </g>
   <g id="legend_1">
    <g id="line2d_48">
-    <path d="M 39.402 77.646159
-L 47.277 77.646159
-L 55.152 77.646159
+    <path d="M 39.402 84.616847
+L 47.277 84.616847
+L 55.152 84.616847
 " style="fill: none; stroke: #176b9a; stroke-width: 2; stroke-linecap: square"/>
     <defs>
      <path id="m3de0525f70" d="M 0 -2
@@ -1406,16 +1406,17 @@ z
 " style="stroke: #176b9a; stroke-linejoin: miter"/>
     </defs>
     <g>
-     <use xlink:href="#m3de0525f70" x="47.277" y="77.646159" style="fill: #176b9a; stroke: #176b9a; stroke-linejoin: miter"/>
+     <use xlink:href="#m3de0525f70" x="47.277" y="84.616847" style="fill: #176b9a; stroke: #176b9a; stroke-linejoin: miter"/>
     </g>
    </g>
    <g id="text_34">
-    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start" x="63.552" y="81.321159" transform="rotate(-0 63.552 81.321159)">MPTUNNEL TCP+QUIC</text>
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'" transform="translate(63.552 81.321159)">MPTUNNEL TCP+QUIC</text>
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'" transform="translate(63.552 93.078863)">4 carriers: 3 TCP + 1 QUIC</text>
    </g>
    <g id="line2d_49">
-    <path d="M 39.402 93.058191
-L 47.277 93.058191
-L 55.152 93.058191
+    <path d="M 39.402 111.786581
+L 47.277 111.786581
+L 55.152 111.786581
 " style="fill: none; stroke: #238c83; stroke-width: 2; stroke-linecap: square"/>
     <defs>
      <path id="m95a9b4f14e" d="M 0 2
@@ -1431,16 +1432,17 @@ z
 " style="stroke: #238c83"/>
     </defs>
     <g>
-     <use xlink:href="#m95a9b4f14e" x="47.277" y="93.058191" style="fill: #238c83; stroke: #238c83"/>
+     <use xlink:href="#m95a9b4f14e" x="47.277" y="111.786581" style="fill: #238c83; stroke: #238c83"/>
     </g>
    </g>
    <g id="text_35">
-    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start" x="63.552" y="96.733191" transform="rotate(-0 63.552 96.733191)">MPTUNNEL QUIC</text>
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'" transform="translate(63.552 108.490894)">MPTUNNEL QUIC</text>
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'" transform="translate(63.552 120.248597)">1 QUIC carrier</text>
    </g>
    <g id="line2d_50">
-    <path d="M 196.011141 77.646159
-L 203.886141 77.646159
-L 211.761141 77.646159
+    <path d="M 218.412234 84.616847
+L 226.287234 84.616847
+L 234.162234 84.616847
 " style="fill: none; stroke: #d58b24; stroke-width: 2; stroke-linecap: square"/>
     <defs>
      <path id="m9e318ccb20" d="M -0 2.828427
@@ -1451,16 +1453,16 @@ z
 " style="stroke: #d58b24; stroke-linejoin: miter"/>
     </defs>
     <g>
-     <use xlink:href="#m9e318ccb20" x="203.886141" y="77.646159" style="fill: #d58b24; stroke: #d58b24; stroke-linejoin: miter"/>
+     <use xlink:href="#m9e318ccb20" x="226.287234" y="84.616847" style="fill: #d58b24; stroke: #d58b24; stroke-linejoin: miter"/>
     </g>
    </g>
    <g id="text_36">
-    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start" x="220.161141" y="81.321159" transform="rotate(-0 220.161141 81.321159)">Hysteria2</text>
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start" x="242.562234" y="88.291847" transform="rotate(-0 242.562234 88.291847)">Hysteria2</text>
    </g>
    <g id="line2d_51">
-    <path d="M 196.011141 93.058191
-L 203.886141 93.058191
-L 211.761141 93.058191
+    <path d="M 218.412234 100.028878
+L 226.287234 100.028878
+L 234.162234 100.028878
 " style="fill: none; stroke: #795a9b; stroke-width: 2; stroke-linecap: square"/>
     <defs>
      <path id="m583a8acd18" d="M -2 2
@@ -1470,16 +1472,16 @@ L 2 2
 " style="stroke: #795a9b"/>
     </defs>
     <g>
-     <use xlink:href="#m583a8acd18" x="203.886141" y="93.058191" style="fill: #795a9b; stroke: #795a9b"/>
+     <use xlink:href="#m583a8acd18" x="226.287234" y="100.028878" style="fill: #795a9b; stroke: #795a9b"/>
     </g>
    </g>
    <g id="text_37">
-    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start" x="220.161141" y="96.733191" transform="rotate(-0 220.161141 96.733191)">Xray VMess/TCP</text>
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start" x="242.562234" y="103.703878" transform="rotate(-0 242.562234 103.703878)">Xray VMess/TCP</text>
    </g>
    <g id="line2d_52">
-    <path d="M 321.095672 77.646159
-L 328.970672 77.646159
-L 336.845672 77.646159
+    <path d="M 343.496766 84.616847
+L 351.371766 84.616847
+L 359.246766 84.616847
 " style="fill: none; stroke: #77838e; stroke-width: 2; stroke-linecap: square"/>
     <defs>
      <path id="mb6e86e18ce" d="M -2 0
@@ -1489,11 +1491,11 @@ L 0 -2
 " style="stroke: #77838e"/>
     </defs>
     <g>
-     <use xlink:href="#mb6e86e18ce" x="328.970672" y="77.646159" style="fill: #77838e; stroke: #77838e"/>
+     <use xlink:href="#mb6e86e18ce" x="351.371766" y="84.616847" style="fill: #77838e; stroke: #77838e"/>
     </g>
    </g>
    <g id="text_38">
-    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start" x="345.245672" y="81.321159" transform="rotate(-0 345.245672 81.321159)">Direct TCP</text>
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start" x="367.646766" y="88.291847" transform="rotate(-0 367.646766 88.291847)">Direct TCP</text>
    </g>
   </g>
  </g>

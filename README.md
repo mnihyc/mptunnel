@@ -4,61 +4,80 @@
 [![Release Build](https://github.com/mnihyc/mptunnel/actions/workflows/release.yml/badge.svg)](https://github.com/mnihyc/mptunnel/actions/workflows/release.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**One connection. Multiple paths. TCP and QUIC together.**
+**Multipath tunneling for your existing applications.**
 
-MPTUNNEL is an encrypted proxy and tunnel that carries a single application
-connection over several network paths. Combine independent links for more
-capacity, use TCP and QUIC together, and recover undelivered data over another
-carrier when a path fails.
+MPTUNNEL is an encrypted proxy and tunnel that combines TCP and QUIC connections
+to carry your traffic. Even a single download or upload can use several of these
+connections at once, drawing on their available bandwidth and recovering through
+another connection when one stops making progress.
 
 [**Get started**](#quick-start) · [**Download**](../../releases/latest) ·
 [**Performance**](docs/PERFORMANCE.md) · [**Configuration**](examples/config.reference.toml)
 
 ## Why MPTUNNEL?
 
-A download, upload or long-lived connection can use more than one path without
-changes to the application. MPTUNNEL handles path selection and delivers the
-bytes back in order at the other end.
+A fast Internet link does not always mean a fast application connection.
+Individual connections can encounter rate limits, loss or congestion, and the
+best route or transport can change during a transfer. Other connections may
+still have useful capacity.
 
-- **Combine links within one connection.** Spread a transfer across independent
-  paths instead of assigning the entire connection to just one.
-- **Adapt in both directions.** Choose paths using live delivery and latency
-  measurements; upload and download can use different combinations.
-- **Recover across transports.** Move undelivered data to a surviving TCP or
-  QUIC carrier when another carrier stops making progress.
-- **Use it with your existing applications.** SOCKS5, HTTP CONNECT, a mixed
-  proxy listener, TCP/UDP forwarding and TUN share routing and DNS controls.
+MPTUNNEL's Multipath Proxy Protocol (MPP) groups TCP and/or QUIC connections into one
+tunnel between peers. Each transport connection is a **carrier**. MPP distributes
+parts of an application's byte stream across eligible carriers, tracks delivery,
+and puts the bytes back in order at the other end. Undelivered parts can be sent
+again over another carrier, so a transfer can keep moving when one carrier stalls.
 
 ```text
-                         ┌── TCP path ──┐
-Your app ── MPTUNNEL ────┤              ├──── MPTUNNEL ── Destination
-                         └── QUIC path ─┘
-                           one connection
+            One MPP session
+         ┌── TCP 1, 2, … ──┐
+MPTUNNEL ┤                 ├ MPTUNNEL
+         └── QUIC 1, 2, … ─┘
+          TCP, QUIC, or both
 ```
 
-Independent paths can add capacity. TCP and QUIC on the same physical link
-share its bandwidth, while giving the tunnel different transport options.
+Choose TCP-only, QUIC-only or mixed sets, from a few carriers to tens. One MPP
+session carries many application flows, and each reliable flow can use several
+carriers. Upload and download select carriers independently using live delivery
+and latency measurements; the set carrying data changes with demand and conditions.
+
+**Aggregation works on one network link or across several.** On one Internet
+link, parallel carriers share its total bandwidth and can help use it more fully
+when individual connections are limited. With separately routed links, a transfer
+can also draw on their combined capacity. Carrier count and link count are
+different: you can run many carriers through one network interface. To use
+separate links, configure endpoints and source routing to reach them.
+
+Applications connect through SOCKS5, HTTP CONNECT, a mixed proxy listener,
+TCP/UDP forwarding or TUN, with routing and DNS controls. They need no multipath
+support of their own. See the [path configuration guide](docs/OPERATIONS.md#path-policy-and-status)
+to choose carriers and their usage policies.
 
 <a name="performance"></a>
 
 ## See it in action
 
-The [performance guide](docs/PERFORMANCE.md) follows a transfer as one path
-slows down and goes offline, then compares download speed, responsiveness and
-CPU cost with Hysteria2, Xray and direct TCP.
+In the [two-link demonstration](docs/PERFORMANCE.md#one-connection-two-links),
+one download uses three TCP carriers on a 200 Mbps link and one QUIC carrier
+on a separate 200 Mbps link. It averages **268 Mbps** through a slowdown and
+brief UDP outage, using capacity beyond either individual link.
+
+The comparison below asks a different question: how much speed and responsiveness
+does each tunnel provide on **one 500 Mbps download / 100 Mbps upload link**?
+Each system runs separately. MPTUNNEL is measured with **3 TCP + 1 QUIC carriers**
+and with **1 QUIC carrier**.
 
 <a href="docs/PERFORMANCE.md#speed-and-responsiveness">
 <picture>
   <source media="(max-width: 600px)" srcset="docs/assets/performance/shared-link-tradeoffs-narrow.svg">
-  <img src="docs/assets/performance/shared-link-tradeoffs.svg" alt="Download speed and response latency on a shared 500 Mbps connection">
+  <img src="docs/assets/performance/shared-link-tradeoffs.svg" alt="Download speed and response latency with each system using the same 500 Mbps bandwidth limit">
 </picture>
 </a>
 
-In this 40-second Linux download, TCP+QUIC delivered **406 Mbps**;
-QUIC alone delivered **343 Mbps**, with 95% of small echo requests answered
-within **154 ms** during the download. The two modes offer different balances
-of speed and responsiveness.
-[See the setup, full timelines and results](docs/PERFORMANCE.md#speed-and-responsiveness).
+Over these 40-second Linux downloads, the mixed set delivered **406 Mbps**, with
+95% of small echo requests answered within **797 ms**. The single QUIC carrier
+delivered **343 Mbps** with a **154 ms** response p95. The
+[performance guide](docs/PERFORMANCE.md#speed-and-responsiveness) follows delivery
+and response times throughout each run and compares CPU cost alongside throughput.
 
 ## Know what your tunnel is doing
 
@@ -74,8 +93,9 @@ Enable the authenticated local dashboard using the
 ## Quick start
 
 Download the archive for your platform from
-[GitHub Releases](../../releases/latest). Generate one shared MPP credential,
-one shared transport key, and a separate TLS identity:
+[GitHub Releases](../../releases/latest) and use matching versions on both peers.
+Generate one shared MPP credential, one shared transport key, and a separate
+TLS identity:
 
 ```bash
 umask 077
@@ -126,9 +146,12 @@ Point an application at SOCKS5 `127.0.0.1:1080` or HTTP proxy `127.0.0.1:8080`:
 curl --proxy socks5h://127.0.0.1:1080 https://example.com
 ```
 
-**Upgrading to 0.6.0:** upgrade both client and server together. This release
-uses MPP wire version 16 and requires matching peers; see the
-[upgrade instructions](docs/OPERATIONS.md#mpp-wire-version-upgrade).
+A configured **path** names a remote endpoint and its carrier policy. A TCP path
+opens a carrier group (three by default, adjustable with `max-tcp-carriers`);
+each QUIC path creates one carrier. This example therefore has four carrier slots.
+Add path entries to build larger sets, including multiple QUIC carriers; the
+default session limit is 64 carrier slots. Paths use the operating system's
+routing unless you configure source addresses and routes.
 
 For persistent operation, copy `examples/client.toml` or
 `examples/server.toml` to `config.toml`, replace the placeholders, and validate
@@ -153,6 +176,7 @@ Start from [client.toml](examples/client.toml) and
 | Inspect traffic or update a running configuration | [Dashboard and management API](docs/OPERATIONS.md#management-api) |
 | Size buffers and memory for a VPS | [Resource envelopes](docs/OPERATIONS.md#resource-envelopes) |
 | Run as a service and collect logs | [Runtime supervision](docs/OPERATIONS.md#runtime-supervision) |
+| Upgrade an existing deployment | [Peer compatibility and upgrades](docs/OPERATIONS.md#mpp-wire-version-upgrade) |
 
 Experimental L3 packet tunneling is also available through `tun-l3` and
 `mpp-l3`, with server-managed address pools. See the

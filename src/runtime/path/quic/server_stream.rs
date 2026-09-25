@@ -37,7 +37,7 @@ use tokio::sync::oneshot;
 
 #[cfg(test)]
 struct ServerUdpStreamAbortActor {
-    attached: oneshot::Sender<()>,
+    attached: oneshot::Sender<tokio::time::Instant>,
     abort: oneshot::Receiver<()>,
     released: oneshot::Sender<()>,
 }
@@ -61,7 +61,7 @@ static NEXT_SERVER_UDP_STREAM_ABORT_ID: AtomicU64 = AtomicU64::new(1);
 pub(in crate::runtime) struct ServerUdpStreamAbortHandle {
     key: (SessionId, StreamId),
     id: u64,
-    attached: oneshot::Receiver<()>,
+    attached: oneshot::Receiver<tokio::time::Instant>,
     abort: Option<oneshot::Sender<()>>,
     released: oneshot::Receiver<()>,
 }
@@ -69,7 +69,11 @@ pub(in crate::runtime) struct ServerUdpStreamAbortHandle {
 #[cfg(test)]
 impl ServerUdpStreamAbortHandle {
     pub(in crate::runtime) async fn wait_attached(&mut self) -> bool {
-        (&mut self.attached).await.is_ok()
+        self.wait_attached_at().await.is_some()
+    }
+
+    pub(in crate::runtime) async fn wait_attached_at(&mut self) -> Option<tokio::time::Instant> {
+        (&mut self.attached).await.ok()
     }
 
     pub(in crate::runtime) fn abort(&mut self) {
@@ -424,7 +428,7 @@ async fn run_server_udp_reliable_stream_loop(
         // would prevent the client commit that the test requires before abort.
         #[cfg(test)]
         if let Some(abort) = take_server_udp_stream_abort_for_test(session_id, stream_id) {
-            let _ = abort.attached.send(());
+            let _ = abort.attached.send(tokio::time::Instant::now());
             if abort.abort.await.is_ok() {
                 // Retire the logical output before publishing release; the
                 // enclosing guard shares this one-shot authority.

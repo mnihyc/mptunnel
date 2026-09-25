@@ -2747,19 +2747,17 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
 
         enter_phase("pre-PTO suppression");
         let pre_pto_deadline = aborted_at + pto.saturating_sub(Duration::from_millis(3));
-        assert!(
-            tokio::time::timeout_at(pre_pto_deadline, replacement_abort.wait_attached())
-                .await
-                .is_err(),
-            "the same failed operation must not spin a replacement before one PTO"
-        );
         enter_phase("replacement QUIC server attachment");
+        let replacement_attached_at = replacement_abort
+            .wait_attached_at()
+            .await
+            .expect("the same live QUIC carrier must be eligible again after suppression expires");
         assert!(
-            replacement_abort.wait_attached().await,
-            "the same live QUIC carrier must be eligible again after suppression expires"
+            replacement_attached_at >= pre_pto_deadline,
+            "the replacement was actually published before the one-PTO suppression deadline"
         );
         assert!(
-            aborted_at.elapsed() + Duration::from_millis(3) >= pto,
+            replacement_attached_at.duration_since(aborted_at) + Duration::from_millis(3) >= pto,
             "reattachment occurred before its path-derived PTO"
         );
         enter_phase("replacement QUIC client commit");

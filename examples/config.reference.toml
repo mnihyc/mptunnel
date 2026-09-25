@@ -912,6 +912,9 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # skip an ineligible family before dialing. Source addresses are bound per connection:
 # a temporarily absent address fails that attempt without terminating the node,
 # and later attempts can succeed after the address or interface returns.
+# TCP preserves DNS family preference with or without source binding, staggering
+# alternate addresses within one connect timeout. The other family can still
+# win if the preferred connection fails or is slow.
 # [[outbounds]]
 # name = "direct-egress"
 # protocol = "direct"

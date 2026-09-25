@@ -906,91 +906,50 @@ async fn connect_direct_tcp(
     deadline: tokio::time::Instant,
     configurator: &dyn NativeSocketConfigurator,
 ) -> Result<TcpStream, OutboundConnectError> {
-    let mut ipv4 = Vec::new();
-    let mut ipv6 = Vec::new();
-    let mut default = Vec::new();
+    let mut eligible = Vec::new();
     for address in addresses.iter().copied() {
-        match config.source_binding_for(address.ip()) {
-            DirectSourceBinding::Ineligible => {}
-            DirectSourceBinding::Default => default.push(address),
-            DirectSourceBinding::Bound(IpAddr::V4(source)) => ipv4.push((address, source)),
-            DirectSourceBinding::Bound(IpAddr::V6(source)) => ipv6.push((address, source)),
+        if matches!(
+            config.source_binding_for(address.ip()),
+            DirectSourceBinding::Ineligible
+        ) || eligible.contains(&address)
+        {
+            continue;
         }
+        eligible.push(address);
     }
-    if !default.is_empty() {
-        return connect_direct_tcp_addresses(&default, None, deadline, configurator).await;
+    if eligible.is_empty() {
+        return Err(TcpTransportError::NoCompatibleAddress.into());
     }
-    let ipv4_source = ipv4.first().map(|(_, source)| IpAddr::V4(*source));
-    let ipv6_source = ipv6.first().map(|(_, source)| IpAddr::V6(*source));
-    let ipv4 = ipv4
-        .into_iter()
-        .map(|(address, _)| address)
-        .collect::<Vec<_>>();
-    let ipv6 = ipv6
-        .into_iter()
-        .map(|(address, _)| address)
-        .collect::<Vec<_>>();
-    match (ipv4_source, ipv6_source) {
-        (Some(source), None) => {
-            connect_direct_tcp_addresses(&ipv4, Some(source), deadline, configurator).await
-        }
-        (None, Some(source)) => {
-            connect_direct_tcp_addresses(&ipv6, Some(source), deadline, configurator).await
-        }
-        (Some(ipv4_source), Some(ipv6_source)) => {
-            tokio::select! {
-                result = connect_direct_tcp_addresses(
-                    &ipv4,
-                    Some(ipv4_source),
-                    deadline,
-                    configurator,
-                ) => match result {
-                    Ok(stream) => Ok(stream),
-                    Err(_) => connect_direct_tcp_addresses(
-                        &ipv6,
-                        Some(ipv6_source),
-                        deadline,
-                        configurator,
-                    ).await,
-                },
-                result = connect_direct_tcp_addresses(
-                    &ipv6,
-                    Some(ipv6_source),
-                    deadline,
-                    configurator,
-                ) => match result {
-                    Ok(stream) => Ok(stream),
-                    Err(_) => connect_direct_tcp_addresses(
-                        &ipv4,
-                        Some(ipv4_source),
-                        deadline,
-                        configurator,
-                    ).await,
-                },
-            }
-        }
-        (None, None) => Err(TcpTransportError::NoCompatibleAddress.into()),
-    }
-}
 
-async fn connect_direct_tcp_addresses(
-    addresses: &[SocketAddr],
-    source_ip: Option<IpAddr>,
-    deadline: tokio::time::Instant,
-    configurator: &dyn NativeSocketConfigurator,
-) -> Result<TcpStream, OutboundConnectError> {
     let timeout = remaining_timeout(deadline)?;
+    // Keep eligible addresses in resolver order; each raced attempt selects
+    // the source binding that matches its own destination family.
     operation_before(
         deadline,
-        tcp::connect_addrs_with_configurator(
-            addresses.to_vec(),
-            TcpConnectOptions {
-                source_ip,
-                timeout,
-                ..TcpConnectOptions::default()
+        tcp::race_tcp_address_attempts(
+            eligible,
+            deadline,
+            |address, attempt_deadline| async move {
+                let source_ip = match config.source_binding_for(address.ip()) {
+                    DirectSourceBinding::Ineligible => {
+                        return Err(TcpTransportError::NoCompatibleAddress);
+                    }
+                    DirectSourceBinding::Default => None,
+                    DirectSourceBinding::Bound(source_ip) => Some(source_ip),
+                };
+                tcp::connect_addr_before(
+                    address,
+                    TcpConnectOptions {
+                        source_ip,
+                        timeout,
+                        ..TcpConnectOptions::default()
+                    },
+                    NativeEgressPurpose::Target,
+                    configurator,
+                    attempt_deadline,
+                )
+                .await
             },
-            NativeEgressPurpose::Target,
-            configurator,
         ),
     )
     .await?

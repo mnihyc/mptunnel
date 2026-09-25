@@ -518,6 +518,14 @@ rules win before the longest suffix rule, and an unmatched query uses
 `[dns].default`. Omitting the entire `[dns]` section creates a system server and
 a policy named `default` with the documented defaults.
 
+Direct TCP egress starts with the first eligible resolved address, including
+when both `bind_ipv4` and `bind_ipv6` are configured. It staggers alternate
+addresses within the same connection deadline and uses the matching source
+binding for each attempt. A failed or slow preferred-family connection can
+therefore fall back to the other family. The `*-then-*` DNS modes only provide
+fallback when resolving records; they do not request the other family after a
+connection failure.
+
 `[[dns.override_records]]` defines named exact domain-to-address answers.
 `[[dns.synthetic_capture]]` defines named bounded pools for captured A/AAAA
 answers. Definitions have no effect until a named DNS policy lists their IDs in

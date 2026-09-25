@@ -154,6 +154,61 @@ fn safe_destination_policy() -> TestDestinationPolicy {
     )])
 }
 
+#[derive(Default)]
+struct RecordingTcpSocketConfigurator {
+    attempts: std::sync::Mutex<Vec<(SocketAddr, SocketAddr)>>,
+    reject_ipv6: bool,
+}
+
+impl RecordingTcpSocketConfigurator {
+    fn attempts(&self) -> Vec<(SocketAddr, SocketAddr)> {
+        self.attempts
+            .lock()
+            .expect("TCP socket attempt lock")
+            .clone()
+    }
+}
+
+impl crate::transport::NativeSocketConfigurator for RecordingTcpSocketConfigurator {
+    fn configure_tcp(
+        &self,
+        socket: &tokio::net::TcpSocket,
+        request: crate::transport::NativeSocketRequest,
+    ) -> std::io::Result<()> {
+        self.attempts
+            .lock()
+            .expect("TCP socket attempt lock")
+            .push((request.remote_addr, socket.local_addr()?));
+        if self.reject_ipv6 && request.remote_addr.is_ipv6() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "intentional test rejection of preferred IPv6 attempt",
+            ));
+        }
+        Ok(())
+    }
+
+    fn configure_udp(
+        &self,
+        _socket: &std::net::UdpSocket,
+        _request: crate::transport::NativeSocketRequest,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn ipv6_loopback_listener() -> TcpListener {
+    TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+        .await
+        .expect("IPv6 loopback is required by this dual-family test")
+}
+
+fn spawn_tcp_accept(listener: TcpListener) {
+    tokio::spawn(async move {
+        let _accepted = listener.accept().await.expect("accept test connection");
+    });
+}
+
 fn allow_restricted_destination_policy() -> TestDestinationPolicy {
     TestDestinationPolicy::compile(vec![RouteRuleSpec::new(
         RuleId::parse("default").expect("test route ID"),
@@ -284,6 +339,96 @@ fn direct_source_bindings_select_only_the_explicit_destination_family() {
         v6_only.source_binding_for(v6_remote),
         DirectSourceBinding::Bound(IpAddr::V6(v6_source))
     );
+}
+
+#[tokio::test]
+async fn direct_dual_bind_tcp_prefers_first_dns_family_and_uses_its_source() {
+    let v6_listener = ipv6_loopback_listener().await;
+    let v6_target = v6_listener.local_addr().expect("IPv6 target address");
+    let v4_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .expect("IPv4 target");
+    let v4_target = v4_listener.local_addr().expect("IPv4 target address");
+    spawn_tcp_accept(v6_listener);
+    spawn_tcp_accept(v4_listener);
+
+    let config = OutboundConfig::BindSourceIps {
+        ipv4: Some(Ipv4Addr::LOCALHOST),
+        ipv6: Some(Ipv6Addr::LOCALHOST),
+    };
+    for (addresses, expected_target, expected_source) in [
+        (
+            vec![v6_target, v4_target],
+            v6_target,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ),
+        (
+            vec![v4_target, v6_target],
+            v4_target,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ),
+    ] {
+        let configurator = RecordingTcpSocketConfigurator::default();
+        tokio::time::pause();
+        let connect = super::connect_direct_tcp(
+            &config,
+            &addresses,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            &configurator,
+        );
+        tokio::pin!(connect);
+        let first_poll = futures::poll!(connect.as_mut());
+        let attempts = configurator.attempts();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the initial poll should configure only the DNS-preferred socket"
+        );
+        assert_eq!(attempts[0].0, expected_target);
+        assert_eq!(attempts[0].1.ip(), expected_source);
+        tokio::time::resume();
+
+        let stream = match first_poll {
+            std::task::Poll::Ready(result) => result.expect("preferred loopback target connects"),
+            std::task::Poll::Pending => connect.await.expect("preferred loopback target connects"),
+        };
+
+        assert_eq!(stream.peer_addr().expect("peer address"), expected_target);
+    }
+}
+
+#[tokio::test]
+async fn direct_dual_bind_tcp_falls_back_after_preferred_socket_setup_fails() {
+    drop(ipv6_loopback_listener().await);
+    let v4_listener = TcpListener::bind("127.0.0.1:0").await.expect("IPv4 target");
+    let v4_target = v4_listener.local_addr().expect("IPv4 target address");
+    spawn_tcp_accept(v4_listener);
+    let v6_target = SocketAddr::from((Ipv6Addr::LOCALHOST, v4_target.port()));
+    let config = OutboundConfig::BindSourceIps {
+        ipv4: Some(Ipv4Addr::LOCALHOST),
+        ipv6: Some(Ipv6Addr::LOCALHOST),
+    };
+    let configurator = RecordingTcpSocketConfigurator {
+        reject_ipv6: true,
+        ..RecordingTcpSocketConfigurator::default()
+    };
+
+    let stream = super::connect_direct_tcp(
+        &config,
+        &[v6_target, v4_target],
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        &configurator,
+    )
+    .await
+    .expect("IPv4 fallback connects after preferred IPv6 setup fails");
+
+    assert_eq!(stream.peer_addr().expect("peer address"), v4_target);
+    let attempts = configurator.attempts();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].0, v6_target);
+    assert_eq!(attempts[0].1.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+    assert_eq!(attempts[1].0, v4_target);
+    assert_eq!(attempts[1].1.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
 }
 
 #[tokio::test]

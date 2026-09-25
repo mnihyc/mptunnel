@@ -272,7 +272,7 @@ pub async fn connect_addr_with_configurator(
     .await
 }
 
-async fn connect_addr_before(
+pub(crate) async fn connect_addr_before(
     addr: SocketAddr,
     options: TcpConnectOptions,
     purpose: NativeEgressPurpose,
@@ -353,7 +353,7 @@ fn next_tcp_address_attempt_at(deadline: Instant, unstarted: usize) -> Instant {
     now + tcp_address_attempt_delay(deadline.saturating_duration_since(now), unstarted)
 }
 
-async fn race_tcp_address_attempts<T, F, Fut>(
+pub(crate) async fn race_tcp_address_attempts<T, F, Fut>(
     addrs: Vec<SocketAddr>,
     deadline: Instant,
     mut connect: F,

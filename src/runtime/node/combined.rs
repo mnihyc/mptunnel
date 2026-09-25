@@ -18,7 +18,9 @@ use crate::runtime::path::ClientPathRuntimeOptions;
 use crate::runtime::product_policy::ClientIngressRouter;
 use crate::runtime::readiness::{RuntimeGenerationControl, RuntimeReadinessBarrier};
 use crate::runtime::telemetry::{RuntimeTelemetry, active_flow_detail_capacity};
+use crate::runtime::webhook::WebhookRuntime;
 use crate::transport::NativeSocketConfigurator;
+use crate::webhook::EventKind;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -66,6 +68,7 @@ pub(super) async fn run(
         tun_l3_ingresses,
         product_policy,
         dns_policy: _,
+        webhooks,
         servers,
     } = node;
     outbounds.retain(|outbound| active.contains_outbound(outbound.id()));
@@ -161,6 +164,14 @@ pub(super) async fn run(
     .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
     carrier_network.install_product_dns(dns.clone())?;
     let outbound_registry = outbound_shell.with_dns(dns);
+    let webhook_shutdown_timeout = webhooks.shutdown_timeout;
+    let mut webhooks =
+        WebhookRuntime::start(webhooks, outbound_registry.clone(), generation.clone())?;
+    let webhook_publisher = webhooks.publisher();
+    for context in &client_contexts {
+        context.attach_webhook_publisher(webhook_publisher.clone());
+    }
+    outbound_registry.attach_webhook_publisher(webhook_publisher.clone());
     let gateway_control = {
         let control = outbound_registry.gateway_control();
         (!control.is_empty()).then_some(control)
@@ -252,6 +263,7 @@ pub(super) async fn run(
             paths,
             reliable_relay,
         } = runtime;
+        paths.attach_webhook_publisher(webhook_publisher.clone());
         if let Some(ip_tunnel) = paths.take_ip_tunnel_device() {
             let device = match packet_devices.open(&PacketDeviceConfig {
                 interface_name: ip_tunnel.interface_name(),
@@ -296,6 +308,7 @@ pub(super) async fn run(
             Some(outbound_registry.dns().clone()),
             outbound_registry.product_admission().clone(),
             generation.clone(),
+            webhooks.stats_handle(),
             management_readiness,
             &mut services,
         )
@@ -332,23 +345,47 @@ pub(super) async fn run(
                 ))
         }
     };
-    match startup {
-        Ok(None) => {}
-        Ok(Some(stop)) => {
-            generation.wait_for_retirement_authorization().await;
-            super::retire_runtime_services(&mut services).await;
-            return Ok(stop);
-        }
-        Err(error) => {
-            super::retire_runtime_services(&mut services).await;
-            return Err(error);
-        }
+    let result = match startup {
+        Ok(None) => tokio::select! {
+            biased;
+            service = services.join_next() => {
+                super::map_runtime_service_result(service, "node service exited", "node has no runtime services")
+            }
+            stop = generation.wait_for_stop() => Ok(stop),
+        },
+        Ok(Some(stop)) => Ok(stop),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = &result {
+        generation.mark_failed(error.to_string());
     }
-    super::supervise_runtime_services(
-        services,
-        &generation,
-        "node service exited",
-        "node has no runtime services",
-    )
-    .await
+    // Host unpublication is coordinated independently. Its authorization wait
+    // and the best-effort callback drain run concurrently; neither holds up
+    // managed VPN route removal. Outbound owners remain alive until both end.
+    let drain = async {
+        if generation.is_activated() && webhook_publisher.interested(EventKind::NodeStateChanged) {
+            webhook_publisher.emit(EventKind::NodeStateChanged, "node", serde_json::json!({
+                "change": {"from": "ready", "to": if result.is_ok() { "stopping" } else { "failed" }},
+                "node": {"state": if result.is_ok() { "stopping" } else { "failed" }},
+                "initial": false,
+                "subject_sequence": 2
+            }));
+        }
+        let timeout = if generation.is_activated() {
+            webhook_shutdown_timeout
+        } else {
+            std::time::Duration::ZERO
+        };
+        webhooks
+            .shutdown(tokio::time::Instant::now() + timeout)
+            .await;
+    };
+    let retirement = async {
+        if result.is_ok() {
+            generation.wait_for_retirement_authorization().await;
+        }
+    };
+    tokio::join!(drain, retirement);
+    super::retire_runtime_services(&mut services).await;
+    result
 }

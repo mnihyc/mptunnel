@@ -4,6 +4,7 @@ use super::{
 };
 use crate::dns::{DnsGeneration, DnsRuntimeError};
 use crate::ingress::socks5 as socks5_udp;
+use crate::product::TargetResolutionMode;
 use crate::product::{AuthorizedDomainTarget, AuthorizedTarget, DnsPlanId, Network};
 use crate::protocol::TargetAddr;
 use crate::transport::Endpoint;
@@ -492,6 +493,78 @@ pub(crate) async fn connect_tcp_target_with_configurator(
                         .await
                 }
             }
+        }
+    }
+}
+
+/// Opens an explicitly configured webhook target without creating a Product
+/// flow or requiring a synthetic inbound principal. The webhook URL is its
+/// own static authorization boundary; this helper only applies the selected
+/// DNS plan, native socket configuration, and the connector's domain/IP
+/// capabilities.
+pub(crate) async fn connect_tcp_webhook_target_with_configurator(
+    config: &OutboundConfig,
+    dns: &DnsGeneration,
+    dns_plan: Option<&DnsPlanId>,
+    target: &TargetAddr,
+    resolution: TargetResolutionMode,
+    deadline: tokio::time::Instant,
+    configurator: &dyn NativeSocketConfigurator,
+) -> Result<OutboundTcpStream, OutboundConnectError> {
+    config.ensure_supports(TargetProtocol::Tcp)?;
+    validate_target(target)?;
+    if !matches!(
+        resolution,
+        TargetResolutionMode::AsIs | TargetResolutionMode::FullResolve
+    ) {
+        return Err(OutboundConnectError::UnsupportedWebhookResolution);
+    }
+    let dns_context = DnsResolutionContext::Product {
+        generation: dns,
+        plan: dns_plan,
+    };
+    let addresses = match target {
+        TargetAddr::Ip(address) => Some(vec![*address]),
+        TargetAddr::Domain { host, port }
+            if resolution == TargetResolutionMode::FullResolve || config.requires_ip_target() =>
+        {
+            Some(
+                dns.resolve_socket_addrs_for_plan(dns_plan, host, *port)
+                    .await?,
+            )
+        }
+        TargetAddr::Domain { .. } => None,
+    };
+    if let Some(addresses) = addresses {
+        return connect_tcp_leaf_to_addresses(
+            config,
+            &dns_context,
+            &addresses,
+            deadline,
+            configurator,
+        )
+        .await;
+    }
+
+    match config {
+        OutboundConfig::Direct
+        | OutboundConfig::BindSourceIp(_)
+        | OutboundConfig::BindSourceIps { .. } => {
+            // The branch above resolves all IP-only leaves.
+            Err(OutboundConnectError::TargetResolutionRequired)
+        }
+        OutboundConfig::Socks5(proxy) => {
+            connect_socks5_tcp_one(proxy, target, &dns_context, deadline, configurator)
+                .await
+                .map(OutboundTcpStream::Plain)
+        }
+        OutboundConfig::HttpConnect(proxy) => {
+            connect_http_connect_tcp_one(proxy, target, &dns_context, deadline, configurator)
+                .await
+                .map(OutboundTcpStream::Plain)
+        }
+        OutboundConfig::HttpsConnect(proxy) => {
+            connect_https_connect_tcp_one(proxy, target, &dns_context, deadline, configurator).await
         }
     }
 }
@@ -1534,6 +1607,7 @@ pub enum OutboundConnectError {
     InvalidProxyResponse,
     NoAuthorizedAddresses,
     TargetResolutionRequired,
+    UnsupportedWebhookResolution,
     DnsDependentProxyEndpoint(String),
 }
 
@@ -1640,6 +1714,9 @@ impl std::fmt::Display for OutboundConnectError {
             Self::TargetResolutionRequired => {
                 write!(f, "native target connector requires resolved addresses")
             }
+            Self::UnsupportedWebhookResolution => {
+                write!(f, "webhook target resolution mode is unsupported")
+            }
             Self::DnsDependentProxyEndpoint(host) => write!(
                 f,
                 "DNS-routed proxy control endpoint {host:?} is not a literal IP"
@@ -1670,6 +1747,7 @@ impl std::error::Error for OutboundConnectError {
             | Self::InvalidProxyResponse
             | Self::NoAuthorizedAddresses
             | Self::TargetResolutionRequired
+            | Self::UnsupportedWebhookResolution
             | Self::DnsDependentProxyEndpoint(_) => None,
         }
     }

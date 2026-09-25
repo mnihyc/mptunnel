@@ -45,7 +45,6 @@ use util::*;
 
 mod token;
 
-
 #[test]
 fn late_original_trains_reordering_without_disabling_real_loss() {
     for bbr in [false, true] {
@@ -73,7 +72,11 @@ fn late_original_trains_reordering_without_disabling_real_loss() {
                 pair.client_conn_mut(client).ping();
                 pair.drive_client();
             }
-            assert_eq!(pair.server.inbound.len(), 4, "five originals must actually be emitted, bbr={bbr}, round={round}");
+            assert_eq!(
+                pair.server.inbound.len(),
+                4,
+                "five originals must actually be emitted, bbr={bbr}, round={round}"
+            );
             pair.time += pair.latency;
             pair.drive_server();
             pair.time += Duration::from_millis(10);
@@ -82,10 +85,18 @@ fn late_original_trains_reordering_without_disabling_real_loss() {
             pair.drive_server();
             pair.time += Duration::from_millis(40);
             pair.drive_client();
-            assert_eq!(pair.client_conn_mut(client).stats().path.lost_packets - before, u64::from(round == 0), "bbr={bbr}, round={round}: only the untrained detector falsely loses this original");
+            assert_eq!(
+                pair.client_conn_mut(client).stats().path.lost_packets - before,
+                u64::from(round == 0),
+                "bbr={bbr}, round={round}: only the untrained detector falsely loses this original"
+            );
             pair.time += Duration::from_millis(10);
             pair.drive();
-            assert_eq!(pair.server_conn_mut(server).stats().frame_rx.ping - received, 5, "bbr={bbr}, round={round}");
+            assert_eq!(
+                pair.server_conn_mut(server).stats().frame_rx.ping - received,
+                5,
+                "bbr={bbr}, round={round}"
+            );
         }
 
         let before = pair.client_conn_mut(client).stats().path.lost_packets;
@@ -99,7 +110,10 @@ fn late_original_trains_reordering_without_disabling_real_loss() {
             pair.drive_client();
         }
         pair.drive();
-        assert!(pair.client_conn_mut(client).stats().path.lost_packets > before, "learned reordering still detects actual loss, bbr={bbr}");
+        assert!(
+            pair.client_conn_mut(client).stats().path.lost_packets > before,
+            "learned reordering still detects actual loss, bbr={bbr}"
+        );
     }
 }
 
@@ -110,9 +124,8 @@ fn late_original_uses_rtt_from_the_same_ack_transaction() {
         let transport = Arc::get_mut(&mut config.transport).unwrap();
         transport.mtu_discovery_config(None);
         if bbr {
-            transport.congestion_controller_factory(Arc::new(
-                crate::congestion::Bbr3Config::default(),
-            ));
+            transport
+                .congestion_controller_factory(Arc::new(crate::congestion::Bbr3Config::default()));
         }
         let mut pair = Pair::default_with_deterministic_pns();
         pair.latency = Duration::from_millis(50);
@@ -133,7 +146,10 @@ fn late_original_uses_rtt_from_the_same_ack_transaction() {
         pair.drive_server();
         pair.time += pair.latency;
         pair.drive_client();
-        assert_eq!(pair.client_conn_mut(client).stats().path.lost_packets, lost_before + 1);
+        assert_eq!(
+            pair.client_conn_mut(client).stats().path.lost_packets,
+            lost_before + 1
+        );
         let old_rtt = pair.client_conn_mut(client).reordering_loss_delay().0;
 
         // This newer live packet and the retained original arrive together.
@@ -159,7 +175,10 @@ fn late_original_uses_rtt_from_the_same_ack_transaction() {
             assert_eq!(current_rtt, pair.time - newer_sent);
             assert!(current_rtt > old_rtt);
         } else {
-            assert!(current_rtt < old_rtt, "old={old_rtt:?}, current={current_rtt:?}");
+            assert!(
+                current_rtt < old_rtt,
+                "old={old_rtt:?}, current={current_rtt:?}"
+            );
         }
         assert_eq!(
             learned_delay,
@@ -1682,6 +1701,9 @@ fn migration() {
     let (client_ch, server_ch) = pair.connect();
     pair.drive();
 
+    let original_peer = pair.client.addr;
+    let initial_observation = pair.server_conn_mut(server_ch).validated_remote_address();
+    assert_eq!(initial_observation, Some((1, original_peer)));
     let client_stats_after_connect = pair.client_conn_mut(client_ch).stats();
 
     pair.client.addr = SocketAddr::new(
@@ -1695,6 +1717,15 @@ fn migration() {
     pair.drive_client();
     pair.drive_server();
     assert_ne!(pair.server_conn_mut(server_ch).total_recvd(), 0);
+    assert_ne!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        original_peer
+    );
+    assert_eq!(
+        pair.server_conn_mut(server_ch).validated_remote_address(),
+        initial_observation,
+        "receiving authenticated traffic from a new address is not path validation"
+    );
 
     pair.drive();
     assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
@@ -1702,6 +1733,16 @@ fn migration() {
         pair.server_conn_mut(server_ch).remote_address(),
         pair.client.addr
     );
+
+    assert_eq!(
+        pair.server_conn_mut(server_ch).validated_remote_address(),
+        Some((2, pair.client.addr))
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::ValidatedRemoteAddressChanged)
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
 
     // Assert that the client's response to the PATH_CHALLENGE was an IMMEDIATE_ACK, instead of a
     // second ping
@@ -1724,6 +1765,7 @@ fn failed_migration_reactivates_the_previous_controller_epoch() {
     let (client_ch, server_ch) = pair.connect();
     pair.drive();
 
+    let validated_before = pair.server_conn_mut(server_ch).validated_remote_address();
     let initial = pair.server_conn_mut(server_ch).active_controller_epoch();
 
     // A different IP is a fresh network path, rather than an IPv4 NAT
@@ -1738,6 +1780,10 @@ fn failed_migration_reactivates_the_previous_controller_epoch() {
     pair.drive_server();
     pair.client.inbound.clear();
 
+    assert_eq!(
+        pair.server_conn_mut(server_ch).validated_remote_address(),
+        validated_before
+    );
     let tentative = pair.server_conn_mut(server_ch).active_controller_epoch();
     assert_ne!(
         tentative, initial,
@@ -1761,6 +1807,11 @@ fn failed_migration_reactivates_the_previous_controller_epoch() {
         initial,
         "failed path validation restores the parked controller identity"
     );
+    assert_eq!(
+        pair.server_conn_mut(server_ch).validated_remote_address(),
+        validated_before
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
 }
 
 #[test]
@@ -4168,10 +4219,13 @@ struct ControllerTrace {
 
 impl Controller for ControllerTrace {
     fn on_packet_discarded(&mut self, packet_number: u64, space: SpaceId) {
-        self.events.lock().unwrap().push(ControllerTraceEvent::Discard {
-            space,
-            packet_number,
-        });
+        self.events
+            .lock()
+            .unwrap()
+            .push(ControllerTraceEvent::Discard {
+                space,
+                packet_number,
+            });
     }
 
     fn on_application_ready(&mut self) {
@@ -4279,7 +4333,11 @@ fn discarded_mtu_probes_release_controller_metadata() {
     pair.mtu = 1200;
     let (client, _) = pair.connect_with(traced_client_config(events.clone()));
     pair.drive();
-    let abandoned = pair.client_conn_mut(client).stats().path.lost_plpmtud_probes;
+    let abandoned = pair
+        .client_conn_mut(client)
+        .stats()
+        .path
+        .lost_plpmtud_probes;
     assert!(
         abandoned > 0,
         "the real packet engine must abandon MTU probes"
@@ -4611,7 +4669,10 @@ fn check_timely_original_beyond_receive_history(warm_packets: usize) {
         // The original must be accepted once, not twice.
         pair.server.inbound.push_front(held);
         pair.drive_server();
-        assert_eq!(pair.server_conn_mut(server).stats().frame_rx.ping - before, received);
+        assert_eq!(
+            pair.server_conn_mut(server).stats().frame_rx.ping - before,
+            received
+        );
     }
 }
 

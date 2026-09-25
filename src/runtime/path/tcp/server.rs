@@ -93,6 +93,11 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         ));
     }
     let peer = tcp_carrier_peer(&stream)?;
+    let webhook_local_addr = context
+        .reliable_streams
+        .webhook_enabled()
+        .then(|| stream.local_addr().ok())
+        .flatten();
     let write_admission = match TcpWriteAdmission::capture(
         &stream,
         crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES,
@@ -233,6 +238,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     if !ready {
         return Ok(());
     }
+    path_registration.publish_ready(webhook_local_addr, None);
     if let Some(metrics) = tcp_metrics.as_mut() {
         metrics.begin_epoch();
     }

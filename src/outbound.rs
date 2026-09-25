@@ -7,8 +7,9 @@ pub mod socks5;
 pub(crate) use connect::resolve_authorization_before;
 pub(crate) use connect::{
     ConnectorTarget, connect_tcp_literal_target_with_configurator,
-    connect_tcp_target_with_configurator, connect_udp_target_with_configurator,
-    resolve_authorized_domain_before, resolve_target_addresses_with_plan_before,
+    connect_tcp_target_with_configurator, connect_tcp_webhook_target_with_configurator,
+    connect_udp_target_with_configurator, resolve_authorized_domain_before,
+    resolve_target_addresses_with_plan_before,
 };
 pub use connect::{
     HttpsProxyConfig, OutboundConfig, OutboundConnectError, OutboundError, OutboundTcpStream,

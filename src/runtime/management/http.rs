@@ -213,6 +213,7 @@ async fn handle_connection(
                         "config_validate": "POST /api/v4/config/validate",
                         "config_apply": "POST /api/v4/config/apply",
                         "balancers": "GET /api/v4/balancers",
+                        "webhooks": "GET /api/v4/webhooks",
                         "balancer_actions": "POST /api/v4/balancers/actions",
                         "dns_status": "GET /api/v4/dns/status",
                         "dns_explain": "GET /api/v4/dns/explain?domain=<domain>",
@@ -241,6 +242,18 @@ async fn handle_connection(
             Ok(value) => write_json(stream, 200, "OK", &value).await,
             Err(err) => write_error(stream, err).await,
         },
+        ("GET", "/api/v4/webhooks") => {
+            write_json(
+                stream,
+                200,
+                "OK",
+                &json!({
+                    "schema": SCHEMA,
+                    "webhooks": target.webhooks.snapshot()
+                }),
+            )
+            .await
+        }
         ("GET", "/api/v4/balancers") => match target.balancer_status_json() {
             Ok(value) => write_json(stream, 200, "OK", &value).await,
             Err(err) => write_error(stream, err).await,
@@ -677,6 +690,7 @@ fn known_path(path: &str, dashboard: bool) -> bool {
             | "/api/v4/config"
             | "/api/v4/config/validate"
             | "/api/v4/config/apply"
+            | "/api/v4/webhooks"
             | "/api/v4/balancers"
             | "/api/v4/balancers/actions"
             | "/api/v4/dns/status"

@@ -25,6 +25,7 @@ mod stream;
 mod telemetry;
 mod tun_l3;
 mod tun_l4;
+mod webhook;
 
 pub(crate) use config_control::RuntimeConfigControl;
 pub use datagram::{client_udp_datagram_round_trip, client_udp_datagram_round_trip_with_provider};

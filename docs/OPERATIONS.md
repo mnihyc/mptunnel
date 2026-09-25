@@ -842,6 +842,8 @@ All data and controls are authenticated under `/api/v4/`:
 - `GET /api/v4/config` returns `mptunnel.config.v4` with the canonical path,
   desired, active, runtime, and pending revisions, mutation endpoints, and
   required precondition. It never returns TOML or resolved secrets.
+- `GET /api/v4/webhooks` reports bounded callback queue and delivery status;
+  see [Webhooks](WEBHOOKS.md) for event conditions, templates, and retry policy.
 - `GET /api/v4/balancers` returns `mptunnel.balancer.v4` with named balancer
   and outbound-member readiness, freshness, load, observations, probes,
   circuit state, and counters.

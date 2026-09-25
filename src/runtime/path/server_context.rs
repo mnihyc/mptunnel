@@ -181,6 +181,17 @@ pub(in crate::runtime) struct ServerPathContext {
 }
 
 impl ServerPathContext {
+    pub(in crate::runtime) fn attach_webhook_publisher(
+        &self,
+        publisher: crate::runtime::webhook::EventPublisher,
+    ) {
+        self.reliable_streams.attach_webhook_publisher(
+            publisher,
+            self.name.clone(),
+            self.configured_path_names.clone(),
+        );
+    }
+
     pub(in crate::runtime) fn configured_path_name(
         &self,
         config_ordinal: usize,

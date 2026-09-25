@@ -104,3 +104,61 @@ async fn deferred_retirement_waits_for_explicit_authorization() {
         .expect("retirement authorization")
         .expect("retirement waiter");
 }
+
+#[tokio::test]
+async fn deferred_observer_activation_waits_for_configuration_commit() {
+    let generation = RuntimeGenerationControl::new();
+    generation.defer_activation();
+    generation.mark_ready();
+    assert!(generation.is_ready());
+    assert!(!generation.is_activated());
+
+    let observed = generation.clone();
+    let waiter = tokio::spawn(async move { observed.wait_until_activated().await });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "readiness must not send candidate hooks"
+    );
+    assert!(generation.activate());
+    assert!(!generation.activate(), "publication is once per generation");
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("activation notification")
+        .expect("activation waiter")
+        .expect("active generation");
+}
+
+#[tokio::test]
+async fn rejected_candidate_never_activates_observers() {
+    let generation = RuntimeGenerationControl::new();
+    generation.defer_activation();
+    generation.mark_ready();
+    generation.request_shutdown();
+    assert!(!generation.activate());
+    assert!(!generation.is_activated());
+    assert_eq!(
+        generation.wait_until_activated().await,
+        Err(RuntimeGenerationReadinessError::Stopping)
+    );
+}
+
+#[tokio::test]
+async fn standalone_observers_activate_at_readiness_and_failures_wake_waiters() {
+    let ordinary = RuntimeGenerationControl::new();
+    assert!(!ordinary.activate(), "starting is not ready");
+    ordinary.mark_ready();
+    ordinary
+        .wait_until_activated()
+        .await
+        .expect("standalone publication");
+
+    let failed = RuntimeGenerationControl::new();
+    failed.defer_activation();
+    failed.mark_failed("listener unavailable");
+    assert!(matches!(
+        failed.wait_until_activated().await,
+        Err(RuntimeGenerationReadinessError::Failed(_))
+    ));
+    assert!(!failed.activate());
+}

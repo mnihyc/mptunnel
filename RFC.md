@@ -2866,6 +2866,26 @@ A response:
 
 Peer status is diagnostic presentation, not delivery evidence.
 
+### 11.4 Local lifecycle webhooks
+
+Optional HTTP webhooks are local Product observers and add no MPP wire fields.
+They MUST observe committed carrier/session facts, preserve exact-incarnation
+fences, and keep administrative policy distinct from transport availability.
+An aggregate configured-path state belongs to the client configuration; a server
+MUST NOT infer remote path names or pool membership from wire member slots.
+Session attachment observations count ready carriers rather than application
+flow references. QUIC address-change observations require successful native
+path validation, not provisional migration destinations.
+
+Publication MUST be bounded and nonblocking with respect to tunnel owners;
+queue saturation or delivery failure MUST NOT hold up forwarding, alter path
+policy, or recursively publish delivery-result events. Optional retries retain
+stable event/delivery identity and obey both attempt and total-age limits.
+Observers MUST NOT send external callbacks for an uncommitted runtime candidate.
+The generation coordinator owns best-effort terminal notification and a bounded
+drain before retiring transport owners; it MUST NOT delay host route withdrawal.
+See [Webhooks](docs/WEBHOOKS.md) for the local event vocabulary and configuration.
+
 ## 12. Wire Format and Registry
 
 ### 12.1 Frame header

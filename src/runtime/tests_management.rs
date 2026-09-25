@@ -77,6 +77,7 @@ fn balancer_status_and_actions_share_the_generation_owned_balancer() {
     )
     .expect("runtime registry");
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: Vec::new(),
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
@@ -148,6 +149,7 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
         vec!["192.0.2.53".parse().expect("address")],
     )]));
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: Vec::new(),
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
@@ -255,6 +257,7 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
     )
     .expect("context");
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: vec![context.clone()],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
@@ -328,6 +331,7 @@ fn node_path_control_can_select_client_by_outbound_name() {
     )
     .expect("context");
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: vec![context.clone()],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
@@ -438,6 +442,7 @@ fn client_status_exposes_named_inventory_without_credentials() {
         )
         .expect("admit one live flow");
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::from_config(&local_inbounds, &outbound_configs),
@@ -601,6 +606,7 @@ fn client_status_retains_stale_raw_rate_with_provenance_without_reentering_sched
         record.carrier_ack_derived_data_seen = true;
     }
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
@@ -686,6 +692,7 @@ fn client_status_does_not_mix_native_pacing_with_newer_product_delivery_epoch() 
         record.product_delivery_rate_expires_at = Some(product_at + Duration::from_secs(1));
     }
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
@@ -788,6 +795,7 @@ fn server_tcp_app_limited_refresh_preserves_frozen_rate_and_pacing_provenance() 
             }),
         );
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: Vec::new(),
         servers: vec![context.clone()],
         inventory: ProductRuntimeInventory::default(),
@@ -1128,6 +1136,7 @@ fn status_projects_the_bounded_tcp_carrier_pool() {
     )
     .expect("context");
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
@@ -1197,6 +1206,7 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
         crate::protocol::TargetAddr::Ip("127.0.0.1:443".parse().expect("literal")),
     );
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
@@ -1272,6 +1282,7 @@ fn control_refresh_does_not_advance_one_hertz_trends() {
     )
     .expect("context");
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),

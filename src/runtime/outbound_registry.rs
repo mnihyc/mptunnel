@@ -4,6 +4,7 @@
 //! per Product flow. The returned concrete branch is then pinned for the flow
 //! lifetime and no routing or balancer decision enters payload forwarding.
 
+use crate::config::EgressRef;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, GatewayBalancerConfig};
 use crate::dns::{
     DirectDnsBackendFactory, DnsBackendError, DnsBackendFactory, DnsGeneration,
@@ -33,8 +34,11 @@ use crate::runtime::telemetry::{
     ObservedProductIo, ProductFlowCounter, ProductFlowLease as RuntimeProductFlowLease,
     ProductFlowOriginKind, ProductFlowScope, ProductFlowSource, RuntimeTelemetry,
 };
+use crate::runtime::webhook::EventPublisher;
+use crate::runtime::webhook::egress::{OpenedWebhookStream, WebhookIo, WebhookOpenError};
 use crate::scheduler::TrafficClass;
 use crate::transport::NativeSocketConfigurator;
+use crate::webhook::WebhookTarget;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -772,6 +776,214 @@ impl RuntimeOutboundRegistry {
         GatewayRuntimeControl {
             balancers: self.shell.balancers.clone(),
         }
+    }
+
+    /// Attaches the generation's bounded lifecycle publisher to configured
+    /// balancers. Uninterested publishers are ignored by each balancer.
+    pub(in crate::runtime) fn attach_webhook_publisher(&self, publisher: EventPublisher) {
+        for runtime in self.shell.balancers.values() {
+            runtime.attach_webhook_publisher(publisher.clone());
+        }
+    }
+
+    /// Opens one explicitly selected webhook target. Balancer failover ends
+    /// when a concrete stream is returned; request bytes are never replayed on
+    /// another member by this layer.
+    pub(in crate::runtime) async fn open_webhook_tcp(
+        &self,
+        target: &WebhookTarget,
+        deadline: tokio::time::Instant,
+    ) -> Result<OpenedWebhookStream, WebhookOpenError> {
+        let destination = webhook_target_addr(&target.url.host, target.url.port)
+            .map_err(|_| WebhookOpenError::permanent("target"))?;
+        let protocol_target = match &destination {
+            TargetAddr::Ip(address) => {
+                crate::product::ProtocolTarget::from_ip(address.ip(), address.port())
+            }
+            TargetAddr::Domain { host, port } => {
+                crate::product::ProtocolTarget::from_host_port(host, *port)
+            }
+        }
+        .map_err(|_| WebhookOpenError::permanent("target"))?;
+        let selection = match &target.egress {
+            EgressRef::Outbound(id) => EgressSelection::Outbound(id.clone()),
+            EgressRef::Balancer(id) => EgressSelection::Balancer(id.clone()),
+        };
+        match selection {
+            EgressSelection::Outbound(id) => {
+                let leaf = self
+                    .shell
+                    .require_leaf(&id, Network::Tcp)
+                    .map_err(|_| WebhookOpenError::permanent("select"))?;
+                self.open_webhook_leaf(leaf, &destination, target, deadline, None)
+                    .await
+            }
+            EgressSelection::Balancer(id) => {
+                let runtime = self
+                    .shell
+                    .require_balancer(&id)
+                    .map_err(|_| WebhookOpenError::permanent("select"))?;
+                let mut excluded = Vec::with_capacity(runtime.member_count());
+                for _ in 0..runtime.member_count() {
+                    let binding = runtime
+                        .select_for_webhook(Network::Tcp, &protocol_target, &excluded)
+                        .map_err(|_| WebhookOpenError::transport("select"))?;
+                    let member = runtime
+                        .member_id(binding.handle)
+                        .map_err(|_| WebhookOpenError::permanent("select"))?;
+                    let selected_handle = binding.handle;
+                    let leaf = self
+                        .shell
+                        .require_leaf(member, Network::Tcp)
+                        .map_err(|_| WebhookOpenError::permanent("select"))?;
+                    match self
+                        .open_webhook_leaf(
+                            leaf,
+                            &destination,
+                            target,
+                            deadline,
+                            Some(binding.lease),
+                        )
+                        .await
+                    {
+                        Ok(stream) => return Ok(stream),
+                        Err(error) => {
+                            excluded.push(selected_handle);
+                            if excluded.len() >= runtime.member_count() {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                Err(WebhookOpenError::transport("connect"))
+            }
+        }
+    }
+
+    async fn open_webhook_leaf(
+        &self,
+        leaf: Arc<RuntimeOutboundLeaf>,
+        destination: &TargetAddr,
+        target: &WebhookTarget,
+        deadline: tokio::time::Instant,
+        mut gateway_lease: Option<GatewayFlowLease>,
+    ) -> Result<OpenedWebhookStream, WebhookOpenError> {
+        let leaf_deadline = deadline.min(tokio::time::Instant::now() + leaf.open_timeout());
+        let opened = match leaf.as_ref() {
+            RuntimeOutboundLeaf::Mpp {
+                context,
+                performance,
+                ..
+            } => {
+                let targets = webhook_mpp_targets(
+                    &self.dns,
+                    target.dns_policy.as_ref(),
+                    destination,
+                    target.target_resolution,
+                    leaf_deadline,
+                )
+                .await?;
+                let mut last_error = None;
+                let mut opened = None;
+                for target_address in targets {
+                    match tokio::time::timeout_at(
+                        leaf_deadline,
+                        open_remote_stream_until(
+                            context,
+                            target_address.clone(),
+                            TrafficClass::Latency,
+                            leaf_deadline,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(remote)) => {
+                            opened = Some((remote, target_address));
+                            break;
+                        }
+                        Ok(Err(error)) => last_error = Some(error),
+                        Err(_) => {
+                            last_error = Some(RuntimeError::PathOpenTimedOut);
+                            break;
+                        }
+                    }
+                }
+                let Some((remote, target_address)) = opened else {
+                    if let Some(lease) = gateway_lease.as_mut() {
+                        let _ = lease.failed("webhook transport connection failed");
+                    }
+                    let retryable = last_error.is_none_or(|error| {
+                        !matches!(
+                            error,
+                            RuntimeError::ProductPolicy(_)
+                                | RuntimeError::DestinationDenied(_)
+                                | RuntimeError::Protocol(_)
+                        )
+                    });
+                    return Err(if retryable {
+                        WebhookOpenError::transport("connect")
+                    } else {
+                        WebhookOpenError::permanent("connect")
+                    });
+                };
+                let (local, relay_side) = tokio::io::duplex(64 * 1024);
+                let relay_context = context.clone();
+                let relay_performance = *performance;
+                let relay = tokio::spawn(async move {
+                    crate::runtime::relay::control::relay_migrating_tcp_stream(
+                        relay_side,
+                        &relay_context,
+                        relay_performance,
+                        ReliableRelayOpenSpec::new(target_address, TrafficClass::Latency),
+                        remote,
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                });
+                (Box::new(local) as Box<dyn WebhookIo>, Some(relay))
+            }
+            RuntimeOutboundLeaf::Local {
+                config,
+                native_sockets,
+                ..
+            } => {
+                let connect = outbound::connect_tcp_webhook_target_with_configurator(
+                    config,
+                    &self.dns,
+                    target.dns_policy.as_ref(),
+                    destination,
+                    target.target_resolution,
+                    leaf_deadline,
+                    native_sockets.as_ref(),
+                );
+                let stream = match tokio::time::timeout_at(leaf_deadline, connect).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        if let Some(lease) = gateway_lease.as_mut() {
+                            let _ = lease.failed("webhook transport connection failed");
+                        }
+                        return Err(outbound_webhook_error(&error));
+                    }
+                    Err(_) => {
+                        if let Some(lease) = gateway_lease.as_mut() {
+                            let _ = lease.failed("webhook connection timed out");
+                        }
+                        return Err(WebhookOpenError::transport("connect"));
+                    }
+                };
+                (Box::new(stream) as Box<dyn WebhookIo>, None)
+            }
+        };
+        if let Some(lease) = gateway_lease.as_mut()
+            && lease.opened().is_err()
+        {
+            if let Some(relay) = opened.1.as_ref() {
+                relay.abort();
+            }
+            return Err(WebhookOpenError::permanent("accounting"));
+        }
+        Ok(OpenedWebhookStream::new(opened.0, opened.1, gateway_lease))
     }
 
     pub(in crate::runtime) fn try_admit_product_flow(
@@ -1721,6 +1933,80 @@ impl RuntimeOutboundRegistry {
             | ProductDestination::RoutedDomain { .. } => {
                 unreachable!("domain destination was promoted to resolved addresses")
             }
+        }
+    }
+}
+
+fn webhook_target_addr(host: &str, port: u16) -> Result<TargetAddr, ()> {
+    if port == 0 {
+        return Err(());
+    }
+    Ok(match host.parse::<IpAddr>() {
+        Ok(address) => TargetAddr::Ip(SocketAddr::new(address, port)),
+        Err(_) if !host.is_empty() => TargetAddr::Domain {
+            host: host.to_string(),
+            port,
+        },
+        Err(_) => return Err(()),
+    })
+}
+
+async fn webhook_mpp_targets(
+    dns: &DnsGeneration,
+    dns_plan: Option<&DnsPlanId>,
+    target: &TargetAddr,
+    resolution: crate::product::TargetResolutionMode,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<TargetAddr>, WebhookOpenError> {
+    match target {
+        TargetAddr::Ip(_) => Ok(vec![target.clone()]),
+        TargetAddr::Domain { .. } if resolution == crate::product::TargetResolutionMode::AsIs => {
+            Ok(vec![target.clone()])
+        }
+        TargetAddr::Domain { host, port }
+            if resolution == crate::product::TargetResolutionMode::FullResolve =>
+        {
+            let addresses = tokio::time::timeout_at(
+                deadline,
+                dns.resolve_socket_addrs_for_plan(dns_plan, host, *port),
+            )
+            .await
+            .map_err(|_| WebhookOpenError::transport("dns"))?
+            .map_err(|_| WebhookOpenError::transport("dns"))?;
+            Ok(addresses.into_iter().map(TargetAddr::Ip).collect())
+        }
+        TargetAddr::Domain { .. } => Err(WebhookOpenError::permanent("resolution")),
+    }
+}
+
+fn outbound_webhook_error(error: &outbound::OutboundConnectError) -> WebhookOpenError {
+    use outbound::OutboundConnectError;
+    match error {
+        OutboundConnectError::ConnectTimeout
+        | OutboundConnectError::ProxyTimeout
+        | OutboundConnectError::Dns(_)
+        | OutboundConnectError::Tcp(_)
+        | OutboundConnectError::NoAuthorizedAddresses => WebhookOpenError::transport("connect"),
+        OutboundConnectError::Io(error) if error.kind() != std::io::ErrorKind::InvalidData => {
+            WebhookOpenError::transport("connect")
+        }
+        OutboundConnectError::Io(_) => WebhookOpenError::permanent("tls"),
+        OutboundConnectError::Policy(_)
+        | OutboundConnectError::DestinationAuthorization(_)
+        | OutboundConnectError::Endpoint(_)
+        | OutboundConnectError::Udp(_)
+        | OutboundConnectError::Socks5Client(_)
+        | OutboundConnectError::HttpConnectClient(_)
+        | OutboundConnectError::ProxyAuthRejected(_)
+        | OutboundConnectError::ProxyRejected(_)
+        | OutboundConnectError::Socks5UdpPacket(_)
+        | OutboundConnectError::UdpRelayTargetMismatch { .. }
+        | OutboundConnectError::UdpReceiveBufferTooSmall { .. }
+        | OutboundConnectError::InvalidProxyResponse
+        | OutboundConnectError::TargetResolutionRequired
+        | OutboundConnectError::UnsupportedWebhookResolution
+        | OutboundConnectError::DnsDependentProxyEndpoint(_) => {
+            WebhookOpenError::permanent("connect")
         }
     }
 }

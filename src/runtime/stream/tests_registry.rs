@@ -1420,6 +1420,7 @@ fn repeated_session_retirement_resweeps_an_exact_late_path_instance() {
         paths.instances.insert(
             server_physical_path_key(identity),
             ServerRegisteredPath {
+                webhook: None,
                 native_delivery: None,
                 configured_slot: ConfiguredMemberSlot(identity.path_id.0),
                 local: ServerLocalPathProperties::default(),
@@ -3023,6 +3024,7 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
         .insert(
             server_physical_path_key(stale_identity),
             ServerRegisteredPath {
+                webhook: None,
                 native_delivery: None,
                 configured_slot: ConfiguredMemberSlot(stale_identity.path_id.0),
                 local: ServerLocalPathProperties::default(),

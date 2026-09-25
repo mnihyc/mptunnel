@@ -6,12 +6,12 @@ use super::{
     DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_PROBE_INTERVAL_MS,
     DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_PRODUCT_FLOW_IDLE_TIMEOUT_SECONDS,
     DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, ForwardingMode, GatewayBalancerConfig,
-    LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
-    MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NamedTunL3Config, NodeConfig,
-    OutboundLeafConfig, ProductAdmissionConfig, ProductFlowConfig, ProductPolicyConfig,
-    ResourceLimits, SecurityPolicyError, ServerSecurityConfig, ServiceConfig, SessionConfig,
-    SharedSecret,
+    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, EgressRef, ForwardingMode,
+    GatewayBalancerConfig, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig,
+    ManagementConfig, MppInboundConfig, MppOutboundConfig, MppPerformanceConfig, NamedPathConfig,
+    NamedTunL3Config, NodeConfig, OutboundLeafConfig, ProductAdmissionConfig, ProductFlowConfig,
+    ProductPolicyConfig, ResourceLimits, SecurityPolicyError, ServerSecurityConfig, ServiceConfig,
+    SessionConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU,
@@ -47,10 +47,16 @@ use crate::product::{
 };
 use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{EndpointParseError, LossPolicyPercent, PathSpecParseError, RateHint};
+use crate::webhook::{
+    DeliveryPolicy, EventKind, EventMatcher, EventMatcherBranch, FormTemplate, HeaderValueTemplate,
+    JsonTemplate, QueryTemplate, Template, WebhookBody, WebhookConfig, WebhookHeader, WebhookRule,
+    WebhookTarget, WebhookUrl,
+};
+use http::{HeaderName, HeaderValue, Method};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -246,6 +252,7 @@ struct FileConfig {
     admission: ProductAdmissionFileConfig,
     #[serde(default)]
     management: ManagementFileConfig,
+    webhooks: Option<WebhooksFileConfig>,
     #[serde(default)]
     credentials: Vec<CredentialFileConfig>,
     #[serde(default)]
@@ -316,6 +323,11 @@ impl FileConfig {
                 &local_user_catalog,
                 default_mpp_performance,
             )?;
+        let webhooks = self
+            .webhooks
+            .map(|webhooks| webhooks.into_config(material_base, &dns_policy))
+            .transpose()?
+            .unwrap_or_default();
         let config = AppConfig {
             logging: self.logging.into_config(material_base)?,
             check_config: self.check_config,
@@ -333,6 +345,7 @@ impl FileConfig {
                 tun_l3_ingresses,
                 product_policy,
                 dns_policy,
+                webhooks,
                 servers,
             }),
         };
@@ -1944,6 +1957,743 @@ struct RoutingFileConfig {
     rule_sets: Vec<RoutingRuleSetFileConfig>,
     #[serde(default)]
     rules: Vec<RoutingRuleFileConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhooksFileConfig {
+    max_in_flight: Option<usize>,
+    max_pending_deliveries: Option<usize>,
+    max_pending_bytes: Option<usize>,
+    shutdown_timeout_s: Option<ConfigSeconds>,
+    delivery: Option<WebhookDeliveryFileConfig>,
+    #[serde(default)]
+    rules: Vec<WebhookRuleFileConfig>,
+}
+
+impl WebhooksFileConfig {
+    fn into_config(
+        self,
+        material_base: &Path,
+        dns: &DnsPolicyConfig,
+    ) -> Result<WebhookConfig, ConfigFileError> {
+        let defaults = WebhookConfig::default();
+        let delivery_defaults = self
+            .delivery
+            .map(|delivery| delivery.overlay(defaults.delivery_defaults))
+            .transpose()?
+            .unwrap_or(defaults.delivery_defaults);
+        let rules = self
+            .rules
+            .into_iter()
+            .map(|rule| rule.into_rule(material_base, dns, delivery_defaults))
+            .collect::<Result<Vec<_>, _>>()?;
+        let config = WebhookConfig {
+            max_in_flight: self.max_in_flight.unwrap_or(defaults.max_in_flight),
+            max_pending_deliveries: self
+                .max_pending_deliveries
+                .unwrap_or(defaults.max_pending_deliveries),
+            max_pending_bytes: self.max_pending_bytes.unwrap_or(defaults.max_pending_bytes),
+            shutdown_timeout: self
+                .shutdown_timeout_s
+                .map_or(defaults.shutdown_timeout, ConfigSeconds::duration),
+            delivery_defaults,
+            rules,
+        };
+        config
+            .validate()
+            .map_err(|error| ConfigFileError::Webhook(error.to_string()))?;
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookRuleFileConfig {
+    name: String,
+    when: WebhookWhenFileConfig,
+    target: WebhookTargetFileConfig,
+    delivery: Option<WebhookDeliveryFileConfig>,
+}
+
+impl WebhookRuleFileConfig {
+    fn into_rule(
+        self,
+        material_base: &Path,
+        dns: &DnsPolicyConfig,
+        delivery_defaults: DeliveryPolicy,
+    ) -> Result<WebhookRule, ConfigFileError> {
+        let name = canonical_config_name(&self.name)?;
+        let (when, interval) = self.when.into_matcher()?;
+        let target = self.target.into_target(material_base)?;
+        let delivery = self
+            .delivery
+            .map(|delivery| delivery.overlay(delivery_defaults))
+            .transpose()?
+            .unwrap_or(delivery_defaults);
+        if target.target_resolution == TargetResolutionMode::RouteOnly {
+            return Err(ConfigFileError::Webhook(format!(
+                "rule {name:?} cannot use target_resolution = \"route-only\""
+            )));
+        }
+        if target
+            .dns_policy
+            .as_ref()
+            .is_some_and(|policy| !dns.spec.plans.iter().any(|plan| &plan.id == policy))
+        {
+            return Err(ConfigFileError::Webhook(format!(
+                "rule {name:?} references an unknown DNS policy"
+            )));
+        }
+        Ok(WebhookRule {
+            name,
+            when,
+            interval,
+            target,
+            delivery,
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookWhenFileConfig {
+    events: Option<Vec<String>>,
+    #[serde(default)]
+    any: Vec<WebhookWhenBranchFileConfig>,
+    #[serde(default)]
+    outbounds: Vec<String>,
+    #[serde(default)]
+    inbounds: Vec<String>,
+    #[serde(default)]
+    balancers: Vec<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    transports: Vec<String>,
+    #[serde(default)]
+    from: Vec<String>,
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    field: Vec<String>,
+    #[serde(default)]
+    trigger: Vec<String>,
+    #[serde(default)]
+    probe_state_at_start: Vec<String>,
+    #[serde(default)]
+    outcome: Vec<String>,
+    initial: Option<bool>,
+    #[serde(default)]
+    changed: Vec<String>,
+    interval_s: Option<ConfigSeconds>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookWhenBranchFileConfig {
+    events: Vec<String>,
+    #[serde(default)]
+    from: Vec<String>,
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    field: Vec<String>,
+    #[serde(default)]
+    trigger: Vec<String>,
+    #[serde(default)]
+    probe_state_at_start: Vec<String>,
+    #[serde(default)]
+    outcome: Vec<String>,
+    initial: Option<bool>,
+    #[serde(default)]
+    changed: Vec<String>,
+}
+
+impl WebhookWhenFileConfig {
+    fn into_matcher(self) -> Result<(EventMatcher, Option<Duration>), ConfigFileError> {
+        if self.events.is_some() != self.any.is_empty() {
+            return Err(ConfigFileError::Webhook(
+                "when requires exactly one of events or any".to_string(),
+            ));
+        }
+        let sources = EventMatcher {
+            branches: Vec::new(),
+            outbounds: canonical_selector_names(self.outbounds, "outbound")?,
+            inbounds: canonical_selector_names(self.inbounds, "inbound")?,
+            balancers: canonical_selector_names(self.balancers, "balancer")?,
+            paths: canonical_selector_names(self.paths, "path")?,
+            transports: parse_transport_filters(self.transports)?,
+        };
+        let branches = if let Some(events) = self.events {
+            vec![
+                WebhookWhenBranchFileConfig {
+                    events,
+                    from: self.from,
+                    to: self.to,
+                    field: self.field,
+                    trigger: self.trigger,
+                    probe_state_at_start: self.probe_state_at_start,
+                    outcome: self.outcome,
+                    initial: self.initial,
+                    changed: self.changed,
+                }
+                .into_branch()?,
+            ]
+        } else {
+            if !self.from.is_empty()
+                || !self.to.is_empty()
+                || !self.field.is_empty()
+                || !self.trigger.is_empty()
+                || !self.probe_state_at_start.is_empty()
+                || !self.outcome.is_empty()
+                || self.initial.is_some()
+                || !self.changed.is_empty()
+            {
+                return Err(ConfigFileError::Webhook(
+                    "event-specific filters must be inside each when.any branch".to_string(),
+                ));
+            }
+            self.any
+                .into_iter()
+                .map(WebhookWhenBranchFileConfig::into_branch)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if branches.is_empty() {
+            return Err(ConfigFileError::Webhook(
+                "when must select at least one event".to_string(),
+            ));
+        }
+        let includes_interval = branches
+            .iter()
+            .any(|branch| branch.events.contains(&EventKind::PathInterval));
+        let interval = self.interval_s.map(ConfigSeconds::duration);
+        match (includes_interval, interval) {
+            (true, None) => {
+                return Err(ConfigFileError::Webhook(
+                    "path.interval requires when.interval_s".to_string(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(ConfigFileError::Webhook(
+                    "when.interval_s is only valid for path.interval".to_string(),
+                ));
+            }
+            (true, Some(value)) if value.is_zero() => {
+                return Err(ConfigFileError::Webhook(
+                    "when.interval_s must be positive".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        let mut matcher = sources;
+        matcher.branches = branches;
+        Ok((matcher, interval))
+    }
+}
+
+impl WebhookWhenBranchFileConfig {
+    fn into_branch(self) -> Result<EventMatcherBranch, ConfigFileError> {
+        let mut events = Vec::with_capacity(self.events.len());
+        for value in self.events {
+            let event = value
+                .parse::<EventKind>()
+                .map_err(|error| ConfigFileError::Webhook(error.to_string()))?;
+            if events.contains(&event) {
+                return Err(ConfigFileError::Webhook(format!(
+                    "duplicate event type {event} in when branch"
+                )));
+            }
+            events.push(event);
+        }
+        if events.is_empty() {
+            return Err(ConfigFileError::Webhook(
+                "each when.any branch requires one or more events".to_string(),
+            ));
+        }
+        let branch = EventMatcherBranch {
+            events,
+            from: self.from,
+            to: self.to,
+            field: self.field,
+            trigger: self.trigger,
+            probe_state_at_start: self.probe_state_at_start,
+            outcome: self.outcome,
+            initial: self.initial,
+            changed: self.changed,
+        };
+        validate_event_branch(&branch)?;
+        Ok(branch)
+    }
+}
+
+fn canonical_selector_names(
+    values: Vec<String>,
+    kind: &'static str,
+) -> Result<Vec<String>, ConfigFileError> {
+    let mut names = Vec::with_capacity(values.len());
+    for value in values {
+        let value = canonical_config_name(&value)?;
+        if names.contains(&value) {
+            return Err(ConfigFileError::Webhook(format!(
+                "duplicate {kind} selector {value:?}"
+            )));
+        }
+        names.push(value);
+    }
+    Ok(names)
+}
+
+fn parse_transport_filters(values: Vec<String>) -> Result<Vec<String>, ConfigFileError> {
+    let mut transports = Vec::with_capacity(values.len());
+    for value in values {
+        if !matches!(value.as_str(), "tcp" | "quic") {
+            return Err(ConfigFileError::Webhook(format!(
+                "unknown webhook transport {value:?}"
+            )));
+        }
+        if transports.contains(&value) {
+            return Err(ConfigFileError::Webhook(format!(
+                "duplicate webhook transport {value:?}"
+            )));
+        }
+        transports.push(value);
+    }
+    Ok(transports)
+}
+
+fn validate_event_branch(branch: &EventMatcherBranch) -> Result<(), ConfigFileError> {
+    let require = |present: bool, allowed: bool, field: &str| {
+        if present && !allowed {
+            Err(ConfigFileError::Webhook(format!(
+                "when.{field} is not supported for this event type"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    let mut from_to_values: Option<Vec<&'static str>> = None;
+    for event in &branch.events {
+        let values: Option<&'static [&'static str]> = match event {
+            EventKind::PathStateChanged => Some(&["unknown", "up", "down", "idle"]),
+            EventKind::PathPolicyChanged => Some(&["enabled", "suspect", "failed", "disabled"]),
+            EventKind::PathProbeCompleted => Some(&[]),
+            EventKind::PathInterval => Some(&[]),
+            EventKind::CarrierStateChanged => Some(&["ready", "draining", "closed"]),
+            EventKind::CarrierPolicyChanged => Some(&["available", "backup"]),
+            EventKind::CarrierAddressChanged => Some(&[]),
+            EventKind::SessionStateChanged => Some(&["attached", "detached", "retired"]),
+            EventKind::SessionPeerAddressesChanged => Some(&[]),
+            EventKind::NodeStateChanged => Some(&["ready", "stopping", "failed"]),
+            EventKind::BalancerMemberChanged => None,
+            EventKind::BalancerProbeCompleted => Some(&[]),
+        };
+        require(
+            !branch.from.is_empty() || !branch.to.is_empty(),
+            values.is_some() || *event == EventKind::BalancerMemberChanged,
+            "from/to",
+        )?;
+        require(
+            !branch.field.is_empty(),
+            *event == EventKind::BalancerMemberChanged,
+            "field",
+        )?;
+        require(
+            !branch.trigger.is_empty(),
+            matches!(
+                event,
+                EventKind::PathProbeCompleted | EventKind::BalancerProbeCompleted
+            ),
+            "trigger",
+        )?;
+        require(
+            !branch.probe_state_at_start.is_empty(),
+            *event == EventKind::PathProbeCompleted,
+            "probe_state_at_start",
+        )?;
+        require(
+            !branch.outcome.is_empty(),
+            matches!(
+                event,
+                EventKind::PathProbeCompleted | EventKind::BalancerProbeCompleted
+            ),
+            "outcome",
+        )?;
+        require(
+            branch.initial.is_some(),
+            matches!(
+                event,
+                EventKind::CarrierStateChanged
+                    | EventKind::CarrierAddressChanged
+                    | EventKind::SessionStateChanged
+                    | EventKind::SessionPeerAddressesChanged
+                    | EventKind::NodeStateChanged
+            ),
+            "initial",
+        )?;
+        require(
+            !branch.changed.is_empty(),
+            matches!(
+                event,
+                EventKind::CarrierAddressChanged | EventKind::SessionPeerAddressesChanged
+            ),
+            "changed",
+        )?;
+        if let Some(values) = values
+            && (!branch.from.is_empty() || !branch.to.is_empty())
+        {
+            if let Some(existing) = &from_to_values {
+                if existing != values {
+                    return Err(ConfigFileError::Webhook(
+                        "from/to filters cannot mix event types with different state values"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                from_to_values = Some(values.to_vec());
+            }
+        }
+    }
+
+    if branch.events.len() > 1
+        && (!branch.from.is_empty()
+            || !branch.to.is_empty()
+            || !branch.field.is_empty()
+            || !branch.trigger.is_empty()
+            || !branch.probe_state_at_start.is_empty()
+            || !branch.outcome.is_empty()
+            || branch.initial.is_some()
+            || !branch.changed.is_empty())
+    {
+        return Err(ConfigFileError::Webhook(
+            "event-specific filters require a branch with one event type".to_string(),
+        ));
+    }
+
+    if !branch.field.is_empty()
+        && branch
+            .field
+            .iter()
+            .any(|field| !matches!(field.as_str(), "health" | "mode"))
+    {
+        return Err(ConfigFileError::Webhook(
+            "balancer member field must be health or mode".to_string(),
+        ));
+    }
+    if branch.field.len() > 1 && branch.field[0] == branch.field[1] {
+        return Err(ConfigFileError::Webhook(
+            "duplicate balancer member field selector".to_string(),
+        ));
+    }
+    let allowed_from_to = if branch.events.contains(&EventKind::BalancerMemberChanged) {
+        let has_health =
+            branch.field.is_empty() || branch.field.iter().any(|field| field == "health");
+        let has_mode = branch.field.is_empty() || branch.field.iter().any(|field| field == "mode");
+        let mut values = Vec::new();
+        if has_health {
+            values.extend(["healthy", "unhealthy"]);
+        }
+        if has_mode {
+            values.extend(["enabled", "draining", "disabled"]);
+        }
+        Some(values)
+    } else {
+        from_to_values
+    };
+    if branch.from.iter().chain(&branch.to).any(|value| {
+        !allowed_from_to
+            .as_ref()
+            .is_some_and(|values| values.contains(&value.as_str()))
+    }) {
+        return Err(ConfigFileError::Webhook(
+            "when.from/to contains a value unsupported by the selected event".to_string(),
+        ));
+    }
+    if branch.changed.len() > 1 && branch.changed[0] == branch.changed[1] {
+        return Err(ConfigFileError::Webhook(
+            "duplicate changed address component".to_string(),
+        ));
+    }
+    let allowed_probe_states = ["unknown", "up", "down", "idle"];
+    if branch
+        .probe_state_at_start
+        .iter()
+        .any(|value| !allowed_probe_states.contains(&value.as_str()))
+    {
+        return Err(ConfigFileError::Webhook(
+            "probe_state_at_start must use a declared path state".to_string(),
+        ));
+    }
+    if branch
+        .outcome
+        .iter()
+        .any(|value| !matches!(value.as_str(), "success" | "failure" | "cancelled"))
+    {
+        return Err(ConfigFileError::Webhook(
+            "outcome must be success, failure, or cancelled".to_string(),
+        ));
+    }
+    for event in &branch.events {
+        if branch.trigger.iter().any(|trigger| !match event {
+            EventKind::PathProbeCompleted => matches!(trigger.as_str(), "periodic" | "reconcile"),
+            EventKind::BalancerProbeCompleted => trigger == "periodic",
+            _ => true,
+        }) {
+            return Err(ConfigFileError::Webhook(
+                "trigger contains a value unsupported by the selected event".to_string(),
+            ));
+        }
+    }
+    if branch
+        .changed
+        .iter()
+        .any(|component| !matches!(component.as_str(), "ip" | "port"))
+    {
+        return Err(ConfigFileError::Webhook(
+            "changed address components must be ip or port".to_string(),
+        ));
+    }
+    if branch
+        .events
+        .contains(&EventKind::SessionPeerAddressesChanged)
+        && branch.changed.iter().any(|component| component == "port")
+    {
+        return Err(ConfigFileError::Webhook(
+            "session peer-address changes support only the ip component".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookDeliveryFileConfig {
+    timeout_s: Option<ConfigSeconds>,
+    max_age_s: Option<ConfigSeconds>,
+    max_attempts: Option<u8>,
+    initial_backoff_s: Option<ConfigSeconds>,
+    max_backoff_s: Option<ConfigSeconds>,
+}
+
+impl WebhookDeliveryFileConfig {
+    fn overlay(self, base: DeliveryPolicy) -> Result<DeliveryPolicy, ConfigFileError> {
+        let max_attempts = self.max_attempts.unwrap_or(base.max_attempts);
+        if max_attempts <= 1 && (self.initial_backoff_s.is_some() || self.max_backoff_s.is_some()) {
+            return Err(ConfigFileError::Webhook(
+                "backoff options require max_attempts greater than one".to_string(),
+            ));
+        }
+        let policy = DeliveryPolicy {
+            timeout: self.timeout_s.map_or(base.timeout, ConfigSeconds::duration),
+            max_age: self.max_age_s.map_or(base.max_age, ConfigSeconds::duration),
+            max_attempts,
+            initial_backoff: self
+                .initial_backoff_s
+                .map_or(base.initial_backoff, ConfigSeconds::duration),
+            max_backoff: self
+                .max_backoff_s
+                .map_or(base.max_backoff, ConfigSeconds::duration),
+        };
+        policy
+            .validate()
+            .map_err(|error| ConfigFileError::Webhook(error.to_string()))?;
+        Ok(policy)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookTargetFileConfig {
+    url: String,
+    method: Option<String>,
+    outbound: Option<String>,
+    balancer: Option<String>,
+    target_resolution: Option<RoutingTargetResolutionFileValue>,
+    dns_policy: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, WebhookHeaderValueFile>,
+    #[serde(default)]
+    query: BTreeMap<String, String>,
+    json: Option<toml::Value>,
+    form: Option<BTreeMap<String, String>>,
+    text: Option<String>,
+    tls_ca_certificate: Option<MaterialSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WebhookHeaderValueFile {
+    Template(String),
+    Secret(MaterialSource),
+}
+
+impl WebhookTargetFileConfig {
+    fn into_target(self, material_base: &Path) -> Result<WebhookTarget, ConfigFileError> {
+        let method = self
+            .method
+            .as_deref()
+            .unwrap_or("POST")
+            .parse::<Method>()
+            .map_err(|_| ConfigFileError::Webhook("invalid HTTP method".to_string()))?;
+        if method == Method::CONNECT {
+            return Err(ConfigFileError::Webhook(
+                "CONNECT is not a supported webhook method".to_string(),
+            ));
+        }
+        let egress = match (self.outbound, self.balancer) {
+            (Some(outbound), None) => EgressRef::Outbound(
+                OutboundId::parse(&canonical_config_name(&outbound)?)
+                    .map_err(|error| ConfigFileError::Webhook(error.to_string()))?,
+            ),
+            (None, Some(balancer)) => EgressRef::Balancer(
+                BalancerId::parse(&canonical_config_name(&balancer)?)
+                    .map_err(|error| ConfigFileError::Webhook(error.to_string()))?,
+            ),
+            _ => {
+                return Err(ConfigFileError::Webhook(
+                    "webhook target requires exactly one of outbound or balancer".to_string(),
+                ));
+            }
+        };
+        let dns_policy = self
+            .dns_policy
+            .as_deref()
+            .map(canonical_config_name)
+            .transpose()?
+            .map(|name| {
+                crate::product::DnsPlanId::parse(&name)
+                    .map_err(|error| ConfigFileError::Webhook(error.to_string()))
+            })
+            .transpose()?;
+        let target_resolution = self
+            .target_resolution
+            .map(RoutingTargetResolutionFileValue::into_mode)
+            .unwrap_or(TargetResolutionMode::FullResolve);
+
+        let query = self
+            .query
+            .into_iter()
+            .map(|(name, value)| {
+                if name.is_empty() || name.bytes().any(|byte| byte.is_ascii_control()) {
+                    return Err(ConfigFileError::Webhook(
+                        "webhook query keys must be non-empty and contain no controls".to_string(),
+                    ));
+                }
+                Ok(QueryTemplate {
+                    name,
+                    value: Template::compile(&value)
+                        .map_err(|error| ConfigFileError::Webhook(error.to_string()))?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let url = WebhookUrl::parse(&self.url, query)
+            .map_err(|error| ConfigFileError::Webhook(error.to_string()))?;
+
+        let mut headers = Vec::with_capacity(self.headers.len());
+        for (name, value) in self.headers {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ConfigFileError::Webhook("invalid HTTP header name".to_string()))?;
+            if matches!(
+                name.as_str(),
+                "host"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "upgrade"
+                    | "te"
+                    | "trailer"
+                    | "proxy-authorization"
+                    | "proxy-connection"
+                    | "content-type"
+            ) {
+                return Err(ConfigFileError::Webhook(format!(
+                    "header {:?} is managed by the webhook client",
+                    name.as_str()
+                )));
+            }
+            let value = match value {
+                WebhookHeaderValueFile::Template(value) => HeaderValueTemplate::Template(
+                    Template::compile(&value)
+                        .map_err(|error| ConfigFileError::Webhook(error.to_string()))?,
+                ),
+                WebhookHeaderValueFile::Secret(source) => {
+                    let bytes = source
+                        .resolve(material_base, "webhook header")
+                        .map_err(ConfigFileError::MaterialSource)?
+                        .into_bytes();
+                    HeaderValue::from_bytes(&bytes).map_err(|_| {
+                        ConfigFileError::Webhook(
+                            "webhook secret is not a valid header value".to_string(),
+                        )
+                    })?;
+                    HeaderValueTemplate::Secret(Arc::from(bytes))
+                }
+            };
+            headers.push(WebhookHeader { name, value });
+        }
+
+        let bodies_selected = self.json.is_some() as usize
+            + self.form.is_some() as usize
+            + self.text.is_some() as usize;
+        if bodies_selected > 1 {
+            return Err(ConfigFileError::Webhook(
+                "target may set only one of json, form, or text".to_string(),
+            ));
+        }
+        let body = match (self.json, self.form, self.text) {
+            (Some(value), None, None) => {
+                let value = serde_json::to_value(value)
+                    .map_err(|_| ConfigFileError::Webhook("invalid JSON template".to_string()))?;
+                WebhookBody::Json(
+                    JsonTemplate::compile(value)
+                        .map_err(|error| ConfigFileError::Webhook(error.to_string()))?,
+                )
+            }
+            (None, Some(values), None) => WebhookBody::Form(
+                values
+                    .into_iter()
+                    .map(|(name, value)| {
+                        Ok(FormTemplate {
+                            name,
+                            value: Template::compile(&value)
+                                .map_err(|error| ConfigFileError::Webhook(error.to_string()))?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ConfigFileError>>()?,
+            ),
+            (None, None, Some(value)) => WebhookBody::Text(
+                Template::compile(&value)
+                    .map_err(|error| ConfigFileError::Webhook(error.to_string()))?,
+            ),
+            (None, None, None) if matches!(method, Method::GET | Method::HEAD) => WebhookBody::None,
+            (None, None, None) if matches!(method, Method::POST | Method::PUT | Method::PATCH) => {
+                WebhookBody::StandardEvent
+            }
+            (None, None, None) => WebhookBody::None,
+            _ => unreachable!("body mode count was checked"),
+        };
+        let tls_roots = self
+            .tls_ca_certificate
+            .as_ref()
+            .map(|source| {
+                load_certificates_from_source(
+                    material_base,
+                    source,
+                    "webhook additional TLS CA certificate",
+                )
+            })
+            .transpose()?;
+        Ok(WebhookTarget {
+            url,
+            method,
+            egress,
+            dns_policy,
+            target_resolution,
+            headers,
+            body,
+            tls_roots: tls_roots.unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3881,6 +4631,7 @@ pub enum ConfigFileError {
     RoutingPolicy(String),
     RoutingValue(String),
     RuleSet(String),
+    Webhook(String),
     DnsPolicy(String),
     DnsValue(String),
     DirectBindFieldConflict,
@@ -3997,6 +4748,7 @@ impl std::fmt::Display for ConfigFileError {
             Self::RoutingPolicy(error) => write!(f, "{error}"),
             Self::RoutingValue(error) => write!(f, "invalid routing value: {error}"),
             Self::RuleSet(error) => write!(f, "invalid routing rule set: {error}"),
+            Self::Webhook(error) => write!(f, "invalid webhook configuration: {error}"),
             Self::DnsPolicy(error) => write!(f, "invalid DNS policy: {error}"),
             Self::DnsValue(error) => write!(f, "invalid DNS value: {error}"),
             Self::DirectBindFieldConflict => write!(
@@ -4080,6 +4832,7 @@ impl std::error::Error for ConfigFileError {
             | Self::RoutingPolicy(_)
             | Self::RoutingValue(_)
             | Self::RuleSet(_)
+            | Self::Webhook(_)
             | Self::DnsPolicy(_)
             | Self::DnsValue(_)
             | Self::DirectBindFieldConflict

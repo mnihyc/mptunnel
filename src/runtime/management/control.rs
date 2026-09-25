@@ -218,6 +218,18 @@ fn set_client_path_state(
             }
         }
     });
+    // Keep commit ordering through publication: a concurrent control update
+    // must not publish an older policy after a newer one.
+    context.update_webhook_path_policy(
+        context.udp_path_ordinals[index],
+        match state {
+            PathControlState::Enabled => "enabled",
+            PathControlState::Suspect => "suspect",
+            PathControlState::Failed => "failed",
+            PathControlState::Disabled => "disabled",
+        },
+        "management",
+    );
     Ok(())
 }
 

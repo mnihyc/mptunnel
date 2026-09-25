@@ -1,5 +1,69 @@
 use super::*;
 
+fn webhook_matcher(event: EventKind) -> crate::webhook::EventMatcher {
+    crate::webhook::EventMatcher {
+        branches: vec![crate::webhook::EventMatcherBranch {
+            events: vec![event],
+            ..crate::webhook::EventMatcherBranch::default()
+        }],
+        ..crate::webhook::EventMatcher::default()
+    }
+}
+
+#[test]
+fn webhook_source_selectors_reject_fields_absent_from_session_and_node_events() {
+    let mut session_paths = webhook_matcher(EventKind::SessionStateChanged);
+    session_paths.paths.push("wan".to_owned());
+    assert!(validate_webhook_source_shape(&session_paths, "test").is_err());
+
+    let mut session_transports = webhook_matcher(EventKind::SessionPeerAddressesChanged);
+    session_transports.transports.push("quic".to_owned());
+    assert!(validate_webhook_source_shape(&session_transports, "test").is_err());
+
+    let mut node_inbounds = webhook_matcher(EventKind::NodeStateChanged);
+    node_inbounds.inbounds.push("server".to_owned());
+    assert!(validate_webhook_source_shape(&node_inbounds, "test").is_err());
+}
+
+#[test]
+fn webhook_carrier_and_session_outbound_sources_must_be_mpp() {
+    let native = OutboundLeafConfig::Local {
+        id: OutboundId::parse("native").expect("outbound ID"),
+        config: OutboundConfig::Direct,
+        connect_timeout: Duration::from_secs(10),
+    };
+    let outbounds = HashMap::from([("native", &native)]);
+
+    for event in [
+        EventKind::CarrierStateChanged,
+        EventKind::SessionStateChanged,
+    ] {
+        let mut matcher = webhook_matcher(event);
+        matcher.outbounds.push("native".to_owned());
+        validate_webhook_source_shape(&matcher, "test").expect("selector has valid shape");
+        assert!(validate_webhook_source_outbound_types(&matcher, "test", &outbounds).is_err());
+    }
+}
+
+#[test]
+fn webhook_address_metadata_templates_are_limited_to_carrier_address_events() {
+    let mut matcher = webhook_matcher(EventKind::CarrierAddressChanged);
+    matcher.outbounds.push("edge".to_owned());
+    for field in ["change.skipped_revisions", "change.coalesced"] {
+        assert!(template_field_is_known(field));
+        assert!(template_field_available(
+            field,
+            EventKind::CarrierAddressChanged,
+            &matcher
+        ));
+        assert!(!template_field_available(
+            field,
+            EventKind::SessionPeerAddressesChanged,
+            &matcher
+        ));
+    }
+}
+
 fn managed_tun(route_mode: crate::platform::RouteMode) -> crate::ingress::tun::TunL4Config {
     use crate::ingress::tun::{ManagedVpnConfig, ManagedVpnPlatformConfig, TunHostConfig};
 

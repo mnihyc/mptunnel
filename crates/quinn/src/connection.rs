@@ -6,30 +6,29 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
-    task::{Context, Poll, Waker, ready},
+    task::{ready, Context, Poll, Waker},
 };
 
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
-use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
-use tracing::{Instrument, Span, debug_span};
+use tokio::sync::{futures::Notified, mpsc, oneshot, Notify};
+use tracing::{debug_span, Instrument, Span};
 
 use crate::{
-    ConnectionEvent, Duration, Instant, VarInt,
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
     send_stream::SendStream,
-    udp_transmit,
+    udp_transmit, ConnectionEvent, Duration, Instant, VarInt,
 };
 use proto::{
-    ActivePathSnapshot, ClosedStream, ConnectionError, ConnectionHandle, ConnectionStats, Dir,
-    EndpointEvent, Side, StreamEvent, StreamId, congestion::Controller,
+    congestion::Controller, ActivePathSnapshot, ClosedStream, ConnectionError, ConnectionHandle,
+    ConnectionStats, Dir, EndpointEvent, Side, StreamEvent, StreamId,
 };
 
 #[cfg(all(
@@ -652,6 +651,44 @@ impl Connection {
         self.0.state.lock("remote_address").inner.remote_address()
     }
 
+    /// Last validated peer address and a monotonically increasing revision.
+    /// Provisional migration and failed validation never replace this value.
+    pub fn validated_remote_address(&self) -> Option<(u64, SocketAddr)> {
+        self.0
+            .state
+            .lock("validated_remote_address")
+            .inner
+            .validated_remote_address()
+    }
+
+    /// Wait for a confirmed peer-address observation newer than `after_revision`.
+    ///
+    /// Initial validation is revision one. This is a latest-state notification:
+    /// a slow consumer can observe a revision gap when successive validations
+    /// coalesce. No timer or packet polling is installed by this future.
+    pub async fn validated_remote_address_changed(
+        &self,
+        after_revision: u64,
+    ) -> Result<(u64, SocketAddr), ConnectionError> {
+        loop {
+            let notified = {
+                let state = self.0.state.lock("validated_remote_address_changed");
+                if let Some(observation) = state.inner.validated_remote_address() {
+                    if observation.0 > after_revision {
+                        return Ok(observation);
+                    }
+                }
+                if let Some(error) = &state.error {
+                    return Err(error.clone());
+                }
+                // Register while holding the driver lock, so neither a path
+                // confirmation nor connection termination can be missed.
+                self.0.shared.validated_remote_changed.notified()
+            };
+            notified.await;
+        }
+    }
+
     /// The local IP address which was used when the peer established
     /// the connection
     ///
@@ -1170,6 +1207,7 @@ pub(crate) struct Shared {
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     closed: Notify,
+    validated_remote_changed: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
     ref_count: AtomicUsize,
 }
@@ -1335,6 +1373,7 @@ impl State {
                 }
                 Connected => {
                     self.connected = true;
+                    shared.validated_remote_changed.notify_waiters();
                     if let Some(x) = self.on_connected.take() {
                         // We don't care if the on-connected future was dropped
                         let _ = x.send(self.inner.accepted_0rtt());
@@ -1349,6 +1388,9 @@ impl State {
                 }
                 ConnectionLost { reason } => {
                     self.terminate(reason, shared);
+                }
+                ValidatedRemoteAddressChanged => {
+                    shared.validated_remote_changed.notify_waiters();
                 }
                 Stream(StreamEvent::Writable { id }) => wake_stream(id, &mut self.blocked_writers),
                 Stream(StreamEvent::PacketizationChanged { id }) => {
@@ -1462,6 +1504,7 @@ impl State {
         wake_all_notify(&mut self.stopped);
         wake_all_notify(&mut self.packetization_observers);
         shared.closed.notify_waiters();
+        shared.validated_remote_changed.notify_waiters();
     }
 
     fn close(&mut self, error_code: VarInt, reason: Bytes, shared: &Shared) {

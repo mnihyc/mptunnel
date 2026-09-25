@@ -468,19 +468,13 @@ fn require_external_tun_host(config: &AppConfig) -> Result<(), RuntimeError> {
 
 fn require_protectable_vpn_dns(config: &AppConfig) -> Result<(), RuntimeError> {
     let CommandConfig::Node(node) = &config.command;
-    let route_dns_plans = node
-        .product_policy
-        .iter()
-        .flat_map(|policy| &policy.routes)
-        .filter_map(|rule| rule.action.dns_plan());
-    let (dns_policy, dns_activation) =
-        node.dns_policy
-            .compile_active(route_dns_plans)
-            .map_err(|error| {
-                RuntimeError::ProductPolicy(format!(
-                    "invalid DNS policy for catch-all embedded VPN: {error}"
-                ))
-            })?;
+    let active = node.compile_active_graph().map_err(|error| {
+        RuntimeError::ProductPolicy(format!(
+            "invalid policy for catch-all embedded VPN: {error}"
+        ))
+    })?;
+    let dns_policy = active.dns_policy;
+    let dns_activation = active.dns_activation;
     if dns_policy.uses_system_resolution_for_activation(&dns_activation) {
         return Err(RuntimeError::ProductPolicy(
             VPN_HOST_SYSTEM_DNS_ERROR.to_string(),
@@ -553,6 +547,7 @@ pub(crate) enum RuntimeGenerationOutcome {
 
 /// Returns the first service result or requested terminal action after joining
 /// every task owned by this runtime generation.
+#[cfg(test)]
 pub(super) async fn supervise_runtime_services(
     mut services: JoinSet<Result<(), RuntimeError>>,
     generation: &RuntimeGenerationControl,

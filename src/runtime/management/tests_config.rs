@@ -173,6 +173,7 @@ fn target_from_document(
     )
     .expect("client context");
     let target = ManagementTarget {
+        webhooks: Default::default(),
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),

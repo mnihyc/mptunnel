@@ -1971,6 +1971,7 @@ async fn tcp_native_carrier_loss_preserves_the_session_and_allows_reconnect() {
             &client,
             crate::config::DEFAULT_PATH_PROBE_INTERVAL,
             &mut retry,
+            crate::runtime::path::WebhookProbeTrigger::Reconcile,
         ),
     )
     .await
@@ -2040,6 +2041,7 @@ async fn tcp_native_carrier_loss_preserves_the_session_and_allows_reconnect() {
             &client,
             crate::config::DEFAULT_PATH_PROBE_INTERVAL,
             &mut retry,
+            crate::runtime::path::WebhookProbeTrigger::Reconcile,
         ),
     )
     .await

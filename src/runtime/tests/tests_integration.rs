@@ -26,6 +26,7 @@ fn spawn_tcp_pool_reconciliation(context: &ClientPathContext) -> tokio::task::Jo
                 &context,
                 crate::config::DEFAULT_PATH_PROBE_INTERVAL,
                 &mut retry,
+                crate::runtime::path::WebhookProbeTrigger::Reconcile,
             )
             .await;
     })
@@ -4795,4 +4796,162 @@ async fn assert_tcp_server_rejects_wrong_mpp_credential(transport_secret: Option
 async fn tcp_server_keeps_transport_and_mpp_credentials_separate() {
     assert_tcp_server_rejects_wrong_mpp_credential(None).await;
     assert_tcp_server_rejects_wrong_mpp_credential(Some([0x5a; 32])).await;
+}
+
+#[tokio::test]
+async fn webhook_posts_body_and_reads_status_over_an_mpp_outbound() {
+    use crate::config::{EgressRef, WebhookConfig};
+    use crate::product::{OutboundId, TargetResolutionMode};
+    use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
+    use crate::runtime::webhook::WebhookRuntime;
+    use crate::webhook::{
+        DeliveryPolicy, EventKind, EventMatcher, EventMatcherBranch, WebhookBody, WebhookRule,
+        WebhookTarget, WebhookUrl,
+    };
+
+    async fn read_complete_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::with_capacity(2048);
+        loop {
+            let mut chunk = [0u8; 2048];
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("read callback request");
+            assert_ne!(read, 0, "callback closed before the request body arrived");
+            request.extend_from_slice(&chunk[..read]);
+            assert!(request.len() <= 64 * 1024, "callback request is bounded");
+            let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>().expect("content length"))
+                .unwrap_or(0);
+            if request.len() >= headers_end + 4 + content_length {
+                return request;
+            }
+        }
+    }
+
+    let callback_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind webhook callback");
+    let callback_address = callback_listener.local_addr().expect("callback address");
+    let (request_tx, request_rx) = oneshot::channel();
+    let callback = tokio::spawn(async move {
+        let (mut stream, _) = callback_listener
+            .accept()
+            .await
+            .expect("accept webhook callback");
+        let request = read_complete_request(&mut stream).await;
+        request_tx.send(request).expect("return callback request");
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write callback status");
+        stream.shutdown().await.expect("close callback connection");
+    });
+
+    let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
+    let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
+        .expect("MPP outbound context");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
+
+    let outbound_id = OutboundId::parse("webhook-mpp").expect("outbound ID");
+    let registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Mpp {
+            id: outbound_id.clone(),
+            context,
+            performance: MppPerformanceConfig::default(),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("MPP webhook registry");
+    let target = WebhookTarget {
+        url: WebhookUrl::parse(&format!("http://{callback_address}/callback"), Vec::new())
+            .expect("callback URL"),
+        method: ::http::Method::POST,
+        egress: EgressRef::Outbound(outbound_id),
+        dns_policy: None,
+        target_resolution: TargetResolutionMode::FullResolve,
+        headers: Vec::new(),
+        body: WebhookBody::StandardEvent,
+        tls_roots: Vec::new(),
+    };
+    let config = WebhookConfig {
+        max_in_flight: 1,
+        max_pending_deliveries: 8,
+        max_pending_bytes: 64 * 1024,
+        rules: vec![WebhookRule {
+            name: "mpp-callback".to_owned(),
+            when: EventMatcher {
+                branches: vec![EventMatcherBranch {
+                    events: vec![EventKind::NodeStateChanged],
+                    ..EventMatcherBranch::default()
+                }],
+                ..EventMatcher::default()
+            },
+            interval: None,
+            target,
+            delivery: DeliveryPolicy::default(),
+        }],
+        ..WebhookConfig::default()
+    };
+    let generation = RuntimeGenerationControl::new();
+    generation.mark_ready();
+    let mut runtime =
+        WebhookRuntime::start(config, registry, generation).expect("start MPP webhook runtime");
+
+    let request = tokio::time::timeout(Duration::from_secs(8), request_rx)
+        .await
+        .expect("callback request timeout")
+        .expect("callback request channel");
+    assert!(request.starts_with(b"POST /callback HTTP/1.1\r\n"));
+    assert!(
+        request
+            .windows(b"MPTUNNEL-Event-ID:".len())
+            .any(|window| window.eq_ignore_ascii_case(b"MPTUNNEL-Event-ID:"))
+    );
+    let headers_end = request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .expect("request headers");
+    let headers = String::from_utf8_lossy(&request[..headers_end]);
+    let content_length = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim().parse::<usize>().expect("content length"))
+        .expect("JSON content length");
+    let body_start = headers_end + 4;
+    let body_end = body_start + content_length;
+    let body: serde_json::Value =
+        serde_json::from_slice(&request[body_start..body_end]).expect("standard event JSON body");
+    assert_eq!(body["event"]["type"], "node.state_changed");
+    assert_eq!(body["node"]["state"], "ready");
+    assert_eq!(body["event"]["initial"], true);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime.stats_handle().snapshot().delivered != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("204 response delivery accounting");
+    callback.await.expect("callback task");
+    runtime
+        .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert_eq!(runtime.stats_handle().snapshot().delivered, 1);
+
+    tokio::time::timeout(Duration::from_secs(5), server_path)
+        .await
+        .expect("MPP relay/session cleanup timeout")
+        .expect("MPP server task join")
+        .expect("MPP server session cleanup");
 }

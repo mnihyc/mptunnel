@@ -9,6 +9,7 @@ use crate::model::timing::path_open_timeout;
 use crate::protocol::{PathId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
+use crate::runtime::path::WebhookProbeTrigger;
 use crate::runtime::path::model::path_record_failure_cooldown;
 use crate::scheduler::PathState as SchedulerPathState;
 use crate::transport::TcpCarrierRange;
@@ -398,6 +399,7 @@ impl ClientTcpCarrierGroups {
         context: &ClientPathContext,
         retry_interval: Duration,
         retry: &mut [ClientTcpMemberRetry],
+        probe_trigger: WebhookProbeTrigger,
     ) {
         if context.ensure_session_active().is_err() {
             return;
@@ -466,10 +468,11 @@ impl ClientTcpCarrierGroups {
                 establishment_attempts.spawn(async move {
                     let deadline = tokio::time::Instant::now() + connect_timeout;
                     session
-                        .prepare_connection_for_endpoint_generation_on_port(
+                        .prepare_connection_for_endpoint_generation_on_port_with_probe(
                             deadline,
                             policy_snapshot.generation,
                             None,
+                            Some(probe_trigger),
                         )
                         .await
                 });
@@ -594,10 +597,11 @@ impl ClientTcpCarrierGroups {
                         member_ordinal,
                         interval,
                         session
-                            .replace_connection_for_endpoint_generation(
+                            .replace_connection_for_endpoint_generation_with_probe(
                                 deadline,
                                 policy_snapshot.generation,
                                 remote_port,
+                                probe_trigger,
                             )
                             .await,
                     )
@@ -743,10 +747,29 @@ impl ClientPathContext {
             });
         }
         drop(health);
+
+        if let Some(path_index) = group.members.first()
+            && let Some(config_ordinal) = self.tcp_path_ordinals.get(*path_index)
+        {
+            self.update_webhook_path_policy(
+                *config_ordinal,
+                tcp_control_policy_name(state),
+                "management",
+            );
+        }
         drop(_policy_commitment);
 
         // Control transitions wake the endpoint's bounded-pool reconciler.
         // Only Disabled forbids establishment; Failed remains health evidence.
         self.tcp_carrier_groups.publish_change();
+    }
+}
+
+const fn tcp_control_policy_name(state: ClientTcpEndpointControlState) -> &'static str {
+    match state {
+        ClientTcpEndpointControlState::Enabled => "enabled",
+        ClientTcpEndpointControlState::Suspect => "suspect",
+        ClientTcpEndpointControlState::Failed => "failed",
+        ClientTcpEndpointControlState::Disabled => "disabled",
     }
 }

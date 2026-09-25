@@ -6,7 +6,8 @@
 
 use crate::protocol::CloseReason;
 use crate::runtime::error::RuntimeError;
-use std::sync::{Arc, Mutex};
+use crate::runtime::path::ClientPathWebhookObserver;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::watch;
 
 #[derive(Clone)]
@@ -23,6 +24,7 @@ struct ClientSessionLifecycleInner {
     /// protected closures must stay synchronous and bounded.
     commitment: Mutex<()>,
     retirement: watch::Sender<Option<CloseReason>>,
+    webhook_observer: OnceLock<Arc<ClientPathWebhookObserver>>,
 }
 
 impl ClientSessionLifecycle {
@@ -32,6 +34,7 @@ impl ClientSessionLifecycle {
                 execution_domain: quinn::ExecutionDomain::default(),
                 commitment: Mutex::new(()),
                 retirement: watch::channel(None).0,
+                webhook_observer: OnceLock::new(),
             }),
         }
     }
@@ -67,7 +70,17 @@ impl ClientSessionLifecycle {
             return existing;
         }
         self.inner.retirement.send_replace(Some(reason));
+        if let Some(observer) = self.inner.webhook_observer.get() {
+            observer.retire_session(close_reason_name(reason));
+        }
         reason
+    }
+
+    pub(in crate::runtime) fn attach_webhook_observer(
+        &self,
+        observer: Arc<ClientPathWebhookObserver>,
+    ) {
+        let _ = self.inner.webhook_observer.set(observer);
     }
 
     /// Linearizes a readiness or Product-admission publication against the
@@ -86,6 +99,15 @@ impl ClientSessionLifecycle {
             return Err(reason);
         }
         Ok(commit())
+    }
+}
+
+const fn close_reason_name(reason: CloseReason) -> &'static str {
+    match reason {
+        CloseReason::Normal => "normal",
+        CloseReason::ProtocolError => "protocol_error",
+        CloseReason::AuthenticationFailed => "authentication_failed",
+        CloseReason::PolicyRejected => "policy_rejected",
     }
 }
 

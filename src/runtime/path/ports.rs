@@ -661,7 +661,7 @@ pub(in crate::runtime) struct ServerStreamManagementSnapshot {
     pub(in crate::runtime) sessions: Vec<ServerSessionManagementSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::runtime) struct ServerCarrierPathIdentity {
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) underlay: UnderlayProtocol,
@@ -887,6 +887,40 @@ impl ServerPathValidation {
 }
 
 impl ServerCarrierPathRegistration {
+    /// Called only after readiness bytes have been accepted and flushed.
+    pub(in crate::runtime) fn publish_ready(
+        &self,
+        local: Option<SocketAddr>,
+        validated_peer: Option<(u64, SocketAddr)>,
+    ) {
+        if !self.inner.backend.webhook_enabled() {
+            return;
+        }
+        let (revision, peer) = match validated_peer {
+            Some((revision, peer)) => (revision, Some(peer)),
+            None => (
+                0,
+                self.inner
+                    .observed_ingress
+                    .as_ref()
+                    .map(|observed| observed.peer.current()),
+            ),
+        };
+        self.inner
+            .backend
+            .carrier_ready(self.inner.identity, local, peer, revision);
+    }
+    pub(in crate::runtime) fn publish_peer_address(&self, peer: SocketAddr, revision: u64) {
+        self.inner
+            .backend
+            .carrier_peer_address(self.inner.identity, peer, revision);
+    }
+    pub(in crate::runtime) fn retirement_reason(&self, reason: &'static str) {
+        self.inner
+            .backend
+            .carrier_retirement_reason(self.inner.identity, reason);
+    }
+
     pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
         self.inner.identity.path_instance_id
     }
@@ -1084,6 +1118,41 @@ type ServerStreamPortFuture<'a, T> =
 pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
     fn owner_token(&self) -> usize;
 
+    fn attach_webhook_publisher(
+        &self,
+        _publisher: crate::runtime::webhook::EventPublisher,
+        _inbound: String,
+        _paths: Arc<Vec<String>>,
+    ) {
+    }
+    fn webhook_enabled(&self) -> bool {
+        false
+    }
+    fn webhook_addresses_interested(&self) -> bool {
+        false
+    }
+    fn carrier_ready(
+        &self,
+        _identity: ServerCarrierPathIdentity,
+        _local: Option<SocketAddr>,
+        _peer: Option<SocketAddr>,
+        _revision: u64,
+    ) {
+    }
+    fn carrier_peer_address(
+        &self,
+        _identity: ServerCarrierPathIdentity,
+        _peer: SocketAddr,
+        _revision: u64,
+    ) {
+    }
+    fn carrier_retirement_reason(
+        &self,
+        _identity: ServerCarrierPathIdentity,
+        _reason: &'static str,
+    ) {
+    }
+
     // This port is the ownership handoff for one authenticated carrier; keeping
     // the fields explicit avoids a second, partially initialized identity type.
     #[allow(clippy::too_many_arguments)]
@@ -1235,6 +1304,22 @@ impl std::fmt::Debug for ServerStreamPort {
 }
 
 impl ServerStreamPort {
+    pub(in crate::runtime) fn webhook_enabled(&self) -> bool {
+        self.backend.webhook_enabled()
+    }
+    pub(in crate::runtime) fn attach_webhook_publisher(
+        &self,
+        publisher: crate::runtime::webhook::EventPublisher,
+        inbound: String,
+        paths: Arc<Vec<String>>,
+    ) {
+        self.backend
+            .attach_webhook_publisher(publisher, inbound, paths);
+    }
+    pub(in crate::runtime) fn webhook_addresses_interested(&self) -> bool {
+        self.backend.webhook_addresses_interested()
+    }
+
     pub(in crate::runtime) fn new(backend: Arc<dyn ServerStreamPortBackend>) -> Self {
         let owner_token = backend.owner_token();
         Self {

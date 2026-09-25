@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
@@ -38,6 +39,8 @@ pub(crate) struct RuntimeGenerationControl {
     status: watch::Sender<RuntimeGenerationStatus>,
     stop: watch::Sender<Option<RuntimeGenerationStopReason>>,
     retirement_authorized: watch::Sender<bool>,
+    activation_deferred: Arc<AtomicBool>,
+    activated: watch::Sender<bool>,
 }
 
 impl RuntimeGenerationControl {
@@ -52,6 +55,8 @@ impl RuntimeGenerationControl {
             status,
             stop,
             retirement_authorized,
+            activation_deferred: Arc::new(AtomicBool::new(false)),
+            activated: watch::channel(false).0,
         }
     }
 
@@ -61,6 +66,61 @@ impl RuntimeGenerationControl {
 
     pub(crate) fn is_ready(&self) -> bool {
         self.status.borrow().phase == RuntimeGenerationPhase::Ready
+    }
+
+    /// Canonical configuration and managed host publication must commit before
+    /// observers may create external side effects. Call before starting runtime.
+    pub(crate) fn defer_activation(&self) {
+        self.activation_deferred.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_activated(&self) -> bool {
+        *self.activated.borrow()
+    }
+
+    /// Linearizes publication against the terminal phase under the status read
+    /// guard. Readiness by itself never activates a deferred candidate.
+    pub(crate) fn activate(&self) -> bool {
+        let status = self.status.borrow();
+        if status.phase != RuntimeGenerationPhase::Ready {
+            return false;
+        }
+        self.activated.send_if_modified(|activated| {
+            if *activated {
+                false
+            } else {
+                *activated = true;
+                true
+            }
+        })
+    }
+
+    pub(crate) async fn wait_until_activated(&self) -> Result<(), RuntimeGenerationReadinessError> {
+        let mut activated = self.activated.subscribe();
+        let mut status = self.status.subscribe();
+        loop {
+            let current = status.borrow_and_update().clone();
+            match current.phase {
+                RuntimeGenerationPhase::Stopping => {
+                    return Err(RuntimeGenerationReadinessError::Stopping);
+                }
+                RuntimeGenerationPhase::Failed => {
+                    return Err(RuntimeGenerationReadinessError::Failed(current.failure));
+                }
+                RuntimeGenerationPhase::Starting | RuntimeGenerationPhase::Ready => {}
+            }
+            if *activated.borrow_and_update() {
+                return Ok(());
+            }
+            tokio::select! {
+                changed = activated.changed() => {
+                    changed.map_err(|_| RuntimeGenerationReadinessError::Closed)?;
+                }
+                changed = status.changed() => {
+                    changed.map_err(|_| RuntimeGenerationReadinessError::Closed)?;
+                }
+            }
+        }
     }
 
     pub(crate) async fn wait_until_ready(&self) -> Result<(), RuntimeGenerationReadinessError> {
@@ -188,6 +248,9 @@ impl RuntimeGenerationControl {
                 false
             }
         });
+        if !self.activation_deferred.load(Ordering::Acquire) {
+            self.activate();
+        }
     }
 }
 

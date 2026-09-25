@@ -24,6 +24,8 @@ fn publish_tcp_carrier(state: &ClientPathState, path_index: usize, path_id: Path
             peer_usage_sequence: 0,
             peer_usage: PathUsage::Available,
             readiness_rtt: None,
+            local_addr: None,
+            peer_addr: None,
         },
         || {},
     );

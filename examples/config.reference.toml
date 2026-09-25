@@ -1012,3 +1012,33 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # separately accounted from user flows. After a target connection or datagram
 # association commits, MPTUNNEL reports its outcome but never transparently
 # replays the flow through another balancer member.
+
+# Optional lifecycle HTTP callbacks. No rules means no worker or interval timer.
+# Events, typed filters, examples and delivery semantics: docs/WEBHOOKS.md.
+# [webhooks]
+# max_in_flight = 4
+# max_pending_deliveries = 256
+# max_pending_bytes = 1048576
+# shutdown_timeout_s = 2       # best-effort drain; 0 cancels immediately
+# [webhooks.delivery]         # shared defaults; rules override only differences
+# timeout_s = 10              # whole attempt including DNS/connect
+# max_age_s = 30              # includes queueing and retry waits
+# max_attempts = 1            # no retry by default; supported range 1..5
+# initial_backoff_s = 1       # positive when retries enabled
+# max_backoff_s = 5
+# [[webhooks.rules]]
+# name = "path-availability"
+# [webhooks.rules.when]
+# events = ["path.state_changed"]
+# outbounds = ["edge-mpp"]    # local configured outbound name
+# to = ["up", "down"]
+# [webhooks.rules.target]
+# url = "https://notify.example.net/mpp"
+# outbound = "direct-egress" # exactly one of outbound or balancer; enable its example above
+# method = "POST"            # default body is the versioned JSON event
+# target_resolution = "full-resolve" # or as-is with compatible proxy/MPP
+# dns_policy = "system"      # active DNS policy; omit to follow configured split DNS
+# headers = { Authorization = { from = "file", path = "notify-authorization.txt" } }
+# json = { event = "{event.type}", path = "{path.name}", state = "{change.to}" }
+# [webhooks.rules.delivery]
+# max_age_s = 60

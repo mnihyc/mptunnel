@@ -29,6 +29,7 @@ use crate::protocol::{
     TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::WebhookProbeTrigger;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::model::{path_startup_snapshot, path_startup_snapshot_for_instance};
@@ -302,6 +303,7 @@ struct ClientUdpCandidateClaim {
 enum ClientUdpEnsureMode {
     Demand,
     Reconciliation,
+    Probe(WebhookProbeTrigger, Option<CarrierPathInstanceId>),
 }
 
 impl ClientUdpCandidateClaim {
@@ -436,7 +438,20 @@ impl ClientUdpPathSessionHandle {
         &self,
         open_deadline: tokio::time::Instant,
     ) -> Result<Option<(CarrierPathInstanceId, Duration)>, RuntimeError> {
-        let (carrier, newly_connected) = self.ensure_connection_with_status(open_deadline).await?;
+        let expected_path_instance_id = self
+            .runtime
+            .state
+            .path_instance_id(UnderlayProtocol::Udp, self.runtime.path_index);
+        let (carrier, newly_connected) = self
+            .ensure_connection_with_status_inner(
+                open_deadline,
+                ClientUdpEnsureMode::Probe(
+                    WebhookProbeTrigger::Periodic,
+                    expected_path_instance_id,
+                ),
+            )
+            .await?
+            .ok_or(RuntimeError::ReliablePathSessionClosed)?;
         Ok(newly_connected.then(|| (carrier.path_instance_id, carrier.connection.rtt())))
     }
 
@@ -811,13 +826,46 @@ impl ClientUdpPathSessionHandle {
         if !carrier_path_instance_identity_is_available() {
             return Err(RuntimeError::ExactIdentityExhausted);
         }
-        if mode == ClientUdpEnsureMode::Reconciliation
+        if matches!(mode, ClientUdpEnsureMode::Reconciliation)
             && self.owner.vacancy_not_before() > tokio::time::Instant::now()
         {
             return Ok(None);
         }
+        let probe_trigger = match mode {
+            ClientUdpEnsureMode::Probe(trigger, _) => Some(trigger),
+            ClientUdpEnsureMode::Reconciliation => Some(WebhookProbeTrigger::Reconcile),
+            ClientUdpEnsureMode::Demand => None,
+        };
+        let expected_probe_path_instance_id = match mode {
+            ClientUdpEnsureMode::Probe(_, expected) => expected,
+            ClientUdpEnsureMode::Demand | ClientUdpEnsureMode::Reconciliation => None,
+        };
+        let mut probe_attempt = probe_trigger.and_then(|trigger| {
+            self.runtime.state.begin_background_probe(
+                UnderlayProtocol::Udp,
+                self.runtime.path_index,
+                trigger,
+            )
+        });
         candidate_claim = Some(ClientUdpCandidateClaim::new(self.owner.clone()));
-        let mut pending = Some(connect_client_udp_path(&self.runtime, open_deadline).await?);
+        let mut pending = match connect_client_udp_path(&self.runtime, open_deadline).await {
+            Ok(pending) => Some(pending),
+            Err(error) => {
+                let applied = matches!(mode, ClientUdpEnsureMode::Probe(_, _))
+                    && client_udp_endpoint_error_has_health_authority(&error)
+                    && self
+                        .runtime
+                        .state
+                        .mark_udp_path_establishment_failure_if_current(
+                            self.runtime.path_index,
+                            expected_probe_path_instance_id,
+                        );
+                if let Some(probe_attempt) = probe_attempt.take() {
+                    probe_attempt.finish("failure", applied);
+                }
+                return Err(error);
+            }
+        };
         let carrier = pending
             .as_ref()
             .expect("new QUIC carrier awaits owner publication")
@@ -839,6 +887,21 @@ impl ClientUdpPathSessionHandle {
                     native_capacity_epoch,
                     0,
                     peer_usage,
+                    pending
+                        .as_ref()
+                        .expect("pending UDP candidate retains local address")
+                        .validated_peer
+                        .map(|(revision, _)| revision)
+                        .unwrap_or_default(),
+                    pending
+                        .as_ref()
+                        .expect("pending UDP candidate retains local address")
+                        .local_addr,
+                    pending
+                        .as_ref()
+                        .expect("pending UDP candidate retains validated peer")
+                        .validated_peer
+                        .map(|(_, peer)| peer),
                     || !carrier.connection.is_closed(),
                     || {
                         let mut connection = pending
@@ -852,6 +915,9 @@ impl ClientUdpPathSessionHandle {
             })
             .map_err(RuntimeError::RemoteClosed)?;
         if !published {
+            if let Some(probe_attempt) = probe_attempt.take() {
+                probe_attempt.finish("success", false);
+            }
             return Err(RuntimeError::ReliablePathSessionClosed);
         }
         current
@@ -862,6 +928,9 @@ impl ClientUdpPathSessionHandle {
             .as_mut()
             .expect("new QUIC carrier owns an unpublished candidate claim")
             .commit();
+        if let Some(probe_attempt) = probe_attempt.take() {
+            probe_attempt.finish("success", true);
+        }
         Ok(Some((carrier, true)))
     }
 
@@ -1124,11 +1193,14 @@ struct ClientUdpPathConnection {
     endpoint: UdpPathEndpoint,
     carrier: ClientUdpCarrierInstance,
     peer_usage: PathUsage,
+    local_addr: Option<std::net::SocketAddr>,
+    validated_peer: Option<(u64, std::net::SocketAddr)>,
     _authenticated_carrier: Option<crate::runtime::path::AuthenticatedCarrierRegistration>,
     startup: Option<ClientUdpPathConnectionStartup>,
     metrics_task: Option<tokio::task::JoinHandle<()>>,
     control_task: Option<tokio::task::JoinHandle<()>>,
     port_migration_task: Option<tokio::task::JoinHandle<()>>,
+    address_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 struct ClientUdpPathConnectionStartup {
@@ -1176,6 +1248,16 @@ impl ClientUdpPathConnection {
             connection.clone(),
             path_instance_id,
         ));
+        if runtime.state.webhook_wants_validated_addresses()
+            && let Some((revision, _)) = self.validated_peer
+        {
+            self.address_task = Some(spawn_client_udp_validated_address_observer(
+                runtime.clone(),
+                connection.clone(),
+                path_instance_id,
+                revision,
+            ));
+        }
         let peer_status = runtime.peer_status.register_path(
             runtime.session_id,
             UnderlayProtocol::Udp,
@@ -1214,6 +1296,39 @@ impl ClientUdpPathConnection {
     }
 }
 
+fn spawn_client_udp_validated_address_observer(
+    runtime: ClientUdpPathSessionRuntime,
+    connection: UdpPathConnection,
+    path_instance_id: CarrierPathInstanceId,
+    initial_revision: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut revision = initial_revision;
+        loop {
+            let changed = tokio::select! {
+                biased;
+                _ = connection.wait_closed() => return,
+                result = connection.connection.validated_remote_address_changed(revision) => result,
+            };
+            let Ok((next_revision, address)) = changed else {
+                return;
+            };
+            if next_revision <= revision {
+                continue;
+            }
+            let skipped_revisions = next_revision.saturating_sub(revision).saturating_sub(1);
+            runtime.state.publish_validated_udp_peer_address(
+                runtime.path_index,
+                path_instance_id,
+                next_revision,
+                address,
+                skipped_revisions,
+            );
+            revision = next_revision;
+        }
+    })
+}
+
 // The metrics loop holds a carrier clone, so the session must retire it explicitly.
 impl Drop for ClientUdpPathConnection {
     fn drop(&mut self) {
@@ -1225,6 +1340,9 @@ impl Drop for ClientUdpPathConnection {
             task.abort();
         }
         if let Some(task) = self.port_migration_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.address_task.take() {
             task.abort();
         }
     }
@@ -1490,6 +1608,14 @@ async fn connect_client_udp_path(
             .map_err(|_| {
                 RuntimeError::Protocol("failed to bind client QUIC native rate authority")
             })?;
+        let (local_addr, validated_peer) = if runtime.state.webhook_wants_carrier_details() {
+            (
+                endpoint.local_addr().ok(),
+                connection.connection.validated_remote_address(),
+            )
+        } else {
+            (None, None)
+        };
         Ok(ClientUdpPathConnection {
             endpoint,
             carrier: ClientUdpCarrierInstance {
@@ -1497,6 +1623,8 @@ async fn connect_client_udp_path(
                 path_instance_id,
             },
             peer_usage,
+            local_addr,
+            validated_peer,
             _authenticated_carrier: None,
             startup: Some(ClientUdpPathConnectionStartup {
                 control_send,
@@ -1506,6 +1634,7 @@ async fn connect_client_udp_path(
             metrics_task: None,
             control_task: None,
             port_migration_task: None,
+            address_task: None,
         })
     };
     let retirement = runtime.state.session_retirement().wait();

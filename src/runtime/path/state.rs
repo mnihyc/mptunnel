@@ -22,6 +22,7 @@ use super::tcp::capacity::RequestTcpCapacityProbeSession;
 #[cfg(test)]
 use super::tcp::capacity::{RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery};
 use super::tcp::group::{ClientTcpCarrierGroups, ClientTcpEndpointPolicy};
+use super::webhook::{ClientPathWebhookObserver, ConfiguredPathObservation, ProbeTrigger};
 #[cfg(test)]
 use super::*;
 use crate::model::capacity::PathRateSample;
@@ -37,7 +38,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -53,6 +54,8 @@ pub(in crate::runtime) struct ClientTcpCarrierPublication {
     pub(in crate::runtime) peer_usage_sequence: u64,
     pub(in crate::runtime) peer_usage: PathUsage,
     pub(in crate::runtime) readiness_rtt: Option<Duration>,
+    pub(in crate::runtime) local_addr: Option<std::net::SocketAddr>,
+    pub(in crate::runtime) peer_addr: Option<std::net::SocketAddr>,
 }
 
 /// Coherent health/load state plus a narrow physical-lifecycle transaction.
@@ -76,6 +79,7 @@ pub(in crate::runtime) struct ClientPathState {
     // self-wake loop during ordinary queue/in-flight accounting.
     path_model_generation: AtomicU64,
     path_model_publication: Arc<Notify>,
+    webhook_observer: OnceLock<Arc<ClientPathWebhookObserver>>,
 }
 
 impl ClientPathState {
@@ -91,7 +95,88 @@ impl ClientPathState {
             request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_count),
             path_model_generation: AtomicU64::new(0),
             path_model_publication: Arc::new(Notify::new()),
+            webhook_observer: OnceLock::new(),
         })
+    }
+
+    pub(in crate::runtime) fn attach_webhook_publisher(
+        &self,
+        publisher: crate::runtime::webhook::EventPublisher,
+        outbound: String,
+        session_id: crate::protocol::SessionId,
+        paths: Vec<ConfiguredPathObservation>,
+    ) -> Arc<ClientPathWebhookObserver> {
+        self.webhook_observer
+            .get_or_init(|| ClientPathWebhookObserver::new(publisher, outbound, session_id, paths))
+            .clone()
+    }
+
+    fn webhook_observer(&self) -> Option<&Arc<ClientPathWebhookObserver>> {
+        self.webhook_observer.get()
+    }
+
+    pub(in crate::runtime) fn webhook_wants_carrier_details(&self) -> bool {
+        self.webhook_observer()
+            .is_some_and(|observer| observer.wants_carrier_details())
+    }
+
+    pub(in crate::runtime) fn webhook_wants_validated_addresses(&self) -> bool {
+        self.webhook_observer()
+            .is_some_and(|observer| observer.wants_validated_addresses())
+    }
+
+    pub(in crate::runtime) fn update_webhook_path_policy(
+        &self,
+        config_ordinal: usize,
+        policy: &'static str,
+        actor: &'static str,
+    ) {
+        if let Some(observer) = self.webhook_observer() {
+            observer.update_path_policy(config_ordinal, policy, actor);
+        }
+    }
+
+    pub(in crate::runtime) fn publish_validated_udp_peer_address(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        revision: u64,
+        peer: std::net::SocketAddr,
+        skipped_revisions: u64,
+    ) {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
+        let current = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get(index)
+            .is_some_and(|record| record.path_instance_id() == Some(path_instance_id));
+        if current && let Some(observer) = self.webhook_observer() {
+            observer.update_peer_address(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                path_instance_id,
+                revision,
+                peer,
+                skipped_revisions,
+            );
+        }
+    }
+
+    pub(in crate::runtime) fn begin_background_probe(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        trigger: ProbeTrigger,
+    ) -> Option<super::webhook::ClientProbeAttempt> {
+        self.webhook_observer()?
+            .begin_probe(RelayPathKey { underlay, index }, trigger)
     }
 
     pub(in crate::runtime) fn health(&self) -> &Mutex<ClientPathHealth> {
@@ -214,6 +299,9 @@ impl ClientPathState {
         native_capacity_epoch: u64,
         sequence: u64,
         usage: PathUsage,
+        address_revision: u64,
+        local_addr: Option<std::net::SocketAddr>,
+        peer_addr: Option<std::net::SocketAddr>,
         carrier_is_live: impl FnOnce() -> bool,
         publish_owner: impl FnOnce(),
     ) -> bool {
@@ -232,6 +320,25 @@ impl ClientPathState {
             record.install_udp_peer_usage(path_instance_id, native_capacity_epoch, sequence, usage);
         });
         publish_owner();
+        drop(health);
+        if let Some(observer) = self.webhook_observer() {
+            observer.publish_ready(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                path_instance_id,
+                PathId(
+                    u16::try_from(index)
+                        .expect("validated UDP configured-member inventory fits wire path ID"),
+                ),
+                local_addr,
+                peer_addr,
+                address_revision,
+                usage,
+            );
+        }
+        drop(_lifecycle);
         true
     }
 
@@ -260,6 +367,19 @@ impl ClientPathState {
         // The connection owner is authoritative for physical membership even
         // when an exact callback already published the same health failure.
         retire_owner();
+        drop(health);
+        if let Some(observer) = self.webhook_observer() {
+            observer.close(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                path_instance_id,
+                false,
+                "carrier_lost",
+            );
+        }
+        drop(_lifecycle);
         marked
     }
 
@@ -301,6 +421,17 @@ impl ClientPathState {
         current.mutate_eligibility(|current| {
             current.mark_failure(now, has_schedulable_alternative);
         });
+        drop(health);
+        if let Some(observer) = self.webhook_observer() {
+            observer.mark_establishment_failure(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                "establishment_failed",
+            );
+        }
+        drop(_lifecycle);
         true
     }
 
@@ -312,11 +443,11 @@ impl ClientPathState {
         publication: ClientTcpCarrierPublication,
         publish_readiness: impl FnOnce(),
     ) {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
         {
-            let _lifecycle = self
-                .carrier_lifecycle
-                .lock()
-                .expect("client carrier lifecycle lock");
             let mut health = self.health.lock().expect("client path health lock");
             let record = health
                 .tcp
@@ -331,7 +462,23 @@ impl ClientPathState {
                 );
             });
             publish_readiness();
+            drop(health);
         }
+        if let Some(observer) = self.webhook_observer() {
+            observer.publish_ready(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: publication.path_index,
+                },
+                publication.path_instance_id,
+                publication.path_id,
+                publication.local_addr,
+                publication.peer_addr,
+                0,
+                publication.peer_usage,
+            );
+        }
+        drop(_lifecycle);
         if let Some(readiness_rtt) = publication.readiness_rtt {
             let _ = self.mutate_path_model(
                 RelayPathKey {
@@ -357,11 +504,11 @@ impl ClientPathState {
         publication: ClientTcpCarrierPublication,
         publish_readiness: impl FnOnce(),
     ) -> bool {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
         {
-            let _lifecycle = self
-                .carrier_lifecycle
-                .lock()
-                .expect("client carrier lifecycle lock");
             let mut health = self.health.lock().expect("client path health lock");
             let record = health
                 .tcp
@@ -379,7 +526,24 @@ impl ClientPathState {
                 );
             });
             publish_readiness();
+            drop(health);
         }
+        if let Some(observer) = self.webhook_observer() {
+            observer.replace_ready(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: publication.path_index,
+                },
+                predecessor_instance_id,
+                publication.path_instance_id,
+                publication.path_id,
+                publication.local_addr,
+                publication.peer_addr,
+                0,
+                publication.peer_usage,
+            );
+        }
+        drop(_lifecycle);
         if let Some(readiness_rtt) = publication.readiness_rtt {
             let _ = self.mutate_path_model(
                 RelayPathKey {
@@ -415,8 +579,12 @@ impl ClientPathState {
         index: usize,
         endpoint_policy: &ClientTcpEndpointPolicy,
         endpoint_generation: u64,
-    ) {
-        endpoint_policy.with_current(endpoint_generation, || {
+    ) -> bool {
+        let marked = endpoint_policy.with_current(endpoint_generation, || {
+            let _lifecycle = self
+                .carrier_lifecycle
+                .lock()
+                .expect("client carrier lifecycle lock");
             let now = Instant::now();
             let mut health = self.health.lock().expect("client path health lock");
             let has_schedulable_alternative =
@@ -428,7 +596,19 @@ impl ClientPathState {
             record.mutate_eligibility(|record| {
                 record.mark_failure(now, has_schedulable_alternative);
             });
+            drop(health);
+            if let Some(observer) = self.webhook_observer() {
+                observer.mark_establishment_failure(
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index,
+                    },
+                    "establishment_failed",
+                );
+            }
+            true
         });
+        marked.unwrap_or(false)
     }
 
     pub(in crate::runtime) fn update_peer_path_usage(
@@ -439,10 +619,27 @@ impl ClientPathState {
         sequence: u64,
         usage: PathUsage,
     ) -> bool {
-        self.mutate_path_model(RelayPathKey { underlay, index }, |record| {
-            record.update_peer_usage(path_instance_id, sequence, usage)
-        })
-        .unwrap_or(false)
+        let key = RelayPathKey { underlay, index };
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
+        let outcome = self.mutate_path_model(key, |record| {
+            let before = record.peer_usage;
+            let accepted = record.update_peer_usage(path_instance_id, sequence, usage);
+            (accepted, before)
+        });
+        let Some((accepted, before)) = outcome else {
+            return false;
+        };
+        if accepted
+            && before != Some(usage)
+            && let Some(observer) = self.webhook_observer()
+        {
+            observer.update_peer_usage(key, path_instance_id, usage);
+        }
+        drop(_lifecycle);
+        accepted
     }
 
     pub(in crate::runtime) fn peer_path_usage(
@@ -480,9 +677,15 @@ impl ClientPathState {
         let Some(current) = health.path_record_mut(key) else {
             return false;
         };
-        current.mutate_eligibility(|current| {
+        let marked = current.mutate_eligibility(|current| {
             current.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
-        })
+        });
+        drop(health);
+        if let Some(observer) = self.webhook_observer() {
+            observer.close(key, path_instance_id, false, "carrier_lost");
+        }
+        drop(_lifecycle);
+        marked
     }
 
     pub(in crate::runtime) fn retire_path_instance_planned(
@@ -498,7 +701,14 @@ impl ClientPathState {
         let Some(record) = health.path_record_mut(key) else {
             return false;
         };
-        record.mutate_eligibility(|record| record.retire_planned_instance(path_instance_id))
+        let retired =
+            record.mutate_eligibility(|record| record.retire_planned_instance(path_instance_id));
+        drop(health);
+        if let Some(observer) = self.webhook_observer() {
+            observer.close(key, path_instance_id, true, "planned_retirement");
+        }
+        drop(_lifecycle);
+        retired
     }
 
     pub(in crate::runtime) fn begin_path_instance_planned_retirement(
@@ -514,8 +724,15 @@ impl ClientPathState {
         let Some(record) = health.path_record_mut(key) else {
             return false;
         };
-        record
-            .mutate_eligibility(|record| record.begin_planned_instance_retirement(path_instance_id))
+        let draining = record.mutate_eligibility(|record| {
+            record.begin_planned_instance_retirement(path_instance_id)
+        });
+        drop(health);
+        if draining && let Some(observer) = self.webhook_observer() {
+            observer.begin_retirement(key, path_instance_id);
+        }
+        drop(_lifecycle);
+        draining
     }
 
     /// Linearization point between an accepted Product value and physical
@@ -1462,15 +1679,6 @@ impl ClientPathContext {
             },
             |current| current.mark_udp_datagram_feedback(observation),
         );
-    }
-
-    pub(in crate::runtime) fn mark_udp_path_establishment_failure_if_current(
-        &self,
-        index: usize,
-        expected_path_instance_id: Option<CarrierPathInstanceId>,
-    ) -> bool {
-        self.state
-            .mark_udp_path_establishment_failure_if_current(index, expected_path_instance_id)
     }
 
     #[cfg(test)]

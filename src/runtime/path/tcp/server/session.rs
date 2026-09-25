@@ -171,7 +171,7 @@ impl ServerTcpPathSession {
         let carrier_terminal = carrier_terminal_signal.wait();
         tokio::pin!(carrier_terminal);
         let mut native_terminal = self.native_terminal.take();
-        let (result, reconcile_native) = {
+        let (result, reconcile_native, retirement_reason) = {
             let native_result = async {
                 match native_terminal.as_mut() {
                     Some(receiver) => match receiver.await {
@@ -187,16 +187,16 @@ impl ServerTcpPathSession {
             tokio::pin!(native_result);
             tokio::select! {
                 biased;
-                reason = &mut session_retirement => (Err(RuntimeError::RemoteClosed(reason)), false),
-                () = &mut retirement => (Ok(()), false),
-                error = &mut native_result => (server_tcp_native_result(error), false),
+                reason = &mut session_retirement => (Err(RuntimeError::RemoteClosed(reason)), false, "session_retired"),
+                () = &mut retirement => (Ok(()), false, "credential_retired"),
+                error = &mut native_result => (server_tcp_native_result(error), false, "transport_closed"),
                 cause = &mut carrier_terminal => match cause {
                     ReliablePathCarrierTerminalCause::Failed => {
-                        (Err(RuntimeError::ReliablePathSessionClosed), true)
+                        (Err(RuntimeError::ReliablePathSessionClosed), true, "transport_error")
                     }
-                    ReliablePathCarrierTerminalCause::Retired => (Ok(()), false),
+                    ReliablePathCarrierTerminalCause::Retired => (Ok(()), false, "planned_retirement"),
                 },
-                () = &mut drain_expiry => (Err(RuntimeError::ReliablePathSessionClosed), false),
+                () = &mut drain_expiry => (Err(RuntimeError::ReliablePathSessionClosed), false, "drain_timeout"),
                 result = self.run_active() => {
                     // Native readiness can observe a carrier close before a
                     // framed write or the reader does. It has the same terminal
@@ -206,7 +206,7 @@ impl ServerTcpPathSession {
                         result => result,
                     };
                     let reconcile = matches!(result, Ok(()) | Err(RuntimeError::ReliablePathSessionClosed));
-                    (result, reconcile)
+                    (result, reconcile, "actor_completed")
                 },
             }
         };
@@ -232,6 +232,7 @@ impl ServerTcpPathSession {
         // successful drain already began the same idempotent transaction and
         // remains the only path that writes PATH_CLOSE.
         self.commands_rx.withdraw_writer_ready();
+        self.path_registration.retirement_reason(retirement_reason);
         let _ = self.path_registration.begin_retirement();
         result
     }

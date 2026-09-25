@@ -12,7 +12,10 @@ use crate::product::{
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
-use std::sync::{Arc, Mutex, MutexGuard};
+use crate::runtime::webhook::EventPublisher;
+use crate::webhook::EventKind;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -24,6 +27,9 @@ pub(in crate::runtime) struct ClientGatewayRuntime {
 }
 
 struct ClientGatewayInner {
+    name: String,
+    publisher: OnceLock<EventPublisher>,
+    webhook_sequence: AtomicU64,
     origin: Instant,
     state: Mutex<ClientGatewayState>,
 }
@@ -60,6 +66,7 @@ pub(in crate::runtime) struct GatewayFlowLease {
     handle: GatewayMemberHandle,
     selected_at: Instant,
     recovery_probe: bool,
+    feedback_enabled: bool,
     phase: GatewayFlowPhase,
 }
 
@@ -126,6 +133,9 @@ impl ClientGatewayRuntime {
                 .map(|member| member.id.clone())
                 .collect(),
             inner: Arc::new(ClientGatewayInner {
+                name: config.id.as_str().to_owned(),
+                publisher: OnceLock::new(),
+                webhook_sequence: AtomicU64::new(0),
                 origin: Instant::now(),
                 state: Mutex::new(ClientGatewayState {
                     balancer,
@@ -135,6 +145,113 @@ impl ClientGatewayRuntime {
                 }),
             }),
         })
+    }
+
+    pub(in crate::runtime) fn attach_webhook_publisher(&self, publisher: EventPublisher) {
+        if publisher.interested(EventKind::BalancerMemberChanged)
+            || publisher.interested(EventKind::BalancerProbeCompleted)
+        {
+            let _ = self.inner.publisher.set(publisher);
+        }
+    }
+
+    fn publisher_for(&self, kind: EventKind) -> Option<&EventPublisher> {
+        self.inner
+            .publisher
+            .get()
+            .filter(|publisher| publisher.interested(kind))
+    }
+
+    fn member_health(
+        &self,
+        balancer: &GatewayBalancer,
+        handle: GatewayMemberHandle,
+        now: GatewayInstant,
+    ) -> Option<&'static str> {
+        self.publisher_for(EventKind::BalancerMemberChanged)?;
+        balancer
+            .member_status(handle, now)
+            .ok()
+            .map(|status| health_name(status.health))
+    }
+
+    fn emit_member_change(
+        &self,
+        handle: GatewayMemberHandle,
+        field: &str,
+        from: &str,
+        to: &str,
+        cause: &str,
+    ) {
+        if from == to {
+            return;
+        }
+        let Some(publisher) = self.publisher_for(EventKind::BalancerMemberChanged) else {
+            return;
+        };
+        let Ok(member) = self.member_id(handle) else {
+            return;
+        };
+        publisher.emit(
+            EventKind::BalancerMemberChanged,
+            &format!("balancer/{}/{}", self.inner.name, member.as_str()),
+            serde_json::json!({
+                "balancer": {"name": self.inner.name},
+                "member": {"outbound": member.as_str()},
+                "change": {"field": field, "from": from, "to": to, "cause": cause},
+                "initial": false,
+                "subject_sequence": self.inner.webhook_sequence.fetch_add(1, Ordering::Relaxed) + 1
+            }),
+        );
+    }
+
+    fn observe_outcome(
+        &self,
+        balancer: &mut GatewayBalancer,
+        handle: GatewayMemberHandle,
+        now: GatewayInstant,
+        source: GatewayObservationSource,
+        outcome: GatewayOutcome,
+        error: Option<String>,
+    ) -> Result<(), RuntimeError> {
+        let previous = self.member_health(balancer, handle, now);
+        balancer
+            .observe_outcome(handle, now, source, outcome, error)
+            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
+        if let Some(previous) = previous
+            && let Some(current) = self.member_health(balancer, handle, now)
+        {
+            let cause = match source {
+                GatewayObservationSource::ActiveProbe => "active_probe",
+                GatewayObservationSource::PassiveOpen => "passive_open",
+                GatewayObservationSource::PassiveFlow => "passive_flow",
+            };
+            self.emit_member_change(handle, "health", previous, current, cause);
+        }
+        Ok(())
+    }
+
+    fn emit_probe(
+        &self,
+        handle: GatewayMemberHandle,
+        outcome: &str,
+        elapsed: Duration,
+        applied: bool,
+    ) {
+        let Some(publisher) = self.publisher_for(EventKind::BalancerProbeCompleted) else {
+            return;
+        };
+        let Ok(member) = self.member_id(handle) else {
+            return;
+        };
+        publisher.emit(EventKind::BalancerProbeCompleted,
+            &format!("balancer/{}/{}", self.inner.name, member.as_str()),
+            serde_json::json!({
+                "balancer": {"name": self.inner.name},
+                "member": {"outbound": member.as_str()},
+                "probe": {"outcome": outcome, "elapsed_s": elapsed.as_secs_f64(), "applied": applied, "trigger": "periodic"},
+                "subject_sequence": self.inner.webhook_sequence.fetch_add(1, Ordering::Relaxed) + 1
+            }));
     }
 
     pub(in crate::runtime) fn members(&self) -> &[OutboundId] {
@@ -223,6 +340,45 @@ impl ClientGatewayRuntime {
                 handle,
                 selected_at: Instant::now(),
                 recovery_probe: matches!(reason, GatewaySelectionReason::AllUnhealthyRecoveryProbe),
+                feedback_enabled: true,
+                phase: GatewayFlowPhase::Pending,
+            },
+        })
+    }
+
+    /// Selects a configured balancer member for internal webhook delivery.
+    /// The ordinary load counters still include the connection, while its
+    /// result is deliberately excluded from passive member health feedback.
+    pub(in crate::runtime) fn select_for_webhook(
+        &self,
+        network: Network,
+        destination: &ProtocolTarget,
+        excluded: &[GatewayMemberHandle],
+    ) -> Result<GatewaySelectionBinding, RuntimeError> {
+        let now = self.now();
+        let mut state = self.lock()?;
+        let ClientGatewayState { balancer, entropy } = &mut *state;
+        let selection = balancer
+            .select_with_principal(now, network, Some(destination), None, excluded, entropy)
+            .map_err(|error| RuntimeError::GatewayUnavailable(error.to_string()))?;
+        let handle = selection.handle();
+        let reason = selection.reason();
+        if !selection.may_attempt() {
+            return Err(RuntimeError::GatewayUnavailable(format!("{reason:?}")));
+        }
+        balancer
+            .record_open_attempt(handle)
+            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
+        adjust_pending(balancer, handle, now, true)?;
+        drop(state);
+        Ok(GatewaySelectionBinding {
+            handle,
+            lease: GatewayFlowLease {
+                runtime: self.clone(),
+                handle,
+                selected_at: Instant::now(),
+                recovery_probe: matches!(reason, GatewaySelectionReason::AllUnhealthyRecoveryProbe),
+                feedback_enabled: false,
                 phase: GatewayFlowPhase::Pending,
             },
         })
@@ -240,10 +396,18 @@ impl ClientGatewayRuntime {
                 member.as_str()
             ))
         })?;
+        let previous = self
+            .publisher_for(EventKind::BalancerMemberChanged)
+            .and_then(|_| state.balancer.member_status(handle, self.now()).ok())
+            .map(|status| mode_name(status.mode));
         state
             .balancer
             .set_member_mode(handle, mode)
-            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))
+            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
+        if let Some(previous) = previous {
+            self.emit_member_change(handle, "mode", previous, mode_name(mode), "operator");
+        }
+        Ok(())
     }
 
     pub(in crate::runtime) fn set_manual_member(
@@ -383,9 +547,9 @@ impl GatewayFlowLease {
         // Set the ownership phase before passive observation so even an
         // impossible foreign-handle error cannot double-decrement pending.
         self.phase = GatewayFlowPhase::Active;
-        state
-            .balancer
-            .observe_outcome(
+        if self.feedback_enabled {
+            self.runtime.observe_outcome(
+                &mut state.balancer,
                 self.handle,
                 now,
                 GatewayObservationSource::PassiveOpen,
@@ -393,8 +557,12 @@ impl GatewayFlowLease {
                     latency: Some(latency),
                 },
                 None,
-            )
-            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
+            )?;
+        }
+        if self.recovery_probe {
+            let _ = state.balancer.cancel_recovery_probe(self.handle);
+            self.recovery_probe = false;
+        }
         Ok(())
     }
 
@@ -409,16 +577,20 @@ impl GatewayFlowLease {
         let mut state = self.runtime.lock()?;
         adjust_pending(&mut state.balancer, self.handle, now, false)?;
         self.phase = GatewayFlowPhase::Complete;
-        state
-            .balancer
-            .observe_outcome(
+        if self.feedback_enabled {
+            self.runtime.observe_outcome(
+                &mut state.balancer,
                 self.handle,
                 now,
                 GatewayObservationSource::PassiveOpen,
                 GatewayOutcome::Failure,
                 Some(error.into()),
-            )
-            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
+            )?;
+        }
+        if self.recovery_probe {
+            let _ = state.balancer.cancel_recovery_probe(self.handle);
+            self.recovery_probe = false;
+        }
         Ok(())
     }
 
@@ -433,21 +605,23 @@ impl GatewayFlowLease {
         let mut state = self.runtime.lock()?;
         adjust_active(&mut state.balancer, self.handle, now, false)?;
         self.phase = GatewayFlowPhase::Complete;
-        let outcome = if error.is_some() {
-            GatewayOutcome::Failure
-        } else {
-            GatewayOutcome::Success { latency: None }
-        };
-        state
-            .balancer
-            .observe_outcome(
+        if self.feedback_enabled {
+            let outcome = if error.is_some() {
+                GatewayOutcome::Failure
+            } else {
+                GatewayOutcome::Success { latency: None }
+            };
+            self.runtime.observe_outcome(
+                &mut state.balancer,
                 self.handle,
                 now,
                 GatewayObservationSource::PassiveFlow,
                 outcome,
                 error,
             )
-            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -480,16 +654,25 @@ impl GatewayProbeLease {
             Err(error) => (GatewayOutcome::Failure, Some(error)),
         };
         self.complete = true;
-        state
-            .balancer
-            .observe_outcome(
-                self.handle,
-                now,
-                GatewayObservationSource::ActiveProbe,
-                outcome,
-                error,
-            )
-            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))
+        let result = self.runtime.observe_outcome(
+            &mut state.balancer,
+            self.handle,
+            now,
+            GatewayObservationSource::ActiveProbe,
+            outcome,
+            error,
+        );
+        self.runtime.emit_probe(
+            self.handle,
+            if matches!(outcome, GatewayOutcome::Success { .. }) {
+                "success"
+            } else {
+                "failure"
+            },
+            self.started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
     }
 }
 
@@ -502,6 +685,8 @@ impl Drop for GatewayProbeLease {
             return;
         };
         let _ = state.balancer.cancel_active_probe(self.handle);
+        self.runtime
+            .emit_probe(self.handle, "cancelled", self.started_at.elapsed(), false);
     }
 }
 
@@ -520,6 +705,9 @@ impl Drop for GatewayFlowLease {
             }
             GatewayFlowPhase::Active => {
                 let _ = adjust_active(&mut state.balancer, self.handle, now, false);
+                if self.recovery_probe {
+                    let _ = state.balancer.cancel_recovery_probe(self.handle);
+                }
             }
             GatewayFlowPhase::Complete => {}
         }
@@ -578,3 +766,22 @@ fn bounded_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 #[path = "tests_gateway.rs"]
 mod tests;
+
+fn health_name(health: GatewayHealthStatus) -> &'static str {
+    match health {
+        GatewayHealthStatus::Healthy => "healthy",
+        // Lease ownership and passage of a backoff deadline are not new
+        // health observations. Each actual probe has its own completion event.
+        GatewayHealthStatus::BackingOff { .. }
+        | GatewayHealthStatus::RecoveryProbeEligible
+        | GatewayHealthStatus::RecoveryProbeInFlight => "unhealthy",
+    }
+}
+
+fn mode_name(mode: GatewayMemberMode) -> &'static str {
+    match mode {
+        GatewayMemberMode::Enabled => "enabled",
+        GatewayMemberMode::Draining => "draining",
+        GatewayMemberMode::Disabled => "disabled",
+    }
+}

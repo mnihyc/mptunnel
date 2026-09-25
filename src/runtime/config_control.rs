@@ -22,18 +22,22 @@ pub(crate) struct RuntimeConfigControl {
 impl RuntimeConfigControl {
     pub(crate) fn new(store: Arc<CanonicalConfigStore>) -> Self {
         let runtime_revision = store.revision();
+        let generation = RuntimeGenerationControl::new();
+        generation.defer_activation();
         Self {
             store,
             runtime_revision: Arc::new(Mutex::new(runtime_revision)),
-            generation: RuntimeGenerationControl::new(),
+            generation,
         }
     }
 
     pub(crate) fn next_generation(&self) -> Self {
+        let generation = RuntimeGenerationControl::new();
+        generation.defer_activation();
         Self {
             runtime_revision: Arc::new(Mutex::new(self.store.revision())),
             store: self.store.clone(),
-            generation: RuntimeGenerationControl::new(),
+            generation,
         }
     }
 

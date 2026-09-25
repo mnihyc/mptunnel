@@ -10,6 +10,7 @@ mod registry;
 pub(in crate::runtime) mod request;
 pub(in crate::runtime) mod response;
 mod send_buffer;
+mod webhook;
 
 pub(in crate::runtime) use feedback::{
     ReliableRecvProgress, StreamFeedbackPublication, reliable_relay_recv_progress_resend_active,

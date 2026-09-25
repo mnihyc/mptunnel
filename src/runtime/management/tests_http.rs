@@ -62,6 +62,7 @@ fn dns_explain_accepts_exactly_one_nonempty_utf8_domain_parameter() {
 
 fn health_target(generation: RuntimeGenerationControl) -> ManagementTarget {
     ManagementTarget {
+        webhooks: Default::default(),
         clients: Vec::new(),
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
@@ -84,6 +85,7 @@ fn management_api_is_one_authenticated_versioned_surface() {
         "/api/v4/health/live",
         "/api/v4/health/ready",
         "/api/v4/status",
+        "/api/v4/webhooks",
         "/api/v4/paths",
         "/api/v4/traffic",
         "/api/v4/sessions",

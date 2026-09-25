@@ -1191,12 +1191,20 @@ async fn handle_disconnected_client_tcp_command(
         ReliablePathCommand::PrepareConnection {
             open_deadline,
             endpoint_generation,
+            probe_trigger,
             mut response,
         } => {
             if open_deadline <= tokio::time::Instant::now() {
                 let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
                 return;
             }
+            let mut probe_attempt = probe_trigger.and_then(|trigger| {
+                runtime.state.begin_background_probe(
+                    UnderlayProtocol::Tcp,
+                    runtime.path_index,
+                    trigger,
+                )
+            });
             let connect = connect_client_tcp_path(runtime, open_deadline, endpoint_generation);
             tokio::pin!(connect);
             let connect_result = tokio::select! {
@@ -1212,28 +1220,37 @@ async fn handle_disconnected_client_tcp_command(
                     }
                     let readiness_rtt = connected.carrier.readiness_rtt;
                     state.connection = Some(connected);
-                    if !publish_client_tcp_connection(
+                    let applied = publish_client_tcp_connection(
                         runtime,
                         state,
                         carrier_readiness,
                         endpoint_generation,
                         Some(readiness_rtt),
-                    ) {
+                    );
+                    if !applied {
                         state.connection = None;
+                        if let Some(probe_attempt) = probe_attempt.take() {
+                            probe_attempt.finish("success", false);
+                        }
                         let _ = response.send(Err(client_tcp_publication_refusal(runtime)));
                         return;
+                    }
+                    if let Some(probe_attempt) = probe_attempt.take() {
+                        probe_attempt.finish("success", true);
                     }
                     let _ = response.send(Ok(Some(readiness_rtt)));
                 }
                 Err(err) => {
-                    if client_tcp_establishment_error_has_health_authority(&err) {
-                        runtime
+                    let applied = client_tcp_establishment_error_has_health_authority(&err)
+                        && runtime
                             .state
                             .mark_tcp_path_establishment_failure_for_endpoint_generation(
                                 runtime.path_index,
                                 &runtime.endpoint_policy,
                                 endpoint_generation,
                             );
+                    if let Some(probe_attempt) = probe_attempt.take() {
+                        probe_attempt.finish("failure", applied);
                     }
                     let _ = response.send(Err(err));
                 }
@@ -1518,6 +1535,7 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
             carrier_network: runtime.carrier_network.as_ref(),
             session_lifecycle: runtime.state.session_lifecycle().clone(),
             remote_port: runtime.remote_port,
+            capture_addresses: runtime.state.webhook_wants_carrier_details(),
         },
         open_deadline,
     );
@@ -1639,6 +1657,8 @@ pub(in crate::runtime::path::tcp) fn publish_client_tcp_connection_committed(
             peer_usage_sequence: connection.carrier.peer_usage_sequence,
             peer_usage: connection.carrier.peer_usage,
             readiness_rtt,
+            local_addr: connection.carrier.local_addr,
+            peer_addr: connection.carrier.peer_addr,
         },
         || {
             authenticated_carrier = Some(runtime.authenticated_carriers.register());
@@ -1672,6 +1692,8 @@ pub(in crate::runtime::path::tcp) fn publish_client_tcp_replacement_connection_c
             peer_usage_sequence: connection.carrier.peer_usage_sequence,
             peer_usage: connection.carrier.peer_usage,
             readiness_rtt,
+            local_addr: connection.carrier.local_addr,
+            peer_addr: connection.carrier.peer_addr,
         },
         || {
             authenticated_carrier = Some(runtime.authenticated_carriers.register());

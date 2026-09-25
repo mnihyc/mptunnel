@@ -391,6 +391,7 @@ fn node_with_vpn(outbounds: Vec<OutboundLeafConfig>) -> NodeConfig {
         tun_l3_ingresses: Vec::new(),
         product_policy: Some(product_policy),
         dns_policy: encrypted_dns_policy(),
+        webhooks: crate::webhook::WebhookConfig::default(),
         servers: Vec::new(),
     }
 }
@@ -419,6 +420,7 @@ fn node_without_managed_tun_compiles_to_none_without_dns_side_effects() {
         tun_l3_ingresses: Vec::new(),
         product_policy: None,
         dns_policy: DnsPolicyConfig::system_default(),
+        webhooks: crate::webhook::WebhookConfig::default(),
         servers: Vec::new(),
     };
 

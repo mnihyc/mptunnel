@@ -4511,3 +4511,346 @@ max_dns_work = 80
         Err(ConfigFileError::Toml(_))
     ));
 }
+
+fn webhook_parser_base(webhooks: &str) -> String {
+    format!(
+        r#"
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[outbounds]]
+name = "notify-direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+decision = "allow"
+outbound = "notify-direct"
+
+{webhooks}
+"#
+    )
+}
+
+#[test]
+fn webhook_events_list_uses_default_queue_and_allows_unfiltered_event_types() {
+    let config = load_config_toml_str(&webhook_parser_base(
+        r#"
+[[webhooks.rules]]
+name = "events"
+[webhooks.rules.when]
+events = ["path.state_changed", "path.probe_completed"]
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+"#,
+    ))
+    .expect("public webhook TOML parser accepts an event list");
+    let CommandConfig::Node(node) = config.command;
+    assert_eq!(node.webhooks.rules.len(), 1);
+    assert_eq!(
+        node.webhooks.rules[0].when.branches[0].events,
+        [EventKind::PathStateChanged, EventKind::PathProbeCompleted]
+    );
+    assert_eq!(node.webhooks.max_in_flight, 4);
+    assert_eq!(node.webhooks.max_pending_deliveries, 256);
+    assert_eq!(node.webhooks.max_pending_bytes, 1_048_576);
+    assert_eq!(node.webhooks.delivery_defaults.max_attempts, 1);
+}
+
+#[test]
+fn webhook_when_any_and_delivery_defaults_inherit_with_rule_overrides() {
+    let config = load_config_toml_str(&webhook_parser_base(
+        r#"
+[webhooks.delivery]
+timeout_s = 8
+max_age_s = 20
+max_attempts = 3
+initial_backoff_s = 1
+max_backoff_s = 4
+
+[[webhooks.rules]]
+name = "down-and-rechecks"
+[webhooks.rules.when]
+[[webhooks.rules.when.any]]
+events = ["path.state_changed"]
+from = ["up"]
+to = ["down"]
+[[webhooks.rules.when.any]]
+events = ["path.probe_completed"]
+probe_state_at_start = ["down"]
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+json = { type = "{event.type}" }
+[webhooks.rules.delivery]
+timeout_s = 5
+"#,
+    ))
+    .expect("public webhook TOML with when.any");
+    let CommandConfig::Node(node) = config.command;
+    let policy = node.webhooks.rules[0].delivery;
+    assert_eq!(policy.timeout, Duration::from_secs(5));
+    assert_eq!(policy.max_age, Duration::from_secs(20));
+    assert_eq!(policy.max_attempts, 3);
+    assert_eq!(policy.initial_backoff, Duration::from_secs(1));
+    assert_eq!(policy.max_backoff, Duration::from_secs(4));
+    assert_eq!(node.webhooks.rules[0].when.branches.len(), 2);
+}
+
+#[test]
+fn webhook_when_requires_exactly_one_of_events_or_any() {
+    let make_rule = |when| {
+        webhook_parser_base(&format!(
+            r#"
+[[webhooks.rules]]
+name = "invalid-when"
+[webhooks.rules.when]
+{when}
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+"#
+        ))
+    };
+    let both = make_rule(
+        "events = [\"path.state_changed\"]\n\n[[webhooks.rules.when.any]]\nevents = [\"path.probe_completed\"]",
+    );
+    assert!(matches!(
+        load_config_toml_str(&both),
+        Err(ConfigFileError::Webhook(_))
+    ));
+    let neither = make_rule("");
+    assert!(matches!(
+        load_config_toml_str(&neither),
+        Err(ConfigFileError::Webhook(_))
+    ));
+}
+
+#[test]
+fn webhook_rejects_durations_that_overflow_runtime_deadlines() {
+    let delivery = webhook_parser_base(
+        r#"
+[webhooks.delivery]
+max_age_s = 9223372036854775807
+
+[[webhooks.rules]]
+name = "events"
+[webhooks.rules.when]
+events = ["path.state_changed"]
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+"#,
+    );
+    assert!(matches!(
+        load_config_toml_str(&delivery),
+        Err(ConfigFileError::Webhook(_))
+    ));
+
+    let interval = webhook_parser_base(
+        r#"
+[[webhooks.rules]]
+name = "periodic"
+[webhooks.rules.when]
+events = ["path.interval"]
+interval_s = 9223372036854775807
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+"#,
+    );
+    assert!(matches!(
+        load_config_toml_str(&interval),
+        Err(ConfigFileError::Webhook(_))
+    ));
+
+    let retry = webhook_parser_base(
+        r#"
+[webhooks.delivery]
+max_attempts = 2
+initial_backoff_s = 9223372036854775807
+max_backoff_s = 9223372036854775807
+
+[[webhooks.rules]]
+name = "events"
+[webhooks.rules.when]
+events = ["path.state_changed"]
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+"#,
+    );
+    assert!(matches!(
+        load_config_toml_str(&retry),
+        Err(ConfigFileError::Webhook(_))
+    ));
+}
+
+#[test]
+fn webhook_delivery_only_native_target_activates_outbound_and_as_is_dns_plan() {
+    let config = load_config_toml_str(
+        r#"
+[dns]
+default = "base-dns"
+[[dns.servers]]
+name = "system"
+protocol = "system"
+[[dns.policies]]
+name = "base-dns"
+servers = ["system"]
+[[dns.policies]]
+name = "notify-dns"
+servers = ["system"]
+
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[outbounds]]
+name = "route-direct"
+protocol = "direct"
+[[outbounds]]
+name = "notify-direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+decision = "allow"
+outbound = "route-direct"
+
+[[webhooks.rules]]
+name = "delivery-only"
+[webhooks.rules.when]
+events = ["path.state_changed"]
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+target_resolution = "as-is"
+dns_policy = "notify-dns"
+"#,
+    )
+    .expect("native webhook target config");
+    let CommandConfig::Node(node) = config.command;
+    let active = node.compile_active_graph().expect("compile active graph");
+    assert!(active.contains_outbound(&crate::product::OutboundId::parse("notify-direct").unwrap()));
+    assert!(
+        active
+            .dns_activation
+            .contains(&crate::product::DnsPlanId::parse("notify-dns").unwrap())
+    );
+}
+
+fn webhook_mpp_dns_cycle_document(notify_endpoint: &str) -> String {
+    format!(
+        r#"
+[dns]
+default = "routed-dns"
+[[dns.servers]]
+name = "resolver"
+protocol = "doh"
+address = "1.1.1.1:443"
+tls_name = "cloudflare-dns.com"
+path = "/dns-query"
+outbound = "edge"
+[[dns.policies]]
+name = "routed-dns"
+servers = ["resolver"]
+
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[outbounds]]
+name = "route-direct"
+protocol = "direct"
+[[outbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{{ name = "edge-path", endpoint = "quic://127.0.0.1:7443" }}]
+[outbounds.security]
+credential_id = "test-default"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate = {{ from = "file", path = "{TEST_CERTIFICATE_FILE}" }}
+[[outbounds]]
+name = "notify-mpp"
+protocol = "mpp"
+paths = [{{ name = "notify-path", endpoint = {notify_endpoint:?} }}]
+[outbounds.security]
+credential_id = "test-default"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate = {{ from = "file", path = "{TEST_CERTIFICATE_FILE}" }}
+
+[routing]
+[[routing.rules]]
+name = "default"
+decision = "allow"
+outbound = "route-direct"
+
+[[webhooks.rules]]
+name = "notify"
+[webhooks.rules.when]
+events = ["path.state_changed"]
+outbounds = ["edge"]
+[webhooks.rules.target]
+url = "https://192.0.2.10/hook"
+outbound = "notify-mpp"
+target_resolution = "as-is"
+"#
+    )
+}
+
+#[test]
+fn webhook_dns_graph_skips_ip_literals_and_rejects_mpp_carrier_dns_cycles() {
+    let literal = webhook_mpp_dns_cycle_document("tcp://127.0.0.2:8443");
+    load_config_toml_str(&literal).unwrap_or_else(|error| {
+        panic!("literal webhook and MPP carrier endpoints should load: {error:?}")
+    });
+
+    let domain = webhook_mpp_dns_cycle_document("tcp://notify.example.net:8443");
+    assert!(matches!(
+        load_config_toml_str(&domain),
+        Err(ConfigFileError::Config(ConfigError::Webhook(message)))
+            if message.contains("observes MPP outbound \"edge\"")
+    ));
+}
+
+#[test]
+fn webhook_balancer_health_filters_use_aggregate_health_states() {
+    let allowed = webhook_parser_base(
+        r#"
+[[webhooks.rules]]
+name = "health"
+[webhooks.rules.when]
+events = ["balancer.member_changed"]
+field = ["health"]
+from = ["healthy"]
+to = ["unhealthy"]
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+"#,
+    );
+    assert!(load_config_toml_str(&allowed).is_ok());
+
+    let rejected = webhook_parser_base(
+        r#"
+[[webhooks.rules]]
+name = "health"
+[webhooks.rules.when]
+events = ["balancer.member_changed"]
+field = ["health"]
+from = ["backing-off"]
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+"#,
+    );
+    assert!(matches!(
+        load_config_toml_str(&rejected),
+        Err(ConfigFileError::Webhook(_))
+    ));
+}

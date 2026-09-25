@@ -186,6 +186,20 @@ async fn run_authenticated_server_udp_connection(
     let mut control_active = true;
     let repair_bindings = super::repair::QuicRepairBindings::default();
     let mut streams = tokio::task::JoinSet::new();
+    if context.reliable_streams.webhook_addresses_interested() {
+        let observed_connection = connection.connection.clone();
+        let observed_path = path_registration.clone();
+        streams.spawn(async move {
+            let mut revision = 0;
+            while let Ok((next, peer)) = observed_connection
+                .validated_remote_address_changed(revision)
+                .await
+            {
+                observed_path.publish_peer_address(peer, next);
+                revision = next;
+            }
+        });
+    }
     streams.spawn(run_server_quic_path_metrics(
         context.clone(),
         path_registration.clone(),
@@ -290,6 +304,13 @@ async fn run_authenticated_server_udp_connection(
             }
         }
     };
+    path_registration.retirement_reason(if matches!(result, Err(RuntimeError::RemoteClosed(_))) {
+        "session_retired"
+    } else if result.is_err() {
+        "transport_error"
+    } else {
+        "credential_retired"
+    });
     retire_server_udp_connection(&connection, &mut streams, &path_registration).await;
     result
 }
@@ -406,6 +427,13 @@ async fn admit_server_udp_path(
     let local_usage = local_path.advertised_usage();
     let local_metrics = local_path.startup_metrics(path_id);
     let observed = connection.clone();
+    let initial_validated =
+        connection
+            .connection
+            .validated_remote_address()
+            .ok_or(RuntimeError::Protocol(
+                "authenticated QUIC carrier has no validated peer address",
+            ))?;
     let path_registration = context
         .reliable_streams
         .register_carrier_path_with_observed_peer_and_authority(
@@ -422,7 +450,12 @@ async fn admit_server_udp_path(
             peer_usage,
             connection.native_capacity_epoch(),
             path_join.principal_permit,
-            ServerCarrierPeer::observed(move || observed.remote_address()),
+            ServerCarrierPeer::observed(move || {
+                observed
+                    .connection
+                    .validated_remote_address()
+                    .map_or(initial_validated.1, |(_, peer)| peer)
+            }),
             context.configured_path_name(local_path.config_ordinal()),
         )?;
     let execution_domain = context
@@ -470,6 +503,7 @@ async fn admit_server_udp_path(
         Ok(())
     })
     .await?;
+    path_registration.publish_ready(None, connection.connection.validated_remote_address());
     Ok(path_registration)
 }
 

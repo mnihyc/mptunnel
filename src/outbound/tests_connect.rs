@@ -5,7 +5,7 @@ use crate::product::{
     CompiledDnsPolicy, DnsPlanId, DnsPlanSpec, DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId,
     DnsUpstreamSpec, DomainName, EgressAction, FlowContext, InboundId, InitialDemand, Network,
     PortRange, PrincipalId, ProductPolicyGeneration, ProtocolTarget, RouteAction, RouteMatchSpec,
-    RouteRuleSpec, RuleId,
+    RouteRuleSpec, RuleId, TargetResolutionMode,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -999,6 +999,169 @@ async fn safe_default_blocks_literal_pivot_before_tcp_or_udp_proxy_connector() {
             .is_err(),
         "a denied target must not invoke even the configured proxy connector"
     );
+}
+
+async fn connect_webhook_target(
+    config: &OutboundConfig,
+    dns: &DnsGeneration,
+    target: &TargetAddr,
+    resolution: TargetResolutionMode,
+) -> Result<OutboundTcpStream, OutboundConnectError> {
+    super::connect_tcp_webhook_target_with_configurator(
+        config,
+        dns,
+        None,
+        target,
+        resolution,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        &crate::transport::SystemNativeSocketConfigurator,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn webhook_native_full_resolve_uses_configured_dns_and_opens_target() {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target");
+    let target_addr = target_listener.local_addr().expect("target address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await.expect("accept target");
+        let mut request = [0u8; 4];
+        stream.read_exact(&mut request).await.expect("request");
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").await.expect("response");
+    });
+    let dns = static_dns_runtime([("hook.example", vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])]);
+    let mut stream = connect_webhook_target(
+        &OutboundConfig::Direct,
+        &dns,
+        &TargetAddr::Domain {
+            host: "hook.example".to_owned(),
+            port: target_addr.port(),
+        },
+        TargetResolutionMode::FullResolve,
+    )
+    .await
+    .expect("native webhook target opens");
+    stream.write_all(b"ping").await.expect("request write");
+    let mut response = [0u8; 4];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("response read");
+    assert_eq!(&response, b"pong");
+    server.await.expect("target server");
+}
+
+#[tokio::test]
+async fn webhook_socks5_as_is_preserves_domain_for_proxy_resolution() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy");
+    let proxy: Endpoint = listener.local_addr().unwrap().to_string().parse().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept proxy");
+        let mut greeting = [0u8; 3];
+        stream.read_exact(&mut greeting).await.expect("greeting");
+        assert_eq!(greeting, socks5::no_auth_greeting());
+        stream.write_all(&[0x05, 0x00]).await.expect("method reply");
+        let expected = socks5::connect_request(&TargetAddr::Domain {
+            host: "hook.example".to_owned(),
+            port: 443,
+        })
+        .expect("expected domain request");
+        let mut request = vec![0u8; expected.len()];
+        stream
+            .read_exact(&mut request)
+            .await
+            .expect("connect request");
+        assert_eq!(request, expected);
+        stream
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+            .await
+            .expect("connect reply");
+        let mut request = [0u8; 4];
+        stream.read_exact(&mut request).await.expect("payload");
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").await.expect("response");
+    });
+    let config = OutboundConfig::Socks5(ProxyConfig::new(proxy, None));
+    let dns = static_dns_runtime([]);
+    let mut stream = connect_webhook_target(
+        &config,
+        &dns,
+        &TargetAddr::Domain {
+            host: "hook.example".to_owned(),
+            port: 443,
+        },
+        TargetResolutionMode::AsIs,
+    )
+    .await
+    .expect("SOCKS5 webhook target opens");
+    stream.write_all(b"ping").await.expect("payload write");
+    let mut response = [0u8; 4];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("response read");
+    assert_eq!(&response, b"pong");
+    server.await.expect("proxy server");
+}
+
+#[tokio::test]
+async fn webhook_http_connect_as_is_preserves_domain_for_proxy_resolution() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy");
+    let proxy: Endpoint = listener.local_addr().unwrap().to_string().parse().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept proxy");
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream.read_exact(&mut byte).await.expect("CONNECT header");
+            request.push(byte[0]);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert_eq!(
+            request,
+            http_connect::connect_request(
+                &TargetAddr::Domain {
+                    host: "hook.example".to_owned(),
+                    port: 443,
+                },
+                None,
+                None,
+            )
+            .expect("expected CONNECT request")
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .expect("CONNECT response");
+        let mut request = [0u8; 4];
+        stream.read_exact(&mut request).await.expect("payload");
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").await.expect("response");
+    });
+    let config = OutboundConfig::HttpConnect(ProxyConfig::new(proxy, None));
+    let dns = static_dns_runtime([]);
+    let mut stream = connect_webhook_target(
+        &config,
+        &dns,
+        &TargetAddr::Domain {
+            host: "hook.example".to_owned(),
+            port: 443,
+        },
+        TargetResolutionMode::AsIs,
+    )
+    .await
+    .expect("HTTP CONNECT webhook target opens");
+    stream.write_all(b"ping").await.expect("payload write");
+    let mut response = [0u8; 4];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("response read");
+    assert_eq!(&response, b"pong");
+    server.await.expect("proxy server");
 }
 
 #[tokio::test]

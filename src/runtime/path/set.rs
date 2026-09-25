@@ -3,6 +3,7 @@
 //! Capacity reservations stay beside health publication and lease rollback so
 //! no sender or carrier can observe half of a request-probe transaction.
 
+use super::ConfiguredPathObservation;
 use super::carrier_inventory::AuthenticatedCarrierInventory;
 use super::commands::reliable_stream_frame_queue;
 use super::health::{ClientPathHealth, ClientPathHealthRecord};
@@ -38,11 +39,14 @@ use crate::runtime::stream::SessionSendBuffer;
 use crate::runtime::telemetry::{ProductFlowScope, RuntimeTelemetry};
 #[cfg(test)]
 use crate::runtime::telemetry::{RuntimeTelemetrySnapshot, active_flow_detail_capacity};
+use crate::runtime::webhook::EventPublisher;
 #[cfg(test)]
 use crate::transport::SystemCarrierNetworkProvider;
 #[cfg(test)]
 use crate::transport::encrypted::TcpClientTlsConfig;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
+use crate::webhook::EventKind;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -153,6 +157,142 @@ impl Drop for ClientOutwardSettlementTestControl {
 }
 
 impl ClientPathContext {
+    /// Attach the optional generation-owned webhook publisher before any
+    /// carrier/probe task is started. The publisher remains absent from normal
+    /// path contexts, so disabled webhooks add no task or per-path polling.
+    pub(in crate::runtime) fn attach_webhook_publisher(&self, publisher: EventPublisher) {
+        let kinds = [
+            EventKind::PathStateChanged,
+            EventKind::PathPolicyChanged,
+            EventKind::PathProbeCompleted,
+            EventKind::PathInterval,
+            EventKind::CarrierStateChanged,
+            EventKind::CarrierPolicyChanged,
+            EventKind::CarrierAddressChanged,
+            EventKind::SessionStateChanged,
+            EventKind::SessionPeerAddressesChanged,
+        ];
+        if !kinds.into_iter().any(|kind| publisher.interested(kind)) {
+            return;
+        }
+
+        let mut configured = BTreeMap::<usize, ConfiguredPathObservation>::new();
+        for (index, (name, ordinal)) in self
+            .tcp_path_names
+            .iter()
+            .zip(self.tcp_path_ordinals.iter())
+            .enumerate()
+        {
+            configured
+                .entry(*ordinal)
+                .or_insert_with(|| ConfiguredPathObservation {
+                    name: name.clone(),
+                    config_ordinal: *ordinal,
+                    members: Vec::new(),
+                    member_slots: HashMap::new(),
+                    transports: Vec::new(),
+                    local_ips: Vec::new(),
+                });
+            let observation = configured.get_mut(ordinal).expect("inserted TCP path");
+            let member = RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index,
+            };
+            observation.members.push(member);
+            observation.member_slots.insert(
+                member,
+                self.tcp_member_ordinal(index)
+                    .expect("validated TCP path member has a configured slot"),
+            );
+            if !observation
+                .transports
+                .iter()
+                .any(|transport| transport == "tcp")
+            {
+                observation.transports.push("tcp".to_owned());
+            }
+            if let Some(local_ip) = self.tcp_paths[index]
+                .binding
+                .source_ip
+                .filter(|ip| !ip.is_unspecified())
+            {
+                let local_ip = local_ip.to_string();
+                if !observation.local_ips.contains(&local_ip) {
+                    observation.local_ips.push(local_ip);
+                }
+            }
+        }
+        for (index, (name, ordinal)) in self
+            .udp_path_names
+            .iter()
+            .zip(self.udp_path_ordinals.iter())
+            .enumerate()
+        {
+            configured
+                .entry(*ordinal)
+                .or_insert_with(|| ConfiguredPathObservation {
+                    name: name.clone(),
+                    config_ordinal: *ordinal,
+                    members: Vec::new(),
+                    member_slots: HashMap::new(),
+                    transports: Vec::new(),
+                    local_ips: Vec::new(),
+                });
+            let observation = configured.get_mut(ordinal).expect("inserted QUIC path");
+            let member = RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index,
+            };
+            observation.members.push(member);
+            observation.member_slots.insert(
+                member,
+                u16::try_from(index).expect("validated UDP path member fits configured slot"),
+            );
+            if !observation
+                .transports
+                .iter()
+                .any(|transport| transport == "quic")
+            {
+                observation.transports.push("quic".to_owned());
+            }
+            if let Some(local_ip) = self.udp_paths[index]
+                .binding
+                .source_ip
+                .filter(|ip| !ip.is_unspecified())
+            {
+                let local_ip = local_ip.to_string();
+                if !observation.local_ips.contains(&local_ip) {
+                    observation.local_ips.push(local_ip);
+                }
+            }
+        }
+        let outbound = self
+            .outbound
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unbound".to_owned());
+        let observer = self.state.attach_webhook_publisher(
+            publisher,
+            outbound,
+            self.session_id,
+            configured.into_values().collect(),
+        );
+        self.state
+            .session_lifecycle()
+            .attach_webhook_observer(observer.clone());
+        observer.register_interval_snapshots();
+    }
+
+    pub(in crate::runtime) fn update_webhook_path_policy(
+        &self,
+        config_ordinal: usize,
+        policy: &'static str,
+        actor: &'static str,
+    ) {
+        self.state
+            .update_webhook_path_policy(config_ordinal, policy, actor);
+    }
+
     #[cfg(test)]
     fn arm_outward_settlement_test(
         &self,

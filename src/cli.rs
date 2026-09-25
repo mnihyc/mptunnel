@@ -1300,6 +1300,7 @@ impl ClientArgs {
             tun_l3_ingresses: Vec::new(),
             product_policy: Some(policy),
             dns_policy,
+            webhooks: crate::webhook::WebhookConfig::default(),
             servers: Vec::new(),
         })
     }
@@ -1637,6 +1638,7 @@ impl ServerArgs {
                 )],
             }),
             dns_policy,
+            webhooks: crate::webhook::WebhookConfig::default(),
             servers: vec![server],
         })
     }

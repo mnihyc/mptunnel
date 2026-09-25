@@ -9,6 +9,7 @@ use super::response::{
     ServerSessionTracker,
 };
 use super::send_buffer::SessionSendBuffer;
+use super::webhook::{CarrierObservation, ServerWebhookContext, socket_value, usage_name};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
@@ -42,12 +43,16 @@ use crate::runtime::path::{
     ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPort, ServerStreamPortBackend,
 };
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
+use crate::runtime::webhook::EventPublisher;
 use crate::scheduler::{TrafficClass, traffic_class_from_stream_demand_hint};
+use crate::webhook::EventKind;
+use serde_json::json;
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
@@ -71,6 +76,7 @@ pub(in crate::runtime) struct ServerReliableStreamRegistry {
     registered_path_instances: Mutex<ServerCarrierPathRegistry>,
     closed_streams: Mutex<RecentIdCache<(SessionId, StreamId)>>,
     session_tracker: Arc<ServerSessionTracker>,
+    webhooks: OnceLock<ServerWebhookContext>,
     #[cfg(test)]
     carrier_activation_after_session_attach_hook:
         Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
@@ -119,6 +125,7 @@ struct ServerRegisteredPath {
     apply_authority: ServerCarrierPathApplyAuthority,
     path_proof: Option<PathProofObservation>,
     retirement_started: bool,
+    webhook: Option<Box<CarrierObservation>>,
     retirement_completion: watch::Sender<bool>,
 }
 
@@ -836,6 +843,7 @@ impl ServerReliableStreamRegistry {
                 max_streams,
                 session_retention_timeout,
             )),
+            webhooks: OnceLock::new(),
             #[cfg(test)]
             carrier_activation_after_session_attach_hook: Mutex::new(None),
         }
@@ -1097,6 +1105,7 @@ impl ServerReliableStreamRegistry {
             )
             .collect::<Vec<_>>();
         for identity in identities {
+            self.carrier_retirement_reason(identity, "session_retired");
             let _ = self.retire_carrier_path(identity);
         }
         reason
@@ -1230,6 +1239,7 @@ impl ServerReliableStreamRegistry {
                     apply_authority,
                     path_proof: None,
                     retirement_started: false,
+                    webhook: None,
                     retirement_completion,
                 },
             )
@@ -1247,6 +1257,159 @@ impl ServerReliableStreamRegistry {
         Ok(session_retirement)
     }
 
+    fn attach_webhook_publisher(
+        &self,
+        publisher: EventPublisher,
+        inbound: String,
+        paths: Arc<Vec<String>>,
+    ) {
+        let context = ServerWebhookContext {
+            publisher,
+            inbound,
+            paths,
+        };
+        if context.interested() {
+            self.session_tracker.attach_webhooks(context.clone());
+            let _ = self.webhooks.set(context);
+        }
+    }
+
+    fn carrier_ready(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        local: Option<SocketAddr>,
+        peer: Option<SocketAddr>,
+        revision: u64,
+    ) {
+        let Some(context) = self.webhooks.get() else {
+            return;
+        };
+        let mut paths = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        let Some(path) = paths.instances.get_mut(&server_physical_path_key(identity)) else {
+            return;
+        };
+        if path.retirement_started
+            || path.state == PeerPathState::Draining
+            || path.webhook.is_some()
+        {
+            return;
+        }
+        if !self.session_tracker.observe_carrier(identity, peer, true) {
+            return;
+        }
+        let mut observation = Box::new(CarrierObservation {
+            local,
+            peer,
+            state: "ready",
+            reason: "readiness_flushed",
+            sequence: 0,
+            address_revision: revision,
+            config_ordinal: path.local.config_ordinal,
+            configured_slot: u64::from(path.configured_slot.0),
+            peer_usage: path.peer_usage.map(|usage| usage.usage),
+        });
+        context.carrier_event(
+            &mut observation,
+            identity,
+            EventKind::CarrierStateChanged,
+            json!({"from":null, "to":"ready"}),
+        );
+        path.webhook = Some(observation);
+    }
+
+    fn carrier_peer_address(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        peer: SocketAddr,
+        revision: u64,
+    ) {
+        let Some(context) = self.webhooks.get() else {
+            return;
+        };
+        let mut paths = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        let Some(path) = paths.instances.get_mut(&server_physical_path_key(identity)) else {
+            return;
+        };
+        if path.retirement_started {
+            return;
+        }
+        let Some(observation) = &mut path.webhook else {
+            return;
+        };
+        if revision <= observation.address_revision {
+            return;
+        }
+        let previous_revision = observation.address_revision;
+        observation.address_revision = revision;
+        let previous = observation.peer;
+        observation.peer = Some(peer);
+        if previous == Some(peer) && revision == previous_revision.saturating_add(1) {
+            return;
+        }
+        let mut components = Vec::new();
+        if previous.is_none_or(|old| old.ip() != peer.ip()) {
+            components.push("ip");
+        }
+        if previous.is_none_or(|old| old.port() != peer.port()) {
+            components.push("port");
+        }
+        context.carrier_event(observation, identity, EventKind::CarrierAddressChanged,
+            json!({"before": socket_value(previous), "after": socket_value(Some(peer)),
+                "components": components, "skipped_revisions": revision.saturating_sub(previous_revision).saturating_sub(1),
+                "coalesced": revision > previous_revision.saturating_add(1),
+                "reason":"native_path_validated"}));
+        self.session_tracker.observe_peer_address(identity, peer);
+    }
+
+    fn carrier_retirement_reason(&self, identity: ServerCarrierPathIdentity, reason: &'static str) {
+        if self.webhooks.get().is_none() {
+            return;
+        }
+        let mut paths = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        if let Some(path) = paths.instances.get_mut(&server_physical_path_key(identity))
+            && let Some(observation) = &mut path.webhook
+        {
+            observation.reason = reason;
+        }
+    }
+
+    fn observe_draining(
+        &self,
+        path: &mut ServerRegisteredPath,
+        identity: ServerCarrierPathIdentity,
+    ) {
+        let Some(context) = self.webhooks.get() else {
+            return;
+        };
+        let Some(observation) = &mut path.webhook else {
+            return;
+        };
+        if observation.state != "ready" {
+            return;
+        }
+        observation.state = "draining";
+        if observation.reason == "readiness_flushed" {
+            observation.reason = "owner_retired";
+        }
+        context.carrier_event(
+            observation,
+            identity,
+            EventKind::CarrierStateChanged,
+            json!({"from":"ready", "to":"draining"}),
+        );
+        self.session_tracker
+            .observe_carrier(identity, observation.peer, false);
+    }
+
     fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState) {
         let key = (
             identity.session_id,
@@ -1261,7 +1424,15 @@ impl ServerReliableStreamRegistry {
             .instances
             .get_mut(&key)
         {
-            path.set_state(state);
+            let changed = path.set_state(state);
+            if changed && state == PeerPathState::Draining {
+                if let Some(observation) = &mut path.webhook
+                    && observation.reason == "readiness_flushed"
+                {
+                    observation.reason = "peer_drain";
+                }
+                self.observe_draining(path, identity);
+            }
         }
     }
 
@@ -1309,6 +1480,9 @@ impl ServerReliableStreamRegistry {
             let retirement =
                 ServerCarrierPathRetirement::pending(path.retirement_completion.subscribe());
             let retirement_started = path.begin_retirement();
+            if retirement_started {
+                self.observe_draining(path, identity);
+            }
             (retirement, retirement_started)
         };
         if !retirement_started {
@@ -1383,7 +1557,21 @@ impl ServerReliableStreamRegistry {
                 paths.logical_instances.remove(&logical_key);
                 decrement_session_path_count(&mut paths.session_path_counts, session_id);
             }
-            paths.instances.remove(&physical_key)
+            let mut retired = paths.instances.remove(&physical_key);
+            if let Some(path) = &mut retired
+                && let Some(observation) = &mut path.webhook
+                && let Some(context) = self.webhooks.get()
+            {
+                let from = observation.state;
+                observation.state = "closed";
+                context.carrier_event(
+                    observation,
+                    identity,
+                    EventKind::CarrierStateChanged,
+                    json!({"from":from, "to":"closed"}),
+                );
+            }
+            retired
         };
         let Some(retired_path) = retired_path else {
             return retirement;
@@ -1861,13 +2049,25 @@ impl ServerReliableStreamRegistry {
             path_instance_id,
         } = identity;
         let instance_key = (session_id, underlay, path_id, path_instance_id);
-        let changed = self
-            .registered_path_instances
-            .lock()
-            .expect("server active path instance lock")
-            .instances
-            .get_mut(&instance_key)
-            .is_some_and(|path| path.update_peer_usage(sequence, usage));
+        let changed = {
+            let mut paths = self
+                .registered_path_instances
+                .lock()
+                .expect("server active path instance lock");
+            paths.instances.get_mut(&instance_key).is_some_and(|path| {
+                let previous = path.peer_usage.map(|entry| entry.usage);
+                let accepted = path.update_peer_usage(sequence, usage);
+                if accepted && previous != Some(usage)
+                    && let Some(context) = self.webhooks.get()
+                    && let Some(observation) = &mut path.webhook
+                {
+                    observation.peer_usage = Some(usage);
+                    context.carrier_event(observation, identity, EventKind::CarrierPolicyChanged,
+                        json!({"field":"peer_usage", "from": previous.map(usage_name), "to":usage_name(usage), "reason":"peer_usage"}));
+                }
+                accepted
+            })
+        };
         if !changed {
             return;
         }
@@ -2517,6 +2717,49 @@ struct ServerReliableStreamPortBackend {
 }
 
 impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
+    fn webhook_enabled(&self) -> bool {
+        self.registry.webhooks.get().is_some()
+    }
+    fn attach_webhook_publisher(
+        &self,
+        publisher: EventPublisher,
+        inbound: String,
+        paths: Arc<Vec<String>>,
+    ) {
+        self.registry
+            .attach_webhook_publisher(publisher, inbound, paths);
+    }
+    fn webhook_addresses_interested(&self) -> bool {
+        self.registry.webhooks.get().is_some_and(|context| {
+            context
+                .publisher
+                .interested(EventKind::CarrierAddressChanged)
+                || context
+                    .publisher
+                    .interested(EventKind::SessionPeerAddressesChanged)
+        })
+    }
+    fn carrier_ready(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        local: Option<SocketAddr>,
+        peer: Option<SocketAddr>,
+        revision: u64,
+    ) {
+        self.registry.carrier_ready(identity, local, peer, revision);
+    }
+    fn carrier_peer_address(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        peer: SocketAddr,
+        revision: u64,
+    ) {
+        self.registry.carrier_peer_address(identity, peer, revision);
+    }
+    fn carrier_retirement_reason(&self, identity: ServerCarrierPathIdentity, reason: &'static str) {
+        self.registry.carrier_retirement_reason(identity, reason);
+    }
+
     fn owner_token(&self) -> usize {
         Arc::as_ptr(&self.registry) as usize
     }
@@ -2830,3 +3073,7 @@ fn project_carrier_path_status(
 #[cfg(test)]
 #[path = "tests_registry.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_webhook.rs"]
+mod webhook_tests;

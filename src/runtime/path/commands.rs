@@ -223,6 +223,7 @@ pub(in crate::runtime) enum ReliablePathCommand {
     PrepareConnection {
         open_deadline: tokio::time::Instant,
         endpoint_generation: u64,
+        probe_trigger: Option<super::WebhookProbeTrigger>,
         response: oneshot::Sender<Result<Option<Duration>, RuntimeError>>,
     },
     OpenStream {

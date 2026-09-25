@@ -7,15 +7,16 @@ use crate::product::{
     DnsUpstreamId, DnsUpstreamSpec, EgressAction, GatewayBalancer, GatewayBalancerSpec, InboundId,
     Network, NetworkSet, OutboundId, PrincipalId, ProductAdmissionConfig,
     ProductAdmissionConfigError, ProductPolicyCompileError, ProductPolicyGeneration, RouteRuleSpec,
-    SecurityPolicyError,
+    SecurityPolicyError, TargetResolutionMode,
 };
 #[cfg(test)]
 use crate::product::{CredentialCatalog, CredentialId, SharedSecret};
 use crate::transport::PathSpec;
 use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
+use crate::webhook::{EventKind, WebhookConfig, WebhookRule, WebhookTarget};
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -214,6 +215,7 @@ fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<
         validate_mpp_inbound(server, resources)?;
     }
     validate_local_ingresses(&node.local_ingresses)?;
+    validate_webhooks(node)?;
     validate_synthetic_capture_tun_routes(&node.local_ingresses, &dns_policy, &dns_activation)?;
     // Do not approximate cross-policy synthetic-capture reachability here:
     // domain and principal selectors can make active policies disjoint. The
@@ -237,6 +239,741 @@ fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<
         }
         (None, true) => return Err(ConfigError::LocalIngressRoutingRequired),
         (None, false) => {}
+    }
+    Ok(())
+}
+
+fn validate_webhooks(node: &NodeConfig) -> Result<(), ConfigError> {
+    node.webhooks
+        .validate()
+        .map_err(|error| ConfigError::Webhook(error.to_string()))?;
+    if !node.webhooks.is_enabled() {
+        return Ok(());
+    }
+
+    let outbound_by_name: HashMap<_, _> = node
+        .outbounds
+        .iter()
+        .map(|outbound| (outbound.id().as_str(), outbound))
+        .collect();
+    let inbound_names: HashSet<_> = node
+        .servers
+        .iter()
+        .map(|server| server.name.as_str())
+        .collect();
+    let balancers: HashMap<_, _> = node
+        .gateway_balancers
+        .iter()
+        .map(|balancer| (balancer.id.as_str(), balancer))
+        .collect();
+
+    for rule in &node.webhooks.rules {
+        validate_webhook_target(node, rule, &outbound_by_name, &balancers)?;
+        let matcher = &rule.when;
+        for name in &matcher.outbounds {
+            if !outbound_by_name.contains_key(name.as_str()) {
+                return Err(ConfigError::Webhook(format!(
+                    "rule {:?} references unknown source outbound {name:?}",
+                    rule.name
+                )));
+            }
+        }
+        for name in &matcher.inbounds {
+            if !inbound_names.contains(name.as_str()) {
+                return Err(ConfigError::Webhook(format!(
+                    "rule {:?} references unknown MPP source inbound {name:?}",
+                    rule.name
+                )));
+            }
+        }
+        for name in &matcher.balancers {
+            if !balancers.contains_key(name.as_str()) {
+                return Err(ConfigError::Webhook(format!(
+                    "rule {:?} references unknown source balancer {name:?}",
+                    rule.name
+                )));
+            }
+        }
+        validate_webhook_source_capabilities(node, rule, &outbound_by_name, &balancers)?;
+        validate_webhook_template_context(rule)?;
+        validate_webhook_dependency_cycle(node, rule, &outbound_by_name, &balancers)?;
+    }
+    Ok(())
+}
+
+fn webhook_domain_host(host: &str) -> Option<crate::product::DomainName> {
+    if host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    crate::product::DomainName::parse(host).ok()
+}
+
+fn webhook_target_resolves_domain_locally(target: &WebhookTarget, node: &NodeConfig) -> bool {
+    if target.target_resolution == TargetResolutionMode::FullResolve {
+        return true;
+    }
+    match &target.egress {
+        EgressRef::Outbound(id) => node
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.id() == id)
+            .is_some_and(|outbound| match outbound {
+                OutboundLeafConfig::Local { config, .. } => config.requires_ip_target(),
+                OutboundLeafConfig::Mpp { .. } => false,
+            }),
+        EgressRef::Balancer(id) => node
+            .gateway_balancers
+            .iter()
+            .find(|balancer| balancer.id == *id)
+            .is_some_and(|balancer| {
+                balancer.spec.members.iter().any(|member| {
+                    node.outbounds
+                        .iter()
+                        .find(|outbound| outbound.id() == &member.id)
+                        .is_some_and(|outbound| match outbound {
+                            OutboundLeafConfig::Local { config, .. } => config.requires_ip_target(),
+                            OutboundLeafConfig::Mpp { .. } => false,
+                        })
+                })
+            }),
+    }
+}
+
+fn validate_webhook_target<'a>(
+    node: &NodeConfig,
+    rule: &WebhookRule,
+    outbounds: &HashMap<&'a str, &'a OutboundLeafConfig>,
+    balancers: &HashMap<&str, &GatewayBalancerConfig>,
+) -> Result<(), ConfigError> {
+    match &rule.target.egress {
+        EgressRef::Outbound(id) => {
+            let Some(outbound) = outbounds.get(id.as_str()) else {
+                return Err(ConfigError::Webhook(format!(
+                    "rule {:?} selects unknown outbound {id}",
+                    rule.name
+                )));
+            };
+            if !outbound.networks().contains(Network::Tcp) {
+                return Err(ConfigError::Webhook(format!(
+                    "rule {:?} outbound {id} does not support TCP",
+                    rule.name
+                )));
+            }
+            if node.forwarding_mode == ForwardingMode::L3
+                && matches!(outbound, OutboundLeafConfig::Mpp { .. })
+            {
+                return Err(ConfigError::Webhook(format!(
+                    "L3 webhook rule {:?} cannot use an MPP outbound; select a native TCP outbound",
+                    rule.name
+                )));
+            }
+        }
+        EgressRef::Balancer(id) => {
+            let Some(balancer) = balancers.get(id.as_str()) else {
+                return Err(ConfigError::Webhook(format!(
+                    "rule {:?} selects unknown balancer {id}",
+                    rule.name
+                )));
+            };
+            if node.forwarding_mode == ForwardingMode::L3
+                || !balancer
+                    .spec
+                    .members
+                    .iter()
+                    .any(|member| member.networks.contains(Network::Tcp))
+            {
+                return Err(ConfigError::Webhook(format!(
+                    "rule {:?} balancer {id} has no supported TCP egress",
+                    rule.name
+                )));
+            }
+        }
+    }
+    if rule.target.target_resolution == TargetResolutionMode::RouteOnly {
+        return Err(ConfigError::Webhook(format!(
+            "rule {:?} cannot use route-only target resolution",
+            rule.name
+        )));
+    }
+    if let Some(policy) = &rule.target.dns_policy
+        && !node
+            .dns_policy
+            .spec
+            .plans
+            .iter()
+            .any(|plan| &plan.id == policy)
+    {
+        return Err(ConfigError::Webhook(format!(
+            "rule {:?} references unknown DNS policy {policy}",
+            rule.name
+        )));
+    }
+    let size = rule.target.compiled_material_bytes();
+    if size > 64 * 1024 {
+        return Err(ConfigError::Webhook(format!(
+            "rule {:?} target templates and headers exceed 64 KiB ({size} bytes)",
+            rule.name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_webhook_source_capabilities(
+    node: &NodeConfig,
+    rule: &WebhookRule,
+    outbounds: &HashMap<&str, &OutboundLeafConfig>,
+    balancers: &HashMap<&str, &GatewayBalancerConfig>,
+) -> Result<(), ConfigError> {
+    let matcher = &rule.when;
+    let known_paths: HashSet<_> = node
+        .outbounds
+        .iter()
+        .filter_map(|outbound| match outbound {
+            OutboundLeafConfig::Mpp { id, config } => Some(
+                config
+                    .paths
+                    .iter()
+                    .map(move |path| (id.as_str(), path.name.as_str())),
+            ),
+            OutboundLeafConfig::Local { .. } => None,
+        })
+        .flatten()
+        .collect();
+    for path in &matcher.paths {
+        let found = known_paths.iter().any(|(outbound, configured_path)| {
+            configured_path == path
+                && (matcher.outbounds.is_empty()
+                    || matcher.outbounds.iter().any(|name| name == outbound))
+        });
+        if !found {
+            return Err(ConfigError::Webhook(format!(
+                "rule {:?} references unknown MPP path {path:?} for its selected outbound set",
+                rule.name
+            )));
+        }
+    }
+    validate_webhook_source_shape(matcher, &rule.name)?;
+    validate_webhook_source_outbound_types(matcher, &rule.name, outbounds)?;
+    for name in &matcher.balancers {
+        if !balancers.contains_key(name.as_str()) {
+            return Err(ConfigError::Webhook(format!(
+                "rule {:?} references unknown balancer source {name:?}",
+                rule.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_webhook_source_outbound_types(
+    matcher: &crate::webhook::EventMatcher,
+    rule_name: &str,
+    outbounds: &HashMap<&str, &OutboundLeafConfig>,
+) -> Result<(), ConfigError> {
+    let requires_mpp = matcher.branches.iter().any(|branch| {
+        branch
+            .events
+            .iter()
+            .any(|event| is_path_event(*event) || is_carrier_or_session_event(*event))
+    });
+    if requires_mpp {
+        for name in &matcher.outbounds {
+            if !matches!(
+                outbounds.get(name.as_str()),
+                Some(OutboundLeafConfig::Mpp { .. })
+            ) {
+                return Err(ConfigError::Webhook(format!(
+                    "rule {rule_name:?} path, carrier, and session events require MPP source outbound {name:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_webhook_source_shape(
+    matcher: &crate::webhook::EventMatcher,
+    rule_name: &str,
+) -> Result<(), ConfigError> {
+    let events = matcher
+        .branches
+        .iter()
+        .flat_map(|branch| branch.events.iter().copied())
+        .collect::<Vec<_>>();
+    let any = |predicate: fn(EventKind) -> bool| events.iter().any(|event| predicate(*event));
+    let every = |predicate: fn(EventKind) -> bool| events.iter().all(|event| predicate(*event));
+
+    if any(is_path_event) && (!matcher.inbounds.is_empty() || !matcher.balancers.is_empty()) {
+        return Err(ConfigError::Webhook(format!(
+            "rule {rule_name:?} path events cannot use inbound or balancer source selectors"
+        )));
+    }
+    if !matcher.paths.is_empty() && !every(|event| is_path_event(event) || is_carrier_event(event))
+    {
+        return Err(ConfigError::Webhook(format!(
+            "rule {rule_name:?} paths selector requires only path or client carrier events"
+        )));
+    }
+    if !matcher.inbounds.is_empty()
+        && !every(|event| is_carrier_event(event) || is_session_event(event))
+    {
+        return Err(ConfigError::Webhook(format!(
+            "rule {rule_name:?} inbounds selector requires only server carrier or session events"
+        )));
+    }
+    if !matcher.inbounds.is_empty() && (!matcher.outbounds.is_empty() || !matcher.paths.is_empty())
+    {
+        return Err(ConfigError::Webhook(format!(
+            "rule {rule_name:?} cannot combine inbound and outbound/path source selectors"
+        )));
+    }
+    if !matcher.balancers.is_empty() && !every(is_balancer_event) {
+        return Err(ConfigError::Webhook(format!(
+            "rule {rule_name:?} balancers selector requires only balancer events"
+        )));
+    }
+    if any(is_balancer_event) && (!matcher.paths.is_empty() || !matcher.inbounds.is_empty()) {
+        return Err(ConfigError::Webhook(format!(
+            "rule {rule_name:?} balancer events cannot use path or inbound source selectors"
+        )));
+    }
+    if !matcher.outbounds.is_empty()
+        && !every(|event| {
+            is_path_event(event) || is_carrier_or_session_event(event) || is_balancer_event(event)
+        })
+    {
+        return Err(ConfigError::Webhook(format!(
+            "rule {rule_name:?} outbounds selector is not valid for every selected event source"
+        )));
+    }
+    if !matcher.transports.is_empty()
+        && !every(|event| is_path_event(event) || is_carrier_event(event))
+    {
+        return Err(ConfigError::Webhook(format!(
+            "rule {rule_name:?} transports selector requires only path or carrier events"
+        )));
+    }
+    Ok(())
+}
+
+fn is_path_event(event: EventKind) -> bool {
+    matches!(
+        event,
+        EventKind::PathStateChanged
+            | EventKind::PathPolicyChanged
+            | EventKind::PathProbeCompleted
+            | EventKind::PathInterval
+    )
+}
+
+fn is_carrier_or_session_event(event: EventKind) -> bool {
+    is_carrier_event(event) || is_session_event(event)
+}
+
+fn is_carrier_event(event: EventKind) -> bool {
+    matches!(
+        event,
+        EventKind::CarrierStateChanged
+            | EventKind::CarrierPolicyChanged
+            | EventKind::CarrierAddressChanged
+    )
+}
+
+fn is_session_event(event: EventKind) -> bool {
+    matches!(
+        event,
+        EventKind::SessionStateChanged | EventKind::SessionPeerAddressesChanged
+    )
+}
+
+fn is_balancer_event(event: EventKind) -> bool {
+    matches!(
+        event,
+        EventKind::BalancerMemberChanged | EventKind::BalancerProbeCompleted
+    )
+}
+
+fn validate_webhook_template_context(rule: &WebhookRule) -> Result<(), ConfigError> {
+    let fields = rule.target.template_fields();
+    for field in fields {
+        if !template_field_is_known(field) {
+            return Err(ConfigError::Webhook(format!(
+                "rule {:?} references unknown template field {field:?}",
+                rule.name
+            )));
+        }
+        for branch in &rule.when.branches {
+            if branch
+                .events
+                .iter()
+                .any(|event| !template_field_available(field, *event, &rule.when))
+            {
+                return Err(ConfigError::Webhook(format!(
+                    "rule {:?} template field {field:?} is unavailable for one or more selected event types",
+                    rule.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn template_field_available(
+    field: &str,
+    event: EventKind,
+    matcher: &crate::webhook::EventMatcher,
+) -> bool {
+    let path_event = is_path_event(event);
+    let carrier_event = matches!(
+        event,
+        EventKind::CarrierStateChanged
+            | EventKind::CarrierPolicyChanged
+            | EventKind::CarrierAddressChanged
+    );
+    let session_event = matches!(
+        event,
+        EventKind::SessionStateChanged | EventKind::SessionPeerAddressesChanged
+    );
+    let client_carrier = carrier_event
+        && matcher.inbounds.is_empty()
+        && (!matcher.outbounds.is_empty() || !matcher.paths.is_empty());
+    let client_session =
+        session_event && matcher.inbounds.is_empty() && !matcher.outbounds.is_empty();
+    let server_event = (carrier_event || session_event) && !matcher.inbounds.is_empty();
+    let balancer_event = is_balancer_event(event);
+    let probe_event = matches!(
+        event,
+        EventKind::PathProbeCompleted | EventKind::BalancerProbeCompleted
+    );
+    if field == "schema_version" || field.starts_with("event.") || field.starts_with("subject.") {
+        return true;
+    }
+    match field.split_once('.') {
+        Some(("path", "name" | "outbound")) => path_event || client_carrier,
+        Some(("path", _)) => path_event,
+        Some(("outbound", "name")) => path_event || client_carrier || client_session,
+        Some(("inbound", "name")) => server_event,
+        Some(("carrier", "address_revision")) => event == EventKind::CarrierAddressChanged,
+        Some(("carrier", "listen_path")) => carrier_event && server_event,
+        Some(("carrier", "peer_usage")) => {
+            matches!(
+                event,
+                EventKind::CarrierStateChanged | EventKind::CarrierPolicyChanged
+            )
+        }
+        Some(("carrier", _)) => carrier_event,
+        Some(("session", "id")) => session_event || carrier_event,
+        Some(("session", "peer_ips")) => event == EventKind::SessionPeerAddressesChanged,
+        Some(("session", "ready_carriers")) => event == EventKind::SessionStateChanged,
+        Some(("session", "lifetime")) => session_event && server_event,
+        Some(("session", _)) => session_event,
+        Some(("probe", "id" | "started_at" | "completed_at" | "duration_s" | "state_at_start")) => {
+            event == EventKind::PathProbeCompleted
+        }
+        Some(("probe", "elapsed_s")) => event == EventKind::BalancerProbeCompleted,
+        Some(("probe", "trigger" | "outcome" | "applied")) => probe_event,
+        Some(("probe", _)) => false,
+        Some(("change", "from")) => matches!(
+            event,
+            EventKind::PathStateChanged
+                | EventKind::PathPolicyChanged
+                | EventKind::CarrierStateChanged
+                | EventKind::CarrierPolicyChanged
+                | EventKind::SessionStateChanged
+                | EventKind::NodeStateChanged
+                | EventKind::BalancerMemberChanged
+        ),
+        Some(("change", "to")) => matches!(
+            event,
+            EventKind::PathStateChanged
+                | EventKind::PathPolicyChanged
+                | EventKind::CarrierStateChanged
+                | EventKind::CarrierPolicyChanged
+                | EventKind::SessionStateChanged
+                | EventKind::NodeStateChanged
+                | EventKind::BalancerMemberChanged
+        ),
+        Some(("change", "before" | "after")) => matches!(
+            event,
+            EventKind::CarrierAddressChanged | EventKind::SessionPeerAddressesChanged
+        ),
+        Some(("change", "components")) => matches!(
+            event,
+            EventKind::CarrierAddressChanged | EventKind::SessionPeerAddressesChanged
+        ),
+        Some(("change", "skipped_revisions" | "coalesced")) => {
+            event == EventKind::CarrierAddressChanged
+        }
+        Some(("change", "field")) => matches!(
+            event,
+            EventKind::CarrierPolicyChanged | EventKind::BalancerMemberChanged
+        ),
+        Some(("change", "cause")) => event == EventKind::BalancerMemberChanged,
+        Some(("change", "reason")) => server_event,
+        Some(("change", _)) => false,
+        Some(("node", "state")) => event == EventKind::NodeStateChanged,
+        Some(("balancer", "name")) => balancer_event,
+        Some(("member", "outbound")) => balancer_event,
+        _ => false,
+    }
+}
+
+fn template_field_is_known(field: &str) -> bool {
+    let allowed = match field.split_once('.') {
+        Some(("event", leaf)) => matches!(
+            leaf,
+            "id" | "type"
+                | "occurred_at"
+                | "observed_at"
+                | "process_boot_id"
+                | "configuration_generation"
+                | "subject_id"
+                | "subject_sequence"
+                | "reason"
+                | "initial"
+        ),
+        Some(("subject", leaf)) => matches!(leaf, "id" | "sequence"),
+        Some(("outbound", leaf)) => leaf == "name",
+        Some(("inbound", leaf)) => leaf == "name",
+        Some(("path", leaf)) => matches!(
+            leaf,
+            "name"
+                | "outbound"
+                | "state"
+                | "transports"
+                | "local_ips"
+                | "ready_carriers"
+                | "draining_carriers"
+                | "policy"
+                | "last_ready_at"
+                | "interval_s"
+                | "metrics"
+        ),
+        Some(("carrier", leaf)) => {
+            matches!(
+                leaf,
+                "id" | "instance"
+                    | "path_id"
+                    | "configured_slot"
+                    | "state"
+                    | "transport"
+                    | "listen_path"
+                    | "address_revision"
+                    | "peer_usage"
+            ) || matches!(leaf, "local.ip" | "local.port" | "peer.ip" | "peer.port")
+        }
+        Some(("session", leaf)) => {
+            matches!(leaf, "id" | "lifetime" | "peer_ips" | "ready_carriers")
+        }
+        Some(("probe", leaf)) => matches!(
+            leaf,
+            "id" | "trigger"
+                | "started_at"
+                | "completed_at"
+                | "duration_s"
+                | "state_at_start"
+                | "outcome"
+                | "applied"
+                | "elapsed_s"
+        ),
+        Some(("change", leaf)) => {
+            matches!(
+                leaf,
+                "from"
+                    | "to"
+                    | "before"
+                    | "after"
+                    | "components"
+                    | "skipped_revisions"
+                    | "coalesced"
+                    | "field"
+                    | "cause"
+                    | "reason"
+            ) || matches!(
+                leaf,
+                "before.ip" | "before.port" | "after.ip" | "after.port"
+            )
+        }
+        Some(("node", leaf)) => leaf == "state",
+        Some(("balancer", leaf)) => leaf == "name",
+        Some(("member", leaf)) => leaf == "outbound",
+        _ => field == "schema_version",
+    };
+    if !allowed {
+        return false;
+    }
+    if field.starts_with("carrier.local.") || field.starts_with("carrier.peer.") {
+        return matches!(field.rsplit('.').next(), Some("ip" | "port"));
+    }
+    field == "schema_version"
+        || field.split('.').next().is_some_and(|root| {
+            matches!(
+                root,
+                "event"
+                    | "subject"
+                    | "outbound"
+                    | "inbound"
+                    | "path"
+                    | "carrier"
+                    | "session"
+                    | "probe"
+                    | "change"
+                    | "node"
+                    | "balancer"
+                    | "member"
+            )
+        })
+}
+
+fn validate_webhook_dependency_cycle(
+    node: &NodeConfig,
+    rule: &WebhookRule,
+    outbounds: &HashMap<&str, &OutboundLeafConfig>,
+    balancers: &HashMap<&str, &GatewayBalancerConfig>,
+) -> Result<(), ConfigError> {
+    let transition_driven = rule.when.branches.iter().any(|branch| {
+        branch
+            .events
+            .iter()
+            .any(|event| *event != EventKind::PathInterval)
+    });
+    if !transition_driven {
+        return Ok(());
+    }
+    let observes_client_outbound = rule.when.branches.iter().any(|branch| {
+        branch.events.iter().any(|event| {
+            matches!(
+                event,
+                EventKind::PathStateChanged
+                    | EventKind::PathPolicyChanged
+                    | EventKind::PathProbeCompleted
+                    | EventKind::CarrierStateChanged
+                    | EventKind::CarrierPolicyChanged
+                    | EventKind::CarrierAddressChanged
+                    | EventKind::SessionStateChanged
+                    | EventKind::SessionPeerAddressesChanged
+            )
+        })
+    }) && rule.when.inbounds.is_empty();
+    let observed_outbounds: HashSet<&str> = if !observes_client_outbound {
+        HashSet::new()
+    } else if rule.when.outbounds.is_empty() {
+        node.outbounds
+            .iter()
+            .filter_map(|leaf| match leaf {
+                OutboundLeafConfig::Mpp { id, .. } => Some(id.as_str()),
+                OutboundLeafConfig::Local { .. } => None,
+            })
+            .collect()
+    } else {
+        rule.when.outbounds.iter().map(String::as_str).collect()
+    };
+    let compiled_dns = node
+        .dns_policy
+        .compile()
+        .map_err(|error| ConfigError::DnsPolicy(error.to_string()))?;
+    let mut dependencies: HashSet<&str> = HashSet::new();
+    let mut pending_outbounds = Vec::new();
+    let mut dependency_balancers: HashSet<&str> = HashSet::new();
+    match &rule.target.egress {
+        EgressRef::Outbound(id) => {
+            dependencies.insert(id.as_str());
+            pending_outbounds.push(id.as_str());
+        }
+        EgressRef::Balancer(id) => {
+            dependency_balancers.insert(id.as_str());
+            if let Some(balancer) = balancers.get(id.as_str()) {
+                for member in &balancer.spec.members {
+                    dependencies.insert(member.id.as_str());
+                    pending_outbounds.push(member.id.as_str());
+                }
+            }
+        }
+    }
+
+    let url_domain = webhook_domain_host(&rule.target.url.host);
+    let mut pending_dns_plans = Vec::new();
+    if let Some(domain) = &url_domain
+        && webhook_target_resolves_domain_locally(&rule.target, node)
+    {
+        if let Some(plan) = &rule.target.dns_policy {
+            pending_dns_plans.push(plan.clone());
+        } else {
+            pending_dns_plans.push(compiled_dns.select(domain).plan().id().clone());
+        }
+    }
+    let mut visited_outbounds = HashSet::new();
+    let mut visited_dns_plans = HashSet::new();
+    while !pending_outbounds.is_empty() || !pending_dns_plans.is_empty() {
+        while let Some(outbound_name) = pending_outbounds.pop() {
+            if !visited_outbounds.insert(outbound_name) {
+                continue;
+            }
+            if let Some(OutboundLeafConfig::Mpp { config, .. }) = outbounds.get(outbound_name) {
+                for path in &config.paths {
+                    if let Some(domain) = webhook_domain_host(&path.spec.endpoint.host) {
+                        pending_dns_plans.push(compiled_dns.select(&domain).plan().id().clone());
+                    }
+                }
+            }
+        }
+        while let Some(plan_id) = pending_dns_plans.pop() {
+            if !visited_dns_plans.insert(plan_id.clone()) {
+                continue;
+            }
+            let Some(plan) = node
+                .dns_policy
+                .spec
+                .plans
+                .iter()
+                .find(|plan| plan.id == plan_id)
+            else {
+                continue;
+            };
+            let upstream_ids: HashSet<_> = plan.upstreams.iter().collect();
+            for upstream in &node.dns_policy.spec.upstreams {
+                if upstream_ids.contains(&upstream.id)
+                    && let DnsEgressSpec::Outbound(id) = &upstream.egress
+                {
+                    dependencies.insert(id.as_str());
+                    pending_outbounds.push(id.as_str());
+                }
+            }
+        }
+    }
+    if let Some(cycle) = observed_outbounds
+        .intersection(&dependencies)
+        .copied()
+        .next()
+    {
+        return Err(ConfigError::Webhook(format!(
+            "rule {:?} observes MPP outbound {cycle:?} used by its own delivery or DNS dependency; choose an independent selector",
+            rule.name
+        )));
+    }
+    let observes_balancers = rule
+        .when
+        .branches
+        .iter()
+        .any(|branch| branch.events.iter().any(|event| is_balancer_event(*event)));
+    let observed_balancers = if !observes_balancers {
+        Vec::new()
+    } else if rule.when.balancers.is_empty() {
+        node.gateway_balancers
+            .iter()
+            .map(|balancer| balancer.id.as_str())
+            .collect()
+    } else {
+        rule.when.balancers.iter().map(String::as_str).collect()
+    };
+    if observed_balancers
+        .iter()
+        .any(|name| dependency_balancers.contains(name))
+    {
+        return Err(ConfigError::Webhook(format!(
+            "rule {:?} observes a balancer used by its own delivery dependency; choose an independent selector",
+            rule.name
+        )));
     }
     Ok(())
 }
@@ -900,6 +1637,8 @@ pub struct NodeConfig {
     /// Immutable named split-DNS policy used whenever this node needs address
     /// evidence. Upstream transport may be system, direct, or routed.
     pub dns_policy: DnsPolicyConfig,
+    /// Optional bounded event publisher and outbound notification rules.
+    pub webhooks: WebhookConfig,
     pub servers: Vec<MppInboundConfig>,
 }
 
@@ -931,12 +1670,62 @@ impl NodeConfig {
     /// configuration catalog. Callers use this only after `AppConfig::validate`
     /// has checked every definition, including inactive ones.
     pub(crate) fn compile_active_graph(&self) -> Result<ActiveNodeGraph, DnsCompileError> {
-        let route_dns_plans = self
+        let mut dns_roots = self
             .product_policy
             .iter()
             .flat_map(|policy| &policy.routes)
-            .filter_map(|rule| rule.action.dns_plan());
-        let (dns_policy, dns_activation) = self.dns_policy.compile_active(route_dns_plans)?;
+            .filter_map(|rule| rule.action.dns_plan().cloned())
+            .collect::<Vec<_>>();
+        if self.webhooks.is_enabled() {
+            let compiled_for_selection = self.dns_policy.compile()?;
+            for rule in &self.webhooks.rules {
+                if let Some(domain) = webhook_domain_host(&rule.target.url.host)
+                    && webhook_target_resolves_domain_locally(&rule.target, self)
+                {
+                    if let Some(plan) = &rule.target.dns_policy {
+                        dns_roots.push(plan.clone());
+                    } else {
+                        dns_roots.push(compiled_for_selection.select(&domain).plan().id().clone());
+                    }
+                }
+
+                let mut selected_outbounds = Vec::new();
+                match &rule.target.egress {
+                    EgressRef::Outbound(id) => selected_outbounds.push(id.as_str()),
+                    EgressRef::Balancer(id) => {
+                        if let Some(balancer) = self
+                            .gateway_balancers
+                            .iter()
+                            .find(|balancer| balancer.id == *id)
+                        {
+                            selected_outbounds.extend(
+                                balancer
+                                    .spec
+                                    .members
+                                    .iter()
+                                    .map(|member| member.id.as_str()),
+                            );
+                        }
+                    }
+                }
+                for outbound_name in selected_outbounds {
+                    if let Some(OutboundLeafConfig::Mpp { config, .. }) = self
+                        .outbounds
+                        .iter()
+                        .find(|outbound| outbound.id().as_str() == outbound_name)
+                    {
+                        for path in &config.paths {
+                            if let Some(domain) = webhook_domain_host(&path.spec.endpoint.host) {
+                                dns_roots.push(
+                                    compiled_for_selection.select(&domain).plan().id().clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (dns_policy, dns_activation) = self.dns_policy.compile_active(dns_roots.iter())?;
 
         let mut active_outbounds = HashSet::new();
         let mut active_balancers = HashSet::new();
@@ -950,6 +1739,16 @@ impl NodeConfig {
                         active_balancers.insert(id.clone());
                     }
                     EgressAction::Direct => {}
+                }
+            }
+        }
+        for rule in &self.webhooks.rules {
+            match &rule.target.egress {
+                EgressRef::Outbound(id) => {
+                    active_outbounds.insert(id.clone());
+                }
+                EgressRef::Balancer(id) => {
+                    active_balancers.insert(id.clone());
                 }
             }
         }
@@ -1616,6 +2415,7 @@ pub enum ConfigError {
     DuplicateInboundName(String),
     LocalIngressRoutingRequired,
     ProductPolicy(String),
+    Webhook(String),
     ManagementListenPortZero,
     ManagementTokenEmpty,
     ManagementTokenInvalid,
@@ -1927,6 +2727,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "local inbounds require a compiled routing policy")
             }
             Self::ProductPolicy(error) => write!(f, "{error}"),
+            Self::Webhook(error) => write!(f, "invalid webhook configuration: {error}"),
             Self::ManagementListenPortZero => {
                 write!(f, "management API listen port must be nonzero")
             }

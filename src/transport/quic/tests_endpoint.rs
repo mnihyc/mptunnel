@@ -734,6 +734,16 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
         .expect("server accept timeout")
         .expect("server accept task");
     assert_quic_ping_round_trip(&client_connection, &server_connection, 90).await;
+    let validated_before = server_connection
+        .validated_remote_address()
+        .expect("validated initial peer");
+    let unchanged = server_connection.validated_remote_address_changed(validated_before.0);
+    tokio::pin!(unchanged);
+    assert!(
+        timeout(Duration::from_millis(10), unchanged.as_mut())
+            .await
+            .is_err()
+    );
     let before_migration = client_connection.congestion_metrics();
     let server_before_migration = server_connection.congestion_metrics();
     let server_shape_before_migration = server_connection.native_controller_shape_snapshot();
@@ -760,6 +770,16 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
         .await
         .expect("destination-port migration confirmation");
     assert_quic_ping_round_trip(&client_connection, &server_connection, 91).await;
+    let validated_after = timeout(Duration::from_secs(5), unchanged.as_mut())
+        .await
+        .expect("validation change wakes observer")
+        .expect("live connection");
+    assert_eq!(validated_after.0, validated_before.0 + 1);
+    assert_ne!(validated_after.1, validated_before.1);
+    assert_eq!(
+        server_connection.validated_remote_address(),
+        Some(validated_after)
+    );
     let after_first_migration = client_connection.congestion_metrics();
     let server_after_first_migration = server_connection.congestion_metrics();
     let server_shape_after_first_migration = server_connection.native_controller_shape_snapshot();
@@ -803,6 +823,14 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
         .await
         .expect("second destination-port migration confirmation");
     assert_quic_ping_round_trip(&client_connection, &server_connection, 92).await;
+    let validated_final = timeout(
+        Duration::from_secs(5),
+        server_connection.validated_remote_address_changed(validated_after.0),
+    )
+    .await
+    .expect("second validation notification")
+    .expect("live connection");
+    assert_eq!(validated_final.0, validated_after.0 + 1);
     let after_second_migration = client_connection.congestion_metrics();
     let server_after_second_migration = server_connection.congestion_metrics();
     let server_shape_after_second_migration = server_connection.native_controller_shape_snapshot();

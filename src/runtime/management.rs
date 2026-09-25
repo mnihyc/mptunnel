@@ -32,6 +32,7 @@ use crate::runtime::outbound_registry::GatewayRuntimeControl;
 use crate::runtime::path::{ClientPathContext, ServerPathContext};
 use crate::runtime::readiness::{RequiredServiceReadiness, RuntimeGenerationControl};
 use crate::runtime::telemetry::RuntimeTelemetry;
+use crate::runtime::webhook::WebhookStatusHandle;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +54,7 @@ pub(super) async fn spawn_node_management_services(
     dns: Option<DnsGeneration>,
     product_admission: ProductAdmission,
     generation: RuntimeGenerationControl,
+    webhooks: WebhookStatusHandle,
     readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
@@ -69,6 +71,7 @@ pub(super) async fn spawn_node_management_services(
         dns,
         product_admission,
         generation,
+        webhooks,
     };
     spawn_management_services(config, target, readiness, services).await
 }
@@ -108,6 +111,7 @@ struct ManagementTarget {
     dns: Option<DnsGeneration>,
     product_admission: ProductAdmission,
     generation: RuntimeGenerationControl,
+    webhooks: WebhookStatusHandle,
 }
 
 #[derive(Debug, Clone, Default)]

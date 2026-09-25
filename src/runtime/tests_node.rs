@@ -79,6 +79,7 @@ fn tun_host_runtime_config(host: TunHostConfig) -> AppConfig {
             tun_l3_ingresses: Vec::new(),
             product_policy: None,
             dns_policy: DnsPolicyConfig::default(),
+            webhooks: crate::webhook::WebhookConfig::default(),
             servers: Vec::new(),
         }),
     }
@@ -608,4 +609,327 @@ async fn rejected_noise_socket_releases_authentication_work_into_bounded_retenti
             .kind(),
         std::io::ErrorKind::UnexpectedEof
     );
+}
+
+fn webhook_node_config(listen: SocketAddr, receiver: SocketAddr, slow: bool) -> AppConfig {
+    let mut config = proxy_only_system_dns_config(listen);
+    let webhook_fragment = format!(
+        r#"
+[webhooks]
+max_in_flight = 1
+max_pending_deliveries = 4
+shutdown_timeout_s = 0.1
+[webhooks.delivery]
+timeout_s = {timeout}
+max_age_s = 10
+[[webhooks.rules]]
+name = "node-lifecycle"
+[webhooks.rules.when]
+events = ["node.state_changed"]
+[webhooks.rules.target]
+url = "http://{receiver}/callback"
+outbound = "direct"
+"#,
+        timeout = if slow { 5 } else { 1 },
+    );
+    // Parse with an ordinary active native outbound, exercising the public
+    // TOML grammar and graph roots used by combined node composition.
+    let parsed = crate::config::load_config_toml_str(&format!(
+        r#"
+[[inbounds]]
+name = "local-mixed"
+protocol = "mixed"
+listen = ["{listen}"]
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+[routing]
+[[routing.rules]]
+name = "default"
+outbound = "direct"
+{webhook_fragment}
+"#
+    ))
+    .expect("webhook node config");
+    let CommandConfig::Node(parsed) = parsed.command;
+    let CommandConfig::Node(node) = &mut config.command;
+    node.webhooks = parsed.webhooks;
+    // This fixture owns its loopback echo target; production defaults correctly
+    // reject restricted addresses without an explicit routing allowance.
+    node.product_policy.as_mut().unwrap().routes[0].action =
+        crate::product::RouteAction::allow_restricted(
+            crate::product::EgressAction::Outbound(
+                crate::product::OutboundId::parse("direct").unwrap(),
+            ),
+            None,
+            crate::product::InitialDemand::Automatic,
+        );
+    config
+}
+
+async fn receive_webhook_json(listener: &tokio::net::TcpListener) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .expect("callback accept timeout")
+            .expect("callback connection");
+        let mut header = Vec::new();
+        loop {
+            assert!(header.len() < 16 * 1024);
+            header.push(stream.read_u8().await.expect("request header"));
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let text = String::from_utf8(header).expect("ASCII headers");
+        let length = text
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("request length");
+        assert!(length < 64 * 1024);
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await.expect("request body");
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("callback response");
+        serde_json::from_slice(&body).expect("JSON event")
+    })
+    .await
+    .expect("callback request deadline")
+}
+
+#[tokio::test]
+async fn webhooks_wait_for_activation_and_deliver_terminal_before_retirement() {
+    let receiver = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("receiver");
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve ingress");
+    let listen = reservation.local_addr().expect("ingress address");
+    drop(reservation);
+    let config = webhook_node_config(listen, receiver.local_addr().unwrap(), false);
+    let generation = RuntimeGenerationControl::new();
+    generation.defer_activation();
+    let runtime = tokio::spawn(run_with_generation_control(config, generation.clone()));
+    tokio::time::timeout(Duration::from_secs(2), generation.wait_until_ready())
+        .await
+        .expect("node readiness timeout")
+        .expect("node ready");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), receiver.accept())
+            .await
+            .is_err(),
+        "a ready but uncommitted candidate cannot send a callback"
+    );
+    assert!(generation.activate());
+    let ready = receive_webhook_json(&receiver).await;
+    assert_eq!(ready["event"]["type"], "node.state_changed");
+    assert_eq!(ready["change"]["to"], "ready");
+    assert_eq!(ready["schema_version"], 1);
+    generation.request_shutdown();
+    let stopped = receive_webhook_json(&receiver).await;
+    assert_eq!(stopped["change"]["to"], "stopping");
+    assert_ne!(ready["event"]["id"], stopped["event"]["id"]);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), runtime)
+            .await
+            .expect("bounded shutdown")
+            .expect("runtime task"),
+        RuntimeGenerationOutcome::ShutdownRequested
+    ));
+}
+
+#[tokio::test]
+async fn stalled_webhook_does_not_hold_up_product_io_or_shutdown() {
+    let receiver = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("receiver");
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("target");
+    let target_addr = target.local_addr().unwrap();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve ingress");
+    let listen = reservation.local_addr().unwrap();
+    drop(reservation);
+    let generation = RuntimeGenerationControl::new();
+    let config = webhook_node_config(listen, receiver.local_addr().unwrap(), true);
+    let runtime = tokio::spawn(run_with_generation_control(config, generation.clone()));
+    tokio::time::timeout(Duration::from_secs(2), generation.wait_until_ready())
+        .await
+        .expect("readiness deadline")
+        .expect("ready");
+    let (stalled_callback, _) = tokio::time::timeout(Duration::from_secs(2), receiver.accept())
+        .await
+        .expect("ready callback deadline")
+        .expect("callback");
+    let echo = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.expect("ordinary target");
+        let (mut read, mut write) = stream.split();
+        tokio::io::copy(&mut read, &mut write)
+            .await
+            .expect("ordinary echo");
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut client = tokio::net::TcpStream::connect(listen)
+            .await
+            .expect("product ingress");
+        client
+            .write_all(
+                format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .expect("CONNECT request");
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            assert!(header.len() < 16 * 1024);
+            header.push(client.read_u8().await.expect("CONNECT response"));
+        }
+        assert!(String::from_utf8(header).unwrap().contains("200"));
+        let payload = vec![0x5a; 256 * 1024];
+        let (mut read, mut write) = client.split();
+        let (sent, received) = tokio::join!(
+            async {
+                write.write_all(&payload).await.expect("payload write");
+                write.shutdown().await.expect("half close");
+            },
+            async {
+                let mut received = Vec::new();
+                read.read_to_end(&mut received).await.expect("payload read");
+                received
+            }
+        );
+        let () = sent;
+        assert_eq!(received, payload);
+    })
+    .await
+    .expect("ordinary transfer proceeds while callback response stalls");
+    echo.await.expect("echo task");
+    generation.request_shutdown();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), runtime)
+            .await
+            .expect("callback cannot extend stop to its five-second timeout")
+            .expect("runtime task"),
+        RuntimeGenerationOutcome::ShutdownRequested
+    ));
+    drop(stalled_callback);
+}
+
+#[tokio::test]
+async fn path_down_and_repeated_real_probes_deliver_canonical_webhooks() {
+    use crate::config::{
+        ClientPathConfig, ClientSecurityConfig, MppOutboundConfig, OutboundLeafConfig,
+    };
+    use crate::product::{EgressAction, InitialDemand, OutboundId, RouteAction};
+    use crate::webhook::{EventKind, EventMatcher, EventMatcherBranch};
+    let receiver = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ingress_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = ingress_reservation.local_addr().unwrap();
+    drop(ingress_reservation);
+    let unused_tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused = unused_tcp.local_addr().unwrap();
+    drop(unused_tcp);
+    let mut config = webhook_node_config(listen, receiver.local_addr().unwrap(), false);
+    let CommandConfig::Node(node) = &mut config.command;
+    let id = OutboundId::parse("edge-mpp").unwrap();
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).unwrap(),
+    );
+    node.outbounds.push(OutboundLeafConfig::Mpp {
+        id: id.clone(),
+        config: Box::new(MppOutboundConfig {
+            security: security.clone(),
+            paths: vec![ClientPathConfig {
+                name: "wan".into(),
+                spec: format!("tcp://{refused}?max-tcp-carriers=1")
+                    .parse()
+                    .unwrap(),
+                security,
+                tls: crate::transport::encrypted::test_client_tls_config_for_server_name(
+                    "mptunnel.example",
+                ),
+            }],
+            path_probe_interval: Duration::from_millis(50),
+            path_probe_timeout: Duration::from_millis(100),
+            allow_peer_diagnostics: false,
+            performance: MppPerformanceConfig::default(),
+        }),
+    });
+    node.product_policy.as_mut().unwrap().routes[0].action =
+        RouteAction::allow(EgressAction::Outbound(id), None, InitialDemand::Automatic);
+    node.webhooks.max_pending_deliveries = 32;
+    node.webhooks.rules[0].name = "down-and-rechecks".into();
+    node.webhooks.rules[0].when = EventMatcher {
+        outbounds: vec!["edge-mpp".into()],
+        paths: vec!["wan".into()],
+        branches: vec![
+            EventMatcherBranch {
+                events: vec![EventKind::PathStateChanged],
+                to: vec!["down".into()],
+                ..Default::default()
+            },
+            EventMatcherBranch {
+                events: vec![EventKind::PathProbeCompleted],
+                probe_state_at_start: vec!["down".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let generation = RuntimeGenerationControl::new();
+    let runtime = tokio::spawn(run_with_generation_control(config, generation.clone()));
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        while events
+            .iter()
+            .filter(|event: &&serde_json::Value| event["event"]["type"] == "path.probe_completed")
+            .count()
+            < 2
+        {
+            events.push(receive_webhook_json(&receiver).await);
+        }
+        events
+    })
+    .await
+    .expect("down transition and actual repeated probes");
+    generation.request_shutdown();
+    let result = tokio::time::timeout(Duration::from_secs(2), runtime)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        result,
+        RuntimeGenerationOutcome::ShutdownRequested
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"]["type"] == "path.state_changed")
+            .count(),
+        1
+    );
+    let probes = events
+        .iter()
+        .filter(|event| event["event"]["type"] == "path.probe_completed")
+        .collect::<Vec<_>>();
+    assert!(
+        probes
+            .iter()
+            .all(|event| event["probe"]["state_at_start"] == "down"
+                && event["probe"]["outcome"] == "failure")
+    );
+    assert_ne!(probes[0]["probe"]["id"], probes[1]["probe"]["id"]);
+    for event in events {
+        assert_eq!(event["schema_version"], 1);
+        assert!(
+            event["event"]["id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(event["path"]["name"], "wan");
+    }
 }

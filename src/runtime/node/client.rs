@@ -15,6 +15,7 @@ use crate::runtime::ingress_runtime::{
     spawn_socks5_client_ingress, spawn_tcp_forward_client_ingress,
     spawn_udp_forward_client_ingress,
 };
+use crate::runtime::path::WebhookProbeTrigger;
 use crate::runtime::path::tcp::group::ClientTcpMemberRetry;
 use crate::runtime::path::{ClientPathContext, ClientPathRuntimeOptions};
 use crate::runtime::product_policy::ClientIngressRouter;
@@ -225,7 +226,14 @@ pub(in crate::runtime) async fn run_path_probe_service(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
 
-    groups.reconcile(&context, interval, &mut retry).await;
+    groups
+        .reconcile(
+            &context,
+            interval,
+            &mut retry,
+            WebhookProbeTrigger::Reconcile,
+        )
+        .await;
     reconcile_udp_carrier_owners(&context).await;
 
     loop {
@@ -247,7 +255,7 @@ pub(in crate::runtime) async fn run_path_probe_service(
             changed = changes.changed() => {
                 changed.expect("TCP carrier group sender lives with path context");
                 groups
-                    .reconcile(&context, interval, &mut retry)
+                    .reconcile(&context, interval, &mut retry, WebhookProbeTrigger::Reconcile)
                     .await;
             }
             changed = udp_changes.changed() => {
@@ -256,7 +264,7 @@ pub(in crate::runtime) async fn run_path_probe_service(
             }
             _ = &mut maintenance_timer => {
                 groups
-                    .reconcile(&context, interval, &mut retry)
+                    .reconcile(&context, interval, &mut retry, WebhookProbeTrigger::Reconcile)
                     .await;
                 reconcile_udp_carrier_owners(&context).await;
             }
@@ -268,7 +276,7 @@ pub(in crate::runtime) async fn run_path_probe_service(
                     });
                 }
                 groups
-                    .reconcile(&context, interval, &mut retry)
+                    .reconcile(&context, interval, &mut retry, WebhookProbeTrigger::Periodic)
                     .await;
             }
             measurement = measurements.join_next(), if !measurements.is_empty() => {
@@ -340,7 +348,6 @@ enum PathProbeResult {
     Tcp,
     Udp {
         path_index: usize,
-        expected_path_instance_id: Option<CarrierPathInstanceId>,
         result: Result<Option<(CarrierPathInstanceId, Duration)>, RuntimeError>,
     },
 }
@@ -368,15 +375,16 @@ async fn probe_selected_paths(
         }
     }
     for path_index in 0..context.udp_paths.len() {
-        let Some(expected_path_instance_id) = context.udp_path_probe_expected_instance(path_index)
-        else {
+        if context
+            .udp_path_probe_expected_instance(path_index)
+            .is_none()
+        {
             continue;
-        };
+        }
         let context = context.clone();
         probes.spawn(async move {
             PathProbeResult::Udp {
                 path_index,
-                expected_path_instance_id,
                 result: probe_udp_client_path(&context, path_index, timeout).await,
             }
         });
@@ -400,16 +408,7 @@ async fn probe_selected_paths(
             Ok(PathProbeResult::Udp {
                 result: Ok(None), ..
             }) => {}
-            Ok(PathProbeResult::Udp {
-                path_index,
-                expected_path_instance_id,
-                result: Err(_),
-            }) => {
-                context.mark_udp_path_establishment_failure_if_current(
-                    path_index,
-                    expected_path_instance_id,
-                );
-            }
+            Ok(PathProbeResult::Udp { result: Err(_), .. }) => {}
             Err(err) => crate::observability::process_event!(
                 Warn,
                 "path",

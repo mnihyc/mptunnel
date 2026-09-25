@@ -777,6 +777,7 @@ async fn run_standalone_generation(
         }
     };
     if let Some(prepared) = prepared {
+        generation.defer_activation();
         generation.defer_retirement();
         let packet_devices = prepared.packet_device_provider();
         let carrier_network = prepared.carrier_network_provider();
@@ -1149,6 +1150,7 @@ where
 {
     // Conservatively protect the entire prepared generation. Linux prepare is
     // inert, while host-owned adapters may already be published.
+    generation.defer_activation();
     shutdown.protect_published_vpn_runtime();
     tokio::pin!(runtime);
     let mut readiness_pending = true;
@@ -1262,6 +1264,7 @@ where
                         match activate_ready_generation(control) {
                             Ok(activation) => {
                                 activated = true;
+                                generation.activate();
                                 match activation {
                                     Some(activation) if activation.changed => {
                                         crate::observability::process_event!(
@@ -1308,6 +1311,7 @@ where
                             }
                         }
                     } else {
+                        generation.activate();
                         crate::observability::process_event!(
                             Info,
                             "vpn",
@@ -1441,6 +1445,7 @@ async fn drive_canonical_generation(
                     match activate_ready_generation(&config_control) {
                         Ok(activation) => {
                             activated = true;
+                            config_control.generation().activate();
                             match activation {
                                 Some(activation) if activation.changed => {
                                     crate::observability::process_event!(

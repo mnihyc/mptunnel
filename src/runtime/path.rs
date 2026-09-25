@@ -29,6 +29,7 @@ mod state;
 mod stream_terminal;
 pub(in crate::runtime) mod tcp;
 pub(in crate::runtime) mod traffic;
+mod webhook;
 pub(in crate::runtime) mod writer_boundary;
 
 pub(in crate::runtime) use carrier_inventory::{
@@ -83,4 +84,7 @@ pub(in crate::runtime) use stream_terminal::{
 #[cfg(test)]
 pub(in crate::runtime) use tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery,
+};
+pub(in crate::runtime) use webhook::{
+    ClientPathWebhookObserver, ConfiguredPathObservation, ProbeTrigger as WebhookProbeTrigger,
 };

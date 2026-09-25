@@ -40,6 +40,8 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
     pub(in crate::runtime) peer_usage: PathUsage,
     /// One authenticated readiness exchange, excluding TCP connection setup.
     pub(in crate::runtime) readiness_rtt: Duration,
+    pub(in crate::runtime) local_addr: Option<std::net::SocketAddr>,
+    pub(in crate::runtime) peer_addr: Option<std::net::SocketAddr>,
 }
 
 /// Immutable inputs for one concrete TCP carrier instance.
@@ -58,6 +60,9 @@ pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
     /// Exact configured port selected by the lifecycle owner. Initial and
     /// failure establishment leave this unset and select uniformly once.
     pub(in crate::runtime) remote_port: Option<u16>,
+    /// Address syscalls are captured only for interested lifecycle/snapshot
+    /// observers. The disabled shape preserves existing establishment work.
+    pub(in crate::runtime) capture_addresses: bool,
 }
 
 impl ClientTcpCarrierConnection {
@@ -159,6 +164,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         carrier_network,
         session_lifecycle,
         remote_port,
+        capture_addresses,
     } = request;
     let connect = async {
         let connect_timeout = open_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -181,6 +187,11 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             carrier_network,
         )
         .await?;
+        let (local_addr, peer_addr) = if capture_addresses {
+            (tcp_stream.local_addr().ok(), tcp_stream.peer_addr().ok())
+        } else {
+            (None, None)
+        };
         #[cfg(feature = "lab-diagnostics")]
         let lab_local_addr = tcp_stream.local_addr().ok();
         let write_admission = match TcpWriteAdmission::capture(
@@ -317,6 +328,8 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             peer_usage_sequence: 0,
             peer_usage: peer_usage.expect("path usage checked before carrier creation"),
             readiness_rtt,
+            local_addr,
+            peer_addr,
         })
     };
     tokio::time::timeout_at(open_deadline, connect)

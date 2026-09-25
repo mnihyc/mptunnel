@@ -139,6 +139,7 @@ pub(in crate::runtime) async fn run(
             None,
             product_admission,
             generation.clone(),
+            Default::default(),
             management_readiness,
             &mut services,
         )

@@ -36,6 +36,7 @@ use crate::protocol::{
     UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::WebhookProbeTrigger;
 use crate::runtime::path::commands::{
     ClientTcpOpenDeadlines, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
     ReliablePathCommandSender, reliable_path_command_channels, reliable_path_command_queue,
@@ -575,17 +576,35 @@ impl ClientTcpPathSessionHandle {
         .await
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) async fn prepare_connection_for_endpoint_generation_on_port(
         &self,
         open_deadline: tokio::time::Instant,
         endpoint_generation: u64,
         remote_port: Option<u16>,
     ) -> Result<Option<Duration>, RuntimeError> {
+        self.prepare_connection_for_endpoint_generation_on_port_with_probe(
+            open_deadline,
+            endpoint_generation,
+            remote_port,
+            None,
+        )
+        .await
+    }
+
+    pub(in crate::runtime) async fn prepare_connection_for_endpoint_generation_on_port_with_probe(
+        &self,
+        open_deadline: tokio::time::Instant,
+        endpoint_generation: u64,
+        remote_port: Option<u16>,
+        probe_trigger: Option<WebhookProbeTrigger>,
+    ) -> Result<Option<Duration>, RuntimeError> {
         self.complete_session_operation(
             self.prepare_connection_for_endpoint_generation_on_port_active(
                 open_deadline,
                 endpoint_generation,
                 remote_port,
+                probe_trigger,
             ),
         )
         .await
@@ -596,6 +615,7 @@ impl ClientTcpPathSessionHandle {
         open_deadline: tokio::time::Instant,
         endpoint_generation: u64,
         remote_port: Option<u16>,
+        probe_trigger: Option<WebhookProbeTrigger>,
     ) -> Result<Option<Duration>, RuntimeError> {
         self.runtime.state.session_lifecycle().ensure_active()?;
         if !self.runtime.endpoint_policy.allows(endpoint_generation) {
@@ -610,6 +630,7 @@ impl ClientTcpPathSessionHandle {
             result = commands.send_control(ReliablePathCommand::PrepareConnection {
                 open_deadline,
                 endpoint_generation,
+                probe_trigger,
                 response: response_tx,
             }) => result.map_err(|_| RuntimeError::ReliablePathSessionClosed)?,
             _ = tokio::time::sleep_until(open_deadline) => {
@@ -629,16 +650,50 @@ impl ClientTcpPathSessionHandle {
 
     /// Establishes and atomically publishes one planned carrier-member
     /// successor before ordering retirement of its predecessor.
+    #[cfg(test)]
     pub(in crate::runtime) async fn replace_connection_for_endpoint_generation(
         &self,
         open_deadline: tokio::time::Instant,
         endpoint_generation: u64,
         remote_port: u16,
     ) -> Result<ClientTcpCarrierReplacement, RuntimeError> {
+        self.replace_connection_for_endpoint_generation_inner(
+            open_deadline,
+            endpoint_generation,
+            remote_port,
+            None,
+        )
+        .await
+    }
+
+    pub(in crate::runtime) async fn replace_connection_for_endpoint_generation_with_probe(
+        &self,
+        open_deadline: tokio::time::Instant,
+        endpoint_generation: u64,
+        remote_port: u16,
+        probe_trigger: WebhookProbeTrigger,
+    ) -> Result<ClientTcpCarrierReplacement, RuntimeError> {
+        self.replace_connection_for_endpoint_generation_inner(
+            open_deadline,
+            endpoint_generation,
+            remote_port,
+            Some(probe_trigger),
+        )
+        .await
+    }
+
+    async fn replace_connection_for_endpoint_generation_inner(
+        &self,
+        open_deadline: tokio::time::Instant,
+        endpoint_generation: u64,
+        remote_port: u16,
+        probe_trigger: Option<WebhookProbeTrigger>,
+    ) -> Result<ClientTcpCarrierReplacement, RuntimeError> {
         self.complete_session_operation(self.replace_connection_for_endpoint_generation_active(
             open_deadline,
             endpoint_generation,
             remote_port,
+            probe_trigger,
         ))
         .await
     }
@@ -648,6 +703,7 @@ impl ClientTcpPathSessionHandle {
         open_deadline: tokio::time::Instant,
         endpoint_generation: u64,
         remote_port: u16,
+        probe_trigger: Option<WebhookProbeTrigger>,
     ) -> Result<ClientTcpCarrierReplacement, RuntimeError> {
         self.runtime.state.session_lifecycle().ensure_active()?;
         if !self.runtime.endpoint_policy.allows(endpoint_generation) {
@@ -691,10 +747,20 @@ impl ClientTcpPathSessionHandle {
         let runtime = self
             .runtime
             .for_carrier(reservation.path_id(), Some(remote_port));
+        let mut probe_attempt = probe_trigger.and_then(|trigger| {
+            runtime
+                .state
+                .begin_background_probe(UnderlayProtocol::Tcp, runtime.path_index, trigger)
+        });
         let mut connection =
             match connect_client_tcp_path(&runtime, open_deadline, endpoint_generation).await {
                 Ok(connection) => connection,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if let Some(probe_attempt) = probe_attempt.take() {
+                        probe_attempt.finish("failure", false);
+                    }
+                    return Err(error);
+                }
             };
         let readiness_rtt = connection.carrier.readiness_rtt;
         apply_authenticated_readiness_to_startup_evidence(
@@ -756,7 +822,13 @@ impl ClientTcpPathSessionHandle {
             .map_err(RuntimeError::RemoteClosed)?
             .unwrap_or(false);
         if !promoted {
+            if let Some(probe_attempt) = probe_attempt.take() {
+                probe_attempt.finish("success", false);
+            }
             return Err(RuntimeError::NoSchedulableTcpPath);
+        }
+        if let Some(probe_attempt) = probe_attempt.take() {
+            probe_attempt.finish("success", true);
         }
         successor_claim.commit();
 

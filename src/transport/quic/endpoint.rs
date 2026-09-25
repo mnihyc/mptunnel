@@ -328,6 +328,20 @@ impl Connection {
         self.connection.remote_address()
     }
 
+    /// Last native-validated address, excluding provisional migration candidates.
+    pub(crate) fn validated_remote_address(&self) -> Option<(u64, SocketAddr)> {
+        self.connection.validated_remote_address()
+    }
+
+    pub(crate) async fn validated_remote_address_changed(
+        &self,
+        after_revision: u64,
+    ) -> Result<(u64, SocketAddr), quinn::ConnectionError> {
+        self.connection
+            .validated_remote_address_changed(after_revision)
+            .await
+    }
+
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), QuicCarrierError> {
         let stream = self.presentation.open().await?;
         let request_stream_id = quinn::StreamId::from(

@@ -194,6 +194,7 @@ Start from [client.toml](examples/client.toml) and
 | Configure multiple paths or port hopping | [Path policy](docs/OPERATIONS.md#path-policy-and-status) |
 | Inspect traffic or update a running configuration | [Dashboard and management API](docs/OPERATIONS.md#management-api) |
 | Size buffers and memory for a VPS | [Resource envelopes](docs/OPERATIONS.md#resource-envelopes) |
+| Send path, probe, or address-change notifications | [Webhooks](docs/WEBHOOKS.md) |
 | Run as a service and collect logs | [Runtime supervision](docs/OPERATIONS.md#runtime-supervision) |
 | Upgrade an existing deployment | [Peer compatibility and upgrades](docs/OPERATIONS.md#mpp-wire-version-upgrade) |
 

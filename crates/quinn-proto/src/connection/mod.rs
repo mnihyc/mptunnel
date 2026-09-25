@@ -174,6 +174,7 @@ pub struct Connection {
     /// This is only populated for the server case, and if known
     local_ip: Option<IpAddr>,
     path: PathData,
+    validated_remote: Option<(u64, SocketAddr)>,
     /// Incremented every time we see a new path
     ///
     /// Stored separately from `path.generation` to account for aborted migrations
@@ -340,6 +341,7 @@ impl Connection {
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
             path: PathData::new(remote, allow_mtud, None, 0, now, &config),
+            validated_remote: None,
             path_counter: 0,
             allow_mtud,
             local_ip,
@@ -1454,6 +1456,15 @@ impl Connection {
         self.path.remote
     }
 
+    /// The last validated peer address and its observation revision.
+    ///
+    /// Unlike `remote_address`, this does not expose an unvalidated migration
+    /// candidate. Initial validation is revision one; only confirmed address
+    /// changes increment it. Failed validation/rollback preserves this value.
+    pub fn validated_remote_address(&self) -> Option<(u64, SocketAddr)> {
+        self.validated_remote
+    }
+
     /// The local IP address which was used when the peer established
     /// the connection
     ///
@@ -1705,7 +1716,11 @@ impl Connection {
         // Learn differential delay against this ACK transaction's current RTT.
         // Publishing before the RTT update retains a common queue increase as
         // future reordering allowance (and undercounts it when RTT falls).
-        self.publish_reordering_evidence(now, largest_current_controller_acked.map(|(_, sent)| sent), retained_ack.oldest_reordered_send);
+        self.publish_reordering_evidence(
+            now,
+            largest_current_controller_acked.map(|(_, sent)| sent),
+            retained_ack.oldest_reordered_send,
+        );
 
         // Must be called before crypto/pto_count are clobbered
         self.detect_lost_packets(now, space, true);
@@ -1764,12 +1779,19 @@ impl Connection {
         )
     }
 
-    fn publish_reordering_evidence(&mut self, now: Instant, newest_live_send: Option<Instant>, oldest_reordered_send: Option<Instant>) {
+    fn publish_reordering_evidence(
+        &mut self,
+        now: Instant,
+        newest_live_send: Option<Instant>,
+        oldest_reordered_send: Option<Instant>,
+    ) {
         if let Some(sent) = newest_live_send.max(oldest_reordered_send) {
             self.path.reordering.on_ack(sent);
         }
         if let Some(sent) = oldest_reordered_send {
-            self.path.reordering.on_late_original(now, sent, self.path.rtt.conservative());
+            self.path
+                .reordering
+                .on_late_original(now, sent, self.path.rtt.conservative());
         }
         // Rebinding/rollback is one learned network-path lineage. An unrelated
         // network path has another epoch and must not inherit this evidence.
@@ -1800,8 +1822,7 @@ impl Connection {
     /// Expire retained loss evidence after two PTOs, matching current-main Quinn.
     fn drain_lost_packets(&mut self, now: Instant) {
         let two_pto = 2 * self.path.rtt.pto_base();
-        let expired =
-            expire_retained_losses_in_spaces(&mut self.spaces, now, two_pto);
+        let expired = expire_retained_losses_in_spaces(&mut self.spaces, now, two_pto);
         settle_lost_packet_owners(
             &mut self.path,
             self.prev_path.as_mut().map(|(_, path)| path),
@@ -1867,9 +1888,9 @@ impl Connection {
                     // after an attributable controller response so even a CE-created snapshot is
                     // ineligible, while invalid ECN feedback above does not taint anything.
                     let controller_epoch = self.path.controller_epoch();
-                    for transaction in abandon_retained_transactions_for_epoch(
-                        &mut self.spaces, controller_epoch,
-                    ) {
+                    for transaction in
+                        abandon_retained_transactions_for_epoch(&mut self.spaces, controller_epoch)
+                    {
                         settle_retained_loss_owners(
                             &mut self.path,
                             self.prev_path.as_mut().map(|(_, path)| path),
@@ -2133,7 +2154,9 @@ impl Connection {
                 controller_largest_lost
             {
                 self.stats.path.congestion_events += 1;
-                self.path.reordering.on_loss(now, controller_largest_lost_sent);
+                self.path
+                    .reordering
+                    .on_loss(now, controller_largest_lost_sent);
                 self.publish_reordering_evidence(now, None, None);
                 self.path.congestion.on_congestion_event(
                     now,
@@ -3187,6 +3210,7 @@ impl Connection {
                         self.timers.stop(Timer::PathValidation);
                         self.path.challenge = None;
                         self.path.validated = true;
+                        self.record_validated_remote_address();
                         if let Some((_, ref mut prev_path)) = self.prev_path {
                             prev_path.challenge = None;
                             prev_path.challenge_pending = false;
@@ -4146,9 +4170,21 @@ impl Connection {
         key.map_or(16, |x| x.tag_len())
     }
 
+    fn record_validated_remote_address(&mut self) {
+        match self.validated_remote {
+            None => self.validated_remote = Some((1, self.path.remote)),
+            Some((_, previous)) if previous == self.path.remote => {}
+            Some((revision, _)) => {
+                self.validated_remote = Some((revision.saturating_add(1), self.path.remote));
+                self.events.push_back(Event::ValidatedRemoteAddressChanged);
+            }
+        }
+    }
+
     /// Mark the path as validated, and enqueue NEW_TOKEN frames to be sent as appropriate
     fn on_path_validated(&mut self) {
         self.path.validated = true;
+        self.record_validated_remote_address();
         let ConnectionSide::Server { server_config } = &self.side else {
             return;
         };
@@ -4397,6 +4433,9 @@ pub enum Event {
         /// Reason that the connection was closed
         reason: ConnectionError,
     },
+    /// The confirmed remote address changed after successful path validation.
+    /// Read the latest observation with `Connection::validated_remote_address`.
+    ValidatedRemoteAddressChanged,
     /// Stream events
     Stream(StreamEvent),
     /// One or more application datagrams have been received
@@ -4496,7 +4535,8 @@ fn settle_retained_loss_owners(
         }
         match outcome {
             RetainedLossTerminal::Abandoned => {
-                path.congestion.on_recovery_transaction_abandoned(transaction);
+                path.congestion
+                    .on_recovery_transaction_abandoned(transaction);
             }
             RetainedLossTerminal::Spurious => {
                 undone |= path.congestion.on_spurious_congestion_event(transaction);
@@ -4583,11 +4623,15 @@ fn acknowledge_retained_losses(
                 ));
                 if info.controller_epoch == current_controller_epoch {
                     matched.oldest_reordered_send = Some(
-                        matched.oldest_reordered_send.map_or(info.time_sent, |sent| sent.min(info.time_sent)),
+                        matched
+                            .oldest_reordered_send
+                            .map_or(info.time_sent, |sent| sent.min(info.time_sent)),
                     );
                 }
                 if let Some(transaction) = info.recovery_transaction {
-                    matched.matched_transactions.insert((info.controller_epoch, transaction));
+                    matched
+                        .matched_transactions
+                        .insert((info.controller_epoch, transaction));
                 }
                 if info.ecn_marked {
                     matched.ecn_marked_packets = matched.ecn_marked_packets.saturating_add(1);
@@ -4612,8 +4656,7 @@ fn detect_spurious_loss_in_spaces(
 ) -> SpuriousLossDetection {
     // Expiry must precede matching in the same ACK transaction. Any expired member makes the
     // transaction unproven, while younger records remain available for transport ECN accounting.
-    let mut expired =
-        expire_retained_losses_in_spaces(spaces, now, retention);
+    let mut expired = expire_retained_losses_in_spaces(spaces, now, retention);
     let acknowledged = acknowledge_retained_losses(
         &mut spaces[space].lost_packets,
         ack,
@@ -5415,7 +5458,10 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(outcome.oldest_reordered_send, Some(sent + Duration::from_millis(80)));
+        assert_eq!(
+            outcome.oldest_reordered_send,
+            Some(sent + Duration::from_millis(80))
+        );
         assert!(!completes_transaction(&spaces, &outcome, 3));
         assert!(spaces[SpaceId::Data].lost_packets.is_empty());
     }
@@ -5434,12 +5480,21 @@ mod tests {
         let now = sent + Duration::from_millis(180);
         let ack = contiguous_packet_ack(20, 21);
         let matched = detect_spurious_loss_in_spaces(
-            &mut spaces, now, Duration::from_secs(1), &ack, SpaceId::Data, 3,
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &ack,
+            SpaceId::Data,
+            3,
         );
         assert_eq!(matched.oldest_reordered_send, Some(sent));
         let duplicate = detect_spurious_loss_in_spaces(
-            &mut spaces, now + Duration::from_millis(10), Duration::from_secs(1),
-            &ack, SpaceId::Data, 3,
+            &mut spaces,
+            now + Duration::from_millis(10),
+            Duration::from_secs(1),
+            &ack,
+            SpaceId::Data,
+            3,
         );
         assert_eq!(duplicate.oldest_reordered_send, None);
     }

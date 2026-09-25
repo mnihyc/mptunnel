@@ -5,13 +5,16 @@
 //! separate owners and must not be stored here.
 
 use super::super::send_buffer::SessionSendBuffer;
+use super::super::webhook::{ServerWebhookContext, SessionObservation};
 use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;
 use crate::protocol::{CloseReason, SessionId};
 use crate::runtime::RuntimeError;
+use crate::runtime::path::ServerCarrierPathIdentity;
 use crate::runtime::path::ServerSessionRetirement;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -21,6 +24,7 @@ pub(in crate::runtime) struct ServerSessionTracker {
     max_sessions: usize,
     session_retention_timeout: Duration,
     sessions: Mutex<HashMap<SessionId, ServerSessionEntry>>,
+    webhooks: OnceLock<ServerWebhookContext>,
 }
 
 #[derive(Debug)]
@@ -33,6 +37,7 @@ struct ServerSessionEntry {
     principal_permit: PrincipalPermit,
     retirement: watch::Sender<Option<CloseReason>>,
     retired_until: Option<Instant>,
+    webhook: Option<Box<SessionObservation>>,
 }
 
 impl Default for ServerSessionTracker {
@@ -61,6 +66,52 @@ impl ServerSessionTracker {
             max_sessions,
             session_retention_timeout,
             sessions: Mutex::new(HashMap::new()),
+            webhooks: OnceLock::new(),
+        }
+    }
+
+    pub(in crate::runtime::stream) fn attach_webhooks(&self, context: ServerWebhookContext) {
+        let _ = self.webhooks.set(context);
+    }
+
+    /// Runs under the registry owner followed by the tracker lock. The same
+    /// tracker fence rejects readiness racing an explicit session terminal.
+    pub(in crate::runtime::stream) fn observe_carrier(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        peer: Option<SocketAddr>,
+        ready: bool,
+    ) -> bool {
+        let Some(context) = self.webhooks.get() else {
+            return true;
+        };
+        let mut sessions = self.sessions.lock().expect("server session tracker lock");
+        let Some(entry) = sessions.get_mut(&identity.session_id) else {
+            return false;
+        };
+        if ready && entry.retirement.borrow().is_some() {
+            return false;
+        }
+        entry
+            .webhook
+            .get_or_insert_with(Default::default)
+            .carrier(context, identity, peer, ready);
+        true
+    }
+
+    pub(in crate::runtime::stream) fn observe_peer_address(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        peer: SocketAddr,
+    ) {
+        let Some(context) = self.webhooks.get() else {
+            return;
+        };
+        let mut sessions = self.sessions.lock().expect("server session tracker lock");
+        if let Some(entry) = sessions.get_mut(&identity.session_id)
+            && let Some(observation) = &mut entry.webhook
+        {
+            observation.address(context, identity, peer);
         }
     }
 
@@ -97,6 +148,7 @@ impl ServerSessionTracker {
                 principal_permit: principal_permit.clone(),
                 retirement: watch::channel(None).0,
                 retired_until: None,
+                webhook: None,
             });
         if !entry.principal_permit.same_principal(principal_permit) {
             return Err(RuntimeError::AuthenticationRejected(
@@ -197,6 +249,12 @@ impl ServerSessionTracker {
         }
         entry.retired_until = Some(now + self.session_retention_timeout);
         entry.retirement.send_replace(Some(reason));
+        if let Some(context) = self.webhooks.get() {
+            entry
+                .webhook
+                .get_or_insert_with(Default::default)
+                .retire(context, session_id);
+        }
         true
     }
 

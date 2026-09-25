@@ -148,3 +148,28 @@ outbound = "direct-egress"
 # members = [{ outbound = "direct-egress" }, { outbound = "socks5-egress" }]
 # health = { failure_threshold = 3, recovery_threshold = 2, initial_backoff_s = 1, maximum_backoff_s = 60 }
 # probe = { target = "192.0.2.1:443", interval_s = 10, timeout_s = 2 }
+
+# Optional callbacks for authenticated peer/session lifecycle. The first rule
+# reports attachment changes; the second sends the before/after client IP set.
+# Both use this profile's independent direct-egress outbound. See
+# docs/WEBHOOKS.md for event fields, retry behavior, and receiver deduplication.
+# [[webhooks.rules]]
+# name = "peer-session-state"
+# [webhooks.rules.when]
+# events = ["session.state_changed"]
+# inbounds = ["mpp-listener"]
+# [webhooks.rules.target]
+# url = "https://notify.example.net/sessions"
+# outbound = "direct-egress"
+#
+# [[webhooks.rules]]
+# name = "peer-addresses"
+# [webhooks.rules.when]
+# events = ["session.peer_addresses_changed"]
+# inbounds = ["mpp-listener"]
+# initial = false
+# changed = ["ip"]
+# [webhooks.rules.target]
+# url = "https://notify.example.net/clients"
+# outbound = "direct-egress"
+# json = { session = "{session.id}", before = "{change.before}", after = "{change.after}", peer_ips = "{session.peer_ips}" }

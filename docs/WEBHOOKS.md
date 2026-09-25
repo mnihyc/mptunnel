@@ -5,6 +5,13 @@ outbound or balancer. Use them to report path outages and recovery attempts,
 observe authenticated client address changes, or export periodic path snapshots.
 They are optional; omitting `[webhooks]` starts no webhook worker or timer.
 
+The shipped [client profile](../examples/client.toml) has a minimal outage and
+recovery example, and the [server profile](../examples/server.toml) has minimal
+peer session and address examples. Their webhook blocks stay commented so each
+profile remains runnable without a notification endpoint. The
+[configuration reference](../examples/config.reference.toml) shows every event,
+filter, target-body form, and delivery setting.
+
 ## Path down and every recovery check
 
 Add this to a configuration with an MPP outbound named `edge-mpp` and an
@@ -126,11 +133,13 @@ not coalesced. Intervals do not create new measurement or probe schedules.
 
 Common source selectors are `outbounds`, `inbounds`, `balancers`, `paths`, and
 `transports` (`tcp`, `quic`). Event-specific selectors include `from`, `to`,
-`outcome`, `probe_state_at_start`, `initial`, and `changed`. Values in ordinary
-filter lists are alternatives; every component listed in `changed` must be
-present in the event's `change.components`. Configuration validation rejects
-unsupported combinations, unknown names, and templates for fields unavailable
-to the selected event families.
+`field`, `trigger`, `outcome`, `probe_state_at_start`, `initial`, and `changed`;
+`interval_s` is required when a rule selects `path.interval`; omit it from
+rules without that event.
+Values in ordinary filter lists are alternatives; every component listed in
+`changed` must be present in the event's `change.components`. Configuration
+validation rejects unsupported combinations, unknown names, and templates for
+fields unavailable to the selected event families.
 
 ## Request and templates
 

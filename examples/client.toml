@@ -153,3 +153,26 @@ outbound = "remote-mpp"
 [[routing.rules]]
 name = "default"
 outbound = "remote-mpp"
+
+# Optional path outage/recovery callback. This rule reports only an observed
+# up-to-down transition, then each real background path check that started
+# while down (including a successful recovery check). Uncomment the delivery
+# outbound and webhook tables together. See docs/WEBHOOKS.md for event details.
+# [[outbounds]]
+# name = "notify-direct"
+# protocol = "direct"
+#
+# [[webhooks.rules]]
+# name = "path-recovery"
+# [webhooks.rules.when]
+# outbounds = ["remote-mpp"]
+# [[webhooks.rules.when.any]]
+# events = ["path.state_changed"]
+# from = ["up"]
+# to = ["down"]
+# [[webhooks.rules.when.any]]
+# events = ["path.probe_completed"]
+# probe_state_at_start = ["down"]
+# [webhooks.rules.target]
+# url = "https://notify.example.net/mpp"
+# outbound = "notify-direct"

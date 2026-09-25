@@ -1013,32 +1013,189 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # association commits, MPTUNNEL reports its outcome but never transparently
 # replays the flow through another balancer member.
 
-# Optional lifecycle HTTP callbacks. No rules means no worker or interval timer.
-# Events, typed filters, examples and delivery semantics: docs/WEBHOOKS.md.
+# Optional lifecycle HTTP callbacks. No rules means no webhook worker or timer.
+# Minimal role-specific examples are in client.toml and server.toml; this section
+# shows the complete event and selector vocabulary plus target and delivery
+# shapes. Keep it commented until the target egress is configured. The path and
+# carrier rules below monitor edge-mpp, so their delivery must use independent
+# egress. Enable the optional direct-egress definition above first.
+# Events, semantics, and template rules: docs/WEBHOOKS.md.
 # [webhooks]
 # max_in_flight = 4
 # max_pending_deliveries = 256
 # max_pending_bytes = 1048576
-# shutdown_timeout_s = 2       # best-effort drain; 0 cancels immediately
-# [webhooks.delivery]         # shared defaults; rules override only differences
-# timeout_s = 10              # whole attempt including DNS/connect
-# max_age_s = 30              # includes queueing and retry waits
-# max_attempts = 1            # no retry by default; supported range 1..5
-# initial_backoff_s = 1       # positive when retries enabled
-# max_backoff_s = 5
+# shutdown_timeout_s = 2
+# [webhooks.delivery]
+# timeout_s = 10
+# max_age_s = 30
+# max_attempts = 1 # default: retries are disabled
+#
+# All path event kinds. `when.any` branches are ORed; source selectors are
+# shared by every branch. `interval_s` is required because this rule includes
+# path.interval, which sends periodic snapshots without adding probes.
 # [[webhooks.rules]]
-# name = "path-availability"
+# name = "path-lifecycle"
 # [webhooks.rules.when]
+# outbounds = ["edge-mpp"]
+# paths = ["path-1", "path-2"]
+# transports = ["tcp", "quic"]
+# interval_s = 60
+# [[webhooks.rules.when.any]]
 # events = ["path.state_changed"]
-# outbounds = ["edge-mpp"]    # local configured outbound name
-# to = ["up", "down"]
+# from = ["up"]
+# to = ["down"]
+# [[webhooks.rules.when.any]]
+# events = ["path.policy_changed"]
+# from = ["enabled", "suspect"]
+# to = ["disabled"]
+# [[webhooks.rules.when.any]]
+# events = ["path.probe_completed"]
+# trigger = ["periodic", "reconcile"]
+# probe_state_at_start = ["down"]
+# outcome = ["success", "failure", "cancelled"]
+# [[webhooks.rules.when.any]]
+# events = ["path.interval"]
 # [webhooks.rules.target]
-# url = "https://notify.example.net/mpp"
-# outbound = "direct-egress" # exactly one of outbound or balancer; enable its example above
-# method = "POST"            # default body is the versioned JSON event
-# target_resolution = "full-resolve" # or as-is with compatible proxy/MPP
-# dns_policy = "system"      # active DNS policy; omit to follow configured split DNS
-# headers = { Authorization = { from = "file", path = "notify-authorization.txt" } }
-# json = { event = "{event.type}", path = "{path.name}", state = "{change.to}" }
+# url = "https://notify.example.net/paths/{path.name}"
+# outbound = "direct-egress"
+# target_resolution = "full-resolve"
+# dns_policy = "system"
+# query = { event = "{event.type}", path = "{path.name}" }
+# headers = { "X-MPP-Event" = "{event.type}", Authorization = { from = "file", path = "notify-authorization.txt" } }
+# json = { id = "{event.id}", event = "{event.type}", path = "{path.name}", state = "{path.state}", local_ips = "{path.local_ips}" }
+# method = "POST"
+# For a bodyless request, use method = "GET" or "HEAD" and omit the body.
+# Alternative: set target_resolution = "as-is" with domain-capable proxy/MPP egress.
+# For a private CA, set:
+# tls_ca_certificate = { from = "file", path = "notify-ca.pem" }
 # [webhooks.rules.delivery]
 # max_age_s = 60
+# max_attempts = 3
+# initial_backoff_s = 1
+# max_backoff_s = 5
+#
+# Client carrier events use outbound/path selectors. Each branch has only the
+# filters supported by its event; `initial` is meaningful for state/address
+# observations, and every requested `changed` component must have changed.
+# [[webhooks.rules]]
+# name = "client-carriers"
+# [webhooks.rules.when]
+# outbounds = ["edge-mpp"]
+# paths = ["path-1", "path-2"]
+# transports = ["tcp", "quic"]
+# [[webhooks.rules.when.any]]
+# events = ["carrier.state_changed"]
+# from = ["ready"]
+# to = ["draining", "closed"]
+# initial = false
+# [[webhooks.rules.when.any]]
+# events = ["carrier.policy_changed"]
+# from = ["available"]
+# to = ["backup"]
+# [[webhooks.rules.when.any]]
+# events = ["carrier.address_changed"]
+# changed = ["ip", "port"]
+# initial = false
+# [webhooks.rules.target]
+# url = "https://notify.example.net/carriers"
+# outbound = "direct-egress"
+#
+# Server carrier events are scoped by inbound. The inbound must be configured
+# above. The default request body is the complete versioned event envelope.
+# [[webhooks.rules]]
+# name = "server-carriers"
+# [webhooks.rules.when]
+# inbounds = ["mpp-listener"]
+# [[webhooks.rules.when.any]]
+# events = ["carrier.state_changed"]
+# from = ["ready"]
+# to = ["closed"]
+# initial = false
+# [[webhooks.rules.when.any]]
+# events = ["carrier.policy_changed"]
+# from = ["available"]
+# to = ["backup"]
+# [[webhooks.rules.when.any]]
+# events = ["carrier.address_changed"]
+# changed = ["ip", "port"]
+# initial = false
+# [webhooks.rules.target]
+# url = "https://notify.example.net/inbound-carriers"
+# outbound = "direct-egress"
+#
+# Session attachment and address-set observations have separate rules because
+# their template fields differ. Session peer-address changes support `ip` only.
+# [[webhooks.rules]]
+# name = "server-session-state"
+# [webhooks.rules.when]
+# events = ["session.state_changed"]
+# inbounds = ["mpp-listener"]
+# from = ["attached"]
+# to = ["detached", "retired"]
+# initial = false
+# [webhooks.rules.target]
+# url = "https://notify.example.net/sessions"
+# outbound = "direct-egress"
+#
+# [[webhooks.rules]]
+# name = "server-peer-addresses"
+# [webhooks.rules.when]
+# events = ["session.peer_addresses_changed"]
+# inbounds = ["mpp-listener"]
+# initial = false
+# changed = ["ip"]
+# [webhooks.rules.target]
+# url = "https://notify.example.net/clients"
+# balancer = "egress-fallback"
+# query = { session = "{session.id}" }
+# form = { session = "{session.id}", before = "{change.before}", after = "{change.after}" }
+#
+# Node events have no resource source selector. This rule demonstrates a text
+# body and a balancer target; enable the egress-fallback balancer above first.
+# [[webhooks.rules]]
+# name = "node-lifecycle"
+# [webhooks.rules.when]
+# events = ["node.state_changed"]
+# from = ["ready"]
+# to = ["stopping", "failed"]
+# initial = false
+# [webhooks.rules.target]
+# url = "https://notify.example.net/nodes"
+# balancer = "egress-fallback"
+# text = "{event.type}: {node.state} (generation {event.configuration_generation})"
+#
+# Balancer source selectors can further narrow events to member outbounds.
+# `field` distinguishes health and administrative mode transitions.
+# [[webhooks.rules]]
+# name = "balancer-members"
+# [webhooks.rules.when]
+# balancers = ["edge-balancer"]
+# outbounds = ["edge-mpp"]
+# [[webhooks.rules.when.any]]
+# events = ["balancer.member_changed"]
+# field = ["health"]
+# from = ["unhealthy"]
+# to = ["healthy"]
+# [[webhooks.rules.when.any]]
+# events = ["balancer.member_changed"]
+# field = ["mode"]
+# from = ["draining"]
+# to = ["enabled"]
+# [webhooks.rules.target]
+# url = "https://notify.example.net/balancers"
+# outbound = "direct-egress"
+# json = { balancer = "{balancer.name}", member = "{member.outbound}", field = "{change.field}", before = "{change.from}", after = "{change.to}" }
+#
+# The balancer probe event has its own probe selectors and fields.
+# [[webhooks.rules]]
+# name = "balancer-probes"
+# [webhooks.rules.when]
+# events = ["balancer.probe_completed"]
+# balancers = ["edge-balancer"]
+# outbounds = ["edge-mpp"]
+# trigger = ["periodic"]
+# outcome = ["success", "failure", "cancelled"]
+# [webhooks.rules.target]
+# url = "https://notify.example.net/balancer-probes"
+# outbound = "direct-egress"
+# json = { balancer = "{balancer.name}", member = "{member.outbound}", trigger = "{probe.trigger}", outcome = "{probe.outcome}", elapsed_s = "{probe.elapsed_s}" }

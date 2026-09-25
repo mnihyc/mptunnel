@@ -1,7 +1,7 @@
 # MPTUNNEL release package
 
 Each archive contains one MPTUNNEL command-line binary, three editable
-configuration examples, and this package guide. It is the same MPTUNNEL binary
+configuration examples, the webhook guide, and this package guide. It is the same MPTUNNEL binary
 for client and server use. Windows archives additionally contain the signed,
 architecture-matched Wintun runtime and its required license.
 
@@ -65,10 +65,10 @@ separate raw 32-byte endpoint key. The flag is optional so both peers can
 instead use TLS TCP and public QUIC Initials. Do not reuse an MPP client
 credential as this endpoint-wide key.
 
-MPTUNNEL 0.6.0 uses MPP wire version 16. Upgrade the client and server
-together, verify `./mptunnel --version` reports `0.6.0` on both endpoints, and
-then enable traffic. A v15 endpoint rejects the first v16 MPP frame; there is
-no capability negotiation or rolling compatibility mode.
+MPTUNNEL 0.6.1 uses MPP wire version 16 and remains wire-compatible with
+0.6.0. When upgrading from 0.5.x or an earlier wire version, upgrade the client
+and server together before enabling traffic. A v15 endpoint rejects the first
+v16 MPP frame; there is no negotiated fallback to earlier wire versions.
 
 For a persistent setup, copy `examples/client.toml` or
 `examples/server.toml`, replace every placeholder, supply the referenced TLS
@@ -84,6 +84,12 @@ variable—resolve beside the selected TOML file. The bundled
 [complete configuration reference](examples/config.reference.toml) documents
 every TOML section, material source, DNS protocol, and carrier URI option. Run
 `./mptunnel --help` for the simple CLI surface.
+
+The client and server examples include concise, optional webhook recipes for
+their respective roles. The reference covers the full configuration, and the
+bundled [webhook guide](docs/WEBHOOKS.md) explains event semantics, templates,
+queue limits, and optional retries. All webhook examples are commented out
+until you configure a receiver.
 
 When upgrading from 0.4.3, rebuild the configuration from the bundled client,
 server, or complete reference example and transfer duration values in seconds.

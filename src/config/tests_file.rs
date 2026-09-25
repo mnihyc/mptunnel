@@ -4534,6 +4534,180 @@ outbound = "notify-direct"
     )
 }
 
+fn activate_commented_config_section(document: &str, marker: &str) -> String {
+    let mut in_section = false;
+    document
+        .lines()
+        .map(|line| {
+            if line.contains(marker) {
+                in_section = true;
+                return line.to_string();
+            }
+            if in_section && let Some(candidate) = line.strip_prefix("# ") {
+                let is_table = candidate.starts_with('[');
+                let is_assignment = candidate.split_once('=').is_some_and(|(key, _)| {
+                    let key = key.trim();
+                    !key.is_empty()
+                        && key.chars().all(|character| {
+                            character.is_ascii_alphanumeric()
+                                || matches!(character, '_' | '-' | '.')
+                        })
+                });
+                if is_table || is_assignment {
+                    return candidate.to_string();
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn comprehensive_webhook_fixtures() -> String {
+    let reference = include_str!("../../examples/config.reference.toml");
+    let marker = "# Optional lifecycle HTTP callbacks.";
+    let section_start = reference.find(marker).expect("reference webhook section");
+    let webhooks = activate_commented_config_section(&reference[section_start..], marker)
+        .replace("notify-authorization.txt", TEST_PROXY_PASSWORD_FILE)
+        .replace("notify-ca.pem", TEST_CERTIFICATE_FILE);
+    let mut document = r#"
+[dns]
+default = "system"
+[[dns.servers]]
+name = "system"
+protocol = "system"
+[[dns.policies]]
+name = "system"
+servers = ["system"]
+
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[inbounds]]
+name = "mpp-listener"
+protocol = "mpp"
+paths = [
+  { name = "path-1", endpoint = "tcp://127.0.0.1:7443" },
+  { name = "path-2", endpoint = "quic://127.0.0.1:7443" },
+]
+[inbounds.security]
+credential_ids = ["test-default"]
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
+
+[[outbounds]]
+name = "edge-mpp"
+protocol = "mpp"
+paths = [
+  { name = "path-1", endpoint = "tcp://127.0.0.1:7443" },
+  { name = "path-2", endpoint = "quic://127.0.0.1:7443" },
+]
+[outbounds.security]
+credential_id = "test-default"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
+
+[[outbounds]]
+name = "edge-mpp-secondary"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7444" }]
+[outbounds.security]
+credential_id = "test-default"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
+
+[[outbounds]]
+name = "direct-egress"
+protocol = "direct"
+
+[[outbounds]]
+name = "socks5-egress"
+protocol = "socks5"
+endpoint = "127.0.0.1:1080"
+
+[routing]
+[[routing.rules]]
+name = "default"
+outbound = "direct-egress"
+
+[[routing.balancers]]
+name = "edge-balancer"
+strategy = "least-latency"
+members = [
+  { outbound = "edge-mpp" },
+  { outbound = "edge-mpp-secondary" },
+]
+
+[[routing.balancers]]
+name = "egress-fallback"
+strategy = "ordered-failover"
+members = [{ outbound = "direct-egress" }, { outbound = "socks5-egress" }]
+"#
+    .to_string();
+    document.push_str(&webhooks);
+    document
+}
+
+#[test]
+fn role_specific_webhook_examples_parse_when_uncommented() {
+    let client = activate_commented_config_section(
+        include_str!("../../examples/client.toml"),
+        "# Optional path outage/recovery callback.",
+    )
+    .replace("server-cert.pem", TEST_CERTIFICATE_FILE)
+    .replace("mpp-transport.key", TEST_TRANSPORT_SECRET_FILE);
+    let config = load_config_toml_str(&client).expect("uncommented client webhook example");
+    let CommandConfig::Node(client) = config.command;
+    assert_eq!(client.webhooks.rules.len(), 1);
+    assert_eq!(client.webhooks.rules[0].name, "path-recovery");
+    assert_eq!(client.webhooks.rules[0].when.branches.len(), 2);
+
+    let server = activate_commented_config_section(
+        include_str!("../../examples/server.toml"),
+        "# Optional callbacks for authenticated peer/session lifecycle.",
+    )
+    .replace("server-cert.pem", TEST_CERTIFICATE_FILE)
+    .replace("server-key.pem", TEST_PRIVATE_KEY_FILE)
+    .replace("mpp-transport.key", TEST_TRANSPORT_SECRET_FILE);
+    let config = load_config_toml_str(&server).expect("uncommented server webhook examples");
+    let CommandConfig::Node(server) = config.command;
+    assert_eq!(server.webhooks.rules.len(), 2);
+    assert_eq!(server.webhooks.rules[0].name, "peer-session-state");
+    assert_eq!(server.webhooks.rules[1].name, "peer-addresses");
+}
+
+#[test]
+fn comprehensive_webhook_reference_parses_with_optional_source_fixtures() {
+    let document = comprehensive_webhook_fixtures();
+    let config = load_config_toml_str(&document)
+        .expect("comprehensive webhook reference with named source/egress fixtures");
+    let CommandConfig::Node(node) = config.command;
+
+    assert_eq!(node.webhooks.rules.len(), 8);
+    assert_eq!(node.webhooks.delivery_defaults.max_attempts, 1);
+    for event in EventKind::ALL {
+        assert!(
+            node.webhooks.rules.iter().any(|rule| {
+                rule.when
+                    .branches
+                    .iter()
+                    .any(|branch| branch.events.contains(&event))
+            }),
+            "comprehensive reference omits parsed event {event}"
+        );
+    }
+    let path_rule = node
+        .webhooks
+        .rules
+        .iter()
+        .find(|rule| rule.name == "path-lifecycle")
+        .expect("path lifecycle rule");
+    assert_eq!(path_rule.delivery.max_attempts, 3);
+    assert_eq!(path_rule.delivery.initial_backoff, Duration::from_secs(1));
+    assert_eq!(path_rule.delivery.max_backoff, Duration::from_secs(5));
+}
+
 #[test]
 fn webhook_events_list_uses_default_queue_and_allows_unfiltered_event_types() {
     let config = load_config_toml_str(&webhook_parser_base(

@@ -134,7 +134,7 @@ try {
     $Package = $Contract.package
     $DistDir = ".tmp/release/dist"
     $Stage = Join-Path $DistDir $Package
-    $ReleaseFiles = @("packaging/README.md")
+    $ReleaseFiles = @("packaging/README.md", "docs/WEBHOOKS.md")
     $ReleaseExamples = @(
         "examples/client.toml",
         "examples/server.toml",
@@ -154,6 +154,9 @@ try {
     Copy-Item $BinaryPath $Stage
     Copy-Item "packaging/README.md" (Join-Path $Stage "README.md")
     Copy-Item $ReleaseExamples $StageExamples
+    $StageDocs = Join-Path $Stage "docs"
+    New-Item -ItemType Directory -Force $StageDocs | Out-Null
+    Copy-Item "docs/WEBHOOKS.md" (Join-Path $StageDocs "WEBHOOKS.md")
 
     $WintunArchive = Get-WintunArchive
     Copy-WintunPackageFiles $WintunArchive $WintunArchitecture $Stage

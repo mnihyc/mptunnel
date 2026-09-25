@@ -1,9 +1,12 @@
 use mptunnel::transport::CARRIER_PATH_QUERY_KEYS;
+use mptunnel::webhook::EventKind;
 
 const MATERIAL_SOURCE_KINDS: [&str; 5] = ["file", "env", "hex", "base64", "raw"];
 const DNS_PROTOCOLS: [&str; 7] = ["system", "udp", "tcp", "udp-tcp", "dot", "doh", "doq"];
 
 const REFERENCE: &str = include_str!("../examples/config.reference.toml");
+const CLIENT_EXAMPLE: &str = include_str!("../examples/client.toml");
+const SERVER_EXAMPLE: &str = include_str!("../examples/server.toml");
 
 #[test]
 fn reference_documents_every_material_source_and_consumer() {
@@ -236,6 +239,101 @@ fn shipped_flow_defaults_are_visible_but_remain_unconfigured() {
                     .lines()
                     .all(|line| !line.trim_start().starts_with(&format!("{key} ="))),
                 "shipped configuration unexpectedly configures [flow] key {key}"
+            );
+        }
+    }
+}
+
+#[test]
+fn webhook_reference_covers_the_runtime_event_selector_and_target_surface() {
+    let webhooks = REFERENCE
+        .split("# Optional lifecycle HTTP callbacks.")
+        .nth(1)
+        .expect("reference webhook section");
+
+    for event in EventKind::ALL {
+        assert!(
+            webhooks.contains(&format!("\"{}\"", event.as_str())),
+            "configuration reference omits webhook event {}",
+            event.as_str()
+        );
+    }
+    for selector in [
+        "events =",
+        "when.any",
+        "outbounds =",
+        "inbounds =",
+        "balancers =",
+        "paths =",
+        "transports =",
+        "from =",
+        "to =",
+        "field =",
+        "trigger =",
+        "probe_state_at_start =",
+        "outcome =",
+        "initial =",
+        "changed =",
+        "interval_s =",
+    ] {
+        assert!(
+            webhooks.contains(selector),
+            "configuration reference omits webhook selector {selector}"
+        );
+    }
+    for target_shape in [
+        "outbound = \"direct-egress\"",
+        "balancer = \"egress-fallback\"",
+        "query = {",
+        "headers = {",
+        "json = {",
+        "form = {",
+        "text = \"",
+        "Authorization = { from = \"file\"",
+        "{path.local_ips}",
+    ] {
+        assert!(
+            webhooks.contains(target_shape),
+            "configuration reference omits webhook target shape {target_shape}"
+        );
+    }
+    for delivery_setting in [
+        "max_in_flight =",
+        "max_pending_deliveries =",
+        "max_pending_bytes =",
+        "shutdown_timeout_s =",
+        "[webhooks.delivery]",
+        "timeout_s =",
+        "max_age_s =",
+        "max_attempts =",
+        "initial_backoff_s =",
+        "max_backoff_s =",
+        "[webhooks.rules.delivery]",
+    ] {
+        assert!(
+            webhooks.contains(delivery_setting),
+            "configuration reference omits webhook delivery setting {delivery_setting}"
+        );
+    }
+}
+
+#[test]
+fn minimal_webhook_examples_match_client_and_server_roles_and_stay_optional() {
+    assert!(CLIENT_EXAMPLE.contains("name = \"path-recovery\""));
+    assert!(CLIENT_EXAMPLE.contains("events = [\"path.state_changed\"]"));
+    assert!(CLIENT_EXAMPLE.contains("events = [\"path.probe_completed\"]"));
+    assert!(CLIENT_EXAMPLE.contains("outbound = \"notify-direct\""));
+
+    assert!(SERVER_EXAMPLE.contains("name = \"peer-session-state\""));
+    assert!(SERVER_EXAMPLE.contains("events = [\"session.state_changed\"]"));
+    assert!(SERVER_EXAMPLE.contains("events = [\"session.peer_addresses_changed\"]"));
+    assert!(SERVER_EXAMPLE.contains("outbound = \"direct-egress\""));
+
+    for example in [CLIENT_EXAMPLE, SERVER_EXAMPLE] {
+        for line in example.lines().filter(|line| line.contains("[webhooks")) {
+            assert!(
+                line.trim_start().starts_with('#'),
+                "optional webhook table is active in a minimal profile: {line}"
             );
         }
     }

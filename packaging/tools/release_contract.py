@@ -24,6 +24,7 @@ REPOSITORY_RE = re.compile(
 COMMON_ARCHIVE_FILES = frozenset(
     {
         "README.md",
+        "docs/WEBHOOKS.md",
         "examples/client.toml",
         "examples/config.reference.toml",
         "examples/server.toml",

@@ -4805,6 +4805,7 @@ outbound = "notify-direct"
 
 #[test]
 fn webhook_rejects_durations_that_overflow_runtime_deadlines() {
+    let max_toml_seconds = i64::MAX as u64;
     let delivery = webhook_parser_base(
         r#"
 [webhooks.delivery]
@@ -4819,10 +4820,7 @@ url = "https://notify.example.net/hook"
 outbound = "notify-direct"
 "#,
     );
-    assert!(matches!(
-        load_config_toml_str(&delivery),
-        Err(ConfigFileError::Webhook(_))
-    ));
+    assert_webhook_duration_parse_matches_instant_range(&delivery, max_toml_seconds);
 
     let interval = webhook_parser_base(
         r#"
@@ -4836,10 +4834,7 @@ url = "https://notify.example.net/hook"
 outbound = "notify-direct"
 "#,
     );
-    assert!(matches!(
-        load_config_toml_str(&interval),
-        Err(ConfigFileError::Webhook(_))
-    ));
+    assert_webhook_duration_parse_matches_instant_range(&interval, max_toml_seconds);
 
     let retry = webhook_parser_base(
         r#"
@@ -4857,10 +4852,63 @@ url = "https://notify.example.net/hook"
 outbound = "notify-direct"
 "#,
     );
-    assert!(matches!(
-        load_config_toml_str(&retry),
-        Err(ConfigFileError::Webhook(_))
-    ));
+    assert_webhook_duration_parse_matches_instant_range(&retry, max_toml_seconds);
+}
+
+fn assert_webhook_duration_parse_matches_instant_range(document: &str, seconds: u64) {
+    let duration = Duration::from_secs(seconds);
+    let representable = std::time::Instant::now().checked_add(duration).is_some();
+    assert_eq!(
+        load_config_toml_str(document).is_ok(),
+        representable,
+        "webhook config deadline validation should match this platform's Instant range"
+    );
+}
+
+#[test]
+fn webhook_model_rejects_duration_max_for_deadline_fields() {
+    let default = DeliveryPolicy::default();
+    for policy in [
+        DeliveryPolicy {
+            timeout: Duration::MAX,
+            ..default
+        },
+        DeliveryPolicy {
+            max_age: Duration::MAX,
+            ..default
+        },
+        DeliveryPolicy {
+            initial_backoff: Duration::MAX,
+            ..default
+        },
+        DeliveryPolicy {
+            max_backoff: Duration::MAX,
+            ..default
+        },
+    ] {
+        assert!(policy.validate().is_err());
+    }
+
+    let config = load_config_toml_str(&webhook_parser_base(
+        r#"
+[[webhooks.rules]]
+name = "periodic"
+[webhooks.rules.when]
+events = ["path.interval"]
+interval_s = 1
+[webhooks.rules.target]
+url = "https://notify.example.net/hook"
+outbound = "notify-direct"
+"#,
+    ))
+    .expect("baseline model for webhook duration checks");
+    let CommandConfig::Node(mut node) = config.command;
+
+    node.webhooks.shutdown_timeout = Duration::MAX;
+    assert!(node.webhooks.validate().is_err());
+    node.webhooks.shutdown_timeout = WebhookConfig::default().shutdown_timeout;
+    node.webhooks.rules[0].interval = Some(Duration::MAX);
+    assert!(node.webhooks.validate().is_err());
 }
 
 #[test]

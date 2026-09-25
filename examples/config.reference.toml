@@ -187,7 +187,8 @@ allow_peer_diagnostics = false
 #   mptunnel --config ./config.toml dns status
 #   mptunnel --config ./config.toml dns explain example.com
 # `route explain` and `doctor` also load this strict file without starting the
-# runtime. See docs/OPERATIONS.md for their typed inputs and exit behavior.
+# runtime. Their typed inputs and exit behavior are documented at:
+# https://github.com/mnihyc/mptunnel/blob/main/docs/OPERATIONS.md
 
 [resources]
 # These are bounded capacity envelopes. Live transport metrics choose paths and
@@ -1019,7 +1020,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # shapes. Keep it commented until the target egress is configured. The path and
 # carrier rules below monitor edge-mpp, so their delivery must use independent
 # egress. Enable the optional direct-egress definition above first.
-# Events, semantics, and template rules: docs/WEBHOOKS.md.
+# Events, semantics, and template rules:
+# https://github.com/mnihyc/mptunnel/blob/main/docs/WEBHOOKS.md
 # [webhooks]
 # max_in_flight = 4
 # max_pending_deliveries = 256

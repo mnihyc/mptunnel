@@ -157,7 +157,8 @@ outbound = "remote-mpp"
 # Optional path outage/recovery callback. This rule reports only an observed
 # up-to-down transition, then each real background path check that started
 # while down (including a successful recovery check). Uncomment the delivery
-# outbound and webhook tables together. See docs/WEBHOOKS.md for event details.
+# outbound and webhook tables together. Event details:
+# https://github.com/mnihyc/mptunnel/blob/main/docs/WEBHOOKS.md
 # [[outbounds]]
 # name = "notify-direct"
 # protocol = "direct"

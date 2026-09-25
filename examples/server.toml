@@ -151,8 +151,9 @@ outbound = "direct-egress"
 
 # Optional callbacks for authenticated peer/session lifecycle. The first rule
 # reports attachment changes; the second sends the before/after client IP set.
-# Both use this profile's independent direct-egress outbound. See
-# docs/WEBHOOKS.md for event fields, retry behavior, and receiver deduplication.
+# Both use this profile's independent direct-egress outbound. Event fields,
+# retry behavior, and receiver deduplication:
+# https://github.com/mnihyc/mptunnel/blob/main/docs/WEBHOOKS.md
 # [[webhooks.rules]]
 # name = "peer-session-state"
 # [webhooks.rules.when]

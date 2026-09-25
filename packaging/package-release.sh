@@ -259,7 +259,7 @@ fi
 dist_dir=".tmp/release/dist"
 stage="${dist_dir}/${package}"
 
-release_files=(packaging/README.md docs/WEBHOOKS.md)
+release_files=(packaging/README.md)
 release_examples=(examples/client.toml examples/server.toml examples/config.reference.toml)
 for release_file in "${release_files[@]}" "${release_examples[@]}"; do
   if [[ ! -f "$release_file" ]]; then
@@ -269,10 +269,9 @@ for release_file in "${release_files[@]}" "${release_examples[@]}"; do
 done
 
 rm -rf "$stage"
-mkdir -p "$stage/examples" "$stage/docs"
+mkdir -p "$stage/examples"
 cp "$binary_path" "$stage/"
 cp packaging/README.md "$stage/README.md"
-cp docs/WEBHOOKS.md "$stage/docs/WEBHOOKS.md"
 cp "${release_examples[@]}" "$stage/examples/"
 
 case "$target_os" in

@@ -1,7 +1,7 @@
 # MPTUNNEL release package
 
 Each archive contains one MPTUNNEL command-line binary, three editable
-configuration examples, the webhook guide, and this package guide. It is the same MPTUNNEL binary
+configuration examples, and this package guide. It is the same MPTUNNEL binary
 for client and server use. Windows archives additionally contain the signed,
 architecture-matched Wintun runtime and its required license.
 
@@ -86,10 +86,12 @@ every TOML section, material source, DNS protocol, and carrier URI option. Run
 `./mptunnel --help` for the simple CLI surface.
 
 The client and server examples include concise, optional webhook recipes for
-their respective roles. The reference covers the full configuration, and the
-bundled [webhook guide](docs/WEBHOOKS.md) explains event semantics, templates,
-queue limits, and optional retries. All webhook examples are commented out
-until you configure a receiver.
+their respective roles. The reference covers the full configuration. All
+webhook examples are commented out until you configure a receiver.
+
+Read the full [product documentation](https://github.com/mnihyc/mptunnel/tree/main/docs)
+online, including the [webhook guide](https://github.com/mnihyc/mptunnel/blob/main/docs/WEBHOOKS.md).
+Standalone product documentation is not included in binary packages.
 
 When upgrading from 0.4.3, rebuild the configuration from the bundled client,
 server, or complete reference example and transfer duration values in seconds.

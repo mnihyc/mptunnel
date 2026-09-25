@@ -458,7 +458,6 @@ gh() {
     def test_packaging_sources_and_documented_names_match_contract(self) -> None:
         required_sources = (
             "packaging/README.md",
-            "docs/WEBHOOKS.md",
             "packaging/service/systemd/mptunnel.service",
             "examples/client.toml",
             "examples/config.reference.toml",

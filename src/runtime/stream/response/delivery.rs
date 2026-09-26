@@ -2428,7 +2428,161 @@ impl ResponseStreamBinding {
     }
 }
 
+/// Releases exact Product flight ranges covered by normalized, ordered,
+/// half-open ACK ranges.
+/// Production ledgers contain only checked nonempty flights with
+/// `flight.end > start` and `flight.bytes == flight.end - start`; an optional
+/// qualification receipt is contained within that flight. The no-hit fast
+/// path relies on those producer invariants and leaves untouched records alone.
 pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
+    flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
+    ranges: &[OffsetRange],
+) -> Vec<(u64, CarrierPathReleasedFlight)> {
+    if ranges.is_empty() || flights.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(last_range) = ranges.last() else {
+        return Vec::new();
+    };
+    let affected_starts = flights
+        .range(..last_range.end)
+        .filter_map(|(&start, path_flights)| {
+            path_flights
+                .iter()
+                .any(|flight| {
+                    if start >= flight.end {
+                        return false;
+                    }
+                    let first_possible = ranges.partition_point(|range| range.end <= start);
+                    ranges
+                        .get(first_possible)
+                        .is_some_and(|range| range.start < flight.end)
+                })
+                .then_some(start)
+        })
+        .collect::<Vec<_>>();
+    if affected_starts.is_empty() {
+        return Vec::new();
+    }
+
+    // Ambiguity is derived from the exact pre-release geometry of every flight,
+    // including flights the ACK will not split. Keep the map as the owner and
+    // borrow its extents instead of flattening every flight into a new Vec.
+    let ambiguous_intervals = ambiguous_flight_intervals(
+        flights
+            .iter()
+            .flat_map(|(start, entries)| entries.iter().map(move |flight| (*start, flight.end))),
+    );
+    let mut released = Vec::new();
+    let mut staged_right_fragments = BTreeMap::<u64, Vec<CarrierPathFlight>>::new();
+    let mut empty_starts = Vec::new();
+    for start in affected_starts {
+        let path_flights = flights
+            .get_mut(&start)
+            .expect("affected carrier-flight key remains in the ledger");
+        path_flights.retain_mut(|flight| {
+            let split = split_flight_interval_by_ack(start, flight.end, ranges);
+            if split.acked.is_empty() {
+                return true;
+            }
+
+            let original = *flight;
+            for (acked_start, acked_end, is_ambiguous) in split
+                .acked
+                .into_iter()
+                .flat_map(|(start, end)| flight_evidence_segments(start, end, &ambiguous_intervals))
+            {
+                let bytes = flight_interval_bytes(acked_start, acked_end);
+                if bytes == 0 {
+                    continue;
+                }
+                let qualification_ambiguous_ranges = if is_ambiguous {
+                    SmallVec::from_slice(&[OffsetRange {
+                        start: acked_start,
+                        end: acked_end,
+                    }])
+                } else {
+                    SmallVec::new()
+                };
+                released.push((
+                    acked_start,
+                    CarrierPathReleasedFlight {
+                        flight: CarrierPathFlight {
+                            end: acked_end,
+                            bytes,
+                            qualification_receipt: original.qualification_receipt.and_then(
+                                |receipt| {
+                                    receipt.intersect(OffsetRange {
+                                        start: acked_start,
+                                        end: acked_end,
+                                    })
+                                },
+                            ),
+                            ..original
+                        },
+                        path_proving: original.evidence_eligible
+                            && original.kind.is_original_transmission()
+                            && !is_ambiguous,
+                        qualification_ambiguous_ranges,
+                    },
+                ));
+            }
+
+            let mut keep_at_source = false;
+            for (retained_start, retained_end) in split.retained {
+                let bytes = flight_interval_bytes(retained_start, retained_end);
+                if bytes == 0 {
+                    continue;
+                }
+                let fragment = CarrierPathFlight {
+                    end: retained_end,
+                    bytes,
+                    qualification_receipt: original.qualification_receipt.and_then(|receipt| {
+                        receipt.intersect(OffsetRange {
+                            start: retained_start,
+                            end: retained_end,
+                        })
+                    }),
+                    ..original
+                };
+                if retained_start == start {
+                    // The left fragment keeps this flight's stable vector slot.
+                    *flight = fragment;
+                    keep_at_source = true;
+                } else {
+                    staged_right_fragments
+                        .entry(retained_start)
+                        .or_default()
+                        .push(fragment);
+                }
+            }
+            keep_at_source
+        });
+        if path_flights.is_empty() {
+            empty_starts.push(start);
+        }
+    }
+
+    for start in empty_starts {
+        flights.remove(&start);
+    }
+    for (start, mut fragments) in staged_right_fragments {
+        if let Some(existing) = flights.get_mut(&start) {
+            // Every staged fragment came from a lower source key, so the old
+            // whole-map rebuild would place it before destination siblings.
+            fragments.append(existing);
+            *existing = fragments;
+        } else {
+            flights.insert(start, fragments);
+        }
+    }
+    released
+}
+
+/// Original whole-map implementation retained as a test oracle only.
+#[cfg(test)]
+fn release_carrier_path_flight_ranges_reference(
     flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
     ranges: &[OffsetRange],
 ) -> Vec<(u64, CarrierPathReleasedFlight)> {

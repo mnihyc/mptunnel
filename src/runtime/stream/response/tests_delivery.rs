@@ -8,6 +8,8 @@ use super::super::test_support::{
 use super::*;
 use crate::model::carrier_rate_authority::CarrierRateAuthorityBasis;
 use crate::model::path::PathPolicy;
+use crate::model::product_qualification::ProductQualificationLedger;
+use crate::model::timing::ReliableDataAckGapTiming;
 use crate::model::work::CarrierWorkKind;
 use crate::protocol::{ConfiguredMemberSlot, OffsetRange, PathId, UnderlayProtocol};
 use crate::runtime::path::commands::{
@@ -17,6 +19,7 @@ use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::TrafficClass;
 use crate::transport::RateHint;
 use std::collections::BTreeMap;
+use std::hint::black_box;
 
 fn key(underlay: UnderlayProtocol, path_id: u16) -> CarrierPathKey {
     CarrierPathKey {
@@ -38,6 +41,157 @@ fn flight(key: CarrierPathKey, end: u64, bytes: usize, kind: CarrierWorkKind) ->
 
 fn range(start: u64, end: u64) -> OffsetRange {
     OffsetRange::new(start, end).expect("valid test range")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlightState {
+    key: CarrierPathKey,
+    output_incarnation: u64,
+    configured_slot: Option<ConfiguredMemberSlot>,
+    end: u64,
+    bytes: usize,
+    sent_at: Instant,
+    kind: CarrierWorkKind,
+    owner_fallback_deadline: Option<Instant>,
+    assignment_range: OffsetRange,
+    original_recovery_timing: Option<ReliableDataAckGapTiming>,
+    evidence_eligible: bool,
+    qualification_receipt: Option<crate::model::product_qualification::ProductQualificationReceipt>,
+    reinjection_suppression_deadline: Option<Instant>,
+}
+
+fn flight_state(flight: CarrierPathFlight) -> FlightState {
+    FlightState {
+        key: flight.key,
+        output_incarnation: flight.output_incarnation,
+        configured_slot: flight.configured_slot,
+        end: flight.end,
+        bytes: flight.bytes,
+        sent_at: flight.sent_at,
+        kind: flight.kind,
+        owner_fallback_deadline: flight.owner_fallback_deadline,
+        assignment_range: flight.assignment_range,
+        original_recovery_timing: flight.original_recovery_timing,
+        evidence_eligible: flight.evidence_eligible,
+        qualification_receipt: flight.qualification_receipt,
+        reinjection_suppression_deadline: flight.reinjection_suppression_deadline,
+    }
+}
+
+fn ledger_state(flights: &BTreeMap<u64, Vec<CarrierPathFlight>>) -> Vec<(u64, Vec<FlightState>)> {
+    flights
+        .iter()
+        .map(|(&start, entries)| (start, entries.iter().copied().map(flight_state).collect()))
+        .collect()
+}
+
+fn release_state(
+    released: &[(u64, CarrierPathReleasedFlight)],
+) -> Vec<(u64, FlightState, bool, Vec<OffsetRange>)> {
+    released
+        .iter()
+        .map(|(start, released)| {
+            (
+                *start,
+                flight_state(released.flight),
+                released.path_proving,
+                released
+                    .qualification_ambiguous_ranges
+                    .iter()
+                    .copied()
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn valid_differential_flight(
+    start: u64,
+    end: u64,
+    kind: CarrierWorkKind,
+    index: usize,
+    now: Instant,
+) -> CarrierPathFlight {
+    let extent = end - start;
+    let mut flight = flight(
+        key(
+            if index.is_multiple_of(2) {
+                UnderlayProtocol::Tcp
+            } else {
+                UnderlayProtocol::Udp
+            },
+            (index % 7) as u16,
+        ),
+        end,
+        extent as usize,
+        kind,
+    );
+    flight.output_incarnation = index as u64 + 1;
+    flight.configured_slot = Some(ConfiguredMemberSlot((index % 3) as u16));
+    flight.sent_at = now + Duration::from_millis(index as u64);
+    flight.assignment_range = range(start, end);
+    if kind.is_original_transmission() {
+        flight.owner_fallback_deadline = Some(now + Duration::from_secs(2 + index as u64));
+        flight.original_recovery_timing = Some(ReliableDataAckGapTiming {
+            assignment_at: now,
+            loss_at: Some(now + Duration::from_millis(5)),
+            fallback_at: now + Duration::from_secs(3),
+        });
+    }
+    flight.evidence_eligible = index.is_multiple_of(2);
+    flight.qualification_receipt = if kind.is_original_transmission() {
+        let mut ledger = ProductQualificationLedger::default();
+        Some(
+            ledger
+                .tag_admitted_original(1, extent, range(start, end))
+                .expect("valid generated qualification receipt")
+                .expect("positive generated range has a receipt"),
+        )
+    } else {
+        None
+    };
+    flight.reinjection_suppression_deadline = (kind == CarrierWorkKind::ReinjectedData)
+        .then_some(now + Duration::from_secs(4 + index as u64));
+    flight
+}
+
+fn ranges_for_four_byte_mask(mask: u8) -> Vec<OffsetRange> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while cursor < 4 {
+        if mask & (1 << cursor) == 0 {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < 4 && mask & (1 << cursor) != 0 {
+            cursor += 1;
+        }
+        ranges.push(range(start, cursor));
+    }
+    ranges
+}
+
+fn assert_ack_release_matches_reference(
+    initial: BTreeMap<u64, Vec<CarrierPathFlight>>,
+    ranges: &[OffsetRange],
+    context: &str,
+) {
+    let mut expected = initial.clone();
+    let expected_released =
+        super::release_carrier_path_flight_ranges_reference(&mut expected, ranges);
+    let mut actual = initial;
+    let actual_released = release_carrier_path_flight_ranges(&mut actual, ranges);
+    assert_eq!(
+        release_state(&actual_released),
+        release_state(&expected_released),
+        "released output differs for {context}"
+    );
+    assert_eq!(
+        ledger_state(&actual),
+        ledger_state(&expected),
+        "retained ledger differs for {context}"
+    );
 }
 
 fn output_identity(
@@ -101,6 +255,401 @@ fn partial_data_ack_splits_and_retains_exact_flight_ranges() {
     assert!(released[0].1.path_proving);
     assert_eq!(flights.get(&0).unwrap()[0].end, 1024);
     assert_eq!(flights.get(&3072).unwrap()[0].end, 4096);
+}
+
+#[test]
+fn in_place_ack_release_matches_reference_for_small_generated_ledgers() {
+    const GEOMETRIES: [(u64, u64); 7] = [(0, 1), (0, 4), (1, 2), (1, 4), (2, 3), (2, 4), (3, 4)];
+    let now = Instant::now();
+    for count in 1..=3 {
+        let sequence_count = GEOMETRIES.len().pow(count as u32);
+        for encoded_sequence in 0..sequence_count {
+            let mut remaining = encoded_sequence;
+            let mut sequence = Vec::with_capacity(count);
+            for _ in 0..count {
+                sequence.push(GEOMETRIES[remaining % GEOMETRIES.len()]);
+                remaining /= GEOMETRIES.len();
+            }
+            for kind_mask in 0..(1usize << count) {
+                let mut initial = BTreeMap::new();
+                for (index, (start, end)) in sequence.iter().copied().enumerate() {
+                    let kind = if kind_mask & (1 << index) == 0 {
+                        CarrierWorkKind::OriginalData
+                    } else {
+                        CarrierWorkKind::ReinjectedData
+                    };
+                    initial
+                        .entry(start)
+                        .or_insert_with(Vec::new)
+                        .push(valid_differential_flight(start, end, kind, index, now));
+                }
+                for ack_mask in 0..16 {
+                    let ranges = ranges_for_four_byte_mask(ack_mask);
+                    assert_ack_release_matches_reference(
+                        initial.clone(),
+                        &ranges,
+                        &format!(
+                            "count={count}, sequence={sequence:?}, kinds={kind_mask:#b}, ack={ack_mask:#06b}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn in_place_ack_release_preserves_metadata_and_repeated_duplicate_behavior() {
+    let now = Instant::now();
+    let mut initial = BTreeMap::new();
+    initial.entry(0).or_insert_with(Vec::new).extend([
+        valid_differential_flight(0, 8, CarrierWorkKind::OriginalData, 0, now),
+        valid_differential_flight(0, 4, CarrierWorkKind::OriginalData, 2, now),
+    ]);
+    initial
+        .entry(2)
+        .or_insert_with(Vec::new)
+        .push(valid_differential_flight(
+            2,
+            6,
+            CarrierWorkKind::ReinjectedData,
+            1,
+            now,
+        ));
+    initial
+        .entry(8)
+        .or_insert_with(Vec::new)
+        .push(valid_differential_flight(
+            8,
+            12,
+            CarrierWorkKind::OriginalData,
+            3,
+            now,
+        ));
+
+    let mut expected = initial.clone();
+    let mut actual = initial;
+    for (pass, ranges) in [
+        vec![range(2, 4), range(6, 7)],
+        vec![range(2, 4), range(6, 7)],
+        vec![range(0, 12)],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_released =
+            super::release_carrier_path_flight_ranges_reference(&mut expected, &ranges);
+        let actual_released = release_carrier_path_flight_ranges(&mut actual, &ranges);
+        assert_eq!(
+            release_state(&actual_released),
+            release_state(&expected_released),
+            "release sequence differs on pass {pass}"
+        );
+        assert_eq!(
+            ledger_state(&actual),
+            ledger_state(&expected),
+            "retained ledger differs on pass {pass}"
+        );
+    }
+    assert!(
+        actual.is_empty(),
+        "the final ACK releases every remaining flight"
+    );
+}
+
+#[test]
+fn in_place_ack_release_preserves_absent_and_leading_prefix_receipts_across_hole_ack() {
+    let now = Instant::now();
+    let mut without_receipt =
+        valid_differential_flight(0, 8, CarrierWorkKind::OriginalData, 0, now);
+    without_receipt.qualification_receipt = None;
+    let leading_receipt = valid_differential_flight(0, 8, CarrierWorkKind::OriginalData, 1, now);
+    assert_eq!(
+        leading_receipt
+            .qualification_receipt
+            .expect("generated strict-prefix receipt")
+            .tagged_range(),
+        range(0, 1)
+    );
+    let mut initial = BTreeMap::from([(0, vec![without_receipt, leading_receipt])]);
+    initial
+        .entry(2)
+        .or_insert_with(Vec::new)
+        .push(valid_differential_flight(
+            2,
+            6,
+            CarrierWorkKind::ReinjectedData,
+            2,
+            now,
+        ));
+
+    let mut expected = initial.clone();
+    let mut actual = initial;
+    for (pass, ranges) in [vec![range(3, 5)], vec![range(3, 5)], vec![range(0, 8)]]
+        .into_iter()
+        .enumerate()
+    {
+        let expected_released =
+            super::release_carrier_path_flight_ranges_reference(&mut expected, &ranges);
+        let actual_released = release_carrier_path_flight_ranges(&mut actual, &ranges);
+        assert_eq!(
+            release_state(&actual_released),
+            release_state(&expected_released),
+            "receipt release differs on pass {pass}"
+        );
+        assert_eq!(
+            ledger_state(&actual),
+            ledger_state(&expected),
+            "receipt ledger differs on pass {pass}"
+        );
+        for fragments in actual.values().flatten().filter(|flight| {
+            flight.kind.is_original_transmission() && flight.output_incarnation <= 2
+        }) {
+            assert_eq!(
+                fragments.assignment_range,
+                range(0, 8),
+                "split fragments preserve the original assignment"
+            );
+            if fragments.output_incarnation == 1 {
+                assert!(fragments.qualification_receipt.is_none());
+            }
+        }
+        if pass == 0 {
+            let prefix_left = actual[&0]
+                .iter()
+                .find(|flight| flight.output_incarnation == 2)
+                .expect("left original prefix remains at its source key");
+            assert_eq!(
+                prefix_left
+                    .qualification_receipt
+                    .expect("the tagged leading byte stays with the left fragment")
+                    .tagged_range(),
+                range(0, 1)
+            );
+            let prefix_right = actual[&5]
+                .iter()
+                .find(|flight| flight.output_incarnation == 2)
+                .expect("right original suffix is staged at its start key");
+            assert!(prefix_right.qualification_receipt.is_none());
+        }
+    }
+    assert!(actual.is_empty());
+}
+
+#[test]
+fn legacy_ack_rebuild_normalization_cases_are_outside_runtime_invariants() {
+    let now = Instant::now();
+    let mut oversized_receipt_ledger = ProductQualificationLedger::default();
+    let oversized_receipt = oversized_receipt_ledger
+        .tag_admitted_original(4, 4, range(0, 4))
+        .expect("valid receipt fixture")
+        .expect("positive receipt fixture");
+    let mut inconsistent = valid_differential_flight(1, 3, CarrierWorkKind::OriginalData, 0, now);
+    inconsistent.bytes = 99;
+    inconsistent.qualification_receipt = Some(oversized_receipt);
+    let zero_extent = flight(
+        key(UnderlayProtocol::Tcp, 1),
+        6,
+        0,
+        CarrierWorkKind::OriginalData,
+    );
+    let initial = BTreeMap::from([
+        (1, vec![inconsistent]),
+        (6, vec![zero_extent]),
+        (9, Vec::new()),
+    ]);
+
+    let mut expected = initial.clone();
+    let expected_released =
+        super::release_carrier_path_flight_ranges_reference(&mut expected, &[range(12, 13)]);
+    let mut actual = initial;
+    let actual_released = release_carrier_path_flight_ranges(&mut actual, &[range(12, 13)]);
+
+    assert!(expected_released.is_empty());
+    assert!(actual_released.is_empty());
+    assert_ne!(
+        ledger_state(&actual),
+        ledger_state(&expected),
+        "the old full rebuild normalizes malformed untouched metadata and drops empty/zero extents"
+    );
+    assert_eq!(actual.get(&1).unwrap()[0].bytes, 99);
+    assert_eq!(expected.get(&1).unwrap()[0].bytes, 2);
+    assert_eq!(
+        actual.get(&1).unwrap()[0]
+            .qualification_receipt
+            .expect("malformed oversized receipt remains in the no-hit candidate")
+            .tagged_range(),
+        range(0, 4)
+    );
+    assert_eq!(
+        expected.get(&1).unwrap()[0]
+            .qualification_receipt
+            .expect("the reference intersects the oversized receipt")
+            .tagged_range(),
+        range(1, 3)
+    );
+    assert!(actual.contains_key(&6) && actual.get(&6).unwrap().len() == 1);
+    assert!(!expected.contains_key(&6));
+    assert!(actual.contains_key(&9) && actual.get(&9).unwrap().is_empty());
+    assert!(!expected.contains_key(&9));
+
+    // Both production insertions require checked, nonempty StreamData frames;
+    // the ACK helper creates only positive-length, extent-accounted fragments.
+    // The inconsistent byte count, oversized receipt, zero extent, and empty
+    // vector above can therefore arise only in a deliberately malformed fixture.
+}
+
+fn synthetic_ack_ledger(
+    records: usize,
+    now: Instant,
+) -> (BTreeMap<u64, Vec<CarrierPathFlight>>, u64) {
+    let mut flights = BTreeMap::new();
+    for index in 0..records {
+        let start = index as u64 * 4;
+        let kind = if index.is_multiple_of(2) {
+            CarrierWorkKind::OriginalData
+        } else {
+            CarrierWorkKind::ReinjectedData
+        };
+        flights.insert(
+            start,
+            vec![CarrierPathFlight::fixed_output(
+                key(
+                    if index.is_multiple_of(2) {
+                        UnderlayProtocol::Tcp
+                    } else {
+                        UnderlayProtocol::Udp
+                    },
+                    (index % u16::MAX as usize) as u16,
+                ),
+                start + 2,
+                2,
+                now,
+                kind,
+                (kind == CarrierWorkKind::ReinjectedData).then_some(Duration::from_secs(1)),
+            )],
+        );
+    }
+    let end = records.saturating_sub(1) as u64 * 4 + if records == 0 { 0 } else { 2 };
+    (flights, end)
+}
+
+type AckReleaseFn = fn(
+    &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
+    &[OffsetRange],
+) -> Vec<(u64, CarrierPathReleasedFlight)>;
+
+fn time_ack_release_batch(
+    ledgers: &mut [BTreeMap<u64, Vec<CarrierPathFlight>>],
+    ranges: &[OffsetRange],
+    repeats: usize,
+    release: AckReleaseFn,
+) -> Duration {
+    let started = Instant::now();
+    let mut released_count = 0usize;
+    for flights in ledgers {
+        for _ in 0..repeats {
+            released_count =
+                released_count.saturating_add(black_box(release(flights, ranges)).len());
+        }
+    }
+    black_box(released_count);
+    started.elapsed()
+}
+
+#[test]
+#[ignore = "bounded local ACK-helper comparison; run manually after correctness verification"]
+fn ack_release_large_ledger_local_cost() {
+    const SIZES: [usize; 3] = [1, 32, 1024];
+    const TIMED_ROUNDS: usize = 3;
+    const MAX_RECORDS_PER_VARIANT_ROUND: usize = 32_768;
+    const MAX_CALLS_PER_ROUND: usize = 4_096;
+    let now = Instant::now();
+
+    for records in SIZES {
+        let (initial, end) = synthetic_ack_ledger(records, now);
+        let cases = [
+            ("duplicate/no-hit x4", vec![range(2, 3)], 4),
+            ("sparse prefix", vec![range(0, 1)], 1),
+            (
+                "sparse interior",
+                vec![range(
+                    (records / 2) as u64 * 4,
+                    (records / 2) as u64 * 4 + 1,
+                )],
+                1,
+            ),
+            ("full release", vec![range(0, end)], 1),
+        ];
+        for (name, ranges, repeats) in cases {
+            assert_ack_release_matches_reference(
+                initial.clone(),
+                &ranges,
+                &format!("cost fixture {name} with {records} synthetic records"),
+            );
+            let calls_per_round =
+                (MAX_RECORDS_PER_VARIANT_ROUND / records).min(MAX_CALLS_PER_ROUND);
+            assert!(calls_per_round * records <= MAX_RECORDS_PER_VARIANT_ROUND);
+            for round in 0..TIMED_ROUNDS {
+                // Prepare independent ledgers for each helper call before the
+                // timer. Per variant and round, no more than 32,768 synthetic
+                // flight records are resident; this is a fixture cost bound,
+                // not a runtime or product threshold.
+                let mut reference_ledgers = (0..calls_per_round)
+                    .map(|_| initial.clone())
+                    .collect::<Vec<_>>();
+                let mut candidate_ledgers = (0..calls_per_round)
+                    .map(|_| initial.clone())
+                    .collect::<Vec<_>>();
+                let (reference_elapsed, candidate_elapsed, order) = if round.is_multiple_of(2) {
+                    let reference_elapsed = time_ack_release_batch(
+                        &mut reference_ledgers,
+                        &ranges,
+                        repeats,
+                        super::release_carrier_path_flight_ranges_reference,
+                    );
+                    let candidate_elapsed = time_ack_release_batch(
+                        &mut candidate_ledgers,
+                        &ranges,
+                        repeats,
+                        release_carrier_path_flight_ranges,
+                    );
+                    (
+                        reference_elapsed,
+                        candidate_elapsed,
+                        "reference_then_candidate",
+                    )
+                } else {
+                    let candidate_elapsed = time_ack_release_batch(
+                        &mut candidate_ledgers,
+                        &ranges,
+                        repeats,
+                        release_carrier_path_flight_ranges,
+                    );
+                    let reference_elapsed = time_ack_release_batch(
+                        &mut reference_ledgers,
+                        &ranges,
+                        repeats,
+                        super::release_carrier_path_flight_ranges_reference,
+                    );
+                    (
+                        reference_elapsed,
+                        candidate_elapsed,
+                        "candidate_then_reference",
+                    )
+                };
+                let helper_calls = calls_per_round * repeats;
+                eprintln!(
+                    "ACK fixture: records={records} case={name} round={} order={order} calls_per_variant={calls_per_round} repeats={repeats} reference_total_us={:.1} reference_us/helper={:.3} candidate_total_us={:.1} candidate_us/helper={:.3}",
+                    round + 1,
+                    reference_elapsed.as_secs_f64() * 1_000_000.0,
+                    reference_elapsed.as_secs_f64() * 1_000_000.0 / helper_calls as f64,
+                    candidate_elapsed.as_secs_f64() * 1_000_000.0,
+                    candidate_elapsed.as_secs_f64() * 1_000_000.0 / helper_calls as f64,
+                );
+            }
+        }
+    }
 }
 
 #[test]

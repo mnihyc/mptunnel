@@ -245,36 +245,36 @@ impl Connection {
         self.connection.mark_application_ready();
     }
 
-    /// Capture the exact active controller together with the `PathData` that
-    /// owns it under Quinn's single connection-state acquisition.
+    /// Capture active `PathData` facts and controller metrics under one
+    /// connection-state acquisition, returning only owned scalar facts and a
+    /// shared path-telemetry handle.
     fn active_native_controller_snapshot(
         &self,
-    ) -> (NativeControllerShapeSnapshot, Box<InstrumentedController>) {
-        let path = self.connection.active_path_snapshot();
-        let smoothed_rtt = path.smoothed_rtt;
-        let rtt_variance = path.rtt_variance;
-        let bytes_in_flight = path.bytes_in_flight;
-        let current_mtu = path.current_mtu;
-        let app_limited = path.app_limited;
-        let instrumented = path
-            .congestion
-            .into_any()
-            .downcast::<InstrumentedController>()
-            .expect("QUIC carrier must use the instrumented congestion controller");
-        debug_assert!(
-            Arc::ptr_eq(&instrumented.telemetry, &self.telemetry),
-            "fresh QUIC paths must preserve the carrier telemetry owner"
-        );
-        let shape = instrumented
-            .native_shape_snapshot(
-                smoothed_rtt,
-                rtt_variance,
-                bytes_in_flight,
-                current_mtu,
-                app_limited,
-            )
-            .expect("the active QUIC controller must carry a transport activation");
-        (shape, instrumented)
+    ) -> (
+        NativeControllerShapeSnapshot,
+        Arc<super::congestion::QuicPathTelemetry>,
+    ) {
+        self.connection.with_active_path_snapshot(|path| {
+            let instrumented = path
+                .congestion
+                .as_any()
+                .and_then(|controller| controller.downcast_ref::<InstrumentedController>())
+                .expect("QUIC carrier must use the instrumented congestion controller");
+            debug_assert!(
+                Arc::ptr_eq(&instrumented.telemetry, &self.telemetry),
+                "fresh QUIC paths must preserve the carrier telemetry owner"
+            );
+            let shape = instrumented
+                .native_shape_snapshot(
+                    path.smoothed_rtt,
+                    path.rtt_variance,
+                    path.bytes_in_flight,
+                    path.current_mtu,
+                    path.app_limited,
+                )
+                .expect("the active QUIC controller must carry a transport activation");
+            (shape, instrumented.path_telemetry())
+        })
     }
 
     async fn from_quinn(
@@ -282,13 +282,14 @@ impl Connection {
         role: EndpointRole,
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
-        let telemetry = connection
-            .congestion_state()
-            .into_any()
-            .downcast::<InstrumentedController>()
-            .expect("QUIC carrier must use the instrumented congestion controller")
-            .telemetry
-            .clone();
+        let telemetry = connection.with_active_path_snapshot(|path| {
+            path.congestion
+                .as_any()
+                .and_then(|controller| controller.downcast_ref::<InstrumentedController>())
+                .expect("QUIC carrier must use the instrumented congestion controller")
+                .telemetry
+                .clone()
+        });
         let concurrent_carrier_streams = quic_native_request_limit(mux_limits);
         let native_route_queue = (mux_limits.max_datagram_queue_bytes / 1200).clamp(8, 256);
         let native_datagrams = NativeDatagramHub::new(
@@ -465,21 +466,23 @@ impl Connection {
         self.telemetry.current_path_epoch()
     }
 
-    /// Coherent `(A, I, kind, B_op)` snapshot from one clone of the exact
-    /// active Quinn controller. This does not consume diagnostic ACK cursors.
+    /// Coherent `(A, I, kind, B_op)` snapshot from the exact active Quinn
+    /// controller. This does not consume diagnostic ACK cursors.
     pub(crate) fn native_controller_authority_snapshot(&self) -> NativeControllerAuthoritySnapshot {
-        let controller = self.connection.congestion_state();
-        let instrumented = controller
-            .into_any()
-            .downcast::<InstrumentedController>()
-            .expect("QUIC carrier must use the instrumented congestion controller");
-        debug_assert!(
-            Arc::ptr_eq(&instrumented.telemetry, &self.telemetry),
-            "fresh QUIC paths must preserve the carrier telemetry owner"
-        );
-        instrumented
-            .native_authority_snapshot()
-            .expect("the active QUIC controller must carry a transport activation")
+        self.connection.with_active_path_snapshot(|path| {
+            let instrumented = path
+                .congestion
+                .as_any()
+                .and_then(|controller| controller.downcast_ref::<InstrumentedController>())
+                .expect("QUIC carrier must use the instrumented congestion controller");
+            debug_assert!(
+                Arc::ptr_eq(&instrumented.telemetry, &self.telemetry),
+                "fresh QUIC paths must preserve the carrier telemetry owner"
+            );
+            instrumented
+                .native_authority_snapshot()
+                .expect("the active QUIC controller must carry a transport activation")
+        })
     }
 
     /// Non-consuming native scheduling shape from one exact active-PathData
@@ -502,8 +505,10 @@ impl Connection {
     }
 
     pub fn congestion_metrics(&self) -> CongestionMetrics {
-        let (shape, instrumented) = self.active_native_controller_snapshot();
-        let snapshot = instrumented.snapshot();
+        let (shape, path_telemetry) = self.active_native_controller_snapshot();
+        // The ACK cursor has its own mutex. Consume it only after releasing
+        // Quinn's connection-state lock to preserve existing lock ordering.
+        let snapshot = path_telemetry.snapshot();
         debug_assert_eq!(
             shape.controller().opaque_serial(),
             snapshot.path_epoch,

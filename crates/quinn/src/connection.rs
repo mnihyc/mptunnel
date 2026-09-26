@@ -735,6 +735,23 @@ impl Connection {
             .active_path_snapshot()
     }
 
+    /// Observe active-path state and its installed congestion controller
+    /// without cloning controller state.
+    ///
+    /// The callback runs synchronously while the connection-state lock is
+    /// held. It must be short, return owned data, and must not call back into
+    /// this connection. The returned value cannot borrow from the view.
+    pub fn with_active_path_snapshot<R>(
+        &self,
+        observe: impl for<'a> FnOnce(proto::ActivePathSnapshotRef<'a>) -> R,
+    ) -> R {
+        self.0
+            .state
+            .lock("with_active_path_snapshot")
+            .inner
+            .with_active_path_snapshot(observe)
+    }
+
     /// Notify the active congestion controller that authenticated application
     /// traffic may now be offered on this connection.
     ///

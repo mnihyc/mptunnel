@@ -136,6 +136,34 @@ async fn assert_quic_ping_round_trip(client: &Connection, server: &Connection, n
     server_stream.await.expect("server stream task");
 }
 
+fn coherent_native_observations(
+    connection: &Connection,
+) -> (
+    NativeControllerAuthoritySnapshot,
+    NativeControllerShapeSnapshot,
+) {
+    connection.connection.with_active_path_snapshot(|path| {
+        let controller = path
+            .congestion
+            .as_any()
+            .and_then(|controller| controller.downcast_ref::<InstrumentedController>())
+            .expect("active controller is instrumented");
+        let authority = controller
+            .native_authority_snapshot()
+            .expect("active controller has transport authority");
+        let shape = controller
+            .native_shape_snapshot(
+                path.smoothed_rtt,
+                path.rtt_variance,
+                path.bytes_in_flight,
+                path.current_mtu,
+                path.app_limited,
+            )
+            .expect("active controller has transport shape");
+        (authority, shape)
+    })
+}
+
 #[test]
 fn native_controller_rate_conversion_is_positive_and_checked() {
     let largest_bytes_per_second = u64::MAX / 8;
@@ -206,13 +234,70 @@ async fn active_controller_snapshot_fence_and_wake_are_coherent_and_non_consumin
         .is_ok()
     {}
 
+    super::super::congestion::reset_instrumented_controller_clone_count();
+    let (expected_authority, expected_shape) = client_connection
+        .connection
+        .with_active_path_snapshot(|path| {
+            let borrowed = path
+                .congestion
+                .as_any()
+                .and_then(|controller| controller.downcast_ref::<InstrumentedController>())
+                .expect("active controller is instrumented");
+            let reference = path
+                .congestion
+                .clone_box()
+                .into_any()
+                .downcast::<InstrumentedController>()
+                .expect("test clone preserves the instrumented type");
+            let reference_authority = reference
+                .native_authority_snapshot()
+                .expect("active controller has transport authority");
+            let reference_shape = reference
+                .native_shape_snapshot(
+                    path.smoothed_rtt,
+                    path.rtt_variance,
+                    path.bytes_in_flight,
+                    path.current_mtu,
+                    path.app_limited,
+                )
+                .expect("active controller has a transport shape");
+            let borrowed_authority = borrowed
+                .native_authority_snapshot()
+                .expect("active controller has transport authority");
+            let borrowed_shape = borrowed
+                .native_shape_snapshot(
+                    path.smoothed_rtt,
+                    path.rtt_variance,
+                    path.bytes_in_flight,
+                    path.current_mtu,
+                    path.app_limited,
+                )
+                .expect("active controller has a transport shape");
+            assert_eq!(borrowed_authority, reference_authority);
+            assert_eq!(borrowed_shape, reference_shape);
+            assert_eq!(borrowed_shape.smoothed_rtt(), path.smoothed_rtt);
+            assert_eq!(borrowed_shape.rtt_variance(), path.rtt_variance);
+            assert_eq!(borrowed_shape.bytes_in_flight(), path.bytes_in_flight);
+            assert_eq!(borrowed_shape.current_mtu(), path.current_mtu);
+            assert_eq!(borrowed_shape.app_limited(), path.app_limited);
+            (reference_authority, reference_shape)
+        });
+    assert_eq!(
+        super::super::congestion::instrumented_controller_clone_count(),
+        1,
+        "the same-view reference check performs exactly its explicit clone"
+    );
+
+    super::super::congestion::reset_instrumented_controller_clone_count();
     let first = client_connection.native_controller_authority_snapshot();
     let second = client_connection.native_controller_authority_snapshot();
     let shape = client_connection.native_controller_shape_snapshot();
-    let expected_path = client_connection.connection.active_path_snapshot();
-    let expected_controller_metrics = expected_path.congestion.metrics();
-    assert_eq!(first, second, "inspection clone is source-state preserving");
+    assert_eq!(first.activation(), second.activation());
+    assert_eq!(first.activation(), expected_authority.activation());
     assert_eq!(first.controller(), second.controller());
+    assert_eq!(first.controller(), expected_authority.controller());
+    assert_eq!(shape.activation(), expected_shape.activation());
+    assert_eq!(shape.controller(), expected_shape.controller());
     assert_eq!(
         shape.activation(),
         first.activation(),
@@ -223,27 +308,12 @@ async fn active_controller_snapshot_fence_and_wake_are_coherent_and_non_consumin
         first.controller(),
         "one active-PathData shape read carries the exact installed I"
     );
-    assert_eq!(shape.smoothed_rtt(), expected_path.smoothed_rtt);
-    assert_eq!(shape.rtt_variance(), expected_path.rtt_variance);
-    assert_eq!(shape.bytes_in_flight(), expected_path.bytes_in_flight);
-    assert_eq!(shape.app_limited(), expected_path.app_limited);
-    assert_eq!(
-        shape.congestion_window(),
-        expected_controller_metrics.congestion_window
-    );
-    assert_eq!(
-        shape.operational_rate_bps().map(NonZeroU64::get),
-        expected_controller_metrics
-            .bandwidth_estimate
-            .and_then(|rate| rate.checked_mul(8))
-    );
-    assert_eq!(
-        shape.pacing_rate_bps().map(NonZeroU64::get),
-        expected_controller_metrics
-            .pacing_rate
-            .and_then(|rate| rate.checked_mul(8))
-    );
     let aggregate = client_connection.congestion_metrics();
+    assert_eq!(
+        super::super::congestion::instrumented_controller_clone_count(),
+        0,
+        "authority, shape, and metrics observations must not clone controller history"
+    );
     assert_eq!(aggregate.path_epoch, shape.controller().opaque_serial());
     assert_eq!(aggregate.congestion_window, shape.congestion_window());
     assert_eq!(aggregate.bytes_in_flight, Some(shape.bytes_in_flight()));
@@ -272,7 +342,7 @@ async fn active_controller_snapshot_fence_and_wake_are_coherent_and_non_consumin
         tokio::time::timeout(Duration::from_millis(20), notify.notified())
             .await
             .is_err(),
-        "congestion_state inspection clone must not publish A or B_op"
+        "borrowed active-controller reads must not publish A or B_op"
     );
 
     client_connection
@@ -746,7 +816,18 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
     );
     let before_migration = client_connection.congestion_metrics();
     let server_before_migration = server_connection.congestion_metrics();
-    let server_shape_before_migration = server_connection.native_controller_shape_snapshot();
+    let (client_authority_before_migration, client_shape_before_migration) =
+        coherent_native_observations(&client_connection);
+    let (server_authority_before_migration, server_shape_before_migration) =
+        coherent_native_observations(&server_connection);
+    assert_eq!(
+        client_authority_before_migration.activation(),
+        client_shape_before_migration.activation()
+    );
+    assert_eq!(
+        server_authority_before_migration.activation(),
+        server_shape_before_migration.activation()
+    );
     let before_stats = client_connection.stats();
 
     let first = first_port.port().min(second_port.port());
@@ -782,7 +863,10 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
     );
     let after_first_migration = client_connection.congestion_metrics();
     let server_after_first_migration = server_connection.congestion_metrics();
-    let server_shape_after_first_migration = server_connection.native_controller_shape_snapshot();
+    let (client_authority_after_first_migration, client_shape_after_first_migration) =
+        coherent_native_observations(&client_connection);
+    let (server_authority_after_first_migration, server_shape_after_first_migration) =
+        coherent_native_observations(&server_connection);
     let after_first_stats = client_connection.stats();
     assert_eq!(
         after_first_migration.path_epoch, before_migration.path_epoch,
@@ -797,10 +881,35 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
         server_shape_before_migration.controller(),
         "same-IP clone retains controller I"
     );
+    assert_eq!(
+        client_authority_after_first_migration.controller(),
+        client_authority_before_migration.controller(),
+        "client same-lineage migration retains controller I"
+    );
+    assert_eq!(
+        server_authority_after_first_migration.controller(),
+        server_authority_before_migration.controller(),
+        "server same-IP clone retains controller I"
+    );
+    assert_eq!(
+        client_authority_after_first_migration.activation(),
+        client_shape_after_first_migration.activation(),
+        "authority and shape name the same installed client activation"
+    );
+    assert_eq!(
+        server_authority_after_first_migration.activation(),
+        server_shape_after_first_migration.activation(),
+        "authority and shape name the same installed server activation"
+    );
     assert_ne!(
         server_shape_after_first_migration.activation(),
         server_shape_before_migration.activation(),
         "the installed same-I clone receives a distinct checked A"
+    );
+    assert_ne!(
+        server_authority_after_first_migration.activation(),
+        server_authority_before_migration.activation(),
+        "the server installed same-I clone receives a distinct checked A"
     );
     assert!(
         after_first_stats.path.sent_packets > before_stats.path.sent_packets,
@@ -833,7 +942,10 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
     assert_eq!(validated_final.0, validated_after.0 + 1);
     let after_second_migration = client_connection.congestion_metrics();
     let server_after_second_migration = server_connection.congestion_metrics();
-    let server_shape_after_second_migration = server_connection.native_controller_shape_snapshot();
+    let (client_authority_after_second_migration, client_shape_after_second_migration) =
+        coherent_native_observations(&client_connection);
+    let (server_authority_after_second_migration, server_shape_after_second_migration) =
+        coherent_native_observations(&server_connection);
     let after_second_stats = client_connection.stats();
     assert_eq!(
         after_second_migration.path_epoch, before_migration.path_epoch,
@@ -847,6 +959,26 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
         server_shape_after_second_migration.controller(),
         server_shape_before_migration.controller(),
         "repeated locator changes retain controller I"
+    );
+    assert_eq!(
+        client_authority_after_second_migration.controller(),
+        client_authority_before_migration.controller(),
+        "client repeated migration retains controller I"
+    );
+    assert_eq!(
+        server_authority_after_second_migration.controller(),
+        server_authority_before_migration.controller(),
+        "server repeated same-IP migration retains controller I"
+    );
+    assert_eq!(
+        client_authority_after_second_migration.activation(),
+        client_shape_after_second_migration.activation(),
+        "authority and shape name the same installed client activation"
+    );
+    assert_eq!(
+        server_authority_after_second_migration.activation(),
+        server_shape_after_second_migration.activation(),
+        "authority and shape name the same installed server activation"
     );
     assert_ne!(
         server_shape_after_second_migration.activation(),

@@ -9,6 +9,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
+#[cfg(test)]
+thread_local! {
+    static INSTRUMENTED_CONTROLLER_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_instrumented_controller_clone_count() {
+    INSTRUMENTED_CONTROLLER_CLONES.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn instrumented_controller_clone_count() -> usize {
+    INSTRUMENTED_CONTROLLER_CLONES.get()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CongestionMetrics {
     /// Equality identity `I` of the current network-path controller lineage.
@@ -19,7 +34,7 @@ pub struct CongestionMetrics {
     pub path_epoch: u64,
     /// Path-lineage diagnostic identity of the non-app-limited ACK clock.
     pub delivery_clock_epoch: u64,
-    /// Activation-local window from the exact active controller clone.
+    /// Activation-local window from the exact active controller.
     pub congestion_window: u64,
     /// Activation-local flight from the exact active Quinn `PathData`.
     pub bytes_in_flight: Option<u64>,
@@ -90,7 +105,7 @@ pub(crate) enum NativeControllerObservationKind {
 
 /// Coherent active native-controller snapshot used by the authority adapter.
 ///
-/// All fields come from one `quinn::Connection::congestion_state()` clone.
+/// All fields come from one scoped borrow of the exact active controller.
 /// Diagnostic ACK cursors are not consumed by this snapshot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct NativeControllerAuthoritySnapshot {
@@ -123,7 +138,7 @@ impl NativeControllerAuthoritySnapshot {
 /// Every field in this value belongs to the same installed controller
 /// activation `A` and controller lineage `I`. RTT, RTT variation, flight, and
 /// application-limited state come from the `PathData` that owns that exact
-/// controller clone; window and rates come from the clone itself. Shared ACK
+/// controller object; window and rates come from that same object. Shared ACK
 /// and loss telemetry is deliberately absent: it is path-lineage diagnostic
 /// evidence and may include callbacks from another activation after a
 /// same-identity migration clone and rollback.
@@ -270,7 +285,7 @@ impl Default for QuicCarrierTelemetry {
 }
 
 #[derive(Debug, Default)]
-struct QuicPathTelemetry {
+pub(super) struct QuicPathTelemetry {
     path_epoch: u64,
     bytes_in_flight: AtomicU64,
     bytes_in_flight_authoritative: AtomicBool,
@@ -659,8 +674,13 @@ impl InstrumentedController {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn snapshot(&self) -> QuicCarrierTelemetrySnapshot {
         self.path_telemetry.snapshot()
+    }
+
+    pub(super) fn path_telemetry(&self) -> Arc<QuicPathTelemetry> {
+        self.path_telemetry.clone()
     }
 
     pub(super) fn native_authority_snapshot(&self) -> Option<NativeControllerAuthoritySnapshot> {
@@ -695,9 +715,9 @@ impl InstrumentedController {
         )
     }
 
-    /// Bind exact active-`PathData` fields to this exact controller clone.
+    /// Bind exact active-`PathData` fields to this exact controller object.
     ///
-    /// The caller must obtain both through one Quinn active-path snapshot. No
+    /// The caller must obtain both through one Quinn active-path callback. No
     /// value is read from shared path telemetry here.
     pub(super) fn native_shape_snapshot(
         &self,
@@ -963,6 +983,10 @@ impl quinn::congestion::ControllerFactory for InstrumentedBbrConfig {
 }
 
 impl quinn::congestion::Controller for InstrumentedController {
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
+    }
+
     fn activation_fence(&self) -> Option<quinn::congestion::ControllerActivationFence> {
         Some(self.telemetry.controller_activation_fence())
     }
@@ -1193,6 +1217,8 @@ impl quinn::congestion::Controller for InstrumentedController {
     }
 
     fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        #[cfg(test)]
+        INSTRUMENTED_CONTROLLER_CLONES.set(INSTRUMENTED_CONTROLLER_CLONES.get().saturating_add(1));
         Box::new(Self {
             inner: self.inner.clone_box(),
             loss_compensation: self.loss_compensation,

@@ -282,6 +282,15 @@ pub struct BandwidthSample {
 
 /// Common interface for different congestion controllers
 pub trait Controller: Send + Sync {
+    /// Borrowed type-erasure hook for short, read-only observations.
+    ///
+    /// Controllers that need concrete inspection can return themselves here.
+    /// The default keeps existing downstream implementations source-compatible
+    /// and does not require every controller type to be `'static`.
+    fn as_any(&self) -> Option<&dyn Any> {
+        None
+    }
+
     /// Optional shared fence for exact active-controller transitions.
     ///
     /// Controllers that opt in must return clones of one stable fence from all

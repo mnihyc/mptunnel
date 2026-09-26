@@ -297,6 +297,28 @@ pub struct ActivePathSnapshot {
     pub congestion: Box<dyn congestion::Controller>,
 }
 
+/// Borrowed view of active-path scalar state and its exact installed
+/// congestion controller.
+///
+/// The reference is valid only during `Connection::with_active_path_snapshot`.
+/// This type exists for synchronous observations that need coherent active
+/// path/controller facts without cloning controller-owned history.
+#[derive(Clone, Copy)]
+pub struct ActivePathSnapshotRef<'a> {
+    /// Smoothed RTT used by the active path's recovery model.
+    pub smoothed_rtt: Duration,
+    /// RTT variation used by the active path's recovery model.
+    pub rtt_variance: Duration,
+    /// Exact ack-eliciting bytes currently in flight on the active path.
+    pub bytes_in_flight: u64,
+    /// Current MTU owned by this exact active path.
+    pub current_mtu: u16,
+    /// Whether the connection is currently application limited.
+    pub app_limited: bool,
+    /// Borrowed controller installed on this exact active path.
+    pub congestion: &'a dyn congestion::Controller,
+}
+
 impl Connection {
     pub(crate) fn new(
         endpoint_config: Arc<EndpointConfig>,
@@ -1502,6 +1524,27 @@ impl Connection {
             app_limited: self.app_limited,
             congestion: self.path.congestion.clone_box(),
         }
+    }
+
+    /// Observe active path and controller state through a borrowed view.
+    ///
+    /// The callback must be synchronous and return owned data; the controller
+    /// borrow cannot escape it. Callers should keep the callback short and
+    /// must not re-enter the connection while observing, since the runtime
+    /// wrapper may hold its connection-state lock for this call.
+    pub fn with_active_path_snapshot<R>(
+        &self,
+        observe: impl for<'a> FnOnce(ActivePathSnapshotRef<'a>) -> R,
+    ) -> R {
+        let path = &self.path;
+        observe(ActivePathSnapshotRef {
+            smoothed_rtt: path.rtt.get(),
+            rtt_variance: path.rtt.variance(),
+            bytes_in_flight: path.in_flight.bytes,
+            current_mtu: path.mtud.current_mtu(),
+            app_limited: self.app_limited,
+            congestion: path.congestion.as_ref(),
+        })
     }
 
     /// Notify the active congestion controller that authenticated application

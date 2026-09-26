@@ -439,6 +439,58 @@ fn candidate_allocation_does_not_publish_active_identity_or_consume_ack_cursor()
 }
 
 #[tokio::test]
+async fn borrowed_authority_and_shape_leave_ack_cursor_for_metrics_once() {
+    let activation = live_test_controller_activation().await;
+    let mut controller = InstrumentedController::new(
+        Box::new(FixedPacingController(12_345)),
+        Arc::new(QuicCarrierTelemetry::default()),
+    );
+    controller.on_activated(activation);
+    let path_telemetry = controller.path_telemetry.clone();
+    path_telemetry.publish_ack_batch(
+        QuicAckTelemetryTotals {
+            delivery_clock_epoch: 1,
+            acked_bytes: 1_200,
+            sample_count: 1,
+            ..QuicAckTelemetryTotals::default()
+        },
+        0,
+        false,
+    );
+
+    let borrowed = quinn::congestion::Controller::as_any(&controller)
+        .expect("instrumented controller exposes a borrowed type view")
+        .downcast_ref::<InstrumentedController>()
+        .expect("borrowed type view names the same controller");
+    let authority = borrowed
+        .native_authority_snapshot()
+        .expect("activated controller authority");
+    let shape = borrowed
+        .native_shape_snapshot(
+            Duration::from_millis(80),
+            Duration::from_millis(5),
+            4_321,
+            1_200,
+            false,
+        )
+        .expect("activated controller shape");
+    assert_eq!(authority.activation(), activation);
+    assert_eq!(shape.activation(), activation);
+    assert_eq!(authority.controller(), shape.controller());
+
+    assert_eq!(
+        path_telemetry.snapshot().newly_acked_bytes,
+        Some(1_200),
+        "borrowed authority and shape reads must leave the ACK delta available"
+    );
+    assert_eq!(
+        path_telemetry.snapshot().newly_acked_bytes,
+        None,
+        "the first owning metrics read advances the cursor exactly once"
+    );
+}
+
+#[tokio::test]
 async fn valid_same_activation_rate_changes_wake_once_and_absence_never_clears() {
     let rate = Arc::new(AtomicU64::new(100));
     let telemetry = Arc::new(QuicCarrierTelemetry::default());

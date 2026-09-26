@@ -11,7 +11,7 @@ use super::datagram::ClientTcpDatagramState;
 use super::receive::handle_client_tcp_path_frame;
 use super::state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::stream::{
-    ClientTcpOpenStreamRequest, ClientTcpPathStreamState, expire_client_tcp_pending_opens,
+    ClientTcpOpenStreamRequest, ClientTcpPathStreams, expire_client_tcp_pending_opens,
     fail_client_tcp_streams, next_client_tcp_pending_open_deadline,
     open_client_tcp_stream_on_connection,
 };
@@ -37,7 +37,6 @@ use crate::runtime::path::model::{
 };
 use crate::runtime::path::state::ClientTcpCarrierPublication;
 use crate::runtime::recent_ids::RecentIdCache;
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -116,7 +115,7 @@ impl Drop for ClientTcpCarrierReadiness {
 
 struct ClientTcpPathSessionState {
     connection: Option<ClientTcpPathConnection>,
-    streams: HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: ClientTcpPathStreams,
     closed_streams: RecentIdCache<StreamId>,
     datagrams: ClientTcpDatagramState,
 }
@@ -233,7 +232,7 @@ async fn run_client_tcp_path_session_inner(
     }
     let mut state = ClientTcpPathSessionState {
         connection: initial_connection,
-        streams: HashMap::new(),
+        streams: ClientTcpPathStreams::new(),
         closed_streams: RecentIdCache::new(runtime.closed_stream_cache_capacity),
         datagrams: ClientTcpDatagramState::new(
             runtime.mux_limits.max_streams,
@@ -939,7 +938,7 @@ async fn handle_draining_client_tcp_command(
     command: ReliablePathCommand,
     commands: &mut ReliablePathCommandReceivers,
     connection: &mut ClientTcpPathConnection,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
@@ -1001,7 +1000,7 @@ async fn handle_draining_client_tcp_command(
 
 async fn drain_client_tcp_path(
     connection: &mut ClientTcpPathConnection,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
@@ -1085,7 +1084,7 @@ enum ClientTcpDrainFrameDisposition {
 async fn apply_client_tcp_drain_frame(
     frame: Frame,
     connection: &mut ClientTcpPathConnection,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
@@ -1463,7 +1462,7 @@ async fn handle_disconnected_client_tcp_command(
 }
 
 fn fail_client_tcp_products(
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     datagrams: &mut ClientTcpDatagramState,
     error: &RuntimeError,
     runtime: &ClientTcpPathSessionRuntime,

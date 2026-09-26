@@ -1,7 +1,9 @@
 use super::{
-    ClientTcpOpenCancellation, ClientTcpPathStreamState, ClientTcpPendingOpen,
-    handle_client_tcp_stream_detach, remove_matching_client_tcp_open,
-    route_client_tcp_lifecycle_frame, route_client_tcp_stream_frame,
+    ClientTcpOpenCancellation, ClientTcpPathStreamState, ClientTcpPathStreams,
+    ClientTcpPendingOpen, expired_client_tcp_pending_open_ids, fail_client_tcp_streams,
+    handle_client_tcp_stream_detach, next_client_tcp_pending_open_deadline,
+    remove_matching_client_tcp_open, route_client_tcp_lifecycle_frame,
+    route_client_tcp_stream_frame,
 };
 use crate::protocol::{Frame, StreamId};
 use crate::runtime::path::commands::{
@@ -10,7 +12,6 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::recent_ids::RecentIdCache;
 use bytes::Bytes;
-use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -44,22 +45,23 @@ async fn tcp_detach_distinguishes_pending_refusal_from_live_retirement() {
     let (pending_frames, pending_frame_rx) = mpsc::channel(1);
     let (session_commands, _session_receivers) = reliable_path_command_channels(1);
     let (response, response_rx) = oneshot::channel();
-    let mut streams = HashMap::from([(
+    let mut streams = ClientTcpPathStreams::new();
+    streams.insert_pending(
         pending_id,
         ClientTcpPathStreamState {
             terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(30),
             frames: pending_frames,
-            pending_open: Some(ClientTcpPendingOpen {
-                initial: None,
-                response,
-                frames: Some(pending_frame_rx),
-                session_commands,
-                lane: crate::scheduler::TrafficClass::Throughput,
-                open_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
-            }),
         },
-    )]);
+        ClientTcpPendingOpen {
+            initial: None,
+            response,
+            frames: Some(pending_frame_rx),
+            session_commands,
+            lane: crate::scheduler::TrafficClass::Throughput,
+            open_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+        },
+    );
     let mut closed = RecentIdCache::new(8);
 
     handle_client_tcp_stream_detach(&mut streams, &mut closed, pending_id).await;
@@ -74,13 +76,12 @@ async fn tcp_detach_distinguishes_pending_refusal_from_live_retirement() {
 
     let live_id = StreamId(96);
     let (live_frames, mut live_frame_rx) = mpsc::channel(1);
-    streams.insert(
+    streams.insert_open(
         live_id,
         ClientTcpPathStreamState {
             terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(31),
             frames: live_frames,
-            pending_open: None,
         },
     );
     handle_client_tcp_stream_detach(&mut streams, &mut closed, live_id).await;
@@ -98,15 +99,15 @@ fn stale_tcp_open_cancellation_cannot_remove_current_generation() {
     let stream_id = StreamId(92);
     let current_attempt = ClientTcpOpenAttemptId(23);
     let (frames, _frame_rx) = mpsc::channel(1);
-    let mut streams = HashMap::from([(
+    let mut streams = ClientTcpPathStreams::new();
+    streams.insert_open(
         stream_id,
         ClientTcpPathStreamState {
             terminal: None,
             open_attempt_id: current_attempt,
             frames,
-            pending_open: None,
         },
-    )]);
+    );
 
     assert!(
         remove_matching_client_tcp_open(&mut streams, stream_id, ClientTcpOpenAttemptId(22),)
@@ -122,17 +123,248 @@ fn stale_tcp_open_cancellation_cannot_remove_current_generation() {
 }
 
 #[tokio::test]
+async fn pending_owner_preserves_attempt_across_max_and_removes_canceled_pair() {
+    let accepted_id = StreamId(93);
+    let accepted_attempt = ClientTcpOpenAttemptId(24);
+    let (accepted_frames, accepted_frame_rx) = mpsc::channel(1);
+    let (accepted_commands, _accepted_command_receivers) = reliable_path_command_channels(1);
+    let (accepted_response, _accepted_response_rx) = oneshot::channel();
+    let mut streams = ClientTcpPathStreams::new();
+    streams.insert_pending(
+        accepted_id,
+        ClientTcpPathStreamState {
+            terminal: None,
+            open_attempt_id: accepted_attempt,
+            frames: accepted_frames,
+        },
+        ClientTcpPendingOpen {
+            initial: None,
+            response: accepted_response,
+            frames: Some(accepted_frame_rx),
+            session_commands: accepted_commands,
+            lane: crate::scheduler::TrafficClass::Throughput,
+            open_deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+        },
+    );
+
+    assert!(
+        remove_matching_client_tcp_open(
+            &mut streams,
+            accepted_id,
+            ClientTcpOpenAttemptId(accepted_attempt.0 - 1),
+        )
+        .is_none()
+    );
+    assert!(streams.is_pending(&accepted_id));
+
+    // MAX acceptance consumes only the pending response; the established
+    // stream keeps its attempt ID so a cancellation racing delivery remains
+    // generation-fenced.
+    drop(
+        streams
+            .take_pending_open(&accepted_id)
+            .expect("pending record before MAX"),
+    );
+    assert!(!streams.is_pending(&accepted_id));
+    assert_eq!(
+        streams.get(&accepted_id).map(|state| state.open_attempt_id),
+        Some(accepted_attempt),
+    );
+    assert!(
+        remove_matching_client_tcp_open(
+            &mut streams,
+            accepted_id,
+            ClientTcpOpenAttemptId(accepted_attempt.0 - 1),
+        )
+        .is_none()
+    );
+    assert!(remove_matching_client_tcp_open(&mut streams, accepted_id, accepted_attempt).is_some());
+    assert!(!streams.contains_key(&accepted_id));
+
+    let canceled_id = StreamId(94);
+    let canceled_attempt = ClientTcpOpenAttemptId(25);
+    let (canceled_frames, canceled_frame_rx) = mpsc::channel(1);
+    let (canceled_commands, _canceled_command_receivers) = reliable_path_command_channels(1);
+    let (canceled_response, canceled_response_rx) = oneshot::channel();
+    streams.insert_pending(
+        canceled_id,
+        ClientTcpPathStreamState {
+            terminal: None,
+            open_attempt_id: canceled_attempt,
+            frames: canceled_frames,
+        },
+        ClientTcpPendingOpen {
+            initial: None,
+            response: canceled_response,
+            frames: Some(canceled_frame_rx),
+            session_commands: canceled_commands,
+            lane: crate::scheduler::TrafficClass::Throughput,
+            open_deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+        },
+    );
+    assert!(remove_matching_client_tcp_open(&mut streams, canceled_id, canceled_attempt).is_some());
+    assert!(!streams.contains_key(&canceled_id));
+    assert!(!streams.is_pending(&canceled_id));
+    assert!(canceled_response_rx.await.is_err());
+}
+
+#[test]
+fn pending_selection_ignores_open_states_and_observes_closed_or_expired_records() {
+    let mut streams = ClientTcpPathStreams::new();
+    let (open_frames, _open_frame_rx) = mpsc::channel(1);
+    streams.insert_open(
+        StreamId(1),
+        ClientTcpPathStreamState {
+            terminal: None,
+            open_attempt_id: ClientTcpOpenAttemptId(1),
+            frames: open_frames,
+        },
+    );
+
+    let now = tokio::time::Instant::now();
+    let closed_id = StreamId(9);
+    let (closed_frames, closed_frame_rx) = mpsc::channel(1);
+    let (closed_commands, _closed_command_receivers) = reliable_path_command_channels(1);
+    let (closed_response, closed_response_rx) = oneshot::channel();
+    streams.insert_pending(
+        closed_id,
+        ClientTcpPathStreamState {
+            terminal: None,
+            open_attempt_id: ClientTcpOpenAttemptId(9),
+            frames: closed_frames,
+        },
+        ClientTcpPendingOpen {
+            initial: None,
+            response: closed_response,
+            frames: Some(closed_frame_rx),
+            session_commands: closed_commands,
+            lane: crate::scheduler::TrafficClass::Throughput,
+            open_deadline: now + Duration::from_secs(30),
+        },
+    );
+    drop(closed_response_rx);
+
+    let expired_id = StreamId(4);
+    let (expired_frames, expired_frame_rx) = mpsc::channel(1);
+    let (expired_commands, _expired_command_receivers) = reliable_path_command_channels(1);
+    let (expired_response, _expired_response_rx) = oneshot::channel();
+    streams.insert_pending(
+        expired_id,
+        ClientTcpPathStreamState {
+            terminal: None,
+            open_attempt_id: ClientTcpOpenAttemptId(4),
+            frames: expired_frames,
+        },
+        ClientTcpPendingOpen {
+            initial: None,
+            response: expired_response,
+            frames: Some(expired_frame_rx),
+            session_commands: expired_commands,
+            lane: crate::scheduler::TrafficClass::Throughput,
+            open_deadline: now - Duration::from_secs(1),
+        },
+    );
+
+    let live_id = StreamId(6);
+    let (live_frames, live_frame_rx) = mpsc::channel(1);
+    let (live_commands, _live_command_receivers) = reliable_path_command_channels(1);
+    let (live_response, _live_response_rx) = oneshot::channel();
+    streams.insert_pending(
+        live_id,
+        ClientTcpPathStreamState {
+            terminal: None,
+            open_attempt_id: ClientTcpOpenAttemptId(6),
+            frames: live_frames,
+        },
+        ClientTcpPendingOpen {
+            initial: None,
+            response: live_response,
+            frames: Some(live_frame_rx),
+            session_commands: live_commands,
+            lane: crate::scheduler::TrafficClass::Throughput,
+            open_deadline: now + Duration::from_secs(30),
+        },
+    );
+
+    assert_eq!(
+        expired_client_tcp_pending_open_ids(&streams),
+        Some(vec![expired_id, closed_id]),
+        "the selector returns only expired/closed pending IDs in key order",
+    );
+    assert!(
+        next_client_tcp_pending_open_deadline(&streams)
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now()),
+        "a closed response or elapsed deadline is immediately due",
+    );
+}
+
+#[test]
+fn carrier_failure_drains_established_and_pending_owners_together() {
+    let open_id = StreamId(101);
+    let pending_id = StreamId(102);
+    let (open_frames, mut open_frame_rx) = mpsc::channel(1);
+    let (pending_frames, pending_frame_rx) = mpsc::channel(1);
+    let (pending_commands, _pending_command_receivers) = reliable_path_command_channels(1);
+    let (pending_response, mut pending_response_rx) = oneshot::channel();
+    let mut streams = ClientTcpPathStreams::new();
+    streams.insert_open(
+        open_id,
+        ClientTcpPathStreamState {
+            terminal: None,
+            open_attempt_id: ClientTcpOpenAttemptId(101),
+            frames: open_frames,
+        },
+    );
+    streams.insert_pending(
+        pending_id,
+        ClientTcpPathStreamState {
+            terminal: None,
+            open_attempt_id: ClientTcpOpenAttemptId(102),
+            frames: pending_frames,
+        },
+        ClientTcpPendingOpen {
+            initial: None,
+            response: pending_response,
+            frames: Some(pending_frame_rx),
+            session_commands: pending_commands,
+            lane: crate::scheduler::TrafficClass::Throughput,
+            open_deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+        },
+    );
+
+    fail_client_tcp_streams(
+        &mut streams,
+        &crate::runtime::error::RuntimeError::PathHeartbeatTimeout,
+    );
+
+    assert!(streams.is_empty());
+    assert!(matches!(
+        open_frame_rx.try_recv(),
+        Ok(Err(
+            crate::runtime::error::RuntimeError::PathHeartbeatTimeout
+        ))
+    ));
+    assert!(matches!(
+        pending_response_rx.try_recv(),
+        Ok(
+            crate::runtime::path::commands::ClientTcpOpenResponse::FailedAfterOpen(
+                crate::runtime::error::RuntimeError::PathHeartbeatTimeout
+            )
+        )
+    ));
+}
+
+#[tokio::test]
 async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
     let stream_id = StreamId(7);
     let (frames_tx, frames_rx) = mpsc::channel(1);
-    let mut streams = HashMap::new();
-    streams.insert(
+    let mut streams = ClientTcpPathStreams::new();
+    streams.insert_open(
         stream_id,
         ClientTcpPathStreamState {
             terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(1),
             frames: frames_tx,
-            pending_open: None,
         },
     );
     let mut closed_streams = RecentIdCache::new(8);
@@ -184,14 +416,13 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
 async fn client_tcp_path_routes_inflight_receive_frames_to_live_stream() {
     let stream_id = StreamId(70);
     let (frames_tx, mut frames_rx) = mpsc::channel(4);
-    let mut streams = HashMap::new();
-    streams.insert(
+    let mut streams = ClientTcpPathStreams::new();
+    streams.insert_open(
         stream_id,
         ClientTcpPathStreamState {
             terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(2),
             frames: frames_tx,
-            pending_open: None,
         },
     );
     let mut closed_streams = RecentIdCache::new(8);
@@ -280,15 +511,15 @@ async fn client_tcp_path_routes_inflight_receive_frames_to_live_stream() {
 async fn client_tcp_idle_writer_routes_both_requalification_frames() {
     let stream_id = StreamId(71);
     let (frames_tx, mut frames_rx) = mpsc::channel(4);
-    let mut streams = HashMap::from([(
+    let mut streams = ClientTcpPathStreams::new();
+    streams.insert_open(
         stream_id,
         ClientTcpPathStreamState {
             terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(3),
             frames: frames_tx,
-            pending_open: None,
         },
-    )]);
+    );
     let mut closed_streams = RecentIdCache::new(8);
     let probe = Frame::StreamRequalifyData {
         stream_id,

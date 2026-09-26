@@ -7,13 +7,12 @@ use super::capacity::handle_client_tcp_capacity_frame;
 use super::datagram::ClientTcpDatagramState;
 use super::state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::stream::{
-    ClientTcpPathStreamState, expire_client_tcp_pending_opens, handle_client_tcp_stream_frame,
+    ClientTcpPathStreams, expire_client_tcp_pending_opens, handle_client_tcp_stream_frame,
 };
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::path_proof_ack_frame;
 use crate::runtime::recent_ids::RecentIdCache;
-use std::collections::HashMap;
 
 fn client_tcp_inbound_frame_is_product_stream(frame: &Frame) -> bool {
     matches!(
@@ -34,7 +33,7 @@ fn client_tcp_inbound_frame_is_product_stream(frame: &Frame) -> bool {
 pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
     frame: Frame,
     connection: &mut ClientTcpPathConnection,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,

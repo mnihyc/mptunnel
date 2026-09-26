@@ -9,9 +9,8 @@ use super::datagram::ClientTcpDatagramState;
 use super::receive::handle_client_tcp_path_frame;
 use super::state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::stream::{
-    ClientTcpOpenStreamRequest, ClientTcpPathStreamState,
-    client_tcp_inbound_frame_retires_attachment, open_client_tcp_stream_on_connection,
-    remove_matching_client_tcp_open,
+    ClientTcpOpenStreamRequest, ClientTcpPathStreams, client_tcp_inbound_frame_retires_attachment,
+    open_client_tcp_stream_on_connection, remove_matching_client_tcp_open,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -35,7 +34,6 @@ use crate::runtime::path::commands::{TcpCapacityProbeCommand, reliable_path_writ
 use crate::runtime::path::input::PendingMailboxFrame;
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::runtime::sender::PreparedOriginalClaim;
-use std::collections::HashMap;
 #[cfg(any(test, feature = "lab-diagnostics"))]
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -54,7 +52,7 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
     first_command: ReliablePathCommand,
     commands: &mut ReliablePathCommandReceivers,
     connection: &mut ClientTcpPathConnection,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
@@ -113,7 +111,7 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                     || work.path_instance_id() != connection.path_instance_id
                     || streams
                         .get(&work.stream_id())
-                        .is_none_or(|stream| stream.pending_open.is_some())
+                        .is_none_or(|_| streams.is_pending(&work.stream_id()))
                 {
                     break;
                 }
@@ -256,7 +254,7 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 let request_current = probe.request_lease().is_current();
                 let stream_is_attached = streams
                     .get(&stream_id)
-                    .is_some_and(|state| state.pending_open.is_none());
+                    .is_some_and(|_| !streams.is_pending(&stream_id));
                 if !request_current || !stream_is_attached {
                     // A planner may revoke a queued probe after the stream or
                     // proof epoch changes, or the product stream may detach
@@ -486,7 +484,7 @@ fn release_client_tcp_writer_transaction_charge(
 async fn commit_client_tcp_command_frame_transaction(
     connection: &mut ClientTcpPathConnection,
     frames: &mut Vec<Frame>,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
@@ -546,7 +544,7 @@ fn ensure_client_tcp_transaction_closed(
 async fn commit_client_tcp_frame_transaction_interlocked(
     connection: &mut ClientTcpPathConnection,
     frames: &mut Vec<Frame>,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
@@ -633,7 +631,7 @@ async fn commit_client_tcp_frame_transaction_interlocked(
 pub(in crate::runtime::path::tcp) async fn write_client_tcp_frame_batch_interlocked(
     connection: &mut ClientTcpPathConnection,
     frames: &mut Vec<Frame>,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
@@ -693,7 +691,7 @@ fn publish_client_tcp_frame_transaction(
 
 #[cfg(test)]
 struct ClientTcpCapacityProbeInterlock<'a> {
-    streams: &'a mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &'a mut ClientTcpPathStreams,
     closed_streams: &'a mut RecentIdCache<StreamId>,
     datagrams: &'a mut ClientTcpDatagramState,
     runtime: &'a ClientTcpPathSessionRuntime,
@@ -836,10 +834,7 @@ async fn client_write_tcp_capacity_probe_interlocked(
 }
 
 #[cfg(all(test, feature = "lab-diagnostics"))]
-fn client_tcp_write_barrier_reason(
-    frame: &Frame,
-    streams: &HashMap<StreamId, ClientTcpPathStreamState>,
-) -> &'static str {
+fn client_tcp_write_barrier_reason(frame: &Frame, streams: &ClientTcpPathStreams) -> &'static str {
     let stream_id = match frame {
         Frame::StreamMaxData { stream_id, .. }
         | Frame::StreamReset { stream_id, .. }
@@ -853,10 +848,10 @@ fn client_tcp_write_barrier_reason(
         | Frame::StreamDetach { stream_id } => Some(*stream_id),
         _ => None,
     };
-    match stream_id.and_then(|stream_id| streams.get(&stream_id)) {
-        Some(state) if state.pending_open.is_some() => "pending_stream_open",
-        Some(_) => "stream_delivery_backpressure",
-        None if stream_id.is_some() => "retired_stream",
+    match stream_id {
+        Some(stream_id) if streams.is_pending(&stream_id) => "pending_stream_open",
+        Some(stream_id) if streams.contains_key(&stream_id) => "stream_delivery_backpressure",
+        Some(_) => "retired_stream",
         None => "carrier_control",
     }
 }
@@ -873,7 +868,7 @@ enum ClientTcpWriteFrameRoute {
 
 fn try_route_client_tcp_frame_during_write_for_session(
     frame: Frame,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
@@ -914,7 +909,7 @@ fn try_route_client_tcp_frame_during_write_for_session(
 
 fn try_route_client_tcp_frame_during_write(
     frame: Frame,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
 ) -> Result<ClientTcpWriteFrameRoute, RuntimeError> {
@@ -936,10 +931,7 @@ fn try_route_client_tcp_frame_during_write(
         | Frame::StreamRequalifyAck { stream_id, .. }
         | Frame::StreamFin { stream_id, .. } => *stream_id,
         Frame::StreamDetach { stream_id } => {
-            if streams
-                .get(stream_id)
-                .is_some_and(|state| state.pending_open.is_some())
-            {
+            if streams.is_pending(stream_id) {
                 return Ok(ClientTcpWriteFrameRoute::Barrier(Frame::StreamDetach {
                     stream_id: *stream_id,
                 }));
@@ -950,10 +942,7 @@ fn try_route_client_tcp_frame_during_write(
         }
         _ => return Ok(ClientTcpWriteFrameRoute::Barrier(frame)),
     };
-    if streams
-        .get(&stream_id)
-        .is_some_and(|state| state.pending_open.is_some())
-    {
+    if streams.is_pending(&stream_id) {
         return Ok(ClientTcpWriteFrameRoute::Barrier(frame));
     }
     let retires_attachment = client_tcp_inbound_frame_retires_attachment(&frame);
@@ -989,7 +978,7 @@ fn try_route_client_tcp_frame_during_write(
 async fn handle_connected_client_tcp_command(
     command: ReliablePathCommand,
     connection: &mut ClientTcpPathConnection,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,

@@ -22,7 +22,8 @@ use crate::runtime::path::tcp::client::state::{
 };
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::scheduler::TrafficClass;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -84,7 +85,6 @@ pub(in crate::runtime::path::tcp) struct ClientTcpPathStreamState {
     pub(in crate::runtime::path::tcp) terminal: Option<crate::runtime::path::PendingStreamTerminal>,
     pub(in crate::runtime::path::tcp) open_attempt_id: ClientTcpOpenAttemptId,
     pub(in crate::runtime::path::tcp) frames: mpsc::Sender<Result<Frame, RuntimeError>>,
-    pub(in crate::runtime::path::tcp) pending_open: Option<ClientTcpPendingOpen>,
 }
 
 pub(in crate::runtime::path::tcp) struct ClientTcpPendingOpen {
@@ -94,6 +94,104 @@ pub(in crate::runtime::path::tcp) struct ClientTcpPendingOpen {
     session_commands: ReliablePathCommandSender,
     lane: TrafficClass,
     open_deadline: tokio::time::Instant,
+}
+
+/// One owner for established stream routing and the disjoint pending-open
+/// lifecycle. Pending values live only in `pending`; established stream states
+/// therefore do not pay for a pending-response slot after MAX. Both deadline
+/// and expiry scans visit pending records only, while their deadlines remain
+/// live reads from the current initial-open arbitration state.
+pub(super) struct ClientTcpPathStreams {
+    streams: HashMap<StreamId, ClientTcpPathStreamState>,
+    pending: BTreeMap<StreamId, ClientTcpPendingOpen>,
+}
+
+impl ClientTcpPathStreams {
+    pub(super) fn new() -> Self {
+        Self {
+            streams: HashMap::new(),
+            pending: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_open(&mut self, stream_id: StreamId, state: ClientTcpPathStreamState) {
+        assert!(
+            !self.streams.contains_key(&stream_id) && !self.pending.contains_key(&stream_id),
+            "TCP stream ID already has an actor-owned state"
+        );
+        self.streams.insert(stream_id, state);
+    }
+
+    pub(super) fn insert_pending(
+        &mut self,
+        stream_id: StreamId,
+        state: ClientTcpPathStreamState,
+        pending: ClientTcpPendingOpen,
+    ) {
+        assert!(
+            !self.streams.contains_key(&stream_id) && !self.pending.contains_key(&stream_id),
+            "TCP stream ID already has an actor-owned state"
+        );
+        self.streams.insert(stream_id, state);
+        self.pending.insert(stream_id, pending);
+    }
+
+    pub(super) fn get_mut(
+        &mut self,
+        stream_id: &StreamId,
+    ) -> Option<&mut ClientTcpPathStreamState> {
+        self.streams.get_mut(stream_id)
+    }
+
+    pub(super) fn is_pending(&self, stream_id: &StreamId) -> bool {
+        self.pending.contains_key(stream_id)
+    }
+
+    fn pending_open(&self, stream_id: &StreamId) -> Option<&ClientTcpPendingOpen> {
+        self.pending.get(stream_id)
+    }
+
+    fn take_pending_open(&mut self, stream_id: &StreamId) -> Option<ClientTcpPendingOpen> {
+        self.pending.remove(stream_id)
+    }
+
+    pub(super) fn remove(&mut self, stream_id: &StreamId) -> Option<ClientTcpPathStreamState> {
+        self.remove_with_pending(stream_id)
+            .map(|(state, _pending)| state)
+    }
+
+    fn remove_with_pending(
+        &mut self,
+        stream_id: &StreamId,
+    ) -> Option<(ClientTcpPathStreamState, Option<ClientTcpPendingOpen>)> {
+        let state = self.streams.remove(stream_id)?;
+        let pending = self.pending.remove(stream_id);
+        Some((state, pending))
+    }
+
+    fn drain_with_pending(
+        &mut self,
+    ) -> impl Iterator<
+        Item = (
+            StreamId,
+            ClientTcpPathStreamState,
+            Option<ClientTcpPendingOpen>,
+        ),
+    > + '_ {
+        let mut pending = std::mem::take(&mut self.pending);
+        self.streams
+            .drain()
+            .map(move |(stream_id, state)| (stream_id, state, pending.remove(&stream_id)))
+    }
+}
+
+impl Deref for ClientTcpPathStreams {
+    type Target = HashMap<StreamId, ClientTcpPathStreamState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.streams
+    }
 }
 
 pub(in crate::runtime::path::tcp) struct ClientTcpOpenStreamRequest {
@@ -112,12 +210,12 @@ pub(in crate::runtime::path::tcp) struct ClientTcpOpenStreamRequest {
 }
 
 pub(in crate::runtime::path::tcp) fn next_client_tcp_pending_open_deadline(
-    streams: &HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &ClientTcpPathStreams,
 ) -> Option<tokio::time::Instant> {
     let now = tokio::time::Instant::now();
     streams
+        .pending
         .values()
-        .filter_map(|state| state.pending_open.as_ref())
         .map(|pending| {
             if pending.response.is_closed() {
                 now
@@ -133,35 +231,36 @@ pub(in crate::runtime::path::tcp) fn next_client_tcp_pending_open_deadline(
         .min()
 }
 
-pub(in crate::runtime::path::tcp) async fn expire_client_tcp_pending_opens(
-    connection: &mut ClientTcpPathConnection,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
-    closed_streams: &mut RecentIdCache<StreamId>,
-) -> Result<(), RuntimeError> {
+fn expired_client_tcp_pending_open_ids(streams: &ClientTcpPathStreams) -> Option<Vec<StreamId>> {
     let now = tokio::time::Instant::now();
     let expired = streams
+        .pending
         .iter()
-        .filter_map(|(stream_id, state)| {
-            state.pending_open.as_ref().and_then(|pending| {
-                let deadline = pending
-                    .initial
-                    .as_ref()
-                    .map_or(pending.open_deadline, |initial| {
-                        initial.deadline().unwrap_or(now)
-                    });
-                (pending.response.is_closed() || deadline <= now).then_some(*stream_id)
-            })
+        .filter_map(|(stream_id, pending)| {
+            let deadline = pending
+                .initial
+                .as_ref()
+                .map_or(pending.open_deadline, |initial| {
+                    initial.deadline().unwrap_or(now)
+                });
+            (pending.response.is_closed() || deadline <= now).then_some(*stream_id)
         })
         .collect::<Vec<_>>();
-    if expired.is_empty() {
+    (!expired.is_empty()).then_some(expired)
+}
+
+pub(in crate::runtime::path::tcp) async fn expire_client_tcp_pending_opens(
+    connection: &mut ClientTcpPathConnection,
+    streams: &mut ClientTcpPathStreams,
+    closed_streams: &mut RecentIdCache<StreamId>,
+) -> Result<(), RuntimeError> {
+    let Some(expired) = expired_client_tcp_pending_open_ids(streams) else {
         return Ok(());
-    }
+    };
 
     let mut detached = false;
     for stream_id in expired {
-        if let Some(mut state) = streams.remove(&stream_id)
-            && let Some(pending) = state.pending_open.take()
-        {
+        if let Some((_state, Some(pending))) = streams.remove_with_pending(&stream_id) {
             let _ = pending
                 .response
                 .send(ClientTcpOpenResponse::FailedAfterOpen(
@@ -185,24 +284,18 @@ pub(in crate::runtime::path::tcp) async fn expire_client_tcp_pending_opens(
 /// Deadline/arbitration rejection retires only that entry, not a healthy carrier.
 async fn retire_client_tcp_pending_open(
     connection: &mut ClientTcpPathConnection,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     stream_id: StreamId,
     error: RuntimeError,
 ) -> Result<(), RuntimeError> {
-    if streams
-        .get(&stream_id)
-        .is_none_or(|state| state.pending_open.is_none())
-    {
+    if !streams.is_pending(&stream_id) {
         return Ok(());
     }
-    let mut state = streams
-        .remove(&stream_id)
-        .expect("checked pending TCP open");
-    let pending = state
-        .pending_open
-        .take()
-        .expect("checked pending TCP response");
+    let (_state, pending) = streams
+        .remove_with_pending(&stream_id)
+        .expect("pending TCP open has a stream state");
+    let pending = pending.expect("checked pending TCP response");
     let _ = pending
         .response
         .send(ClientTcpOpenResponse::FailedAfterOpen(error));
@@ -218,7 +311,7 @@ async fn retire_client_tcp_pending_open(
 pub(in crate::runtime::path::tcp) async fn open_client_tcp_stream_on_connection(
     connection: &mut ClientTcpPathConnection,
     open: ClientTcpOpenStreamRequest,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     stream_frame_queue: usize,
 ) -> Result<(), RuntimeError> {
@@ -255,20 +348,20 @@ pub(in crate::runtime::path::tcp) async fn open_client_tcp_stream_on_connection(
         return Ok(());
     }
     let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);
-    streams.insert(
+    streams.insert_pending(
         stream_id,
         ClientTcpPathStreamState {
             terminal,
             open_attempt_id: attempt_id,
             frames: frames_tx,
-            pending_open: Some(ClientTcpPendingOpen {
-                initial: initial.clone(),
-                response,
-                frames: Some(frames_rx),
-                session_commands,
-                lane,
-                open_deadline,
-            }),
+        },
+        ClientTcpPendingOpen {
+            initial: initial.clone(),
+            response,
+            frames: Some(frames_rx),
+            session_commands,
+            lane,
+            open_deadline,
         },
     );
     let send_open = async {
@@ -317,7 +410,7 @@ pub(in crate::runtime::path::tcp) async fn open_client_tcp_stream_on_connection(
 }
 
 pub(in crate::runtime::path::tcp) fn remove_matching_client_tcp_open(
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     stream_id: StreamId,
     attempt_id: ClientTcpOpenAttemptId,
 ) -> Option<ClientTcpPathStreamState> {
@@ -329,7 +422,7 @@ pub(in crate::runtime::path::tcp) fn remove_matching_client_tcp_open(
 }
 
 async fn route_client_tcp_stream_frame(
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     stream_id: StreamId,
     frame: Frame,
@@ -369,7 +462,7 @@ pub(in crate::runtime::path::tcp) fn client_tcp_inbound_frame_retires_attachment
 }
 
 async fn route_client_tcp_lifecycle_frame(
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     stream_id: StreamId,
     frame: Frame,
@@ -384,16 +477,16 @@ async fn route_client_tcp_lifecycle_frame(
 }
 
 async fn handle_client_tcp_stream_detach(
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     stream_id: StreamId,
 ) {
-    let Some(mut state) = streams.remove(&stream_id) else {
+    let Some((state, pending)) = streams.remove_with_pending(&stream_id) else {
         closed_streams.insert(stream_id);
         return;
     };
     closed_streams.insert(stream_id);
-    if let Some(pending) = state.pending_open.take() {
+    if let Some(pending) = pending {
         let _ = pending
             .response
             .send(ClientTcpOpenResponse::FailedAfterOpen(
@@ -410,11 +503,11 @@ async fn handle_client_tcp_stream_detach(
 }
 
 pub(in crate::runtime::path::tcp) fn fail_client_tcp_streams(
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     reason: &RuntimeError,
 ) {
-    for (_, mut state) in streams.drain() {
-        if let Some(pending) = state.pending_open.take() {
+    for (_, state, pending) in streams.drain_with_pending() {
+        if let Some(pending) = pending {
             let _ = pending
                 .response
                 .send(ClientTcpOpenResponse::FailedAfterOpen(
@@ -443,7 +536,7 @@ fn tcp_path_stream_error(reason: &RuntimeError) -> RuntimeError {
 pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
     frame: Frame,
     connection: &mut ClientTcpPathConnection,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    streams: &mut ClientTcpPathStreams,
     closed_streams: &mut RecentIdCache<StreamId>,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
@@ -453,8 +546,7 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
             max_offset,
         } => {
             let admitted_deadline = streams
-                .get(&stream_id)
-                .and_then(|state| state.pending_open.as_ref())
+                .pending_open(&stream_id)
                 .and_then(|pending| pending.initial.as_ref())
                 .map(|initial| initial.admission())
                 .transpose();
@@ -472,10 +564,10 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
                     return Ok(());
                 }
             };
-            if let Some(state) = streams.get_mut(&stream_id)
-                && state.pending_open.is_some()
-                && let Some(mut pending) = state.pending_open.take()
-            {
+            if streams.is_pending(&stream_id) {
+                let mut pending = streams
+                    .take_pending_open(&stream_id)
+                    .expect("checked pending TCP response");
                 let open_deadline = admitted_deadline.unwrap_or(pending.open_deadline);
                 let frames = pending
                     .frames
@@ -491,6 +583,9 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
                         Duration::from_micros(u64::from(evidence.metrics.rttvar_us)),
                     ),
                 );
+                let state = streams
+                    .get_mut(&stream_id)
+                    .expect("pending TCP response has a stream state");
                 let carrier = OpenedReliableCarrierStream {
                     retirement: None,
                     terminal: state.terminal.clone(),
@@ -546,11 +641,8 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
             {
                 terminal.publish_reset(stream_id, reason);
             }
-            if streams
-                .get(&stream_id)
-                .is_some_and(|state| state.pending_open.is_some())
-                && let Some(mut state) = streams.remove(&stream_id)
-                && let Some(pending) = state.pending_open.take()
+            if streams.is_pending(&stream_id)
+                && let Some((_state, Some(pending))) = streams.remove_with_pending(&stream_id)
             {
                 closed_streams.insert(stream_id);
                 let _ = pending

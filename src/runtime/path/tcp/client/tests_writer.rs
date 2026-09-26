@@ -9,11 +9,10 @@ use crate::runtime::path::commands::{
     try_recv_reliable_path_command,
 };
 use crate::runtime::path::tcp::client::datagram::ClientTcpDatagramState;
-use crate::runtime::path::tcp::client::stream::ClientTcpPathStreamState;
+use crate::runtime::path::tcp::client::stream::{ClientTcpPathStreamState, ClientTcpPathStreams};
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 #[test]
@@ -72,15 +71,15 @@ fn client_tcp_stale_probe_normal_exit_requires_prior_transaction_commit() {
 async fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
     let stream_id = StreamId(81);
     let (frames, mut frame_rx) = mpsc::channel(1);
-    let mut streams = HashMap::from([(
+    let mut streams = ClientTcpPathStreams::new();
+    streams.insert_open(
         stream_id,
         ClientTcpPathStreamState {
             terminal: None,
             open_attempt_id: ClientTcpOpenAttemptId(3),
             frames,
-            pending_open: None,
         },
-    )]);
+    );
     let mut closed_streams = RecentIdCache::new(4);
     let mut datagrams = ClientTcpDatagramState::new(4, 4);
     let ack = Frame::StreamAck {

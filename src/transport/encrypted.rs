@@ -858,6 +858,20 @@ struct NoiseReadState {
     plaintext: Vec<u8>,
     plaintext_offset: usize,
     poisoned: bool,
+    #[cfg(test)]
+    direct_record_count: usize,
+    #[cfg(test)]
+    direct_plaintext_bytes: usize,
+    #[cfg(test)]
+    copied_plaintext_bytes: usize,
+    #[cfg(test)]
+    peak_ciphertext_capacity: usize,
+    #[cfg(test)]
+    peak_plaintext_capacity: usize,
+    #[cfg(test)]
+    frame_count: usize,
+    #[cfg(test)]
+    frame_backing_capacity_bytes: usize,
 }
 
 impl NoiseReadState {
@@ -869,6 +883,20 @@ impl NoiseReadState {
             plaintext: Vec::new(),
             plaintext_offset: 0,
             poisoned: false,
+            #[cfg(test)]
+            direct_record_count: 0,
+            #[cfg(test)]
+            direct_plaintext_bytes: 0,
+            #[cfg(test)]
+            copied_plaintext_bytes: 0,
+            #[cfg(test)]
+            peak_ciphertext_capacity: 0,
+            #[cfg(test)]
+            peak_plaintext_capacity: 0,
+            #[cfg(test)]
+            frame_count: 0,
+            #[cfg(test)]
+            frame_backing_capacity_bytes: 0,
         }
     }
 }
@@ -1788,6 +1816,18 @@ async fn read_noise_exact<R>(
 where
     R: AsyncRead + Unpin,
 {
+    read_noise_exact_mode::<false, false, R>(stream, transport, state, output).await
+}
+
+async fn read_noise_exact_mode<const DIRECT_RECORDS: bool, const TRACK_METRICS: bool, R>(
+    stream: &mut R,
+    transport: &RwLock<StatelessTransportState>,
+    state: &mut NoiseReadState,
+    output: &mut [u8],
+) -> Result<(), EncryptedFramedTransportError>
+where
+    R: AsyncRead + Unpin,
+{
     if state.poisoned {
         return Err(EncryptedFramedTransportError::ReadStatePoisoned);
     }
@@ -1801,6 +1841,10 @@ where
             );
             state.plaintext_offset += copied;
             output_offset += copied;
+            #[cfg(test)]
+            if TRACK_METRICS {
+                state.copied_plaintext_bytes = state.copied_plaintext_bytes.saturating_add(copied);
+            }
             continue;
         }
 
@@ -1824,12 +1868,48 @@ where
             ));
         }
         state.ciphertext.resize(ciphertext_len, 0);
+        #[cfg(test)]
+        if TRACK_METRICS {
+            state.peak_ciphertext_capacity = state
+                .peak_ciphertext_capacity
+                .max(state.ciphertext.capacity());
+        }
         stream.read_exact(&mut state.ciphertext).await?;
-        state.plaintext.resize(ciphertext_len, 0);
-        let plaintext_len =
-            read_noise_message(transport, nonce, &state.ciphertext, &mut state.plaintext)?;
-        state.plaintext.truncate(plaintext_len);
-        state.plaintext_offset = 0;
+        let output_remaining = output.len() - output_offset;
+        if DIRECT_RECORDS && ciphertext_len <= output_remaining {
+            // Snow's ring resolver decrypts in place when the output can hold
+            // the full ciphertext. The extra tag-sized tail is overwritten by
+            // subsequent plaintext; a final/boundary record falls back to the
+            // reusable scratch buffer. If authentication fails, these bytes
+            // remain private to this temporary frame buffer.
+            let direct_end = output_offset + ciphertext_len;
+            let plaintext_len = read_noise_message(
+                transport,
+                nonce,
+                &state.ciphertext,
+                &mut output[output_offset..direct_end],
+            )?;
+            output_offset += plaintext_len;
+            state.plaintext_offset = state.plaintext.len();
+            #[cfg(test)]
+            if TRACK_METRICS {
+                state.direct_record_count = state.direct_record_count.saturating_add(1);
+                state.direct_plaintext_bytes =
+                    state.direct_plaintext_bytes.saturating_add(plaintext_len);
+            }
+        } else {
+            state.plaintext.resize(ciphertext_len, 0);
+            #[cfg(test)]
+            if TRACK_METRICS {
+                state.peak_plaintext_capacity = state
+                    .peak_plaintext_capacity
+                    .max(state.plaintext.capacity());
+            }
+            let plaintext_len =
+                read_noise_message(transport, nonce, &state.ciphertext, &mut state.plaintext)?;
+            state.plaintext.truncate(plaintext_len);
+            state.plaintext_offset = 0;
+        }
         state.nonce = next_nonce;
         state.poisoned = false;
     }
@@ -1898,10 +1978,22 @@ async fn read_noise_frame_from<R>(
 where
     R: AsyncRead + Unpin,
 {
+    read_noise_frame_from_mode::<true, false, R>(stream, transport, read, limits).await
+}
+
+async fn read_noise_frame_from_mode<const DIRECT_BODY_RECORDS: bool, const TRACK_METRICS: bool, R>(
+    stream: &mut R,
+    transport: &RwLock<StatelessTransportState>,
+    read: &mut NoiseReadState,
+    limits: CodecLimits,
+) -> Result<Frame, EncryptedFramedTransportError>
+where
+    R: AsyncRead + Unpin,
+{
     #[cfg(feature = "lab-diagnostics")]
     let total_started = std::time::Instant::now();
     let mut header = [0u8; FRAME_HEADER_LEN];
-    read_noise_exact(stream, transport, read, &mut header).await?;
+    read_noise_exact_mode::<false, TRACK_METRICS, R>(stream, transport, read, &mut header).await?;
     let payload_len = decode_payload_len_from_header(&header, limits)?;
     let frame_len = FRAME_HEADER_LEN
         .checked_add(payload_len)
@@ -1909,7 +2001,20 @@ where
     let mut encoded = BytesMut::with_capacity(frame_len);
     encoded.extend_from_slice(&header);
     encoded.resize(frame_len, 0);
-    read_noise_exact(stream, transport, read, &mut encoded[FRAME_HEADER_LEN..]).await?;
+    read_noise_exact_mode::<DIRECT_BODY_RECORDS, TRACK_METRICS, R>(
+        stream,
+        transport,
+        read,
+        &mut encoded[FRAME_HEADER_LEN..],
+    )
+    .await?;
+    #[cfg(test)]
+    if TRACK_METRICS {
+        read.frame_count = read.frame_count.saturating_add(1);
+        read.frame_backing_capacity_bytes = read
+            .frame_backing_capacity_bytes
+            .saturating_add(encoded.capacity());
+    }
     let frame = decode_frame_bytes(encoded.freeze(), limits)?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(

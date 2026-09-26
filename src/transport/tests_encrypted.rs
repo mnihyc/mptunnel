@@ -3,7 +3,7 @@ use crate::protocol::{Frame, SessionId, StreamId};
 use bytes::Bytes;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, duplex};
 
@@ -110,6 +110,168 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CaptureWrites<S> {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
+}
+
+struct ChunkedBytesReader {
+    bytes: Vec<u8>,
+    offset: usize,
+    max_chunk: usize,
+}
+
+struct PausingBytesReader {
+    bytes: Vec<u8>,
+    offset: usize,
+    max_chunk: usize,
+    pause_at: usize,
+}
+
+impl AsyncRead for ChunkedBytesReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let remaining = this.bytes.len().saturating_sub(this.offset);
+        let count = remaining.min(buf.remaining()).min(this.max_chunk.max(1));
+        if count > 0 {
+            buf.put_slice(&this.bytes[this.offset..this.offset + count]);
+            this.offset += count;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for PausingBytesReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.offset >= this.pause_at {
+            return Poll::Pending;
+        }
+        let remaining = this
+            .bytes
+            .len()
+            .saturating_sub(this.offset)
+            .min(this.pause_at - this.offset);
+        let count = remaining.min(buf.remaining()).min(this.max_chunk.max(1));
+        if count > 0 {
+            buf.put_slice(&this.bytes[this.offset..this.offset + count]);
+            this.offset += count;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct NoiseTranscript {
+    wire: Vec<u8>,
+    transport: Arc<RwLock<snow::StatelessTransportState>>,
+    read_length_key: [u8; 32],
+    limits: CodecLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NoiseReadFixtureMetrics {
+    direct_records: usize,
+    direct_bytes: usize,
+    copied_bytes: usize,
+    peak_ciphertext_capacity: usize,
+    peak_plaintext_capacity: usize,
+    frame_count: usize,
+    frame_backing_capacity_bytes: usize,
+}
+
+fn max_stream_data_payload(limits: CodecLimits) -> usize {
+    limits.max_payload_bytes.min(
+        limits
+            .max_frame_bytes
+            .saturating_sub(FRAME_HEADER_LEN + 8 + 8 + 4),
+    )
+}
+
+async fn capture_noise_transcript(frames: &[Frame]) -> NoiseTranscript {
+    let limits = CodecLimits::default();
+    let encoded = crate::protocol::codec::encode_frames(frames, limits)
+        .expect("encode read-cost fixture frames");
+    let records = encoded.len().div_ceil(TCP_NOISE_MAX_PLAINTEXT);
+    let capacity = encoded
+        .len()
+        .saturating_add(records.saturating_mul(TCP_NOISE_MASKED_LENGTH_LEN + TCP_NOISE_TAG_LEN))
+        .saturating_add(64 * 1024);
+    let (client_io, server_io) = duplex(capacity.max(64 * 1024));
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let client_io = CaptureWrites {
+        inner: client_io,
+        bytes: captured.clone(),
+    };
+    let client_config = test_client_tls_config_with_transport_secret([0x5a; 32]);
+    let server_config = test_server_tls_config_with_transport_secret([0x5a; 32]);
+    let (client, server) = tokio::join!(
+        EncryptedFramedStream::connect(client_io, &client_config, limits),
+        EncryptedFramedStream::accept(server_io, &server_config, limits),
+    );
+    let EncryptedFramedStreamInner::Noise(mut client) =
+        client.expect("Noise fixture client handshake").inner
+    else {
+        panic!("fixture requires Noise client");
+    };
+    let EncryptedFramedStreamInner::Noise(server) =
+        server.expect("Noise fixture server handshake").inner
+    else {
+        panic!("fixture requires Noise server");
+    };
+    captured.lock().expect("captured wire").clear();
+    client
+        .write_frames(frames)
+        .await
+        .expect("write Noise fixture frames");
+    client.flush().await.expect("flush Noise fixture frames");
+    let wire = captured.lock().expect("captured wire").clone();
+    NoiseTranscript {
+        wire,
+        transport: server.transport.clone(),
+        read_length_key: server.read.length_key,
+        limits,
+    }
+}
+
+async fn run_noise_read_fixture<const DIRECT: bool, const TRACK_METRICS: bool>(
+    frames: &[Frame],
+    max_read_chunk: usize,
+) -> (NoiseReadFixtureMetrics, Vec<Frame>) {
+    let transcript = capture_noise_transcript(frames).await;
+    let mut stream = ChunkedBytesReader {
+        bytes: transcript.wire,
+        offset: 0,
+        max_chunk: max_read_chunk,
+    };
+    let mut read = NoiseReadState::new(transcript.read_length_key);
+    let mut retained = Vec::with_capacity(frames.len());
+    for expected in frames {
+        let frame = read_noise_frame_from_mode::<DIRECT, TRACK_METRICS, _>(
+            &mut stream,
+            &transcript.transport,
+            &mut read,
+            transcript.limits,
+        )
+        .await
+        .expect("decode Noise fixture frame");
+        assert_eq!(&frame, expected, "reader mode changed decoded frame");
+        retained.push(frame);
+    }
+    let metrics = NoiseReadFixtureMetrics {
+        direct_records: read.direct_record_count,
+        direct_bytes: read.direct_plaintext_bytes,
+        copied_bytes: read.copied_plaintext_bytes,
+        peak_ciphertext_capacity: read.peak_ciphertext_capacity,
+        peak_plaintext_capacity: read.peak_plaintext_capacity,
+        frame_count: read.frame_count,
+        frame_backing_capacity_bytes: read.frame_backing_capacity_bytes,
+    };
+    (metrics, retained)
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for CountWrites<S> {
@@ -686,6 +848,216 @@ async fn noise_record_boundaries_are_invisible_to_large_mpp_frames() {
         read_result.expect("read frame spanning Noise records"),
         frame
     );
+}
+
+#[tokio::test]
+async fn noise_direct_record_reader_matches_copy_oracle_across_boundaries() {
+    let limits = CodecLimits::default();
+    let max_stream_data_bytes = max_stream_data_payload(limits);
+    let frame_batches = vec![
+        vec![
+            Frame::Ping { nonce: 1 },
+            Frame::StreamData {
+                stream_id: StreamId(81),
+                offset: 0,
+                payload: Bytes::from(vec![0x64; 64 * 1024]),
+            },
+            Frame::Ping { nonce: 2 },
+            Frame::StreamData {
+                stream_id: StreamId(81),
+                offset: 64 * 1024,
+                payload: Bytes::from(vec![0x51; 512 * 1024]),
+            },
+        ],
+        vec![Frame::StreamData {
+            stream_id: StreamId(81),
+            offset: 64 * 1024 + 512 * 1024,
+            payload: Bytes::from(vec![0x4d; max_stream_data_bytes]),
+        }],
+    ];
+
+    for frames in &frame_batches {
+        for max_read_chunk in [usize::MAX, 257] {
+            let (copy_metrics, copy_frames) =
+                run_noise_read_fixture::<false, true>(frames, max_read_chunk).await;
+            let (direct_metrics, direct_frames) =
+                run_noise_read_fixture::<true, true>(frames, max_read_chunk).await;
+            assert_eq!(copy_frames.as_slice(), frames.as_slice());
+            assert_eq!(direct_frames.as_slice(), frames.as_slice());
+            assert_eq!(direct_frames, copy_frames);
+            assert_eq!(copy_metrics.frame_count, frames.len());
+            assert_eq!(direct_metrics.frame_count, frames.len());
+            assert_eq!(
+                direct_metrics.frame_backing_capacity_bytes,
+                copy_metrics.frame_backing_capacity_bytes,
+                "direct decryption must retain the same exact frame-owned allocations"
+            );
+            assert_eq!(
+                direct_metrics.peak_ciphertext_capacity, copy_metrics.peak_ciphertext_capacity,
+                "ciphertext scratch bound must not change"
+            );
+            assert_eq!(
+                direct_metrics.peak_plaintext_capacity, copy_metrics.peak_plaintext_capacity,
+                "header and boundary records keep the same reusable plaintext scratch"
+            );
+            assert!(direct_metrics.direct_records > 0);
+            assert!(direct_metrics.direct_bytes > 0);
+            assert!(
+                direct_metrics.copied_bytes < copy_metrics.copied_bytes,
+                "eligible large-frame records should skip the plaintext-to-frame copy"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn noise_direct_record_auth_failure_poisoning_keeps_frame_private() {
+    let limits = CodecLimits::default();
+    let body_bytes = max_stream_data_payload(limits);
+    let frames = [Frame::StreamData {
+        stream_id: StreamId(82),
+        offset: 0,
+        payload: Bytes::from(vec![0x37; body_bytes]),
+    }];
+    let mut transcript = capture_noise_transcript(&frames).await;
+
+    let mut record_offset = 0usize;
+    for nonce in 0..2u64 {
+        let encoded_len = u16::from_be_bytes(
+            transcript.wire[record_offset..record_offset + TCP_NOISE_MASKED_LENGTH_LEN]
+                .try_into()
+                .expect("record length bytes"),
+        );
+        let ciphertext_len = usize::from(masked_length(
+            &transcript.read_length_key,
+            b"mptunnel noise record header v1",
+            &nonce.to_be_bytes(),
+            encoded_len,
+        ));
+        let record_end = record_offset + TCP_NOISE_MASKED_LENGTH_LEN + ciphertext_len;
+        if nonce == 1 {
+            transcript.wire[record_end - 1] ^= 1;
+        }
+        record_offset = record_end;
+    }
+
+    let mut stream = ChunkedBytesReader {
+        bytes: transcript.wire,
+        offset: 0,
+        max_chunk: 113,
+    };
+    let mut read = NoiseReadState::new(transcript.read_length_key);
+    let error = read_noise_frame_from_mode::<true, true, _>(
+        &mut stream,
+        &transcript.transport,
+        &mut read,
+        transcript.limits,
+    )
+    .await
+    .expect_err("tampered direct record must fail authentication");
+    assert!(matches!(
+        error,
+        EncryptedFramedTransportError::NoiseRecord(_)
+    ));
+    assert_eq!(read.frame_count, 0, "no partial frame is published");
+    assert!(
+        read.poisoned,
+        "failed authentication poisons the read owner"
+    );
+    assert!(matches!(
+        read_noise_frame_from(
+            &mut stream,
+            &transcript.transport,
+            &mut read,
+            transcript.limits,
+        )
+        .await,
+        Err(EncryptedFramedTransportError::ReadStatePoisoned)
+    ));
+}
+
+#[tokio::test]
+async fn canceled_noise_direct_body_record_keeps_poison_contract() {
+    let limits = CodecLimits::default();
+    let body_bytes = max_stream_data_payload(limits);
+    let frames = [Frame::StreamData {
+        stream_id: StreamId(83),
+        offset: 0,
+        payload: Bytes::from(vec![0x28; body_bytes]),
+    }];
+    let transcript = capture_noise_transcript(&frames).await;
+
+    let encoded_len = u16::from_be_bytes(
+        transcript.wire[..TCP_NOISE_MASKED_LENGTH_LEN]
+            .try_into()
+            .expect("first record length bytes"),
+    );
+    let first_ciphertext_len = usize::from(masked_length(
+        &transcript.read_length_key,
+        b"mptunnel noise record header v1",
+        &0u64.to_be_bytes(),
+        encoded_len,
+    ));
+    let first_record_end = TCP_NOISE_MASKED_LENGTH_LEN + first_ciphertext_len;
+    let pause_at = first_record_end + TCP_NOISE_MASKED_LENGTH_LEN + 8;
+    assert!(
+        pause_at < transcript.wire.len(),
+        "fixture must contain a second encrypted record"
+    );
+
+    let mut stream = PausingBytesReader {
+        bytes: transcript.wire,
+        offset: 0,
+        max_chunk: 4096,
+        pause_at,
+    };
+    let mut read = NoiseReadState::new(transcript.read_length_key);
+    let mut read_frame = Box::pin(read_noise_frame_from(
+        &mut stream,
+        &transcript.transport,
+        &mut read,
+        transcript.limits,
+    ));
+    // Drive the in-memory reader until its programmed second-record stall.
+    // This polls the real read future to Pending without a wall-clock timeout.
+    std::future::poll_fn(
+        |cx| match std::future::Future::poll(read_frame.as_mut(), cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!("reader completed before its programmed stall: {result:?}")
+            }
+        },
+    )
+    .await;
+    drop(read_frame);
+    assert_eq!(stream.offset, pause_at);
+    assert_eq!(read.nonce, 1, "only the first authenticated record commits");
+    assert!(
+        read.poisoned,
+        "cancellation during record two poisons the reader"
+    );
+    assert!(matches!(
+        read_noise_frame_from(
+            &mut stream,
+            &transcript.transport,
+            &mut read,
+            transcript.limits
+        )
+        .await,
+        Err(EncryptedFramedTransportError::ReadStatePoisoned)
+    ));
+}
+
+#[tokio::test]
+async fn canceled_noise_record_read_retains_existing_poison_contract() {
+    let (client, mut server) = transport_secret_pair(64 * 1024).await;
+    let result = tokio::time::timeout(Duration::from_millis(10), server.read_frame()).await;
+    assert!(result.is_err(), "no application record was sent");
+    assert!(matches!(
+        server.read_frame().await,
+        Err(EncryptedFramedTransportError::ReadStatePoisoned)
+    ));
+    drop(client);
 }
 
 #[tokio::test]

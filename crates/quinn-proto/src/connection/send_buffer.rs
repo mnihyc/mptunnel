@@ -2,13 +2,13 @@ use std::{collections::VecDeque, ops::Range};
 
 use bytes::{Buf, Bytes};
 
-use crate::{VarInt, range_set::RangeSet};
+use crate::{range_set::RangeSet, VarInt};
 
 /// Buffer of outgoing retransmittable stream data
 #[derive(Default, Debug)]
 pub(super) struct SendBuffer {
     /// Data queued by the application but not yet acknowledged. May or may not have been sent.
-    unacked_segments: VecDeque<Bytes>,
+    unacked_segments: VecDeque<Segment>,
     /// Total size of `unacked_segments`
     unacked_len: usize,
     /// The first offset that hasn't been written by the application, i.e. the offset past the end of `unacked`
@@ -25,6 +25,17 @@ pub(super) struct SendBuffer {
     retransmits: RangeSet,
 }
 
+/// One owned, contiguous range of unacknowledged stream bytes.
+///
+/// `start` is the absolute stream offset represented by `data[0]`. The starts are ordered and
+/// may be equal when empty writes precede a non-empty write. This adds one 8-byte start per
+/// retained segment.
+#[derive(Debug)]
+struct Segment {
+    start: u64,
+    data: Bytes,
+}
+
 impl SendBuffer {
     /// Construct an empty buffer at the initial offset
     pub(super) fn new() -> Self {
@@ -33,9 +44,10 @@ impl SendBuffer {
 
     /// Append application data to the end of the stream
     pub(super) fn write(&mut self, data: Bytes) {
+        let start = self.offset;
         self.unacked_len += data.len();
         self.offset += data.len() as u64;
-        self.unacked_segments.push_back(data);
+        self.unacked_segments.push_back(Segment { start, data });
     }
 
     /// Discard a range of acknowledged stream data
@@ -58,15 +70,16 @@ impl SendBuffer {
                     .front_mut()
                     .expect("Expected buffered data");
 
-                if front.len() <= to_advance {
-                    to_advance -= front.len();
+                if front.data.len() <= to_advance {
+                    to_advance -= front.data.len();
                     self.unacked_segments.pop_front();
 
                     if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
                         self.unacked_segments.shrink_to_fit();
                     }
                 } else {
-                    front.advance(to_advance);
+                    front.data.advance(to_advance);
+                    front.start += to_advance as u64;
                     to_advance = 0;
                 }
             }
@@ -137,22 +150,32 @@ impl SendBuffer {
     /// should call the function again with an incremented start offset to
     /// retrieve more data.
     pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
-        let base_offset = self.offset - self.unacked_len as u64;
+        let mut low = 0;
+        let mut high = self.unacked_segments.len();
 
-        let mut segment_offset = base_offset;
-        for segment in self.unacked_segments.iter() {
-            if offsets.start >= segment_offset
-                && offsets.start < segment_offset + segment.len() as u64
-            {
-                let start = (offsets.start - segment_offset) as usize;
-                let end = (offsets.end - segment_offset) as usize;
-
-                return &segment[start..end.min(segment.len())];
+        // Find the rightmost start <= the requested offset. There can be duplicate starts when
+        // an empty write is followed by another write, so an arbitrary equal-key match could
+        // select an empty segment and hide the following non-empty one.
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.unacked_segments[mid].start <= offsets.start {
+                low = mid + 1;
+            } else {
+                high = mid;
             }
-            segment_offset += segment.len() as u64;
         }
 
-        &[]
+        let Some(index) = low.checked_sub(1) else {
+            return &[];
+        };
+        let segment = &self.unacked_segments[index];
+        if offsets.start >= segment.start + segment.data.len() as u64 {
+            return &[];
+        }
+
+        let start = (offsets.start - segment.start) as usize;
+        let end = (offsets.end - segment.start) as usize;
+        &segment.data[start..end.min(segment.data.len())]
     }
 
     /// Queue a range of sent but unacknowledged data to be retransmitted
@@ -198,6 +221,19 @@ impl SendBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Weak};
+    use std::time::{Duration, Instant};
+
+    struct TrackedBytesOwner {
+        bytes: Vec<u8>,
+        _lifetime: Arc<()>,
+    }
+
+    impl AsRef<[u8]> for TrackedBytesOwner {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
 
     #[test]
     fn fragment_with_length() {
@@ -389,11 +425,325 @@ mod tests {
         assert!(buf.acks.is_empty());
     }
 
+    #[test]
+    fn indexed_get_matches_legacy_through_empty_and_reordered_acks() {
+        let mut indexed = SendBuffer::new();
+        let mut legacy = LegacySendBuffer::default();
+        let writes: [&[u8]; 7] = [b"", b"ab", b"", b"cde", b"", b"fg", b""];
+
+        for bytes in writes {
+            let bytes = Bytes::copy_from_slice(bytes);
+            indexed.write(bytes.clone());
+            legacy.write(bytes);
+        }
+        assert_matches_legacy(&indexed, &legacy);
+
+        // Reordered ACKs first retain later data, then partially advance the head, then close
+        // the gap. This also leaves an empty descriptor at the old end offset.
+        for range in [5..7, 0..1, 3..4, 1..3, 4..5] {
+            indexed.ack(range.clone());
+            legacy.ack(range);
+            assert_matches_legacy(&indexed, &legacy);
+        }
+        assert!(indexed.is_fully_acked());
+
+        // The retained trailing empty write and this new non-empty write have the same start.
+        // Lookup must choose the rightmost equal start.
+        let appended = Bytes::from_static(b"hi");
+        indexed.write(appended.clone());
+        legacy.write(appended);
+        assert_matches_legacy(&indexed, &legacy);
+        assert_eq!(indexed.get(7..8), b"h");
+        assert_eq!(indexed.get(8..9), b"i");
+    }
+
+    #[test]
+    fn indexed_offsets_survive_deque_wrap_and_repeated_ack_write_cycles() {
+        let mut indexed = SendBuffer::new();
+        let mut legacy = LegacySendBuffer::default();
+
+        for byte in 0..32u8 {
+            let bytes = Bytes::copy_from_slice(&[byte]);
+            indexed.write(bytes.clone());
+            legacy.write(bytes);
+        }
+        let capacity = indexed.unacked_segments.capacity();
+        while indexed.unacked_segments.len() < capacity {
+            let byte = indexed.unacked_segments.len() as u8;
+            let bytes = Bytes::copy_from_slice(&[byte]);
+            indexed.write(bytes.clone());
+            legacy.write(bytes);
+        }
+        assert_eq!(indexed.unacked_segments.len(), capacity);
+
+        // Keep the deque full while moving its head. Each append reuses the freed slot, forcing
+        // the VecDeque's physical storage to wrap while absolute stream starts keep increasing.
+        for cycle in 0..4u8 {
+            let base = indexed.offset - indexed.unacked_len as u64;
+            indexed.ack(base..base + 1);
+            legacy.ack(base..base + 1);
+
+            let byte = (capacity as u8).wrapping_add(32).wrapping_add(cycle);
+            let bytes = Bytes::copy_from_slice(&[byte]);
+            indexed.write(bytes.clone());
+            legacy.write(bytes);
+        }
+
+        assert!(
+            !indexed.unacked_segments.as_slices().1.is_empty(),
+            "fixture should exercise a wrapped VecDeque"
+        );
+        assert_matches_legacy(&indexed, &legacy);
+    }
+
+    #[test]
+    fn zero_rtt_retransmission_restarts_across_segments() {
+        let mut buf = SendBuffer::new();
+        buf.write(Bytes::from_static(b"abcdef"));
+        buf.write(Bytes::from_static(b"ghij"));
+
+        let first_transmit = buf.poll_transmit(18);
+        assert_eq!(first_transmit, (0..10, true));
+        assert_eq!(buf.first_unpacketized(), 10);
+
+        buf.retransmit_all_for_0rtt();
+        assert_eq!(buf.first_unpacketized(), 0);
+        assert_eq!(buf.poll_transmit(18), first_transmit);
+    }
+
+    #[test]
+    fn owned_backing_lives_until_contiguous_ack_frontier_passes_it() {
+        let lifetime = Arc::new(());
+        let lifetime_observer: Weak<()> = Arc::downgrade(&lifetime);
+        let bytes = Bytes::from_owner(TrackedBytesOwner {
+            bytes: b"abcdefghijkl".to_vec(),
+            _lifetime: Arc::clone(&lifetime),
+        });
+        drop(lifetime);
+
+        let mut buf = SendBuffer::new();
+        buf.write(bytes);
+
+        // A later ACK cannot release bytes while the native contiguous ACK
+        // frontier is still at zero.
+        buf.ack(8..12);
+        assert!(lifetime_observer.upgrade().is_some());
+        assert_eq!(aggregate_unacked(&buf), b"abcdefghijkl");
+
+        // Advancing only part of the first segment still leaves a live suffix
+        // sharing the same owner.
+        buf.ack(0..4);
+        assert!(lifetime_observer.upgrade().is_some());
+        assert_eq!(aggregate_unacked(&buf), b"efghijkl");
+
+        // This fills the gap; the contiguous ACK frontier now consumes the
+        // remaining segment and releases its owned backing.
+        buf.ack(4..8);
+        assert!(buf.is_fully_acked());
+        assert!(lifetime_observer.upgrade().is_none());
+    }
+
     fn aggregate_unacked(buf: &SendBuffer) -> Vec<u8> {
         let mut result = Vec::new();
         for segment in buf.unacked_segments.iter() {
-            result.extend_from_slice(&segment[..]);
+            result.extend_from_slice(&segment.data[..]);
         }
         result
+    }
+
+    fn assert_matches_legacy(indexed: &SendBuffer, legacy: &LegacySendBuffer) {
+        assert_eq!(indexed.offset(), legacy.offset);
+        assert_eq!(indexed.is_fully_acked(), legacy.unacked_len == 0);
+        assert_eq!(indexed.unacked(), legacy.unacked());
+
+        // Includes zero-length queries, every segment boundary, end offsets, and starts beyond
+        // the retained data. End is never less than start, keeping the old API defined.
+        for start in 0..=legacy.offset + 2 {
+            for end in start..=legacy.offset + 3 {
+                assert_eq!(
+                    indexed.get(start..end),
+                    legacy.get(start..end),
+                    "different bytes for {start}..{end}"
+                );
+            }
+        }
+    }
+
+    /// Test-only copy of the former prefix-scanning representation, used as a differential oracle.
+    #[derive(Default)]
+    struct LegacySendBuffer {
+        unacked_segments: VecDeque<Bytes>,
+        unacked_len: usize,
+        offset: u64,
+        acks: RangeSet,
+    }
+
+    impl LegacySendBuffer {
+        fn write(&mut self, data: Bytes) {
+            self.unacked_len += data.len();
+            self.offset += data.len() as u64;
+            self.unacked_segments.push_back(data);
+        }
+
+        fn ack(&mut self, mut range: Range<u64>) {
+            let base_offset = self.offset - self.unacked_len as u64;
+            range.start = base_offset.max(range.start);
+            range.end = base_offset.max(range.end);
+            self.acks.insert(range);
+
+            while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
+                let prefix = self.acks.pop_min().unwrap();
+                let mut to_advance = (prefix.end - prefix.start) as usize;
+                self.unacked_len -= to_advance;
+                while to_advance > 0 {
+                    let front = self
+                        .unacked_segments
+                        .front_mut()
+                        .expect("Expected buffered data");
+                    if front.len() <= to_advance {
+                        to_advance -= front.len();
+                        self.unacked_segments.pop_front();
+                    } else {
+                        front.advance(to_advance);
+                        to_advance = 0;
+                    }
+                }
+            }
+        }
+
+        fn get(&self, offsets: Range<u64>) -> &[u8] {
+            let base_offset = self.offset - self.unacked_len as u64;
+            let mut segment_offset = base_offset;
+            for segment in self.unacked_segments.iter() {
+                if offsets.start >= segment_offset
+                    && offsets.start < segment_offset + segment.len() as u64
+                {
+                    let start = (offsets.start - segment_offset) as usize;
+                    let end = (offsets.end - segment_offset) as usize;
+                    return &segment[start..end.min(segment.len())];
+                }
+                segment_offset += segment.len() as u64;
+            }
+            &[]
+        }
+
+        fn unacked(&self) -> u64 {
+            self.unacked_len as u64
+                - self
+                    .acks
+                    .iter()
+                    .map(|range| range.end - range.start)
+                    .sum::<u64>()
+        }
+    }
+
+    /// Manual, deterministic lookup-cost check. Run explicitly in release mode; normal tests
+    /// never include this timing experiment. Sequential and permuted query orders and bytes are
+    /// fixed, and both paths must produce the same checksum before their times are reported.
+    #[test]
+    #[ignore = "manual local SendBuffer lookup-cost check; run in release mode"]
+    fn send_buffer_lookup_cost_small_and_large_retained_sets() {
+        const SEGMENT_BYTES: usize = 64;
+        const TARGET_QUERIES_PER_REPETITION: usize = 32_768;
+        const REPETITIONS: usize = 3;
+
+        for segment_count in [1usize, 2, 88, 1024] {
+            let mut indexed = SendBuffer::new();
+            let mut legacy = LegacySendBuffer::default();
+            let bytes = Bytes::from(vec![0x5a; SEGMENT_BYTES]);
+            for _ in 0..segment_count {
+                indexed.write(bytes.clone());
+                legacy.write(bytes.clone());
+            }
+
+            // Ordered starts model packetization advancing through the stream. The second order
+            // visits every segment once in a fixed permutation and probes different interiors.
+            let sequential_offsets: Vec<u64> = (0..segment_count)
+                .map(|index| (index * SEGMENT_BYTES) as u64)
+                .collect();
+            let permuted_offsets: Vec<u64> = (0..segment_count)
+                .map(|index| {
+                    (((index * 37) % segment_count) * SEGMENT_BYTES + (index % SEGMENT_BYTES))
+                        as u64
+                })
+                .collect();
+            let rounds = TARGET_QUERIES_PER_REPETITION.div_ceil(segment_count);
+
+            for (order, offsets) in [
+                ("sequential", sequential_offsets.as_slice()),
+                ("permuted", permuted_offsets.as_slice()),
+            ] {
+                for &offset in offsets {
+                    assert_eq!(
+                        indexed.get(offset..offset + 1),
+                        legacy.get(offset..offset + 1)
+                    );
+                }
+
+                let mut indexed_times = Vec::with_capacity(REPETITIONS);
+                let mut legacy_times = Vec::with_capacity(REPETITIONS);
+                let mut indexed_checksum = 0u64;
+                let mut legacy_checksum = 0u64;
+
+                for repetition in 0..REPETITIONS {
+                    if repetition % 2 == 0 {
+                        let (elapsed, checksum) = measure_indexed(&indexed, offsets, rounds);
+                        indexed_times.push(elapsed);
+                        indexed_checksum = indexed_checksum.wrapping_add(checksum);
+
+                        let (elapsed, checksum) = measure_legacy(&legacy, offsets, rounds);
+                        legacy_times.push(elapsed);
+                        legacy_checksum = legacy_checksum.wrapping_add(checksum);
+                    } else {
+                        let (elapsed, checksum) = measure_legacy(&legacy, offsets, rounds);
+                        legacy_times.push(elapsed);
+                        legacy_checksum = legacy_checksum.wrapping_add(checksum);
+
+                        let (elapsed, checksum) = measure_indexed(&indexed, offsets, rounds);
+                        indexed_times.push(elapsed);
+                        indexed_checksum = indexed_checksum.wrapping_add(checksum);
+                    }
+                }
+
+                assert_eq!(indexed_checksum, legacy_checksum);
+                indexed_times.sort_unstable();
+                legacy_times.sort_unstable();
+                let indexed_median: Duration = indexed_times[REPETITIONS / 2];
+                let legacy_median: Duration = legacy_times[REPETITIONS / 2];
+                let queries_per_repetition = offsets.len() * rounds;
+                println!(
+                    "segments={segment_count} order={order} queries_per_repetition={queries_per_repetition} timed_queries_per_method={} total_across_both_methods={} indexed_median_of_3={indexed_median:?} legacy_linear_median_of_3={legacy_median:?} ratio={:.2}x checksum={indexed_checksum}",
+                    queries_per_repetition * REPETITIONS,
+                    queries_per_repetition * REPETITIONS * 2,
+                    legacy_median.as_secs_f64() / indexed_median.as_secs_f64()
+                );
+            }
+        }
+    }
+
+    fn measure_indexed(buf: &SendBuffer, offsets: &[u64], rounds: usize) -> (Duration, u64) {
+        let started = Instant::now();
+        let mut checksum = 0u64;
+        for _ in 0..rounds {
+            for &offset in offsets {
+                let offset = std::hint::black_box(offset);
+                checksum = checksum
+                    .wrapping_add(std::hint::black_box(buf.get(offset..offset + 1)[0] as u64));
+            }
+        }
+        (started.elapsed(), checksum)
+    }
+
+    fn measure_legacy(buf: &LegacySendBuffer, offsets: &[u64], rounds: usize) -> (Duration, u64) {
+        let started = Instant::now();
+        let mut checksum = 0u64;
+        for _ in 0..rounds {
+            for &offset in offsets {
+                let offset = std::hint::black_box(offset);
+                checksum = checksum
+                    .wrapping_add(std::hint::black_box(buf.get(offset..offset + 1)[0] as u64));
+            }
+        }
+        (started.elapsed(), checksum)
     }
 }

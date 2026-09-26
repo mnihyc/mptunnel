@@ -6,9 +6,10 @@ use super::{QuicCarrierError, QuicCarrierTelemetry};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_perf_record;
 use crate::protocol::codec::{
-    CodecLimits, decode_frame_bytes, encode_frame_into, encoded_frame_capacity_hint,
+    CodecLimits, STREAM_DATA_PREFIX_LEN, decode_frame_bytes, encode_frame_into,
+    encode_stream_data_prefix, encoded_frame_capacity_hint,
 };
-use crate::protocol::{DatagramFlowId, Frame, IpTunnelId};
+use crate::protocol::{DatagramFlowId, Frame, IpTunnelId, StreamId};
 use bytes::{Bytes, BytesMut};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -628,46 +629,237 @@ async fn write_reliable_frame_bytes(
 ) -> Result<(), QuicCarrierError> {
     #[cfg(feature = "lab-diagnostics")]
     let encode_started = std::time::Instant::now();
-    let mut packet = Vec::new();
-    let capacity_hint = frames.iter().fold(0usize, |total, frame| {
-        total.saturating_add(quic_encoded_frame_capacity_hint(frame))
-    });
-    packet.reserve(capacity_hint);
-    for frame in frames {
-        encode_quic_length_prefixed_frame(frame, limits, &mut packet)?;
-    }
-    let packet_len = packet.len() as u64;
+    let (body, body_len) = prepare_reliable_body(frames, limits)?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.quic.encode_frames",
         encode_started.elapsed(),
-        packet_len as usize,
+        body_len,
     );
     #[cfg(feature = "lab-diagnostics")]
     let write_started = std::time::Instant::now();
+    let packet_len = body_len as u64;
     let pending_before = send.write_backlog.fetch_add(packet_len, Ordering::Relaxed);
     if pending_before == 0 {
         send.telemetry.record_write_activity();
     }
     let _transaction = QuicWriteTransaction::new(send.write_backlog.clone(), packet_len);
-    send.stream.send_data(Bytes::from(packet)).await?;
+    match body {
+        PreparedReliableBody::Contiguous(bytes) => send.stream.send_data(bytes).await?,
+        PreparedReliableBody::Segmented(chunks) => send.stream.send_data_chunks(chunks).await?,
+    }
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.quic.write_frames_wait",
         write_started.elapsed(),
-        packet_len as usize,
+        body_len,
     );
     Ok(())
 }
 
-pub(super) fn quic_encoded_frame_capacity_hint(frame: &Frame) -> usize {
-    match frame {
-        Frame::StreamData { payload, .. } if payload.len() > QUIC_STREAM_RECORD_PAYLOAD_BYTES => {
-            let chunks = payload.len().div_ceil(QUIC_STREAM_RECORD_PAYLOAD_BYTES);
-            encoded_frame_capacity_hint(frame)
-                .saturating_add(chunks.saturating_mul(FRAME_LEN_BYTES + 32))
+enum PreparedReliableBody {
+    Contiguous(Bytes),
+    Segmented(VecDeque<Bytes>),
+}
+
+/// Preflight all records and prepare an owned H3 body without copying
+/// StreamData payload bytes into a contiguous packet allocation.
+fn prepare_reliable_body(
+    frames: &[Frame],
+    limits: CodecLimits,
+) -> Result<(PreparedReliableBody, usize), QuicCarrierError> {
+    if !frames
+        .iter()
+        .any(|frame| matches!(frame, Frame::StreamData { .. }))
+    {
+        // Control-only and empty batches keep their established contiguous
+        // encoder and H3 send_data path; scatter bookkeeping has no payload
+        // copy to remove for these batches.
+        let capacity_hint = frames.iter().fold(0usize, |total, frame| {
+            total
+                .saturating_add(FRAME_LEN_BYTES)
+                .saturating_add(encoded_frame_capacity_hint(frame))
+        });
+        let mut packet = Vec::with_capacity(capacity_hint);
+        for frame in frames {
+            encode_quic_length_prefixed_frame(frame, limits, &mut packet)?;
         }
-        _ => FRAME_LEN_BYTES.saturating_add(encoded_frame_capacity_hint(frame)),
+        let body_len = packet.len();
+        return Ok((
+            PreparedReliableBody::Contiguous(Bytes::from(packet)),
+            body_len,
+        ));
+    }
+
+    let (metadata_capacity, chunk_count) = prepared_body_capacities(frames)?;
+    let chunk_capacity = chunk_count
+        .checked_add(1)
+        .ok_or(QuicCarrierError::FrameTooLarge)?;
+    let mut metadata = BytesMut::with_capacity(metadata_capacity);
+    let mut chunks = VecDeque::with_capacity(chunk_capacity);
+    let mut fallback = Vec::new();
+    let mut body_len = 0usize;
+    let mut frame_index = 0usize;
+
+    while frame_index < frames.len() {
+        if let Frame::StreamData {
+            stream_id,
+            offset,
+            payload,
+        } = &frames[frame_index]
+        {
+            append_stream_data_chunks(
+                *stream_id,
+                *offset,
+                payload,
+                limits,
+                &mut metadata,
+                &mut chunks,
+                &mut body_len,
+            )?;
+            frame_index += 1;
+            continue;
+        }
+
+        // Keep every non-StreamData variant on the existing canonical encoder
+        // path, coalescing each consecutive run into its former contiguous
+        // representation. The whole batch is prepared before H3.
+        let run_start = frame_index;
+        while frame_index < frames.len()
+            && !matches!(&frames[frame_index], Frame::StreamData { .. })
+        {
+            frame_index += 1;
+        }
+        let fallback_capacity =
+            frames[run_start..frame_index]
+                .iter()
+                .fold(0usize, |capacity, frame| {
+                    capacity
+                        .saturating_add(FRAME_LEN_BYTES)
+                        .saturating_add(encoded_frame_capacity_hint(frame))
+                });
+        fallback.reserve(fallback_capacity);
+        for frame in &frames[run_start..frame_index] {
+            let before = fallback.len();
+            encode_quic_length_prefixed_frame(frame, limits, &mut fallback)?;
+            body_len = body_len
+                .checked_add(fallback.len() - before)
+                .ok_or(QuicCarrierError::FrameTooLarge)?;
+        }
+        flush_fallback(&mut fallback, &mut chunks);
+    }
+
+    Ok((PreparedReliableBody::Segmented(chunks), body_len))
+}
+
+/// Count exact scatter metadata and descriptor slots before constructing the
+/// body. Each StreamData record has one metadata segment and, when nonempty,
+/// one source-payload segment. Consecutive fallback frames share one segment.
+fn prepared_body_capacities(frames: &[Frame]) -> Result<(usize, usize), QuicCarrierError> {
+    let metadata_bytes_per_record = FRAME_LEN_BYTES
+        .checked_add(STREAM_DATA_PREFIX_LEN)
+        .ok_or(QuicCarrierError::FrameTooLarge)?;
+    let mut metadata_capacity = 0usize;
+    let mut chunk_count = 0usize;
+    let mut frame_index = 0usize;
+
+    while frame_index < frames.len() {
+        if let Frame::StreamData { payload, .. } = &frames[frame_index] {
+            let payload_len = payload.len();
+            let has_partial_record = payload_len % QUIC_STREAM_RECORD_PAYLOAD_BYTES != 0;
+            let records = (payload_len / QUIC_STREAM_RECORD_PAYLOAD_BYTES)
+                .checked_add(if has_partial_record { 1 } else { 0 })
+                .ok_or(QuicCarrierError::FrameTooLarge)?
+                .max(1);
+            metadata_capacity = metadata_capacity
+                .checked_add(
+                    records
+                        .checked_mul(metadata_bytes_per_record)
+                        .ok_or(QuicCarrierError::FrameTooLarge)?,
+                )
+                .ok_or(QuicCarrierError::FrameTooLarge)?;
+            let descriptors_per_record = if payload_len == 0 { 1 } else { 2 };
+            chunk_count = chunk_count
+                .checked_add(
+                    records
+                        .checked_mul(descriptors_per_record)
+                        .ok_or(QuicCarrierError::FrameTooLarge)?,
+                )
+                .ok_or(QuicCarrierError::FrameTooLarge)?;
+            frame_index += 1;
+            continue;
+        }
+
+        // Any nonempty contiguous run of canonical fallback records produces
+        // one coalesced Bytes descriptor and no scatter metadata.
+        chunk_count = chunk_count
+            .checked_add(1)
+            .ok_or(QuicCarrierError::FrameTooLarge)?;
+        while frame_index < frames.len()
+            && !matches!(&frames[frame_index], Frame::StreamData { .. })
+        {
+            frame_index += 1;
+        }
+    }
+
+    Ok((metadata_capacity, chunk_count))
+}
+
+fn flush_fallback(fallback: &mut Vec<u8>, chunks: &mut VecDeque<Bytes>) {
+    if !fallback.is_empty() {
+        chunks.push_back(Bytes::from(std::mem::take(fallback)));
+    }
+}
+
+fn append_stream_data_chunks(
+    stream_id: StreamId,
+    offset: u64,
+    payload: &Bytes,
+    limits: CodecLimits,
+    metadata: &mut BytesMut,
+    chunks: &mut VecDeque<Bytes>,
+    body_len: &mut usize,
+) -> Result<(), QuicCarrierError> {
+    let mut cursor = 0usize;
+    loop {
+        let end = if payload.is_empty() {
+            0
+        } else {
+            cursor
+                .saturating_add(QUIC_STREAM_RECORD_PAYLOAD_BYTES)
+                .min(payload.len())
+        };
+        let payload_len = end - cursor;
+        // Match the established QUIC record splitter exactly, including its
+        // saturating offset update followed by codec extent validation.
+        let record_offset = offset.saturating_add(cursor as u64);
+        let prefix = encode_stream_data_prefix(stream_id, record_offset, payload_len, limits)?;
+        debug_assert_eq!(prefix.len(), STREAM_DATA_PREFIX_LEN);
+
+        let frame_len = prefix
+            .len()
+            .checked_add(payload_len)
+            .ok_or(QuicCarrierError::FrameTooLarge)?;
+        let record_len = u32::try_from(frame_len).map_err(|_| QuicCarrierError::FrameTooLarge)?;
+        let record_wire_len = FRAME_LEN_BYTES
+            .checked_add(frame_len)
+            .ok_or(QuicCarrierError::FrameTooLarge)?;
+        *body_len = body_len
+            .checked_add(record_wire_len)
+            .ok_or(QuicCarrierError::FrameTooLarge)?;
+
+        metadata.extend_from_slice(&record_len.to_be_bytes());
+        metadata.extend_from_slice(&prefix);
+        debug_assert_eq!(metadata.len(), FRAME_LEN_BYTES + prefix.len());
+        chunks.push_back(metadata.split_to(FRAME_LEN_BYTES + prefix.len()).freeze());
+        if payload_len > 0 {
+            chunks.push_back(payload.slice(cursor..end));
+        }
+
+        if payload.is_empty() || end == payload.len() {
+            return Ok(());
+        }
+        cursor = end;
     }
 }
 

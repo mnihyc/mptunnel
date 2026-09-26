@@ -766,6 +766,66 @@ fn stream_data_encoder_rejects_offset_extent_overflow() {
 }
 
 #[test]
+fn stream_data_prefix_matches_the_contiguous_codec() {
+    for payload_len in [0, 1, 11_999, 12_000] {
+        let payload = Bytes::from(vec![0x5a; payload_len]);
+        let frame = Frame::StreamData {
+            stream_id: StreamId(0x0102_0304_0506_0708),
+            offset: 0x1112_1314_1516_1718,
+            payload: payload.clone(),
+        };
+        let wire = encode_frame(&frame, CodecLimits::default()).expect("encode StreamData");
+        let prefix = crate::protocol::codec::encode_stream_data_prefix(
+            StreamId(0x0102_0304_0506_0708),
+            0x1112_1314_1516_1718,
+            payload_len,
+            CodecLimits::default(),
+        )
+        .expect("encode scatter prefix");
+
+        assert_eq!(&wire[..prefix.len()], &prefix);
+        assert_eq!(&wire[prefix.len()..], payload.as_ref());
+    }
+}
+
+#[test]
+fn stream_data_prefix_reuses_codec_limits_and_extent_validation() {
+    let limits = CodecLimits {
+        max_payload_bytes: 2,
+        ..CodecLimits::default()
+    };
+    assert_eq!(
+        crate::protocol::codec::encode_stream_data_prefix(StreamId(1), 0, 3, limits),
+        Err(CodecError::PayloadTooLarge {
+            actual: 3,
+            limit: 2,
+        })
+    );
+
+    assert_eq!(
+        crate::protocol::codec::encode_stream_data_prefix(
+            StreamId(1),
+            u64::MAX,
+            1,
+            CodecLimits::default(),
+        ),
+        Err(CodecError::LengthOverflow)
+    );
+
+    let limits = CodecLimits {
+        max_frame_bytes: FRAME_HEADER_LEN + 8 + 8 + 4,
+        ..CodecLimits::default()
+    };
+    assert_eq!(
+        crate::protocol::codec::encode_stream_data_prefix(StreamId(1), 0, 1, limits),
+        Err(CodecError::FrameTooLarge {
+            actual: FRAME_HEADER_LEN + 8 + 8 + 4 + 1,
+            limit: FRAME_HEADER_LEN + 8 + 8 + 4,
+        })
+    );
+}
+
+#[test]
 fn stream_data_decoder_rejects_offset_extent_overflow() {
     let mut encoded = encode_frame(
         &Frame::StreamData {

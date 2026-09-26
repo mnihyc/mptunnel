@@ -640,6 +640,316 @@ fn quic_writer_splits_large_stream_data_below_product_scheduler() {
     }
 }
 
+fn flatten_owned_body(chunks: &VecDeque<Bytes>) -> Vec<u8> {
+    chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect()
+}
+
+fn flatten_prepared_body(body: &PreparedReliableBody) -> Vec<u8> {
+    match body {
+        PreparedReliableBody::Contiguous(bytes) => bytes.to_vec(),
+        PreparedReliableBody::Segmented(chunks) => flatten_owned_body(chunks),
+    }
+}
+
+fn encode_legacy_batch(frames: &[Frame], limits: CodecLimits) -> Result<Vec<u8>, QuicCarrierError> {
+    let capacity_hint = frames.iter().fold(0usize, |total, frame| {
+        total.saturating_add(legacy_quic_encoded_frame_capacity_hint(frame))
+    });
+    let mut packet = Vec::with_capacity(capacity_hint);
+    for frame in frames {
+        encode_quic_length_prefixed_frame(frame, limits, &mut packet)?;
+    }
+    Ok(packet)
+}
+
+fn legacy_quic_encoded_frame_capacity_hint(frame: &Frame) -> usize {
+    match frame {
+        Frame::StreamData { payload, .. } if payload.len() > QUIC_STREAM_RECORD_PAYLOAD_BYTES => {
+            let records = payload.len().div_ceil(QUIC_STREAM_RECORD_PAYLOAD_BYTES);
+            encoded_frame_capacity_hint(frame)
+                .saturating_add(records.saturating_mul(FRAME_LEN_BYTES + 32))
+        }
+        _ => FRAME_LEN_BYTES.saturating_add(encoded_frame_capacity_hint(frame)),
+    }
+}
+
+#[test]
+fn scatter_quic_records_match_contiguous_wire_and_share_payload_slices() {
+    let limits = CodecLimits::default();
+    for payload_len in [0usize, 1, 11_999, 12_000, 12_001, 24_017] {
+        let payload = Bytes::from(
+            (0..payload_len)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let frames = [Frame::StreamData {
+            stream_id: StreamId(9),
+            offset: 123,
+            payload: payload.clone(),
+        }];
+        let expected = encode_legacy_batch(&frames, limits).expect("legacy encoding");
+        let (body, body_len) = prepare_reliable_body(&frames, limits).expect("scatter encoding");
+        let PreparedReliableBody::Segmented(chunks) = &body else {
+            panic!("StreamData batches use the segmented body");
+        };
+
+        assert_eq!(body_len, expected.len());
+        assert_eq!(flatten_prepared_body(&body), expected);
+
+        let record_count = payload_len
+            .max(1)
+            .div_ceil(QUIC_STREAM_RECORD_PAYLOAD_BYTES);
+        assert_eq!(
+            chunks.len(),
+            record_count * if payload_len == 0 { 1 } else { 2 }
+        );
+        assert!(chunks.capacity() > chunks.len());
+        if payload_len > 0 {
+            let mut source_offset = 0usize;
+            let mut prior_metadata_end = None;
+            for record in 0..record_count {
+                let metadata = &chunks[record * 2];
+                let body = &chunks[record * 2 + 1];
+                let expected_payload_len =
+                    (payload_len - source_offset).min(QUIC_STREAM_RECORD_PAYLOAD_BYTES);
+                assert_eq!(metadata.len(), FRAME_LEN_BYTES + STREAM_DATA_PREFIX_LEN);
+                if let Some(prior_end) = prior_metadata_end {
+                    assert_eq!(
+                        prior_end,
+                        metadata.as_ptr(),
+                        "MPP record headers should occupy adjacent ranges in one arena"
+                    );
+                }
+                prior_metadata_end = Some(metadata.as_ptr().wrapping_add(metadata.len()));
+                assert_eq!(body.len(), expected_payload_len);
+                assert_eq!(
+                    body.as_ptr(),
+                    payload.as_ptr().wrapping_add(source_offset),
+                    "split body must refer to the source Bytes"
+                );
+                source_offset += expected_payload_len;
+            }
+            assert_eq!(source_offset, payload_len);
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual release-mode encoding cost check; root runs after ordinary musl build"]
+fn scatter_encoder_release_cost_check_vs_contiguous() {
+    use std::time::Instant;
+
+    fn elapsed_for(
+        frames: &[Frame],
+        limits: CodecLimits,
+        iterations: usize,
+        scatter: bool,
+    ) -> std::time::Duration {
+        let mut total_output_bytes = 0usize;
+        let started = Instant::now();
+        if scatter {
+            for _ in 0..iterations {
+                let (body, body_len) = std::hint::black_box(prepare_reliable_body(
+                    std::hint::black_box(frames),
+                    limits,
+                ))
+                .expect("scatter encoding");
+                total_output_bytes = total_output_bytes.wrapping_add(body_len);
+                drop(std::hint::black_box(body));
+            }
+        } else {
+            for _ in 0..iterations {
+                let packet =
+                    std::hint::black_box(encode_legacy_batch(std::hint::black_box(frames), limits))
+                        .expect("contiguous encoding");
+                total_output_bytes = total_output_bytes.wrapping_add(packet.len());
+                drop(std::hint::black_box(packet));
+            }
+        }
+        std::hint::black_box(total_output_bytes);
+        started.elapsed()
+    }
+
+    let limits = CodecLimits::default();
+    for (payload_len, repetition_iterations) in [
+        (1usize, [2731usize, 2731, 2730]),
+        (12_000, [1366, 1365, 1365]),
+        (64 * 1024, [342, 341, 341]),
+        (512 * 1024, [43, 43, 42]),
+    ] {
+        let payload = Bytes::from(vec![0x5a; payload_len]);
+        let frames = [Frame::StreamData {
+            stream_id: StreamId(9),
+            offset: 123,
+            payload,
+        }];
+        let expected = encode_legacy_batch(&frames, limits).expect("contiguous oracle");
+        let (candidate, candidate_len) =
+            prepare_reliable_body(&frames, limits).expect("scatter oracle");
+        assert_eq!(candidate_len, expected.len());
+        assert_eq!(flatten_prepared_body(&candidate), expected);
+        drop(candidate);
+
+        for (repetition, iterations) in repetition_iterations.into_iter().enumerate() {
+            let (contiguous, scatter) = if repetition % 2 == 0 {
+                (
+                    elapsed_for(&frames, limits, iterations, false),
+                    elapsed_for(&frames, limits, iterations, true),
+                )
+            } else {
+                let scatter = elapsed_for(&frames, limits, iterations, true);
+                let contiguous = elapsed_for(&frames, limits, iterations, false);
+                (contiguous, scatter)
+            };
+            println!(
+                "payload_bytes={payload_len} iterations_this_rep={iterations} total_iterations_per_method={} repetition={repetition} contiguous_ns_per_call={} scatter_ns_per_call={}",
+                repetition_iterations.iter().sum::<usize>(),
+                contiguous.as_nanos() / iterations as u128,
+                scatter.as_nanos() / iterations as u128,
+            );
+        }
+    }
+}
+
+#[test]
+fn scatter_quic_batch_preserves_mixed_frame_order_and_empty_body_semantics() {
+    let limits = CodecLimits::default();
+    let frames = [
+        Frame::StreamData {
+            stream_id: StreamId(3),
+            offset: 7,
+            payload: Bytes::from_static(b"prefix"),
+        },
+        Frame::Ping { nonce: 0x1122 },
+        Frame::StreamData {
+            stream_id: StreamId(3),
+            offset: 13,
+            payload: Bytes::from(vec![0x6b; QUIC_STREAM_RECORD_PAYLOAD_BYTES + 1]),
+        },
+    ];
+    let expected = encode_legacy_batch(&frames, limits).expect("legacy mixed encoding");
+    let (body, body_len) = prepare_reliable_body(&frames, limits).expect("scatter mixed encoding");
+    assert!(matches!(&body, PreparedReliableBody::Segmented(_)));
+    assert_eq!(body_len, expected.len());
+    assert_eq!(flatten_prepared_body(&body), expected);
+
+    let (empty_body, empty_len) = prepare_reliable_body(&[], limits).expect("empty batch");
+    assert!(matches!(&empty_body, PreparedReliableBody::Contiguous(bytes) if bytes.is_empty()));
+    assert_eq!(empty_len, 0);
+
+    let controls = [Frame::Ping { nonce: 0x7788 }];
+    let expected = encode_legacy_batch(&controls, limits).expect("control fallback");
+    let (control_body, control_len) =
+        prepare_reliable_body(&controls, limits).expect("control-only batch");
+    assert!(matches!(&control_body, PreparedReliableBody::Contiguous(_)));
+    assert_eq!(control_len, expected.len());
+    assert_eq!(flatten_prepared_body(&control_body), expected);
+
+    let empty_data = [Frame::StreamData {
+        stream_id: StreamId(4),
+        offset: 0,
+        payload: Bytes::new(),
+    }];
+    let expected = encode_legacy_batch(&empty_data, limits).expect("empty StreamData record");
+    let (body, body_len) = prepare_reliable_body(&empty_data, limits).expect("empty StreamData");
+    let PreparedReliableBody::Segmented(chunks) = &body else {
+        panic!("empty StreamData uses the segmented body");
+    };
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].len(), FRAME_LEN_BYTES + STREAM_DATA_PREFIX_LEN);
+    assert_eq!(body_len, expected.len());
+    assert_eq!(flatten_prepared_body(&body), expected);
+}
+
+#[test]
+fn scatter_quic_preflight_matches_split_limits_and_offset_overflow() {
+    let payload = Bytes::from(vec![0x4d; QUIC_STREAM_RECORD_PAYLOAD_BYTES + 1]);
+    // The original payload is larger than max_frame_bytes, but the old QUIC
+    // record writer splits it into records that each fit this limit.
+    let limits = CodecLimits {
+        max_payload_bytes: QUIC_STREAM_RECORD_PAYLOAD_BYTES,
+        max_frame_bytes: STREAM_DATA_PREFIX_LEN + QUIC_STREAM_RECORD_PAYLOAD_BYTES,
+        ..CodecLimits::default()
+    };
+    let frames = [Frame::StreamData {
+        stream_id: StreamId(5),
+        offset: 0,
+        payload: payload.clone(),
+    }];
+    let expected = encode_legacy_batch(&frames, limits).expect("split frames fit limits");
+    let (body, body_len) = prepare_reliable_body(&frames, limits).expect("split limits accepted");
+    assert_eq!(body_len, expected.len());
+    assert_eq!(flatten_prepared_body(&body), expected);
+
+    let exact_extent = [Frame::StreamData {
+        stream_id: StreamId(5),
+        offset: u64::MAX - QUIC_STREAM_RECORD_PAYLOAD_BYTES as u64,
+        payload: payload.slice(..QUIC_STREAM_RECORD_PAYLOAD_BYTES),
+    }];
+    let expected = encode_legacy_batch(&exact_extent, CodecLimits::default())
+        .expect("extent ending exactly at u64 max");
+    let (body, body_len) = prepare_reliable_body(&exact_extent, CodecLimits::default())
+        .expect("exact u64 extent accepted");
+    assert_eq!(body_len, expected.len());
+    assert_eq!(flatten_prepared_body(&body), expected);
+
+    let crossing = [Frame::StreamData {
+        stream_id: StreamId(5),
+        offset: u64::MAX - QUIC_STREAM_RECORD_PAYLOAD_BYTES as u64,
+        payload,
+    }];
+    let mut old_packet = Vec::new();
+    let old_result =
+        encode_quic_length_prefixed_frame(&crossing[0], CodecLimits::default(), &mut old_packet);
+    let new_result = prepare_reliable_body(&crossing, CodecLimits::default());
+    assert!(matches!(
+        old_result,
+        Err(QuicCarrierError::Codec(
+            crate::protocol::codec::CodecError::LengthOverflow
+        ))
+    ));
+    assert!(matches!(
+        new_result,
+        Err(QuicCarrierError::Codec(
+            crate::protocol::codec::CodecError::LengthOverflow
+        ))
+    ));
+}
+
+#[test]
+fn scatter_quic_later_invalid_frame_fails_before_returning_a_body() {
+    let frames = [
+        Frame::Ping { nonce: 1 },
+        Frame::StreamData {
+            stream_id: StreamId(6),
+            offset: 0,
+            payload: Bytes::from(vec![0x2a; QUIC_STREAM_RECORD_PAYLOAD_BYTES + 1]),
+        },
+    ];
+    let limits = CodecLimits {
+        max_payload_bytes: QUIC_STREAM_RECORD_PAYLOAD_BYTES - 1,
+        ..CodecLimits::default()
+    };
+
+    let old_result = encode_legacy_batch(&frames, limits);
+    let new_result = prepare_reliable_body(&frames, limits);
+    assert!(matches!(
+        old_result,
+        Err(QuicCarrierError::Codec(
+            crate::protocol::codec::CodecError::PayloadTooLarge { .. }
+        ))
+    ));
+    assert!(matches!(
+        new_result,
+        Err(QuicCarrierError::Codec(
+            crate::protocol::codec::CodecError::PayloadTooLarge { .. }
+        ))
+    ));
+}
+
 fn encoded_h3_records(frames: &[Frame], limits: CodecLimits) -> Bytes {
     let mut packet = Vec::new();
     for frame in frames {

@@ -9,6 +9,7 @@ use super::{QuicCandidateSelector, QuicCandidateVerifier, QuicCarrierError};
 use bytes::{Buf, Bytes};
 use h3::ConnectionState;
 use http::{HeaderValue, Method, Request, Response, StatusCode};
+use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -354,6 +355,20 @@ impl H3SendStream {
         match operation.half_mut() {
             H3SendHalf::Client(stream) => stream.send_data(data).await?,
             H3SendHalf::Server(stream) => stream.send_data(data).await?,
+        }
+        operation.complete();
+        Ok(())
+    }
+
+    pub(super) async fn send_data_chunks(
+        &mut self,
+        chunks: VecDeque<Bytes>,
+    ) -> Result<(), QuicCarrierError> {
+        self.ensure_success_response().await?;
+        let mut operation = H3SendOperation::begin(self)?;
+        match operation.half_mut() {
+            H3SendHalf::Client(stream) => stream.send_data_chunks(chunks).await?,
+            H3SendHalf::Server(stream) => stream.send_data_chunks(chunks).await?,
         }
         operation.complete();
         Ok(())

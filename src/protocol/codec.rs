@@ -15,6 +15,8 @@ const MAGIC: &[u8; 4] = b"MPTF";
 const VERSION: u8 = 16;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
+const STREAM_DATA_FIXED_PAYLOAD_LEN: usize = 8 + 8 + 4;
+pub(crate) const STREAM_DATA_PREFIX_LEN: usize = FRAME_HEADER_LEN + STREAM_DATA_FIXED_PAYLOAD_LEN;
 const PATH_METRICS_ENCODED_LEN: usize = 117;
 const PEER_PATH_STATUS_ENCODED_LEN: usize = 2 + PATH_METRICS_ENCODED_LEN + 25;
 const PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN: usize = 11;
@@ -117,6 +119,47 @@ pub fn encode_frame_into(
     out[frame_start + 5] = kind as u8;
     out[frame_start + 6..frame_start + 10].copy_from_slice(&(payload_len as u32).to_be_bytes());
     Ok(())
+}
+
+/// Encode the MPP header and fixed fields for one StreamData payload segment.
+///
+/// The returned prefix omits the payload bytes. This is shared by the ordinary
+/// codec and the QUIC scatter encoder so both paths apply the same payload,
+/// offset-extent, and frame-size checks before encoding the header.
+pub(crate) fn encode_stream_data_prefix(
+    stream_id: StreamId,
+    offset: u64,
+    payload_len: usize,
+    limits: CodecLimits,
+) -> Result<[u8; STREAM_DATA_PREFIX_LEN], CodecError> {
+    encode_payload_bytes_len(payload_len, limits)?;
+    validate_stream_data_extent(offset, payload_len)?;
+
+    let wire_payload_len = u32::try_from(payload_len).map_err(|_| CodecError::LengthOverflow)?;
+    let encoded_payload_len = STREAM_DATA_FIXED_PAYLOAD_LEN
+        .checked_add(payload_len)
+        .ok_or(CodecError::LengthOverflow)?;
+    let encoded_payload_len =
+        u32::try_from(encoded_payload_len).map_err(|_| CodecError::LengthOverflow)?;
+    let encoded_frame_len = FRAME_HEADER_LEN
+        .checked_add(encoded_payload_len as usize)
+        .ok_or(CodecError::LengthOverflow)?;
+    if encoded_frame_len > limits.max_frame_bytes {
+        return Err(CodecError::FrameTooLarge {
+            actual: encoded_frame_len,
+            limit: limits.max_frame_bytes,
+        });
+    }
+
+    let mut prefix = [0; STREAM_DATA_PREFIX_LEN];
+    prefix[..4].copy_from_slice(MAGIC);
+    prefix[4] = VERSION;
+    prefix[5] = FrameKind::StreamData as u8;
+    prefix[6..FRAME_HEADER_LEN].copy_from_slice(&encoded_payload_len.to_be_bytes());
+    prefix[FRAME_HEADER_LEN..FRAME_HEADER_LEN + 8].copy_from_slice(&stream_id.0.to_be_bytes());
+    prefix[FRAME_HEADER_LEN + 8..FRAME_HEADER_LEN + 16].copy_from_slice(&offset.to_be_bytes());
+    prefix[FRAME_HEADER_LEN + 16..].copy_from_slice(&wire_payload_len.to_be_bytes());
+    Ok(prefix)
 }
 
 pub fn encoded_frame_capacity_hint(frame: &Frame) -> usize {
@@ -395,11 +438,8 @@ fn encode_payload(
             offset,
             payload,
         } => {
-            encode_payload_bytes_len(payload.len(), limits)?;
-            validate_stream_data_extent(*offset, payload.len())?;
-            put_u64(out, stream_id.0);
-            put_u64(out, *offset);
-            put_u32(out, payload.len() as u32);
+            let prefix = encode_stream_data_prefix(*stream_id, *offset, payload.len(), limits)?;
+            out.extend_from_slice(&prefix[FRAME_HEADER_LEN..]);
             out.extend_from_slice(payload);
             Ok(FrameKind::StreamData)
         }

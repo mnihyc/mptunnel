@@ -46,6 +46,7 @@ pub(crate) struct ResponsePathObservation {
 /// This includes live OriginalData and ranges acknowledged above a lower hole.
 /// The attachment incarnation prevents a replacement carrier with the same
 /// wire PathId from inheriting the old range's ordering credit.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CarrierPathFlightDebt {
     pub(crate) key: CarrierPathKey,
@@ -57,6 +58,7 @@ pub(crate) struct CarrierPathFlightDebt {
 ///
 /// This bounds receive-side reordering; it is not a congestion window and does
 /// not replace either carrier's native bytes-in-flight accounting.
+#[cfg(test)]
 pub(crate) fn response_ordering_debt_bytes(
     lower_flights: &[CarrierPathFlightDebt],
     candidate_key: CarrierPathKey,
@@ -75,6 +77,7 @@ pub(crate) fn response_ordering_debt_bytes(
 ///
 /// The ledger is ordered by data sequence number, so this is the path whose
 /// native delivery currently gates contiguous product progress.
+#[cfg(test)]
 pub(crate) fn response_oldest_lower_flight_owner(
     lower_flights: &[CarrierPathFlightDebt],
 ) -> Option<(CarrierPathKey, u64)> {

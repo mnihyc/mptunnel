@@ -9,6 +9,7 @@ use super::*;
 use crate::model::carrier_rate_authority::CarrierRateAuthorityBasis;
 use crate::model::path::PathPolicy;
 use crate::model::product_qualification::ProductQualificationLedger;
+use crate::model::response::{response_oldest_lower_flight_owner, response_ordering_debt_bytes};
 use crate::model::timing::ReliableDataAckGapTiming;
 use crate::model::work::CarrierWorkKind;
 use crate::protocol::{ConfiguredMemberSlot, OffsetRange, PathId, UnderlayProtocol};
@@ -1835,6 +1836,421 @@ fn lower_path_debt_merges_unacknowledged_and_out_of_order_acked_ranges() {
     assert_eq!(debt[0].bytes, 4096);
     assert_eq!(debt[1].key, second);
     assert_eq!(debt[1].bytes, 4096);
+}
+
+#[test]
+fn lower_debt_projection_matches_ordered_reference_for_owner_and_targets() {
+    let (binding, first, _first_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let second = key(UnderlayProtocol::Udp, 7);
+    let third = key(UnderlayProtocol::Tcp, 9);
+    let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        second.underlay,
+        second.path_id,
+        second_commands,
+        TrafficClass::Throughput,
+    );
+    let (third_commands, _third_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        third.underlay,
+        third.path_id,
+        third_commands,
+        TrafficClass::Throughput,
+    );
+
+    let targets = binding.sender_path_targets(TrafficClass::Throughput, 4096);
+    let target_id = |key| {
+        targets
+            .iter()
+            .find(|target| target.observation.key == key)
+            .map(|target| (target.observation.key, target.observation.incarnation))
+            .expect("attached test target")
+    };
+    let (first, first_incarnation) = target_id(first);
+    let (second, second_incarnation) = target_id(second);
+    let (third, third_incarnation) = target_id(third);
+
+    let empty = binding.project_lower_debt_before_offset(32, targets.clone());
+    assert_eq!(empty.oldest_owner(), None);
+    assert!(!empty.has_materialized_target_debts());
+    assert_eq!(empty.exact_other_path_debt_bytes(0), Some(0));
+    assert_eq!(
+        empty.exact_other_path_debt_bytes(targets.len()),
+        None,
+        "an empty all-zero proof still rejects an out-of-range target",
+    );
+
+    let mut first_original = flight(first, 1, 11, CarrierWorkKind::OriginalData);
+    first_original.output_incarnation = first_incarnation;
+    let mut latest_original = flight(second, 1, 0, CarrierWorkKind::OriginalData);
+    latest_original.output_incarnation = second_incarnation;
+    let mut trailing_reinjection = flight(first, 1, 99, CarrierWorkKind::ReinjectedData);
+    trailing_reinjection.output_incarnation = first_incarnation;
+    let mut same_key_replacement = flight(first, 10, 5, CarrierWorkKind::OriginalData);
+    same_key_replacement.output_incarnation = first_incarnation.wrapping_add(100);
+    let mut tied_flight = flight(first, 11, 7, CarrierWorkKind::OriginalData);
+    tied_flight.output_incarnation = first_incarnation;
+    let mut reinjection_only = flight(third, 17, 17, CarrierWorkKind::ReinjectedData);
+    reinjection_only.output_incarnation = third_incarnation;
+    binding.flights.lock().expect("test flights").extend([
+        (
+            0,
+            vec![first_original, latest_original, trailing_reinjection],
+        ),
+        (8, vec![same_key_replacement]),
+        (10, vec![tied_flight]),
+        (16, vec![reinjection_only]),
+    ]);
+
+    let tied_ack = CarrierPathAckedHole {
+        key: third,
+        output_incarnation: third_incarnation,
+        end: 11,
+        bytes: 2,
+        sent_at: Instant::now(),
+        kind: CarrierWorkKind::OriginalData,
+        path_proving: true,
+    };
+    let latest_ack_original = CarrierPathAckedHole {
+        key: second,
+        output_incarnation: second_incarnation,
+        end: 13,
+        bytes: 4,
+        sent_at: Instant::now(),
+        kind: CarrierWorkKind::OriginalData,
+        path_proving: true,
+    };
+    let trailing_ack_reinjection = CarrierPathAckedHole {
+        key: first,
+        output_incarnation: first_incarnation,
+        end: 13,
+        bytes: 100,
+        sent_at: Instant::now(),
+        kind: CarrierWorkKind::ReinjectedData,
+        path_proving: false,
+    };
+    let excluded_at_boundary = CarrierPathAckedHole {
+        key: third,
+        output_incarnation: third_incarnation,
+        end: 33,
+        bytes: 33,
+        sent_at: Instant::now(),
+        kind: CarrierWorkKind::OriginalData,
+        path_proving: true,
+    };
+    binding
+        .ack_ordering
+        .lock()
+        .expect("test ACK ordering")
+        .acked_holes
+        .extend([
+            (10, vec![tied_ack]),
+            (
+                12,
+                vec![
+                    latest_ack_original,
+                    trailing_ack_reinjection,
+                    CarrierPathAckedHole {
+                        key: third,
+                        output_incarnation: third_incarnation,
+                        end: 13,
+                        bytes: 8,
+                        sent_at: Instant::now(),
+                        kind: CarrierWorkKind::OriginalData,
+                        path_proving: true,
+                    },
+                ],
+            ),
+            (32, vec![excluded_at_boundary]),
+        ]);
+
+    for offset in [0, 1, 8, 9, 10, 11, 12, 13, 32, 33] {
+        let reference = binding.lower_flights_before_offset(offset);
+        let projection = binding.project_lower_debt_before_offset(offset, targets.clone());
+        assert_eq!(
+            projection.oldest_owner(),
+            response_oldest_lower_flight_owner(&reference),
+            "oldest owner at strict offset {offset}",
+        );
+        for (target_index, target) in projection.targets().iter().enumerate() {
+            assert_eq!(
+                projection
+                    .exact_other_path_debt_bytes(target_index)
+                    .unwrap(),
+                response_ordering_debt_bytes(
+                    &reference,
+                    target.observation.key,
+                    target.observation.incarnation,
+                ),
+                "exact excluded sum at strict offset {offset} for {:?}",
+                target.observation.key,
+            );
+        }
+        assert_eq!(projection.targets().len(), targets.len());
+        assert_eq!(
+            projection.exact_other_path_debt_bytes(targets.len()),
+            None,
+            "out-of-range target index fails closed at strict offset {offset}",
+        );
+    }
+
+    let reference = binding.lower_flights_before_offset(32);
+    assert_eq!(reference.len(), 4, "reinjection-only start was omitted");
+    assert_eq!(reference[0].key, second);
+    assert_eq!(reference[0].bytes, 0, "zero-byte oldest owner is retained");
+    assert_eq!(reference[1].key, first);
+    assert_eq!(
+        reference[1].output_incarnation,
+        first_incarnation.wrapping_add(100)
+    );
+    assert_eq!(
+        (reference[1].bytes, reference[2].key, reference[2].bytes),
+        (5, third, 2)
+    );
+    assert_eq!((reference[3].key, reference[3].bytes), (third, 8));
+}
+
+/// Offline release-musl fixture for the whole debt query plus its exact
+/// per-target consumption. Run alone with `--ignored --test-threads=1`; input
+/// construction and the matching target snapshots are outside both timers.
+#[test]
+#[ignore = "manual counterbalanced release-musl response-debt cost fixture"]
+fn response_debt_projection_release_cost_fixture() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn fixture_binding(
+        target_count: usize,
+        range_count: usize,
+    ) -> (
+        std::sync::Arc<ResponseStreamBinding>,
+        Vec<super::super::ResponseSenderPathTarget>,
+        u64,
+    ) {
+        let (binding, _first, first_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let mut _receivers = vec![first_receivers];
+        for index in 1..target_count {
+            let underlay = if index % 2 == 0 {
+                UnderlayProtocol::Tcp
+            } else {
+                UnderlayProtocol::Udp
+            };
+            let path_id = PathId(index as u16);
+            let (commands, receivers) = reliable_path_command_channels(8);
+            binding.attach(underlay, path_id, commands, TrafficClass::Throughput);
+            _receivers.push(receivers);
+        }
+
+        let targets = binding.sender_path_targets(TrafficClass::Throughput, 64 * 1024);
+        assert_eq!(targets.len(), target_count);
+        // Equal, adjacent 1 KiB DSN ranges keep the synthetic ledgers
+        // disjoint and bounded; record count, not payload size, is varied.
+        const RANGE_BYTES: u64 = 1024;
+        let end_offset = (range_count as u64)
+            .saturating_mul(RANGE_BYTES)
+            .saturating_add(1);
+        {
+            let mut flights = binding.flights.lock().expect("fixture flights");
+            let mut ack_ordering = binding.ack_ordering.lock().expect("fixture ACK ordering");
+            for index in 0..range_count {
+                let target = &targets[(index.wrapping_mul(7)) % target_count];
+                let key = target.observation.key;
+                let incarnation = target.observation.incarnation;
+                let start = (index as u64) * RANGE_BYTES;
+                let bytes = RANGE_BYTES;
+                if index % 2 == 0 {
+                    let mut original = flight(
+                        key,
+                        start + bytes,
+                        bytes as usize,
+                        CarrierWorkKind::OriginalData,
+                    );
+                    original.output_incarnation = incarnation;
+                    flights.insert(start, vec![original]);
+                } else {
+                    ack_ordering.acked_holes.insert(
+                        start,
+                        vec![CarrierPathAckedHole {
+                            key,
+                            output_incarnation: incarnation,
+                            end: start + bytes,
+                            bytes,
+                            sent_at: Instant::now(),
+                            kind: CarrierWorkKind::OriginalData,
+                            path_proving: true,
+                        }],
+                    );
+                }
+            }
+        }
+        (binding, targets, end_offset)
+    }
+
+    fn consume_reference(
+        debts: &[CarrierPathFlightDebt],
+        targets: &[super::super::ResponseSenderPathTarget],
+        consumed_targets: usize,
+    ) -> u64 {
+        targets
+            .iter()
+            .take(consumed_targets)
+            .fold(0u64, |value, target| {
+                value
+                    .wrapping_mul(37)
+                    .wrapping_add(response_ordering_debt_bytes(
+                        debts,
+                        target.observation.key,
+                        target.observation.incarnation,
+                    ))
+            })
+    }
+
+    fn consume_projection(
+        projection: &super::super::ResponseDebtProjection,
+        consumed_targets: usize,
+    ) -> u64 {
+        projection
+            .targets()
+            .iter()
+            .take(consumed_targets)
+            .enumerate()
+            .fold(0u64, |value, (index, _)| {
+                value.wrapping_mul(37).wrapping_add(
+                    projection
+                        .exact_other_path_debt_bytes(index)
+                        .expect("owned target summary"),
+                )
+            })
+    }
+
+    // Each case is run baseline/candidate, candidate/baseline, baseline/
+    // candidate. Repeat counts bound total work while giving small cases enough
+    // observations to rise above timer granularity.
+    let sizes = [0usize, 1, 32, 1024];
+    let target_counts = [1usize, 4, 32];
+    let round_orders = [
+        "baseline_then_fold",
+        "fold_then_baseline",
+        "baseline_then_fold",
+    ];
+    let mut fixture_cases = 0usize;
+    for range_count in sizes {
+        let repeats = match range_count {
+            0 => 8192,
+            1 => 4096,
+            32 => 256,
+            _ => 16,
+        };
+        for target_count in target_counts {
+            let (binding, targets, end_offset) = fixture_binding(target_count, range_count);
+            for (consume_case, consumed_targets) in
+                [("one_target", 1), ("all_targets", target_count)]
+            {
+                fixture_cases += 1;
+                let mut round_baseline_ns = [0u128; 3];
+                let mut round_candidate_ns = [0u128; 3];
+                let mut expected_checksum = None;
+                let mut baseline_returned_capacity = None;
+                let mut candidate_summary_capacity = None;
+                for round in 0..3 {
+                    let baseline_first = round != 1;
+                    for _ in 0..repeats {
+                        let run_baseline = || {
+                            let owned_targets = targets.clone();
+                            let started = Instant::now();
+                            let debts = binding.lower_flights_before_offset(end_offset);
+                            let owner = response_oldest_lower_flight_owner(&debts);
+                            let checksum =
+                                consume_reference(&debts, &owned_targets, consumed_targets);
+                            let returned_capacity = debts.capacity();
+                            black_box((owner, checksum, returned_capacity));
+                            drop(debts);
+                            drop(owned_targets);
+                            let elapsed = started.elapsed().as_nanos();
+                            (elapsed, owner, checksum, returned_capacity)
+                        };
+                        let mut run_candidate = || {
+                            // Both arms receive the same already-constructed
+                            // target snapshot. The production caller has
+                            // already built it before beginning this query.
+                            let owned_targets = targets.clone();
+                            let started = Instant::now();
+                            let projection =
+                                binding.project_lower_debt_before_offset(end_offset, owned_targets);
+                            let owner = projection.oldest_owner();
+                            let checksum = consume_projection(&projection, consumed_targets);
+                            let summary_len = if projection.has_materialized_target_debts() {
+                                target_count
+                            } else {
+                                0
+                            };
+                            black_box((owner, checksum, projection.targets().len()));
+                            drop(projection);
+                            let elapsed = started.elapsed().as_nanos();
+                            candidate_summary_capacity.get_or_insert(summary_len);
+                            (elapsed, owner, checksum, summary_len)
+                        };
+
+                        let (first_run, second_run) = if baseline_first {
+                            (run_baseline(), run_candidate())
+                        } else {
+                            (run_candidate(), run_baseline())
+                        };
+                        let (
+                            (first_elapsed, first_owner, first_checksum, first_capacity),
+                            (second_elapsed, second_owner, second_checksum, second_capacity),
+                        ) = (first_run, second_run);
+                        assert_eq!(first_owner, second_owner);
+                        assert_eq!(first_checksum, second_checksum);
+                        if let Some(expected) = expected_checksum {
+                            assert_eq!(first_checksum, expected);
+                        } else {
+                            expected_checksum = Some(first_checksum);
+                        }
+                        if baseline_first {
+                            round_baseline_ns[round] += first_elapsed;
+                            round_candidate_ns[round] += second_elapsed;
+                            baseline_returned_capacity.get_or_insert(first_capacity);
+                            candidate_summary_capacity.get_or_insert(second_capacity);
+                            black_box((first_capacity, second_capacity));
+                        } else {
+                            round_candidate_ns[round] += first_elapsed;
+                            round_baseline_ns[round] += second_elapsed;
+                            candidate_summary_capacity.get_or_insert(first_capacity);
+                            baseline_returned_capacity.get_or_insert(second_capacity);
+                            black_box((second_capacity, first_capacity));
+                        }
+                    }
+                }
+
+                let baseline_total_ns: u128 = round_baseline_ns.iter().sum();
+                let candidate_total_ns: u128 = round_candidate_ns.iter().sum();
+                let total_calls = repeats as u128 * 3;
+                for round in 0..3 {
+                    let baseline_ns_per_query = round_baseline_ns[round] as f64 / repeats as f64;
+                    let candidate_ns_per_query = round_candidate_ns[round] as f64 / repeats as f64;
+                    eprintln!(
+                        "debt-fold fixture round: N={range_count} K={target_count} case={consume_case} consume={consumed_targets} round={} order={} repeats={repeats} baseline_total_ns={} fold_total_ns={} baseline_ns_per_query={baseline_ns_per_query:.1} fold_ns_per_query={candidate_ns_per_query:.1} fold_over_baseline={:.3}",
+                        round + 1,
+                        round_orders[round],
+                        round_baseline_ns[round],
+                        round_candidate_ns[round],
+                        round_candidate_ns[round] as f64 / round_baseline_ns[round].max(1) as f64,
+                    );
+                }
+                eprintln!(
+                    "debt-fold fixture pooled: N={range_count} K={target_count} case={consume_case} consume={consumed_targets} rounds=3 repeats_per_round={repeats} baseline_ns_per_query={:.1} fold_ns_per_query={:.1} fold_over_baseline={:.3} reference_map_entries={range_count} baseline_returned_vec_capacity={} fold_summary_len={} checksum={}",
+                    baseline_total_ns as f64 / total_calls as f64,
+                    candidate_total_ns as f64 / total_calls as f64,
+                    candidate_total_ns as f64 / baseline_total_ns.max(1) as f64,
+                    baseline_returned_capacity.unwrap_or(0),
+                    candidate_summary_capacity.unwrap_or(0),
+                    expected_checksum.unwrap_or_default(),
+                );
+            }
+        }
+    }
+    assert_eq!(fixture_cases, 24);
 }
 
 #[test]

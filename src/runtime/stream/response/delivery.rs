@@ -12,6 +12,7 @@ use crate::model::capacity::{reliable_path_startup_sample_limit_bytes, reliable_
 use crate::model::path::CarrierPathKey;
 use crate::model::product_qualification::ProductQualificationReceipt;
 use crate::model::requalification::StreamPathQualification;
+#[cfg(test)]
 use crate::model::response::CarrierPathFlightDebt;
 use crate::model::timing::{
     ReliableDataAckGapTiming, reliable_data_ack_gap_timing, reliable_data_retransmission_interval,
@@ -2353,6 +2354,96 @@ impl ResponseStreamBinding {
         outputs
     }
 
+    pub(in crate::runtime) fn project_lower_debt_before_offset(
+        &self,
+        offset: u64,
+        targets: Vec<super::ResponseSenderPathTarget>,
+    ) -> super::ResponseDebtProjection {
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        let ack_ordering = self
+            .ack_ordering
+            .lock()
+            .expect("server response ACK ordering lock");
+
+        let mut projection = super::ResponseDebtProjection::for_targets(targets);
+        let mut flight_debts = flights.range(..offset).filter_map(|(flight_offset, rows)| {
+            rows.iter()
+                .rev()
+                .find(|flight| flight.kind.is_original_transmission())
+                .map(|original| {
+                    (
+                        *flight_offset,
+                        original.key,
+                        original.output_incarnation,
+                        original.bytes as u64,
+                    )
+                })
+        });
+        let mut ack_debts =
+            ack_ordering
+                .acked_holes
+                .range(..offset)
+                .filter_map(|(hole_offset, holes)| {
+                    response_latest_original_hole(holes).map(|latest| {
+                        (
+                            *hole_offset,
+                            latest.key,
+                            latest.output_incarnation,
+                            latest.bytes,
+                        )
+                    })
+                });
+        let mut flight = flight_debts.next();
+        let mut ack = ack_debts.next();
+
+        loop {
+            let selected = match (flight.as_ref(), ack.as_ref()) {
+                (None, None) => break,
+                (Some(_), None) => {
+                    let debt = flight.take().expect("peeked flight debt");
+                    flight = flight_debts.next();
+                    debt
+                }
+                (None, Some(_)) => {
+                    let debt = ack.take().expect("peeked ACK debt");
+                    ack = ack_debts.next();
+                    debt
+                }
+                (Some((flight_offset, ..)), Some((ack_offset, ..)))
+                    if flight_offset < ack_offset =>
+                {
+                    let debt = flight.take().expect("peeked flight debt");
+                    flight = flight_debts.next();
+                    debt
+                }
+                (Some((flight_offset, ..)), Some((ack_offset, ..)))
+                    if flight_offset > ack_offset =>
+                {
+                    let debt = ack.take().expect("peeked ACK debt");
+                    ack = ack_debts.next();
+                    debt
+                }
+                (Some(_), Some(_)) => {
+                    // The reference BTreeMap inserts flights first and ACK
+                    // holes second, so ACK ownership wins this exact tie.
+                    let _ = flight.take().expect("peeked flight debt");
+                    flight = flight_debts.next();
+                    let debt = ack.take().expect("peeked ACK debt");
+                    ack = ack_debts.next();
+                    debt
+                }
+            };
+            let (_, key, incarnation, bytes) = selected;
+            projection.add_range_debt(key, incarnation, bytes);
+        }
+
+        projection
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn lower_flights_before_offset(
         &self,
         offset: u64,

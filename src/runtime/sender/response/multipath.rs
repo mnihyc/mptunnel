@@ -4,7 +4,7 @@
 //! identity. The response binding revalidates that identity and the connection
 //! flight generation before publishing the carrier command.
 
-use super::scheduling::select_response_data_path_with_payload;
+use super::scheduling::select_response_data_path_with_projection;
 use crate::model::admission::{BulkCandidatePosition, ReliableDataAckFrontierState};
 use crate::model::path::CarrierPathKey;
 use crate::model::work::ReliableWorkClass;
@@ -87,14 +87,13 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
             // update then makes commit reject this plan instead of accepting a
             // snapshot assembled across two generations.
             let expected_model_generation = binding.response_model_generation();
-            let lower_flights = binding.lower_flights_before_offset(next_offset);
             let targets = binding.sender_path_targets(relay_lane, payload_bytes);
-            let selection = select_response_data_path_with_payload(
-                &targets,
+            let debt_projection = binding.project_lower_debt_before_offset(next_offset, targets);
+            let selection = select_response_data_path_with_projection(
                 relay_lane,
                 payload_bytes,
                 binding.mux_limits(),
-                &lower_flights,
+                &debt_projection,
                 data_ack_outstanding_bytes,
                 frontier_state,
             )

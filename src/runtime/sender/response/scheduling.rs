@@ -13,14 +13,15 @@ use crate::model::admission::{
 };
 use crate::model::capacity::reliable_unproven_path_startup_flight_limit_bytes;
 use crate::model::path::carrier_path_key_order;
-use crate::model::response::{
-    CarrierPathFlightDebt, response_oldest_lower_flight_owner, response_ordering_debt_bytes,
-};
+#[cfg(test)]
+use crate::model::response::CarrierPathFlightDebt;
 use crate::mux::MuxLimits;
 use crate::protocol::Frame;
 use crate::runtime::sender::response::ResponseOutputIdentity;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
-use crate::runtime::stream::response::{ResponseAcquisitionOutputId, ResponseSenderPathTarget};
+use crate::runtime::stream::response::{
+    ResponseAcquisitionOutputId, ResponseDebtProjection, ResponseSenderPathTarget,
+};
 use crate::scheduler::{self, TrafficClass};
 
 /// Selects the path for the next unique connection-data range.
@@ -86,12 +87,31 @@ pub(super) fn select_response_data_path_with_payload(
     connection_ordering_debt_bytes: usize,
     frontier_state: ReliableDataAckFrontierState,
 ) -> Option<ResponseDataPathSelection> {
-    select_response_data_path_with_service(
-        targets,
+    let projection = ResponseDebtProjection::from_ordered_debts(targets.to_vec(), lower_flights);
+    select_response_data_path_with_projection(
         lane,
         payload_bytes,
         mux_limits,
-        lower_flights,
+        &projection,
+        connection_ordering_debt_bytes,
+        frontier_state,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn select_response_data_path_with_projection(
+    lane: TrafficClass,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    debt_projection: &ResponseDebtProjection,
+    connection_ordering_debt_bytes: usize,
+    frontier_state: ReliableDataAckFrontierState,
+) -> Option<ResponseDataPathSelection> {
+    select_response_data_path_with_service(
+        lane,
+        payload_bytes,
+        mux_limits,
+        debt_projection,
         connection_ordering_debt_bytes,
         frontier_state,
         ResponseOriginalService::Queued,
@@ -100,21 +120,19 @@ pub(super) fn select_response_data_path_with_payload(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_prepared_response_data_path(
-    targets: &[ResponseSenderPathTarget],
     lane: TrafficClass,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-    lower_flights: &[CarrierPathFlightDebt],
+    debt_projection: &ResponseDebtProjection,
     connection_ordering_debt_bytes: usize,
     frontier_state: ReliableDataAckFrontierState,
     ready: &[ResponseAcquisitionOutputId],
 ) -> Option<ResponseDataPathSelection> {
     select_response_data_path_with_service(
-        targets,
         lane,
         payload_bytes,
         mux_limits,
-        lower_flights,
+        debt_projection,
         connection_ordering_debt_bytes,
         frontier_state,
         ResponseOriginalService::Prepared(ready),
@@ -130,15 +148,15 @@ enum ResponseOriginalService<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn select_response_data_path_with_service(
-    targets: &[ResponseSenderPathTarget],
     lane: TrafficClass,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-    lower_flights: &[CarrierPathFlightDebt],
+    debt_projection: &ResponseDebtProjection,
     connection_ordering_debt_bytes: usize,
     frontier_state: ReliableDataAckFrontierState,
     service: ResponseOriginalService<'_>,
 ) -> Option<ResponseDataPathSelection> {
+    let targets = debt_projection.targets();
     let nonstale_live_paths = targets
         .iter()
         .filter(|target| {
@@ -171,13 +189,14 @@ fn select_response_data_path_with_service(
     if connection_credit == 0 {
         return None;
     }
-    let lower_owner = response_oldest_lower_flight_owner(lower_flights);
+    let lower_owner = debt_projection.oldest_owner();
     let select = |allow_backup: bool, allow_stale: bool| {
         let candidates = targets
             .iter()
-            .filter(|target| allow_stale || !target.observation.stale_for_original_data)
-            .filter(|target| target.product_admission_active)
-            .filter(|target| match service {
+            .enumerate()
+            .filter(|(_, target)| allow_stale || !target.observation.stale_for_original_data)
+            .filter(|(_, target)| target.product_admission_active)
+            .filter(|(_, target)| match service {
                 #[cfg(test)]
                 ResponseOriginalService::Queued => target.can_enqueue_stream_data(lane),
                 ResponseOriginalService::Prepared(ready) => {
@@ -188,10 +207,10 @@ fn select_response_data_path_with_service(
             // authenticated PATH_JOIN/SESSION_READY exchange. That is the
             // MPTUN equivalent of an established MPTCP subflow; a second
             // product-stream challenge must not delay data placement.
-            .filter(|target| {
+            .filter(|(_, target)| {
                 allow_backup || !scheduler::path_is_backup(target.observation.snapshot)
             })
-            .filter_map(|target| {
+            .filter_map(|(target_index, target)| {
                 let snapshot = response_completion_snapshot(target);
                 let score = scheduler::score_path(snapshot, lane, payload_bytes)?;
                 let target_payload_bytes =
@@ -199,9 +218,11 @@ fn select_response_data_path_with_service(
                 if target_payload_bytes == 0 {
                     return None;
                 }
+                let exact_other_path_debt =
+                    debt_projection.exact_other_path_debt_bytes(target_index)?;
                 let external_flight = response_external_ordering_debt_bytes(
                     target,
-                    lower_flights,
+                    exact_other_path_debt,
                     connection_ordering_debt_bytes,
                 );
                 Some((
@@ -621,14 +642,9 @@ pub(super) fn select_response_frame_path_for_extent(
 
 fn response_external_ordering_debt_bytes(
     target: &ResponseSenderPathTarget,
-    lower_flights: &[CarrierPathFlightDebt],
+    exact_other_path_debt: u64,
     connection_ordering_debt_bytes: usize,
 ) -> u64 {
-    let exact_other_path_debt = response_ordering_debt_bytes(
-        lower_flights,
-        target.observation.key,
-        target.observation.incarnation,
-    );
     let connection_other_path_debt = u64::try_from(connection_ordering_debt_bytes)
         .unwrap_or(u64::MAX)
         .saturating_sub(target.observation.original_data_in_flight_bytes);

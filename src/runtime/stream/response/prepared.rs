@@ -4,9 +4,8 @@ use super::snapshot::{
     server_bulk_output_snapshot_at, server_native_bulk_output_snapshot_at,
     server_sender_path_target_at,
 };
-use super::{ResponseAcquisitionOutputId, ResponseSenderPathTarget, ResponseStreamBinding};
+use super::{ResponseAcquisitionOutputId, ResponseStreamBinding};
 use crate::model::carrier_rate_authority::CarrierRateAuthorityScope;
-use crate::model::response::CarrierPathFlightDebt;
 use crate::protocol::{PathMetricDirection, UnderlayProtocol};
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::commands::ReliablePathCommandSender;
@@ -66,8 +65,7 @@ impl ResponsePreparedNativeInputs {
 }
 
 pub(in crate::runtime) struct ResponsePreparedObservation {
-    pub(in crate::runtime) targets: Vec<ResponseSenderPathTarget>,
-    pub(in crate::runtime) lower_flights: Vec<CarrierPathFlightDebt>,
+    pub(in crate::runtime) debt_projection: super::ResponseDebtProjection,
     pub(in crate::runtime) model_generation: u64,
 }
 
@@ -121,7 +119,7 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server response ingress lock");
         let now = Instant::now();
-        let targets = outputs
+        let targets: Vec<_> = outputs
             .entries
             .iter()
             .zip(&inputs.outputs)
@@ -160,9 +158,9 @@ impl ResponseStreamBinding {
                 target
             })
             .collect();
+        let debt_projection = self.project_lower_debt_before_offset(next_offset, targets);
         Some(ResponsePreparedObservation {
-            targets,
-            lower_flights: self.lower_flights_before_offset(next_offset),
+            debt_projection,
             model_generation: self.response_model_generation.load(Ordering::Acquire),
         })
     }

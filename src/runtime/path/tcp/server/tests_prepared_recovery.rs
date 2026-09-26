@@ -394,7 +394,7 @@ async fn prepared_tcp_recovery_serves_two_due_ranges_before_fresh_original_witho
                 &state.send_stream,
                 &state.last_send_ack,
                 TrafficClass::Throughput,
-                &observation.targets,
+                observation.debt_projection.targets(),
                 &ready_outputs,
                 observed_at,
             );
@@ -403,7 +403,7 @@ async fn prepared_tcp_recovery_serves_two_due_ranges_before_fresh_original_witho
                 &state.send_stream,
                 &state.last_send_ack,
                 TrafficClass::Throughput,
-                &observation.targets,
+                observation.debt_projection.targets(),
                 &ready_outputs,
                 Instant::now(),
             );
@@ -421,7 +421,7 @@ async fn prepared_tcp_recovery_serves_two_due_ranges_before_fresh_original_witho
                     candidate.cause,
                 )
             });
-            let targets = observation.targets.iter().map(|target| {
+            let targets = observation.debt_projection.targets().iter().map(|target| {
                 let id = ResponseAcquisitionOutputId::from(target);
                 let path = &target.observation;
                 format!("id={id:?} ready={} active={} stale={} measured={} qualified={} enqueue={} state={:?} usage={:?} srtt_ms={} rate_bps={} P={} O={} queue={} native_flight={}",
@@ -614,12 +614,13 @@ async fn prepared_tcp_latency_completion_reaches_peer_before_owner_fallback() {
             &state.send_stream,
             &state.last_send_ack,
             TrafficClass::Latency,
-            &observed.targets,
+            observed.debt_projection.targets(),
             &ready,
             Instant::now(),
         );
         let facts = observed
-            .targets
+            .debt_projection
+            .targets()
             .iter()
             .map(|target| {
                 (

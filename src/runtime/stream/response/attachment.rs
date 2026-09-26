@@ -1348,6 +1348,91 @@ pub(in crate::runtime) struct ResponseAcquisitionOutputId {
     pub(in crate::runtime) incarnation: u64,
 }
 
+/// Per-observation lower-range facts consumed by response scheduling.
+///
+/// The projection owns the target snapshot it summarizes, so selection cannot
+/// accidentally pair these debts with another slice of target identities.
+pub(in crate::runtime) struct ResponseDebtProjection {
+    oldest_owner: Option<(CarrierPathKey, u64)>,
+    targets: Vec<ResponseSenderPathTarget>,
+    /// None is the complete all-zero proof. If any target has nonzero
+    /// external debt, the vector has exactly one sum for every owned target.
+    exact_other_path_debts: Option<Vec<u64>>,
+}
+
+impl ResponseDebtProjection {
+    pub(super) fn for_targets(targets: Vec<ResponseSenderPathTarget>) -> Self {
+        Self {
+            oldest_owner: None,
+            targets,
+            exact_other_path_debts: None,
+        }
+    }
+
+    pub(in crate::runtime) fn targets(&self) -> &[ResponseSenderPathTarget] {
+        &self.targets
+    }
+
+    pub(in crate::runtime) fn oldest_owner(&self) -> Option<(CarrierPathKey, u64)> {
+        self.oldest_owner
+    }
+
+    pub(in crate::runtime) fn exact_other_path_debt_bytes(
+        &self,
+        target_index: usize,
+    ) -> Option<u64> {
+        if target_index >= self.targets.len() {
+            return None;
+        }
+        match &self.exact_other_path_debts {
+            None => Some(0),
+            Some(sums) if sums.len() == self.targets.len() => sums.get(target_index).copied(),
+            Some(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn has_materialized_target_debts(&self) -> bool {
+        self.exact_other_path_debts.is_some()
+    }
+
+    pub(super) fn add_range_debt(&mut self, key: CarrierPathKey, incarnation: u64, bytes: u64) {
+        if self.oldest_owner.is_none() {
+            self.oldest_owner = Some((key, incarnation));
+        }
+        if bytes == 0 {
+            return;
+        }
+        if self.exact_other_path_debts.is_none()
+            && !self.targets.iter().any(|target| {
+                target.observation.key != key || target.observation.incarnation != incarnation
+            })
+        {
+            return;
+        }
+        let sums = self
+            .exact_other_path_debts
+            .get_or_insert_with(|| vec![0; self.targets.len()]);
+        for (target, sum) in self.targets.iter().zip(sums) {
+            if target.observation.key != key || target.observation.incarnation != incarnation {
+                *sum += bytes;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn from_ordered_debts(
+        targets: Vec<ResponseSenderPathTarget>,
+        debts: &[crate::model::response::CarrierPathFlightDebt],
+    ) -> Self {
+        let mut projection = Self::for_targets(targets);
+        for debt in debts {
+            projection.add_range_debt(debt.key, debt.output_incarnation, debt.bytes);
+        }
+        projection
+    }
+}
+
 impl From<&ResponseStreamOutputEntry> for ResponseAcquisitionOutputId {
     fn from(entry: &ResponseStreamOutputEntry) -> Self {
         Self {

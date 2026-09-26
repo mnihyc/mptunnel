@@ -5,6 +5,7 @@ use crate::model::capacity::{
     reliable_unproven_path_startup_flight_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;
+use crate::model::response::{response_oldest_lower_flight_owner, response_ordering_debt_bytes};
 use crate::protocol::{Frame, PathId, PathUsage, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{
     reliable_path_command_channels, reliable_path_command_pending_bytes,
@@ -44,6 +45,67 @@ fn block_data_queue(target: &mut ResponseSenderPathTarget) {
         )
         .expect("fill data queue");
     target.command_queue = commands.queue_snapshot();
+}
+
+#[test]
+fn debt_projection_represents_empty_external_debt_without_summary_storage() {
+    let target = response_target(0, UnderlayProtocol::Tcp, 800.0, 0, 16 * 1024, true);
+    let identity = ResponseAcquisitionOutputId::from(&target);
+    let debts = [CarrierPathFlightDebt {
+        key: identity.key,
+        output_incarnation: identity.incarnation,
+        bytes: 0,
+    }];
+    let projection = ResponseDebtProjection::from_ordered_debts(vec![target], &debts);
+
+    assert_eq!(
+        projection.oldest_owner(),
+        Some((identity.key, identity.incarnation))
+    );
+    assert_eq!(projection.exact_other_path_debt_bytes(0), Some(0));
+    assert_eq!(projection.exact_other_path_debt_bytes(1), None);
+    assert!(!projection.has_materialized_target_debts());
+    assert_eq!(
+        ResponseAcquisitionOutputId::from(&projection.targets()[0]),
+        identity,
+        "the projection owns the exact target snapshot, so another target slice cannot be paired with it",
+    );
+}
+
+#[test]
+fn debt_projection_keeps_reference_u64_sum_overflow_behavior() {
+    let target = response_target(0, UnderlayProtocol::Tcp, 800.0, 0, 16 * 1024, true);
+    let candidate_key = target.observation.key;
+    let other_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(65000),
+    };
+    let debts = [
+        CarrierPathFlightDebt {
+            key: other_key,
+            output_incarnation: 1,
+            bytes: u64::MAX,
+        },
+        CarrierPathFlightDebt {
+            key: other_key,
+            output_incarnation: 1,
+            bytes: 1,
+        },
+    ];
+    let expected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        response_ordering_debt_bytes(&debts, candidate_key, target.observation.incarnation)
+    }));
+    let actual = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ResponseDebtProjection::from_ordered_debts(vec![target], &debts)
+            .exact_other_path_debt_bytes(0)
+            .expect("complete summary")
+    }));
+
+    match (expected, actual) {
+        (Ok(expected), Ok(actual)) => assert_eq!(actual, expected),
+        (Err(_), Err(_)) => {}
+        _ => panic!("fold and reference must have identical u64 overflow behavior"),
+    }
 }
 
 #[test]

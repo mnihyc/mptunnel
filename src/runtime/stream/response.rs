@@ -32,9 +32,9 @@ use crate::transport::RateHint;
 #[cfg(test)]
 pub(in crate::runtime) use attachment::next_server_carrier_path_instance_id;
 pub(in crate::runtime) use attachment::{
-    ResponseAcquisitionOutputId, ResponseDispatchTarget, ResponseOutputAttachment,
-    ResponseOutputAttachmentState, ResponsePathDetachOutcome, ResponseSenderPathTarget,
-    ResponseStreamAttachOutcome,
+    ResponseAcquisitionOutputId, ResponseDebtProjection, ResponseDispatchTarget,
+    ResponseOutputAttachment, ResponseOutputAttachmentState, ResponsePathDetachOutcome,
+    ResponseSenderPathTarget, ResponseStreamAttachOutcome,
 };
 use attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
 use delivery::ResponseAckOrderingState;

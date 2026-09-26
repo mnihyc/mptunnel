@@ -331,7 +331,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         &state.send_stream,
         &state.last_send_ack,
         lane,
-        &observation.targets,
+        observation.debt_projection.targets(),
         &ready_outputs(&outputs),
         Instant::now(),
     );
@@ -389,7 +389,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
                     &state.send_stream,
                     &state.last_send_ack,
                     lane,
-                    &observation.targets,
+                    observation.debt_projection.targets(),
                     &ready_outputs(&outputs),
                     Instant::now(),
                 )
@@ -486,11 +486,10 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         return PreparedOriginalClaim::Blocked(wake);
     }
     let Some(selection) = select_prepared_response_data_path(
-        &observation.targets,
         lane,
         source.len(),
         owner.binding().mux_limits(),
-        &observation.lower_flights,
+        &observation.debt_projection,
         state.send_stream.reinjection_bytes(),
         frontier(&state),
         &commitments.original_ready(ready_outputs(&outputs), &mut commitment_waits),
@@ -578,7 +577,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
             &state.send_stream,
             &state.last_send_ack,
             lane,
-            &observation.targets,
+            observation.debt_projection.targets(),
             &ready_outputs(&outputs),
             Instant::now(),
         );
@@ -621,11 +620,10 @@ pub(in crate::runtime) fn claim_prepared_response_data(
             };
         }
         let current_plan = select_prepared_response_data_path(
-            &observation.targets,
             lane,
             source.len(),
             owner.binding().mux_limits(),
-            &observation.lower_flights,
+            &observation.debt_projection,
             state.send_stream.reinjection_bytes(),
             frontier(&state),
             &commitments.original_ready(ready_outputs(&outputs), &mut commitment_waits),

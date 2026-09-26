@@ -3752,6 +3752,7 @@ where
                     receive_stream_fin(
                         &recv_stream,
                         &mut pending_remote_fin_offset,
+                        remote_open,
                         final_offset,
                     )?;
                     target_receipt_pending = true;

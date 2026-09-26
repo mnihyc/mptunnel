@@ -745,7 +745,7 @@ fn stream_fin_waits_for_final_offset_before_close() {
     let mut pending_final_offset = None;
 
     assert!(
-        !receive_stream_fin(&recv_stream, &mut pending_final_offset, 5)
+        !receive_stream_fin(&recv_stream, &mut pending_final_offset, true, 5)
             .expect("record pending fin")
     );
     assert_eq!(pending_final_offset, Some(5));
@@ -770,7 +770,7 @@ fn stream_fin_rejects_final_offset_behind_reordered_data() {
     let mut pending_final_offset = None;
 
     assert!(matches!(
-        receive_stream_fin(&recv_stream, &mut pending_final_offset, 10),
+        receive_stream_fin(&recv_stream, &mut pending_final_offset, true, 10),
         Err(RuntimeError::Protocol(
             "stream FIN final offset is behind received data"
         ))
@@ -796,10 +796,87 @@ fn in_order_stream_fin_remains_pending_until_feedback_commits() {
     let mut pending_final_offset = None;
 
     assert!(
-        receive_stream_fin(&recv_stream, &mut pending_final_offset, 0)
+        receive_stream_fin(&recv_stream, &mut pending_final_offset, true, 0)
             .expect("record in-order fin")
     );
     assert_eq!(pending_final_offset, Some(0));
+    assert!(pending_stream_fin_ready(&recv_stream, pending_final_offset));
+}
+
+#[test]
+fn committed_stream_fin_duplicates_are_idempotent_for_empty_and_nonempty_streams() {
+    let empty = ReliableRecvStream::new(StreamId(406), MuxLimits::default());
+    let mut empty_pending = None;
+    assert!(
+        !receive_stream_fin(&empty, &mut empty_pending, false, 0)
+            .expect("committed empty FIN replay")
+    );
+    assert_eq!(empty_pending, None, "committed zero FIN stays closed");
+
+    let mut nonempty = ReliableRecvStream::new(StreamId(407), MuxLimits::default());
+    nonempty
+        .receive_data(0, Bytes::from_static(b"end"))
+        .expect("committed receive prefix");
+    assert_eq!(nonempty.next_offset(), 3);
+    let mut nonempty_pending = None;
+    assert!(
+        !receive_stream_fin(&nonempty, &mut nonempty_pending, false, 3)
+            .expect("committed nonempty FIN replay")
+    );
+    assert_eq!(
+        nonempty_pending, None,
+        "a duplicate after local shutdown cannot recreate FIN debt"
+    );
+}
+
+#[test]
+fn committed_stream_fin_rejects_changed_final_offsets() {
+    let mut recv_stream = ReliableRecvStream::new(StreamId(408), MuxLimits::default());
+    recv_stream
+        .receive_data(0, Bytes::from_static(b"x"))
+        .expect("committed receive prefix");
+    let mut pending_final_offset = None;
+
+    assert!(
+        matches!(
+            receive_stream_fin(&recv_stream, &mut pending_final_offset, false, 2),
+            Err(RuntimeError::Protocol(_)),
+        ),
+        "a larger second final offset must not extend a committed stream"
+    );
+    assert_eq!(pending_final_offset, None);
+    assert!(
+        matches!(
+            receive_stream_fin(&recv_stream, &mut pending_final_offset, false, 0),
+            Err(RuntimeError::Protocol(_)),
+        ),
+        "a lower second final offset must not rewrite a committed stream"
+    );
+    assert_eq!(pending_final_offset, None);
+}
+
+#[test]
+fn matching_pending_stream_fin_replay_preserves_hole_fill_obligation() {
+    let mut recv_stream = ReliableRecvStream::new(StreamId(409), MuxLimits::default());
+    recv_stream
+        .receive_data(2, Bytes::from_static(b"c"))
+        .expect("buffer final extent out of order");
+    let mut pending_final_offset = None;
+
+    assert!(
+        !receive_stream_fin(&recv_stream, &mut pending_final_offset, true, 3)
+            .expect("retain FIN behind missing prefix")
+    );
+    assert_eq!(pending_final_offset, Some(3));
+    assert!(
+        !receive_stream_fin(&recv_stream, &mut pending_final_offset, true, 3)
+            .expect("matching pending FIN replay")
+    );
+    assert_eq!(pending_final_offset, Some(3));
+
+    recv_stream
+        .receive_data(0, Bytes::from_static(b"ab"))
+        .expect("fill the prefix before FIN");
     assert!(pending_stream_fin_ready(&recv_stream, pending_final_offset));
 }
 

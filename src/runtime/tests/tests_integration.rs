@@ -2479,7 +2479,9 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
         Err(_) => {
             handler.abort();
             let _ = handler.await;
-            panic!("logical relay handler did not finish after both FINs and payload delivery");
+            panic!(
+                "logical relay handler did not finish after reply delivery and local half-close"
+            );
         }
     };
     handler_result.expect("handler join").expect("handler");
@@ -4101,6 +4103,13 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
+    // This tests peer isolation, not a sub-second cold-handshake target. The
+    // standalone API charges setup to the product TTL, so allow its existing
+    // handshake budget plus the one-second datagram exchange allowance.
+    let ttl_ms = u32::try_from(
+        (crate::runtime::datagram::UDP_PATH_HANDSHAKE_TIMEOUT + Duration::from_secs(1)).as_millis(),
+    )
+    .expect("test TTL fits the datagram field");
     let first = client_udp_datagram_round_trip(
         &path,
         security(),
@@ -4108,7 +4117,7 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
         ResourceLimits::default(),
         TargetAddr::Ip(first_target_addr),
         Bytes::from_static(b"ping"),
-        1000,
+        ttl_ms,
     );
     let second = client_udp_datagram_round_trip(
         &path,
@@ -4117,7 +4126,7 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
         ResourceLimits::default(),
         TargetAddr::Ip(second_target_addr),
         Bytes::from_static(b"ping"),
-        1000,
+        ttl_ms,
     );
     let (first_response, second_response) = tokio::join!(first, second);
 

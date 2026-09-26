@@ -1865,6 +1865,7 @@ async fn retained_in_order_fin_commits_after_reattachment_feedback() {
         receive_stream_fin(
             &recv_stream,
             &mut state.endpoint.pending_remote_fin_offset,
+            true,
             0,
         )
         .expect("in-order FIN")
@@ -1930,6 +1931,7 @@ async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted(
         receive_stream_fin(
             &recv_stream,
             &mut state.endpoint.pending_remote_fin_offset,
+            true,
             0,
         )
         .expect("in-order FIN")
@@ -2040,6 +2042,7 @@ async fn final_ack_retry_commits_cross_kind_credit_without_releasing_fin_on_max_
         receive_stream_fin(
             &recv_stream,
             &mut state.endpoint.pending_remote_fin_offset,
+            true,
             2,
         )
         .unwrap()
@@ -2686,6 +2689,160 @@ async fn retired_last_carrier_does_not_strand_pending_client_delivery() {
     feedback.abort();
     completion.expect("retired carrier must not own already-received delivery bytes");
     assert_eq!(control.accepted_bytes(), b"retained");
+}
+
+#[tokio::test]
+async fn client_duplicate_committed_response_fin_does_not_reopen_fin_debt() {
+    let stream_id = StreamId(621);
+    let address = "127.0.0.1:9".parse().expect("test target address");
+    let context = ClientPathContext::new(
+        vec!["tcp://127.0.0.1:9".parse::<PathSpec>().unwrap()],
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let limits = context.mux_limits;
+    let (commands, mut receivers) = reliable_path_command_channels(16);
+    let (frames_tx, frames_rx) = mpsc::channel(8);
+    let opened = test_opened_remote_stream(stream_id, 0, commands, frames_rx);
+    context.install_relay_path_instance_for_test(crate::model::path::RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        path_instance_id: opened.path_instance_id(),
+        attachment_id: 0,
+    });
+    let (mut application, relay_side) = duplex(4096);
+    let relay_context = context.clone();
+    let mut relay = tokio::spawn(async move {
+        relay_migrating_tcp_stream(
+            relay_side,
+            &relay_context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec::new(TargetAddr::Ip(address), TrafficClass::Latency),
+            opened,
+            None,
+        )
+        .await
+    });
+
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: Bytes::from_static(b"x"),
+        }))
+        .await
+        .expect("response DATA");
+    frames_tx
+        .send(Ok(Frame::StreamFin {
+            stream_id,
+            final_offset: 1,
+        }))
+        .await
+        .expect("response FIN");
+
+    let mut payload = [0; 1];
+    tokio::time::timeout(Duration::from_secs(5), application.read_exact(&mut payload))
+        .await
+        .expect("response payload deadline")
+        .expect("response payload");
+    assert_eq!(&payload, b"x");
+    let mut eof = [0; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), application.read(&mut eof))
+            .await
+            .expect("response EOF deadline")
+            .expect("response EOF read"),
+        0,
+    );
+
+    let mut initial_ack_received = false;
+    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
+        if let ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. }) = &command {
+            initial_ack_received |= ranges == &vec![OffsetRange { start: 0, end: 1 }];
+        }
+        receivers.release_pending_command_bytes(
+            crate::runtime::path::commands::reliable_path_command_pending_bytes(&command),
+        );
+    }
+    assert!(initial_ack_received, "shutdown must publish cumulative ACK");
+
+    // Keep the application write half open. FIFO delivery of the following
+    // probe receipt proves that the actor has already processed the duplicate
+    // FIN after its target half-close committed.
+    frames_tx
+        .send(Ok(Frame::StreamFin {
+            stream_id,
+            final_offset: 1,
+        }))
+        .await
+        .expect("duplicate response FIN");
+    let token = 0x621;
+    frames_tx
+        .send(Ok(Frame::StreamFeedbackProbe {
+            stream_id,
+            token,
+            max_offset: reliable_stream_initial_advertised_window_bytes(
+                UnderlayProtocol::Tcp,
+                TrafficClass::Latency,
+                limits,
+            ),
+        }))
+        .await
+        .expect("ordered probe barrier");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let command = recv_reliable_path_command(&mut receivers)
+                .await
+                .expect("live mock carrier");
+            let pending =
+                crate::runtime::path::commands::reliable_path_command_pending_bytes(&command);
+            let matching_receipt = matches!(
+                command,
+                ReliablePathCommand::SendFrame(Frame::StreamFeedbackReceipt {
+                    stream_id: actual,
+                    token: actual_token,
+                }) if actual == stream_id && actual_token == token
+            );
+            receivers.release_pending_command_bytes(pending);
+            if matching_receipt {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("duplicate FIN and ordered probe processing deadline");
+    assert!(
+        !relay.is_finished(),
+        "the application write half is still open at the probe barrier"
+    );
+
+    application.shutdown().await.expect("local EOF");
+    let completion = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut relay => break result.expect("relay task join"),
+                command = recv_reliable_path_command(&mut receivers) => {
+                    let command = command.expect("carrier remains live through cleanup");
+                    receivers.release_pending_command_bytes(
+                        crate::runtime::path::commands::reliable_path_command_pending_bytes(&command),
+                    );
+                }
+            }
+        }
+    })
+    .await;
+    match completion {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => panic!("duplicate FIN caused orderly relay failure: {error}"),
+        Err(_) => {
+            relay.abort();
+            let _ = relay.await;
+            panic!("client relay retained FIN debt after an identical post-shutdown FIN");
+        }
+    }
 }
 
 #[tokio::test]

@@ -1071,15 +1071,30 @@ where
     write_applied_ready_stream_data_batch(local, batch, applied).await
 }
 
+/// `remote_open` stays true until delivery and shutdown commit at the accepted
+/// final offset. A false result also covers an already committed matching FIN:
+/// it must not create another pending shutdown transition.
 pub(in crate::runtime) fn receive_stream_fin(
     recv_stream: &ReliableRecvStream,
     pending_final_offset: &mut Option<u64>,
+    remote_open: bool,
     final_offset: u64,
 ) -> Result<bool, RuntimeError> {
     if final_offset < recv_stream.ack_range_summary().largest_end {
         return Err(RuntimeError::Protocol(
             "stream FIN final offset is behind received data",
         ));
+    }
+    if !remote_open {
+        // Shutdown commits only at the contiguous, flushed final frontier.
+        // Closed receivers admit no new DATA, so that frontier remains the
+        // authoritative final offset after pending shutdown work is cleared.
+        if final_offset != recv_stream.next_offset() {
+            return Err(RuntimeError::Protocol(
+                "conflicting stream FIN final offsets",
+            ));
+        }
+        return Ok(false);
     }
     if let Some(existing) = *pending_final_offset {
         if existing != final_offset {

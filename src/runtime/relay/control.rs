@@ -3940,7 +3940,8 @@ where
                                 final_offset,
                             } if fin_stream_id == stream_id => {
                                 let mut product_guard = request_product.lock();
-                                let remotes = &mut product_guard.remotes;
+                                let product = &mut *product_guard;
+                                let (sender, remotes) = (&mut product.sender, &mut product.remotes);
                                 stream_ack_capacity_wait = None;
                                 state.progress.last_stream_at = Instant::now();
                                 return_plan.observe_response_terminal(
@@ -3955,11 +3956,27 @@ where
                                 let _fin_ready = match receive_stream_fin(
                                     &recv_stream,
                                     &mut state.endpoint.pending_remote_fin_offset,
+                                    state.endpoint.remote_open,
                                     final_offset,
                                 ) {
                                     Ok(ready) => ready,
                                     Err(err) => break Err(err),
                                 };
+                                if !state.endpoint.remote_open {
+                                    // A matching replay may request cumulative
+                                    // feedback, but cannot recreate shutdown work.
+                                    match sender.send_recv_progress(
+                                        remotes,
+                                        context,
+                                        &mut recv_stream,
+                                        &mut state.progress.recv_progress,
+                                        RelayRecvProgressSend::final_ack(response_path_snapshot, response_lane),
+                                    ) {
+                                        Ok(sent) => state.record_recv_progress_sent(sent),
+                                        Err(err) if reliable_path_error_is_migratable(&err) => {},
+                                        Err(err) => break Err(err),
+                                    }
+                                }
                                 #[cfg(feature = "lab-diagnostics")]
                                 lab_diagnostic(
                                     "client_stream_fin_received",
@@ -3973,8 +3990,8 @@ where
                                         target_delivery.delivered_offset(),
                                     ),
                                 );
-                                // Final ACK and target half-close are sequenced by the
-                                // outer loop only after this final offset is flushed.
+                                // The first FIN sequences final ACK and target half-close
+                                // in the outer loop after this final offset is flushed.
                             }
                             Frame::StreamReset {
                                 stream_id: reset_stream_id,

@@ -19,7 +19,6 @@ use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record, lab_sender_service
 use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::{
     ReliableStreamSourceAdmission, adaptive_reliable_relay_reinjection_bytes,
-    reliable_stream_advertised_window_bytes,
 };
 use crate::model::multipath::{
     LiveOwnerFallbackEpoch, LiveOwnerFrontierFloorEpoch, OptionalReinjectionLedger,
@@ -380,8 +379,8 @@ pub(in crate::runtime) struct RelayRecvProgressSend {
     path: Option<PathSnapshot>,
     lane: TrafficClass,
     force_ack: bool,
-    publish_max_data: bool,
     force_max_data: bool,
+    max_data_offset: Option<u64>,
 }
 
 impl RelayRecvProgressSend {
@@ -389,14 +388,20 @@ impl RelayRecvProgressSend {
         path: Option<PathSnapshot>,
         lane: TrafficClass,
         force_max_data: bool,
+        max_data_offset: u64,
     ) -> Self {
         Self {
             path,
             lane,
             force_ack: force_max_data,
-            publish_max_data: true,
             force_max_data,
+            max_data_offset: Some(max_data_offset),
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn max_data_offset(&self) -> Option<u64> {
+        self.max_data_offset
     }
 
     pub(in crate::runtime) fn final_ack(path: Option<PathSnapshot>, lane: TrafficClass) -> Self {
@@ -404,10 +409,10 @@ impl RelayRecvProgressSend {
             path,
             lane,
             force_ack: true,
-            publish_max_data: false,
             // Once the final receive offset is contiguous, new receive credit
             // has no consumer and must not precede the terminal Data ACK.
             force_max_data: false,
+            max_data_offset: None,
         }
     }
 
@@ -416,8 +421,8 @@ impl RelayRecvProgressSend {
             path,
             lane,
             force_ack: true,
-            publish_max_data: false,
             force_max_data: false,
+            max_data_offset: None,
         }
     }
 }
@@ -2274,21 +2279,9 @@ impl RequestSenderService {
                 ),
             );
         }
-        if request.publish_max_data
-            && progress.should_send_max_data(
-                recv_stream,
-                request.path,
-                request.lane,
-                context.mux_limits,
-                request.force_max_data,
-            )
+        if let Some(max_offset) = request.max_data_offset
+            && progress.should_send_max_data_offset(max_offset, request.force_max_data)
         {
-            let advertised_window = reliable_stream_advertised_window_bytes(
-                request.path,
-                request.lane,
-                context.mux_limits,
-            );
-            let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
             let publication = remotes.publish_max_data_with_context(context, max_offset);
             if let Some(published_offset) = publication.max_data.published_offset {
                 recv_stream.commit_max_data(published_offset);

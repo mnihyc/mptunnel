@@ -46,6 +46,7 @@ pub(super) struct ClientRelayEndpointState {
 
 pub(super) struct ClientRelayProgressState {
     pub(super) last_stream_at: Instant,
+    /// Last contiguous receive-model advance (historical name: `last_delivery_at`).
     pub(super) last_delivery_at: Instant,
     pub(super) last_response_stall_reinjection_at: Instant,
     pub(super) last_product_stall_attempt_at: Option<Instant>,
@@ -286,7 +287,6 @@ impl ClientRelayState {
         self.endpoint.remote_open = false;
         self.endpoint.pending_remote_fin_offset = None;
         self.progress.interactive_response_pending = false;
-        self.progress.last_delivery_at = Instant::now();
     }
 
     pub(super) fn record_recv_progress_sent(&mut self, publication: StreamFeedbackPublication) {
@@ -300,17 +300,9 @@ impl ClientRelayState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ClientStreamDataEffect {
-    pub(super) delivered_payload_bytes: usize,
-    pub(super) delivered_progress: bool,
-    pub(super) fin_ready: bool,
-}
-
-/// Applies one original frame to mux and client delivery state without taking
-/// local-socket ownership. The relay I/O layer may therefore preserve
-/// per-path attribution for every frame and write several ready outcomes with
-/// one vectored transaction.
+/// Applies one original frame to receive and accounting state without taking
+/// local-socket ownership. The returned contiguous payload moves to the
+/// actor-owned target cursor, which may remain pending across remote input.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_client_stream_data_state(
     state: &mut ClientRelayState,
@@ -319,7 +311,7 @@ pub(super) fn apply_client_stream_data_state(
     instance: RelayPathInstance,
     offset: u64,
     payload: Bytes,
-) -> Result<(ClientStreamDataEffect, ReceiveOutcome), RuntimeError> {
+) -> Result<ReceiveOutcome, RuntimeError> {
     let path_key = instance.key;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = (stream_id, path_key);
@@ -405,19 +397,9 @@ pub(super) fn apply_client_stream_data_state(
         state.progress.interactive_response_pending = false;
     }
     let delivered = &outcome.delivered;
-    let delivered_payload_bytes = state.record_delivery(delivered.as_slice());
+    let _ = state.record_delivery(delivered.as_slice());
 
-    Ok((
-        ClientStreamDataEffect {
-            delivered_payload_bytes,
-            delivered_progress,
-            fin_ready: super::io::pending_stream_fin_ready(
-                recv_stream,
-                state.endpoint.pending_remote_fin_offset,
-            ),
-        },
-        outcome,
-    ))
+    Ok(outcome)
 }
 
 pub(super) struct ClientStreamAckContext<'a> {

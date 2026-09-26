@@ -4,6 +4,7 @@
 //! coordinate tasks, but carrier policy and exact-flight state live elsewhere.
 
 mod client;
+mod client_delivery;
 pub(super) mod control;
 mod diagnostics;
 pub(super) mod flow;

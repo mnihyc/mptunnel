@@ -18,6 +18,7 @@ use crate::runtime::stream::{
 };
 use crate::transport::PathSpec;
 use bytes::Bytes;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1871,9 +1872,19 @@ async fn retained_in_order_fin_commits_after_reattachment_feedback() {
     assert_eq!(state.endpoint.pending_remote_fin_offset, Some(0));
 
     let (mut application, mut relay_side) = duplex(64);
-    commit_pending_remote_fin(&mut relay_side, &mut state, &recv_stream, true)
+    let mut delivery = ServerTargetIo::new(64, 64);
+    assert!(commit_pending_remote_fin(
+        &mut delivery,
+        &mut state,
+        &recv_stream,
+        true,
+    ));
+    assert!(state.endpoint.remote_open, "shutdown has not been polled");
+    std::future::poll_fn(|cx| delivery.poll_io(cx, &mut relay_side))
         .await
-        .expect("commit retained FIN");
+        .expect("commit retained FIN shutdown");
+    assert!(delivery.is_shutdown());
+    state.record_remote_finished();
 
     assert!(!state.endpoint.remote_open);
     assert_eq!(state.endpoint.pending_remote_fin_offset, None);
@@ -1945,15 +1956,21 @@ async fn retained_in_order_fin_commits_when_blocked_final_ack_retry_is_admitted(
         Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 1 }))
     ));
     let (mut application, mut relay_side) = duplex(64);
-    let local_shutdown = retry_stream_ack_and_commit_ready_fin(
-        &mut relay_side,
+    let mut delivery = ServerTargetIo::new(64, 64);
+    retry_stream_ack_and_commit_ready_fin(
+        &mut delivery,
         &mut state,
         &mut recv_stream,
         &mut remotes,
-    );
-    local_shutdown
+    )
+    .expect("retry final ACK and request retained FIN shutdown");
+    assert!(delivery.shutdown_requested());
+    assert!(state.endpoint.remote_open);
+    std::future::poll_fn(|cx| delivery.poll_io(cx, &mut relay_side))
         .await
-        .expect("retry final ACK and commit retained FIN");
+        .expect("commit retained FIN shutdown");
+    assert!(delivery.is_shutdown());
+    state.record_remote_finished();
 
     assert!(!state.endpoint.remote_open);
     assert_eq!(state.endpoint.pending_remote_fin_offset, None);
@@ -2028,18 +2045,24 @@ async fn final_ack_retry_commits_cross_kind_credit_without_releasing_fin_on_max_
         .unwrap()
     );
     let (mut application, mut relay_side) = duplex(64);
-    relay_side.write_all(b"ab").await.unwrap();
+    let mut delivery = ServerTargetIo::new(64, 64);
+    delivery
+        .append_batch(smallvec::smallvec![Bytes::from_static(b"ab")])
+        .unwrap();
+    std::future::poll_fn(|cx| delivery.poll_io(cx, &mut relay_side))
+        .await
+        .unwrap();
+    assert_eq!(delivery.delivered_offset(), 2);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 1 }))
     ));
     retry_stream_ack_and_commit_ready_fin(
-        &mut relay_side,
+        &mut delivery,
         &mut state,
         &mut recv_stream,
         &mut remotes,
     )
-    .await
     .unwrap();
 
     assert_eq!(
@@ -2051,6 +2074,7 @@ async fn final_ack_retry_commits_cross_kind_credit_without_releasing_fin_on_max_
         state.endpoint.remote_open,
         "MAX alone cannot publish the final ACK generation"
     );
+    assert!(!delivery.shutdown_requested());
     assert_eq!(state.endpoint.pending_remote_fin_offset, Some(2));
     assert!(remotes.has_pending_stream_ack_publication());
     assert!(matches!(
@@ -2073,13 +2097,19 @@ async fn final_ack_retry_commits_cross_kind_credit_without_releasing_fin_on_max_
     // The FIN owner re-reads current publication status, even though another
     // trigger already completed the retained ACK job without publishing MAX.
     retry_stream_ack_and_commit_ready_fin(
-        &mut relay_side,
+        &mut delivery,
         &mut state,
         &mut recv_stream,
         &mut remotes,
     )
-    .await
     .unwrap();
+    assert!(delivery.shutdown_requested());
+    assert!(state.endpoint.remote_open);
+    std::future::poll_fn(|cx| delivery.poll_io(cx, &mut relay_side))
+        .await
+        .unwrap();
+    assert!(delivery.is_shutdown());
+    state.record_remote_finished();
     assert!(!state.endpoint.remote_open);
     assert_eq!(state.endpoint.pending_remote_fin_offset, None);
     let mut delivered = Vec::new();
@@ -2289,6 +2319,161 @@ async fn final_feedback_backpressure_keeps_fin_pending_until_ack_is_queued() {
     );
 
     relay.abort();
+}
+
+#[tokio::test]
+async fn blocked_client_delivery_keeps_ordered_input_live_through_reset() {
+    for block_flush in [false, true] {
+        let stream_id = StreamId(if block_flush { 621 } else { 620 });
+        let address = "127.0.0.1:9".parse().unwrap();
+        let context = ClientPathContext::new(
+            vec!["tcp://127.0.0.1:9".parse::<PathSpec>().unwrap()],
+            test_security(),
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        let frame_queue = reliable_stream_frame_queue(context.mux_limits);
+        let (commands, mut receivers) = reliable_path_command_channels(16);
+        let (frames_tx, frames_rx) = mpsc::channel(frame_queue);
+        let opened = test_opened_remote_stream(stream_id, 0, commands, frames_rx);
+        let (local, control) = BlockedLocalDelivery::with_flush_block(block_flush);
+        let mut relay = tokio::spawn(async move {
+            relay_migrating_tcp_stream(
+                local,
+                &context,
+                MppPerformanceConfig::default(),
+                ReliableRelayOpenSpec::new(TargetAddr::Ip(address), TrafficClass::Latency),
+                opened,
+                None,
+            )
+            .await
+        });
+        let feedback = tokio::spawn(async move {
+            while let Some(command) = recv_reliable_path_command(&mut receivers).await {
+                receivers.release_pending_command_bytes(
+                    crate::runtime::path::commands::reliable_path_command_pending_bytes(&command),
+                );
+            }
+        });
+        frames_tx
+            .send(Ok(Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from_static(b"ab"),
+            }))
+            .await
+            .unwrap();
+        control.wait_blocked().await;
+
+        // Exceed both frame-count queues plus the forwarder's held item while
+        // using only a few hundred bytes of the existing advertised window.
+        // RESET must reach the logical actor without releasing its local sink.
+        let completion = tokio::time::timeout(Duration::from_secs(2), async {
+            for index in 0..(2 * frame_queue + 2) {
+                frames_tx
+                    .send(Ok(Frame::StreamData {
+                        stream_id,
+                        offset: 2 + index as u64,
+                        payload: Bytes::from_static(b"x"),
+                    }))
+                    .await
+                    .unwrap();
+            }
+            frames_tx
+                .send(Ok(Frame::StreamReset {
+                    stream_id,
+                    reason: crate::protocol::ResetReason::RemoteClosed,
+                }))
+                .await
+                .unwrap();
+            (&mut relay).await
+        })
+        .await;
+        relay.abort();
+        feedback.abort();
+        let result = completion
+            .expect("ordered RESET must not wait for blocked local delivery")
+            .expect("relay task");
+        assert!(matches!(
+            result,
+            Err(RuntimeError::RemoteReset(
+                crate::protocol::ResetReason::RemoteClosed
+            ))
+        ));
+        assert_eq!(
+            control.accepted_bytes(),
+            if block_flush {
+                b"ab".as_slice()
+            } else {
+                b"a".as_slice()
+            },
+            "a blocked write/flush cannot replay or accept later queued DATA"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retired_last_carrier_does_not_strand_pending_client_delivery() {
+    let stream_id = StreamId(622);
+    let address = "127.0.0.1:9".parse().unwrap();
+    let context = ClientPathContext::new(
+        vec!["tcp://127.0.0.1:9".parse::<PathSpec>().unwrap()],
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    let (commands, mut receivers) = reliable_path_command_channels(16);
+    let (frames_tx, frames_rx) = mpsc::channel(8);
+    let opened = test_opened_remote_stream(stream_id, 0, commands, frames_rx);
+    let (local, control) = BlockedLocalDelivery::new();
+    let relay = tokio::spawn(async move {
+        relay_migrating_tcp_stream(
+            local,
+            &context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec::new(TargetAddr::Ip(address), TrafficClass::Latency),
+            opened,
+            None,
+        )
+        .await
+    });
+    let feedback = tokio::spawn(async move {
+        while let Some(command) = recv_reliable_path_command(&mut receivers).await {
+            receivers.release_pending_command_bytes(
+                crate::runtime::path::commands::reliable_path_command_pending_bytes(&command),
+            );
+        }
+    });
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: Bytes::from_static(b"retained"),
+        }))
+        .await
+        .unwrap();
+    control.wait_blocked().await;
+    // The carrier consumes wire DETACH and forwards this ordered retirement
+    // event to an already opened logical attachment.
+    frames_tx
+        .send(Err(RuntimeError::ReliablePathRetired))
+        .await
+        .unwrap();
+    let completion = tokio::time::timeout(Duration::from_secs(2), async {
+        // Dropping the exact input forwarder proves the retirement event was
+        // consumed; releasing the sink only afterward tests disconnected I/O.
+        frames_tx.closed().await;
+        assert_eq!(control.accepted_bytes(), b"r");
+        control.release();
+        while control.accepted_bytes().len() < b"retained".len() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    relay.abort();
+    feedback.abort();
+    completion.expect("retired carrier must not own already-received delivery bytes");
+    assert_eq!(control.accepted_bytes(), b"retained");
 }
 
 #[tokio::test]

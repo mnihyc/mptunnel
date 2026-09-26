@@ -14,7 +14,9 @@ use crate::scheduler::PathSnapshot;
 use bytes::Bytes;
 use smallvec::SmallVec;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
+#[cfg(test)]
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 // Relay I/O orchestrates reads, writes, and feedback timing. It observes queue
 // counters but delegates product admission limits to their policy modules.
@@ -653,6 +655,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(in crate::runtime) async fn write_delivered_payloads<S>(
     local: &mut S,
     delivered: &[Bytes],
@@ -735,12 +738,12 @@ impl<T> ReadyStreamDataBatch<T> {
         }
     }
 
-    #[cfg(any(test, feature = "lab-diagnostics"))]
+    #[cfg(test)]
     pub(in crate::runtime) fn len(&self) -> usize {
         self.items.len()
     }
 
-    #[cfg(any(test, feature = "lab-diagnostics"))]
+    #[cfg(test)]
     pub(in crate::runtime) fn payload_bytes(&self) -> usize {
         self.payload_bytes
     }
@@ -790,8 +793,8 @@ pub(in crate::runtime) enum ReadyStreamDataDirection {
     ServerUpload,
 }
 
+#[cfg(all(test, feature = "lab-diagnostics"))]
 impl ReadyStreamDataDirection {
-    #[cfg(feature = "lab-diagnostics")]
     fn metric(self) -> &'static str {
         match self {
             Self::ClientDownload => "relay.ready_stream_data_batch.client_download",
@@ -799,7 +802,6 @@ impl ReadyStreamDataDirection {
         }
     }
 
-    #[cfg(feature = "lab-diagnostics")]
     fn label(self) -> &'static str {
         match self {
             Self::ClientDownload => "client_download",
@@ -811,25 +813,25 @@ impl ReadyStreamDataDirection {
 /// Receive-state application completed for one ready batch, while local
 /// delivery remains pending.
 ///
-/// The receive actor may inspect `has_apply_error` before it constructs the
-/// single local-write future.  The deferred error remains owned here so the
-/// write/flush phase preserves the existing rule that an I/O error takes
-/// precedence after every successfully applied prefix has been delivered.
-#[must_use = "an applied ready batch must be completed by its write/flush phase"]
+/// The deferred error remains owned here so the delivery owner can report it
+/// after every successfully applied prefix has been transferred.
+#[must_use = "an applied ready batch state must be consumed by its delivery owner"]
 pub(in crate::runtime) struct ReadyStreamDataBatchApplyState {
     apply_error: Option<RuntimeError>,
+    #[cfg(test)]
     flush_empty: bool,
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     direction: ReadyStreamDataDirection,
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     source_frames: usize,
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     source_payload_bytes: usize,
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     batch_started: Instant,
 }
 
 impl ReadyStreamDataBatchApplyState {
+    #[cfg(test)]
     pub(in crate::runtime) fn has_apply_error(&self) -> bool {
         self.apply_error.is_some()
     }
@@ -920,20 +922,20 @@ where
 pub(in crate::runtime) fn apply_ready_stream_data_batch<T, A>(
     recv_stream: &mut ReliableRecvStream,
     batch: &mut ReadyStreamDataBatch<T>,
-    direction: ReadyStreamDataDirection,
+    _direction: ReadyStreamDataDirection,
     flush_empty: bool,
     mut apply: A,
 ) -> ReadyStreamDataBatchApplyState
 where
     A: FnMut(&mut ReliableRecvStream, T) -> Result<ReceiveOutcome, RuntimeError>,
 {
-    #[cfg(not(feature = "lab-diagnostics"))]
-    let _ = direction;
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(not(test))]
+    let _ = flush_empty;
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     let batch_started = Instant::now();
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     let source_frames = batch.len();
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     let source_payload_bytes = batch.payload_bytes();
     let mut apply_error = None;
     {
@@ -953,14 +955,15 @@ where
 
     ReadyStreamDataBatchApplyState {
         apply_error,
+        #[cfg(test)]
         flush_empty,
-        #[cfg(feature = "lab-diagnostics")]
-        direction,
-        #[cfg(feature = "lab-diagnostics")]
+        #[cfg(all(test, feature = "lab-diagnostics"))]
+        direction: _direction,
+        #[cfg(all(test, feature = "lab-diagnostics"))]
         source_frames,
-        #[cfg(feature = "lab-diagnostics")]
+        #[cfg(all(test, feature = "lab-diagnostics"))]
         source_payload_bytes,
-        #[cfg(feature = "lab-diagnostics")]
+        #[cfg(all(test, feature = "lab-diagnostics"))]
         batch_started,
     }
 }
@@ -969,6 +972,7 @@ where
 /// ready batch. Callers that interleave protocol control while local delivery
 /// is pending must construct this future once and keep polling that same
 /// future; rebuilding it after a partial write would duplicate payload.
+#[cfg(test)]
 pub(in crate::runtime) async fn write_applied_ready_stream_data_batch<S, T>(
     local: &mut S,
     batch: &mut ReadyStreamDataBatch<T>,
@@ -980,17 +984,17 @@ where
     let ReadyStreamDataBatchApplyState {
         apply_error,
         flush_empty,
-        #[cfg(feature = "lab-diagnostics")]
+        #[cfg(all(test, feature = "lab-diagnostics"))]
         direction,
-        #[cfg(feature = "lab-diagnostics")]
+        #[cfg(all(test, feature = "lab-diagnostics"))]
         source_frames,
-        #[cfg(feature = "lab-diagnostics")]
+        #[cfg(all(test, feature = "lab-diagnostics"))]
         source_payload_bytes,
-        #[cfg(feature = "lab-diagnostics")]
+        #[cfg(all(test, feature = "lab-diagnostics"))]
         batch_started,
     } = applied;
 
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     let write_started = Instant::now();
     let delivered_bytes = match write_delivered_payloads(local, batch.delivered.as_slice()).await {
         Ok(delivered_bytes) => delivered_bytes,
@@ -1000,28 +1004,28 @@ where
             return Err(RuntimeError::Io(err));
         }
     };
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     crate::lab_diagnostics::lab_perf_record(
         "relay.local_write_wait",
         write_started.elapsed(),
         delivered_bytes,
     );
     if !batch.delivered.is_empty() || (flush_empty && apply_error.is_none()) {
-        #[cfg(feature = "lab-diagnostics")]
+        #[cfg(all(test, feature = "lab-diagnostics"))]
         let flush_started = Instant::now();
         if let Err(err) = local.flush().await {
             batch.delivered.clear();
             batch.payload_bytes = 0;
             return Err(RuntimeError::Io(err));
         }
-        #[cfg(feature = "lab-diagnostics")]
+        #[cfg(all(test, feature = "lab-diagnostics"))]
         crate::lab_diagnostics::lab_perf_record(
             "relay.local_flush_wait",
             flush_started.elapsed(),
             0,
         );
     }
-    #[cfg(feature = "lab-diagnostics")]
+    #[cfg(all(test, feature = "lab-diagnostics"))]
     if source_frames > 1 && apply_error.is_none() {
         crate::lab_diagnostics::lab_perf_record(
             direction.metric(),

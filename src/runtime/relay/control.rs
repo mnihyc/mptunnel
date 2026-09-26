@@ -3,6 +3,7 @@ use super::client::{
     ClientStreamAckContext, apply_client_stream_ack, apply_client_stream_data_state,
     evaluate_client_data_ack_reinjection, update_request_path_staleness,
 };
+use super::client_delivery::{recv_progress_send, remote_fin_delivery_ready};
 use super::diagnostics::log_unexpected_stream_relay_frame;
 use super::flow::{
     ReliableRelayFlowDemandTracker, ReliableRelayFlowPathEvidence, ReliableRelayFlowSignals,
@@ -10,10 +11,9 @@ use super::flow::{
 use super::io::{
     AuthoritativeStreamAckSnapshot, ReadyStreamDataBatchBounds, ReadyStreamDataDirection,
     accepted_copy_wake_is_due, apply_ready_stream_data_batch, collect_ready_stream_data_batch,
-    pending_stream_fin_ready, read_reliable_relay_payload, receive_stream_fin,
-    reconcile_accepted_copy_wake, retain_accepted_copy_wake,
-    stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
-    stream_terminal_fin_replay_required, write_applied_ready_stream_data_batch,
+    read_reliable_relay_payload, receive_stream_fin, reconcile_accepted_copy_wake,
+    retain_accepted_copy_wake, stream_ack_ranges_expose_authoritative_gap,
+    stream_data_range_already_delivered, stream_terminal_fin_replay_required,
 };
 use super::lifecycle::{
     ClientReliableReturnPlan, RelayAdditionalPathOpenResult,
@@ -36,6 +36,7 @@ use super::remote::{
     ReliableRelayAttachInput, ReliableRelayAttachMode, ReliableRelayAttachPlan,
     ReliableRelayPathLanes,
 };
+use super::server_delivery::ServerTargetIo;
 use super::service::{RelayServiceEvent, RelayServiceTurn};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
@@ -74,11 +75,10 @@ use crate::runtime::stream::{
 };
 use crate::runtime::telemetry::ObservedProductIo;
 use crate::scheduler::TrafficClass;
-use std::collections::VecDeque;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 /// Apply a finite Input quantum without changing ACK transaction or credit order.
@@ -320,69 +320,62 @@ pub(super) fn arm_request_path_staleness_model_publication(
     .then(|| context.arm_path_model_publication(observed_generation))
 }
 
-async fn commit_pending_remote_fin<S>(
-    local: &mut S,
+fn commit_pending_remote_fin(
+    delivery: &mut ServerTargetIo,
     state: &mut ClientRelayState,
     recv_stream: &ReliableRecvStream,
     feedback_published: bool,
-) -> Result<(), RuntimeError>
-where
-    S: AsyncWrite + Unpin,
-{
+) -> bool {
     if feedback_published
-        && pending_stream_fin_ready(recv_stream, state.endpoint.pending_remote_fin_offset)
+        && remote_fin_delivery_ready(
+            delivery,
+            recv_stream,
+            state.endpoint.pending_remote_fin_offset,
+        )
     {
-        local.shutdown().await.map_err(RuntimeError::Io)?;
-        state.record_remote_finished();
+        delivery.request_shutdown();
+        state.progress.sender_retry_at = None;
+        true
+    } else {
+        false
     }
-    Ok(())
 }
 
 /// Completes the same remote-FIN transition after a retained receive ACK wins
 /// carrier admission that the immediate FIN path completes on first publish.
-fn commit_published_feedback_and_ready_fin<'a, S>(
-    local: &'a mut S,
-    state: &'a mut ClientRelayState,
-    recv_stream: &'a mut ReliableRecvStream,
+fn commit_published_feedback_and_ready_fin(
+    delivery: &mut ServerTargetIo,
+    state: &mut ClientRelayState,
+    recv_stream: &mut ReliableRecvStream,
     remotes: &ReliableRelayRemoteSet,
     publication: StreamFeedbackPublication,
-) -> impl Future<Output = Result<(), RuntimeError>> + use<'a, S>
-where
-    S: AsyncWrite + Unpin,
-{
+) {
     if let Some(published_offset) = publication.max_data.published_offset {
         recv_stream.commit_max_data(published_offset);
     }
     state.record_recv_progress_sent(publication);
-    let feedback_published = if publication.ack.published
-        && pending_stream_fin_ready(recv_stream, state.endpoint.pending_remote_fin_offset)
+    if publication.ack.published
+        && remotes.has_receive_feedback_output()
+        && remote_fin_delivery_ready(
+            delivery,
+            recv_stream,
+            state.endpoint.pending_remote_fin_offset,
+        )
     {
-        state.progress.sender_retry_at = None;
-        Some(remotes.has_receive_feedback_output())
-    } else {
-        None
-    };
-    // Publication is complete before this Product-free local-I/O future exists.
-    async move {
-        if let Some(feedback_published) = feedback_published {
-            commit_pending_remote_fin(local, state, recv_stream, feedback_published).await?;
-        }
-        Ok(())
+        commit_pending_remote_fin(delivery, state, recv_stream, true);
     }
 }
 
 #[cfg(test)]
-fn retry_stream_ack_and_commit_ready_fin<'a, S>(
-    local: &'a mut S,
-    state: &'a mut ClientRelayState,
-    recv_stream: &'a mut ReliableRecvStream,
+fn retry_stream_ack_and_commit_ready_fin(
+    delivery: &mut ServerTargetIo,
+    state: &mut ClientRelayState,
+    recv_stream: &mut ReliableRecvStream,
     remotes: &mut ReliableRelayRemoteSet,
-) -> impl Future<Output = Result<(), RuntimeError>> + use<'a, S>
-where
-    S: AsyncWrite + Unpin,
-{
+) -> Result<(), RuntimeError> {
     let publication = remotes.retry_pending_stream_ack();
-    commit_published_feedback_and_ready_fin(local, state, recv_stream, remotes, publication)
+    commit_published_feedback_and_ready_fin(delivery, state, recv_stream, remotes, publication);
+    Ok(())
 }
 
 fn client_relay_finished(
@@ -638,14 +631,6 @@ fn reliable_relay_topology_lane(
     }
 }
 
-// Deferral owns the complete open result across an async control boundary;
-// boxing would add allocation to every deferred additional-path open.
-#[allow(clippy::large_enum_variant)]
-enum PendingLocalWritePathOpen {
-    Applied(Option<ReliableRelayAttachMode>),
-    Deferred(RelayAdditionalPathOpenResult),
-}
-
 fn drive_client_response_startup_control(
     return_plan: &mut ClientReliableReturnPlan,
     stream_id: crate::protocol::StreamId,
@@ -731,6 +716,7 @@ fn apply_client_additional_path_open_postaction(
     context: &ClientPathContext,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
+    target_delivery: &ServerTargetIo,
     recv_stream: &mut ReliableRecvStream,
     state: &mut ClientRelayState,
     request_lane: TrafficClass,
@@ -744,12 +730,20 @@ fn apply_client_additional_path_open_postaction(
     }
     let response_path_snapshot =
         remotes.lowest_eta_path_snapshot(context, response_lane, PATH_OPEN_SCORE_BYTES);
+    let progress_send = recv_progress_send(
+        target_delivery,
+        recv_stream,
+        response_path_snapshot,
+        response_lane,
+        context.mux_limits,
+        true,
+    );
     match sender.send_recv_progress(
         remotes,
         context,
         recv_stream,
         &mut state.progress.recv_progress,
-        RelayRecvProgressSend::new(response_path_snapshot, response_lane, true),
+        progress_send,
     ) {
         Ok(sent) => state.record_recv_progress_sent(sent),
         Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -879,10 +873,11 @@ where
         spec.target.clone(),
     );
     let activity = ProductFlowActivity::new();
-    let mut local = ObservedProductIo::new(
+    let local = ObservedProductIo::new(
         ProductFlowActivityIo::new(local, activity.clone()),
         telemetry_flow.counter(),
     );
+    let (mut local_read, mut local_write) = tokio::io::split(local);
     let idle = activity.wait_until_idle(idle_timeout);
     tokio::pin!(idle);
     let mut send_stream =
@@ -895,6 +890,12 @@ where
     );
     let chunk_size =
         adaptive_reliable_relay_chunk_bytes(None, TrafficClass::Latency, context.mux_limits);
+    let delivery_chunk_size = reliable_relay_buffer_len(context.mux_limits).max(1);
+    let mut target_delivery = ServerTargetIo::new(
+        delivery_chunk_size,
+        usize::try_from(initial_recv_max_offset)
+            .map_err(|_| RuntimeError::Protocol("initial receive window does not fit usize"))?,
+    );
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
     let mut state = ClientRelayState::new();
     let sender = RequestSenderService::new_with_performance(stream_id, performance);
@@ -972,7 +973,7 @@ where
             if client_relay_finished(&state, send_stream, &recv_stream, sender_queue, remotes) {
                 break Ok(state.delivery.total);
             }
-            if remotes.is_empty() {
+            if remotes.is_empty() && deferred_remote_frame.is_none() {
                 let now = Instant::now();
                 let now_async = tokio::time::Instant::now();
                 let path_open_suppression_retry_at = state
@@ -1039,11 +1040,42 @@ where
         {
             // A withdrawn generation may still publish a terminal result.
             // Empty membership cannot disable the result channel while resting.
+            let target_flush_before = target_delivery.delivered_offset();
             tokio::select! {
+                result = tokio::task::coop::cooperative(poll_fn(|cx| target_delivery.poll_io(cx, &mut local_write))), if target_delivery.has_work() => {
+                    if let Err(err) = result {
+                        break Err(RuntimeError::Io(err));
+                    }
+                    let flushed_offset = target_delivery.delivered_offset();
+                    if flushed_offset > target_flush_before {
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "client_target_flush",
+                            format_args!(
+                                "stream_id={} receive_frontier={} flushed_offset={} pending_target_bytes={}",
+                                stream_id.0,
+                                recv_stream.next_offset(),
+                                flushed_offset,
+                                target_delivery.pending_bytes(),
+                            ),
+                        );
+                        let mut product_guard = request_product.lock();
+                        product_guard.remotes.observe_delivered_offset(flushed_offset);
+                    }
+                    if target_delivery.is_shutdown() && state.endpoint.remote_open {
+                        state.record_remote_finished();
+                    }
+                    continue;
+                }
+                frame = remote_input.recv_frame() => {
+                    match frame {
+                        Ok(frame) => deferred_remote_frame = Some(frame),
+                        Err(err) => break Err(err),
+                    }
+                    continue;
+                }
                 _ = tokio::time::sleep_until(retry_at), if no_pending_opens => continue,
                 additional_path_open = additional_path_open_rx.recv() => {
-                    let local_shutdown = {
-                    let mut local_shutdown = None;
                     let mut product_guard = request_product.lock();
                     let (sender, send_stream, remotes) = {
                         let product = &mut *product_guard;
@@ -1092,13 +1124,21 @@ where
                             response_lane,
                             PATH_OPEN_SCORE_BYTES,
                         );
-                        let recv_progress_send = if pending_stream_fin_ready(
+                        let recv_progress_send = if remote_fin_delivery_ready(
+                            &target_delivery,
                             &recv_stream,
                             state.endpoint.pending_remote_fin_offset,
                         ) {
                             RelayRecvProgressSend::final_ack(path_snapshot, response_lane)
                         } else {
-                            RelayRecvProgressSend::new(path_snapshot, response_lane, true)
+                            recv_progress_send(
+                                &target_delivery,
+                                &recv_stream,
+                                path_snapshot,
+                                response_lane,
+                                context.mux_limits,
+                                true,
+                            )
                         };
                         let progress_ready = match sender
                             .send_recv_progress(
@@ -1122,24 +1162,17 @@ where
                             }
                         } else {
                             state.recovery.disconnected = None;
-                            local_shutdown = Some(commit_pending_remote_fin(
-                                &mut local,
+                            commit_pending_remote_fin(
+                                &mut target_delivery,
                                 &mut state,
                                 &recv_stream,
                                 progress_ready,
-                            ));
+                            );
                         }
                     } else if state.recovery.pending_additional_path_opens.is_empty()
                         && let Some(disconnected) = state.recovery.disconnected.as_mut()
                     {
                         disconnected.retry_after(reliable_relay_disconnected_retry_delay());
-                    }
-                    local_shutdown
-                    };
-                    if let Some(local_shutdown) = local_shutdown
-                        && let Err(error) = local_shutdown.await
-                    {
-                        break Err(error);
                     }
                     continue;
                 }
@@ -1938,7 +1971,8 @@ where
                 // Any due range may need the existing native-capacity wake;
                 // the first missing byte alone no longer represents this set.
                 let retained_data_ack_recovery_due = data_ack_reinjection.due_recovery_work;
-                let pending_remote_fin_ready = pending_stream_fin_ready(
+                let pending_remote_fin_ready = remote_fin_delivery_ready(
+                    &target_delivery,
                     &recv_stream,
                     state.endpoint.pending_remote_fin_offset,
                 );
@@ -1949,14 +1983,14 @@ where
                     let capacity_wait =
                         arm_carrier_capacity_notifies(remotes.pending_feedback_capacity_notifies());
                     let publication = remotes.retry_pending_feedback_with_context(context);
-                    let local_shutdown = commit_published_feedback_and_ready_fin(
-                        &mut local,
+                    commit_published_feedback_and_ready_fin(
+                        &mut target_delivery,
                         &mut state,
                         &mut recv_stream,
                         remotes,
                         publication,
                     );
-                    Some((capacity_wait, local_shutdown))
+                    Some(capacity_wait)
                 } else {
                     None
                 };
@@ -1996,10 +2030,7 @@ where
                     pending_local_shutdown,
                 )
             };
-            if let Some((capacity_wait, local_shutdown)) = pending_local_shutdown {
-                if let Err(err) = local_shutdown.await {
-                    break Err(err);
-                }
+            if let Some(capacity_wait) = pending_local_shutdown {
                 let product = request_product.lock();
                 if product.remotes.has_pending_feedback_publication() {
                     stream_ack_capacity_wait = capacity_wait;
@@ -2257,6 +2288,7 @@ where
             // eligibility ends, without resetting it on ordinary select turns.
             send_buffer_updates.withdraw();
         }
+        let target_flush_before = target_delivery.delivered_offset();
         tokio::select! {
             () = &mut prepared_work_wait => {
                 // A real writer commit or source/eligibility change requires
@@ -2358,10 +2390,72 @@ where
                 // before assigning more OriginalData; native recovery continues.
                 continue;
             }
+            result = tokio::task::coop::cooperative(poll_fn(|cx| target_delivery.poll_io(cx, &mut local_write))), if target_delivery.has_work() => {
+                if let Err(err) = result {
+                    break Err(RuntimeError::Io(err));
+                }
+                let flushed_offset = target_delivery.delivered_offset();
+                if flushed_offset > target_flush_before {
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "client_target_flush",
+                        format_args!(
+                            "stream_id={} receive_frontier={} flushed_offset={} pending_target_bytes={}",
+                            stream_id.0,
+                            recv_stream.next_offset(),
+                            flushed_offset,
+                            target_delivery.pending_bytes(),
+                        ),
+                    );
+                    let mut product_guard = request_product.lock();
+                    let product = &mut *product_guard;
+                    let (sender, remotes) = (&mut product.sender, &mut product.remotes);
+                    remotes.observe_delivered_offset(flushed_offset);
+                    let response_path_snapshot = remotes.lowest_eta_path_snapshot(
+                        context,
+                        response_lane,
+                        PATH_OPEN_SCORE_BYTES,
+                    );
+                    let progress_send = recv_progress_send(
+                        &target_delivery,
+                        &recv_stream,
+                        response_path_snapshot,
+                        response_lane,
+                        context.mux_limits,
+                        false,
+                    );
+                    match sender.send_recv_progress(
+                        remotes,
+                        context,
+                        &mut recv_stream,
+                        &mut state.progress.recv_progress,
+                        progress_send,
+                    ) {
+                        Ok(publication) => state.record_recv_progress_sent(publication),
+                        Err(err) if reliable_path_error_is_migratable(&err) => {
+                            state.progress.sender_retry_at = None;
+                        }
+                        Err(err) => break Err(err),
+                    }
+                    if remotes.has_pending_feedback_publication() {
+                        let publication = remotes.retry_pending_feedback_with_context(context);
+                        commit_published_feedback_and_ready_fin(
+                            &mut target_delivery,
+                            &mut state,
+                            &mut recv_stream,
+                            remotes,
+                            publication,
+                        );
+                    }
+                }
+                if target_delivery.is_shutdown() && state.endpoint.remote_open {
+                    state.record_remote_finished();
+                }
+                continue;
+            }
             _ = std::future::ready(()), if pending_remote_fin_ready
                 && receive_feedback_output
                 && state.progress.sender_retry_at.is_none() => {
-                let local_shutdown = {
                 let mut product_guard = request_product.lock();
                 let (sender, remotes) = {
                     let product = &mut *product_guard;
@@ -2394,16 +2488,11 @@ where
                     Err(err) => break Err(err),
                 };
                 commit_pending_remote_fin(
-                    &mut local,
+                    &mut target_delivery,
                     &mut state,
                     &recv_stream,
                     feedback_published && remotes.has_receive_feedback_output(),
-                )
-                };
-                if let Err(err) = local_shutdown.await
-                {
-                    break Err(err);
-                }
+                );
             }
             _ = tokio::time::sleep_until(receive_hole_reinjection_deadline), if receive_hole_reinjection_active => {
                 let mut product_guard = request_product.lock();
@@ -2428,17 +2517,21 @@ where
                 );
                 state.progress.receive_hole_reinjection_attempts =
                     state.progress.receive_hole_reinjection_attempts.saturating_add(1);
+                let progress_send = recv_progress_send(
+                    &target_delivery,
+                    &recv_stream,
+                    response_path_snapshot,
+                    response_lane,
+                    context.mux_limits,
+                    true,
+                );
                 match sender
                     .send_recv_progress(
                         remotes,
                         context,
                         &mut recv_stream,
                         &mut state.progress.recv_progress,
-                        RelayRecvProgressSend::new(
-                            response_path_snapshot,
-                            response_lane,
-                            true,
-                        ),
+                        progress_send,
                     )
                 {
                     Ok(sent) => state.record_recv_progress_sent(sent),
@@ -2529,16 +2622,20 @@ where
                     if queued_existing_tail_reinjection {
                         state.progress.sender_retry_at = None;
                     }
+                    let progress_send = recv_progress_send(
+                        &target_delivery,
+                        &recv_stream,
+                        response_path_snapshot,
+                        response_lane,
+                        context.mux_limits,
+                        true,
+                    );
                     match sender.send_recv_progress(
                         remotes,
                         context,
                         &mut recv_stream,
                         &mut state.progress.recv_progress,
-                        RelayRecvProgressSend::new(
-                            response_path_snapshot,
-                            response_lane,
-                            true,
-                        ),
+                        progress_send,
                     )
                     {
                         Ok(sent) => state.record_recv_progress_sent(sent),
@@ -2620,12 +2717,20 @@ where
                     }
                     continue;
                 }
+                let progress_send = recv_progress_send(
+                    &target_delivery,
+                    &recv_stream,
+                    response_path_snapshot,
+                    response_lane,
+                    context.mux_limits,
+                    true,
+                );
                 match sender.send_recv_progress(
                     remotes,
                     context,
                     &mut recv_stream,
                     &mut state.progress.recv_progress,
-                    RelayRecvProgressSend::new(response_path_snapshot, response_lane, true),
+                    progress_send,
                 )
                 {
                     Ok(sent) => state.record_recv_progress_sent(sent),
@@ -2660,22 +2765,26 @@ where
                         Ok(attached) if attached > 0 => {
                             let mut product_guard = request_product.lock();
                             let product = &mut *product_guard;
-                            let (sender, send_stream, remotes) = (
-                                &mut product.sender, &mut product.send_stream, &mut product.remotes,
-                            );
+                                let (sender, send_stream, remotes) = (
+                                    &mut product.sender, &mut product.send_stream, &mut product.remotes,
+                                );
 
                                 send_stream.update_max_offset(remotes.max_offset());
+                                let progress_send = recv_progress_send(
+                                    &target_delivery,
+                                    &recv_stream,
+                                    response_path_snapshot,
+                                    response_lane,
+                                    context.mux_limits,
+                                    true,
+                                );
                                 match sender
                                     .send_recv_progress(
                                         remotes,
                                         context,
                                         &mut recv_stream,
                                         &mut state.progress.recv_progress,
-                                        RelayRecvProgressSend::new(
-                                            response_path_snapshot,
-                                            response_lane,
-                                            true,
-                                        ),
+                                        progress_send,
                                     )
                                 {
                                     Ok(sent) => state.record_recv_progress_sent(sent),
@@ -2725,7 +2834,14 @@ where
                     )
                 };
                 let recv_progress_send = if recv_progress_resend_active {
-                    RelayRecvProgressSend::new(response_path_snapshot, response_lane, true)
+                    recv_progress_send(
+                        &target_delivery,
+                        &recv_stream,
+                        response_path_snapshot,
+                        response_lane,
+                        context.mux_limits,
+                        true,
+                    )
                 } else {
                     RelayRecvProgressSend::ack_only(response_path_snapshot, response_lane)
                 };
@@ -3018,6 +3134,7 @@ where
                     context,
                     remotes,
                     send_stream,
+                    &target_delivery,
                     &mut recv_stream,
                     &mut state,
                     request_lane,
@@ -3040,7 +3157,7 @@ where
                     #[cfg(feature = "lab-diagnostics")]
                     let read_started = Instant::now();
                     let result = read_reliable_relay_payload(
-                        &mut local,
+                        &mut local_read,
                         &mut buf,
                         reserved_read_budget,
                         read_budget,
@@ -3304,7 +3421,7 @@ where
                                     let permit = context.session_send_buffer
                                         .reserve(&mut send_buffer_updates, next_read_budget).await;
                                     let result = read_reliable_relay_payload(
-                                        &mut local, &mut buf, permit.bytes(), next_read_budget,
+                                        &mut local_read, &mut buf, permit.bytes(), next_read_budget,
                                     ).await;
                                     (result, permit)
                                 }).await;
@@ -3450,7 +3567,12 @@ where
                                     context.session_id.0, stream_id.0, instance, token, max_offset, applied_max,
                                 ));
                                 product.remotes.observe_applied_peer_max_offset(applied_max);
-                                if let Err(error) = product.remotes.receive_feedback_probe(instance, token, max_offset) {
+                                if let Err(error) = product.remotes.receive_feedback_probe(
+                                    instance,
+                                    token,
+                                    max_offset,
+                                    recv_stream.next_offset(),
+                                ) {
                                     break Err(error);
                                 }
                                 stream_ack_capacity_wait = None;
@@ -3558,7 +3680,6 @@ where
                                 );
                                 debug_assert!(deferred_remote_frame.is_none());
                                 deferred_remote_frame = deferred;
-                                let mut data_effect = None;
                                 let applied = apply_ready_stream_data_batch(
                                     &mut recv_stream,
                                     &mut ready_remote_data,
@@ -3576,7 +3697,7 @@ where
                                             unreachable!("ready data batch contains only STREAM_DATA");
                                         };
                                         debug_assert_eq!(received_stream_id, stream_id);
-                                        let (effect, outcome) = apply_client_stream_data_state(
+                                        let outcome = apply_client_stream_data_state(
                                             &mut state,
                                             recv_stream,
                                             stream_id,
@@ -3584,51 +3705,45 @@ where
                                             offset,
                                             payload,
                                         )?;
-                                        data_effect = Some(effect);
                                         Ok(outcome)
                                     },
                                 );
-                                if applied.has_apply_error() {
-                                    // Client ready-batch collection admits only the exact
-                                    // contiguous stream, payload, final-offset, and
-                                    // published-credit geometry consumed by the callback.
-                                    // Its first fallible operation therefore precedes all
-                                    // receive-state mutation; a later-item error cannot
-                                    // follow an accepted prefix in this synchronous branch.
-                                    debug_assert!(data_effect.is_none());
-                                    if let Err(err) = write_applied_ready_stream_data_batch(
-                                        &mut local,
-                                        &mut ready_remote_data,
-                                        applied,
-                                    )
-                                    .await
-                                    {
-                                        break Err(err);
-                                    }
-                                    unreachable!("a deferred apply error must surface after its valid prefix write");
+                                if let Some(err) = applied.into_apply_error() {
+                                    // Collection admitted only validated contiguous frames. An
+                                    // apply error is therefore reported before any target bytes
+                                    // from this batch become owned by the durable cursor.
+                                    break Err(err);
+                                }
+                                let delivered = ready_remote_data.take_delivery();
+                                if delivered.is_empty() {
+                                    // Preserve the legacy flush boundary for an out-of-order
+                                    // frame that advanced ACK state but delivered no prefix.
+                                    target_delivery.request_empty_flush();
+                                } else if let Err(err) = target_delivery.append_batch(delivered) {
+                                    break Err(RuntimeError::Io(err));
                                 }
 
-                                {
+                                // Preserve immediate receipt ACKs before local delivery.
+                                // Only the later successful flush publishes new MAX_DATA.
                                 let mut product_guard = request_product.lock();
                                 let product = &mut *product_guard;
                                 let (sender, remotes) = (&mut product.sender, &mut product.remotes);
-                                let prewrite_response_path_snapshot = remotes.lowest_eta_path_snapshot(
+                                let response_path_snapshot = remotes.lowest_eta_path_snapshot(
                                     context,
                                     response_lane,
                                     PATH_OPEN_SCORE_BYTES,
                                 );
-                                match sender
-                                    .send_recv_progress(
-                                        remotes,
-                                        context,
-                                        &mut recv_stream,
-                                        &mut state.progress.recv_progress,
-                                        RelayRecvProgressSend::ack_only(
-                                            prewrite_response_path_snapshot,
-                                            response_lane,
-                                        ),
-                                    )
-                                {
+                                let progress_send = RelayRecvProgressSend::ack_only(
+                                    response_path_snapshot,
+                                    response_lane,
+                                );
+                                match sender.send_recv_progress(
+                                    remotes,
+                                    context,
+                                    &mut recv_stream,
+                                    &mut state.progress.recv_progress,
+                                    progress_send,
+                                ) {
                                     Ok(sent) => state.record_recv_progress_sent(sent),
                                     Err(err) if reliable_path_error_is_migratable(&err) => {
                                         state.progress.sender_retry_at = None;
@@ -3642,341 +3757,6 @@ where
                                     remotes,
                                     &mut state,
                                 ) {
-                                    break Err(err);
-                                }
-
-                                }
-                                let mut pending_write_path_opens = VecDeque::new();
-                                let write = {
-                                    let write = write_applied_ready_stream_data_batch(
-                                        &mut local,
-                                        &mut ready_remote_data,
-                                        applied,
-                                    );
-                                    tokio::pin!(write);
-                                    loop {
-                                        let (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, mut prepared_work_wait) = {
-                                        let mut product_guard = request_product.lock();
-                                        if let Some(error) = product_guard.prepared.pending_error.take() {
-                                            break Err(error);
-                                        }
-                                        publish_prepared_request_work(
-                                            &mut product_guard,
-                                            &request_product,
-                                            context,
-                                            request_lane,
-                                            adaptive_chunk,
-                                            false,
-                                        );
-                                        let applied_max = product_guard.send_stream.peer_max_offset();
-                                        let remotes = &mut product_guard.remotes;
-                                        remotes.observe_applied_peer_max_offset(applied_max);
-                                        if let Err(err) = drive_client_response_startup_control(
-                                            &mut return_plan,
-                                            stream_id,
-                                            recv_stream.next_offset(),
-                                            remotes,
-                                            &mut state,
-                                        ) {
-                                            break Err(err);
-                                        }
-
-                                        let stream_ack_pending =
-                                            remotes.has_pending_feedback_publication();
-                                        let stream_ack_capacity_wait = stream_ack_pending
-                                            .then(|| {
-                                                arm_carrier_capacity_notifies(
-                                                    remotes.pending_feedback_capacity_notifies(),
-                                                )
-                                            })
-                                            .flatten();
-                                        if stream_ack_pending {
-                                            let publication = remotes.retry_pending_feedback_with_context(context);
-                                            if let Some(published_offset) = publication.max_data.published_offset {
-                                                recv_stream.commit_max_data(published_offset);
-                                            }
-                                            state.record_recv_progress_sent(publication);
-                                        }
-                                        let stream_ack_blocked =
-                                            remotes.has_pending_feedback_publication();
-                                        let has_stream_ack_capacity_wait =
-                                            stream_ack_capacity_wait.is_some();
-
-                                        let return_plan_final_pending =
-                                            remotes.has_pending_return_plan_final_publication();
-                                        let return_plan_final_capacity_wait = return_plan_final_pending
-                                            .then(|| {
-                                                arm_carrier_capacity_notifies(
-                                                    remotes
-                                                        .pending_return_plan_final_capacity_notifies(),
-                                                )
-                                            })
-                                            .flatten();
-                                        if return_plan_final_pending {
-                                            remotes.retry_pending_return_plan_final();
-                                        }
-                                        let return_plan_final_blocked =
-                                            remotes.has_pending_return_plan_final_publication();
-                                        let has_return_plan_final_capacity_wait =
-                                            return_plan_final_capacity_wait.is_some();
-
-                                        let mut prepared_work_wait = Box::pin(
-                                            product_guard.prepared.work_changed.clone().notified_owned(),
-                                        );
-                                        prepared_work_wait.as_mut().enable();
-                                        (stream_ack_capacity_wait, stream_ack_blocked, has_stream_ack_capacity_wait, return_plan_final_capacity_wait, return_plan_final_blocked, has_return_plan_final_capacity_wait, prepared_work_wait)
-                                        };
-                                        tokio::select! {
-                                            biased;
-                                            result = &mut write => break result,
-                                            () = &mut prepared_work_wait => continue,
-                                            additional_path_open = additional_path_open_rx.recv() => {
-                                                let mut product_guard = request_product.lock();
-                                                let (sender, send_stream, remotes) = {
-                                                    let product = &mut *product_guard;
-                                                    (&mut product.sender, &mut product.send_stream, &mut product.remotes)
-                                                };
-                                                let Some(additional_path_open) = additional_path_open else {
-                                                    cancel_pending_additional_path_opens(
-                                                        stream_id,
-                                                        &mut state.recovery.pending_additional_path_opens,
-                                                    );
-                                                    continue;
-                                                };
-                                                // Stream-terminal authority is independent of local
-                                                // delivery and of the attachment attempt's generation.
-                                                if let Some(error) = additional_path_open.terminal_error() {
-                                                    break Err(error);
-                                                }
-                                                if additional_path_open.startup_ordinal.is_none() {
-                                                    if matching_additional_path_open_pending(
-                                                        &state.recovery.pending_additional_path_opens,
-                                                        additional_path_open.key,
-                                                        additional_path_open.generation,
-                                                    ) {
-                                                        pending_write_path_opens.push_back(
-                                                            PendingLocalWritePathOpen::Deferred(
-                                                                additional_path_open,
-                                                            ),
-                                                        );
-                                                    } else if let Ok(opened) = additional_path_open.result {
-                                                        opened.retire_uncommitted();
-                                                    }
-                                                    continue;
-                                                }
-                                                let attached_mode = match settle_matching_client_additional_path_open(
-                                                    stream_id,
-                                                    &mut state,
-                                                    &mut return_plan,
-                                                    remotes,
-                                                    send_stream,
-                                                    request_lane,
-                                                    additional_path_open,
-                                                    source_complete,
-                                                ) {
-                                                    Ok(mode) => mode,
-                                                    Err(err) => break Err(err),
-                                                };
-                                                let attached = attached_mode.is_some();
-                                                pending_write_path_opens.push_back(
-                                                    PendingLocalWritePathOpen::Applied(attached_mode),
-                                                );
-                                                if attached {
-                                                    let current_response_path_snapshot = remotes
-                                                        .lowest_eta_path_snapshot(
-                                                            context,
-                                                            response_lane,
-                                                            PATH_OPEN_SCORE_BYTES,
-                                                        );
-                                                    match sender
-                                                        .send_recv_progress(
-                                                            remotes,
-                                                            context,
-                                                            &mut recv_stream,
-                                                            &mut state.progress.recv_progress,
-                                                            RelayRecvProgressSend::ack_only(
-                                                                current_response_path_snapshot,
-                                                                response_lane,
-                                                            ),
-                                                        )
-                                                    {
-                                                        Ok(sent) => state.record_recv_progress_sent(sent),
-                                                        Err(err) if reliable_path_error_is_migratable(&err) => {
-                                                            state.progress.sender_retry_at = None;
-                                                        }
-                                                        Err(err) => break Err(err),
-                                                    }
-                                                }
-                                            }
-                                            _ = async move {
-                                                if let Some(wait) = stream_ack_capacity_wait {
-                                                    wait.await;
-                                                }
-                                            }, if stream_ack_blocked && has_stream_ack_capacity_wait => {
-                                                continue;
-                                            }
-                                            _ = async move {
-                                                if let Some(wait) = return_plan_final_capacity_wait {
-                                                    wait.await;
-                                                }
-                                            }, if return_plan_final_blocked && has_return_plan_final_capacity_wait => {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                };
-                                if let Err(err) = write {
-                                    break Err(err);
-                                }
-                                let data_effect = data_effect.expect("ready data batch contains its first frame");
-                                let pending_attach = {
-                                let mut product_guard = request_product.lock();
-                                let (sender_queue, sender, send_stream, remotes) = {
-                                    let product = &mut *product_guard;
-                                    (&mut product.sender_queue, &mut product.sender, &mut product.send_stream, &mut product.remotes)
-                                };
-
-                                let postactions = 'postactions: {
-                                    while let Some(open) = pending_write_path_opens.pop_front() {
-                                        let attached_mode = match open {
-                                            PendingLocalWritePathOpen::Applied(mode) => mode,
-                                            PendingLocalWritePathOpen::Deferred(additional_path_open) => {
-                                                match settle_matching_client_additional_path_open(
-                                                    stream_id,
-                                                    &mut state,
-                                                    &mut return_plan,
-                                                    remotes,
-                                                    send_stream,
-                                                    request_lane,
-                                                    additional_path_open,
-                                                    sender_queue.data_bytes() == 0,
-                                                ) {
-                                                    Ok(mode) => mode,
-                                                    Err(err) => break 'postactions Err(err),
-                                                }
-                                            }
-                                        };
-                                        if let Err(err) = apply_client_additional_path_open_postaction(
-                                            attached_mode,
-                                            sender,
-                                            sender_queue,
-                                            context,
-                                            remotes,
-                                            send_stream,
-                                            &mut recv_stream,
-                                            &mut state,
-                                            request_lane,
-                                            response_lane,
-                                        )
-                                        {
-                                            break 'postactions Err(err);
-                                        }
-                                    }
-                                    Ok(())
-                                };
-                                if let Err(err) = postactions {
-                                    break Err(err);
-                                }
-
-                                let mut pending_attach = None;
-                                let current_response_path_snapshot = remotes.lowest_eta_path_snapshot(
-                                    context,
-                                    response_lane,
-                                    PATH_OPEN_SCORE_BYTES,
-                                );
-                                match sender.send_recv_progress(
-                                    remotes,
-                                    context,
-                                    &mut recv_stream,
-                                    &mut state.progress.recv_progress,
-                                    RelayRecvProgressSend::new(
-                                        current_response_path_snapshot,
-                                        response_lane,
-                                        false,
-                                    ),
-                                )
-                                {
-                                    Ok(sent) => state.record_recv_progress_sent(sent),
-                                    Err(err) if reliable_path_error_is_migratable(&err) => {
-                                        if remotes.is_empty() {
-                                            continue;
-                                        }
-                                            let attach = begin_reliable_relay_attach_with_suppressions(
-                                                context,
-                                                &spec,
-                                                ReliableRelayPathLanes::new(response_lane, request_lane),
-                                                remotes,
-                                                ReliableRelayAttachInput::capture(
-                                                    send_stream,
-                                                    response_lane,
-                                                    context.mux_limits,
-                                                    source_complete,
-                                                    ReliableRelayAttachMode::Any,
-                                                ),
-                                                &state.recovery.path_open_suppressions,
-                                                &state.recovery.pending_additional_path_opens,
-                                            );
-                                        pending_attach = Some((attach, err));
-                                    }
-                                    Err(err) => break Err(err),
-                                }
-                                pending_attach
-                                };
-                                if let Some((attach, original_error)) = pending_attach {
-                                    match finish_request_attachment(context, &request_product, &mut return_plan, attach).await {
-                                        Ok(attached) if attached > 0 => {
-                                            state.progress.sender_retry_at = None;
-                                            state.progress.last_stream_at = Instant::now();
-                                        }
-                                        Ok(_) => break Err(original_error),
-                                        Err(error) => break Err(error),
-                                    }
-                                }
-                                let local_shutdown = {
-                                let mut product_guard = request_product.lock();
-                                let product = &mut *product_guard;
-                                let (sender, remotes) = (&mut product.sender, &mut product.remotes);
-                                let current_response_path_snapshot = remotes.lowest_eta_path_snapshot(
-                                    context,
-                                    response_lane,
-                                    PATH_OPEN_SCORE_BYTES,
-                                );
-                                if data_effect.fin_ready {
-                                    let feedback_published = match sender.send_recv_progress(
-                                        remotes,
-                                        context,
-                                        &mut recv_stream,
-                                        &mut state.progress.recv_progress,
-                                        RelayRecvProgressSend::final_ack(
-                                            current_response_path_snapshot,
-                                            response_lane,
-                                        ),
-                                    )
-                                    {
-                                        Ok(sent) => {
-                                            record_final_recv_progress_enqueue(
-                                                &mut state,
-                                                sent,
-                                                current_response_path_snapshot,
-                                            );
-                                            sent.ack.published
-                                        }
-                                        Err(err) if reliable_path_error_is_migratable(&err) => false,
-                                        Err(err) => break Err(err),
-                                    };
-                                    Some(commit_pending_remote_fin(
-                                        &mut local,
-                                        &mut state,
-                                        &recv_stream,
-                                        feedback_published && remotes.has_receive_feedback_output(),
-                                    ))
-                                } else {
-                                    None
-                                }
-                                };
-                                if let Some(local_shutdown) = local_shutdown
-                                    && let Err(err) = local_shutdown.await
-                                {
                                     break Err(err);
                                 }
                             }
@@ -4148,10 +3928,8 @@ where
                                 stream_id: fin_stream_id,
                                 final_offset,
                             } if fin_stream_id == stream_id => {
-                                let local_shutdown = {
                                 let mut product_guard = request_product.lock();
-                                let product = &mut *product_guard;
-                                let (sender, remotes) = (&mut product.sender, &mut product.remotes);
+                                let remotes = &mut product_guard.remotes;
                                 stream_ack_capacity_wait = None;
                                 state.progress.last_stream_at = Instant::now();
                                 return_plan.observe_response_terminal(
@@ -4163,7 +3941,7 @@ where
                                 }
                                 #[cfg(feature = "lab-diagnostics")]
                                 let receive_frontier = recv_stream.next_offset();
-                                let fin_ready = match receive_stream_fin(
+                                let _fin_ready = match receive_stream_fin(
                                     &recv_stream,
                                     &mut state.endpoint.pending_remote_fin_offset,
                                     final_offset,
@@ -4175,53 +3953,17 @@ where
                                 lab_diagnostic(
                                     "client_stream_fin_received",
                                     format_args!(
-                                        "stream_id={} final_offset={} receive_frontier_before={} pending_remote_fin_offset={:?} fin_ready={}",
+                                        "stream_id={} final_offset={} receive_frontier={} pending_remote_fin_offset={:?} receive_fin_ready={} flushed_target_offset={}",
                                         stream_id.0,
                                         final_offset,
                                         receive_frontier,
                                         state.endpoint.pending_remote_fin_offset,
-                                        fin_ready,
+                                        _fin_ready,
+                                        target_delivery.delivered_offset(),
                                     ),
                                 );
-                                if fin_ready {
-                                    state.progress.last_delivery_at = Instant::now();
-                                    let feedback_published = match sender.send_recv_progress(
-                                        remotes,
-                                        context,
-                                        &mut recv_stream,
-                                        &mut state.progress.recv_progress,
-                                        RelayRecvProgressSend::final_ack(
-                                            response_path_snapshot,
-                                            response_lane,
-                                        ),
-                                    )
-                                    {
-                                        Ok(sent) => {
-                                            record_final_recv_progress_enqueue(
-                                                &mut state,
-                                                sent,
-                                                response_path_snapshot,
-                                            );
-                                            sent.ack.published
-                                        }
-                                        Err(err) if reliable_path_error_is_migratable(&err) => false,
-                                        Err(err) => break Err(err),
-                                    };
-                                    Some(commit_pending_remote_fin(
-                                        &mut local,
-                                        &mut state,
-                                        &recv_stream,
-                                        feedback_published && remotes.has_receive_feedback_output(),
-                                    ))
-                                } else {
-                                    None
-                                }
-                                };
-                                if let Some(local_shutdown) = local_shutdown
-                                    && let Err(err) = local_shutdown.await
-                                {
-                                    break Err(err);
-                                }
+                                // Final ACK and target half-close are sequenced by the
+                                // outer loop only after this final offset is flushed.
                             }
                             Frame::StreamReset {
                                 stream_id: reset_stream_id,
@@ -4238,17 +3980,21 @@ where
                                 let mut product_guard = request_product.lock();
                                 let product = &mut *product_guard;
                                 let (sender, remotes) = (&mut product.sender, &mut product.remotes);
+                                let progress_send = recv_progress_send(
+                                    &target_delivery,
+                                    &recv_stream,
+                                    response_path_snapshot,
+                                    response_lane,
+                                    context.mux_limits,
+                                    true,
+                                );
                                 match sender
                                     .send_recv_progress(
                                         remotes,
                                         context,
                                         &mut recv_stream,
                                         &mut state.progress.recv_progress,
-                                        RelayRecvProgressSend::new(
-                                            response_path_snapshot,
-                                            response_lane,
-                                            true,
-                                        ),
+                                        progress_send,
                                     )
                                 {
                                     Ok(sent) => state.record_recv_progress_sent(sent),

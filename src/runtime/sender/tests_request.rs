@@ -3644,6 +3644,18 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
         .expect("receive response bytes");
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
+    let recv_progress_send = RelayRecvProgressSend::new(
+        None,
+        TrafficClass::Throughput,
+        false,
+        recv_stream.max_data_offset_with_window(
+            crate::model::capacity::reliable_stream_advertised_window_bytes(
+                None,
+                TrafficClass::Throughput,
+                MuxLimits::default(),
+            ),
+        ),
+    );
 
     let sent = sender
         .send_recv_progress(
@@ -3651,7 +3663,7 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
             &context,
             &mut recv_stream,
             &mut progress,
-            RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
+            recv_progress_send,
         )
         .expect("recv progress backpressure should not close the product stream");
 
@@ -3943,6 +3955,18 @@ async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
         ReliableRecvStream::new_with_initial_max_offset(stream_id, MuxLimits::default(), 0);
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
+    let recv_progress_send = RelayRecvProgressSend::new(
+        None,
+        TrafficClass::Throughput,
+        false,
+        recv_stream.max_data_offset_with_window(
+            crate::model::capacity::reliable_stream_advertised_window_bytes(
+                None,
+                TrafficClass::Throughput,
+                MuxLimits::default(),
+            ),
+        ),
+    );
 
     let sent = sender
         .send_recv_progress(
@@ -3950,7 +3974,7 @@ async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
             &context,
             &mut recv_stream,
             &mut progress,
-            RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
+            recv_progress_send,
         )
         .expect("blocked MAX_DATA publication is retryable");
 
@@ -4020,6 +4044,18 @@ async fn client_max_data_retries_only_the_blocked_attachment() {
         ReliableRecvStream::new_with_initial_max_offset(stream_id, MuxLimits::default(), 0);
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
+    let recv_progress_send = RelayRecvProgressSend::new(
+        None,
+        TrafficClass::Throughput,
+        false,
+        recv_stream.max_data_offset_with_window(
+            crate::model::capacity::reliable_stream_advertised_window_bytes(
+                None,
+                TrafficClass::Throughput,
+                MuxLimits::default(),
+            ),
+        ),
+    );
 
     assert!(
         sender
@@ -4028,7 +4064,7 @@ async fn client_max_data_retries_only_the_blocked_attachment() {
                 &context,
                 &mut recv_stream,
                 &mut progress,
-                RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
+                recv_progress_send,
             )
             .expect("one live attachment publishes shared credit")
             .max_data
@@ -4123,6 +4159,18 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
         .expect("receive response bytes");
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
+    let recv_progress_send = RelayRecvProgressSend::new(
+        None,
+        TrafficClass::Throughput,
+        false,
+        recv_stream.max_data_offset_with_window(
+            crate::model::capacity::reliable_stream_advertised_window_bytes(
+                None,
+                TrafficClass::Throughput,
+                MuxLimits::default(),
+            ),
+        ),
+    );
 
     let sent = sender
         .send_recv_progress(
@@ -4130,7 +4178,7 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
             &context,
             &mut recv_stream,
             &mut progress,
-            RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
+            recv_progress_send,
         )
         .expect("available alternate control queue should accept recv progress");
 

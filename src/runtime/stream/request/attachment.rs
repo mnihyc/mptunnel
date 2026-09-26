@@ -473,18 +473,23 @@ pub(in crate::runtime) struct ReliableRelayRemotePath {
 
 #[derive(Debug, Default)]
 struct ClientFeedbackReceipt {
-    latest: Option<(u64, u64)>,
+    latest: Option<(u64, u64, u64)>,
     pending: bool,
 }
 
 impl ClientFeedbackReceipt {
-    fn observe(&mut self, token: u64, max_offset: u64) -> Result<(), RuntimeError> {
-        if let Some((latest, required)) = self.latest {
+    fn observe(
+        &mut self,
+        token: u64,
+        max_offset: u64,
+        required_delivery_offset: u64,
+    ) -> Result<(), RuntimeError> {
+        if let Some((latest, required_max_offset, _)) = self.latest {
             if token < latest {
                 return Ok(());
             }
             if token == latest {
-                return if max_offset == required {
+                return if max_offset == required_max_offset {
                     Ok(())
                 } else {
                     Err(RuntimeError::Protocol(
@@ -493,19 +498,23 @@ impl ClientFeedbackReceipt {
                 };
             }
         }
-        self.latest = Some((token, max_offset));
+        self.latest = Some((token, max_offset, required_delivery_offset));
         self.pending = true;
         Ok(())
     }
 
-    fn ready(&self, applied_max_offset: u64) -> Option<u64> {
-        self.latest.and_then(|(token, required)| {
-            (self.pending && applied_max_offset >= required).then_some(token)
-        })
+    fn ready(&self, applied_max_offset: u64, delivered_offset: u64) -> Option<u64> {
+        self.latest
+            .and_then(|(token, required_max_offset, required_delivery_offset)| {
+                (self.pending
+                    && applied_max_offset >= required_max_offset
+                    && delivered_offset >= required_delivery_offset)
+                    .then_some(token)
+            })
     }
 
     fn admitted(&mut self, token: u64) {
-        if self.latest.is_some_and(|(latest, _)| latest == token) {
+        if self.latest.is_some_and(|(latest, _, _)| latest == token) {
             self.pending = false;
         }
     }
@@ -924,6 +933,9 @@ pub(in crate::runtime) struct ReliableRelayRemoteSet {
     feedback_diagnostic_scope: Option<(crate::protocol::SessionId, StreamId)>,
     /// Applied only by the logical send owner, never by a probe or decoder.
     applied_peer_max_offset: u64,
+    /// Greatest local receive offset whose target write and flush completed.
+    /// Feedback probe receipts cannot pass this independent delivery fence.
+    applied_local_delivery_offset: u64,
     /// Immutable startup receipt retained until response bytes above `h` or a
     /// response terminal proves the peer no longer needs a retry.
     desired_return_plan_final: Option<Vec<u8>>,
@@ -1069,6 +1081,7 @@ impl ReliableRelayRemoteSet {
             #[cfg(feature = "lab-diagnostics")]
             feedback_diagnostic_scope: None,
             applied_peer_max_offset: 0,
+            applied_local_delivery_offset: 0,
             desired_return_plan_final: None,
             pending_requalification_ack: None,
             latest_requalification_ack: None,
@@ -1416,12 +1429,19 @@ impl ReliableRelayRemoteSet {
         self.applied_peer_max_offset = self.applied_peer_max_offset.max(offset);
     }
 
+    /// Called by the logical receive owner after local target delivery is
+    /// flushed. This frontier is monotone and distinct from peer MAX credit.
+    pub(in crate::runtime) fn observe_delivered_offset(&mut self, offset: u64) {
+        self.applied_local_delivery_offset = self.applied_local_delivery_offset.max(offset);
+    }
+
     /// Called only after the logical owner has applied preceding ACK frames.
     pub(in crate::runtime) fn receive_feedback_probe(
         &mut self,
         instance: RelayPathInstance,
         token: u64,
         required_max_offset: u64,
+        required_delivery_offset: u64,
     ) -> Result<(), RuntimeError> {
         let Some(path) = self
             .paths
@@ -1435,15 +1455,22 @@ impl ReliableRelayRemoteSet {
         }
         #[cfg(feature = "lab-diagnostics")]
         let previous = path.feedback_receipt.latest;
-        let result = path.feedback_receipt.observe(token, required_max_offset);
+        let result =
+            path.feedback_receipt
+                .observe(token, required_max_offset, required_delivery_offset);
         #[cfg(feature = "lab-diagnostics")]
         if result.is_ok() && path.feedback_receipt.latest != previous {
             super::super::feedback::lab_feedback_return(
                 self.feedback_diagnostic_scope,
                 "reply_bound",
                 format_args!(
-                    "output={:?} token={} required_max_offset={} applied_peer_max_offset={}",
-                    instance, token, required_max_offset, self.applied_peer_max_offset,
+                    "output={:?} token={} required_max_offset={} required_delivery_offset={} applied_peer_max_offset={} applied_local_delivery_offset={}",
+                    instance,
+                    token,
+                    required_max_offset,
+                    required_delivery_offset,
+                    self.applied_peer_max_offset,
+                    self.applied_local_delivery_offset,
                 ),
             );
         }
@@ -1458,7 +1485,10 @@ impl ReliableRelayRemoteSet {
                 || path.published_max_data_offset < self.desired_feedback.max_data_offset)
                 || path
                     .feedback_receipt
-                    .ready(self.applied_peer_max_offset)
+                    .ready(
+                        self.applied_peer_max_offset,
+                        self.applied_local_delivery_offset,
+                    )
                     .is_some())
     }
 
@@ -1489,7 +1519,10 @@ impl ReliableRelayRemoteSet {
                 stream_id,
                 &mut path.published_max_data_offset,
                 StreamFeedbackService {
-                    receipt: path.feedback_receipt.ready(self.applied_peer_max_offset),
+                    receipt: path.feedback_receipt.ready(
+                        self.applied_peer_max_offset,
+                        self.applied_local_delivery_offset,
+                    ),
                 },
                 |frame| path.stream.try_enqueue_request_control_frame(frame).is_ok(),
             );
@@ -1499,11 +1532,15 @@ impl ReliableRelayRemoteSet {
                     self.feedback_diagnostic_scope,
                     "reply_admitted",
                     format_args!(
-                        "output={:?} token={} required_max_offset={:?} applied_peer_max_offset={}",
+                        "output={:?} token={} required_max_offset={:?} required_delivery_offset={:?} applied_peer_max_offset={} applied_local_delivery_offset={}",
                         instance,
                         token,
-                        path.feedback_receipt.latest.map(|(_, required)| required),
+                        path.feedback_receipt.latest.map(|(_, max, _)| max),
+                        path.feedback_receipt
+                            .latest
+                            .map(|(_, _, delivery)| delivery),
                         self.applied_peer_max_offset,
+                        self.applied_local_delivery_offset,
                     ),
                 );
                 path.feedback_receipt.admitted(token);

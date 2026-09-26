@@ -3,10 +3,9 @@
 //! This module decides when connection-level Data ACK and receive-window
 //! updates are due. Carrier ACK and loss recovery remain owned by TCP or QUIC.
 
-use crate::model::capacity::{
-    QUIC_TIMER_GRANULARITY, reliable_stream_ack_update_bytes,
-    reliable_stream_advertised_window_bytes,
-};
+#[cfg(test)]
+use crate::model::capacity::reliable_stream_advertised_window_bytes;
+use crate::model::capacity::{QUIC_TIMER_GRANULARITY, reliable_stream_ack_update_bytes};
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableRecvStream;
@@ -314,6 +313,7 @@ impl ReliableRecvProgress {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn should_send_max_data(
         &mut self,
         recv_stream: &ReliableRecvStream,

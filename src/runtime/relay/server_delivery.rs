@@ -321,6 +321,20 @@ impl ServerTargetIo {
         self.shutdown_requested = true;
     }
 
+    pub(super) fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    /// Preserve the legacy idle empty-batch flush. Pending DATA already owns a
+    /// flush at its next quantum/drain boundary, so an empty receive coalesces
+    /// with that work instead of splitting an in-progress delivery quantum.
+    pub(super) fn request_empty_flush(&mut self) {
+        if !self.shutdown_requested && !self.shutdown && self.delivery.is_empty() {
+            self.flushing = true;
+            self.delivery.flush_pending = true;
+        }
+    }
+
     pub(super) fn is_shutdown(&self) -> bool {
         self.shutdown
     }
@@ -960,6 +974,81 @@ mod tests {
             writer.flush_polls, 6,
             "five quantum flushes, one initially pending"
         );
+        assert!(!target.has_work());
+    }
+
+    #[test]
+    fn empty_batch_does_not_split_a_backlogged_delivery_quantum() {
+        let mut target = ServerTargetIo::new(4, 64);
+        target
+            .append_batch(smallvec![Bytes::from_static(b"abcdefgh")])
+            .unwrap();
+        let mut writer = Writer {
+            steps: [
+                WriteStep::Accept(1),
+                WriteStep::Accept(1),
+                WriteStep::Accept(1),
+                WriteStep::Accept(1),
+            ]
+            .into(),
+            ..Writer::default()
+        };
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            target.poll_io(&mut cx, &mut writer),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(target.delivery.delivered_offset(), 1);
+        assert_eq!(target.delivered_offset(), 0);
+        assert_eq!(writer.flush_polls, 0);
+
+        // This models an empty/out-of-order DATA receive while the older
+        // contiguous delivery is still pending. The pre-owner actor could not
+        // consume that receive until its current write+flush had completed, so
+        // an empty-batch flush must not split the in-progress target quantum.
+        target.request_empty_flush();
+
+        assert!(matches!(
+            target.poll_io(&mut cx, &mut writer),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(target.delivery.delivered_offset(), 2);
+        assert_eq!(target.delivered_offset(), 0);
+        assert_eq!(
+            writer.flush_polls, 0,
+            "an empty receive batch must not force an early flush of older queued DATA"
+        );
+
+        for written in [3, 4] {
+            assert!(matches!(
+                target.poll_io(&mut cx, &mut writer),
+                Poll::Ready(Ok(()))
+            ));
+            if written < 4 {
+                assert_eq!(target.delivered_offset(), 0);
+                assert_eq!(writer.flush_polls, 0);
+            }
+        }
+        assert_eq!(target.delivery.delivered_offset(), 4);
+        assert_eq!(target.delivered_offset(), 4);
+        assert_eq!(writer.flush_polls, 1);
+        assert_eq!(target.pending_bytes(), 4);
+    }
+
+    #[test]
+    fn idle_empty_batch_still_requests_a_flush() {
+        let mut target = ServerTargetIo::new(4, 64);
+        target.request_empty_flush();
+        let mut writer = Writer::default();
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            target.poll_io(&mut cx, &mut writer),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(writer.flush_polls, 1);
+        assert_eq!(target.delivered_offset(), 0);
         assert!(!target.has_work());
     }
 }

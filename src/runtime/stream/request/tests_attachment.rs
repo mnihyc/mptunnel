@@ -282,27 +282,46 @@ async fn client_feedback_fanout_preserves_blocked_sibling_and_replacement() {
 }
 
 #[tokio::test]
-async fn client_feedback_reply_retains_one_exact_output_and_waits_for_applied_credit() {
+async fn client_feedback_reply_waits_for_peer_credit_and_local_delivery_fence() {
     let stream_id = StreamId(820);
     let (opened, _input, mut commands) = opened_stream_at_with_command_capacity(stream_id, 0, 1);
     let (mut remotes, _remote_input) = ReliableRelayRemoteSet::new(opened, 4);
     let old = remotes.paths[0].instance();
     // The initial PathProof occupies the sole ordinary-priority slot.
-    remotes.receive_feedback_probe(old, 10, 5).unwrap();
+    remotes.receive_feedback_probe(old, 10, 5, 3).unwrap();
     remotes.retry_pending_stream_ack();
     assert!(
         !remotes.has_pending_feedback_publication(),
-        "unapplied MAX is not queue capacity debt"
+        "neither unapplied MAX nor undelivered bytes make a receipt ready"
     );
     remotes.observe_applied_peer_max_offset(5);
     remotes.retry_pending_stream_ack();
+    assert!(
+        !remotes.has_pending_feedback_publication(),
+        "peer credit alone must not pass the local delivery fence"
+    );
+    remotes.observe_delivered_offset(3);
+    remotes.retry_pending_stream_ack();
     assert!(remotes.has_pending_feedback_publication());
-    remotes.receive_feedback_probe(old, 11, 6).unwrap();
-    assert!(remotes.receive_feedback_probe(old, 11, 7).is_err());
+    // A newer token supersedes the blocked reply. An exact duplicate retains
+    // the original local fence even if observed after more stream bytes.
+    remotes.receive_feedback_probe(old, 11, 6, 5).unwrap();
+    remotes.receive_feedback_probe(old, 11, 6, 99).unwrap();
+    assert!(remotes.receive_feedback_probe(old, 11, 7, 99).is_err());
     assert!(!remotes.has_pending_feedback_publication());
     let command = try_recv_reliable_path_command(&mut commands).unwrap();
     commands.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
     remotes.observe_applied_peer_max_offset(6);
+    remotes.retry_pending_stream_ack();
+    assert!(
+        !remotes.has_pending_feedback_publication(),
+        "applied peer MAX still cannot pass an unmet local delivery fence"
+    );
+    assert!(try_recv_reliable_path_command(&mut commands).is_none());
+    remotes.observe_delivered_offset(4);
+    remotes.retry_pending_stream_ack();
+    assert!(try_recv_reliable_path_command(&mut commands).is_none());
+    remotes.observe_delivered_offset(5);
     remotes.retry_pending_stream_ack();
     let command = try_recv_reliable_path_command(&mut commands).unwrap();
     commands.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
@@ -310,16 +329,20 @@ async fn client_feedback_reply_retains_one_exact_output_and_waits_for_applied_cr
         command,
         ReliablePathCommand::SendFrame(Frame::StreamFeedbackReceipt { token: 11, .. })
     ));
-    remotes.receive_feedback_probe(old, 11, 6).unwrap();
+    remotes.receive_feedback_probe(old, 11, 6, 99).unwrap();
     remotes.retry_pending_stream_ack();
     assert!(try_recv_reliable_path_command(&mut commands).is_none());
-    remotes.receive_feedback_probe(old, 12, 7).unwrap();
+    remotes.receive_feedback_probe(old, 10, 5, 99).unwrap();
+    remotes.retry_pending_stream_ack();
+    assert!(try_recv_reliable_path_command(&mut commands).is_none());
+    remotes.receive_feedback_probe(old, 12, 7, 9).unwrap();
     remotes.remove_path_instance(old).unwrap();
     let (replacement, _replacement_input, mut replacement_commands) =
         opened_stream_at(stream_id, 0);
     remotes.attach(replacement);
     remotes.observe_applied_peer_max_offset(7);
-    remotes.receive_feedback_probe(old, 12, 7).unwrap();
+    remotes.observe_delivered_offset(9);
+    remotes.receive_feedback_probe(old, 12, 7, 9).unwrap();
     remotes.retry_pending_stream_ack();
     while let Some(command) = try_recv_reliable_path_command(&mut replacement_commands) {
         assert!(

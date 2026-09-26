@@ -916,6 +916,29 @@
     return cell;
   }
 
+  function lossCellTitle(path, lossStale, ecnStale) {
+    const source = String(path.loss_source || "");
+    let meaning;
+    if (path.underlay === "tcp" && source === "tcp_info_bytes_retrans") {
+      meaning = "Approx. Windows TCP: retransmitted bytes / sent bytes over the latest counter interval";
+    } else if (path.underlay === "tcp" && source === "native_carrier") {
+      meaning = "Linux TCP: retransmitted / sent data segments accumulated since tracking began";
+    } else if (path.underlay === "tcp") {
+      meaning = "TCP retransmission ratio; units and interval depend on the reporting platform";
+    } else if (path.underlay === "udp") {
+      meaning = "QUIC: cumulative bytes declared lost / bytes sent";
+    } else {
+      meaning = "Transport loss ratio; units and interval depend on the carrier and source";
+    }
+    return [
+      meaning + "; not a physical packet-loss probability",
+      "Loss: " + (path.loss_source ? titleCase(path.loss_source) : "-") +
+        " (" + (lossStale ? "stale" : "current") + "); ECN: " +
+        (path.ecn_source ? titleCase(path.ecn_source) : "-") +
+        " (" + (ecnStale ? "stale" : "current") + ")"
+    ].join("\n");
+  }
+
   function localPathSortValue(column, entry) {
     const path = entry.path;
     const quality = entry.quality;
@@ -2085,12 +2108,7 @@
       path.loss_ppm, formatPpm, lossStale, path.loss_approximate === true
     )));
     loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, ecnStale)));
-    loss.title = [
-      "Loss / ECN",
-      "Loss source: " + (path.loss_source ? titleCase(path.loss_source) : "-"),
-      "Loss evidence: " + (lossStale ? "stale" : "current"),
-      "ECN evidence: " + (ecnStale ? "stale" : "current")
-    ].join("\n");
+    loss.title = lossCellTitle(path, lossStale, ecnStale);
     appendCell(row, "Loss", loss);
 
     appendCell(row, "Quality", nativeQualityCell(path, qualityValueObject));
@@ -2413,15 +2431,7 @@
       path.loss_ppm, formatPpm, lossStale, path.loss_approximate === true
     )));
     loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, ecnStale)));
-    loss.title = [
-      "Loss / ECN",
-      "Loss source: " + (path.loss_source ? titleCase(path.loss_source) : "-"),
-      "ECN source: " + (path.ecn_source ? titleCase(path.ecn_source) : "-"),
-      "Loss observed: " + formatOptionalFlag(path.loss_observed),
-      "ECN observed: " + formatOptionalFlag(path.ecn_observed),
-      "Loss evidence: " + (lossStale ? "stale" : "current"),
-      "ECN evidence: " + (ecnStale ? "stale" : "current")
-    ].join("\n");
+    loss.title = lossCellTitle(path, lossStale, ecnStale);
     appendCell(row, "Loss", loss);
 
     appendCell(row, "Quality", nativeQualityCell(path, qualityValueObject));

@@ -353,6 +353,15 @@ struct TcpCapacityProbeLeaseState {
     attempts: AtomicU8,
 }
 
+/// Internal synchronous hook for carrier-local state that must cross the
+/// lifecycle's drain linearization point. Implementations must not re-enter
+/// this command queue; the callback runs under the lifecycle transition lock.
+pub(in crate::runtime::path) trait ReliablePathDrainObserver:
+    Send + Sync
+{
+    fn begin_path_drain(&self);
+}
+
 /// One exact carrier-instance fence for new application work.
 ///
 /// The lifecycle check after queue reservation is the admission boundary.
@@ -362,10 +371,28 @@ struct TcpCapacityProbeLeaseState {
 struct ReliablePathCarrierLifecycle {
     phase: AtomicU8,
     // This lock is also the transition lock. Publishing Draining and recording
-    // its monotonic start are one transaction, so neither a competing failure
-    // nor a duplicate drain request can create or extend a retirement budget.
-    drain_started_at: Mutex<Option<tokio::time::Instant>>,
+    // its monotonic start are one transaction. The synchronous internal hook
+    // first fences exact-carrier liveness; lock order is lifecycle -> owner,
+    // and observers must never re-enter queue lifecycle while holding owner
+    // state. Neither a competing failure nor a duplicate request can extend
+    // the retirement budget.
+    drain_state: Mutex<ReliablePathCarrierDrainState>,
     changed: Notify,
+}
+
+#[derive(Default)]
+struct ReliablePathCarrierDrainState {
+    started_at: Option<tokio::time::Instant>,
+    observer: Option<Arc<dyn ReliablePathDrainObserver>>,
+}
+
+impl std::fmt::Debug for ReliablePathCarrierDrainState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReliablePathCarrierDrainState")
+            .field("started_at", &self.started_at)
+            .field("observer_registered", &self.observer.is_some())
+            .finish()
+    }
 }
 
 const RELIABLE_PATH_CARRIER_ACTIVE: u8 = 0;
@@ -397,7 +424,7 @@ impl Default for ReliablePathCarrierLifecycle {
     fn default() -> Self {
         Self {
             phase: AtomicU8::new(RELIABLE_PATH_CARRIER_ACTIVE),
-            drain_started_at: Mutex::new(None),
+            drain_state: Mutex::new(ReliablePathCarrierDrainState::default()),
             changed: Notify::new(),
         }
     }
@@ -421,12 +448,15 @@ impl ReliablePathCarrierLifecycle {
     }
 
     fn begin_drain(&self) {
-        let mut drain_started_at = self
-            .drain_started_at
+        let mut drain_state = self
+            .drain_state
             .lock()
             .expect("reliable path carrier lifecycle transition lock");
         if self.phase.load(Ordering::Acquire) == RELIABLE_PATH_CARRIER_ACTIVE {
-            *drain_started_at = Some(tokio::time::Instant::now());
+            if let Some(observer) = &drain_state.observer {
+                observer.begin_path_drain();
+            }
+            drain_state.started_at = Some(tokio::time::Instant::now());
             self.phase
                 .store(RELIABLE_PATH_CARRIER_DRAINING, Ordering::Release);
             self.changed.notify_waiters();
@@ -434,10 +464,21 @@ impl ReliablePathCarrierLifecycle {
     }
 
     fn drain_started_at(&self) -> Option<tokio::time::Instant> {
-        *self
-            .drain_started_at
+        self.drain_state
             .lock()
             .expect("reliable path carrier lifecycle transition lock")
+            .started_at
+    }
+
+    fn bind_drain_observer(&self, observer: Arc<dyn ReliablePathDrainObserver>) {
+        let mut drain_state = self
+            .drain_state
+            .lock()
+            .expect("reliable path carrier lifecycle transition lock");
+        drain_state.observer = Some(observer.clone());
+        if drain_state.started_at.is_some() {
+            observer.begin_path_drain();
+        }
     }
 
     fn is_terminal(&self) -> bool {
@@ -456,7 +497,7 @@ impl ReliablePathCarrierLifecycle {
 
     fn finish_failed(&self) {
         let _transition = self
-            .drain_started_at
+            .drain_state
             .lock()
             .expect("reliable path carrier lifecycle transition lock");
         if self.phase.load(Ordering::Acquire) < RELIABLE_PATH_CARRIER_TERMINAL_FAILED {
@@ -468,7 +509,7 @@ impl ReliablePathCarrierLifecycle {
 
     fn finish_planned_retirement(&self) -> bool {
         let _transition = self
-            .drain_started_at
+            .drain_state
             .lock()
             .expect("reliable path carrier lifecycle transition lock");
         let finished = self.phase.load(Ordering::Acquire) == RELIABLE_PATH_CARRIER_DRAINING;
@@ -862,6 +903,16 @@ impl ReliablePathCommandReceivers {
         ReliablePathDrainSignal {
             metrics: self.metrics.clone(),
         }
+    }
+
+    /// Binds the carrier-specific synchronous half of planned drain. The
+    /// observer is installed once for the queue lifetime and must not re-enter
+    /// queue lifecycle while invoked.
+    pub(in crate::runtime::path) fn bind_path_drain_observer(
+        &self,
+        observer: Arc<dyn ReliablePathDrainObserver>,
+    ) {
+        self.metrics.lifecycle.bind_drain_observer(observer);
     }
 
     pub(in crate::runtime) fn terminal_signal(&self) -> ReliablePathCarrierTerminalSignal {

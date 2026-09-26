@@ -56,7 +56,6 @@ fn observe_authenticated_server_tcp_frame(
     context: &ServerPathContext,
     heartbeat: &TcpCarrierHeartbeat,
 ) -> AuthenticatedFrameDisposition {
-    let decoded_at = tokio::time::Instant::now();
     let accepted_path_drain =
         matches!(frame, Frame::PathDrain { path_id: drain_path_id } if *drain_path_id == path_id);
     let accepted_session_close = matches!(frame, Frame::SessionClose { .. });
@@ -64,13 +63,10 @@ fn observe_authenticated_server_tcp_frame(
         // Publish only role-valid lifecycle intent before ordinary receive
         // expiry is evaluated. A mismatched PATH_DRAIN is merely activity and
         // cannot stop this exact carrier's heartbeat clock.
-        heartbeat.begin_drain_at(decoded_at);
+        heartbeat.begin_drain();
     }
-    let heartbeat_disposition = heartbeat.observe_authenticated_frame(
-        frame,
-        decoded_at,
-        crate::runtime::identity::random_u64_sample,
-    );
+    let heartbeat_disposition =
+        heartbeat.observe_authenticated_frame(frame, crate::runtime::identity::random_u64_sample);
     match frame {
         Frame::PathDrain {
             path_id: drain_path_id,
@@ -238,6 +234,10 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
             peer,
             context.configured_path_name(local_path.config_ordinal()),
         )?;
+    // Sample the initial schedule before advertising protocol readiness. If
+    // entropy is unavailable, the registered but unready instance is dropped
+    // without sending SessionReady or publishing a ready/up transition.
+    let heartbeat_initial_sample = crate::runtime::identity::random_u64()?;
     let local_usage = local_path.advertised_usage();
     let ready = fence_server_carrier_readiness(path_registration.session_retirement(), async {
         context.reliable_streams.record_local_path_metrics(
@@ -273,7 +273,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         context.mux_limits.tcp_path_heartbeat_interval,
         context.mux_limits.tcp_path_heartbeat_timeout,
         tokio::time::Instant::now(),
-        crate::runtime::identity::random_u64()?,
+        heartbeat_initial_sample,
     ));
 
     let (reader, writer) = framed.split()?;

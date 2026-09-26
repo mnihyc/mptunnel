@@ -227,8 +227,7 @@ mod tests {
         let observed_sample_calls = sample_calls.clone();
         let mut frames =
             spawn_encrypted_tcp_reader_with_filtered_observer(server_reader, 1, move |frame| {
-                let decoded_at = tokio::time::Instant::now();
-                match observed_heartbeat.observe_authenticated_frame(frame, decoded_at, || {
+                match observed_heartbeat.observe_authenticated_frame(frame, || {
                     observed_sample_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(0)
                 }) {

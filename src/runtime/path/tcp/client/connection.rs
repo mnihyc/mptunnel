@@ -250,7 +250,6 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             reader,
             reliable_path_writer_frame_queue(mux_limits),
             move |frame| {
-                let decoded_at = tokio::time::Instant::now();
                 #[cfg(feature = "lab-diagnostics")]
                 if let Frame::StreamData {
                     stream_id,
@@ -281,7 +280,6 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
                 }
                 match observed_heartbeat.observe_authenticated_frame(
                     frame,
-                    decoded_at,
                     random_u64_sample,
                 ) {
                     crate::runtime::path::tcp::heartbeat::TcpCarrierHeartbeatFrameDisposition::Forward => {

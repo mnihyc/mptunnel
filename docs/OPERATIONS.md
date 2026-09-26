@@ -253,8 +253,8 @@ rather than to a global path role.
 
 ### MPP wire-version upgrade
 
-MPTUNNEL 0.6.2 speaks MPP wire version 16 and remains wire-compatible with
-0.6.0 and 0.6.1. When upgrading from 0.5.x or an earlier wire version, upgrade
+MPTUNNEL 0.6.3 speaks MPP wire version 16 and remains wire-compatible with
+0.6.0 through 0.6.2. When upgrading from 0.5.x or an earlier wire version, upgrade
 each client and server in a session as one coordinated pair before enabling
 traffic. A v15 endpoint rejects the first v16 MPP frame; there is no negotiated
 fallback to earlier wire versions.
@@ -966,16 +966,17 @@ has no current share. Partial coverage is not a measurement of the whole group's
 traffic or capacity.
 
 The following lines show bytes and sampling interval, then serialization time for
-64 KiB at that measured rate. This excludes setup, propagation, queued work and
-application delivery; no one-way delay is inferred from half an RTT. Socket
-sampling is asynchronous: byte deltas are normalized by their intervals, and
-multi-path shares use `~` because their windows need not coincide. When fresh rates
-sum to zero, shares are undefined; a fresh zero rate alongside positive fresh rates
-has a zero observed share, not zero capacity. The first observation, changed counter
-epoch or missing sample cannot establish a native interval rate. Repeated snapshots
-cannot make old counters fresh. Platform-derived fallback rates require their own
-fresh sample evidence. Measured interval rates use the dashboard refresh window
-for their `~` marker.
+64 KiB based on the displayed rate. A trailing `*` on that time marks a rate from
+an approximate fallback. `~` there marks a stale input rate. This excludes setup,
+propagation, queued work and application delivery; no one-way delay is inferred
+from half an RTT. Socket sampling is asynchronous: byte deltas are normalized by their
+intervals, and multi-path shares use `~` because their windows need not coincide.
+When fresh rates sum to zero, shares are undefined; a fresh zero rate alongside
+positive fresh rates has a zero observed share, not zero capacity. The first
+observation, changed counter epoch or missing sample cannot establish a native
+interval rate. Repeated snapshots cannot make old counters fresh. Platform-derived
+fallback rates require their own fresh sample evidence. Measured interval rates
+use the dashboard refresh window for their `~` marker.
 
 Retained estimates and pacing values remain visible after their three-PTO freshness window,
 prefixed with `~`; effective sample age includes time the management snapshot

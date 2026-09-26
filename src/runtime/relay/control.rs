@@ -39,7 +39,9 @@ use super::remote::{
 use super::server_delivery::ServerTargetIo;
 use super::service::{RelayServiceEvent, RelayServiceTurn};
 #[cfg(feature = "lab-diagnostics")]
-use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
+use crate::lab_diagnostics::{
+    lab_diagnostic, lab_diagnostic_event_enabled, lab_perf_flush, lab_perf_record,
+};
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes,
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, reliable_relay_buffer_len,
@@ -2247,6 +2249,15 @@ where
 
             let receive_feedback_output = remotes.has_receive_feedback_output();
             let service_active = !state.is_finished(send_stream, &recv_stream, sender_queue);
+            // Feedback retries above can discharge the last completion debt
+            // after the loop-entry check. Once Product service is finished,
+            // no further data event is required to wake this actor. Recheck
+            // the full predicate before parking, preserving all ACK duties.
+            if !service_active
+                && client_relay_finished(&state, send_stream, &recv_stream, sender_queue, remotes)
+            {
+                break Ok(state.delivery.total);
+            }
             publish_prepared_request_work(
                 &mut product_guard,
                 &request_product,
@@ -4019,6 +4030,12 @@ where
         }
     };
 
+    #[cfg(feature = "lab-diagnostics")]
+    let pre_map_exit_cause =
+        lab_diagnostic_event_enabled("client_relay_result").then(|| match &result {
+            Ok(_) => "ok".to_owned(),
+            Err(error) => format!("{error:?}"),
+        });
     let cleanup: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = {
         let mut product_guard = request_product.lock();
         let product = &mut *product_guard;
@@ -4080,12 +4097,15 @@ where
     lab_diagnostic(
         "client_relay_result",
         format_args!(
-            "stream_id={} ok={} local_open={} remote_open={} pending_local_fin={} pending_remote_fin_offset={:?} recv_next_offset={} recv_reorder_bytes={} sender_queue_bytes={} send_reinjection_bytes={} payload_bytes={}",
+            "stream_id={} ok={} pre_map_exit_cause={} local_open={} remote_open={} pending_local_fin={} local_fin_sent={} terminal_fin_replayed={} pending_remote_fin_offset={:?} recv_next_offset={} recv_reorder_bytes={} sender_queue_bytes={} send_reinjection_bytes={} payload_bytes={}",
             stream_id.0,
             result.is_ok(),
+            pre_map_exit_cause.as_deref().unwrap_or("not_captured"),
             state.endpoint.local_open,
             state.endpoint.remote_open,
             state.endpoint.pending_local_fin,
+            state.endpoint.local_fin_sent,
+            state.endpoint.terminal_fin_replayed,
             state.endpoint.pending_remote_fin_offset,
             recv_stream.next_offset(),
             recv_stream.reorder_bytes(),

@@ -270,16 +270,41 @@ impl TcpCarrierHeartbeat {
         }
     }
 
-    /// Observes one authenticated frame before it can wait behind the actor.
-    /// `renewal_source` runs only for an exact, timely active PONG; wrong,
-    /// late, unsolicited, and drain-tombstone PONGs never sample entropy.
+    /// Applies one authenticated frame to this carrier before actor queueing.
+    /// The owner samples time under its lock: receipt, drain, and expiry have
+    /// one ordering, and an already terminal carrier cannot be revived by a
+    /// timestamp captured before a reader was descheduled.
+    /// `renewal_source` runs only for an exact, timely active PONG.
     pub(in crate::runtime::path::tcp) fn observe_authenticated_frame(
         &self,
         frame: &Frame,
-        decoded_at: tokio::time::Instant,
+        renewal_source: impl FnOnce() -> Result<u64, getrandom::Error>,
+    ) -> TcpCarrierHeartbeatFrameDisposition {
+        self.observe_authenticated_frame_with_clock(
+            frame,
+            tokio::time::Instant::now,
+            renewal_source,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::path::tcp) fn observe_authenticated_frame_at(
+        &self,
+        frame: &Frame,
+        observed_at: tokio::time::Instant,
+        renewal_source: impl FnOnce() -> Result<u64, getrandom::Error>,
+    ) -> TcpCarrierHeartbeatFrameDisposition {
+        self.observe_authenticated_frame_with_clock(frame, || observed_at, renewal_source)
+    }
+
+    fn observe_authenticated_frame_with_clock(
+        &self,
+        frame: &Frame,
+        clock: impl FnOnce() -> tokio::time::Instant,
         renewal_source: impl FnOnce() -> Result<u64, getrandom::Error>,
     ) -> TcpCarrierHeartbeatFrameDisposition {
         let mut inner = self.lock();
+        let observed_at = clock();
         match frame {
             Frame::Pong { nonce } => {
                 match inner.state {
@@ -289,7 +314,7 @@ impl TcpCarrierHeartbeat {
                         deadline,
                         phase,
                     } => {
-                        if decoded_at >= deadline {
+                        if observed_at >= deadline {
                             let failure = match phase {
                                 SendPhase::Sending => {
                                     TcpCarrierHeartbeatFailure::SendProgressTimeout
@@ -308,7 +333,7 @@ impl TcpCarrierHeartbeat {
                                     let delay = heartbeat_renewal_delay(self.interval, sample);
                                     inner.delay = delay;
                                     inner.state = HeartbeatState::Idle {
-                                        due_at: decoded_at + delay,
+                                        due_at: observed_at + delay,
                                     };
                                     self.notify_schedule_change();
                                 }
@@ -334,7 +359,7 @@ impl TcpCarrierHeartbeat {
                     }
                     HeartbeatState::Failed(_) => {}
                     HeartbeatState::Idle { due_at } => {
-                        if decoded_at >= due_at + self.timeout {
+                        if observed_at >= due_at + self.timeout {
                             self.fail_locked(
                                 &mut inner,
                                 TcpCarrierHeartbeatFailure::SendProgressTimeout,
@@ -352,20 +377,20 @@ impl TcpCarrierHeartbeat {
             _ => {
                 match inner.state {
                     HeartbeatState::Idle { due_at } => {
-                        if decoded_at >= due_at + self.timeout {
+                        if observed_at >= due_at + self.timeout {
                             self.fail_locked(
                                 &mut inner,
                                 TcpCarrierHeartbeatFailure::SendProgressTimeout,
                             );
                         } else {
                             inner.state = HeartbeatState::Idle {
-                                due_at: decoded_at + inner.delay,
+                                due_at: observed_at + inner.delay,
                             };
                         }
                     }
                     HeartbeatState::Pending {
                         deadline, phase, ..
-                    } if decoded_at >= deadline => {
+                    } if observed_at >= deadline => {
                         let failure = match phase {
                             SendPhase::Sending => TcpCarrierHeartbeatFailure::SendProgressTimeout,
                             SendPhase::AwaitingPong => TcpCarrierHeartbeatFailure::ReplyTimeout,
@@ -388,11 +413,11 @@ impl TcpCarrierHeartbeat {
         self.begin_drain_locked(&mut inner, tokio::time::Instant::now());
     }
 
-    /// Records an authenticated, role-valid drain at its decode instant so
-    /// timeout and graceful-retirement ordering use the same timestamp.
-    pub(in crate::runtime::path::tcp) fn begin_drain_at(&self, decoded_at: tokio::time::Instant) {
+    /// Deterministic clock seam for drain boundary tests.
+    #[cfg(test)]
+    pub(in crate::runtime::path::tcp) fn begin_drain_at(&self, observed_at: tokio::time::Instant) {
         let mut inner = self.lock();
-        self.begin_drain_locked(&mut inner, decoded_at);
+        self.begin_drain_locked(&mut inner, observed_at);
     }
 
     pub(in crate::runtime::path::tcp) async fn failure_future(
@@ -572,7 +597,7 @@ mod tests {
         let initial_due = start + Duration::from_secs(8);
         assert_eq!(heartbeat.next_due_at(), Some(initial_due));
 
-        heartbeat.observe_authenticated_frame(
+        heartbeat.observe_authenticated_frame_at(
             &Frame::Ping { nonce: 1 },
             start + Duration::from_secs(7),
             || Ok(0),
@@ -584,7 +609,7 @@ mod tests {
             heartbeat.claim_due_ping(renewed_due, || Ok(10)),
             TcpCarrierHeartbeatClaim::Claimed(_)
         ));
-        heartbeat.observe_authenticated_frame(
+        heartbeat.observe_authenticated_frame_at(
             &Frame::Ping { nonce: 2 },
             renewed_due + Duration::from_secs(1),
             || Ok(0),
@@ -601,19 +626,22 @@ mod tests {
         else {
             panic!("heartbeat due claim");
         };
-        let decoded_at = due_at + Duration::from_secs(1);
+        let observed_at = due_at + Duration::from_secs(1);
 
         assert_eq!(
-            heartbeat
-                .observe_authenticated_frame(&Frame::Pong { nonce: 44 }, decoded_at, || Ok(0),),
+            heartbeat.observe_authenticated_frame_at(
+                &Frame::Pong { nonce: 44 },
+                observed_at,
+                || Ok(0),
+            ),
             TcpCarrierHeartbeatFrameDisposition::Consume
         );
         assert_eq!(
             heartbeat.next_due_at(),
-            Some(decoded_at + Duration::from_secs(8))
+            Some(observed_at + Duration::from_secs(8))
         );
-        assert!(heartbeat.mark_ping_flushed(44, decoded_at).is_ok());
-        assert!(ping.deadline > decoded_at);
+        assert!(heartbeat.mark_ping_flushed(44, observed_at).is_ok());
+        assert!(ping.deadline > observed_at);
     }
 
     #[test]
@@ -630,14 +658,15 @@ mod tests {
             .mark_ping_flushed(ping.nonce, due_at + Duration::from_secs(1))
             .expect("PING flush before the immutable response deadline");
 
-        heartbeat.observe_authenticated_frame(
+        heartbeat.observe_authenticated_frame_at(
             &Frame::Ping { nonce: 12 },
             ping.deadline - Duration::from_nanos(1),
             || Ok(0),
         );
         assert_eq!(heartbeat.current_failure(), None);
         assert_eq!(heartbeat.failure_deadline(), Some(ping.deadline));
-        heartbeat.observe_authenticated_frame(&Frame::Pong { nonce: 44 }, ping.deadline, || Ok(0));
+        heartbeat
+            .observe_authenticated_frame_at(&Frame::Pong { nonce: 44 }, ping.deadline, || Ok(0));
         assert_eq!(
             heartbeat.current_failure(),
             Some(TcpCarrierHeartbeatFailure::ReplyTimeout)
@@ -648,7 +677,7 @@ mod tests {
         else {
             panic!("second heartbeat due claim");
         };
-        other.observe_authenticated_frame(
+        other.observe_authenticated_frame_at(
             &Frame::Pong { nonce: 46 },
             due_at + Duration::from_secs(1),
             || Ok(0),
@@ -658,6 +687,59 @@ mod tests {
             Some(TcpCarrierHeartbeatFailure::ProtocolViolation)
         );
         assert!(other_ping.deadline > due_at);
+    }
+
+    #[test]
+    fn serialized_receipt_cannot_revive_expired_carrier_from_earlier_timestamp() {
+        let start = tokio::time::Instant::now();
+        let heartbeat = owner_at(start);
+        let due_at = start + Duration::from_secs(8);
+        let TcpCarrierHeartbeatClaim::Claimed(ping) = heartbeat.claim_due_ping(due_at, || Ok(57))
+        else {
+            panic!("heartbeat due claim");
+        };
+        heartbeat.mark_ping_flushed(57, due_at).unwrap();
+        heartbeat.expire(ping.deadline);
+        let earlier = ping.deadline - Duration::from_nanos(1);
+        heartbeat.observe_authenticated_frame_at(&Frame::Pong { nonce: 57 }, earlier, || {
+            panic!("terminal receipt must not sample renewal entropy")
+        });
+        heartbeat.begin_drain_at(earlier);
+        assert_eq!(
+            heartbeat.current_failure(),
+            Some(TcpCarrierHeartbeatFailure::ReplyTimeout)
+        );
+        assert_eq!(heartbeat.next_due_at(), None);
+    }
+
+    #[test]
+    fn receipt_clock_and_expiry_use_one_serialized_owner_boundary() {
+        let start = tokio::time::Instant::now();
+        let heartbeat = owner_at(start);
+        let due_at = start + Duration::from_secs(8);
+        let TcpCarrierHeartbeatClaim::Claimed(ping) = heartbeat.claim_due_ping(due_at, || Ok(58))
+        else {
+            panic!("heartbeat due claim");
+        };
+        heartbeat.mark_ping_flushed(58, due_at).unwrap();
+        heartbeat.observe_authenticated_frame_with_clock(
+            &Frame::Pong { nonce: 58 },
+            || {
+                assert!(matches!(
+                    heartbeat.inner.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                ping.deadline - Duration::from_nanos(1)
+            },
+            || Ok(0),
+        );
+        heartbeat.expire(ping.deadline);
+        assert_eq!(heartbeat.current_failure(), None);
+        assert!(
+            heartbeat
+                .next_due_at()
+                .is_some_and(|due| due > ping.deadline)
+        );
     }
 
     #[test]
@@ -673,7 +755,7 @@ mod tests {
         heartbeat.expire(due_at + Duration::from_secs(31));
         assert_eq!(heartbeat.current_failure(), None);
         assert_eq!(
-            heartbeat.observe_authenticated_frame(
+            heartbeat.observe_authenticated_frame_at(
                 &Frame::Pong { nonce: 57 },
                 due_at + Duration::from_secs(2),
                 || Ok(0),
@@ -681,7 +763,7 @@ mod tests {
             TcpCarrierHeartbeatFrameDisposition::Consume
         );
         assert_eq!(heartbeat.current_failure(), None);
-        heartbeat.observe_authenticated_frame(
+        heartbeat.observe_authenticated_frame_at(
             &Frame::Pong { nonce: 57 },
             due_at + Duration::from_secs(3),
             || Ok(0),
@@ -730,7 +812,7 @@ mod tests {
         let absent = owner_at(start);
         absent.begin_drain_at(start + Duration::from_secs(1));
         let mut sample_calls = 0;
-        absent.observe_authenticated_frame(
+        absent.observe_authenticated_frame_at(
             &Frame::Pong { nonce: 71 },
             start + Duration::from_secs(2),
             || {
@@ -751,7 +833,7 @@ mod tests {
             TcpCarrierHeartbeatClaim::Claimed(_)
         ));
         with_tombstone.begin_drain_at(due_at + Duration::from_secs(1));
-        with_tombstone.observe_authenticated_frame(
+        with_tombstone.observe_authenticated_frame_at(
             &Frame::Pong { nonce: 73 },
             due_at + Duration::from_secs(2),
             || {
@@ -819,7 +901,7 @@ mod tests {
             TcpCarrierHeartbeatClaim::Claimed(_)
         ));
         let mut renewal_calls = 0;
-        wrong.observe_authenticated_frame(
+        wrong.observe_authenticated_frame_at(
             &Frame::Pong { nonce: 82 },
             due_at + Duration::from_secs(1),
             || {
@@ -840,7 +922,7 @@ mod tests {
         };
         late.mark_ping_flushed(late_ping.nonce, due_at + Duration::from_secs(1))
             .expect("late-PONG fixture flush");
-        late.observe_authenticated_frame(
+        late.observe_authenticated_frame_at(
             &Frame::Pong {
                 nonce: late_ping.nonce,
             },
@@ -862,7 +944,7 @@ mod tests {
             TcpCarrierHeartbeatClaim::Claimed(_)
         ));
         draining.begin_drain_at(due_at + Duration::from_secs(1));
-        draining.observe_authenticated_frame(
+        draining.observe_authenticated_frame_at(
             &Frame::Pong { nonce: 84 },
             due_at + Duration::from_secs(2),
             || {
@@ -878,7 +960,7 @@ mod tests {
             failed_renewal.claim_due_ping(due_at, || Ok(85)),
             TcpCarrierHeartbeatClaim::Claimed(_)
         ));
-        failed_renewal.observe_authenticated_frame(
+        failed_renewal.observe_authenticated_frame_at(
             &Frame::Pong { nonce: 85 },
             due_at + Duration::from_secs(1),
             || {
@@ -924,8 +1006,8 @@ mod tests {
         let due_wait = tokio::spawn(async move { waiting_owner.wait_until_due().await });
         tokio::task::yield_now().await;
 
-        let decoded_at = tokio::time::Instant::now();
-        heartbeat.observe_authenticated_frame(&Frame::Pong { nonce: 81 }, decoded_at, || Ok(0));
+        let observed_at = tokio::time::Instant::now();
+        heartbeat.observe_authenticated_frame_at(&Frame::Pong { nonce: 81 }, observed_at, || Ok(0));
         tokio::task::yield_now().await;
         assert!(
             !due_wait.is_finished(),

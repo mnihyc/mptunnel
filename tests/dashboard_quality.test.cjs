@@ -366,4 +366,32 @@ test("quality tooltip names fresh-subset semantics and coverage", () => {
   assert.match(dashboard, /Share among fresh observed paths/);
   assert.match(dashboard, /Fresh rate coverage:/);
   assert.match(dashboard, /stale or missing observations are excluded, not treated as zero/);
+  assert.match(dashboard, /A \* on serialization marks an approximate fallback rate; ~ marks a stale input rate/);
+});
+
+test("approximate fallback marks the derived serialization estimate", () => {
+  const context = vm.createContext({});
+  const names = [
+    "finiteNumber",
+    "metricAvailable",
+    "formatOptionalMetric",
+    "formatDiagnosticMetric",
+    "formatDuration",
+    "formatRtt",
+    "formatQualitySerialization"
+  ];
+  vm.runInContext(names.map(extractFunction).join("\n"), context);
+
+  assert.equal(context.formatQualitySerialization({
+    etaMs: 1_500, stale: false, approximate: true
+  }), "1.5 s*");
+  assert.equal(context.formatQualitySerialization({
+    etaMs: 1_500, stale: false, approximate: false
+  }), "1.5 s");
+  assert.equal(context.formatQualitySerialization({
+    etaMs: 1_500, stale: true, approximate: true
+  }), "~1.5 s*");
+  assert.equal(context.formatQualitySerialization({
+    etaMs: null, stale: false, approximate: true
+  }), "-");
 });

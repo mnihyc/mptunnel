@@ -688,17 +688,23 @@ therefore bounded by `I` plus the configured heartbeat timeout.
 A receiver of `PING(nonce)` returns exactly `PONG(nonce)` in the opposite
 direction on the same bidirectional reliable carrier operation; a PONG grants
 no Product, flow-control, delivery, or rate evidence. Only a matching PONG
-authenticated and decoded on that exact carrier before its deadline completes
-the challenge. Completion occurs at decode, independently of subsequent actor
-queue service; it is valid even if the sender has not yet observed its local
-flush completion. Simultaneous challenges in opposite directions are independent.
+authenticated and applied to that exact carrier's liveness owner before its
+deadline completes the challenge. The authenticated reader applies this receipt
+synchronously before actor queueing. Receipt, accepted drain, and expiry share
+one serialized decision boundary; time is sampled at that boundary, and an
+already terminal expiry cannot be reversed by an earlier reader timestamp.
+Completion is independent of subsequent actor queue service and remains valid
+even before the sender observes its local flush completion. Simultaneous
+challenges in opposite directions are independent.
 An unsolicited or mismatched TCP heartbeat PONG is a carrier protocol violation.
 An expired attempt terminally fails that exact carrier: a local send-progress
 timeout is distinguished from a reply timeout, and neither proves packet loss.
 A possibly partial encrypted write MUST NOT be resumed on a timed-out carrier.
 
 An accepted graceful drain stops new heartbeat challenges and takes precedence
-through the existing drain lifecycle and deadline. A reply to its canceled
+through the existing drain lifecycle and deadline. Local planned drain acceptance
+MUST reach this owner synchronously with the carrier lifecycle transition, even
+if the carrier actor is blocked; waiting for actor dispatch is insufficient. A reply to its canceled
 outstanding challenge may be consumed without delaying `PATH_CLOSE`; unrelated
 PONG nonces remain invalid. On heartbeat failure, exact-carrier retirement
 withdraws its placement eligibility and current inventory before waiting for

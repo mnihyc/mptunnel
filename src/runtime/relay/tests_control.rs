@@ -2322,6 +2322,218 @@ async fn final_feedback_backpressure_keeps_fin_pending_until_ack_is_queued() {
 }
 
 #[tokio::test]
+async fn client_relay_exits_after_final_ack_retry_with_both_fins_complete() {
+    let stream_id = StreamId(617);
+    let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("first test carrier endpoint");
+    let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("second test carrier endpoint");
+    let first_addr = first_listener.local_addr().expect("first carrier address");
+    let second_addr = second_listener
+        .local_addr()
+        .expect("second carrier address");
+    drop((first_listener, second_listener));
+    let context = ClientPathContext::new(
+        vec![
+            format!("tcp://{first_addr}").parse::<PathSpec>().unwrap(),
+            format!("tcp://{second_addr}").parse::<PathSpec>().unwrap(),
+        ],
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(16);
+    let (frames_tx, frames_rx) = mpsc::channel(8);
+    let initial = test_opened_remote_stream(stream_id, 0, first_commands.clone(), frames_rx);
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(16);
+    let (_second_frames, second_frames_rx) = mpsc::channel(8);
+    let second = test_opened_remote_stream(stream_id, 1, second_commands.clone(), second_frames_rx);
+    for (index, opened) in [(0, &initial), (1, &second)] {
+        context.install_relay_path_instance_for_test(crate::model::path::RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index,
+            },
+            path_instance_id: opened.path_instance_id(),
+            attachment_id: index as u64,
+        });
+    }
+    let release_second_open = Arc::new(Notify::new());
+    let (second_opened_tx, second_opened_rx) = tokio::sync::oneshot::channel();
+    let ingress = super::super::lifecycle::BlockedWriteOpenTestIngress {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        },
+        obsolete_generation: false,
+        startup_ordinal: None,
+        insert_pending_task: true,
+        opened: Some(second),
+        release: release_second_open.clone(),
+        consumed: second_opened_tx,
+    };
+    let (mut application, relay_side) = duplex(4096);
+    application.shutdown().await.expect("local EOF");
+    let relay_context = context.clone();
+    let mut relay = tokio::spawn(async move {
+        relay_migrating_tcp_stream_active(
+            relay_side,
+            &relay_context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec::new(TargetAddr::Ip(first_addr), TrafficClass::Latency),
+            initial,
+            None,
+            Some(ingress),
+        )
+        .await
+    });
+    // Finish the original local FIN and terminal replay on the sole carrier
+    // before making the second attachment live. This pins the FIN predicate
+    // independently of the ACK-capacity event below.
+    let mut fin_count = 0usize;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            while let Some(command) = try_recv_reliable_path_command(&mut first_receivers) {
+                let pending =
+                    crate::runtime::path::commands::reliable_path_command_pending_bytes(&command);
+                if matches!(
+                    command,
+                    ReliablePathCommand::SendFrame(Frame::StreamFin {
+                        stream_id: actual,
+                        ..
+                    }) if actual == stream_id
+                ) {
+                    fin_count += 1;
+                }
+                first_receivers.release_pending_command_bytes(pending);
+            }
+            if fin_count >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("local FIN and its terminal replay are both admitted");
+
+    release_second_open.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), second_opened_rx)
+        .await
+        .expect("second carrier attach timeout")
+        .expect("second carrier attach task");
+    while let Some(command) = try_recv_reliable_path_command(&mut second_receivers) {
+        let pending = crate::runtime::path::commands::reliable_path_command_pending_bytes(&command);
+        second_receivers.release_pending_command_bytes(pending);
+    }
+
+    let mut blocked_frames = 0u64;
+    loop {
+        match second_commands.try_enqueue_admitted_frame(
+            Frame::Ping {
+                nonce: blocked_frames,
+            },
+            TrafficClass::Control,
+        ) {
+            Ok(()) => blocked_frames += 1,
+            Err(RuntimeError::SenderServiceBlocked) => break,
+            Err(error) => panic!("unexpected blocker enqueue error: {error}"),
+        }
+    }
+    assert!(blocked_frames > 0, "second carrier queue must be saturated");
+
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: Bytes::from_static(b"x"),
+        }))
+        .await
+        .expect("response data creates a new ACK generation after saturation");
+    frames_tx
+        .send(Ok(Frame::StreamFin {
+            stream_id,
+            final_offset: 1,
+        }))
+        .await
+        .expect("response FIN");
+    let mut payload = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(5), application.read_exact(&mut payload))
+        .await
+        .expect("response payload deadline")
+        .expect("response payload");
+    assert_eq!(&payload, b"x");
+    let mut eof = [0u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), application.read(&mut eof))
+            .await
+            .expect("remote FIN delivery timeout")
+            .expect("remote EOF read"),
+        0,
+    );
+    let mut first_ack_count = 0usize;
+    while let Some(command) = try_recv_reliable_path_command(&mut first_receivers) {
+        let pending = crate::runtime::path::commands::reliable_path_command_pending_bytes(&command);
+        if matches!(
+            command,
+            ReliablePathCommand::SendFrame(Frame::StreamAck {
+                stream_id: actual,
+                ranges,
+                ..
+            }) if actual == stream_id && ranges == vec![OffsetRange { start: 0, end: 1 }]
+        ) {
+            first_ack_count += 1;
+        }
+        first_receivers.release_pending_command_bytes(pending);
+    }
+    assert!(
+        first_ack_count > 0,
+        "the final ACK must enter the first carrier while the second is saturated"
+    );
+    assert!(
+        !relay.is_finished(),
+        "completion must retain the ACK obligation on the saturated attachment"
+    );
+
+    // Free the second path after target shutdown. The ACK retry is then the
+    // final state mutation; no further Product, frame, or carrier event exists.
+    while let Some(command) = try_recv_reliable_path_command(&mut second_receivers) {
+        let pending = crate::runtime::path::commands::reliable_path_command_pending_bytes(&command);
+        assert!(matches!(
+            command,
+            ReliablePathCommand::SendFrame(Frame::Ping { .. })
+        ));
+        second_receivers.release_pending_command_bytes(pending);
+    }
+
+    match tokio::time::timeout(Duration::from_secs(5), &mut relay).await {
+        Ok(result) => result
+            .expect("relay task join")
+            .expect("relay should finish after both FINs and the last ACK retry"),
+        Err(_) => {
+            relay.abort();
+            let _ = relay.await;
+            panic!("relay did not finish after final ACK retry completed the stream");
+        }
+    };
+    let mut secondary_ack_received = false;
+    while let Some(command) = try_recv_reliable_path_command(&mut second_receivers) {
+        second_receivers.release_pending_command_bytes(
+            crate::runtime::path::commands::reliable_path_command_pending_bytes(&command),
+        );
+        if let ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. }) = command {
+            secondary_ack_received |= ranges == vec![OffsetRange { start: 0, end: 1 }];
+        }
+    }
+    assert!(
+        secondary_ack_received,
+        "completion must publish the retained cumulative ACK"
+    );
+}
+
+#[tokio::test]
 async fn blocked_client_delivery_keeps_ordered_input_live_through_reset() {
     for block_flush in [false, true] {
         let stream_id = StreamId(if block_flush { 621 } else { 620 });

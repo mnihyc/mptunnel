@@ -2432,7 +2432,7 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
         .await
         .expect("ingress bind");
     let ingress_addr = ingress_listener.local_addr().expect("ingress addr");
-    let handler = tokio::spawn(async move {
+    let mut handler = tokio::spawn(async move {
         let (server, _) = ingress_listener.accept().await.expect("ingress accept");
         handle_socks5_client_stream(server, context.clone()).await
     });
@@ -2474,7 +2474,15 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
     client.read_exact(&mut payload).await.expect("payload read");
     assert_eq!(&payload, b"done");
     client.shutdown().await.expect("client shutdown");
-    handler.await.expect("handler join").expect("handler");
+    let handler_result = match tokio::time::timeout(Duration::from_secs(5), &mut handler).await {
+        Ok(result) => result,
+        Err(_) => {
+            handler.abort();
+            let _ = handler.await;
+            panic!("logical relay handler did not finish after both FINs and payload delivery");
+        }
+    };
+    handler_result.expect("handler join").expect("handler");
     {
         let health = health_context.health().lock().expect("health lock");
         assert!(matches!(

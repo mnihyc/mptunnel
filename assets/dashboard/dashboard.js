@@ -912,6 +912,12 @@
     return cell;
   }
 
+  function formatQualitySerialization(quality) {
+    return formatDiagnosticMetric(quality.etaMs, function (ms) {
+      return ms < 1000 ? formatRtt(ms) : formatDuration(ms);
+    }, quality.stale, quality.approximate);
+  }
+
   function nativeQualityCell(path, quality) {
     const cell = createElement("div");
     cell.append(createElement("span", "cell-primary",
@@ -924,9 +930,7 @@
     cell.append(createElement("span", "cell-secondary",
       formatOptionalMetric(quality.delta === null ? null : quality.delta.toString(), formatBytes, quality.stale) +
       " / " + formatOptionalMetric(quality.elapsedMs, formatDuration, quality.stale)));
-    const serialization = formatOptionalMetric(quality.etaMs, function (ms) {
-      return ms < 1000 ? formatRtt(ms) : formatDuration(ms);
-    }, quality.stale);
+    const serialization = formatQualitySerialization(quality);
     cell.append(createElement("span", "cell-secondary", serialization === "-" ? "-" : "64K / " + serialization));
     cell.title = [
       "Share among fresh observed paths / bytes and interval / 64 KiB serialization",
@@ -934,6 +938,7 @@
       "Counter direction: " + directionLabel(quality.direction),
       "Fresh rates normalize over the fresh subset; stale or missing observations are excluded, not treated as zero",
       "A fresh zero-rate sample is observed zero; an empty or zero-rate denominator has undefined share",
+      "A * on serialization marks an approximate fallback rate; ~ marks a stale input rate",
       "Serialization excludes setup, propagation, queueing and application delivery"
     ].join("\n");
     return cell;

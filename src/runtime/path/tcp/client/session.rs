@@ -36,6 +36,7 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::model::{
     directional_startup_service_rate, path_startup_metrics, path_startup_snapshot,
 };
+use crate::runtime::path::queue::ReliablePathDrainObserver;
 use crate::runtime::path::state::ClientTcpCarrierPublication;
 use crate::runtime::recent_ids::RecentIdCache;
 use std::future::Future;
@@ -118,6 +119,7 @@ impl Drop for ClientTcpCarrierReadiness {
 struct ClientTcpPathSessionState {
     connection: Option<ClientTcpPathConnection>,
     heartbeat_publication: watch::Sender<Option<Arc<TcpCarrierHeartbeat>>>,
+    heartbeat_drain_observer: Arc<ClientTcpHeartbeatDrainObserver>,
     streams: ClientTcpPathStreams,
     closed_streams: RecentIdCache<StreamId>,
     datagrams: ClientTcpDatagramState,
@@ -130,6 +132,42 @@ impl ClientTcpPathSessionState {
             .map(|connection| connection.carrier.heartbeat.clone());
         self.connection = connection;
         let _ = self.heartbeat_publication.send_replace(heartbeat);
+        self.heartbeat_drain_observer.path_owner_published();
+    }
+}
+
+/// Couples a planned client-carrier drain to the exact published heartbeat
+/// owner. The lifecycle calls `begin_path_drain` synchronously before making
+/// Draining visible; publication rechecks the latch in case a connection was
+/// installed concurrently with that transition.
+struct ClientTcpHeartbeatDrainObserver {
+    published: watch::Receiver<Option<Arc<TcpCarrierHeartbeat>>>,
+    draining: AtomicBool,
+}
+
+impl ClientTcpHeartbeatDrainObserver {
+    fn begin_path_drain(&self) {
+        self.draining.store(true, Ordering::Release);
+        self.apply_to_published_owner();
+    }
+
+    fn path_owner_published(&self) {
+        if self.draining.load(Ordering::Acquire) {
+            self.apply_to_published_owner();
+        }
+    }
+
+    fn apply_to_published_owner(&self) {
+        let heartbeat = self.published.borrow().clone();
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.begin_drain();
+        }
+    }
+}
+
+impl ReliablePathDrainObserver for ClientTcpHeartbeatDrainObserver {
+    fn begin_path_drain(&self) {
+        ClientTcpHeartbeatDrainObserver::begin_path_drain(self);
     }
 }
 
@@ -289,9 +327,15 @@ async fn run_client_tcp_path_session_inner(
         .as_ref()
         .map(|connection| connection.carrier.heartbeat.clone());
     let (heartbeat_publication, published_heartbeat) = watch::channel(initial_heartbeat);
+    let heartbeat_drain_observer = Arc::new(ClientTcpHeartbeatDrainObserver {
+        published: published_heartbeat.clone(),
+        draining: AtomicBool::new(false),
+    });
+    commands.bind_path_drain_observer(heartbeat_drain_observer.clone());
     let mut state = ClientTcpPathSessionState {
         connection: initial_connection,
         heartbeat_publication,
+        heartbeat_drain_observer,
         streams: ClientTcpPathStreams::new(),
         closed_streams: RecentIdCache::new(runtime.closed_stream_cache_capacity),
         datagrams: ClientTcpDatagramState::new(
@@ -1945,7 +1989,7 @@ mod tests {
             0,
         ));
         published_tx.send_replace(Some(replacement.clone()));
-        first.observe_authenticated_frame(&Frame::Pong { nonce: 1 }, now, || Ok(0));
+        first.observe_authenticated_frame_at(&Frame::Pong { nonce: 1 }, now, || Ok(0));
         assert_eq!(
             first.current_failure(),
             Some(TcpCarrierHeartbeatFailure::ProtocolViolation)
@@ -1957,7 +2001,7 @@ mod tests {
         }
 
         published_tx.send_replace(None);
-        replacement.observe_authenticated_frame(&Frame::Pong { nonce: 2 }, now, || Ok(0));
+        replacement.observe_authenticated_frame_at(&Frame::Pong { nonce: 2 }, now, || Ok(0));
         assert_eq!(
             replacement.current_failure(),
             Some(TcpCarrierHeartbeatFailure::ProtocolViolation)
@@ -2078,6 +2122,159 @@ mod tests {
         assert!(
             active_dropped.load(Ordering::Acquire),
             "whole-actor deadline did not cancel a blocked inner await"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn planned_drain_applies_to_a_heartbeat_owner_published_later() {
+        let (commands, receivers) =
+            crate::runtime::path::commands::reliable_path_command_channels(1);
+        commands.begin_path_drain();
+
+        let (published_tx, published_rx) = watch::channel(None);
+        let observer = Arc::new(ClientTcpHeartbeatDrainObserver {
+            published: published_rx,
+            draining: AtomicBool::new(false),
+        });
+        // Binding after the queue transition sets the same latch as an
+        // observer that was present at drain time.
+        receivers.bind_path_drain_observer(observer.clone());
+
+        let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            tokio::time::Instant::now(),
+            0,
+        ));
+        published_tx.send_replace(Some(heartbeat.clone()));
+        observer.path_owner_published();
+
+        assert!(observer.draining.load(Ordering::Acquire));
+        assert_eq!(heartbeat.next_due_at(), None);
+        let failure = heartbeat.clone().failure_future();
+        tokio::pin!(failure);
+        tokio::select! {
+            biased;
+            failure = &mut failure => panic!("late-published owner failed despite planned drain: {failure:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_secs(40)).await;
+        assert_eq!(heartbeat.current_failure(), None);
+        tokio::select! {
+            biased;
+            failure = &mut failure => panic!("late-published owner expired after planned drain: {failure:?}"),
+            () = std::future::ready(()) => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn planned_drain_synchronously_suppresses_client_heartbeat_expiry() {
+        let now = tokio::time::Instant::now();
+        let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            now,
+            0,
+        ));
+        let (commands, receivers) =
+            crate::runtime::path::commands::reliable_path_command_channels(1);
+        let (published_tx, published_rx) = watch::channel(Some(heartbeat.clone()));
+        let observer = Arc::new(ClientTcpHeartbeatDrainObserver {
+            published: published_rx.clone(),
+            draining: AtomicBool::new(false),
+        });
+        receivers.bind_path_drain_observer(observer);
+
+        let active = std::future::pending::<()>();
+        let heartbeat_failure = wait_for_published_heartbeat_failure(published_rx);
+        let drain_signal = receivers.path_drain_signal();
+        let retention = Duration::from_secs(60);
+        let drain_deadline = drain_signal.wait_for_drain_deadline(retention);
+        let bounded = run_client_tcp_path_session_until_lifecycle_boundary(
+            active,
+            std::future::pending(),
+            heartbeat_failure,
+            drain_deadline,
+        );
+        tokio::pin!(bounded);
+
+        // Establish all guard subscriptions before crossing the queue's
+        // lifecycle transition. The actor future stays blocked as if inside a
+        // writer await.
+        tokio::select! {
+            biased;
+            exit = &mut bounded => panic!("active client actor unexpectedly ended: {exit:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        commands.begin_path_drain();
+        assert_eq!(heartbeat.next_due_at(), None);
+        assert_eq!(heartbeat.current_failure(), None);
+        assert_eq!(
+            drain_signal.drain_deadline(retention),
+            Some(now + retention),
+        );
+
+        // The old idle due+timeout passes, but the same-carrier synchronous
+        // drain transition has already disabled heartbeat expiry.
+        tokio::time::advance(Duration::from_secs(39)).await;
+        tokio::select! {
+            biased;
+            exit = &mut bounded => panic!("heartbeat overrode the accepted planned drain: {exit:?}"),
+            () = std::future::ready(()) => {}
+        }
+
+        tokio::time::advance(Duration::from_secs(21)).await;
+        assert_eq!(bounded.await, ClientTcpPathActiveExit::DrainDeadline);
+        assert_eq!(heartbeat.current_failure(), None);
+        drop(published_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn planned_drain_does_not_resurrect_terminal_heartbeat_failure() {
+        let now = tokio::time::Instant::now();
+        let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            now - Duration::from_secs(40),
+            0,
+        ));
+        assert_eq!(
+            heartbeat.claim_due_ping(now, || Ok(7)),
+            crate::runtime::path::tcp::heartbeat::TcpCarrierHeartbeatClaim::Failed(
+                TcpCarrierHeartbeatFailure::SendProgressTimeout,
+            ),
+        );
+
+        let (commands, receivers) =
+            crate::runtime::path::commands::reliable_path_command_channels(1);
+        let (_published_tx, published_rx) = watch::channel(Some(heartbeat.clone()));
+        let observer = Arc::new(ClientTcpHeartbeatDrainObserver {
+            published: published_rx.clone(),
+            draining: AtomicBool::new(false),
+        });
+        receivers.bind_path_drain_observer(observer);
+        let drain_signal = receivers.path_drain_signal();
+        let bounded = run_client_tcp_path_session_until_lifecycle_boundary(
+            std::future::pending(),
+            std::future::pending(),
+            wait_for_published_heartbeat_failure(published_rx),
+            drain_signal.wait_for_drain_deadline(Duration::from_secs(60)),
+        );
+        tokio::pin!(bounded);
+
+        commands.begin_path_drain();
+
+        assert_eq!(
+            bounded.await,
+            ClientTcpPathActiveExit::HeartbeatFailed(
+                TcpCarrierHeartbeatFailure::SendProgressTimeout,
+            ),
+            "planned drain must not resurrect or relabel an earlier terminal failure",
+        );
+        assert_eq!(
+            heartbeat.current_failure(),
+            Some(TcpCarrierHeartbeatFailure::SendProgressTimeout),
         );
     }
 

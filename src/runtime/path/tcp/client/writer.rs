@@ -328,7 +328,6 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 .await;
                 commands.release_pending_command_bytes(pending_bytes);
                 let (write_outcome, deferred_frames) = measurement_result?;
-                connection.record_outbound_activity();
                 match write_outcome {
                     ClientTcpCapacityProbeWriteOutcome::NoWire => {
                         probe.request_lease().refund_if_unwritten();
@@ -686,7 +685,6 @@ fn publish_client_tcp_frame_transaction(
         connection.path_proofs.record_sent_frame(frame);
     }
     frames.clear();
-    connection.record_outbound_activity();
 }
 
 #[cfg(test)]
@@ -1033,7 +1031,6 @@ async fn handle_connected_client_tcp_command(
                 stream_frame_queue,
             )
             .await?;
-            connection.record_outbound_activity();
             Ok(())
         }
         ReliablePathCommand::CancelTcpOpen {
@@ -1048,7 +1045,6 @@ async fn handle_connected_client_tcp_command(
             connection.carrier.writer.write_frame(&detach).await?;
             connection.path_proofs.record_sent_frame(&detach);
             connection.carrier.writer.flush().await?;
-            connection.record_outbound_activity();
             Ok(())
         }
         ReliablePathCommand::OpenDatagramAttachment {
@@ -1104,7 +1100,6 @@ async fn handle_connected_client_tcp_command(
                 connection.carrier.writer.write_frame(&frame).await?;
                 connection.carrier.writer.flush().await?;
                 connection.path_proofs.record_sent_frame(&frame);
-                connection.record_outbound_activity();
                 datagrams.commit_open_flow(attachment_id, flow_id, target);
             }
             let _ = response.send(Ok(()));
@@ -1135,7 +1130,6 @@ async fn handle_connected_client_tcp_command(
             connection.carrier.writer.write_frame(&frame).await?;
             connection.carrier.writer.flush().await?;
             connection.path_proofs.record_sent_frame(&frame);
-            connection.record_outbound_activity();
             let _ = response.send(Ok(()));
             Ok(())
         }
@@ -1152,7 +1146,6 @@ async fn handle_connected_client_tcp_command(
             }
             if wrote_close {
                 connection.carrier.writer.flush().await?;
-                connection.record_outbound_activity();
             }
             datagrams.remove_attachment(attachment_id);
             if let Some(response) = response {
@@ -1176,7 +1169,6 @@ async fn handle_connected_client_tcp_command(
             if flush_after_frame {
                 connection.carrier.writer.flush().await?;
             }
-            connection.record_outbound_activity();
             Ok(())
         }
         #[cfg(test)]
@@ -1188,7 +1180,6 @@ async fn handle_connected_client_tcp_command(
             connection.carrier.writer.write_frame(&reset).await?;
             connection.path_proofs.record_sent_frame(&reset);
             connection.carrier.writer.flush().await?;
-            connection.record_outbound_activity();
             streams.remove(&stream_id);
             closed_streams.insert(stream_id);
             Ok(())

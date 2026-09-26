@@ -2,6 +2,7 @@ use super::*;
 use crate::protocol::{PeerPathState, PeerStatusCode, UnderlayProtocol};
 use crate::runtime::peer_status::PeerStatusBroker;
 use crate::runtime::relay::open::open_remote_stream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const PEER_STATUS_E2E_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -15,6 +16,87 @@ async fn hold_tcp_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         std::future::pending::<()>().await;
     });
     (address, task)
+}
+
+async fn spawn_echo_tcp_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind heartbeat sibling target");
+    let address = listener
+        .local_addr()
+        .expect("heartbeat sibling target address");
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("accept heartbeat sibling stream");
+        let mut buffer = [0; 256];
+        loop {
+            let bytes = stream
+                .read(&mut buffer)
+                .await
+                .expect("read heartbeat sibling payload");
+            if bytes == 0 {
+                return;
+            }
+            stream
+                .write_all(&buffer[..bytes])
+                .await
+                .expect("echo heartbeat sibling payload");
+        }
+    });
+    (address, task)
+}
+
+async fn assert_echo_round_trip<S>(stream: &mut S, payload: &[u8])
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(payload)
+        .await
+        .expect("send Product bytes over healthy sibling");
+    let mut echoed = vec![0; payload.len()];
+    stream
+        .read_exact(&mut echoed)
+        .await
+        .expect("read Product bytes over healthy sibling");
+    assert_eq!(echoed, payload);
+}
+
+async fn open_socks5_tcp_tunnel<S>(client: &mut S, target_addr: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    client
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("SOCKS5 authentication request");
+    let mut auth_response = [0; 2];
+    client
+        .read_exact(&mut auth_response)
+        .await
+        .expect("SOCKS5 authentication response");
+    assert_eq!(auth_response, [0x05, 0x00]);
+
+    let mut connect = vec![0x05, 0x01, 0x00, 0x01];
+    match target_addr {
+        SocketAddr::V4(address) => {
+            connect.extend_from_slice(&address.ip().octets());
+            connect.extend_from_slice(&address.port().to_be_bytes());
+        }
+        SocketAddr::V6(_) => panic!("heartbeat test target must be IPv4"),
+    }
+    client
+        .write_all(&connect)
+        .await
+        .expect("SOCKS5 CONNECT request");
+    let mut response = [0; 10];
+    client
+        .read_exact(&mut response)
+        .await
+        .expect("SOCKS5 CONNECT response");
+    assert_eq!(response[1], 0, "SOCKS5 CONNECT must succeed");
 }
 
 async fn request_and_assert_server_path(
@@ -339,6 +421,194 @@ async fn peer_status_retains_path_identity_until_server_eof_cleanup() {
     );
 
     drop(context);
+    abort_task(server).await;
+    abort_task(relay).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_heartbeat_retires_eof_gated_carrier_while_sibling_serves() {
+    let server_path = reserve_tcp_path().await;
+    let listener = bind_listener(&server_path)
+        .await
+        .expect("bind heartbeat lifecycle server");
+    let server_address = listener
+        .local_addr()
+        .expect("heartbeat lifecycle server address");
+    let local_path = ServerLocalPath::new(0, server_path.clone());
+    let server_resources = ResourceLimits {
+        tcp_path_heartbeat_interval: Duration::from_millis(200),
+        tcp_path_heartbeat_timeout: Duration::from_millis(600),
+        ..ResourceLimits::default()
+    };
+    let ServerIdentityRuntime {
+        mut paths,
+        reliable_relay,
+    } = new_identity_runtime(
+        Vec::new(),
+        OutboundConfig::Direct,
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        server_security(),
+        crate::performance::MppPerformanceConfig::default(),
+        server_resources,
+    );
+    paths.peer_status = PeerStatusBroker::new(true);
+    let server_context = paths.clone();
+    let relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 heartbeat server has a reliable relay")
+            .run(),
+    );
+    let server = tokio::spawn(async move {
+        let mut carriers = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.expect("accept heartbeat carrier");
+                    let local_path = local_path.clone();
+                    let paths = paths.clone();
+                    carriers.spawn(async move {
+                        handle_server_path(stream, local_path, paths).await
+                    });
+                }
+                Some(result) = carriers.join_next(), if !carriers.is_empty() => {
+                    result.expect("heartbeat carrier task").expect("heartbeat carrier");
+                }
+            }
+        }
+    });
+
+    let mut eof_gate = ServerEofGate::spawn(server_address).await;
+    let client = ClientPathContext::new(
+        vec![eof_gate.path.clone(), server_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("heartbeat lifecycle client context");
+    probe_client_paths(&client, Duration::from_secs(2)).await;
+
+    let initial = tokio::time::timeout(PEER_STATUS_E2E_TIMEOUT, async {
+        loop {
+            let snapshot = server_context.reliable_streams.management_snapshot();
+            if snapshot.paths.len() == 2 && client.peer_status.carrier_count(client.session_id) == 2
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two authenticated heartbeat carriers");
+    let gated_path_id = initial
+        .paths
+        .iter()
+        .find_map(|path| {
+            (client.peer_status.local_path_index(
+                client.session_id,
+                UnderlayProtocol::Tcp,
+                path.path_id,
+            ) == Some(0))
+            .then_some(path.path_id)
+        })
+        .expect("identify EOF-gated wire PathId");
+    let sibling_path_id = initial
+        .paths
+        .iter()
+        .find_map(|path| (path.path_id != gated_path_id).then_some(path.path_id))
+        .expect("identify healthy sibling PathId");
+    let (target_addr, target) = spawn_echo_tcp_target().await;
+    let (mut product_client, product_server) = duplex(4096);
+    let product = tokio::spawn(handle_socks5_client_stream(product_server, client.clone()));
+    tokio::time::timeout(
+        PEER_STATUS_E2E_TIMEOUT,
+        open_socks5_tcp_tunnel(&mut product_client, target_addr),
+    )
+    .await
+    .expect("SOCKS5 sibling CONNECT timed out");
+    assert_echo_round_trip(&mut product_client, b"before").await;
+    eof_gate.cut_client().await;
+    tokio::time::timeout(PEER_STATUS_E2E_TIMEOUT, async {
+        loop {
+            if client.peer_status.carrier_count(client.session_id) == 1
+                && client
+                    .peer_status
+                    .local_path_index(client.session_id, UnderlayProtocol::Tcp, gated_path_id)
+                    .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client removes its side of the cut carrier");
+
+    let mut echoes_while_old_path_registered = 0;
+    tokio::time::timeout(PEER_STATUS_E2E_TIMEOUT, async {
+        loop {
+            let snapshot = server_context.reliable_streams.management_snapshot();
+            if snapshot.paths.len() == 1 && snapshot.paths[0].path_id == sibling_path_id {
+                break;
+            }
+            assert!(
+                snapshot
+                    .paths
+                    .iter()
+                    .any(|path| path.path_id == gated_path_id)
+            );
+            assert_echo_round_trip(&mut product_client, b"during").await;
+            let snapshot = server_context.reliable_streams.management_snapshot();
+            if snapshot
+                .paths
+                .iter()
+                .any(|path| path.path_id == gated_path_id)
+            {
+                echoes_while_old_path_registered += 1;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server heartbeat retires exact cut carrier while sibling stream runs");
+    assert!(
+        echoes_while_old_path_registered > 0,
+        "persistent Product traffic must continue while the old path remains registered"
+    );
+    assert_echo_round_trip(&mut product_client, b"after").await;
+
+    // The client-facing side is cut and the gate still owns the server-facing
+    // socket here. A fresh peer-status round trip therefore proves the sibling
+    // is still usable while the server no longer reports the exact old path.
+    let peer_status = tokio::time::timeout(
+        PEER_STATUS_E2E_TIMEOUT,
+        client.peer_status.request(client.session_id),
+    )
+    .await
+    .expect("post-retirement sibling peer-status request timed out")
+    .expect("post-retirement sibling peer-status request failed");
+    assert_eq!(peer_status.code, PeerStatusCode::Ok);
+    assert_eq!(peer_status.paths.len(), 1);
+    assert_eq!(peer_status.paths[0].metrics.path_id, sibling_path_id);
+
+    assert_eq!(
+        server_context.reliable_streams.management_snapshot().paths[0].path_id,
+        sibling_path_id
+    );
+
+    product_client
+        .shutdown()
+        .await
+        .expect("SOCKS product shutdown");
+    drop(product_client);
+    tokio::time::timeout(PEER_STATUS_E2E_TIMEOUT, product)
+        .await
+        .expect("SOCKS product relay shutdown timed out")
+        .expect("SOCKS product relay task")
+        .expect("SOCKS product relay");
+    target.await.expect("sibling target task");
+
+    eof_gate.release_server_eof();
+    eof_gate.join().await;
+    drop(client);
     abort_task(server).await;
     abort_task(relay).await;
 }

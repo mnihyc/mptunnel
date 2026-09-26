@@ -4,6 +4,7 @@
 //! lifetime coupling between one TCP carrier and all attached product streams.
 
 use super::super::group::{ClientTcpCarrierGroups, ClientTcpCarrierReservation};
+use super::super::heartbeat::{TcpCarrierHeartbeat, TcpCarrierHeartbeatFailure};
 use super::connection::{
     ClientTcpCarrierConnect, ClientTcpCarrierConnection, connect_client_tcp_carrier,
 };
@@ -41,6 +42,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::watch;
 
 struct ClientTcpCarrierReadiness {
     published_instance: Arc<AtomicU64>,
@@ -115,9 +117,20 @@ impl Drop for ClientTcpCarrierReadiness {
 
 struct ClientTcpPathSessionState {
     connection: Option<ClientTcpPathConnection>,
+    heartbeat_publication: watch::Sender<Option<Arc<TcpCarrierHeartbeat>>>,
     streams: ClientTcpPathStreams,
     closed_streams: RecentIdCache<StreamId>,
     datagrams: ClientTcpDatagramState,
+}
+
+impl ClientTcpPathSessionState {
+    fn replace_connection(&mut self, connection: Option<ClientTcpPathConnection>) {
+        let heartbeat = connection
+            .as_ref()
+            .map(|connection| connection.carrier.heartbeat.clone());
+        self.connection = connection;
+        let _ = self.heartbeat_publication.send_replace(heartbeat);
+    }
 }
 
 struct ClientTcpPathSessionOwnership {
@@ -136,7 +149,16 @@ struct ClientTcpPathSessionStart {
 enum ClientTcpPathActiveExit {
     Completed,
     CarrierFailed,
+    HeartbeatFailed(TcpCarrierHeartbeatFailure),
     DrainDeadline,
+}
+
+// Keep the existing command inline through arbitration; boxing would allocate
+// once for every received command merely to compact the idle-heartbeat variant.
+#[allow(clippy::large_enum_variant)]
+enum ClientTcpConnectedPriorityEvent {
+    HeartbeatDue,
+    Command(Option<ReliablePathCommand>),
 }
 
 /// Applies exact carrier failure and planned-drain boundaries around the
@@ -146,16 +168,49 @@ enum ClientTcpPathActiveExit {
 async fn run_client_tcp_path_session_until_lifecycle_boundary(
     active: impl Future<Output = ()>,
     carrier_failure: impl Future<Output = ()>,
+    heartbeat_failure: impl Future<Output = TcpCarrierHeartbeatFailure>,
     drain_deadline: impl Future<Output = ()>,
 ) -> ClientTcpPathActiveExit {
     tokio::pin!(active);
     tokio::pin!(carrier_failure);
+    tokio::pin!(heartbeat_failure);
     tokio::pin!(drain_deadline);
     tokio::select! {
         biased;
-        () = &mut active => ClientTcpPathActiveExit::Completed,
+        failure = &mut heartbeat_failure => ClientTcpPathActiveExit::HeartbeatFailed(failure),
         () = &mut carrier_failure => ClientTcpPathActiveExit::CarrierFailed,
+        () = &mut active => ClientTcpPathActiveExit::Completed,
         () = &mut drain_deadline => ClientTcpPathActiveExit::DrainDeadline,
+    }
+}
+
+async fn wait_for_published_heartbeat_failure(
+    mut published: watch::Receiver<Option<Arc<TcpCarrierHeartbeat>>>,
+) -> TcpCarrierHeartbeatFailure {
+    loop {
+        let heartbeat = published.borrow_and_update().clone();
+        if let Some(heartbeat) = heartbeat {
+            let failure = tokio::select! {
+                biased;
+                changed = published.changed() => {
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                    None
+                }
+                failure = heartbeat.clone().failure_future() => Some(failure),
+            };
+            if let Some(failure) = failure
+                && published
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &heartbeat))
+            {
+                return failure;
+            }
+        } else if published.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -230,8 +285,13 @@ async fn run_client_tcp_path_session_inner(
     if let Some(connection) = initial_connection.as_ref() {
         carrier_readiness.adopt_published(connection.path_instance_id);
     }
+    let initial_heartbeat = initial_connection
+        .as_ref()
+        .map(|connection| connection.carrier.heartbeat.clone());
+    let (heartbeat_publication, published_heartbeat) = watch::channel(initial_heartbeat);
     let mut state = ClientTcpPathSessionState {
         connection: initial_connection,
+        heartbeat_publication,
         streams: ClientTcpPathStreams::new(),
         closed_streams: RecentIdCache::new(runtime.closed_stream_cache_capacity),
         datagrams: ClientTcpDatagramState::new(
@@ -251,7 +311,8 @@ async fn run_client_tcp_path_session_inner(
             ReliablePathCarrierTerminalCause::Retired => std::future::pending::<()>().await,
         }
     };
-    let (terminal_reason, lifecycle_failed) = {
+    let heartbeat_failure = wait_for_published_heartbeat_failure(published_heartbeat);
+    let (terminal_reason, lifecycle_failed, heartbeat_failure) = {
         let active = run_client_tcp_path_session_active(
             &runtime,
             &mut commands,
@@ -263,16 +324,20 @@ async fn run_client_tcp_path_session_inner(
         let bounded_active = run_client_tcp_path_session_until_lifecycle_boundary(
             active,
             carrier_failure,
+            heartbeat_failure,
             drain_deadline,
         );
         tokio::pin!(bounded_active);
         tokio::select! {
             biased;
-            reason = &mut session_closed => (Some(reason), false),
+            reason = &mut session_closed => (Some(reason), false, None),
             exit = &mut bounded_active => match exit {
-                ClientTcpPathActiveExit::Completed => (None, false),
-                ClientTcpPathActiveExit::CarrierFailed => (None, true),
-                ClientTcpPathActiveExit::DrainDeadline => (None, true),
+                ClientTcpPathActiveExit::Completed => (None, false, None),
+                ClientTcpPathActiveExit::CarrierFailed => (None, true, None),
+                ClientTcpPathActiveExit::HeartbeatFailed(failure) => {
+                    (None, true, Some(failure))
+                }
+                ClientTcpPathActiveExit::DrainDeadline => (None, true, None),
             },
         }
     };
@@ -281,9 +346,19 @@ async fn run_client_tcp_path_session_inner(
     }
 
     commands.withdraw_writer_ready();
-    let error = terminal_reason.map_or(RuntimeError::ReliablePathSessionClosed, |reason| {
-        RuntimeError::RemoteClosed(reason)
-    });
+    let error = terminal_reason.map_or_else(
+        || {
+            heartbeat_failure
+                .and_then(|failure| {
+                    state
+                        .connection
+                        .as_ref()
+                        .map(|connection| connection.carrier.heartbeat.runtime_error(failure))
+                })
+                .unwrap_or(RuntimeError::ReliablePathSessionClosed)
+        },
+        RuntimeError::RemoteClosed,
+    );
     fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &error, &runtime);
     if state.connection.is_some() {
         retire_failed_client_tcp_connection(&runtime, &mut state, &mut carrier_readiness);
@@ -347,14 +422,18 @@ async fn run_client_tcp_path_session_active(
             continue;
         }
 
-        let heartbeat_at = state
+        let heartbeat = state
             .connection
             .as_ref()
             .expect("checked connected TCP path session")
             .carrier
-            .heartbeat_deadline();
-        let heartbeat_timer = tokio::time::sleep_until(heartbeat_at);
-        tokio::pin!(heartbeat_timer);
+            .heartbeat
+            .clone();
+        let heartbeat_at = heartbeat
+            .next_due_at()
+            .unwrap_or_else(tokio::time::Instant::now);
+        let heartbeat_due = heartbeat.wait_until_due();
+        tokio::pin!(heartbeat_due);
         let pending_open_deadline = next_client_tcp_pending_open_deadline(&state.streams);
         let pending_open_timer =
             tokio::time::sleep_until(pending_open_deadline.unwrap_or(heartbeat_at));
@@ -655,8 +734,37 @@ async fn run_client_tcp_path_session_active(
                     }
                 }
             }
-            command = recv_client_tcp_command(commands, draining), if command_may_recv => {
-                match command {
+            // Preserve peer-status and authenticated-frame priority. At the
+            // original ordinary-command slot, let a due receive-driven probe
+            // win over command traffic without changing earlier actor fairness.
+            priority = wait_for_client_tcp_heartbeat_or_command(
+                commands,
+                draining,
+                command_may_recv,
+                !request_probe_pending && !draining,
+                &mut heartbeat_due,
+            ), if command_may_recv || (!request_probe_pending && !draining) => match priority {
+                ClientTcpConnectedPriorityEvent::HeartbeatDue => {
+                    commands.withdraw_writer_ready();
+                    if let Err(err) = connection.carrier.tick_heartbeat().await {
+                        fail_client_tcp_products(
+                            &mut state.streams,
+                            &mut state.datagrams,
+                            &err,
+                            runtime,
+                        );
+                        crate::observability::process_event!(
+                            Warn,
+                            "tcp",
+                            "heartbeat_failed",
+                            "TCP path heartbeat failed: path_index={} path_instance_id={} error={err}",
+                            runtime.path_index,
+                            connection.path_instance_id.as_u64(),
+                        );
+                        drop_connection = true;
+                    }
+                }
+                ClientTcpConnectedPriorityEvent::Command(command) => match command {
                     Some(command) => {
                         let result = if draining {
                             match tokio::time::timeout_at(
@@ -722,29 +830,8 @@ async fn run_client_tcp_path_session_active(
                             return;
                         }
                     }
-                }
-            }
-            _ = &mut heartbeat_timer, if !request_probe_pending && !draining => {
-                commands.withdraw_writer_ready();
-                if let Err(err) = connection.carrier.tick_heartbeat().await
-                {
-                    fail_client_tcp_products(
-                        &mut state.streams,
-                        &mut state.datagrams,
-                        &err,
-                        runtime,
-                    );
-                    crate::observability::process_event!(
-                        Warn,
-                        "tcp",
-                        "heartbeat_failed",
-                        "TCP path heartbeat failed: path_index={} path_instance_id={} error={err}",
-                        runtime.path_index,
-                        connection.path_instance_id.as_u64(),
-                    );
-                    drop_connection = true;
-                }
-            }
+                },
+            },
             result = ClientTcpCarrierConnection::native_writable(
                 &connection.carrier.write_admission,
             ), if may_publish_original && !native_handoff_allowed => {
@@ -834,7 +921,7 @@ async fn run_client_tcp_path_session_active(
             if !planned_retirement_completed {
                 retire_failed_client_tcp_connection(runtime, state, carrier_readiness);
             } else {
-                state.connection = None;
+                state.replace_connection(None);
                 carrier_readiness.clear();
             }
             actor_terminal.finish();
@@ -914,12 +1001,34 @@ async fn recv_client_tcp_command(
     }
 }
 
+async fn wait_for_client_tcp_heartbeat_or_command(
+    commands: &mut ReliablePathCommandReceivers,
+    draining: bool,
+    command_may_recv: bool,
+    heartbeat_may_run: bool,
+    heartbeat_due: impl Future<Output = ()>,
+) -> ClientTcpConnectedPriorityEvent {
+    tokio::select! {
+        biased;
+        () = heartbeat_due, if heartbeat_may_run => {
+            ClientTcpConnectedPriorityEvent::HeartbeatDue
+        }
+        command = recv_client_tcp_command(commands, draining), if command_may_recv => {
+            ClientTcpConnectedPriorityEvent::Command(command)
+        }
+        else => {
+            std::future::pending::<ClientTcpConnectedPriorityEvent>().await
+        }
+    }
+}
+
 fn begin_client_tcp_path_drain(
     connection: &mut ClientTcpPathConnection,
     commands: &mut ReliablePathCommandReceivers,
     carrier_readiness: &mut ClientTcpCarrierReadiness,
     runtime: &ClientTcpPathSessionRuntime,
 ) {
+    connection.carrier.heartbeat.begin_drain();
     runtime.state.begin_path_instance_planned_retirement(
         RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
@@ -1218,7 +1327,7 @@ async fn handle_disconnected_client_tcp_command(
                         return;
                     }
                     let readiness_rtt = connected.carrier.readiness_rtt;
-                    state.connection = Some(connected);
+                    state.replace_connection(Some(connected));
                     let applied = publish_client_tcp_connection(
                         runtime,
                         state,
@@ -1227,7 +1336,7 @@ async fn handle_disconnected_client_tcp_command(
                         Some(readiness_rtt),
                     );
                     if !applied {
-                        state.connection = None;
+                        state.replace_connection(None);
                         if let Some(probe_attempt) = probe_attempt.take() {
                             probe_attempt.finish("success", false);
                         }
@@ -1299,7 +1408,7 @@ async fn handle_disconnected_client_tcp_command(
                         ));
                         return;
                     }
-                    state.connection = Some(connected);
+                    state.replace_connection(Some(connected));
                     if !publish_client_tcp_connection(
                         runtime,
                         state,
@@ -1307,7 +1416,7 @@ async fn handle_disconnected_client_tcp_command(
                         endpoint_generation,
                         None,
                     ) {
-                        state.connection = None;
+                        state.replace_connection(None);
                         let _ = response.send(ClientTcpOpenResponse::RejectedWithoutOpen(
                             client_tcp_publication_refusal(runtime),
                         ));
@@ -1398,7 +1507,7 @@ async fn handle_disconnected_client_tcp_command(
                         let _ = response.send(Err(err));
                         return;
                     }
-                    state.connection = Some(connected);
+                    state.replace_connection(Some(connected));
                     if !publish_client_tcp_connection(
                         runtime,
                         state,
@@ -1406,7 +1515,7 @@ async fn handle_disconnected_client_tcp_command(
                         endpoint_generation,
                         None,
                     ) {
-                        state.connection = None;
+                        state.replace_connection(None);
                         state.datagrams.remove_attachment(attachment_id);
                         let _ = response.send(Err(client_tcp_publication_refusal(runtime)));
                         return;
@@ -1487,14 +1596,22 @@ fn retire_failed_client_tcp_connection(
         .as_ref()
         .expect("connected TCP path being retired")
         .path_instance_id;
-    runtime.state.mark_path_instance_data_plane_failure(
-        RelayPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            index: runtime.path_index,
-        },
-        path_instance_id,
-    );
-    state.connection = None;
+    let failure_reason = state
+        .connection
+        .as_ref()
+        .and_then(|connection| connection.carrier.heartbeat.current_failure())
+        .map_or("carrier_lost", TcpCarrierHeartbeatFailure::reason);
+    runtime
+        .state
+        .mark_path_instance_data_plane_failure_with_reason(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: runtime.path_index,
+            },
+            path_instance_id,
+            failure_reason,
+        );
+    state.replace_connection(None);
     // Readiness loss becomes externally visible only after exact health
     // invalidation and physical-instance removal.
     carrier_readiness.clear();
@@ -1754,6 +1871,173 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn heartbeat_guard_follows_later_publication_and_cancels_blocked_actor() {
+        let (published_tx, published_rx) = watch::channel(None);
+        let heartbeat_failure = wait_for_published_heartbeat_failure(published_rx);
+        let active_dropped = Arc::new(AtomicBool::new(false));
+        let active_drop = DropFlag(active_dropped.clone());
+        let active = async move {
+            let _active_drop = active_drop;
+            std::future::pending::<()>().await;
+        };
+        let bounded = run_client_tcp_path_session_until_lifecycle_boundary(
+            active,
+            std::future::pending(),
+            heartbeat_failure,
+            std::future::pending(),
+        );
+        tokio::pin!(bounded);
+        tokio::select! {
+            biased;
+            exit = &mut bounded => panic!("initially unpublished carrier ended session: {exit:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        // The only published carrier appears after the session guard starts;
+        // its due-plus-timeout deadline is already expired to bound this test.
+        let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            tokio::time::Instant::now() - Duration::from_secs(40),
+            0,
+        ));
+        published_tx.send_replace(Some(heartbeat));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), &mut bounded)
+                .await
+                .expect("published heartbeat did not trip its outer guard"),
+            ClientTcpPathActiveExit::HeartbeatFailed(
+                TcpCarrierHeartbeatFailure::SendProgressTimeout
+            )
+        );
+        assert!(
+            active_dropped.load(Ordering::Acquire),
+            "outer heartbeat failure did not cancel the blocked actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_guard_ignores_removed_and_replaced_owner_failures() {
+        let now = tokio::time::Instant::now();
+        let first = Arc::new(TcpCarrierHeartbeat::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            now,
+            0,
+        ));
+        let (published_tx, published_rx) = watch::channel(Some(first.clone()));
+        let mut heartbeat_failure = Box::pin(wait_for_published_heartbeat_failure(published_rx));
+
+        // Poll through the initial Some(owner) and ensure the guard is waiting
+        // on that exact owner before replacing it.
+        tokio::select! {
+            biased;
+            failure = &mut heartbeat_failure => panic!("healthy initial owner failed: {failure:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        let replacement = Arc::new(TcpCarrierHeartbeat::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            now,
+            0,
+        ));
+        published_tx.send_replace(Some(replacement.clone()));
+        first.observe_authenticated_frame(&Frame::Pong { nonce: 1 }, now, || Ok(0));
+        assert_eq!(
+            first.current_failure(),
+            Some(TcpCarrierHeartbeatFailure::ProtocolViolation)
+        );
+        tokio::select! {
+            biased;
+            failure = &mut heartbeat_failure => panic!("replaced owner retired the current carrier: {failure:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        published_tx.send_replace(None);
+        replacement.observe_authenticated_frame(&Frame::Pong { nonce: 2 }, now, || Ok(0));
+        assert_eq!(
+            replacement.current_failure(),
+            Some(TcpCarrierHeartbeatFailure::ProtocolViolation)
+        );
+        tokio::select! {
+            biased;
+            failure = &mut heartbeat_failure => panic!("removed owner retired a carrier: {failure:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        let current = Arc::new(TcpCarrierHeartbeat::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            now - Duration::from_secs(40),
+            0,
+        ));
+        published_tx.send_replace(Some(current));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut heartbeat_failure)
+                .await
+                .expect("new owner failure was not observed"),
+            TcpCarrierHeartbeatFailure::SendProgressTimeout
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn due_heartbeat_preempts_an_already_ready_outbound_command() {
+        let now = tokio::time::Instant::now();
+        let heartbeat = TcpCarrierHeartbeat::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            now - Duration::from_secs(10),
+            0,
+        );
+        let (sender, mut receivers) =
+            crate::runtime::path::commands::reliable_path_command_channels(1);
+        sender
+            .send_control(ReliablePathCommand::SendFrame(Frame::PeerStatusRequest {
+                request_id: 91,
+            }))
+            .await
+            .expect("queue ordinary outbound control");
+
+        let event = wait_for_client_tcp_heartbeat_or_command(
+            &mut receivers,
+            false,
+            true,
+            true,
+            heartbeat.wait_until_due(),
+        )
+        .await;
+        assert!(
+            matches!(event, ClientTcpConnectedPriorityEvent::HeartbeatDue),
+            "ready outbound command won over the due heartbeat"
+        );
+
+        let queued = try_recv_reliable_path_command(&mut receivers)
+            .expect("heartbeat arbitration removed the ordinary command");
+        assert!(matches!(
+            &queued,
+            ReliablePathCommand::SendFrame(Frame::PeerStatusRequest { request_id: 91 })
+        ));
+        let pending_bytes = reliable_path_command_pending_bytes(&queued);
+        receivers.release_pending_command_bytes(pending_bytes);
+
+        let disabled = wait_for_client_tcp_heartbeat_or_command(
+            &mut receivers,
+            false,
+            false,
+            false,
+            std::future::pending(),
+        );
+        tokio::pin!(disabled);
+        tokio::select! {
+            biased;
+            _ = &mut disabled => panic!("disabled arbitration completed without an event"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn client_tcp_planned_drain_deadline_bounds_the_complete_actor() {
         let (commands, receivers) =
@@ -1771,6 +2055,7 @@ mod tests {
         let bounded = run_client_tcp_path_session_until_lifecycle_boundary(
             active,
             std::future::pending(),
+            std::future::pending::<TcpCarrierHeartbeatFailure>(),
             deadline,
         );
         tokio::pin!(bounded);
@@ -1821,6 +2106,7 @@ mod tests {
         let bounded = run_client_tcp_path_session_until_lifecycle_boundary(
             active,
             carrier_failure,
+            std::future::pending::<TcpCarrierHeartbeatFailure>(),
             drain_deadline,
         );
         tokio::pin!(bounded);

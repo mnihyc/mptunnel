@@ -660,6 +660,19 @@ impl ClientPathState {
         key: RelayPathKey,
         path_instance_id: CarrierPathInstanceId,
     ) -> bool {
+        self.mark_path_instance_data_plane_failure_with_reason(
+            key,
+            path_instance_id,
+            "carrier_lost",
+        )
+    }
+
+    pub(in crate::runtime) fn mark_path_instance_data_plane_failure_with_reason(
+        &self,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        reason: &'static str,
+    ) -> bool {
         let _lifecycle = self
             .carrier_lifecycle
             .lock()
@@ -682,7 +695,7 @@ impl ClientPathState {
         });
         drop(health);
         if let Some(observer) = self.webhook_observer() {
-            observer.close(key, path_instance_id, false, "carrier_lost");
+            observer.close(key, path_instance_id, false, reason);
         }
         drop(_lifecycle);
         marked

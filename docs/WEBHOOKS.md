@@ -97,6 +97,17 @@ is the client IP set; on the client it is the server IP set. A TCP reconnect is 
 new carrier; QUIC address-change events require successful path validation.
 Carrier `closed` records retirement from MPP ownership; final socket cleanup
 can finish afterward.
+TCP heartbeat failure uses these existing carrier lifecycle events. Its reason
+is `heartbeat_send_progress_timeout`, `heartbeat_reply_timeout`,
+`heartbeat_protocol_error`, or `heartbeat_random_source_error`, distinguishing
+local send progress, the expected reply, an invalid reply, and entropy-source
+failure. A healthy heartbeat exchange emits no webhook and
+is not a `path.probe_completed` establishment check. On the client, losing one
+pooled carrier preserves the aggregate path's `up` state while another is ready;
+losing the last ready carrier through failure can change it to `down`. An accepted
+graceful drain follows deliberate retirement semantics. On the server, these
+changes are reported through carrier/session events, without inventing a client
+path name or pool grouping.
 Native address observations include a revision: a slow observer can coalesce
 rapid successive validations, and a revision gap identifies that loss of detail.
 The fields are `carrier.address_revision`, `change.skipped_revisions`, and

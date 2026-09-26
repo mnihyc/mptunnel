@@ -23,6 +23,7 @@ use crate::runtime::path::commands::{
     recv_reliable_path_command, reliable_path_command_channels,
     reliable_path_command_pending_bytes, try_recv_reliable_path_command,
 };
+use crate::runtime::path::tcp::heartbeat::{TcpCarrierHeartbeat, TcpCarrierHeartbeatFailure};
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, PathProofObservation, ServerDatagramOpenError,
     ServerDatagramOpenRequest, ServerDatagramPort, ServerDatagramPortBackend,
@@ -327,7 +328,7 @@ async fn server_tcp_test_session_with_reader(
         path_id,
         forwarding_mode,
         command_capacity,
-        |_| None,
+        |_, _| None,
     )
     .await
 }
@@ -337,7 +338,10 @@ async fn server_tcp_test_session_with_socket_setup(
     path_id: PathId,
     forwarding_mode: crate::config::ForwardingMode,
     command_capacity: Option<usize>,
-    setup: impl FnOnce(&TcpStream) -> Option<crate::transport::tcp_write_admission::TcpWriteAdmission>,
+    setup: impl FnOnce(
+        &TcpStream,
+        &TcpStream,
+    ) -> Option<crate::transport::tcp_write_admission::TcpWriteAdmission>,
 ) -> (
     ServerTcpPathSession,
     EncryptedFramedStream<TcpStream>,
@@ -370,7 +374,7 @@ async fn server_tcp_test_session_with_socket_setup(
         .await
         .expect("connect test TCP carrier");
     let (server_socket, _) = listener.accept().await.expect("accept test TCP carrier");
-    let write_admission = setup(&server_socket);
+    let write_admission = setup(&server_socket, &client_socket);
     let client_tls = crate::transport::encrypted::test_client_tls_config();
     let server_tls = &context.tls;
     let (client_framed, server_framed) = tokio::join!(
@@ -419,6 +423,12 @@ async fn server_tcp_test_session_with_socket_setup(
     let (path_frames_tx, path_frames) = mpsc::channel(1);
     let evidence = ServerTcpEvidenceState::new(None, None, context.mux_limits);
     let peer_status = context.peer_status.register(session_id);
+    let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+        context.mux_limits.tcp_path_heartbeat_interval,
+        context.mux_limits.tcp_path_heartbeat_timeout,
+        tokio::time::Instant::now(),
+        0,
+    ));
     let mut writer = ServerTcpWriter::new(server_writer);
     writer.set_write_admission(write_admission);
     (
@@ -430,6 +440,7 @@ async fn server_tcp_test_session_with_socket_setup(
             writer,
             path_frames,
             native_terminal: None,
+            heartbeat,
             commands_tx,
             commands_rx,
             evidence,
@@ -441,6 +452,384 @@ async fn server_tcp_test_session_with_socket_setup(
         reliable_relay,
         server_reader,
     )
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fill_server_tcp_send_queue_until_would_block(socket: &std::os::fd::OwnedFd) -> usize {
+    use std::os::fd::AsRawFd;
+
+    let payload = [0x5a_u8; 64 * 1024];
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let byte_limit = 1024 * 1024;
+    let mut accepted = 0usize;
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "unread test peer did not reach native send WouldBlock before deadline"
+        );
+        let wanted = payload.len().min(byte_limit - accepted);
+        assert!(
+            wanted > 0,
+            "bounded fixture bytes exhausted before WouldBlock"
+        );
+        // SAFETY: this test owns a duplicate descriptor for the exact connected
+        // server socket. MSG_DONTWAIT bounds each syscall, and the initialized
+        // payload remains alive for the duration of this synchronous send.
+        let sent = unsafe {
+            libc::send(
+                socket.as_raw_fd(),
+                payload.as_ptr().cast::<libc::c_void>(),
+                wanted,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent > 0 {
+            accepted += sent as usize;
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if sent < 0 && error.kind() == std::io::ErrorKind::WouldBlock {
+            assert!(
+                accepted > 0,
+                "fixture reached WouldBlock after native writes"
+            );
+            return accepted;
+        }
+        if sent < 0 && error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        panic!("native socket saturation failed: result={sent}, error={error}");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn server_tcp_send_one_would_block(socket: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let byte = [0x5a_u8; 1];
+    // SAFETY: the fixture owns this duplicate descriptor and the one-byte
+    // payload remains valid for the nonblocking syscall.
+    let sent = unsafe {
+        libc::send(
+            socket.as_raw_fd(),
+            byte.as_ptr().cast::<libc::c_void>(),
+            byte.len(),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    if sent == -1 {
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "bounded socket saturation check: {error}"
+        );
+        true
+    } else {
+        assert_eq!(sent, 1, "one-byte saturation probe is complete");
+        false
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn fill_server_tcp_send_queue_until_stably_blocked(socket: &std::os::fd::OwnedFd) -> usize {
+    let mut accepted = fill_server_tcp_send_queue_until_would_block(socket);
+    let mut consecutive_blocked_checks = 0;
+    for _ in 0..8 {
+        // Let the loopback peer kernel acknowledge bytes already in flight.
+        // If that reopens local send capacity, refill it before starting the
+        // server actor; the peer application deliberately does not read.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if server_tcp_send_one_would_block(socket) {
+            consecutive_blocked_checks += 1;
+            if consecutive_blocked_checks == 3 {
+                return accepted;
+            }
+            continue;
+        }
+        consecutive_blocked_checks = 0;
+        accepted += 1;
+        accepted += fill_server_tcp_send_queue_until_would_block(socket);
+        assert!(accepted <= 8 * 1024 * 1024, "fixture refill stays bounded");
+    }
+    panic!("fixture did not reach stable native backpressure after {accepted} bytes");
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_test_tcp_socket_buffer(socket: &TcpStream, option: libc::c_int, bytes: libc::c_int) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: setsockopt reads this initialized integer synchronously and
+    // changes only the test-owned connected socket before its actor starts.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&bytes as *const libc::c_int).cast(),
+            std::mem::size_of_val(&bytes) as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "set bounded test socket buffer: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn assert_heartbeat_deadline_cancels_blocked_server_writer(
+    session_id: SessionId,
+    ordinary_frame_first: bool,
+) {
+    use std::os::fd::AsFd;
+
+    let mut writer_socket = None;
+    let (mut session, _client, commands, _frames, _relay, _reader) =
+        server_tcp_test_session_with_socket_setup(
+            session_id,
+            PathId(0),
+            crate::config::ForwardingMode::L4,
+            None,
+            |socket, client_socket| {
+                set_test_tcp_socket_buffer(client_socket, libc::SO_RCVBUF, 1024);
+                set_test_tcp_socket_buffer(socket, libc::SO_SNDBUF, 4096);
+                writer_socket = Some(
+                    socket
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .expect("duplicate exact server socket for bounded saturation"),
+                );
+                None
+            },
+        )
+        .await;
+    let context = session.context.clone();
+    let writer_socket = writer_socket.expect("captured exact server socket");
+    let accepted = fill_server_tcp_send_queue_until_stably_blocked(&writer_socket).await;
+    assert!(
+        accepted > 0,
+        "stable saturation used actual native send bytes"
+    );
+    let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+        tokio::time::Instant::now(),
+        0,
+    ));
+    session.heartbeat = heartbeat.clone();
+
+    if ordinary_frame_first {
+        commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(730),
+                    offset: 0,
+                    payload: Bytes::from(vec![0x31; 16 * 1024]),
+                },
+                TrafficClass::Throughput,
+            )
+            .expect("queue ordinary protected writer frame");
+    }
+
+    let mut actor = tokio::spawn(session.run());
+    if ordinary_frame_first {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while commands.writer_pending_bytes() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary frame enters the still-uncommitted writer transaction");
+        assert!(commands.writer_pending_bytes() > 0);
+        assert!(heartbeat.next_due_at().is_some());
+    } else {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while heartbeat.next_due_at().is_some() {
+                assert!(heartbeat.current_failure().is_none());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("heartbeat PING is claimed before its immutable deadline");
+        assert!(heartbeat.current_failure().is_none());
+    }
+    let completed = tokio::time::timeout(Duration::from_secs(2), &mut actor).await;
+    if completed.is_err() {
+        actor.abort();
+    }
+    completed
+        .expect("outer heartbeat deadline cancels the blocked writer")
+        .expect("server TCP session task joins")
+        .expect("heartbeat send-progress expiry retires the exact carrier cleanly");
+    assert_eq!(
+        heartbeat.current_failure(),
+        Some(TcpCarrierHeartbeatFailure::SendProgressTimeout)
+    );
+    assert!(
+        context
+            .reliable_streams
+            .management_snapshot()
+            .paths
+            .is_empty(),
+        "blocked writer expiry removes only its exact test carrier"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn server_tcp_heartbeat_outer_deadline_cancels_real_blocked_writes() {
+    assert_heartbeat_deadline_cancels_blocked_server_writer(SessionId(730), true).await;
+    assert_heartbeat_deadline_cancels_blocked_server_writer(SessionId(731), false).await;
+}
+
+#[tokio::test]
+async fn server_tcp_due_heartbeat_preempts_ready_ordinary_command() {
+    let (mut session, mut client, commands, _frames, _relay, _reader) =
+        server_tcp_test_session_with_reader(
+            SessionId(734),
+            PathId(0),
+            crate::config::ForwardingMode::L4,
+            Some(8),
+        )
+        .await;
+    let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+        Duration::from_millis(200),
+        Duration::from_millis(600),
+        tokio::time::Instant::now(),
+        0,
+    ));
+    let due_at = heartbeat.next_due_at().expect("initial idle schedule");
+    session.heartbeat = heartbeat.clone();
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamAck {
+                stream_id: StreamId(734),
+                scope_start: None,
+                ranges: Vec::new(),
+            },
+            TrafficClass::Control,
+        )
+        .expect("ordinary outbound command is ready before the heartbeat");
+    assert!(commands.pending_bytes() > 0);
+    tokio::time::sleep_until(due_at).await;
+
+    let actor = tokio::spawn(session.run());
+    let first = tokio::time::timeout(Duration::from_secs(1), client.read_frame())
+        .await
+        .expect("due heartbeat is not starved by a ready command")
+        .expect("read first server frame");
+    assert!(
+        matches!(first, Frame::Ping { .. }),
+        "the ready ordinary command must remain ordered after the due PING; first frame was {first:?}"
+    );
+    let second = tokio::time::timeout(Duration::from_secs(1), client.read_frame())
+        .await
+        .expect("ordinary command remains serviceable after PING")
+        .expect("read queued ordinary frame");
+    assert!(matches!(
+        second,
+        Frame::StreamAck {
+            stream_id: StreamId(734),
+            ..
+        }
+    ));
+    assert!(heartbeat.current_failure().is_none());
+
+    actor.abort();
+    let _ = actor.await;
+}
+
+#[tokio::test]
+async fn server_tcp_heartbeat_repeats_and_overlaps_peer_ping() {
+    use crate::runtime::path::commands::reliable_path_writer_frame_queue;
+    use crate::runtime::path::tcp::io::spawn_encrypted_tcp_reader_with_filtered_terminal_result;
+
+    let session_id = SessionId(732);
+    let path_id = PathId(0);
+    let (mut session, mut client, commands, _path_frames, _relay, server_reader) =
+        server_tcp_test_session_with_reader(
+            session_id,
+            path_id,
+            crate::config::ForwardingMode::L4,
+            None,
+        )
+        .await;
+    drop(_path_frames);
+    let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+        tokio::time::Instant::now(),
+        0,
+    ));
+    session.heartbeat = heartbeat.clone();
+    let observed_commands = commands.clone();
+    let observed_path_state = session.path_registration.state_handle();
+    let observed_context = session.context.clone();
+    let observed_heartbeat = heartbeat.clone();
+    let terminal_commands = commands.clone();
+    let (path_frames, native_terminal) = spawn_encrypted_tcp_reader_with_filtered_terminal_result(
+        server_reader,
+        reliable_path_writer_frame_queue(session.context.mux_limits),
+        move |frame| {
+            observe_authenticated_server_tcp_frame(
+                frame,
+                session_id,
+                path_id,
+                &observed_commands,
+                &observed_path_state,
+                &observed_context,
+                &observed_heartbeat,
+            )
+        },
+        move || terminal_commands.terminate_failed_path(),
+    );
+    session.path_frames = path_frames;
+    session.native_terminal = Some(native_terminal);
+    let actor = tokio::spawn(session.run());
+
+    for challenge in 0..2 {
+        let ping = tokio::time::timeout(Duration::from_secs(2), client.read_frame())
+            .await
+            .expect("server heartbeat PING arrives")
+            .expect("read server heartbeat PING");
+        let Frame::Ping { nonce } = ping else {
+            panic!("expected heartbeat PING, received {ping:?}");
+        };
+        if challenge == 1 {
+            client
+                .write_frame(&Frame::Ping { nonce: 733 })
+                .await
+                .expect("send peer PING during server heartbeat");
+        }
+        client
+            .write_frame(&Frame::Pong { nonce })
+            .await
+            .expect("answer server PING on the same carrier");
+        client.flush().await.expect("flush heartbeat response");
+        if challenge == 1 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), client.read_frame())
+                    .await
+                    .expect("server responds to simultaneous peer PING")
+                    .expect("read response to peer PING"),
+                Frame::Pong { nonce: 733 }
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while heartbeat.next_due_at().is_none() {
+                assert!(heartbeat.current_failure().is_none());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-carrier PONG resets the next idle deadline");
+    }
+
+    assert!(heartbeat.current_failure().is_none());
+    actor.abort();
+    let _ = actor.await;
 }
 
 #[tokio::test]
@@ -1907,7 +2296,7 @@ async fn server_tcp_native_write_admission_hangup_retires_without_a_reader_resul
             PathId(0),
             crate::config::ForwardingMode::L4,
             None,
-            |socket| {
+            |socket, _client_socket| {
                 terminal_socket = Some(
                     socket
                         .as_fd()
@@ -2198,6 +2587,7 @@ async fn authenticated_session_close_precedes_following_native_eof() {
         server_tcp_test_session(session_id, path_id).await;
     let context = session.context.clone();
     let path_state = session.path_registration.state_handle();
+    let heartbeat = session.heartbeat.clone();
     let (native_terminal_tx, native_terminal_rx) = oneshot::channel();
     session.native_terminal = Some(native_terminal_rx);
 
@@ -2210,6 +2600,7 @@ async fn authenticated_session_close_precedes_following_native_eof() {
         &commands,
         &path_state,
         &context,
+        &heartbeat,
     );
     commands.terminate_failed_path();
     native_terminal_tx
@@ -2237,8 +2628,9 @@ async fn authenticated_path_drain_deadline_is_not_deferred_by_actor_delivery() {
     let retained_registration = session.path_registration.clone();
     let path_state = session.path_registration.state_handle();
     let drain = commands.path_drain_signal();
+    let heartbeat = session.heartbeat.clone();
 
-    observe_authenticated_server_tcp_frame(
+    let _ = observe_authenticated_server_tcp_frame(
         &Frame::PathDrain {
             path_id: PathId(path_id.0 + 1),
         },
@@ -2247,8 +2639,10 @@ async fn authenticated_path_drain_deadline_is_not_deferred_by_actor_delivery() {
         &commands,
         &path_state,
         &context,
+        &heartbeat,
     );
     assert_eq!(drain.drain_started_at(), None);
+    assert!(heartbeat.next_due_at().is_some());
     assert_eq!(
         context.reliable_streams.management_snapshot().paths[0].state,
         PeerPathState::Active,
@@ -2256,15 +2650,17 @@ async fn authenticated_path_drain_deadline_is_not_deferred_by_actor_delivery() {
     );
 
     let requested_at = tokio::time::Instant::now();
-    observe_authenticated_server_tcp_frame(
+    let _ = observe_authenticated_server_tcp_frame(
         &Frame::PathDrain { path_id },
         session_id,
         path_id,
         &commands,
         &path_state,
         &context,
+        &heartbeat,
     );
     assert_eq!(drain.drain_started_at(), Some(requested_at));
+    assert!(heartbeat.next_due_at().is_none());
     assert_eq!(
         context.reliable_streams.management_snapshot().paths[0].state,
         PeerPathState::Draining,
@@ -2274,13 +2670,14 @@ async fn authenticated_path_drain_deadline_is_not_deferred_by_actor_delivery() {
     let actor = tokio::spawn(session.run());
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(5)).await;
-    observe_authenticated_server_tcp_frame(
+    let _ = observe_authenticated_server_tcp_frame(
         &Frame::PathDrain { path_id },
         session_id,
         path_id,
         &commands,
         &path_state,
         &context,
+        &heartbeat,
     );
     assert_eq!(
         drain.drain_started_at(),

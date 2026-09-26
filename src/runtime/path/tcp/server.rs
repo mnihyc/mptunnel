@@ -15,7 +15,11 @@ use self::evidence::ServerTcpEvidenceState;
 use self::session::{ServerTcpPathAdmission, ServerTcpPathSession};
 use self::writer::ServerTcpWriter;
 use super::admission::authenticate_prelude;
-use super::io::{encrypted_framed_peer_closed, spawn_encrypted_tcp_reader_with_terminal_result};
+use super::heartbeat::{TcpCarrierHeartbeat, TcpCarrierHeartbeatFrameDisposition};
+use super::io::{
+    AuthenticatedFrameDisposition, encrypted_framed_peer_closed,
+    spawn_encrypted_tcp_reader_with_filtered_terminal_result,
+};
 use super::metrics::TcpMetricPublisher;
 use crate::protocol::{Frame, PeerPathState, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
@@ -29,6 +33,7 @@ use crate::runtime::path::{
 };
 use crate::transport::encrypted::{EncryptedFramedStream, ServerEncryptedStreamAdmission};
 use crate::transport::tcp_write_admission::TcpWriteAdmission;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -49,7 +54,23 @@ fn observe_authenticated_server_tcp_frame(
     commands: &crate::runtime::path::commands::ReliablePathCommandSender,
     path_state: &ServerCarrierPathStateHandle,
     context: &ServerPathContext,
-) {
+    heartbeat: &TcpCarrierHeartbeat,
+) -> AuthenticatedFrameDisposition {
+    let decoded_at = tokio::time::Instant::now();
+    let accepted_path_drain =
+        matches!(frame, Frame::PathDrain { path_id: drain_path_id } if *drain_path_id == path_id);
+    let accepted_session_close = matches!(frame, Frame::SessionClose { .. });
+    if accepted_path_drain || accepted_session_close {
+        // Publish only role-valid lifecycle intent before ordinary receive
+        // expiry is evaluated. A mismatched PATH_DRAIN is merely activity and
+        // cannot stop this exact carrier's heartbeat clock.
+        heartbeat.begin_drain_at(decoded_at);
+    }
+    let heartbeat_disposition = heartbeat.observe_authenticated_frame(
+        frame,
+        decoded_at,
+        crate::runtime::identity::random_u64_sample,
+    );
     match frame {
         Frame::PathDrain {
             path_id: drain_path_id,
@@ -60,8 +81,14 @@ fn observe_authenticated_server_tcp_frame(
         // Session retirement is session-wide negative authority. Publish it at
         // the authenticated decode boundary so a following native EOF cannot
         // preempt the retained close reason behind a full actor queue.
-        Frame::SessionClose { reason } => context.retire_session(session_id, *reason),
+        Frame::SessionClose { reason } => {
+            context.retire_session(session_id, *reason);
+        }
         _ => {}
+    }
+    match heartbeat_disposition {
+        TcpCarrierHeartbeatFrameDisposition::Forward => AuthenticatedFrameDisposition::Forward,
+        TcpCarrierHeartbeatFrameDisposition::Consume => AuthenticatedFrameDisposition::Consume,
     }
 }
 
@@ -242,6 +269,12 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     if let Some(metrics) = tcp_metrics.as_mut() {
         metrics.begin_epoch();
     }
+    let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+        context.mux_limits.tcp_path_heartbeat_interval,
+        context.mux_limits.tcp_path_heartbeat_timeout,
+        tokio::time::Instant::now(),
+        crate::runtime::identity::random_u64()?,
+    ));
 
     let (reader, writer) = framed.split()?;
     let (commands_tx, commands_rx) =
@@ -249,8 +282,9 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     let observed_commands = commands_tx.clone();
     let observed_path_state = path_registration.state_handle();
     let observed_context = context.clone();
+    let observed_heartbeat = heartbeat.clone();
     let terminal_commands = commands_tx.clone();
-    let (path_frames, native_terminal) = spawn_encrypted_tcp_reader_with_terminal_result(
+    let (path_frames, native_terminal) = spawn_encrypted_tcp_reader_with_filtered_terminal_result(
         reader,
         reliable_path_writer_frame_queue(context.mux_limits),
         move |frame| {
@@ -261,7 +295,8 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
                 &observed_commands,
                 &observed_path_state,
                 &observed_context,
-            );
+                &observed_heartbeat,
+            )
         },
         move || terminal_commands.terminate_failed_path(),
     );
@@ -278,6 +313,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         writer,
         path_frames,
         native_terminal: Some(native_terminal),
+        heartbeat,
         commands_tx,
         commands_rx,
         evidence,

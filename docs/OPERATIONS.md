@@ -958,16 +958,24 @@ plan, current throughput or the capacity of the complete application route.
 The summary's Path estimates is a sum of observed estimates, not aggregate
 capacity: paths can share bottlenecks.
 
-Quality is the share of measured native ACK rates among measured paths
-in the same session and sender direction. Its following lines show bytes and
-sampling interval, then serialization time for 64 KiB at that measured rate.
-This excludes setup, propagation, queued work and application delivery; no
-one-way delay is inferred from half an RTT. Socket sampling is asynchronous:
-byte deltas are normalized by their intervals, and multi-path shares use `~`
-because their windows need not coincide. An interval with no acknowledged bytes has no
-defined share. The first observation, changed counter epoch or missing sample
-cannot establish a rate. Repeated snapshots cannot make old counters fresh.
-Measured interval rates use the dashboard refresh window for their `~` marker.
+Quality is a best-effort share of fresh observed delivery rates in the same
+session and sender direction. Stale or missing rates are excluded independently:
+fresh paths still show their share among the fresh observations, with the measured
+coverage in the tooltip. A stale path keeps its historical sample marked `~`, but
+has no current share. Partial coverage is not a measurement of the whole group's
+traffic or capacity.
+
+The following lines show bytes and sampling interval, then serialization time for
+64 KiB at that measured rate. This excludes setup, propagation, queued work and
+application delivery; no one-way delay is inferred from half an RTT. Socket
+sampling is asynchronous: byte deltas are normalized by their intervals, and
+multi-path shares use `~` because their windows need not coincide. When fresh rates
+sum to zero, shares are undefined; a fresh zero rate alongside positive fresh rates
+has a zero observed share, not zero capacity. The first observation, changed counter
+epoch or missing sample cannot establish a native interval rate. Repeated snapshots
+cannot make old counters fresh. Platform-derived fallback rates require their own
+fresh sample evidence. Measured interval rates use the dashboard refresh window
+for their `~` marker.
 
 Retained estimates and pacing values remain visible after their three-PTO freshness window,
 prefixed with `~`; effective sample age includes time the management snapshot
@@ -1080,10 +1088,16 @@ transmission modes and not desired memory occupancy.
 | `quic_path_keep_alive_interval_s` | 10 s |
 | `quic_path_idle_timeout_s` | 30 s |
 
-Each heartbeat/keep-alive interval is a maximum idle delay. The client renews
-the next idle probe within 80%--100% of that interval; authenticated activity
-defers it, while an outstanding response deadline is never extended. The
-server does not originate a second QUIC keep-alive schedule.
+Each heartbeat/keep-alive interval is a maximum idle delay, renewed within
+80%--100% of that interval. Both TCP endpoints independently monitor received
+authenticated activity on each carrier. Local writes and traffic on another
+carrier do not keep it alive. A TCP heartbeat has one fixed send-and-reply budget,
+including waiting for a busy writer; other traffic cannot extend an outstanding
+challenge. With the defaults, an inactive TCP carrier reaches its deadline
+within 40 seconds, subject to runtime scheduling. Failure retires that carrier
+and leaves surviving carriers available for recovery. An accepted graceful drain
+continues under its existing drain deadline. QUIC retains its native idle timers;
+the server does not originate a second QUIC keep-alive schedule.
 
 The four byte-window fields compose rather than replace one another. Estimate
 aggregate BDP as `sum(rate_bps × RTT_seconds) / 8`. Aggregate admitted work is

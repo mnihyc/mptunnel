@@ -275,7 +275,6 @@ pub(in crate::runtime::path::tcp) async fn expire_client_tcp_pending_opens(
     }
     if detached {
         connection.carrier.writer.flush().await?;
-        connection.record_outbound_activity();
     }
     Ok(())
 }
@@ -304,7 +303,6 @@ async fn retire_client_tcp_pending_open(
     connection.carrier.writer.write_frame(&detach).await?;
     connection.path_proofs.record_sent_frame(&detach);
     connection.carrier.writer.flush().await?;
-    connection.record_outbound_activity();
     Ok(())
 }
 
@@ -405,7 +403,6 @@ pub(in crate::runtime::path::tcp) async fn open_client_tcp_stream_on_connection(
             .await?;
         return Ok(());
     }
-    connection.carrier.schedule_next_heartbeat();
     Ok(())
 }
 
@@ -619,7 +616,6 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
                     connection.carrier.writer.write_frame(&detach).await?;
                     connection.path_proofs.record_sent_frame(&detach);
                     connection.carrier.writer.flush().await?;
-                    connection.record_outbound_activity();
                 }
                 return Ok(());
             }

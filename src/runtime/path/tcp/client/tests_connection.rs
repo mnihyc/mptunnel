@@ -1,5 +1,5 @@
+use super::super::heartbeat::heartbeat_renewal_delay;
 use super::ClientTcpPathSessionSlot;
-use super::connection::heartbeat_renewal_delay;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::model::path::next_carrier_path_instance_id;
 use crate::protocol::{

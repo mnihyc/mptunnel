@@ -56,6 +56,86 @@ fn server_webhooks_require_readiness_and_reject_late_or_duplicate_publication() 
 }
 
 #[test]
+fn heartbeat_retirement_keeps_sibling_session_and_uses_carrier_lifecycle_reason() {
+    let (registry, capture) = observed_registry(&EventKind::ALL);
+    let expired = registry.register_carrier_path(SessionId(7), UnderlayProtocol::Tcp, PathId(1));
+    let sibling = registry.register_carrier_path(SessionId(7), UnderlayProtocol::Tcp, PathId(2));
+    registry.carrier_ready(
+        identity(&expired),
+        None,
+        Some("192.0.2.1:1001".parse().unwrap()),
+        0,
+    );
+    registry.carrier_ready(
+        identity(&sibling),
+        None,
+        Some("192.0.2.2:1002".parse().unwrap()),
+        0,
+    );
+
+    let session_events = events(&capture, EventKind::SessionStateChanged);
+    assert_eq!(session_events.len(), 1);
+    assert_eq!(session_events[0]["change"]["to"], "attached");
+
+    expired.retirement_reason("heartbeat_reply_timeout");
+    let _ = expired.begin_retirement();
+
+    let carrier_events = events(&capture, EventKind::CarrierStateChanged);
+    let expired_events = carrier_events
+        .iter()
+        .filter(|event| event["carrier"]["path_id"] == 1)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        expired_events
+            .iter()
+            .map(|event| event["change"]["to"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["ready", "draining", "closed"]
+    );
+    assert!(expired_events.iter().any(|event| {
+        event["change"]["to"] == "draining" && event["reason"] == "heartbeat_reply_timeout"
+    }));
+    assert!(expired_events.iter().any(|event| {
+        event["change"]["to"] == "closed" && event["reason"] == "heartbeat_reply_timeout"
+    }));
+    assert_eq!(
+        carrier_events.len(),
+        4,
+        "no heartbeat-specific event is emitted"
+    );
+    let session_events = events(&capture, EventKind::SessionStateChanged);
+    assert_eq!(
+        session_events.len(),
+        1,
+        "the ready sibling keeps the session attached"
+    );
+    assert_eq!(session_events[0]["change"]["to"], "attached");
+
+    sibling.retirement_reason("heartbeat_send_progress_timeout");
+    let _ = sibling.begin_retirement();
+    let sibling_events = events(&capture, EventKind::CarrierStateChanged)
+        .into_iter()
+        .filter(|event| event["carrier"]["path_id"] == 2)
+        .collect::<Vec<_>>();
+    assert!(sibling_events.iter().any(|event| {
+        event["change"]["to"] == "draining" && event["reason"] == "heartbeat_send_progress_timeout"
+    }));
+    assert!(sibling_events.iter().any(|event| {
+        event["change"]["to"] == "closed" && event["reason"] == "heartbeat_send_progress_timeout"
+    }));
+    let session_events = events(&capture, EventKind::SessionStateChanged);
+    assert_eq!(session_events.len(), 2);
+    assert_eq!(session_events[1]["change"]["from"], "attached");
+    assert_eq!(session_events[1]["change"]["to"], "detached");
+    assert_eq!(
+        session_events[1]["change"]["reason"],
+        "last_ready_carrier_left"
+    );
+    assert_eq!(events(&capture, EventKind::CarrierStateChanged).len(), 6);
+    assert_eq!(capture.dropped(), 0);
+}
+
+#[test]
 fn server_session_presence_counts_ready_carriers_independently_of_product_references() {
     let (registry, capture) = observed_registry(&[EventKind::SessionStateChanged]);
     let path = registry.register_carrier_path(SessionId(2), UnderlayProtocol::Tcp, PathId(1));

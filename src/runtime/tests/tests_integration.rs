@@ -3103,27 +3103,6 @@ async fn reliable_relay_heartbeat_timeout_enters_session_retention_without_a_sur
         .expect("heartbeat test server");
 }
 
-#[test]
-fn tcp_path_activity_does_not_extend_pending_heartbeat_deadline() {
-    let before = tokio::time::Instant::now();
-    let mut next_heartbeat_at = before;
-    let old_deadline = before + Duration::from_millis(1);
-    let pending = Some((42, old_deadline));
-
-    refresh_client_tcp_path_liveness_state(
-        &mut next_heartbeat_at,
-        Duration::from_secs(10),
-        pending.is_some(),
-    );
-
-    assert_eq!(next_heartbeat_at, before);
-    let Some((nonce, deadline)) = pending else {
-        panic!("heartbeat should remain pending");
-    };
-    assert_eq!(nonce, 42);
-    assert_eq!(deadline, old_deadline);
-}
-
 #[tokio::test]
 async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
     let (target_addr, target) = spawn_echo_target().await;

@@ -3,6 +3,9 @@
 //! The registration guard, substates, and biased input loop live together so
 //! no stream, datagram, or proof can outlive the TCP carrier that owns it.
 
+use super::super::heartbeat::{
+    TcpCarrierHeartbeat, TcpCarrierHeartbeatClaim, TcpCarrierHeartbeatFailure,
+};
 use super::super::io::encrypted_framed_peer_closed;
 use super::datagram::{ServerTcpDatagramEffect, ServerTcpDatagramState};
 use super::evidence::ServerTcpEvidenceState;
@@ -31,6 +34,7 @@ use crate::runtime::path::{
 };
 use crate::runtime::peer_status::PeerStatusCarrier;
 use crate::transport::encrypted::EncryptedFramedTransportError;
+use std::sync::Arc;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -40,6 +44,18 @@ fn server_tcp_native_result(error: EncryptedFramedTransportError) -> Result<(), 
         Ok(())
     } else {
         Err(RuntimeError::Encrypted(error))
+    }
+}
+
+fn server_tcp_heartbeat_failure(
+    heartbeat: &TcpCarrierHeartbeat,
+    failure: TcpCarrierHeartbeatFailure,
+) -> Result<(), RuntimeError> {
+    match failure {
+        TcpCarrierHeartbeatFailure::SendProgressTimeout
+        | TcpCarrierHeartbeatFailure::ReplyTimeout => Ok(()),
+        TcpCarrierHeartbeatFailure::ProtocolViolation
+        | TcpCarrierHeartbeatFailure::RandomSourceFailure => Err(heartbeat.runtime_error(failure)),
     }
 }
 
@@ -67,6 +83,7 @@ enum ServerTcpPathEvent {
     Command(ReliablePathCommand),
     PeerStatusRequest(u64),
     SenderObservationDue,
+    HeartbeatDue,
 }
 
 enum ServerTcpPathDrainEvent {
@@ -85,6 +102,7 @@ pub(in crate::runtime::path::tcp) struct ServerTcpPathAdmission {
         mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     pub(in crate::runtime::path::tcp) native_terminal:
         Option<tokio::sync::oneshot::Receiver<EncryptedFramedTransportError>>,
+    pub(in crate::runtime::path::tcp) heartbeat: Arc<TcpCarrierHeartbeat>,
     pub(in crate::runtime::path::tcp) commands_tx: ReliablePathCommandSender,
     pub(in crate::runtime::path::tcp) commands_rx: ReliablePathCommandReceivers,
     pub(in crate::runtime::path::tcp) evidence: ServerTcpEvidenceState,
@@ -104,6 +122,7 @@ pub(in crate::runtime::path::tcp) struct ServerTcpPathSession {
     commands_tx: ReliablePathCommandSender,
     path_frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     native_terminal: Option<tokio::sync::oneshot::Receiver<EncryptedFramedTransportError>>,
+    heartbeat: Arc<TcpCarrierHeartbeat>,
     deferred_input: Option<Frame>,
     writer: ServerTcpWriter,
     peer_status: PeerStatusCarrier,
@@ -140,6 +159,7 @@ impl ServerTcpPathSession {
             commands_tx: admission.commands_tx,
             path_frames: admission.path_frames,
             native_terminal: admission.native_terminal,
+            heartbeat: admission.heartbeat,
             deferred_input: None,
             writer: admission.writer,
             peer_status: admission.peer_status,
@@ -170,8 +190,11 @@ impl ServerTcpPathSession {
         let carrier_terminal_signal = self.commands_tx.terminal_signal();
         let carrier_terminal = carrier_terminal_signal.wait();
         tokio::pin!(carrier_terminal);
+        let heartbeat_owner = self.heartbeat.clone();
+        let heartbeat_failure = heartbeat_owner.clone().failure_future();
+        tokio::pin!(heartbeat_failure);
         let mut native_terminal = self.native_terminal.take();
-        let (result, reconcile_native, retirement_reason) = {
+        let (mut result, reconcile_native, mut retirement_reason) = {
             let native_result = async {
                 match native_terminal.as_mut() {
                     Some(receiver) => match receiver.await {
@@ -197,6 +220,11 @@ impl ServerTcpPathSession {
                     ReliablePathCarrierTerminalCause::Retired => (Ok(()), false, "planned_retirement"),
                 },
                 () = &mut drain_expiry => (Err(RuntimeError::ReliablePathSessionClosed), false, "drain_timeout"),
+                failure = &mut heartbeat_failure => (
+                    server_tcp_heartbeat_failure(&heartbeat_owner, failure),
+                    false,
+                    failure.reason(),
+                ),
                 result = self.run_active() => {
                     // Native readiness can observe a carrier close before a
                     // framed write or the reader does. It has the same terminal
@@ -210,6 +238,13 @@ impl ServerTcpPathSession {
                 },
             }
         };
+        if retirement_reason == "actor_completed"
+            && result.is_ok()
+            && let Some(failure) = heartbeat_owner.current_failure()
+        {
+            retirement_reason = failure.reason();
+            result = server_tcp_heartbeat_failure(&heartbeat_owner, failure);
+        }
         let result = if reconcile_native {
             // A biased select is not an atomic snapshot. The reader may publish
             // its result and failure fence after the native branch polls Pending,
@@ -253,6 +288,15 @@ impl ServerTcpPathSession {
                 }
                 tokio::select! {
                     biased;
+                    // Probe deadlines are independent of outbound product
+                    // activity. Service an already-due challenge before a
+                    // continuously ready command queue can monopolize actor
+                    // turns. Accepted PATH_DRAIN was published by the
+                    // authenticated reader before it entered this mailbox,
+                    // so graceful drain still suppresses new probes.
+                    _ = self.heartbeat.wait_until_due() => {
+                        Some(ServerTcpPathEvent::HeartbeatDue)
+                    }
                     event = recv_server_tcp_path_event(
                         &mut self.path_frames,
                         &mut self.commands_rx,
@@ -318,8 +362,43 @@ impl ServerTcpPathSession {
                     }
                 }
                 ServerTcpPathEvent::SenderObservationDue => {}
+                ServerTcpPathEvent::HeartbeatDue => match self.send_due_heartbeat().await? {
+                    ServerTcpSessionDisposition::Continue => {}
+                    ServerTcpSessionDisposition::Stop => return Ok(()),
+                },
             }
         }
+    }
+
+    async fn send_due_heartbeat(&mut self) -> Result<ServerTcpSessionDisposition, RuntimeError> {
+        let claim = self.heartbeat.claim_due_ping(
+            tokio::time::Instant::now(),
+            crate::runtime::identity::random_u64_sample,
+        );
+        let ping = match claim {
+            TcpCarrierHeartbeatClaim::Claimed(ping) => ping,
+            TcpCarrierHeartbeatClaim::Failed(_) => {
+                return Ok(ServerTcpSessionDisposition::Stop);
+            }
+            TcpCarrierHeartbeatClaim::NotDue | TcpCarrierHeartbeatClaim::Draining => {
+                return Ok(ServerTcpSessionDisposition::Continue);
+            }
+        };
+        if !self
+            .writer
+            .write_frame(&Frame::Ping { nonce: ping.nonce })
+            .await?
+        {
+            return Ok(ServerTcpSessionDisposition::Stop);
+        }
+        if self
+            .heartbeat
+            .mark_ping_flushed(ping.nonce, tokio::time::Instant::now())
+            .is_err()
+        {
+            return Ok(ServerTcpSessionDisposition::Stop);
+        }
+        Ok(ServerTcpSessionDisposition::Continue)
     }
 
     async fn run_path_drain(&mut self) -> Result<(), RuntimeError> {
@@ -384,6 +463,7 @@ impl ServerTcpPathSession {
                     }
                 }
                 ServerTcpPathEvent::SenderObservationDue => {}
+                ServerTcpPathEvent::HeartbeatDue => {}
             }
         }
 

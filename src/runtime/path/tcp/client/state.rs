@@ -66,10 +66,6 @@ impl ClientTcpPathConnection {
         }
     }
 
-    pub(in crate::runtime::path::tcp) fn record_outbound_activity(&mut self) {
-        self.carrier.refresh_liveness();
-    }
-
     pub(in crate::runtime::path::tcp) fn retain_authenticated_carrier(
         &mut self,
         registration: AuthenticatedCarrierRegistration,

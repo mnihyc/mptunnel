@@ -41,6 +41,11 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --all-features
 
+      - name: Dashboard behavior
+        run: |
+          node --check assets/dashboard/dashboard.js
+          node --test tests/dashboard_quality.test.cjs
+
       - name: Standalone patched Quinn locked tests
         run: cargo test --locked --manifest-path crates/quinn-proto/Cargo.toml
 

@@ -122,8 +122,6 @@ use node::run_path_probe_service as run_client_path_service;
 #[cfg(test)]
 use node::server::run as run_server;
 #[cfg(test)]
-use path::tcp::client::connection::*;
-#[cfg(test)]
 use path::tcp::client::*;
 #[cfg(test)]
 use path::tcp::server::*;

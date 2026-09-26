@@ -8,6 +8,7 @@ pub(in crate::runtime) mod admission;
 pub(in crate::runtime) mod capacity;
 pub(in crate::runtime) mod client;
 pub(in crate::runtime) mod group;
+pub(in crate::runtime) mod heartbeat;
 pub(in crate::runtime) mod io;
 pub(in crate::runtime) mod metrics;
 pub(in crate::runtime) mod server;

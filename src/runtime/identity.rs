@@ -19,8 +19,12 @@ pub(super) fn random_session_id() -> Result<SessionId, RuntimeError> {
 }
 
 pub(super) fn random_u64() -> Result<u64, RuntimeError> {
+    random_u64_sample().map_err(RuntimeError::Random)
+}
+
+pub(super) fn random_u64_sample() -> Result<u64, getrandom::Error> {
     let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).map_err(RuntimeError::Random)?;
+    getrandom::fill(&mut bytes)?;
     Ok(u64::from_be_bytes(bytes))
 }
 

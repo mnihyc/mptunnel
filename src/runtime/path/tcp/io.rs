@@ -19,16 +19,23 @@ use tokio::sync::{mpsc, oneshot};
 pub(in crate::runtime) type EncryptedTcpReader = EncryptedFramedReader<TcpStream>;
 pub(in crate::runtime) type EncryptedTcpWriter = EncryptedFramedWriter<TcpStream>;
 
-/// Observes one completely authenticated and decoded frame before bounded
-/// actor delivery. Session-wide terminal publication uses this boundary so a
-/// blocked ordered writer cannot defer a peer SESSION_CLOSE behind its write.
-pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_observer<Observe>(
+/// Decides whether an authenticated frame enters the bounded actor queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::runtime::path::tcp) enum AuthenticatedFrameDisposition {
+    Forward,
+    Consume,
+}
+
+/// Observes an authenticated frame and may consume it before bounded actor
+/// delivery. This is used for carrier-local control that must not wait behind
+/// an actor blocked on ordered writes.
+pub(in crate::runtime::path::tcp) fn spawn_encrypted_tcp_reader_with_filtered_observer<Observe>(
     mut reader: EncryptedTcpReader,
     queue_size: usize,
     mut observe: Observe,
 ) -> mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>
 where
-    Observe: FnMut(&Frame) + Send + 'static,
+    Observe: FnMut(&Frame) -> AuthenticatedFrameDisposition + Send + 'static,
 {
     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
     tokio::spawn(async move {
@@ -37,10 +44,15 @@ where
                 _ = frames_tx.closed() => break,
                 frame = reader.read_frame() => frame,
             };
-            if let Ok(frame) = frame.as_ref() {
-                observe(frame);
-            }
+            let disposition = if let Ok(frame) = frame.as_ref() {
+                observe(frame)
+            } else {
+                AuthenticatedFrameDisposition::Forward
+            };
             let done = frame.is_err();
+            if disposition == AuthenticatedFrameDisposition::Consume {
+                continue;
+            }
             #[cfg(feature = "lab-diagnostics")]
             let bytes = frame
                 .as_ref()
@@ -66,7 +78,37 @@ where
 /// Product admission. A consumer observing that failure fence can therefore
 /// recover its owned result even if it polled the result plane before publication.
 /// A full ordered frame queue cannot delay this terminal publication.
+#[cfg(test)]
 pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_terminal_result<
+    Observe,
+    ObserveTerminal,
+>(
+    reader: EncryptedTcpReader,
+    queue_size: usize,
+    mut observe: Observe,
+    observe_terminal: ObserveTerminal,
+) -> (
+    mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+    oneshot::Receiver<EncryptedFramedTransportError>,
+)
+where
+    Observe: FnMut(&Frame) + Send + 'static,
+    ObserveTerminal: FnMut() + Send + 'static,
+{
+    spawn_encrypted_tcp_reader_with_filtered_terminal_result(
+        reader,
+        queue_size,
+        move |frame| {
+            observe(frame);
+            AuthenticatedFrameDisposition::Forward
+        },
+        observe_terminal,
+    )
+}
+
+/// Terminal-result reader with an authenticated pre-queue consume boundary.
+/// Existing terminal publication ordering is preserved for transport errors.
+pub(in crate::runtime::path::tcp) fn spawn_encrypted_tcp_reader_with_filtered_terminal_result<
     Observe,
     ObserveTerminal,
 >(
@@ -79,7 +121,7 @@ pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_terminal_result<
     oneshot::Receiver<EncryptedFramedTransportError>,
 )
 where
-    Observe: FnMut(&Frame) + Send + 'static,
+    Observe: FnMut(&Frame) -> AuthenticatedFrameDisposition + Send + 'static,
     ObserveTerminal: FnMut() + Send + 'static,
 {
     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
@@ -92,7 +134,9 @@ where
             };
             match frame {
                 Ok(frame) => {
-                    observe(&frame);
+                    if observe(&frame) == AuthenticatedFrameDisposition::Consume {
+                        continue;
+                    }
                     #[cfg(feature = "lab-diagnostics")]
                     let bytes = reliable_path_frame_pacing_bytes(&frame);
                     #[cfg(feature = "lab-diagnostics")]
@@ -138,10 +182,108 @@ mod tests {
     use super::*;
     use crate::protocol::Frame;
     use crate::runtime::CodecLimits;
+    use crate::runtime::path::tcp::heartbeat::{
+        TcpCarrierHeartbeat, TcpCarrierHeartbeatClaim, TcpCarrierHeartbeatFrameDisposition,
+    };
     use crate::transport::encrypted::EncryptedFramedStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn authenticated_reader_consumes_matching_pong_while_actor_queue_is_full() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind TCP reader test");
+        let client_socket = TcpStream::connect(listener.local_addr().expect("listener address"));
+        let server_socket = listener.accept();
+        let (client_socket, server_socket) = tokio::join!(client_socket, server_socket);
+        let client_socket = client_socket.expect("connect TCP reader test");
+        let (server_socket, _) = server_socket.expect("accept TCP reader test");
+        let client_tls = crate::transport::encrypted::test_client_tls_config();
+        let server_tls = crate::transport::encrypted::test_server_tls_config();
+        let codec_limits = CodecLimits::default();
+        let (client, server) = tokio::join!(
+            EncryptedFramedStream::connect(client_socket, &client_tls, codec_limits),
+            EncryptedFramedStream::accept(server_socket, &server_tls, codec_limits),
+        );
+        let mut client = client.expect("client protected carrier");
+        let server = server.expect("server protected carrier");
+        let (server_reader, _server_writer) = server.split().expect("split protected carrier");
+        let started_at = tokio::time::Instant::now() - Duration::from_secs(10);
+        let heartbeat = std::sync::Arc::new(TcpCarrierHeartbeat::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            started_at,
+            0,
+        ));
+        assert!(matches!(
+            heartbeat.claim_due_ping(tokio::time::Instant::now(), || Ok(73)),
+            TcpCarrierHeartbeatClaim::Claimed(_)
+        ));
+        let observed_heartbeat = heartbeat.clone();
+        let sample_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_sample_calls = sample_calls.clone();
+        let mut frames =
+            spawn_encrypted_tcp_reader_with_filtered_observer(server_reader, 1, move |frame| {
+                let decoded_at = tokio::time::Instant::now();
+                match observed_heartbeat.observe_authenticated_frame(frame, decoded_at, || {
+                    observed_sample_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(0)
+                }) {
+                    TcpCarrierHeartbeatFrameDisposition::Consume => {
+                        AuthenticatedFrameDisposition::Consume
+                    }
+                    TcpCarrierHeartbeatFrameDisposition::Forward => {
+                        AuthenticatedFrameDisposition::Forward
+                    }
+                }
+            });
+
+        client
+            .write_frame(&Frame::Ping { nonce: 74 })
+            .await
+            .expect("write ordinary frame");
+        client.flush().await.expect("flush ordinary frame");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while frames.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary frame did not fill bounded actor queue");
+
+        client
+            .write_frame(&Frame::Pong { nonce: 73 })
+            .await
+            .expect("write matching PONG");
+        client.flush().await.expect("flush matching PONG");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while heartbeat.next_due_at().is_none() && heartbeat.current_failure().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader did not decode the matching PONG");
+        assert_eq!(heartbeat.current_failure(), None);
+        assert!(
+            heartbeat.next_due_at().is_some(),
+            "matching PONG did not clear challenge"
+        );
+        assert_eq!(sample_calls.load(Ordering::Relaxed), 1);
+
+        let received = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .expect("ordinary authenticated frame delivery timeout")
+            .expect("reader dropped before ordinary frame");
+        assert!(matches!(received, Ok(Frame::Ping { nonce: 74 })));
+        assert!(
+            frames.try_recv().is_err(),
+            "consumed PONG entered actor queue"
+        );
+    }
 
     #[tokio::test]
     async fn native_terminal_is_published_before_error_delivery_blocks_on_a_full_actor_queue() {

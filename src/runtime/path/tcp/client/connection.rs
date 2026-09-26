@@ -4,14 +4,18 @@
 //! telemetry, and liveness. Reliable-stream proof and capacity policy belong to
 //! the reliable client actor, while datagram sessions reuse this carrier alone.
 
-use super::super::io::{EncryptedTcpWriter, spawn_encrypted_tcp_reader_with_observer};
+use super::super::heartbeat::{TcpCarrierHeartbeat, TcpCarrierHeartbeatClaim};
+use super::super::io::{
+    AuthenticatedFrameDisposition, EncryptedTcpWriter,
+    spawn_encrypted_tcp_reader_with_filtered_observer,
+};
 use super::super::metrics::TcpMetricPublisher;
 use crate::config::ClientSecurityConfig;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{ConfiguredMemberSlot, Frame, PathId, PathUsage, SessionId};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::identity::random_u64;
+use crate::runtime::identity::{random_u64, random_u64_sample};
 use crate::runtime::path::client_session::ClientSessionLifecycle;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
 use crate::runtime::path::tcp::admission::ClientTcpPathAuthentication;
@@ -21,6 +25,7 @@ use crate::transport::encrypted::{
 use crate::transport::tcp::{self as tcp_transport, TcpConnectOptions};
 use crate::transport::tcp_write_admission::TcpWriteAdmission;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -29,11 +34,7 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
     pub(in crate::runtime) remote_port: u16,
     pub(in crate::runtime) writer: EncryptedTcpWriter,
     pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
-    heartbeat_interval: Duration,
-    heartbeat_delay: Duration,
-    heartbeat_timeout: Duration,
-    next_heartbeat_at: tokio::time::Instant,
-    pending_heartbeat: Option<(u64, tokio::time::Instant)>,
+    pub(in crate::runtime::path::tcp) heartbeat: Arc<TcpCarrierHeartbeat>,
     pub(in crate::runtime) tcp_metrics: Option<TcpMetricPublisher>,
     pub(super) write_admission: Option<TcpWriteAdmission>,
     pub(in crate::runtime) peer_usage_sequence: u64,
@@ -86,62 +87,23 @@ impl ClientTcpCarrierConnection {
         }
     }
 
-    pub(in crate::runtime) fn heartbeat_deadline(&self) -> tokio::time::Instant {
-        self.pending_heartbeat
-            .as_ref()
-            .map(|(_, deadline)| *deadline)
-            .unwrap_or(self.next_heartbeat_at)
-    }
-
-    pub(in crate::runtime) fn schedule_next_heartbeat(&mut self) {
-        self.next_heartbeat_at = tokio::time::Instant::now() + self.heartbeat_delay;
-    }
-
-    /// Reschedules the idle probe only while no response is outstanding.
-    /// Local writes are not peer evidence and cannot extend a Pong deadline.
-    pub(in crate::runtime) fn refresh_liveness(&mut self) {
-        refresh_client_tcp_path_liveness_state(
-            &mut self.next_heartbeat_at,
-            self.heartbeat_delay,
-            self.pending_heartbeat.is_some(),
-        );
-    }
-
-    /// Reliable paths require an exact Pong and restart the idle interval.
-    pub(in crate::runtime) fn complete_expected_heartbeat(
-        &mut self,
-        nonce: u64,
-    ) -> Result<(), RuntimeError> {
-        let Some((pending_nonce, _)) = self.pending_heartbeat.as_ref() else {
-            return Err(RuntimeError::Protocol(
-                "unexpected TCP path heartbeat response",
-            ));
-        };
-        if *pending_nonce != nonce {
-            return Err(RuntimeError::Protocol(
-                "unexpected TCP path heartbeat response",
-            ));
-        }
-        self.pending_heartbeat = None;
-        self.heartbeat_delay = heartbeat_renewal_delay(self.heartbeat_interval, random_u64()?);
-        self.next_heartbeat_at = tokio::time::Instant::now() + self.heartbeat_delay;
-        Ok(())
-    }
-
     pub(in crate::runtime) async fn tick_heartbeat(&mut self) -> Result<(), RuntimeError> {
         let now = tokio::time::Instant::now();
-        if let Some((_, deadline)) = self.pending_heartbeat.as_ref()
-            && now >= *deadline
-        {
-            return Err(RuntimeError::PathHeartbeatTimeout);
-        }
-        if self.pending_heartbeat.is_none() && now >= self.next_heartbeat_at {
-            let nonce = random_u64()?;
-            self.writer.write_frame(&Frame::Ping { nonce }).await?;
-            self.writer.flush().await?;
-            self.pending_heartbeat = Some((nonce, now + self.heartbeat_timeout));
-        }
-        Ok(())
+        let claim = self.heartbeat.claim_due_ping(now, random_u64_sample);
+        let ping = match claim {
+            TcpCarrierHeartbeatClaim::NotDue | TcpCarrierHeartbeatClaim::Draining => return Ok(()),
+            TcpCarrierHeartbeatClaim::Failed(failure) => {
+                return Err(self.heartbeat.runtime_error(failure));
+            }
+            TcpCarrierHeartbeatClaim::Claimed(ping) => ping,
+        };
+        self.writer
+            .write_frame(&Frame::Ping { nonce: ping.nonce })
+            .await?;
+        self.writer.flush().await?;
+        self.heartbeat
+            .mark_ping_flushed(ping.nonce, tokio::time::Instant::now())
+            .map_err(|failure| self.heartbeat.runtime_error(failure))
     }
 }
 
@@ -275,11 +237,20 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         }
 
         let (reader, writer) = framed.split()?;
+        let now = tokio::time::Instant::now();
+        let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+            mux_limits.tcp_path_heartbeat_interval,
+            mux_limits.tcp_path_heartbeat_timeout,
+            now,
+            random_u64()?,
+        ));
         let observed_lifecycle = session_lifecycle.clone();
-        let frames = spawn_encrypted_tcp_reader_with_observer(
+        let observed_heartbeat = heartbeat.clone();
+        let frames = spawn_encrypted_tcp_reader_with_filtered_observer(
             reader,
             reliable_path_writer_frame_queue(mux_limits),
             move |frame| {
+                let decoded_at = tokio::time::Instant::now();
                 #[cfg(feature = "lab-diagnostics")]
                 if let Frame::StreamData {
                     stream_id,
@@ -308,21 +279,26 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
                 if let Frame::SessionClose { reason } = frame {
                     observed_lifecycle.retire(*reason);
                 }
+                match observed_heartbeat.observe_authenticated_frame(
+                    frame,
+                    decoded_at,
+                    random_u64_sample,
+                ) {
+                    crate::runtime::path::tcp::heartbeat::TcpCarrierHeartbeatFrameDisposition::Forward => {
+                        AuthenticatedFrameDisposition::Forward
+                    }
+                    crate::runtime::path::tcp::heartbeat::TcpCarrierHeartbeatFrameDisposition::Consume => {
+                        AuthenticatedFrameDisposition::Consume
+                    }
+                }
             },
         );
-        let now = tokio::time::Instant::now();
-        let heartbeat_delay =
-            heartbeat_renewal_delay(mux_limits.tcp_path_heartbeat_interval, random_u64()?);
         Ok(ClientTcpCarrierConnection {
             path_id,
             remote_port,
             writer,
             frames,
-            heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
-            heartbeat_delay,
-            heartbeat_timeout: mux_limits.tcp_path_heartbeat_timeout,
-            next_heartbeat_at: now + heartbeat_delay,
-            pending_heartbeat: None,
+            heartbeat,
             tcp_metrics,
             write_admission,
             peer_usage_sequence: 0,
@@ -335,37 +311,4 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
     tokio::time::timeout_at(open_deadline, connect)
         .await
         .map_err(|_| RuntimeError::PathOpenTimedOut)?
-}
-
-pub(in crate::runtime) fn refresh_client_tcp_path_liveness_state(
-    next_heartbeat_at: &mut tokio::time::Instant,
-    heartbeat_delay: Duration,
-    heartbeat_pending: bool,
-) {
-    if !heartbeat_pending {
-        *next_heartbeat_at = tokio::time::Instant::now() + heartbeat_delay;
-    }
-}
-
-/// Maps one uniformly random sample onto the RFC heartbeat renewal window.
-///
-/// The configured interval remains the maximum delay. Integer multiplication
-/// avoids floating-point drift and introduces at most one-sample quantization
-/// imbalance across a nanosecond-sized range.
-pub(in crate::runtime::path::tcp) fn heartbeat_renewal_delay(
-    maximum: Duration,
-    sample: u64,
-) -> Duration {
-    let maximum_nanos = maximum.as_nanos();
-    let minimum_nanos = maximum_nanos.saturating_mul(4) / 5;
-    let span = maximum_nanos.saturating_sub(minimum_nanos);
-    let offset = (u128::from(sample).saturating_mul(span.saturating_add(1))) >> 64;
-    duration_from_nanos(minimum_nanos.saturating_add(offset).min(maximum_nanos))
-}
-
-fn duration_from_nanos(nanos: u128) -> Duration {
-    const NANOS_PER_SECOND: u128 = 1_000_000_000;
-    let seconds = nanos / NANOS_PER_SECOND;
-    let subsecond_nanos = (nanos % NANOS_PER_SECOND) as u32;
-    Duration::new(u64::try_from(seconds).unwrap_or(u64::MAX), subsecond_nanos)
 }

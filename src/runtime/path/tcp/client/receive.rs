@@ -38,7 +38,6 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
-    connection.carrier.refresh_liveness();
     expire_client_tcp_pending_opens(connection, streams, closed_streams).await?;
     let path_id = runtime.path_id();
     match &frame {
@@ -129,7 +128,9 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
         | Frame::PathCapacityReceipt { .. }) => {
             handle_client_tcp_capacity_frame(frame, connection, runtime).await
         }
-        Frame::Pong { nonce } => connection.carrier.complete_expected_heartbeat(nonce),
+        Frame::Pong { .. } => Err(RuntimeError::Protocol(
+            "TCP path heartbeat response bypassed authenticated observer",
+        )),
         Frame::PathStatus {
             path_id: status_path_id,
             sequence,

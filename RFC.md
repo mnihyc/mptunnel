@@ -664,25 +664,46 @@ Section 13.
 
 One TCP carrier instance multiplexes path control, stream attachments, and
 datagram-flow attachments. `PING` and `PONG` may provide MPP-level heartbeat.
-The TCP client alone initiates an idle heartbeat. The configured heartbeat
-interval `I` is the maximum idle delay, not a periodic wire cadence. At
-connection start and after each completed idle heartbeat, the client selects a
+Either TCP endpoint may initiate an idle heartbeat independently. The configured
+interval `I` is the maximum receive-idle delay, not a periodic wire cadence. At
+connection start and after each completed idle heartbeat, the endpoint selects a
 fresh cryptographically random delay uniformly from `[0.8I, I]`. Authenticated
-traffic defers the current delay without drawing another value; it MUST NOT
-extend an outstanding `PONG` deadline. A late wake coalesces missed timer work
-into at most one probe and never emits a catch-up burst. Thus the maximum
-last-activity-to-failure bound remains `I` plus the configured heartbeat
-timeout.
+frames received on that exact carrier defer the current delay without drawing
+another value, provided no challenge has started. Locally queuing or writing
+bytes and activity on sibling carriers MUST NOT renew receive-idle liveness.
+
+Each endpoint owns at most one outstanding challenge on each carrier. When a
+due probe is claimed for the serialized writer, its nonce and absolute deadline
+become fixed. The deadline is the idle due time plus the configured heartbeat
+timeout; it includes waiting for writer service, transmission, and receipt of the
+reply. Deadline enforcement MUST remain active while ordinary writes or a
+heartbeat write are blocked, including before the writer can claim the probe.
+At a writer arbitration boundary, a due probe takes precedence over ordinary
+outgoing work; a continuously ready sender MUST NOT starve its own liveness check.
+Other authenticated traffic MUST NOT extend an outstanding challenge. A late
+wake coalesces missed timer work into at most one probe, never a catch-up burst
+or a fresh timeout budget. Subject to runtime scheduling, receive inactivity is
+therefore bounded by `I` plus the configured heartbeat timeout.
 
 A receiver of `PING(nonce)` returns exactly `PONG(nonce)` in the opposite
 direction on the same bidirectional reliable carrier operation; a PONG grants
-no Product, flow-control, delivery, or rate evidence. On a TCP carrier the
-client may have at most one heartbeat PING outstanding, the server MUST NOT
-originate an idle heartbeat, and only a PONG carrying that outstanding nonce
-completes the heartbeat. An unsolicited or mismatched TCP heartbeat PONG is a
-carrier protocol violation; failure to receive the matching PONG before expiry
-of the local configured heartbeat timeout terminally fails that exact TCP
-carrier. A QUIC request operation may
+no Product, flow-control, delivery, or rate evidence. Only a matching PONG
+authenticated and decoded on that exact carrier before its deadline completes
+the challenge. Completion occurs at decode, independently of subsequent actor
+queue service; it is valid even if the sender has not yet observed its local
+flush completion. Simultaneous challenges in opposite directions are independent.
+An unsolicited or mismatched TCP heartbeat PONG is a carrier protocol violation.
+An expired attempt terminally fails that exact carrier: a local send-progress
+timeout is distinguished from a reply timeout, and neither proves packet loss.
+A possibly partial encrypted write MUST NOT be resumed on a timed-out carrier.
+
+An accepted graceful drain stops new heartbeat challenges and takes precedence
+through the existing drain lifecycle and deadline. A reply to its canceled
+outstanding challenge may be consumed without delaying `PATH_CLOSE`; unrelated
+PONG nonces remain invalid. On heartbeat failure, exact-carrier retirement
+withdraws its placement eligibility and current inventory before waiting for
+ordered stream cleanup. Logical stream retention and recovery through surviving
+carriers remain unchanged. A QUIC request operation may
 instead use one PING/PONG exchange as a bounded operation-local reachability
 probe. Its local deadline, mismatch, or timeout fails only that probe unless
 native QUIC independently declares the connection terminal.

@@ -778,6 +778,13 @@
       finiteNumber(ageMs) >= finiteNumber(horizonMs);
   }
 
+  function deliveryRateIsStale(path, ageMs, snapshotStale) {
+    // Approximate history without both clocks cannot attest to a current rate.
+    return snapshotStale || metricIsStale(ageMs, path.freshness_horizon_ms) ||
+      (path.delivery_rate_approximate === true &&
+        (!metricAvailable(ageMs) || !metricAvailable(path.freshness_horizon_ms)));
+  }
+
   function qualityGroupKey(path, result) {
     return [
       result ? result.service : path.service,
@@ -824,39 +831,55 @@
           ? finiteNumber(path.delivery_rate_bps)
           : null
       );
+      const stale = snapshotStale || Boolean(point &&
+        (now - point.observedAt >= staleAfterMs() || point.elapsedMs > staleAfterMs()));
+      let rateFresh = rate !== null && !stale;
+      let rateStale = stale;
+      if (rate !== null && !point && approximateRate) {
+        const metricAgeMs = result
+          ? effectivePeerMetricAgeMs(path, result)
+          : effectivePathMetricAgeMs(path);
+        rateFresh = !deliveryRateIsStale(path, metricAgeMs, snapshotStale);
+        rateStale = !rateFresh;
+      }
       return {
         group: group, rate: rate,
+        rateFresh: rateFresh,
         delta: point ? point.delta : null,
         elapsedMs: point ? point.elapsedMs : null,
         direction: sample ? sample.direction : path.direction,
         approximate: approximateRate || path.quality_approximate === true,
-        stale: snapshotStale || Boolean(point &&
-          (now - point.observedAt >= staleAfterMs() || point.elapsedMs > staleAfterMs())),
+        stale: rateStale,
         // Serialization only. RTT/2 is not one-way delay on asymmetric paths.
         etaMs: rate > 0 ? QUALITY_PAYLOAD_BYTES * 8 / rate * 1000 : null,
-        sharePpm: null, shareApproximate: approximateRate, peers: 0
+        sharePpm: null, shareApproximate: approximateRate, peers: 0,
+        coverageFresh: 0, coverageTotal: 0
       };
     });
     // Retain only the currently displayed carrier identities, not hopping history.
     state.nativeDeliveryCursors.set(tableKey, current);
     const groups = new Map();
     qualities.forEach(function (quality) {
-      if (quality.rate === null) return;
-      const group = groups.get(quality.group) || { totalRate: 0, stale: false, count: 0 };
-      group.totalRate += quality.rate;
-      group.stale = group.stale || quality.stale;
-      group.count += 1;
+      const group = groups.get(quality.group) || { totalRate: 0, freshCount: 0, totalCount: 0 };
+      group.totalCount += 1;
+      if (quality.rateFresh && quality.rate !== null) {
+        group.totalRate += quality.rate;
+        group.freshCount += 1;
+      }
       groups.set(quality.group, group);
     });
     qualities.forEach(function (quality) {
       const group = groups.get(quality.group);
-      if (quality.rate === null || !group || group.totalRate === 0) return;
+      if (!group) return;
+      quality.coverageFresh = group.freshCount;
+      quality.coverageTotal = group.totalCount;
+      quality.peers = group.freshCount;
+      quality.shareApproximate = quality.shareApproximate ||
+        group.freshCount > 1 || group.freshCount < group.totalCount;
+      if (!quality.rateFresh || quality.rate === null || group.totalRate === 0) return;
       // Normalize by the native sampling interval. Comparing a one-second
       // byte delta to a three-second delta would invent an allocation bias.
       quality.sharePpm = quality.rate * 1000000 / group.totalRate;
-      quality.shareApproximate = quality.shareApproximate || group.count > 1; // Independent sample windows.
-      quality.stale = quality.stale || group.stale;
-      quality.peers = group.count;
     });
     return qualities;
   }
@@ -906,11 +929,11 @@
     }, quality.stale);
     cell.append(createElement("span", "cell-secondary", serialization === "-" ? "-" : "64K / " + serialization));
     cell.title = [
-      "Share of delivery rates / bytes and interval / 64 KiB serialization",
-      "Measured paths: " + formatCount(quality.peers),
+      "Share among fresh observed paths / bytes and interval / 64 KiB serialization",
+      "Fresh rate coverage: " + formatCount(quality.coverageFresh) + "/" + formatCount(quality.coverageTotal) + " paths",
       "Counter direction: " + directionLabel(quality.direction),
-      "Share normalizes byte deltas by their intervals; independent sample windows make multi-path shares approximate",
-      "No traffic means undefined share, not zero capacity",
+      "Fresh rates normalize over the fresh subset; stale or missing observations are excluded, not treated as zero",
+      "A fresh zero-rate sample is observed zero; an empty or zero-rate denominator has undefined share",
       "Serialization excludes setup, propagation, queueing and application delivery"
     ].join("\n");
     return cell;
@@ -2004,12 +2027,12 @@
     const path = asObject(pathValue);
     const qualityValueObject = asObject(qualityValue);
     const effectiveAgeMs = effectivePathMetricAgeMs(path);
-    const rateStale = metricIsStale(effectiveAgeMs, path.freshness_horizon_ms);
+    const snapshotStale = statusResidenceMs() >= staleAfterMs();
+    const rateStale = deliveryRateIsStale(path, effectiveAgeMs, snapshotStale);
     const pacingStale = metricIsStale(
       effectivePathPacingAgeMs(path),
       path.freshness_horizon_ms
     );
-    const snapshotStale = statusResidenceMs() >= staleAfterMs();
     // Older peers do not carry independent loss/ECN clocks. Their measured
     // bundle age is the safe fallback; local native records have exact ages.
     const lossStale = snapshotStale ||
@@ -2356,8 +2379,8 @@
     const path = asObject(pathValue);
     const qualityValueObject = asObject(qualityValue);
     const effectiveAgeMs = effectivePeerMetricAgeMs(path, result);
-    const rateStale = metricIsStale(effectiveAgeMs, path.freshness_horizon_ms);
     const snapshotStale = peerResultResidenceMs(result) >= staleAfterMs();
+    const rateStale = deliveryRateIsStale(path, effectiveAgeMs, snapshotStale);
     const lossStale = snapshotStale ||
       metricIsStale(effectivePeerLossAgeMs(path, result), path.freshness_horizon_ms) ||
       (!metricAvailable(path.loss_age_ms) && rateStale);

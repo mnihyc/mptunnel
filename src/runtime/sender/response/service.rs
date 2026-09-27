@@ -12,6 +12,7 @@ use super::dispatch::{
 };
 #[cfg(test)]
 use super::multipath::plan_response_data_payload_with_data_ack_outstanding_impl;
+use super::prepared::revalidated_recovery_frames_equal;
 use super::response_reinjection_avoid_outputs;
 use super::scheduling::{response_completion_snapshot, select_response_frame_path_for_extent};
 #[cfg(all(test, feature = "lab-diagnostics"))]
@@ -713,8 +714,10 @@ impl ServerResponseSenderService {
                 && binding
                     .reinjection_suppression_deadline(&candidate.frame)
                     .is_some())
-            || exact_contiguous_retransmission_frames(send_stream, range)
-                .is_none_or(|frames| frames.len() != 1 || frames[0] != candidate.frame)
+            || exact_contiguous_retransmission_frames(send_stream, range).is_none_or(|frames| {
+                frames.len() != 1
+                    || !revalidated_recovery_frames_equal(&frames[0], &candidate.frame)
+            })
             || response_reinjection_avoid_outputs(binding, &candidate.frame, candidate.cause)
                 .contains(&(candidate.target.key, candidate.target.incarnation))
         {

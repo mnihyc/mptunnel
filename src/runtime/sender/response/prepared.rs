@@ -25,6 +25,34 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Notify;
 
+/// Compare a recovery frame revalidated from the retained mux cache without
+/// scanning bytes when both immutable StreamData views name the same slice.
+/// Recovery discovery and final Apply construct the same cache slice twice;
+/// `Bytes::slice` preserves its data pointer for that exact range.
+pub(super) fn revalidated_recovery_frames_equal(left: &Frame, right: &Frame) -> bool {
+    match (left, right) {
+        (
+            Frame::StreamData {
+                stream_id: left_stream,
+                offset: left_offset,
+                payload: left_payload,
+            },
+            Frame::StreamData {
+                stream_id: right_stream,
+                offset: right_offset,
+                payload: right_payload,
+            },
+        ) => {
+            left_stream == right_stream
+                && left_offset == right_offset
+                && left_payload.len() == right_payload.len()
+                && (left_payload.as_ptr() == right_payload.as_ptr()
+                    || left_payload == right_payload)
+        }
+        _ => left == right,
+    }
+}
+
 pub(in crate::runtime) struct ResponseProductState {
     pub(in crate::runtime) sender: ServerResponseSenderService,
     pub(in crate::runtime) send_stream: ReliableSendStream,
@@ -411,7 +439,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
             // The fresh query re-proves authority. Its newly constructed
             // batch validity deadline is not the identity of that authority;
             // compare cause kind while retaining exact target/range checks.
-            if current.frame != candidate.frame
+            if !revalidated_recovery_frames_equal(&current.frame, &candidate.frame)
                 || current.credit_frontier.as_ref().map(|proof| {
                     (
                         proof.range,
@@ -743,5 +771,305 @@ mod tests {
         );
         queue.commit_front_reinjection().unwrap();
         assert_eq!(queue.data_bytes(), b"unclaimed source".len());
+    }
+
+    fn stream_data_frame(stream_id: u64, offset: u64, payload: Bytes) -> Frame {
+        Frame::StreamData {
+            stream_id: crate::protocol::StreamId(stream_id),
+            offset,
+            payload,
+        }
+    }
+
+    #[test]
+    fn recovery_frame_equality_shortcuts_same_immutable_bytes_slice() {
+        let source = Bytes::from(vec![0x5a; 16 * 1024]);
+        let first = source.slice(128..12_128);
+        let cloned = first.clone();
+        let independently_sliced = source.slice(128..12_128);
+        assert_eq!(first.as_ptr(), cloned.as_ptr());
+        assert_eq!(first.as_ptr(), independently_sliced.as_ptr());
+
+        let frame = stream_data_frame(811, 4096, first);
+        let clone_frame = stream_data_frame(811, 4096, cloned);
+        let slice_frame = stream_data_frame(811, 4096, independently_sliced);
+        assert!(revalidated_recovery_frames_equal(&frame, &clone_frame));
+        assert!(revalidated_recovery_frames_equal(&frame, &slice_frame));
+    }
+
+    #[test]
+    fn recovery_frame_equality_preserves_content_fallback_and_slice_offsets() {
+        let left = Bytes::from(vec![1, 2, 3, 4, 5, 6]);
+        let equal = Bytes::from(vec![1, 2, 3, 4, 5, 6]);
+        let different = Bytes::from(vec![1, 2, 9, 4, 5, 6]);
+        assert_ne!(left.as_ptr(), equal.as_ptr());
+        assert!(revalidated_recovery_frames_equal(
+            &stream_data_frame(812, 10, left.clone()),
+            &stream_data_frame(812, 10, equal),
+        ));
+        assert!(!revalidated_recovery_frames_equal(
+            &stream_data_frame(812, 10, left),
+            &stream_data_frame(812, 10, different),
+        ));
+
+        let backing = Bytes::from_static(b"xabcabc!");
+        let first_abc = backing.slice(1..4);
+        let second_abc = backing.slice(4..7);
+        assert_ne!(first_abc.as_ptr(), second_abc.as_ptr());
+        assert!(revalidated_recovery_frames_equal(
+            &stream_data_frame(813, 20, first_abc.clone()),
+            &stream_data_frame(813, 20, second_abc),
+        ));
+        assert!(!revalidated_recovery_frames_equal(
+            &stream_data_frame(813, 20, backing.slice(0..3)),
+            &stream_data_frame(813, 20, first_abc.clone()),
+        ));
+        assert!(!revalidated_recovery_frames_equal(
+            &stream_data_frame(813, 20, first_abc),
+            &stream_data_frame(813, 20, backing.slice(1..3)),
+        ));
+    }
+
+    #[test]
+    fn recovery_frame_equality_checks_stream_metadata_and_other_variants() {
+        let payload = Bytes::from_static(b"same payload");
+        let shared = stream_data_frame(814, 30, payload.clone());
+        assert!(!revalidated_recovery_frames_equal(
+            &shared,
+            &stream_data_frame(815, 30, payload.clone()),
+        ));
+        assert!(!revalidated_recovery_frames_equal(
+            &shared,
+            &stream_data_frame(814, 31, payload),
+        ));
+        assert!(!revalidated_recovery_frames_equal(
+            &shared,
+            &Frame::SessionReady,
+        ));
+        assert!(revalidated_recovery_frames_equal(
+            &Frame::SessionReady,
+            &Frame::SessionReady,
+        ));
+    }
+
+    #[test]
+    fn recovery_frame_equality_matches_derived_equality_for_edge_cases() {
+        use crate::protocol::{PathId, SessionId};
+
+        let empty = Bytes::new();
+        let cases = [
+            (
+                "same empty stream data",
+                stream_data_frame(820, 40, empty.clone()),
+                stream_data_frame(820, 40, Bytes::new()),
+                true,
+            ),
+            (
+                "empty stream data stream id mismatch",
+                stream_data_frame(820, 40, empty.clone()),
+                stream_data_frame(821, 40, Bytes::new()),
+                false,
+            ),
+            (
+                "empty stream data offset mismatch",
+                stream_data_frame(820, 40, empty),
+                stream_data_frame(820, 41, Bytes::new()),
+                false,
+            ),
+            (
+                "same non-data frame",
+                Frame::SessionHello {
+                    session_id: SessionId(82),
+                },
+                Frame::SessionHello {
+                    session_id: SessionId(82),
+                },
+                true,
+            ),
+            (
+                "non-data field mismatch",
+                Frame::SessionHello {
+                    session_id: SessionId(82),
+                },
+                Frame::SessionHello {
+                    session_id: SessionId(83),
+                },
+                false,
+            ),
+            (
+                "non-data variant mismatch",
+                Frame::SessionHello {
+                    session_id: SessionId(82),
+                },
+                Frame::SessionReady,
+                false,
+            ),
+            (
+                "non-data proof fields",
+                Frame::PathProofAck {
+                    path_id: PathId(4),
+                    proof_id: 17,
+                    payload_bytes: 256,
+                },
+                Frame::PathProofAck {
+                    path_id: PathId(4),
+                    proof_id: 18,
+                    payload_bytes: 256,
+                },
+                false,
+            ),
+        ];
+
+        for (case, left, right, expected) in cases {
+            assert_eq!(left == right, expected, "derived equality: {case}");
+            assert_eq!(
+                revalidated_recovery_frames_equal(&left, &right),
+                expected,
+                "specialized equality: {case}",
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "bounded manual release-musl comparison of revalidated recovery frame equality"]
+    fn benchmark_revalidated_recovery_frame_equality() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const PAYLOAD_BYTES: usize = 12 * 1024;
+        const ITERATIONS_PER_BLOCK: usize = 4096;
+
+        struct Case {
+            name: &'static str,
+            left: Frame,
+            right: Frame,
+            expected: bool,
+            payload_bytes: usize,
+        }
+
+        fn measure(
+            left: &Frame,
+            right: &Frame,
+            iterations: usize,
+            specialized: bool,
+        ) -> (Duration, u64) {
+            let started = Instant::now();
+            let mut checksum = 0u64;
+            for index in 0..iterations {
+                let left = black_box(left);
+                let right = black_box(right);
+                let equal = if specialized {
+                    revalidated_recovery_frames_equal(left, right)
+                } else {
+                    left == right
+                };
+                checksum = checksum
+                    .rotate_left(7)
+                    .wrapping_add(u64::from(black_box(equal)))
+                    .wrapping_add(index as u64);
+            }
+            (started.elapsed(), black_box(checksum))
+        }
+
+        let same_source = Bytes::from(vec![0x5a; PAYLOAD_BYTES]);
+        let same_left = same_source.slice(128..12_128);
+        let same_right = same_source.slice(128..12_128);
+        assert_eq!(same_left.as_ptr(), same_right.as_ptr());
+
+        let equal_left = Bytes::from(vec![0x5a; PAYLOAD_BYTES]);
+        let equal_right = Bytes::from(vec![0x5a; PAYLOAD_BYTES]);
+        assert_ne!(equal_left.as_ptr(), equal_right.as_ptr());
+
+        let different_left = Bytes::from(vec![0x5a; PAYLOAD_BYTES]);
+        let mut different_bytes = vec![0x5a; PAYLOAD_BYTES];
+        different_bytes[PAYLOAD_BYTES - 1] ^= 1;
+        let different_right = Bytes::from(different_bytes);
+        assert_ne!(different_left.as_ptr(), different_right.as_ptr());
+
+        let cases = [
+            Case {
+                name: "same-slice",
+                left: stream_data_frame(830, 4096, same_left),
+                right: stream_data_frame(830, 4096, same_right),
+                expected: true,
+                payload_bytes: 12_000,
+            },
+            Case {
+                name: "different-equal",
+                left: stream_data_frame(830, 4096, equal_left),
+                right: stream_data_frame(830, 4096, equal_right),
+                expected: true,
+                payload_bytes: PAYLOAD_BYTES,
+            },
+            Case {
+                name: "different-last-byte",
+                left: stream_data_frame(830, 4096, different_left),
+                right: stream_data_frame(830, 4096, different_right),
+                expected: false,
+                payload_bytes: PAYLOAD_BYTES,
+            },
+            Case {
+                name: "nondata-control",
+                left: Frame::SessionHello {
+                    session_id: crate::protocol::SessionId(83),
+                },
+                right: Frame::SessionHello {
+                    session_id: crate::protocol::SessionId(83),
+                },
+                expected: true,
+                payload_bytes: 0,
+            },
+        ];
+
+        let mut derived_elapsed = vec![Duration::ZERO; cases.len()];
+        let mut specialized_elapsed = vec![Duration::ZERO; cases.len()];
+        let mut derived_checksums = vec![0u64; cases.len()];
+        let mut specialized_checksums = vec![0u64; cases.len()];
+        // A fixed ABBA block order limits first-order clock and thermal drift.
+        for specialized in [false, true, true, false] {
+            for (index, case) in cases.iter().enumerate() {
+                let (elapsed, checksum) =
+                    measure(&case.left, &case.right, ITERATIONS_PER_BLOCK, specialized);
+                if specialized {
+                    specialized_elapsed[index] += elapsed;
+                    specialized_checksums[index] =
+                        specialized_checksums[index].wrapping_add(checksum);
+                } else {
+                    derived_elapsed[index] += elapsed;
+                    derived_checksums[index] = derived_checksums[index].wrapping_add(checksum);
+                }
+                assert_eq!(
+                    revalidated_recovery_frames_equal(&case.left, &case.right),
+                    case.expected,
+                    "specialized result for {}",
+                    case.name,
+                );
+                assert_eq!(
+                    case.left == case.right,
+                    case.expected,
+                    "derived result for {}",
+                    case.name,
+                );
+            }
+        }
+
+        let comparisons_per_arm = (ITERATIONS_PER_BLOCK * 2) as f64;
+        for (index, case) in cases.iter().enumerate() {
+            assert_eq!(derived_checksums[index], specialized_checksums[index]);
+            let derived_ns = derived_elapsed[index].as_secs_f64() * 1e9 / comparisons_per_arm;
+            let specialized_ns =
+                specialized_elapsed[index].as_secs_f64() * 1e9 / comparisons_per_arm;
+            let overhead_percent = (specialized_ns / derived_ns - 1.0) * 100.0;
+            eprintln!(
+                "revalidated recovery Frame equality: case={} payload_bytes={} comparisons_per_arm={} derived_ns={:.1} specialized_ns={:.1} overhead_percent={:.1} checksum={}",
+                case.name,
+                case.payload_bytes,
+                comparisons_per_arm as usize,
+                derived_ns,
+                specialized_ns,
+                overhead_percent,
+                derived_checksums[index],
+            );
+        }
     }
 }

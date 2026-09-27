@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     mem,
-    ops::{Bound, Index, IndexMut, Range},
+    ops::{Bound, Index, IndexMut, Range, RangeBounds},
 };
 
 use rand::{Rng, RngExt};
@@ -11,10 +11,14 @@ use tracing::trace;
 use super::assembler::Assembler;
 use crate::{
     cid_queue::CidQueue,
-    congestion::{PacketDeliveryState, RecoveryTransactionId}, connection::StreamsState,
-    crypto::Keys, frame,
-    packet::SpaceId, range_set::ArrayRangeSet, shared::IssuedCid, Dir, Duration, Instant,
-    SocketAddr, StreamId, TransportError, VarInt,
+    congestion::{PacketDeliveryState, RecoveryTransactionId},
+    connection::StreamsState,
+    crypto::Keys,
+    frame,
+    packet::SpaceId,
+    range_set::ArrayRangeSet,
+    shared::IssuedCid,
+    Dir, Duration, Instant, SocketAddr, StreamId, TransportError, VarInt,
 };
 
 pub(super) struct PacketSpace {
@@ -41,7 +45,7 @@ pub(super) struct PacketSpace {
     // We use a BTreeMap here so we can efficiently query by range on ACK and for loss detection
     pub(super) sent_packets: BTreeMap<u64, SentPacket>,
     /// Packets retained after loss declaration so late ACKs can identify a spurious episode.
-    pub(super) lost_packets: BTreeMap<u64, LostPacket>,
+    pub(super) lost_packets: RetainedLosses,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -94,7 +98,7 @@ impl PacketSpace {
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
             sent_packets: BTreeMap::new(),
-            lost_packets: BTreeMap::new(),
+            lost_packets: RetainedLosses::default(),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
 
@@ -387,16 +391,173 @@ impl StoredPacketDeliveryState {
 }
 
 /// Minimal retained evidence for a packet declared lost.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Debug)]
 pub(super) struct LostPacket {
     /// Original transmission time, used to expire evidence after two PTOs.
-    pub(super) time_sent: Instant,
+    time_sent: Instant,
     /// Congestion-controller model whose loss episode retained this evidence.
     pub(super) controller_epoch: u64,
     /// Exact controller undo transaction, if this loss can contribute proof of spurious recovery.
     pub(super) recovery_transaction: Option<RecoveryTransactionId>,
     /// Whether the original transmission carried an ECN-capable codepoint.
     pub(super) ecn_marked: bool,
+}
+
+impl LostPacket {
+    pub(super) fn new(
+        time_sent: Instant,
+        controller_epoch: u64,
+        recovery_transaction: Option<RecoveryTransactionId>,
+        ecn_marked: bool,
+    ) -> Self {
+        Self {
+            time_sent,
+            controller_epoch,
+            recovery_transaction,
+            ecn_marked,
+        }
+    }
+
+    pub(super) fn time_sent(&self) -> Instant {
+        self.time_sent
+    }
+}
+
+/// Per-space lost-packet evidence with a conservative lower bound on send time. The map remains
+/// private so every insertion maintains the expiry guard and callers cannot mutate `time_sent`.
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug, Default)]
+pub(super) struct RetainedLosses {
+    entries: BTreeMap<u64, LostPacket>,
+    oldest_send_time: Option<Instant>,
+}
+
+impl RetainedLosses {
+    pub(super) fn insert(&mut self, packet_number: u64, packet: LostPacket) -> Option<LostPacket> {
+        self.oldest_send_time = Some(
+            self.oldest_send_time
+                .map_or(packet.time_sent, |floor| floor.min(packet.time_sent)),
+        );
+        self.entries.insert(packet_number, packet)
+    }
+
+    pub(super) fn remove(&mut self, packet_number: &u64) -> Option<LostPacket> {
+        let packet = self.entries.remove(packet_number);
+        if self.entries.is_empty() {
+            self.oldest_send_time = None;
+        }
+        packet
+    }
+
+    /// Expire old records with the same strict boundary as a full scan, while refreshing the
+    /// conservative floor from surviving records. The callback receives immutable metadata only;
+    /// callers cannot replace a record or change its send time while it is resident in the map.
+    pub(super) fn expire<F>(
+        &mut self,
+        now: Instant,
+        retention: Duration,
+        mut on_expired: F,
+    ) -> usize
+    where
+        F: FnMut(u64, &LostPacket),
+    {
+        let visits = self.entries.len();
+        let mut oldest_send_time = None;
+        self.entries.retain(|packet_number, packet| {
+            let keep = now.saturating_duration_since(packet.time_sent) <= retention;
+            if keep {
+                oldest_send_time =
+                    Some(oldest_send_time.map_or(packet.time_sent, |floor: Instant| {
+                        floor.min(packet.time_sent)
+                    }));
+            } else {
+                on_expired(*packet_number, packet);
+            }
+            keep
+        });
+        self.oldest_send_time = oldest_send_time;
+        visits
+    }
+
+    pub(super) fn values(&self) -> impl Iterator<Item = &LostPacket> {
+        self.entries.values()
+    }
+
+    /// Clear only transaction identifiers selected by the caller and report what was cleared.
+    /// This deliberately does not expose mutable records: `time_sent` is the proof invariant for
+    /// `oldest_send_time`, and replacing a record through a generic mutable iterator would bypass
+    /// the wrapper's insertion path.
+    pub(super) fn clear_transactions<F, G>(&mut self, mut should_clear: F, mut on_cleared: G)
+    where
+        F: FnMut(u64, RecoveryTransactionId) -> bool,
+        G: FnMut(u64, RecoveryTransactionId),
+    {
+        for packet in self.entries.values_mut() {
+            let Some(transaction) = packet.recovery_transaction else {
+                continue;
+            };
+            if should_clear(packet.controller_epoch, transaction) {
+                on_cleared(packet.controller_epoch, transaction);
+                packet.recovery_transaction = None;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn keys(&self) -> impl Iterator<Item = &u64> {
+        self.entries.keys()
+    }
+
+    pub(super) fn range<R>(&self, range: R) -> impl Iterator<Item = (&u64, &LostPacket)>
+    where
+        R: RangeBounds<u64>,
+    {
+        self.entries.range(range)
+    }
+
+    #[cfg(test)]
+    pub(super) fn get(&self, packet_number: &u64) -> Option<&LostPacket> {
+        self.entries.get(packet_number)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.oldest_send_time = None;
+    }
+
+    pub(super) fn expiry_may_be_due(&self, now: Instant, retention: Duration) -> bool {
+        if self.entries.is_empty() {
+            debug_assert!(self.oldest_send_time.is_none());
+            return false;
+        }
+
+        match self.oldest_send_time {
+            Some(floor) => now.saturating_duration_since(floor) > retention,
+            None => {
+                debug_assert!(
+                    false,
+                    "nonempty retained-loss map must have a send-time floor"
+                );
+                true
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn oldest_send_time_for_test(&self) -> Option<Instant> {
+        self.oldest_send_time
+    }
 }
 
 /// Retransmittable data queue
@@ -560,7 +721,10 @@ const STORAGE_BITS: u64 = WINDOW_WORDS as u64 * 64;
 
 impl Dedup {
     pub(super) fn new() -> Self {
-        Self { window: Box::new([0; WINDOW_WORDS]), next: 0 }
+        Self {
+            window: Box::new([0; WINDOW_WORDS]),
+            next: 0,
+        }
     }
 
     /// Highest packet number authenticated.
@@ -622,7 +786,8 @@ impl Dedup {
     }
 
     fn missing_in_interval(&self, lower_bound: u64, upper_bound: u64) -> bool {
-        self.smallest_missing_in_interval(lower_bound, upper_bound).is_some()
+        self.smallest_missing_in_interval(lower_bound, upper_bound)
+            .is_some()
     }
 }
 
@@ -1025,10 +1190,16 @@ mod test {
         dedup.insert(WINDOW_SIZE + 10);
         // Retired holes never become newly unseen packets.
         assert!(!dedup.missing_in_interval(0, 4));
-        assert_eq!(dedup.smallest_missing_in_interval(0, WINDOW_SIZE + 10), Some(11));
+        assert_eq!(
+            dedup.smallest_missing_in_interval(0, WINDOW_SIZE + 10),
+            Some(11)
+        );
         assert!(dedup.insert(10));
         assert!(!dedup.insert(11));
-        assert_eq!(dedup.smallest_missing_in_interval(0, WINDOW_SIZE + 10), Some(12));
+        assert_eq!(
+            dedup.smallest_missing_in_interval(0, WINDOW_SIZE + 10),
+            Some(12)
+        );
     }
 
     #[test]
@@ -1050,8 +1221,14 @@ mod test {
         assert_eq!(dedup.smallest_missing_in_interval(170, 172), Some(171));
         dedup.insert(2 * WINDOW_SIZE);
         let floor = WINDOW_SIZE + 1;
-        assert_eq!(dedup.smallest_missing_in_interval(0, 2 * WINDOW_SIZE), Some(floor));
-        assert_eq!(dedup.smallest_missing_in_interval(0, floor + 1), Some(floor));
+        assert_eq!(
+            dedup.smallest_missing_in_interval(0, 2 * WINDOW_SIZE),
+            Some(floor)
+        );
+        assert_eq!(
+            dedup.smallest_missing_in_interval(0, floor + 1),
+            Some(floor)
+        );
         assert_eq!(dedup.smallest_missing_in_interval(0, floor), None);
     }
 
@@ -1075,7 +1252,10 @@ mod test {
             let first_missing = (start + 1..highest)
                 .filter(|n| *n >= dedup.next.saturating_sub(WINDOW_SIZE))
                 .find(|n| !received.contains(n));
-            assert_eq!(dedup.smallest_missing_in_interval(start, highest), first_missing);
+            assert_eq!(
+                dedup.smallest_missing_in_interval(start, highest),
+                first_missing
+            );
         }
     }
 

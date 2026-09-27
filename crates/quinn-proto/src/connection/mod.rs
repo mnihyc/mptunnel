@@ -75,8 +75,8 @@ pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
 use spaces::Retransmits;
 use spaces::{
-    EcnValidation, LostPacket, PacketNumberFilter, PacketSpace, SendableFrames, SentPacket,
-    ThinRetransmits,
+    EcnValidation, LostPacket, PacketNumberFilter, PacketSpace, RetainedLosses, SendableFrames,
+    SentPacket, ThinRetransmits,
 };
 
 mod stats;
@@ -2173,12 +2173,12 @@ impl Connection {
                 if current_controller_owned {
                     self.spaces[pn_space].lost_packets.insert(
                         packet,
-                        LostPacket {
-                            time_sent: info.time_sent,
-                            controller_epoch: info.controller_epoch,
+                        LostPacket::new(
+                            info.time_sent,
+                            info.controller_epoch,
                             recovery_transaction,
-                            ecn_marked: info.ecn_marked,
-                        },
+                            info.ecn_marked,
+                        ),
                     );
                 }
             }
@@ -4613,6 +4613,8 @@ fn settle_lost_packet_owners(
 struct RetainedLossExpiry {
     retired_packets: Vec<(u64, LostPacketTerminal)>,
     abandoned_transactions: Vec<RetainedRecoveryTransaction>,
+    #[cfg(test)]
+    record_visits: usize,
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
@@ -4639,7 +4641,7 @@ fn path_owns_rtt_sample(packet: &SentPacket, path_generation: u64, controller_ep
 }
 
 fn acknowledge_retained_losses(
-    lost_packets: &mut std::collections::BTreeMap<u64, LostPacket>,
+    lost_packets: &mut RetainedLosses,
     ack: &frame::Ack,
     space: SpaceId,
     current_controller_epoch: u64,
@@ -4668,7 +4670,7 @@ fn acknowledge_retained_losses(
                     matched.oldest_reordered_send = Some(
                         matched
                             .oldest_reordered_send
-                            .map_or(info.time_sent, |sent| sent.min(info.time_sent)),
+                            .map_or(info.time_sent(), |sent| sent.min(info.time_sent())),
                     );
                 }
                 if let Some(transaction) = info.recovery_transaction {
@@ -4738,13 +4740,12 @@ fn abandon_retained_transactions_for_epoch(
 ) -> Vec<RetainedRecoveryTransaction> {
     let mut abandoned = BTreeSet::new();
     for space in SpaceId::iter() {
-        for info in spaces[space].lost_packets.values_mut() {
-            if info.controller_epoch == controller_epoch {
-                if let Some(transaction) = info.recovery_transaction.take() {
-                    abandoned.insert((controller_epoch, transaction));
-                }
-            }
-        }
+        spaces[space].lost_packets.clear_transactions(
+            |epoch, _| epoch == controller_epoch,
+            |epoch, transaction| {
+                abandoned.insert((epoch, transaction));
+            },
+        );
     }
     abandoned.into_iter().collect()
 }
@@ -4756,51 +4757,55 @@ fn expire_retained_losses_in_spaces(
 ) -> RetainedLossExpiry {
     let mut abandoned = BTreeSet::new();
     let mut retired_packets = Vec::new();
+    #[cfg(test)]
+    let mut record_visits = 0;
     for space in SpaceId::iter() {
-        spaces[space].lost_packets.retain(|&packet_number, info| {
-            let retained = now.saturating_duration_since(info.time_sent) <= retention;
-            if !retained {
-                retired_packets.push((
-                    info.controller_epoch,
-                    LostPacketTerminal {
-                        space,
-                        packet_number,
-                        outcome: LostPacketOutcome::Expired,
-                    },
-                ));
-                if let Some(transaction) = info.recovery_transaction {
-                    abandoned.insert((info.controller_epoch, transaction));
-                }
+        let lost_packets = &mut spaces[space].lost_packets;
+        if !lost_packets.expiry_may_be_due(now, retention) {
+            continue;
+        }
+        let visits = lost_packets.expire(now, retention, |packet_number, info| {
+            retired_packets.push((
+                info.controller_epoch,
+                LostPacketTerminal {
+                    space,
+                    packet_number,
+                    outcome: LostPacketOutcome::Expired,
+                },
+            ));
+            if let Some(transaction) = info.recovery_transaction {
+                abandoned.insert((info.controller_epoch, transaction));
             }
-            retained
         });
+        #[cfg(test)]
+        {
+            record_visits += visits;
+        }
+        #[cfg(not(test))]
+        let _ = visits;
     }
 
     if !abandoned.is_empty() {
         // Store the disqualification on the bounded retained records themselves, avoiding an
         // ever-growing transport-side transaction set.
         for space in SpaceId::iter() {
-            for info in spaces[space].lost_packets.values_mut() {
-                if info.recovery_transaction.is_some_and(|transaction| {
-                    abandoned.contains(&(info.controller_epoch, transaction))
-                }) {
-                    info.recovery_transaction = None;
-                }
-            }
+            spaces[space].lost_packets.clear_transactions(
+                |epoch, transaction| abandoned.contains(&(epoch, transaction)),
+                |_, _| {},
+            );
         }
     }
 
     RetainedLossExpiry {
         retired_packets,
         abandoned_transactions: abandoned.into_iter().collect(),
+        #[cfg(test)]
+        record_visits,
     }
 }
 
 #[cfg(test)]
-fn has_retained_loss_for_epoch(
-    lost_packets: &std::collections::BTreeMap<u64, LostPacket>,
-    controller_epoch: u64,
-) -> bool {
+fn has_retained_loss_for_epoch(lost_packets: &RetainedLosses, controller_epoch: u64) -> bool {
     lost_packets
         .values()
         .any(|info| info.controller_epoch == controller_epoch)
@@ -4860,6 +4865,319 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn retained_loss_floor_matches_full_scan_across_lifecycle_operations() {
+        let base = Instant::now();
+        let mut guarded = RetainedLosses::default();
+        let mut reference = BTreeMap::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next_packet = 0u64;
+        let retentions = [
+            Duration::ZERO,
+            Duration::from_millis(17),
+            Duration::from_millis(80),
+            Duration::from_secs(2),
+        ];
+        let mut full_scan_visits = 0usize;
+        let mut guarded_visits = 0usize;
+
+        for step in 0..8_000 {
+            // Fixed LCG makes this a reproducible lifecycle differential without depending on
+            // test RNG seeds or wall-clock scheduling.
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let key = (seed >> 19) % 193;
+            match seed % 13 {
+                0..=5 => {
+                    let sent = base + Duration::from_millis((seed >> 31) % 400);
+                    let transaction =
+                        (seed & 4 != 0).then(|| RecoveryTransactionId::new((seed % 11) + 1));
+                    let packet = LostPacket::new(sent, (seed % 5) + 1, transaction, seed & 8 != 0);
+                    guarded.insert(key, packet.clone());
+                    reference.insert(key, packet);
+                    next_packet += 1;
+                }
+                6..=7 => {
+                    let actual = guarded.remove(&key);
+                    let expected = reference.remove(&key);
+                    assert_eq!(
+                        actual.map(|packet| (
+                            packet.time_sent(),
+                            packet.controller_epoch,
+                            packet.recovery_transaction,
+                            packet.ecn_marked,
+                        )),
+                        expected.map(|packet| (
+                            packet.time_sent(),
+                            packet.controller_epoch,
+                            packet.recovery_transaction,
+                            packet.ecn_marked,
+                        )),
+                    );
+                }
+                8 => {
+                    let epoch = (seed % 5) + 1;
+                    let transaction = RecoveryTransactionId::new((seed % 11) + 1);
+                    let mut actual = Vec::new();
+                    guarded.clear_transactions(
+                        |candidate_epoch, candidate| {
+                            candidate_epoch == epoch && candidate == transaction
+                        },
+                        |cleared_epoch, cleared_transaction| {
+                            actual.push((cleared_epoch, cleared_transaction));
+                        },
+                    );
+                    let mut expected = Vec::new();
+                    for packet in reference.values_mut() {
+                        if packet.controller_epoch == epoch
+                            && packet.recovery_transaction == Some(transaction)
+                        {
+                            expected.push((epoch, transaction));
+                            packet.recovery_transaction = None;
+                        }
+                    }
+                    assert_eq!(actual, expected);
+                }
+                9..=11 => {
+                    let now = base + Duration::from_millis((seed >> 37) % 500);
+                    let retention = retentions[((seed >> 47) as usize) % retentions.len()];
+                    let (actual, visits) = guarded_expire(&mut guarded, now, retention);
+                    let (expected, old_visits) = full_scan_expire(&mut reference, now, retention);
+                    guarded_visits += visits;
+                    full_scan_visits += old_visits;
+                    assert_eq!(actual, expected, "expiry operation at step {step}");
+                }
+                _ => {
+                    guarded.clear();
+                    reference.clear();
+                }
+            }
+
+            assert_eq!(
+                retained_loss_snapshot(&guarded),
+                reference
+                    .iter()
+                    .map(|(&packet_number, info)| {
+                        (
+                            packet_number,
+                            info.time_sent(),
+                            info.controller_epoch,
+                            info.recovery_transaction,
+                            info.ecn_marked,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                "retained record state at step {step}"
+            );
+            assert_floor_is_conservative(&guarded);
+
+            if step % 251 == 0 {
+                let copy = guarded.clone();
+                assert_eq!(
+                    retained_loss_snapshot(&copy),
+                    retained_loss_snapshot(&guarded)
+                );
+                assert_floor_is_conservative(&copy);
+                if let Some((&packet_number, _)) = reference.iter().next() {
+                    let original = retained_loss_snapshot(&guarded);
+                    let mut detached = copy;
+                    detached.remove(&packet_number);
+                    assert_eq!(retained_loss_snapshot(&guarded), original);
+                }
+            }
+        }
+
+        assert!(next_packet > 0);
+        assert!(full_scan_visits > guarded_visits);
+    }
+
+    #[test]
+    fn retained_loss_floor_uses_each_current_retention_and_strict_boundary() {
+        let sent = Instant::now();
+        let boundary = sent + Duration::from_millis(100);
+        let mut guarded = RetainedLosses::default();
+        let mut reference = BTreeMap::new();
+        for (packet_number, time_sent) in [(1, sent), (2, sent + Duration::from_millis(50))] {
+            let packet = LostPacket::new(time_sent, 4, None, true);
+            guarded.insert(packet_number, packet.clone());
+            reference.insert(packet_number, packet);
+        }
+
+        // At exactly 100 ms the oldest record remains eligible, so the floor guard may skip.
+        let (actual, visits) = guarded_expire(&mut guarded, boundary, Duration::from_millis(100));
+        let (expected, _) = full_scan_expire(&mut reference, boundary, Duration::from_millis(100));
+        assert!(actual.is_empty());
+        assert!(expected.is_empty());
+        assert_eq!(visits, 0);
+
+        // A shorter retention supplied by the next callback must be observed immediately. The
+        // old floor expires, and the exact scan refreshes the floor to the remaining record.
+        let (actual, visits) = guarded_expire(&mut guarded, boundary, Duration::from_millis(50));
+        let (expected, _) = full_scan_expire(&mut reference, boundary, Duration::from_millis(50));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(visits, 2);
+        assert_eq!(
+            guarded.oldest_send_time_for_test(),
+            Some(sent + Duration::from_millis(50))
+        );
+        assert_eq!(
+            guarded.remove(&2).map(|packet| packet.time_sent()),
+            reference.remove(&2).map(|packet| packet.time_sent())
+        );
+        assert_eq!(guarded.oldest_send_time_for_test(), None);
+        assert!(guarded.is_empty());
+    }
+
+    #[test]
+    fn ack_removal_leaves_only_a_safe_stale_floor_until_a_due_sweep() {
+        let sent = Instant::now();
+        let mut losses = RetainedLosses::default();
+        losses.insert(1, LostPacket::new(sent, 1, None, false));
+        losses.insert(
+            2,
+            LostPacket::new(sent + Duration::from_millis(80), 1, None, false),
+        );
+        assert_eq!(losses.remove(&1).unwrap().time_sent(), sent);
+
+        let (expired, visits) = guarded_expire(
+            &mut losses,
+            sent + Duration::from_millis(90),
+            Duration::from_millis(100),
+        );
+        assert!(expired.is_empty());
+        assert_eq!(visits, 0);
+        assert_eq!(
+            losses.oldest_send_time_for_test(),
+            Some(sent),
+            "ACK removal may leave a conservative stale-low floor"
+        );
+
+        let (expired, visits) = guarded_expire(
+            &mut losses,
+            sent + Duration::from_millis(101),
+            Duration::from_millis(50),
+        );
+        assert!(expired.is_empty(), "the remaining record is still fresh");
+        assert_eq!(
+            visits, 1,
+            "a stale floor may trigger one harmless extra pass"
+        );
+        assert_eq!(
+            losses.oldest_send_time_for_test(),
+            Some(sent + Duration::from_millis(80)),
+            "the due sweep refreshes the floor to the surviving record"
+        );
+    }
+
+    #[test]
+    fn expiry_invalidates_transactions_in_guard_skipped_packet_spaces() {
+        let sent = Instant::now();
+        let now = sent + Duration::from_millis(101);
+        let retention = Duration::from_millis(100);
+        let transaction = RecoveryTransactionId::new(77);
+        let mut spaces = packet_spaces(sent);
+        retain_loss_with_transaction(
+            &mut spaces[SpaceId::Initial].lost_packets,
+            10,
+            sent,
+            3,
+            Some(transaction),
+        );
+        retain_loss_with_transaction(
+            &mut spaces[SpaceId::Handshake].lost_packets,
+            20,
+            sent + Duration::from_millis(80),
+            3,
+            Some(transaction),
+        );
+        retain_loss_with_transaction(
+            &mut spaces[SpaceId::Data].lost_packets,
+            30,
+            sent + Duration::from_millis(80),
+            3,
+            Some(transaction),
+        );
+
+        let expired = expire_retained_losses_in_spaces(&mut spaces, now, retention);
+        assert_eq!(
+            expired.record_visits, 1,
+            "only the old Initial record is scanned"
+        );
+        assert_eq!(expired.retired_packets.len(), 1);
+        assert_eq!(expired.abandoned_transactions, vec![(3, transaction)]);
+        assert_eq!(
+            spaces[SpaceId::Handshake]
+                .lost_packets
+                .get(&20)
+                .unwrap()
+                .recovery_transaction,
+            None,
+            "the skipped Handshake store still loses undo eligibility"
+        );
+        assert_eq!(
+            spaces[SpaceId::Data]
+                .lost_packets
+                .get(&30)
+                .unwrap()
+                .recovery_transaction,
+            None,
+            "the skipped Data store still loses undo eligibility"
+        );
+
+        let acked = acknowledge_retained_losses(
+            &mut spaces[SpaceId::Data].lost_packets,
+            &single_packet_ack(30),
+            SpaceId::Data,
+            3,
+        );
+        assert!(acked.matched_transactions.is_empty());
+        assert_eq!(acked.ecn_marked_packets, 1);
+        assert_eq!(
+            acked.oldest_reordered_send,
+            Some(sent + Duration::from_millis(80))
+        );
+    }
+
+    #[test]
+    #[ignore = "bounded retained-loss lifecycle timing; run explicitly with --ignored --nocapture"]
+    fn retained_loss_lifecycle_benchmark() {
+        const ROUNDS: usize = 3_000;
+        println!(
+            "layout BTreeMap={} RetainedLosses={} Option<Instant>={}",
+            std::mem::size_of::<BTreeMap<u64, LostPacket>>(),
+            std::mem::size_of::<RetainedLosses>(),
+            std::mem::size_of::<Option<Instant>>(),
+        );
+
+        for size in [0, 16, 64, 4_096] {
+            let base = Instant::now();
+            let started = std::time::Instant::now();
+            let guarded = run_guarded_lifecycle(size, ROUNDS, base);
+            let guarded_elapsed = started.elapsed();
+
+            let started = std::time::Instant::now();
+            let legacy = run_full_scan_lifecycle(size, ROUNDS, base);
+            let legacy_elapsed = started.elapsed();
+
+            assert_eq!(guarded.0, legacy.0, "final store state for size {size}");
+            assert_eq!(guarded.2, legacy.2, "lifecycle checksum for size {size}");
+            println!(
+                "size={size} rounds={ROUNDS} guarded_elapsed_ns={} legacy_elapsed_ns={} guarded_record_visits={} legacy_record_visits={} checksum={}",
+                guarded_elapsed.as_nanos(),
+                legacy_elapsed.as_nanos(),
+                guarded.1,
+                legacy.1,
+                guarded.2,
+            );
+        }
+    }
 
     #[test]
     fn migration_rollback_does_not_restore_settled_loss_transaction() {
@@ -5028,7 +5346,7 @@ mod tests {
     }
 
     fn retain_loss_with_transaction(
-        losses: &mut std::collections::BTreeMap<u64, LostPacket>,
+        losses: &mut RetainedLosses,
         packet_number: u64,
         time_sent: Instant,
         controller_epoch: u64,
@@ -5036,17 +5354,12 @@ mod tests {
     ) {
         losses.insert(
             packet_number,
-            LostPacket {
-                time_sent,
-                controller_epoch,
-                recovery_transaction,
-                ecn_marked: true,
-            },
+            LostPacket::new(time_sent, controller_epoch, recovery_transaction, true),
         );
     }
 
     fn retain_loss(
-        losses: &mut std::collections::BTreeMap<u64, LostPacket>,
+        losses: &mut RetainedLosses,
         packet_number: u64,
         time_sent: Instant,
         controller_epoch: u64,
@@ -5062,6 +5375,340 @@ mod tests {
 
     fn packet_spaces(now: Instant) -> [PacketSpace; 3] {
         std::array::from_fn(|_| PacketSpace::new(now))
+    }
+
+    fn retained_loss_snapshot(
+        losses: &RetainedLosses,
+    ) -> Vec<(u64, Instant, u64, Option<RecoveryTransactionId>, bool)> {
+        losses
+            .range(..)
+            .map(|(&packet_number, info)| {
+                (
+                    packet_number,
+                    info.time_sent(),
+                    info.controller_epoch,
+                    info.recovery_transaction,
+                    info.ecn_marked,
+                )
+            })
+            .collect()
+    }
+
+    fn full_scan_expire(
+        losses: &mut BTreeMap<u64, LostPacket>,
+        now: Instant,
+        retention: Duration,
+    ) -> (Vec<(u64, u64, Option<RecoveryTransactionId>)>, usize) {
+        let visits = losses.len();
+        let mut expired = Vec::new();
+        losses.retain(|&packet_number, info| {
+            let keep = now.saturating_duration_since(info.time_sent()) <= retention;
+            if !keep {
+                expired.push((
+                    packet_number,
+                    info.controller_epoch,
+                    info.recovery_transaction,
+                ));
+            }
+            keep
+        });
+        (expired, visits)
+    }
+
+    /// Baseline ACK removal loop from 187fdc95, kept over a raw BTreeMap so the lifecycle timing
+    /// compares identical ACK lookup/accounting work in the old and guarded stores.
+    fn legacy_acknowledge_retained_losses(
+        lost_packets: &mut BTreeMap<u64, LostPacket>,
+        ack: &frame::Ack,
+        space: SpaceId,
+        current_controller_epoch: u64,
+    ) -> RetainedAckMatch {
+        if lost_packets.is_empty() {
+            return RetainedAckMatch::default();
+        }
+
+        let mut matched = RetainedAckMatch::default();
+        for range in ack.iter() {
+            let acknowledged: Vec<u64> = lost_packets
+                .range(range.clone())
+                .map(|(&packet_number, _)| packet_number)
+                .collect();
+            for packet_number in acknowledged {
+                if let Some(info) = lost_packets.remove(&packet_number) {
+                    matched.retired_packets.push((
+                        info.controller_epoch,
+                        LostPacketTerminal {
+                            space,
+                            packet_number,
+                            outcome: LostPacketOutcome::Acknowledged,
+                        },
+                    ));
+                    if info.controller_epoch == current_controller_epoch {
+                        matched.oldest_reordered_send = Some(
+                            matched
+                                .oldest_reordered_send
+                                .map_or(info.time_sent(), |sent| sent.min(info.time_sent())),
+                        );
+                    }
+                    if let Some(transaction) = info.recovery_transaction {
+                        matched
+                            .matched_transactions
+                            .insert((info.controller_epoch, transaction));
+                    }
+                    if info.ecn_marked {
+                        matched.ecn_marked_packets = matched.ecn_marked_packets.saturating_add(1);
+                        if info.controller_epoch != current_controller_epoch {
+                            matched.ecn_marked_noncurrent_epoch = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        matched
+    }
+
+    fn guarded_expire(
+        losses: &mut RetainedLosses,
+        now: Instant,
+        retention: Duration,
+    ) -> (Vec<(u64, u64, Option<RecoveryTransactionId>)>, usize) {
+        if !losses.expiry_may_be_due(now, retention) {
+            return (Vec::new(), 0);
+        }
+        let mut expired = Vec::new();
+        let visits = losses.expire(now, retention, |packet_number, info| {
+            expired.push((
+                packet_number,
+                info.controller_epoch,
+                info.recovery_transaction,
+            ));
+        });
+        (expired, visits)
+    }
+
+    fn assert_floor_is_conservative(losses: &RetainedLosses) {
+        let minimum = losses.values().map(LostPacket::time_sent).min();
+        assert!(match (losses.oldest_send_time_for_test(), minimum) {
+            (None, None) => true,
+            (Some(floor), Some(minimum)) => floor <= minimum,
+            _ => false,
+        });
+    }
+
+    fn full_scan_expire_spaces(
+        spaces: &mut [BTreeMap<u64, LostPacket>; 3],
+        now: Instant,
+        retention: Duration,
+    ) -> RetainedLossExpiry {
+        let mut abandoned = BTreeSet::new();
+        let mut retired_packets = Vec::new();
+        let mut record_visits = 0;
+        for (space, losses) in SpaceId::iter().zip(spaces.iter_mut()) {
+            record_visits += losses.len();
+            losses.retain(|&packet_number, info| {
+                if now.saturating_duration_since(info.time_sent()) <= retention {
+                    return true;
+                }
+                retired_packets.push((
+                    info.controller_epoch,
+                    LostPacketTerminal {
+                        space,
+                        packet_number,
+                        outcome: LostPacketOutcome::Expired,
+                    },
+                ));
+                if let Some(transaction) = info.recovery_transaction {
+                    abandoned.insert((info.controller_epoch, transaction));
+                }
+                false
+            });
+        }
+        if !abandoned.is_empty() {
+            for losses in spaces.iter_mut() {
+                for packet in losses.values_mut() {
+                    if packet.recovery_transaction.is_some_and(|transaction| {
+                        abandoned.contains(&(packet.controller_epoch, transaction))
+                    }) {
+                        packet.recovery_transaction = None;
+                    }
+                }
+            }
+        }
+
+        RetainedLossExpiry {
+            retired_packets,
+            abandoned_transactions: abandoned.into_iter().collect(),
+            record_visits,
+        }
+    }
+
+    type LifecycleSnapshot = Vec<Vec<(u64, Instant, u64, Option<RecoveryTransactionId>, bool)>>;
+
+    fn lifecycle_snapshot(spaces: &[PacketSpace; 3]) -> LifecycleSnapshot {
+        SpaceId::iter()
+            .map(|space| retained_loss_snapshot(&spaces[space].lost_packets))
+            .collect()
+    }
+
+    fn legacy_lifecycle_snapshot(spaces: &[BTreeMap<u64, LostPacket>; 3]) -> LifecycleSnapshot {
+        spaces
+            .iter()
+            .map(|losses| {
+                losses
+                    .iter()
+                    .map(|(&packet_number, info)| {
+                        (
+                            packet_number,
+                            info.time_sent(),
+                            info.controller_epoch,
+                            info.recovery_transaction,
+                            info.ecn_marked,
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn lifecycle_fixture(
+        size: usize,
+        base: Instant,
+    ) -> ([PacketSpace; 3], [BTreeMap<u64, LostPacket>; 3]) {
+        let mut spaces = packet_spaces(base);
+        let mut legacy = std::array::from_fn(|_| BTreeMap::new());
+        for (space, legacy_space) in SpaceId::iter().zip(legacy.iter_mut()) {
+            for index in 0..size {
+                let packet_number = index as u64;
+                let time_sent = base + Duration::from_millis((index % 1_000) as u64);
+                let transaction = Some(RecoveryTransactionId::new((index / 8 + 1) as u64));
+                let packet = LostPacket::new(time_sent, (index % 4) as u64, transaction, true);
+                spaces[space]
+                    .lost_packets
+                    .insert(packet_number, packet.clone());
+                legacy_space.insert(packet_number, packet);
+            }
+        }
+        (spaces, legacy)
+    }
+
+    fn lifecycle_now_and_retention(
+        base: Instant,
+        round: usize,
+        rounds: usize,
+    ) -> (Instant, Duration) {
+        let transition = rounds / 2;
+        if round < transition {
+            (
+                base + Duration::from_millis((round % 9 * 10) as u64),
+                Duration::from_secs(10),
+            )
+        } else {
+            let elapsed = round - transition;
+            let retention = match round % 3 {
+                0 => Duration::from_millis(20),
+                1 => Duration::from_millis(250),
+                _ => Duration::from_secs(2),
+            };
+            (
+                base + Duration::from_secs(2) + Duration::from_millis((elapsed * 5) as u64),
+                retention,
+            )
+        }
+    }
+
+    fn mix_expiry_checksum(checksum: &mut u64, expiry: &RetainedLossExpiry) {
+        for (epoch, terminal) in &expiry.retired_packets {
+            *checksum =
+                checksum.rotate_left(7) ^ *epoch ^ terminal.packet_number ^ 0x9e37_79b9_7f4a_7c15;
+        }
+        for (epoch, transaction) in &expiry.abandoned_transactions {
+            *checksum = checksum.rotate_left(11) ^ *epoch ^ transaction.0;
+        }
+    }
+
+    fn run_guarded_lifecycle(
+        size: usize,
+        rounds: usize,
+        base: Instant,
+    ) -> (LifecycleSnapshot, usize, u64) {
+        let (mut spaces, _) = lifecycle_fixture(size, base);
+        let mut visits = 0;
+        let mut checksum = 0u64;
+        for round in 0..rounds {
+            let (now, retention) = lifecycle_now_and_retention(base, round, rounds);
+            if size != 0 && round % 4 == 0 {
+                let packet_number = (round % size) as u64;
+                let ack = single_packet_ack(packet_number);
+                let matched = acknowledge_retained_losses(
+                    &mut spaces[SpaceId::Data].lost_packets,
+                    &ack,
+                    SpaceId::Data,
+                    2,
+                );
+                for (epoch, terminal) in matched.retired_packets {
+                    checksum = checksum.rotate_left(5) ^ epoch ^ terminal.packet_number;
+                }
+            }
+            if size != 0 && round % 32 == 0 {
+                let packet_number = size as u64 + round as u64;
+                let packet = LostPacket::new(
+                    now,
+                    2,
+                    Some(RecoveryTransactionId::new((round % 31 + 1) as u64)),
+                    true,
+                );
+                spaces[SpaceId::Data]
+                    .lost_packets
+                    .insert(packet_number, packet);
+            }
+            let expiry = expire_retained_losses_in_spaces(&mut spaces, now, retention);
+            visits += expiry.record_visits;
+            mix_expiry_checksum(&mut checksum, &expiry);
+        }
+        (lifecycle_snapshot(&spaces), visits, checksum)
+    }
+
+    fn run_full_scan_lifecycle(
+        size: usize,
+        rounds: usize,
+        base: Instant,
+    ) -> (LifecycleSnapshot, usize, u64) {
+        let (_, mut legacy) = lifecycle_fixture(size, base);
+        let mut visits = 0;
+        let mut checksum = 0u64;
+        for round in 0..rounds {
+            let (now, retention) = lifecycle_now_and_retention(base, round, rounds);
+            if size != 0 && round % 4 == 0 {
+                let packet_number = (round % size) as u64;
+                let ack = single_packet_ack(packet_number);
+                let matched = legacy_acknowledge_retained_losses(
+                    &mut legacy[SpaceId::Data as usize],
+                    &ack,
+                    SpaceId::Data,
+                    2,
+                );
+                for (epoch, terminal) in matched.retired_packets {
+                    checksum = checksum.rotate_left(5) ^ epoch ^ terminal.packet_number;
+                }
+            }
+            if size != 0 && round % 32 == 0 {
+                let packet_number = size as u64 + round as u64;
+                legacy[SpaceId::Data as usize].insert(
+                    packet_number,
+                    LostPacket::new(
+                        now,
+                        2,
+                        Some(RecoveryTransactionId::new((round % 31 + 1) as u64)),
+                        true,
+                    ),
+                );
+            }
+            let expiry = full_scan_expire_spaces(&mut legacy, now, retention);
+            visits += expiry.record_visits;
+            mix_expiry_checksum(&mut checksum, &expiry);
+        }
+        (legacy_lifecycle_snapshot(&legacy), visits, checksum)
     }
 
     fn completes_transaction(
@@ -5444,6 +6091,37 @@ mod tests {
             outcome.abandoned_transactions,
             vec![(3, RecoveryTransactionId(1))]
         );
+        assert!(spaces[SpaceId::Data].lost_packets.is_empty());
+    }
+
+    #[test]
+    fn late_ack_at_exact_retention_boundary_still_matches_before_expiry() {
+        let sent = Instant::now();
+        let retention = Duration::from_millis(100);
+        let mut spaces = packet_spaces(sent);
+        retain_loss_with_transaction(
+            &mut spaces[SpaceId::Data].lost_packets,
+            20,
+            sent,
+            3,
+            Some(RecoveryTransactionId::new(1)),
+        );
+
+        let outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            sent + retention,
+            retention,
+            &single_packet_ack(20),
+            SpaceId::Data,
+            3,
+        );
+        assert!(outcome.abandoned_transactions.is_empty());
+        assert_eq!(
+            outcome.matched_transactions,
+            vec![(3, RecoveryTransactionId::new(1))]
+        );
+        assert_eq!(outcome.ecn_marked_packets, 1);
+        assert_eq!(outcome.oldest_reordered_send, Some(sent));
         assert!(spaces[SpaceId::Data].lost_packets.is_empty());
     }
 

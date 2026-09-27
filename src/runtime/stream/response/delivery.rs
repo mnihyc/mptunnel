@@ -74,6 +74,17 @@ pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) reinjection_suppression_deadline: Option<Instant>,
 }
 
+/// One ephemeral per-slot union accumulated during a batched debt observation.
+/// The flight map is traversed in ascending start-offset order, so each slot's
+/// matching ranges can be unioned online without a per-range temporary Vec.
+struct ReinjectedSlotDebtObservation {
+    underlay: UnderlayProtocol,
+    configured_slot: ConfiguredMemberSlot,
+    current_outputs: SmallVec<[(CarrierPathKey, u64); 4]>,
+    pending_union: Option<(u64, u64)>,
+    bytes: usize,
+}
+
 /// Raw copy debt is lifetime evidence, independent of current path membership
 /// and suppression clocks. Do not skip a spent head to race a later suffix.
 fn uncopied_completion_prefix(
@@ -1042,6 +1053,197 @@ impl ResponseStreamBinding {
             configured_slot,
             &current_slot_outputs,
         )
+    }
+
+    /// Observes ReinjectedData interval-union debt for several candidate
+    /// outputs from one coherent output-membership / Product-flight snapshot.
+    /// Results preserve input order; an output that is no longer current has
+    /// zero debt, matching the single-output query above.
+    pub(in crate::runtime) fn accepted_reinjected_data_in_flight_bytes_for_outputs_at(
+        &self,
+        identities: &[ServerReinjectionOutputIdentity],
+    ) -> SmallVec<[usize; 4]> {
+        #[cfg(test)]
+        {
+            self.accepted_reinjected_data_in_flight_bytes_for_outputs_at_inner(identities, None)
+        }
+        #[cfg(not(test))]
+        {
+            self.accepted_reinjected_data_in_flight_bytes_for_outputs_at_inner(identities)
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn accepted_reinjected_data_in_flight_bytes_for_outputs_at_with_flight_visits(
+        &self,
+        identities: &[ServerReinjectionOutputIdentity],
+    ) -> (SmallVec<[usize; 4]>, usize) {
+        let mut flight_visits = 0usize;
+        let bytes = self.accepted_reinjected_data_in_flight_bytes_for_outputs_at_inner(
+            identities,
+            Some(&mut flight_visits),
+        );
+        (bytes, flight_visits)
+    }
+
+    fn accepted_reinjected_data_in_flight_bytes_for_outputs_at_inner(
+        &self,
+        identities: &[ServerReinjectionOutputIdentity],
+        #[cfg(test)] mut flight_visits: Option<&mut usize>,
+    ) -> SmallVec<[usize; 4]> {
+        if identities.is_empty() {
+            return SmallVec::new();
+        }
+
+        // Keep outputs locked through the one flight scan. This is the same
+        // output -> flight lock order used by final admission and makes the
+        // exact current-member set coherent with the retained physical flights.
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let mut domains = SmallVec::<[ReinjectedSlotDebtObservation; 4]>::new();
+        let mut identity_domains = SmallVec::<[Option<usize>; 4]>::new();
+        let mut domain_indices: Option<HashMap<(UnderlayProtocol, ConfiguredMemberSlot), usize>> =
+            None;
+        for identity in identities {
+            let target = outputs.entries.iter().find(|entry| {
+                entry.key == identity.key && entry.incarnation == identity.incarnation
+            });
+            let Some(target) = target else {
+                identity_domains.push(None);
+                continue;
+            };
+            let underlay = target.key.underlay;
+            let configured_slot = target.configured_slot;
+            let domain_key = (underlay, configured_slot);
+            let existing_domain = match &domain_indices {
+                Some(indices) => indices.get(&domain_key).copied(),
+                None => domains.iter().position(|domain| {
+                    domain.underlay == underlay && domain.configured_slot == configured_slot
+                }),
+            };
+            let domain_index = match existing_domain {
+                Some(index) => index,
+                None => {
+                    // Stay allocation-free for the inline four-slot case, then
+                    // promote once so a wider candidate set does not require
+                    // quadratic domain lookups.
+                    if domain_indices.is_none() && domains.len() == 4 {
+                        domain_indices = Some(
+                            domains
+                                .iter()
+                                .enumerate()
+                                .map(|(index, domain)| {
+                                    ((domain.underlay, domain.configured_slot), index)
+                                })
+                                .collect(),
+                        );
+                    }
+                    let index = domains.len();
+                    domains.push(ReinjectedSlotDebtObservation {
+                        underlay,
+                        configured_slot,
+                        current_outputs: SmallVec::new(),
+                        pending_union: None,
+                        bytes: 0,
+                    });
+                    if let Some(indices) = &mut domain_indices {
+                        indices.insert(domain_key, index);
+                    }
+                    index
+                }
+            };
+            identity_domains.push(Some(domain_index));
+        }
+
+        // Every requested identity may have become stale before this query.
+        // Preserve the old zero result without walking unrelated flight state.
+        if domains.is_empty() {
+            let mut debts = SmallVec::<[usize; 4]>::new();
+            debts.resize(identities.len(), 0);
+            return debts;
+        }
+
+        // Keep one-to-four candidate slot sets allocation-free. Wider sets get
+        // one temporary lookup map so per-flight domain selection stays O(1).
+        for entry in &outputs.entries {
+            let domain_index = match &domain_indices {
+                Some(indices) => indices
+                    .get(&(entry.key.underlay, entry.configured_slot))
+                    .copied(),
+                None => domains.iter().position(|domain| {
+                    domain.underlay == entry.key.underlay
+                        && domain.configured_slot == entry.configured_slot
+                }),
+            };
+            if let Some(domain_index) = domain_index {
+                domains[domain_index]
+                    .current_outputs
+                    .push((entry.key, entry.incarnation));
+            }
+        }
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        for (&start, entries) in flights.iter() {
+            for flight in entries {
+                #[cfg(test)]
+                if let Some(visits) = flight_visits.as_deref_mut() {
+                    *visits = (*visits).saturating_add(1);
+                }
+                if flight.kind != CarrierWorkKind::ReinjectedData || flight.end <= start {
+                    continue;
+                }
+                let Some(configured_slot) = flight.configured_slot else {
+                    continue;
+                };
+                let domain_index = match &domain_indices {
+                    Some(indices) => indices
+                        .get(&(flight.key.underlay, configured_slot))
+                        .copied(),
+                    None => domains.iter().position(|domain| {
+                        domain.underlay == flight.key.underlay
+                            && domain.configured_slot == configured_slot
+                    }),
+                };
+                let Some(domain_index) = domain_index else {
+                    continue;
+                };
+                let domain = &mut domains[domain_index];
+                if !domain
+                    .current_outputs
+                    .contains(&(flight.key, flight.output_incarnation))
+                {
+                    continue;
+                }
+                match domain.pending_union {
+                    Some((union_start, union_end)) if union_end >= start => {
+                        domain.pending_union = Some((union_start, union_end.max(flight.end)));
+                    }
+                    Some((union_start, union_end)) => {
+                        domain.bytes = domain
+                            .bytes
+                            .saturating_add(flight_interval_bytes(union_start, union_end));
+                        domain.pending_union = Some((start, flight.end));
+                    }
+                    None => domain.pending_union = Some((start, flight.end)),
+                }
+            }
+        }
+        drop(flights);
+        for domain in &mut domains {
+            if let Some((start, end)) = domain.pending_union.take() {
+                domain.bytes = domain
+                    .bytes
+                    .saturating_add(flight_interval_bytes(start, end));
+            }
+        }
+        identity_domains
+            .into_iter()
+            .map(|domain_index| domain_index.map_or(0, |index| domains[index].bytes))
+            .collect::<SmallVec<[usize; 4]>>()
     }
 
     /// Raw retained range union after one exact target has already been
@@ -2680,51 +2882,64 @@ fn release_indexed_carrier_path_flight_ranges(
         .map(|range| (range.start, range.end))
         .collect::<Vec<_>>();
     let full_release = overlap.ack_covers_all(ranges);
-    let mut original = Vec::<(u64, usize, CarrierPathFlight)>::new();
-    let mut touched = BTreeMap::<u64, (usize, Vec<Option<CarrierPathFlight>>)>::new();
     if full_release {
-        original = std::mem::take(flights)
-            .into_iter()
-            .flat_map(|(start, entries)| {
-                entries
-                    .into_iter()
-                    .enumerate()
-                    .map(move |(order, flight)| (start, order, flight))
-            })
-            .collect();
+        // `ambiguous_before_ack` must outlive clearing the index: qualification
+        // for every released atom uses the same pre-ACK multiplicity snapshot.
+        // Full coverage means no flight can leave a retained fragment, so drain
+        // the ordered payload directly without a staged identity Vec or splitter.
+        let all_flights = std::mem::take(flights);
         overlap.clear();
-    } else {
-        let keys = overlap.intersecting(ranges);
-        if keys.is_empty() {
-            return Vec::new();
-        }
-        let mut by_start = BTreeMap::<u64, Vec<usize>>::new();
-        for key in keys {
-            by_start.entry(key.start).or_default().push(key.order);
-        }
-        for (start, orders) in by_start {
-            let bucket = flights
-                .remove(&start)
-                .expect("overlap-index identity has a response payload bucket");
-            let old_len = bucket.len();
-            let mut order_cursor = 0;
-            let mut slots = Vec::with_capacity(old_len);
-            for (order, flight) in bucket.into_iter().enumerate() {
-                if orders.get(order_cursor) == Some(&order) {
-                    original.push((start, order, flight));
-                    slots.push(None);
-                    order_cursor += 1;
-                } else {
-                    slots.push(Some(flight));
+        let mut released = Vec::new();
+        for (start, entries) in all_flights {
+            for original_flight in entries {
+                for (acked_start, acked_end, is_ambiguous) in
+                    flight_evidence_segments(start, original_flight.end, &ambiguous_before_ack)
+                {
+                    append_released_carrier_path_flight(
+                        &mut released,
+                        original_flight,
+                        acked_start,
+                        acked_end,
+                        is_ambiguous,
+                    );
                 }
             }
-            assert_eq!(
-                order_cursor,
-                orders.len(),
-                "response overlap bucket identities match payloads"
-            );
-            touched.insert(start, (old_len, slots));
         }
+        return released;
+    }
+
+    let mut original = Vec::<(u64, usize, CarrierPathFlight)>::new();
+    let mut touched = BTreeMap::<u64, (usize, Vec<Option<CarrierPathFlight>>)>::new();
+    let keys = overlap.intersecting(ranges);
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut by_start = BTreeMap::<u64, Vec<usize>>::new();
+    for key in keys {
+        by_start.entry(key.start).or_default().push(key.order);
+    }
+    for (start, orders) in by_start {
+        let bucket = flights
+            .remove(&start)
+            .expect("overlap-index identity has a response payload bucket");
+        let old_len = bucket.len();
+        let mut order_cursor = 0;
+        let mut slots = Vec::with_capacity(old_len);
+        for (order, flight) in bucket.into_iter().enumerate() {
+            if orders.get(order_cursor) == Some(&order) {
+                original.push((start, order, flight));
+                slots.push(None);
+                order_cursor += 1;
+            } else {
+                slots.push(Some(flight));
+            }
+        }
+        assert_eq!(
+            order_cursor,
+            orders.len(),
+            "response overlap bucket identities match payloads"
+        );
+        touched.insert(start, (old_len, slots));
     }
 
     let mut released = Vec::new();
@@ -2736,40 +2951,13 @@ fn release_indexed_carrier_path_flight_ranges(
                 flight_evidence_segments(part_start, part_end, &ambiguous_before_ack)
             })
         {
-            let bytes = flight_interval_bytes(acked_start, acked_end);
-            if bytes == 0 {
-                continue;
-            }
-            let qualification_ambiguous_ranges = if is_ambiguous {
-                SmallVec::from_slice(&[OffsetRange {
-                    start: acked_start,
-                    end: acked_end,
-                }])
-            } else {
-                SmallVec::new()
-            };
-            released.push((
+            append_released_carrier_path_flight(
+                &mut released,
+                original_flight,
                 acked_start,
-                CarrierPathReleasedFlight {
-                    flight: CarrierPathFlight {
-                        end: acked_end,
-                        bytes,
-                        qualification_receipt: original_flight.qualification_receipt.and_then(
-                            |receipt| {
-                                receipt.intersect(OffsetRange {
-                                    start: acked_start,
-                                    end: acked_end,
-                                })
-                            },
-                        ),
-                        ..original_flight
-                    },
-                    path_proving: original_flight.evidence_eligible
-                        && original_flight.kind.is_original_transmission()
-                        && !is_ambiguous,
-                    qualification_ambiguous_ranges,
-                },
-            ));
+                acked_end,
+                is_ambiguous,
+            );
         }
         for (retained_start, retained_end) in split.retained {
             let bytes = flight_interval_bytes(retained_start, retained_end);
@@ -2787,7 +2975,7 @@ fn release_indexed_carrier_path_flight_ranges(
                 }),
                 ..original_flight
             };
-            if retained_start == start && !full_release {
+            if retained_start == start {
                 touched
                     .get_mut(&start)
                     .expect("source response bucket was selected")
@@ -2817,10 +3005,51 @@ fn release_indexed_carrier_path_flight_ranges(
         overlap.rebuild_bucket(start, old_len, fragments.iter().map(|flight| flight.end));
         flights.insert(start, fragments);
     }
-    if !full_release {
-        overlap.acknowledge(ranges);
-    }
+    overlap.finish_partial_ack(
+        ranges,
+        flights.iter().flat_map(|(&start, bucket)| {
+            bucket
+                .iter()
+                .enumerate()
+                .map(move |(order, flight)| (FlightIndexKey { start, order }, flight.end))
+        }),
+    );
     released
+}
+
+fn append_released_carrier_path_flight(
+    released: &mut Vec<(u64, CarrierPathReleasedFlight)>,
+    original_flight: CarrierPathFlight,
+    start: u64,
+    end: u64,
+    is_ambiguous: bool,
+) {
+    let bytes = flight_interval_bytes(start, end);
+    if bytes == 0 {
+        return;
+    }
+    let qualification_ambiguous_ranges = if is_ambiguous {
+        SmallVec::from_slice(&[OffsetRange { start, end }])
+    } else {
+        SmallVec::new()
+    };
+    released.push((
+        start,
+        CarrierPathReleasedFlight {
+            flight: CarrierPathFlight {
+                end,
+                bytes,
+                qualification_receipt: original_flight
+                    .qualification_receipt
+                    .and_then(|receipt| receipt.intersect(OffsetRange { start, end })),
+                ..original_flight
+            },
+            path_proving: original_flight.evidence_eligible
+                && original_flight.kind.is_original_transmission()
+                && !is_ambiguous,
+            qualification_ambiguous_ranges,
+        },
+    ));
 }
 
 /// Old ordered-map release retained as a differential oracle for tests.

@@ -464,7 +464,15 @@ pub(crate) fn split_flight_interval_by_ack(
     let mut acked = Vec::new();
     let mut retained = Vec::new();
     let mut cursor = start;
-    for range in ranges {
+    // Ranges are normalized, so their ends are monotone. Avoid walking an
+    // irrelevant prefix when a flight starts after several ACK-mask holes,
+    // while keeping the one-mask and already-overlapping cases linear.
+    let first = if ranges.len() > 1 && ranges[0].end <= start {
+        ranges.partition_point(|range| range.end <= start)
+    } else {
+        0
+    };
+    for range in &ranges[first..] {
         if range.end <= cursor {
             continue;
         }
@@ -496,7 +504,55 @@ pub(crate) fn flight_interval_bytes(start: u64, end: u64) -> usize {
 
 #[cfg(test)]
 mod flight_evidence_tests {
-    use super::{ambiguous_flight_intervals, flight_evidence_segments};
+    use super::{
+        ambiguous_flight_intervals, flight_evidence_segments, split_flight_interval_by_ack,
+    };
+    use crate::protocol::OffsetRange;
+
+    fn normalized_masks(mut ranges: Vec<OffsetRange>) -> Vec<OffsetRange> {
+        ranges.sort_unstable_by_key(|range| (range.start, range.end));
+        let mut normalized = Vec::<OffsetRange>::new();
+        for range in ranges.into_iter().filter(|range| !range.is_empty()) {
+            if let Some(previous) = normalized.last_mut()
+                && range.start <= previous.end
+            {
+                previous.end = previous.end.max(range.end);
+            } else {
+                normalized.push(range);
+            }
+        }
+        normalized
+    }
+
+    fn full_scan_split(start: u64, end: u64, ranges: &[OffsetRange]) -> super::FlightIntervalSplit {
+        let mut acked = Vec::new();
+        let mut retained = Vec::new();
+        let mut cursor = start;
+        for range in ranges {
+            if range.end <= cursor {
+                continue;
+            }
+            if range.start >= end {
+                break;
+            }
+            let ack_start = cursor.max(range.start);
+            if cursor < ack_start {
+                retained.push((cursor, ack_start));
+            }
+            let ack_end = end.min(range.end);
+            if ack_start < ack_end {
+                acked.push((ack_start, ack_end));
+                cursor = ack_end;
+            }
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            retained.push((cursor, end));
+        }
+        super::FlightIntervalSplit { acked, retained }
+    }
 
     #[test]
     fn evidence_partition_matches_byte_ambiguity_and_half_open_bounds() {
@@ -528,6 +584,52 @@ mod flight_evidence_tests {
                     assert_eq!(cursor, end);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn ack_mask_seek_matches_full_scan_for_fragmented_and_large_offsets() {
+        let mut state = 0x8b5a_7d31_c2e4_690f_u64;
+        for case in 0..8_000_u64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let origin = if case.is_multiple_of(2) {
+                0
+            } else {
+                u64::MAX - 4096
+            };
+            let start = origin + ((state >> 19) % 384);
+            let end = start + 1 + ((state >> 37) % 64);
+            let count = ((state >> 7) % 80) as usize;
+            let mut candidates = Vec::with_capacity(count + 2);
+            for index in 0..count {
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493);
+                let mask_start = origin + ((state >> 23) % 448);
+                let mask_end = mask_start + 1 + ((state >> 43) % 20);
+                candidates.push(OffsetRange {
+                    start: mask_start,
+                    end: mask_end,
+                });
+                if index == 0 {
+                    candidates.push(OffsetRange {
+                        start: start.saturating_sub(8),
+                        end: start,
+                    });
+                    candidates.push(OffsetRange {
+                        start: end,
+                        end: end.saturating_add(8),
+                    });
+                }
+            }
+            let ranges = normalized_masks(candidates);
+            let expected = full_scan_split(start, end, &ranges);
+            let actual = split_flight_interval_by_ack(start, end, &ranges);
+            assert_eq!(actual.acked, expected.acked, "case {case}: ACK atoms");
+            assert_eq!(
+                actual.retained, expected.retained,
+                "case {case}: retained atoms"
+            );
         }
     }
 }

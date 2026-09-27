@@ -16,6 +16,7 @@
 //! order is rebuilt whenever a bucket changes.
 
 use crate::protocol::OffsetRange;
+use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Unbounded};
 
@@ -162,11 +163,6 @@ impl IntervalUnion {
         }
         true
     }
-
-    fn clear(&mut self) {
-        self.ranges.clear();
-        self.covered_bytes = 0;
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,7 +299,11 @@ impl Node {
         }
     }
 
-    fn query(node: &Option<Box<Self>>, range: OffsetRange, output: &mut Vec<FlightIndexKey>) {
+    fn query(
+        node: &Option<Box<Self>>,
+        range: OffsetRange,
+        output: &mut SmallVec<[FlightIndexKey; 4]>,
+    ) {
         let Some(node) = node else { return };
         if range.is_empty() || node.max_end <= range.start {
             return;
@@ -337,19 +337,16 @@ impl Node {
     }
 }
 
-/// One Product owner's overlap state. Its methods intentionally distinguish a
-/// new accepted publication from storage of an ACK-retained fragment.
 #[derive(Debug, Default, Clone)]
-pub(in crate::runtime::stream) struct ProductFlightIndex {
+struct IndexedFlightState {
     root: Option<Box<Node>>,
     len: usize,
     covered: IntervalUnion,
     ambiguous: IntervalUnion,
 }
 
-impl ProductFlightIndex {
-    /// Add a newly accepted Product flight and update U/M from pre-insert U.
-    pub(in crate::runtime::stream) fn publish(&mut self, key: FlightIndexKey, end: u64) {
+impl IndexedFlightState {
+    fn publish(&mut self, key: FlightIndexKey, end: u64) {
         assert!(key.start < end, "published Product flight must be nonempty");
         let range = OffsetRange {
             start: key.start,
@@ -382,57 +379,41 @@ impl ProductFlightIndex {
         self.len -= 1;
     }
 
-    /// Return exact retained identities intersecting an ACK mask, in Product
-    /// ledger order, with duplicate hits across mask ranges removed.
-    pub(in crate::runtime::stream) fn intersecting(
-        &self,
-        ranges: &[OffsetRange],
-    ) -> Vec<FlightIndexKey> {
-        let mut keys = Vec::new();
+    fn intersecting(&self, ranges: &[OffsetRange]) -> SmallVec<[FlightIndexKey; 4]> {
+        let mut keys = SmallVec::new();
         for &range in ranges {
             Node::query(&self.root, range, &mut keys);
         }
-        keys.sort_unstable();
-        keys.dedup();
+        // A single mask is queried once, and the tree visits in key order.
+        // Multiple disjoint masks can select one long flight repeatedly.
+        if ranges.len() > 1 {
+            keys.sort_unstable();
+            keys.dedup();
+        }
         keys
     }
 
-    #[cfg(test)]
-    fn ambiguous_intersections(&self, range: OffsetRange) -> Vec<OffsetRange> {
-        self.ambiguous.intersections(range)
-    }
-
-    pub(in crate::runtime::stream) fn ambiguous_intersections_for_ack(
-        &self,
-        ranges: &[OffsetRange],
-    ) -> Vec<OffsetRange> {
+    fn ambiguous_intersections_for_ack(&self, ranges: &[OffsetRange]) -> Vec<OffsetRange> {
         ranges
             .iter()
             .flat_map(|&range| self.ambiguous.intersections(range))
             .collect()
     }
 
-    /// Subtract a global Product ACK mask only after all released flights were
-    /// classified against the same pre-ACK ambiguous union.
-    pub(in crate::runtime::stream) fn acknowledge(&mut self, ranges: &[OffsetRange]) {
+    fn acknowledge(&mut self, ranges: &[OffsetRange]) {
         for &range in ranges {
             self.covered.subtract(range);
             self.ambiguous.subtract(range);
         }
     }
 
-    pub(in crate::runtime::stream) fn ack_covers_all(&self, ranges: &[OffsetRange]) -> bool {
+    fn ack_covers_all(&self, ranges: &[OffsetRange]) -> bool {
         self.covered.subset_of_ranges(ranges)
     }
 
     /// Rebuild just one touched ordered bucket after a split/removal. The
     /// payload vector remains the output-order oracle.
-    pub(in crate::runtime::stream) fn rebuild_bucket(
-        &mut self,
-        start: u64,
-        old_len: usize,
-        ends: impl IntoIterator<Item = u64>,
-    ) {
+    fn rebuild_bucket(&mut self, start: u64, old_len: usize, ends: impl IntoIterator<Item = u64>) {
         for order in 0..old_len {
             self.remove(FlightIndexKey { start, order });
         }
@@ -441,18 +422,300 @@ impl ProductFlightIndex {
         }
     }
 
-    pub(in crate::runtime::stream) fn clear(&mut self) {
-        self.root = None;
-        self.len = 0;
-        self.covered.clear();
-        self.ambiguous.clear();
-    }
-
     #[cfg(test)]
     fn assert_valid(&self) -> usize {
         let (_, _, count) = Node::assert_valid(&self.root, None, None);
         assert_eq!(count, self.len);
         count
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+enum ProductFlightIndexState {
+    #[default]
+    Empty,
+    Single {
+        key: FlightIndexKey,
+        end: u64,
+    },
+    Indexed(IndexedFlightState),
+}
+
+/// One Product owner's overlap state. Its methods intentionally distinguish a
+/// new accepted publication from storage of an ACK-retained fragment. Empty
+/// and one-flight ledgers stay inline; a partial ACK keeps Indexed alive until
+/// the serialized mutation is complete, even if bucket rebuilding temporarily
+/// removes every indexed identity.
+#[derive(Debug, Default, Clone)]
+pub(in crate::runtime::stream) struct ProductFlightIndex {
+    state: ProductFlightIndexState,
+}
+
+impl ProductFlightIndex {
+    /// Add a newly accepted Product flight and update U/M from pre-insert U.
+    pub(in crate::runtime::stream) fn publish(&mut self, key: FlightIndexKey, end: u64) {
+        assert!(key.start < end, "published Product flight must be nonempty");
+        if let ProductFlightIndexState::Indexed(indexed) = &mut self.state {
+            indexed.publish(key, end);
+            return;
+        }
+        self.state = match std::mem::take(&mut self.state) {
+            ProductFlightIndexState::Empty => ProductFlightIndexState::Single { key, end },
+            ProductFlightIndexState::Single {
+                key: prior_key,
+                end: prior_end,
+            } => {
+                let mut indexed = IndexedFlightState::default();
+                indexed.covered.add(OffsetRange {
+                    start: prior_key.start,
+                    end: prior_end,
+                });
+                indexed.insert_retained(prior_key, prior_end);
+                indexed.publish(key, end);
+                ProductFlightIndexState::Indexed(indexed)
+            }
+            ProductFlightIndexState::Indexed(_) => unreachable!("indexed publication was handled"),
+        };
+    }
+
+    /// Return exact retained identities intersecting an ACK mask, in Product
+    /// ledger order, with duplicate hits across mask ranges removed.
+    pub(in crate::runtime::stream) fn intersecting(
+        &self,
+        ranges: &[OffsetRange],
+    ) -> SmallVec<[FlightIndexKey; 4]> {
+        match &self.state {
+            ProductFlightIndexState::Empty => SmallVec::new(),
+            ProductFlightIndexState::Single { key, end } => {
+                let mut keys = SmallVec::new();
+                if ranges
+                    .iter()
+                    .any(|range| key.start < range.end && *end > range.start)
+                {
+                    keys.push(*key);
+                }
+                keys
+            }
+            ProductFlightIndexState::Indexed(indexed) => indexed.intersecting(ranges),
+        }
+    }
+
+    #[cfg(test)]
+    fn ambiguous_intersections(&self, range: OffsetRange) -> Vec<OffsetRange> {
+        match &self.state {
+            ProductFlightIndexState::Indexed(indexed) => indexed.ambiguous.intersections(range),
+            ProductFlightIndexState::Empty | ProductFlightIndexState::Single { .. } => Vec::new(),
+        }
+    }
+
+    pub(in crate::runtime::stream) fn ambiguous_intersections_for_ack(
+        &self,
+        ranges: &[OffsetRange],
+    ) -> Vec<OffsetRange> {
+        match &self.state {
+            ProductFlightIndexState::Indexed(indexed) => {
+                indexed.ambiguous_intersections_for_ack(ranges)
+            }
+            ProductFlightIndexState::Empty | ProductFlightIndexState::Single { .. } => Vec::new(),
+        }
+    }
+
+    pub(in crate::runtime::stream) fn ack_covers_all(&self, ranges: &[OffsetRange]) -> bool {
+        match &self.state {
+            ProductFlightIndexState::Empty => true,
+            ProductFlightIndexState::Single { key, end } => {
+                let mut cursor = key.start;
+                for range in ranges {
+                    if range.end <= cursor {
+                        continue;
+                    }
+                    if range.start > cursor {
+                        return false;
+                    }
+                    cursor = cursor.max(range.end.min(*end));
+                    if cursor >= *end {
+                        return true;
+                    }
+                }
+                false
+            }
+            ProductFlightIndexState::Indexed(indexed) => indexed.ack_covers_all(ranges),
+        }
+    }
+
+    /// Update the identity set while preserving the current lifetime's U/M.
+    /// Single retains its original summary until `finish_partial_ack`, because
+    /// a split may briefly have no start-key fragment before a staged right
+    /// fragment is reinserted.
+    pub(in crate::runtime::stream) fn rebuild_bucket(
+        &mut self,
+        start: u64,
+        old_len: usize,
+        ends: impl IntoIterator<Item = u64>,
+    ) {
+        match &mut self.state {
+            ProductFlightIndexState::Empty => {
+                let mut ends = ends.into_iter();
+                assert!(
+                    old_len == 0 && ends.next().is_none(),
+                    "empty overlap ledger bucket"
+                );
+            }
+            ProductFlightIndexState::Single { .. } => {
+                // The owner has at most one identity; reconstruct it from the
+                // final retained payload only after the entire ACK transaction.
+            }
+            ProductFlightIndexState::Indexed(indexed) => {
+                indexed.rebuild_bucket(start, old_len, ends);
+            }
+        }
+    }
+
+    /// Commit a partial global ACK after payload fragments and ordered buckets
+    /// have reached their final shape. Indexed owners preserve the incremental
+    /// U/M algebra; a former Single owner can promote only if it actually has
+    /// multiple retained fragments, inserted as geometry rather than copies.
+    pub(in crate::runtime::stream) fn finish_partial_ack(
+        &mut self,
+        ranges: &[OffsetRange],
+        retained: impl IntoIterator<Item = (FlightIndexKey, u64)>,
+    ) {
+        let indexed_empty = if let ProductFlightIndexState::Indexed(indexed) = &mut self.state {
+            indexed.acknowledge(ranges);
+            let empty = indexed.len == 0;
+            if empty {
+                assert!(indexed.root.is_none());
+            }
+            Some(empty)
+        } else {
+            None
+        };
+        if let Some(empty) = indexed_empty {
+            if empty {
+                self.state = ProductFlightIndexState::Empty;
+            }
+            return;
+        }
+
+        let state = std::mem::take(&mut self.state);
+        match state {
+            ProductFlightIndexState::Empty => {
+                assert!(retained.into_iter().next().is_none());
+            }
+            ProductFlightIndexState::Single { .. } => {
+                let mut fragments = retained.into_iter();
+                let Some((key, end)) = fragments.next() else {
+                    self.state = ProductFlightIndexState::Empty;
+                    return;
+                };
+                assert!(
+                    key.start < end,
+                    "retained Product fragment must be nonempty"
+                );
+                let Some((second_key, second_end)) = fragments.next() else {
+                    self.state = ProductFlightIndexState::Single { key, end };
+                    return;
+                };
+                let mut indexed = IndexedFlightState::default();
+                for (key, end) in [(key, end), (second_key, second_end)]
+                    .into_iter()
+                    .chain(fragments)
+                {
+                    assert!(
+                        key.start < end,
+                        "retained Product fragment must be nonempty"
+                    );
+                    debug_assert!(
+                        indexed
+                            .covered
+                            .intersections(OffsetRange {
+                                start: key.start,
+                                end
+                            })
+                            .is_empty()
+                    );
+                    indexed.covered.add(OffsetRange {
+                        start: key.start,
+                        end,
+                    });
+                    indexed.insert_retained(key, end);
+                }
+                self.state = ProductFlightIndexState::Indexed(indexed);
+            }
+            ProductFlightIndexState::Indexed(_) => unreachable!("indexed ACK was handled"),
+        }
+    }
+
+    /// Test-only direct algebra path for a stable indexed owner.
+    #[cfg(test)]
+    fn acknowledge(&mut self, ranges: &[OffsetRange]) {
+        match &mut self.state {
+            ProductFlightIndexState::Indexed(indexed) => indexed.acknowledge(ranges),
+            ProductFlightIndexState::Empty | ProductFlightIndexState::Single { .. } => {
+                panic!("direct ACK algebra requires indexed owner")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn remove(&mut self, key: FlightIndexKey) {
+        match &mut self.state {
+            ProductFlightIndexState::Indexed(indexed) => indexed.remove(key),
+            ProductFlightIndexState::Empty | ProductFlightIndexState::Single { .. } => {
+                panic!("direct identity removal requires indexed owner")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn insert_retained(&mut self, key: FlightIndexKey, end: u64) {
+        match &mut self.state {
+            ProductFlightIndexState::Indexed(indexed) => indexed.insert_retained(key, end),
+            ProductFlightIndexState::Empty | ProductFlightIndexState::Single { .. } => {
+                panic!("direct fragment insertion requires indexed owner")
+            }
+        }
+    }
+
+    pub(in crate::runtime::stream) fn clear(&mut self) {
+        self.state = ProductFlightIndexState::Empty;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::stream) fn flight_count(&self) -> usize {
+        match &self.state {
+            ProductFlightIndexState::Empty => 0,
+            ProductFlightIndexState::Single { .. } => 1,
+            ProductFlightIndexState::Indexed(indexed) => indexed.len,
+        }
+    }
+
+    #[cfg(test)]
+    fn covered_intersections(&self, range: OffsetRange) -> Vec<OffsetRange> {
+        match &self.state {
+            ProductFlightIndexState::Indexed(indexed) => indexed.covered.intersections(range),
+            ProductFlightIndexState::Single { key, end } => {
+                let start = key.start.max(range.start);
+                let end = (*end).min(range.end);
+                (start < end)
+                    .then_some(OffsetRange { start, end })
+                    .into_iter()
+                    .collect()
+            }
+            ProductFlightIndexState::Empty => Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_valid(&self) -> usize {
+        match &self.state {
+            ProductFlightIndexState::Empty => 0,
+            ProductFlightIndexState::Single { key, end } => {
+                assert!(key.start < *end);
+                1
+            }
+            ProductFlightIndexState::Indexed(indexed) => indexed.assert_valid(),
+        }
     }
 
     #[cfg(test)]
@@ -488,7 +751,10 @@ mod tests {
         assert_eq!(index.ambiguous_intersections(r(0, 100)), vec![r(40, 80)]);
         index.acknowledge(&[r(40, 60)]);
         assert_eq!(index.ambiguous_intersections(r(0, 100)), vec![r(60, 80)]);
-        assert_eq!(index.covered.ranges, BTreeMap::from([(0, 40), (60, 100)]));
+        assert_eq!(
+            index.covered_intersections(r(0, 100)),
+            vec![r(0, 40), r(60, 100)]
+        );
         assert_eq!(index.intersecting(&[r(0, 100)]).len(), 2);
         index.assert_valid();
     }
@@ -509,8 +775,8 @@ mod tests {
         );
         let hits = index.intersecting(&[r(10_000, 10_001)]);
         assert_eq!(
-            hits,
-            vec![
+            hits.as_slice(),
+            &[
                 FlightIndexKey { start: 0, order: 0 },
                 FlightIndexKey {
                     start: 10_000,
@@ -529,16 +795,166 @@ mod tests {
     fn retained_fragment_is_not_a_second_publication() {
         let mut index = ProductFlightIndex::default();
         index.publish(FlightIndexKey { start: 0, order: 0 }, 100);
-        index.rebuild_bucket(0, 1, [40]);
-        index.insert_retained(
-            FlightIndexKey {
-                start: 60,
-                order: 0,
-            },
-            100,
+        index.finish_partial_ack(
+            &[r(40, 60)],
+            [
+                (FlightIndexKey { start: 0, order: 0 }, 40),
+                (
+                    FlightIndexKey {
+                        start: 60,
+                        order: 0,
+                    },
+                    100,
+                ),
+            ],
         );
         assert!(index.ambiguous_intersections(r(0, 100)).is_empty());
         index.assert_valid();
+    }
+
+    #[test]
+    fn empty_single_and_fragmented_owners_use_actual_retained_cardinality() {
+        let key = FlightIndexKey { start: 0, order: 0 };
+        let mut index = ProductFlightIndex::default();
+        assert!(matches!(&index.state, ProductFlightIndexState::Empty));
+
+        index.publish(key, 100);
+        assert!(matches!(
+            &index.state,
+            ProductFlightIndexState::Single { .. }
+        ));
+        assert_eq!(index.intersecting(&[r(20, 30)]).as_slice(), &[key]);
+        assert_eq!(
+            index.intersecting(&[r(20, 30), r(40, 50)]).as_slice(),
+            &[key]
+        );
+
+        // A middle ACK leaves two real fragments and promotes from their final
+        // geometry without replaying either as a new publication.
+        index.finish_partial_ack(
+            &[r(40, 60)],
+            [
+                (FlightIndexKey { start: 0, order: 0 }, 40),
+                (
+                    FlightIndexKey {
+                        start: 60,
+                        order: 0,
+                    },
+                    100,
+                ),
+            ],
+        );
+        let ProductFlightIndexState::Indexed(indexed) = &index.state else {
+            panic!("two retained fragments must promote to Indexed")
+        };
+        assert_eq!(indexed.len, 2);
+        assert!(indexed.ambiguous.intersections(r(0, 100)).is_empty());
+        assert_eq!(
+            index.covered_intersections(r(0, 100)),
+            vec![r(0, 40), r(60, 100)]
+        );
+
+        // A following ACK removes both identities, then completed-empty state
+        // demotes to Empty. No temporary index-empty transition loses geometry.
+        index.rebuild_bucket(0, 1, []);
+        index.rebuild_bucket(60, 1, []);
+        assert!(matches!(&index.state, ProductFlightIndexState::Indexed(i) if i.len == 0));
+        index.finish_partial_ack(&[r(0, 40), r(60, 100)], []);
+        assert!(matches!(&index.state, ProductFlightIndexState::Empty));
+        assert_eq!(index.assert_valid(), 0);
+    }
+
+    #[test]
+    fn indexed_rebuild_keeps_pre_ack_ambiguity_until_repeated_ack_finishes() {
+        let first = FlightIndexKey { start: 0, order: 0 };
+        let second = FlightIndexKey {
+            start: 20,
+            order: 0,
+        };
+        let third = FlightIndexKey {
+            start: 20,
+            order: 1,
+        };
+        let mut index = ProductFlightIndex::default();
+        index.publish(first, 100);
+        index.publish(second, 120);
+        index.publish(third, 110);
+        assert_eq!(index.ambiguous_intersections(r(0, 120)), vec![r(20, 110)]);
+
+        // Model the production remove-all-then-stage-right-fragments boundary.
+        // The AVL becomes temporarily empty, but old U/M remain the ACK oracle.
+        index.rebuild_bucket(0, 1, []);
+        index.rebuild_bucket(20, 2, []);
+        assert!(matches!(&index.state, ProductFlightIndexState::Indexed(i) if i.len == 0));
+        assert_eq!(index.ambiguous_intersections(r(0, 120)), vec![r(20, 110)]);
+        index.rebuild_bucket(80, 0, [100, 120, 110]);
+        assert_eq!(index.ambiguous_intersections(r(0, 120)), vec![r(20, 110)]);
+        index.finish_partial_ack(
+            &[r(0, 80)],
+            [
+                (
+                    FlightIndexKey {
+                        start: 80,
+                        order: 0,
+                    },
+                    100,
+                ),
+                (
+                    FlightIndexKey {
+                        start: 80,
+                        order: 1,
+                    },
+                    120,
+                ),
+                (
+                    FlightIndexKey {
+                        start: 80,
+                        order: 2,
+                    },
+                    110,
+                ),
+            ],
+        );
+        assert_eq!(index.covered_intersections(r(0, 120)), vec![r(80, 120)]);
+        assert_eq!(index.ambiguous_intersections(r(0, 120)), vec![r(80, 110)]);
+        assert_eq!(index.assert_valid(), 3);
+
+        index.rebuild_bucket(80, 3, []);
+        assert!(matches!(&index.state, ProductFlightIndexState::Indexed(i) if i.len == 0));
+        index.rebuild_bucket(90, 0, [100, 120, 110]);
+        index.finish_partial_ack(
+            &[r(80, 90)],
+            [
+                (
+                    FlightIndexKey {
+                        start: 90,
+                        order: 0,
+                    },
+                    100,
+                ),
+                (
+                    FlightIndexKey {
+                        start: 90,
+                        order: 1,
+                    },
+                    120,
+                ),
+                (
+                    FlightIndexKey {
+                        start: 90,
+                        order: 2,
+                    },
+                    110,
+                ),
+            ],
+        );
+        assert_eq!(index.covered_intersections(r(0, 120)), vec![r(90, 120)]);
+        assert_eq!(index.ambiguous_intersections(r(0, 120)), vec![r(90, 110)]);
+        assert_eq!(index.assert_valid(), 3);
+
+        index.rebuild_bucket(90, 3, []);
+        index.finish_partial_ack(&[r(90, 120)], []);
+        assert!(matches!(&index.state, ProductFlightIndexState::Empty));
     }
 
     #[test]
@@ -546,6 +962,20 @@ mod tests {
         let mut index = ProductFlightIndex::default();
         let mut flights = BTreeMap::<FlightIndexKey, u64>::new();
         let mut next_order = BTreeMap::<u64, usize>::new();
+        // Keep this low-level algebra trace in the indexed representation; the
+        // separate cardinality tests exercise Empty/Single promotion and demotion.
+        let seed_a = FlightIndexKey {
+            start: 1_000,
+            order: 0,
+        };
+        let seed_b = FlightIndexKey {
+            start: 1_001,
+            order: 0,
+        };
+        index.publish(seed_a, 1_002);
+        index.publish(seed_b, 1_003);
+        flights.insert(seed_a, 1_002);
+        flights.insert(seed_b, 1_003);
         for step in 0..2_000u64 {
             let start = step.wrapping_mul(37) % 127;
             let end = start + 1 + step.wrapping_mul(19) % 31;
@@ -590,8 +1020,8 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(
-                    index.intersecting(&[ack]),
-                    expected_hits,
+                    index.intersecting(&[ack]).as_slice(),
+                    expected_hits.as_slice(),
                     "query at step {step}"
                 );
 
@@ -629,8 +1059,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 let actual_covered = index
-                    .covered
-                    .intersections(full)
+                    .covered_intersections(full)
                     .into_iter()
                     .flat_map(|part| part.start..part.end)
                     .collect::<Vec<_>>();

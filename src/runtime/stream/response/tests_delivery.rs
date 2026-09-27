@@ -259,6 +259,34 @@ fn lifecycle_records(
     records
 }
 
+fn benchmark_extra_lifecycle_case(
+    name: &str,
+    records: &[(u64, CarrierPathFlight)],
+    ranges: &[OffsetRange],
+    runs: usize,
+) {
+    for round in 0..3 {
+        let (reference, indexed, order) = if round % 2 == 0 {
+            let reference = time_reference_lifecycle(records, ranges, runs);
+            let indexed = time_indexed_lifecycle(records, ranges, runs);
+            (reference, indexed, "reference-first")
+        } else {
+            let indexed = time_indexed_lifecycle(records, ranges, runs);
+            let reference = time_reference_lifecycle(records, ranges, runs);
+            (reference, indexed, "indexed-first")
+        };
+        eprintln!(
+            "lifecycle: case={name} flights={} masks={} runs={runs} round={} order={order} reference_total_ms={:.3} indexed_total_ms={:.3} ratio={:.3}",
+            records.len(),
+            ranges.len(),
+            round + 1,
+            reference.as_secs_f64() * 1_000.0,
+            indexed.as_secs_f64() * 1_000.0,
+            indexed.as_secs_f64() / reference.as_secs_f64(),
+        );
+    }
+}
+
 fn time_reference_lifecycle(
     records: &[(u64, CarrierPathFlight)],
     ranges: &[OffsetRange],
@@ -398,7 +426,7 @@ fn product_flight_indexed_lifecycle_cost_and_memory() {
     let (index_owner, index_node, union_header, key_bytes) =
         ResponseProductFlightLedger::overlap_layout_for_test();
     eprintln!(
-        "ledger-layout: flight_payload={}B btree_map_header={}B vec_header={}B index_owner={}B union_headers={}B index_key={}B avl_node={}B; one Box<Node> allocation per retained flight plus BTreeMap U/M nodes per disjoint run",
+        "ledger-layout: flight_payload={}B btree_map_header={}B vec_header={}B ProductFlightIndex_enum_owner={}B union_header_each={}B index_key={}B avl_node={}B; Empty/Single keep flight geometry inline; Indexed adds one Box<Node> per retained flight and BTreeMap U/M nodes per disjoint run",
         std::mem::size_of::<CarrierPathFlight>(),
         std::mem::size_of::<BTreeMap<u64, Vec<CarrierPathFlight>>>(),
         std::mem::size_of::<Vec<CarrierPathFlight>>(),
@@ -446,6 +474,43 @@ fn product_flight_indexed_lifecycle_cost_and_memory() {
             );
         }
     }
+    let now = Instant::now();
+    let one_flight = lifecycle_records(1, false, false, now);
+    benchmark_extra_lifecycle_case(
+        "single-partial-split-1",
+        &one_flight,
+        &[range(1, 4)],
+        20_000,
+    );
+
+    // One late selected flight sits after 255 unrelated normalized masks;
+    // another retained flight keeps this on the partial-ACK path. The release
+    // still includes publication, indexed lookup, splitting and union updates.
+    let mask_count = 256usize;
+    let late_start = (mask_count as u64 - 1) * 2;
+    let target = valid_differential_flight(
+        late_start,
+        late_start + 1,
+        CarrierWorkKind::OriginalData,
+        0,
+        now,
+    );
+    let tail = valid_differential_flight(
+        late_start + 10,
+        late_start + 11,
+        CarrierWorkKind::OriginalData,
+        1,
+        now,
+    );
+    let fragmented_masks = (0..mask_count)
+        .map(|index| range(index as u64 * 2, index as u64 * 2 + 1))
+        .collect::<Vec<_>>();
+    benchmark_extra_lifecycle_case(
+        "fragmented-mask-late-hit-256",
+        &[(late_start, target), (late_start + 10, tail)],
+        &fragmented_masks,
+        4_096,
+    );
     benchmark_cumulative_refill("steady-cumulative-retained-8", 8, 2_048, 2);
     benchmark_cumulative_refill("steady-cumulative-retained-512", 512, 2_048, 2);
 }
@@ -611,6 +676,53 @@ fn in_place_ack_release_preserves_metadata_and_repeated_duplicate_behavior() {
         actual.is_empty(),
         "the final ACK releases every remaining flight"
     );
+}
+
+#[test]
+fn indexed_owner_rebuilds_duplicate_overlap_fragments_across_repeated_ack() {
+    let now = Instant::now();
+    let initial = BTreeMap::from([
+        (
+            0,
+            vec![valid_differential_flight(
+                0,
+                100,
+                CarrierWorkKind::OriginalData,
+                0,
+                now,
+            )],
+        ),
+        (
+            20,
+            vec![
+                valid_differential_flight(20, 120, CarrierWorkKind::ReinjectedData, 1, now),
+                valid_differential_flight(20, 110, CarrierWorkKind::OriginalData, 2, now),
+            ],
+        ),
+    ]);
+    let mut expected = initial.clone();
+    let mut actual = ResponseProductFlightLedger::default();
+    actual.extend_for_test(initial);
+
+    for (pass, ack) in [range(0, 80), range(80, 90), range(90, 120)]
+        .into_iter()
+        .enumerate()
+    {
+        let expected_released =
+            super::release_carrier_path_flight_ranges_reference(&mut expected, &[ack]);
+        let actual_released = actual.release(&[ack]);
+        assert_eq!(
+            release_state(&actual_released),
+            release_state(&expected_released),
+            "release evidence differs on pass {pass}"
+        );
+        assert_eq!(
+            ledger_state(&actual),
+            ledger_state(&expected),
+            "retained fragments differ on pass {pass}"
+        );
+    }
+    assert!(actual.is_empty());
 }
 
 #[test]

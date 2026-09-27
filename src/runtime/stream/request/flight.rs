@@ -742,54 +742,72 @@ impl RequestFlightLedger {
             .map(|range| (range.start, range.end))
             .collect::<Vec<_>>();
         let full_release = self.overlap.ack_covers_all(ranges);
-        // Full cumulative release remains O(F): drain the payload/index once.
+        // The pre-ACK ambiguity snapshot is complete before the fast path clears
+        // the index. Every retained flight is wholly covered in this branch, so
+        // no split plan or staged `(start, order, flight)` copy is needed.
+        if full_release {
+            #[cfg(test)]
+            let flight_count = self.overlap.flight_count();
+            let all_flights = std::mem::take(&mut self.flights);
+            self.overlap.clear();
+            #[cfg(test)]
+            ACK_RELEASE_FLIGHT_VISITS.with(|work| work.set(work.get() + flight_count));
+            let now = Instant::now();
+            let mut released = Vec::new();
+            for (start, bucket) in all_flights {
+                for flight in bucket {
+                    for (acked_start, acked_end, is_ambiguous) in
+                        flight_evidence_segments(start, flight.end, &ambiguous_intervals)
+                    {
+                        if let Some(release) = self.release_request_ack_segment(
+                            flight,
+                            acked_start,
+                            acked_end,
+                            is_ambiguous,
+                            now,
+                        ) {
+                            released.push(release);
+                        }
+                    }
+                }
+            }
+            return released;
+        }
+
         // Partial ACKs query exact identities and do not scan the start prefix.
         let mut original_flights = Vec::<(u64, usize, RequestFlight)>::new();
         let mut touched = BTreeMap::<u64, (usize, Vec<Option<RequestFlight>>)>::new();
-        if full_release {
-            original_flights = std::mem::take(&mut self.flights)
-                .into_iter()
-                .flat_map(|(start, flights)| {
-                    flights
-                        .into_iter()
-                        .enumerate()
-                        .map(move |(order, flight)| (start, order, flight))
-                })
-                .collect();
-            self.overlap.clear();
-        } else {
-            let keys = self.overlap.intersecting(ranges);
-            if keys.is_empty() {
-                return Vec::new();
-            }
-            let mut by_start = BTreeMap::<u64, Vec<usize>>::new();
-            for key in keys {
-                by_start.entry(key.start).or_default().push(key.order);
-            }
-            for (start, orders) in by_start {
-                let bucket = self
-                    .flights
-                    .remove(&start)
-                    .expect("overlap-index identity has a request payload bucket");
-                let old_len = bucket.len();
-                let mut order_cursor = 0;
-                let mut slots = Vec::with_capacity(old_len);
-                for (order, flight) in bucket.into_iter().enumerate() {
-                    if orders.get(order_cursor) == Some(&order) {
-                        original_flights.push((start, order, flight));
-                        slots.push(None);
-                        order_cursor += 1;
-                    } else {
-                        slots.push(Some(flight));
-                    }
+        let keys = self.overlap.intersecting(ranges);
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let mut by_start = BTreeMap::<u64, Vec<usize>>::new();
+        for key in keys {
+            by_start.entry(key.start).or_default().push(key.order);
+        }
+        for (start, orders) in by_start {
+            let bucket = self
+                .flights
+                .remove(&start)
+                .expect("overlap-index identity has a request payload bucket");
+            let old_len = bucket.len();
+            let mut order_cursor = 0;
+            let mut slots = Vec::with_capacity(old_len);
+            for (order, flight) in bucket.into_iter().enumerate() {
+                if orders.get(order_cursor) == Some(&order) {
+                    original_flights.push((start, order, flight));
+                    slots.push(None);
+                    order_cursor += 1;
+                } else {
+                    slots.push(Some(flight));
                 }
-                assert_eq!(
-                    order_cursor,
-                    orders.len(),
-                    "request overlap bucket identities match payloads"
-                );
-                touched.insert(start, (old_len, slots));
             }
+            assert_eq!(
+                order_cursor,
+                orders.len(),
+                "request overlap bucket identities match payloads"
+            );
+            touched.insert(start, (old_len, slots));
         }
         #[cfg(test)]
         ACK_RELEASE_FLIGHT_VISITS.with(|work| work.set(work.get() + original_flights.len()));
@@ -803,61 +821,15 @@ impl RequestFlightLedger {
                 .into_iter()
                 .flat_map(|(start, end)| flight_evidence_segments(start, end, &ambiguous_intervals))
             {
-                let bytes = flight_interval_bytes(acked_start, acked_end);
-                if bytes == 0 {
-                    continue;
+                if let Some(release) = self.release_request_ack_segment(
+                    flight,
+                    acked_start,
+                    acked_end,
+                    is_ambiguous,
+                    now,
+                ) {
+                    released.push(release);
                 }
-                if flight.kind.is_original_transmission() {
-                    self.original_data_in_flight_bytes = self
-                        .original_data_in_flight_bytes
-                        .checked_sub(bytes as u64)
-                        .expect("request shared OriginalData debt covers released flight");
-                    let instance_bytes = self
-                        .original_data_in_flight_bytes_by_instance
-                        .get_mut(&flight.instance)
-                        .expect("request exact-instance OriginalData debt covers released flight");
-                    *instance_bytes = instance_bytes
-                        .checked_sub(bytes as u64)
-                        .expect("request exact-instance OriginalData debt covers released bytes");
-                    let remove_instance = *instance_bytes == 0;
-                    if remove_instance {
-                        self.original_data_in_flight_bytes_by_instance
-                            .remove(&flight.instance);
-                    }
-                } else if flight.kind == CarrierWorkKind::ReinjectedData {
-                    let instance_bytes = self
-                        .reinjected_data_in_flight_bytes_by_instance
-                        .get_mut(&flight.instance)
-                        .expect("request exact-instance copy debt covers released flight");
-                    *instance_bytes = instance_bytes
-                        .checked_sub(bytes as u64)
-                        .expect("request exact-instance copy debt covers released bytes");
-                    if *instance_bytes == 0 {
-                        self.reinjected_data_in_flight_bytes_by_instance
-                            .remove(&flight.instance);
-                    }
-                }
-                let path_proving = flight.evidence_eligible
-                    && flight.kind.is_original_transmission()
-                    && !is_ambiguous;
-                released.push(RequestPathRelease {
-                    instance: flight.instance,
-                    range: OffsetRange {
-                        start: acked_start,
-                        end: acked_end,
-                    },
-                    bytes,
-                    kind: flight.kind,
-                    sent_at: flight.sent_at,
-                    elapsed: now.saturating_duration_since(flight.sent_at),
-                    path_proving,
-                    qualification: flight.qualification.and_then(|qualification| {
-                        qualification.intersect(OffsetRange {
-                            start: acked_start,
-                            end: acked_end,
-                        })
-                    }),
-                });
             }
             for (retained_start, retained_end) in split.retained {
                 let bytes = flight_interval_bytes(retained_start, retained_end);
@@ -875,7 +847,7 @@ impl RequestFlightLedger {
                     }),
                     ..flight
                 };
-                if retained_start == start && !full_release {
+                if retained_start == start {
                     touched
                         .get_mut(&start)
                         .expect("source request bucket was selected")
@@ -908,10 +880,74 @@ impl RequestFlightLedger {
                 .rebuild_bucket(start, old_len, fragments.iter().map(|flight| flight.end));
             self.flights.insert(start, fragments);
         }
-        if !full_release {
-            self.overlap.acknowledge(ranges);
-        }
+        self.overlap.finish_partial_ack(
+            ranges,
+            self.flights.iter().flat_map(|(&start, bucket)| {
+                bucket
+                    .iter()
+                    .enumerate()
+                    .map(move |(order, flight)| (FlightIndexKey { start, order }, flight.end))
+            }),
+        );
         released
+    }
+
+    fn release_request_ack_segment(
+        &mut self,
+        flight: RequestFlight,
+        start: u64,
+        end: u64,
+        is_ambiguous: bool,
+        now: Instant,
+    ) -> Option<RequestPathRelease> {
+        let bytes = flight_interval_bytes(start, end);
+        if bytes == 0 {
+            return None;
+        }
+        if flight.kind.is_original_transmission() {
+            self.original_data_in_flight_bytes = self
+                .original_data_in_flight_bytes
+                .checked_sub(bytes as u64)
+                .expect("request shared OriginalData debt covers released flight");
+            let instance_bytes = self
+                .original_data_in_flight_bytes_by_instance
+                .get_mut(&flight.instance)
+                .expect("request exact-instance OriginalData debt covers released flight");
+            *instance_bytes = instance_bytes
+                .checked_sub(bytes as u64)
+                .expect("request exact-instance OriginalData debt covers released bytes");
+            let remove_instance = *instance_bytes == 0;
+            if remove_instance {
+                self.original_data_in_flight_bytes_by_instance
+                    .remove(&flight.instance);
+            }
+        } else if flight.kind == CarrierWorkKind::ReinjectedData {
+            let instance_bytes = self
+                .reinjected_data_in_flight_bytes_by_instance
+                .get_mut(&flight.instance)
+                .expect("request exact-instance copy debt covers released flight");
+            *instance_bytes = instance_bytes
+                .checked_sub(bytes as u64)
+                .expect("request exact-instance copy debt covers released bytes");
+            if *instance_bytes == 0 {
+                self.reinjected_data_in_flight_bytes_by_instance
+                    .remove(&flight.instance);
+            }
+        }
+        Some(RequestPathRelease {
+            instance: flight.instance,
+            range: OffsetRange { start, end },
+            bytes,
+            kind: flight.kind,
+            sent_at: flight.sent_at,
+            elapsed: now.saturating_duration_since(flight.sent_at),
+            path_proving: flight.evidence_eligible
+                && flight.kind.is_original_transmission()
+                && !is_ambiguous,
+            qualification: flight
+                .qualification
+                .and_then(|qualification| qualification.intersect(OffsetRange { start, end })),
+        })
     }
 
     pub(in crate::runtime) fn drain_all(&mut self) -> Vec<RequestPathRelease> {

@@ -455,5 +455,9 @@ impl ResponseStreamBinding {
 mod tests;
 
 #[cfg(test)]
+#[path = "response/tests_slot_debt.rs"]
+mod tests_slot_debt;
+
+#[cfg(test)]
 #[path = "response/tests_test_support.rs"]
 mod test_support;

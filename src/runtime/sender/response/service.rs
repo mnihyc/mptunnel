@@ -64,6 +64,7 @@ use crate::runtime::stream::{
 };
 use crate::scheduler::{self, PathSnapshot, TrafficClass};
 use bytes::Bytes;
+use smallvec::SmallVec;
 use std::time::{Duration, Instant};
 
 pub(super) fn response_data_dispatch_lane(
@@ -287,6 +288,10 @@ impl ServerResponseSenderService {
         observed_at: Instant,
     ) -> ResponsePreparedRecoveryObservation {
         let (covered, mut next_deadline) = binding.prepared_recovery_coverage(observed_at);
+        // Both the exceptional frontier attempt and the ordinary fallback are
+        // one discovery observation. Reuse one coherent slot-debt snapshot if
+        // the first range falls through; final admission still revalidates it.
+        let mut target_copy_debts = None;
         let retained = send_stream.retained_ranges_in_scope(OffsetRange {
             start: send_stream.data_ack_frontier(),
             end: send_stream.next_offset(),
@@ -310,6 +315,7 @@ impl ServerResponseSenderService {
                 range,
                 true,
                 next_deadline,
+                &mut target_copy_debts,
             );
             if exceptional.candidate.is_some() {
                 return exceptional;
@@ -336,6 +342,7 @@ impl ServerResponseSenderService {
             range,
             false,
             next_deadline,
+            &mut target_copy_debts,
         )
     }
 
@@ -352,6 +359,7 @@ impl ServerResponseSenderService {
         mut range: OffsetRange,
         credit_frontier: bool,
         next_deadline: Option<Instant>,
+        target_copy_debts: &mut Option<SmallVec<[usize; 4]>>,
     ) -> ResponsePreparedRecoveryObservation {
         let mux_limits = binding.mux_limits();
         let mut result = ResponsePreparedRecoveryObservation {
@@ -450,29 +458,58 @@ impl ServerResponseSenderService {
                 // later recovery until final Apply discovers the same debt.
                 avoid.extend(binding.reinjection_avoid_outputs_for_frame(preview));
             }
-            let available = targets
-                .iter()
-                .filter(|target| {
-                    if !ready.contains(&ResponseAcquisitionOutputId::from(*target)) {
-                        return false;
-                    }
-                    let identity = ServerReinjectionOutputIdentity {
+            let target_copy_debts = target_copy_debts.get_or_insert_with(|| {
+                let ready_identities = targets
+                    .iter()
+                    .filter(|target| ready.contains(&ResponseAcquisitionOutputId::from(*target)))
+                    .map(|target| ServerReinjectionOutputIdentity {
                         key: target.observation.key,
                         incarnation: target.observation.incarnation,
-                    };
-                    reliable_reinjection_service_limit_bytes(
-                        ReliableReinjectionTargetWork::new(
-                            Some(response_completion_snapshot(target)),
-                            self.queue
-                                .response_target_queued_reinjection_bytes(identity, false),
-                            binding.accepted_reinjected_data_in_flight_bytes_at(identity),
-                        ),
-                        send_stream.reinjection_bytes(),
-                        mux_limits,
-                    ) > 0
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+                    })
+                    .collect::<SmallVec<[_; 4]>>();
+                let ready_debts = binding
+                    .accepted_reinjected_data_in_flight_bytes_for_outputs_at(&ready_identities);
+                let mut debts = SmallVec::<[usize; 4]>::new();
+                debts.resize(targets.len(), 0);
+                for ((index, _), debt) in targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, target)| {
+                        ready.contains(&ResponseAcquisitionOutputId::from(*target))
+                    })
+                    .zip(ready_debts)
+                {
+                    debts[index] = debt;
+                }
+                debts
+            });
+            let mut available = Vec::new();
+            let mut available_copy_debts = SmallVec::<[usize; 4]>::new();
+            for (target, accepted_copy_debt) in
+                targets.iter().zip(target_copy_debts.iter().copied())
+            {
+                if !ready.contains(&ResponseAcquisitionOutputId::from(target)) {
+                    continue;
+                }
+                let identity = ServerReinjectionOutputIdentity {
+                    key: target.observation.key,
+                    incarnation: target.observation.incarnation,
+                };
+                if reliable_reinjection_service_limit_bytes(
+                    ReliableReinjectionTargetWork::new(
+                        Some(response_completion_snapshot(target)),
+                        self.queue
+                            .response_target_queued_reinjection_bytes(identity, false),
+                        accepted_copy_debt,
+                    ),
+                    send_stream.reinjection_bytes(),
+                    mux_limits,
+                ) > 0
+                {
+                    available.push(target.clone());
+                    available_copy_debts.push(accepted_copy_debt);
+                }
+            }
             let mut target = select_response_frame_path_for_extent(
                 &available,
                 lane,
@@ -553,12 +590,21 @@ impl ServerResponseSenderService {
                 incarnation: target.observation.incarnation,
             };
             let snapshot = response_completion_snapshot(&target);
+            let accepted_copy_debt = available
+                .iter()
+                .zip(&available_copy_debts)
+                .find(|(candidate, _)| {
+                    candidate.observation.key == identity.key
+                        && candidate.observation.incarnation == identity.incarnation
+                })
+                .map(|(_, debt)| *debt)
+                .expect("selected prepared-recovery target belongs to available candidates");
             let target_service = reliable_reinjection_service_limit_bytes(
                 ReliableReinjectionTargetWork::new(
                     Some(snapshot),
                     self.queue
                         .response_target_queued_reinjection_bytes(identity, false),
-                    binding.accepted_reinjected_data_in_flight_bytes_at(identity),
+                    accepted_copy_debt,
                 ),
                 send_stream.reinjection_bytes(),
                 mux_limits,

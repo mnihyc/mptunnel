@@ -1,12 +1,16 @@
 #[path = "tests_recovery_index.rs"]
 mod recovery_index;
 
-use super::{RequestFlightLedger, RequestRecoveryOwnershipView};
+use super::{RequestFlight, RequestFlightLedger, RequestPathRelease, RequestRecoveryOwnershipView};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::model::work::CarrierWorkKind;
+use crate::model::work::{
+    CarrierWorkKind, ambiguous_flight_intervals, flight_evidence_segments, flight_interval_bytes,
+    split_flight_interval_by_ack,
+};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::stream::request::RequestPathStates;
 use bytes::Bytes;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 fn data_frame(offset: u64, len: usize) -> Frame {
@@ -15,6 +19,165 @@ fn data_frame(offset: u64, len: usize) -> Frame {
         offset,
         payload: Bytes::from(vec![0x5a; len]),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestFlightSnapshot {
+    instance: RelayPathInstance,
+    assignment_range: OffsetRange,
+    end: u64,
+    bytes: usize,
+    sent_at: Instant,
+    kind: CarrierWorkKind,
+    evidence_eligible: bool,
+    qualification: Option<super::RequestProductQualificationReceipt>,
+    reinjection_suppression_deadline: Option<Instant>,
+    original_recovery_timing: Option<crate::model::timing::ReliableDataAckGapTiming>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestFlightBucketSnapshot {
+    start: u64,
+    flights: Vec<RequestFlightSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestReleaseSnapshot {
+    instance: RelayPathInstance,
+    range: OffsetRange,
+    bytes: usize,
+    kind: CarrierWorkKind,
+    sent_at: Instant,
+    path_proving: bool,
+    qualification: Option<super::RequestProductQualificationReceipt>,
+}
+
+fn request_flight_state(
+    flights: &BTreeMap<u64, Vec<RequestFlight>>,
+) -> Vec<RequestFlightBucketSnapshot> {
+    flights
+        .iter()
+        .map(|(&start, entries)| RequestFlightBucketSnapshot {
+            start,
+            flights: entries
+                .iter()
+                .copied()
+                .map(|flight| RequestFlightSnapshot {
+                    instance: flight.instance,
+                    assignment_range: flight.assignment_range,
+                    end: flight.end,
+                    bytes: flight.bytes,
+                    sent_at: flight.sent_at,
+                    kind: flight.kind,
+                    evidence_eligible: flight.evidence_eligible,
+                    qualification: flight.qualification,
+                    reinjection_suppression_deadline: flight.reinjection_suppression_deadline,
+                    original_recovery_timing: flight.original_recovery_timing,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn request_release_state(released: &[RequestPathRelease]) -> Vec<RequestReleaseSnapshot> {
+    released
+        .iter()
+        .map(|release| RequestReleaseSnapshot {
+            instance: release.instance,
+            range: release.range,
+            bytes: release.bytes,
+            kind: release.kind,
+            sent_at: release.sent_at,
+            path_proving: release.path_proving,
+            qualification: release.qualification,
+        })
+        .collect()
+}
+
+fn reference_request_release(
+    flights: &mut BTreeMap<u64, Vec<RequestFlight>>,
+    ranges: &[OffsetRange],
+) -> Vec<RequestPathRelease> {
+    let original = std::mem::take(flights)
+        .into_iter()
+        .flat_map(|(start, entries)| entries.into_iter().map(move |flight| (start, flight)))
+        .collect::<Vec<_>>();
+    let ambiguous =
+        ambiguous_flight_intervals(original.iter().map(|(start, flight)| (*start, flight.end)));
+    let now = Instant::now();
+    let mut released = Vec::new();
+    for (start, flight) in original {
+        let split = split_flight_interval_by_ack(start, flight.end, ranges);
+        for (acked_start, acked_end, is_ambiguous) in split
+            .acked
+            .into_iter()
+            .flat_map(|(start, end)| flight_evidence_segments(start, end, &ambiguous))
+        {
+            let bytes = flight_interval_bytes(acked_start, acked_end);
+            if bytes > 0 {
+                released.push(RequestPathRelease {
+                    instance: flight.instance,
+                    range: OffsetRange {
+                        start: acked_start,
+                        end: acked_end,
+                    },
+                    bytes,
+                    kind: flight.kind,
+                    sent_at: flight.sent_at,
+                    elapsed: now.saturating_duration_since(flight.sent_at),
+                    path_proving: flight.evidence_eligible
+                        && flight.kind.is_original_transmission()
+                        && !is_ambiguous,
+                    qualification: flight.qualification.and_then(|qualification| {
+                        qualification.intersect(OffsetRange {
+                            start: acked_start,
+                            end: acked_end,
+                        })
+                    }),
+                });
+            }
+        }
+        for (retained_start, retained_end) in split.retained {
+            let bytes = flight_interval_bytes(retained_start, retained_end);
+            if bytes > 0 {
+                flights
+                    .entry(retained_start)
+                    .or_default()
+                    .push(RequestFlight {
+                        end: retained_end,
+                        bytes,
+                        qualification: flight.qualification.and_then(|qualification| {
+                            qualification.intersect(OffsetRange {
+                                start: retained_start,
+                                end: retained_end,
+                            })
+                        }),
+                        ..flight
+                    });
+            }
+        }
+    }
+    released
+}
+
+fn assert_request_release_matches_reference(
+    ledger: &mut RequestFlightLedger,
+    ranges: &[OffsetRange],
+    context: &str,
+) {
+    let mut expected_flights = ledger.flights.clone();
+    let expected = reference_request_release(&mut expected_flights, ranges);
+    let actual = ledger.release_normalized_acked_ranges(ranges);
+    assert_eq!(
+        request_release_state(&actual),
+        request_release_state(&expected),
+        "request ACK evidence differs for {context}"
+    );
+    assert_eq!(
+        request_flight_state(&ledger.flights),
+        request_flight_state(&expected_flights),
+        "request retained geometry/order differs for {context}"
+    );
 }
 
 #[test]
@@ -1806,4 +1969,99 @@ fn reinjection_scrubs_the_flight_owner_not_a_same_range_replacement() {
         8,
         "a raw range broadcast would have incorrectly scrubbed this exact replacement",
     );
+}
+
+#[test]
+fn request_indexed_ack_release_matches_full_sweep_reference_through_fragment_collisions() {
+    let original = path(UnderlayProtocol::Tcp, 0, 7101);
+    let copy_a = path(UnderlayProtocol::Udp, 1, 7102);
+    let copy_b = path(UnderlayProtocol::Tcp, 2, 7103);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(original, &data_frame(0, 64));
+    ledger.record_original_frame_instance(original, &data_frame(12, 6));
+    ledger.record_reinjection_frame_instance(copy_a, &data_frame(12, 16));
+    ledger.record_reinjection_frame_instance(copy_b, &data_frame(12, 8));
+    ledger.record_original_frame_instance(copy_b, &data_frame(24, 12));
+
+    let original_debt = ledger.original_data_in_flight_bytes(original);
+    // Detach/evidence invalidation revokes proof only; retained geometry and
+    // all-copy ACK ownership remain present in the Product ledger.
+    ledger.invalidate_original_evidence(original);
+    assert_eq!(
+        ledger.original_data_in_flight_bytes(original),
+        original_debt
+    );
+
+    let ack_masks = [
+        vec![
+            OffsetRange { start: 8, end: 12 },
+            OffsetRange { start: 20, end: 24 },
+        ],
+        vec![
+            OffsetRange { start: 8, end: 12 },
+            OffsetRange { start: 20, end: 24 },
+        ],
+        vec![
+            OffsetRange { start: 12, end: 20 },
+            OffsetRange { start: 24, end: 32 },
+        ],
+        vec![OffsetRange { start: 0, end: 64 }],
+        vec![OffsetRange { start: 0, end: 64 }],
+    ];
+    for (pass, ranges) in ack_masks.into_iter().enumerate() {
+        assert_request_release_matches_reference(
+            &mut ledger,
+            &ranges,
+            &format!("fixed pass {pass}"),
+        );
+    }
+    assert!(ledger.flights.is_empty());
+    assert_eq!(ledger.original_data_in_flight_bytes(original), 0);
+    assert_eq!(ledger.original_data_in_flight_bytes(copy_b), 0);
+
+    // Persistent deterministic insert/ACK trace: flight multiplicity and ACK
+    // fragmentation evolve across operations, compared after every mutation
+    // with a simple whole-ledger sweep oracle.
+    let owners = [original, copy_a, copy_b];
+    let mut state = 0x9e37_79b9_u64;
+    for step in 0..1_200u64 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        if step % 3 == 0 {
+            let start = state % 192;
+            let len = 1 + ((state >> 17) % 19) as usize;
+            let owner = owners[((state >> 37) as usize) % owners.len()];
+            if state & 1 == 0 {
+                ledger.record_original_frame_instance(owner, &data_frame(start, len));
+            } else {
+                ledger.record_reinjection_frame_instance(owner, &data_frame(start, len));
+            }
+        } else {
+            let start = state % 192;
+            let first_end = start + 1 + ((state >> 13) % 11);
+            let next_start = first_end + 1 + ((state >> 29) % 8);
+            let second_end = next_start + 1 + ((state >> 41) % 9);
+            let ranges = if step % 5 == 0 {
+                vec![
+                    OffsetRange {
+                        start,
+                        end: first_end,
+                    },
+                    OffsetRange {
+                        start: next_start,
+                        end: second_end,
+                    },
+                ]
+            } else {
+                vec![OffsetRange {
+                    start,
+                    end: first_end,
+                }]
+            };
+            assert_request_release_matches_reference(
+                &mut ledger,
+                &ranges,
+                &format!("randomized persistent step {step}"),
+            );
+        }
+    }
 }

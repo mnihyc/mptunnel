@@ -994,6 +994,66 @@ fn ready_h3_stream_data_decode_is_zero_copy_for_one_record() {
 }
 
 #[test]
+fn ready_h3_stream_data_waits_for_record_end_but_not_trailing_batch() {
+    let limits = CodecLimits::default();
+    let first = Frame::StreamData {
+        stream_id: StreamId(7),
+        offset: 11,
+        payload: Bytes::from_static(b"first record payload"),
+    };
+    let second = Frame::StreamData {
+        stream_id: StreamId(7),
+        offset: 11 + b"first record payload".len() as u64,
+        payload: Bytes::from_static(b"second record payload"),
+    };
+    let first_bytes = encoded_h3_records(std::slice::from_ref(&first), limits);
+
+    // H3 body chunks can stop inside the length prefix, MPP header, or payload.
+    // None of those authenticated/ordered prefixes is a decoded MPP record.
+    for partial_len in [
+        1,
+        FRAME_LEN_BYTES,
+        FRAME_LEN_BYTES + STREAM_DATA_PREFIX_LEN,
+        first_bytes.len() - 1,
+    ] {
+        let mut partial = first_bytes.slice(..partial_len);
+        assert_eq!(
+            decode_ready_h3_frame(&mut partial, limits).expect("partial H3 body chunk"),
+            None,
+            "a prefix of a length-prefixed StreamData record must not be published"
+        );
+        assert_eq!(partial, first_bytes.slice(..partial_len));
+    }
+
+    // The first complete MPP record is independently ready even when the same
+    // H3 body chunk ends partway through the next record. The parser retains
+    // that tail for the next call instead of making one chunk/batch atomic.
+    let second_bytes = encoded_h3_records(std::slice::from_ref(&second), limits);
+    let second_partial_len = second_bytes.len() - 1;
+    let mut body_chunk = first_bytes.to_vec();
+    body_chunk.extend_from_slice(&second_bytes[..second_partial_len]);
+    let mut pending = Bytes::from(body_chunk);
+    assert_eq!(
+        decode_ready_h3_frame(&mut pending, limits).expect("first record is complete"),
+        Some(first)
+    );
+    assert_eq!(pending, second_bytes.slice(..second_partial_len));
+    assert_eq!(
+        decode_ready_h3_frame(&mut pending, limits).expect("second record is partial"),
+        None
+    );
+
+    let mut completed_second = pending.to_vec();
+    completed_second.push(second_bytes[second_partial_len]);
+    pending = Bytes::from(completed_second);
+    assert_eq!(
+        decode_ready_h3_frame(&mut pending, limits).expect("second record now complete"),
+        Some(second)
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
 fn ready_h3_stream_data_coalesces_adjacent_records_from_one_chunk() {
     let limits = CodecLimits::default();
     let mut pending = encoded_h3_records(

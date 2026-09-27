@@ -4,6 +4,7 @@ use super::*;
 fn duplicate_ledger(source: &RequestFlightLedger) -> RequestFlightLedger {
     RequestFlightLedger {
         flights: source.flights.clone(),
+        overlap: source.overlap.clone(),
         geometry_revision: source.geometry_revision,
         original_data_in_flight_bytes: source.original_data_in_flight_bytes,
         original_data_in_flight_bytes_by_instance: source

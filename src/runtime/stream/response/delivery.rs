@@ -17,11 +17,13 @@ use crate::model::response::CarrierPathFlightDebt;
 use crate::model::timing::{
     ReliableDataAckGapTiming, reliable_data_ack_gap_timing, reliable_data_retransmission_interval,
 };
+#[cfg(test)]
+use crate::model::work::ambiguous_flight_intervals;
 use crate::model::work::{
     CarrierWorkKind, RangeRecoveryState, ReliableFlightSpan, ReliableLiveOwnerFrontier,
-    ReliableReinjectionTargetWork, ambiguous_flight_intervals, flight_evidence_segments,
-    flight_interval_bytes, reliable_live_owner_uniform_frontier,
-    reliable_reinjection_service_limit_bytes, split_flight_interval_by_ack,
+    ReliableReinjectionTargetWork, flight_evidence_segments, flight_interval_bytes,
+    reliable_live_owner_uniform_frontier, reliable_reinjection_service_limit_bytes,
+    split_flight_interval_by_ack,
 };
 use crate::protocol::frame::{
     normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_accounted_bytes,
@@ -33,9 +35,11 @@ use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::writer_boundary::ReliableWriterReadyGuard;
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
+use crate::runtime::stream::flight_overlap::{FlightIndexKey, ProductFlightIndex};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -129,6 +133,163 @@ pub(in crate::runtime) struct ResponseCreditFrontierProof {
 pub(in crate::runtime) struct ResponseDataAckRelease {
     /// Outputs with exact, unambiguous OriginalData progress.
     pub(in crate::runtime) path_progress_outputs: SmallVec<[ServerReinjectionOutputIdentity; 4]>,
+}
+
+/// One locked owner for ordered Product payloads and their overlap/index state.
+/// Read-only map access preserves the established recovery iteration API;
+/// structural changes go through publication, indexed ACK release, or clear.
+#[derive(Debug, Default)]
+pub(in crate::runtime::stream) struct ResponseProductFlightLedger {
+    flights: BTreeMap<u64, Vec<CarrierPathFlight>>,
+    overlap: ProductFlightIndex,
+}
+
+impl Deref for ResponseProductFlightLedger {
+    type Target = BTreeMap<u64, Vec<CarrierPathFlight>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.flights
+    }
+}
+
+impl ResponseProductFlightLedger {
+    pub(in crate::runtime::stream) fn publish(&mut self, start: u64, flight: CarrierPathFlight) {
+        let bucket = self.flights.entry(start).or_default();
+        let order = bucket.len();
+        self.overlap
+            .publish(FlightIndexKey { start, order }, flight.end);
+        bucket.push(flight);
+    }
+
+    pub(in crate::runtime::stream) fn release(
+        &mut self,
+        ranges: &[OffsetRange],
+    ) -> Vec<(u64, CarrierPathReleasedFlight)> {
+        release_indexed_carrier_path_flight_ranges(&mut self.flights, &mut self.overlap, ranges)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::stream) fn retained_geometry_for_test(
+        &self,
+    ) -> Vec<(u64, u64, usize, CarrierWorkKind)> {
+        self.flights
+            .iter()
+            .flat_map(|(&start, entries)| {
+                entries
+                    .iter()
+                    .map(move |flight| (start, flight.end, flight.bytes, flight.kind))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::stream) fn overlap_layout_for_test() -> (usize, usize, usize, usize) {
+        ProductFlightIndex::layout_for_test()
+    }
+
+    pub(super) fn invalidate_evidence(&mut self, key: CarrierPathKey, incarnation: u64) {
+        for flight in self
+            .flights
+            .values_mut()
+            .flatten()
+            .filter(|flight| flight.key == key && flight.output_incarnation == incarnation)
+        {
+            flight.evidence_eligible = false;
+        }
+    }
+
+    fn tighten_original_recovery_timing(
+        &mut self,
+        key: CarrierPathKey,
+        incarnation: u64,
+        sent_at: Instant,
+        assignment_range: OffsetRange,
+        timing: ReliableDataAckGapTiming,
+    ) {
+        for flight in self
+            .flights
+            .range_mut(assignment_range.start..assignment_range.end)
+            .flat_map(|(_, entries)| entries)
+            .filter(|flight| {
+                flight.kind.is_original_transmission()
+                    && flight.key == key
+                    && flight.output_incarnation == incarnation
+                    && flight.sent_at == sent_at
+                    && flight.assignment_range == assignment_range
+            })
+        {
+            flight.original_recovery_timing = Some(timing);
+            flight.owner_fallback_deadline = Some(timing.fallback_at);
+        }
+    }
+
+    fn tighten_owner_fallback_deadline(
+        &mut self,
+        start: u64,
+        key: CarrierPathKey,
+        incarnation: u64,
+        sent_at: Instant,
+        deadline: Instant,
+    ) {
+        if let Some(entries) = self.flights.get_mut(&start) {
+            for flight in entries.iter_mut().filter(|flight| {
+                flight.kind.is_original_transmission()
+                    && flight.key == key
+                    && flight.output_incarnation == incarnation
+                    && flight.sent_at == sent_at
+            }) {
+                flight.owner_fallback_deadline = Some(
+                    flight
+                        .owner_fallback_deadline
+                        .map_or(deadline, |current| current.min(deadline)),
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn extend_for_test(
+        &mut self,
+        records: impl IntoIterator<Item = (u64, Vec<CarrierPathFlight>)>,
+    ) {
+        for (start, flights) in records {
+            for flight in flights {
+                self.publish(start, flight);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_reinjection_suppression_for_test(&mut self) {
+        for flight in self.flights.values_mut().flatten() {
+            if flight.kind == CarrierWorkKind::ReinjectedData {
+                flight.reinjection_suppression_deadline = Some(Instant::now());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn age_reinjected_flights_for_test(&mut self, age: Duration) {
+        let sent_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        for flight in self.flights.values_mut().flatten() {
+            if flight.kind == CarrierWorkKind::ReinjectedData {
+                flight.sent_at = sent_at;
+                flight.reinjection_suppression_deadline = flight
+                    .reinjection_suppression_deadline
+                    .and_then(|deadline| deadline.checked_sub(age));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn age_original_flights_for_test(&mut self, age: Duration) {
+        let sent_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        for flight in self.flights.values_mut().flatten() {
+            if flight.kind == CarrierWorkKind::OriginalData {
+                flight.sent_at = sent_at;
+            }
+        }
+    }
 }
 
 /// Current retained head and the contiguous part whose assignments are all due.
@@ -1066,7 +1227,7 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        let released = release_carrier_path_flight_ranges(&mut flights, ranges);
+        let released = flights.release(ranges);
         if released.is_empty() {
             drop(flights);
             let ordering_update = self
@@ -1286,23 +1447,24 @@ impl ResponseStreamBinding {
         self.flights
             .lock()
             .expect("server reliable stream flight lock")
-            .entry(offset)
-            .or_default()
-            .push(CarrierPathFlight {
-                key,
-                output_incarnation,
-                configured_slot: Some(configured_slot),
-                end,
-                bytes,
-                sent_at: Instant::now(),
-                kind: CarrierWorkKind::OriginalData,
-                owner_fallback_deadline: None,
-                assignment_range: OffsetRange { start: offset, end },
-                original_recovery_timing: None,
-                evidence_eligible,
-                qualification_receipt,
-                reinjection_suppression_deadline: None,
-            });
+            .publish(
+                offset,
+                CarrierPathFlight {
+                    key,
+                    output_incarnation,
+                    configured_slot: Some(configured_slot),
+                    end,
+                    bytes,
+                    sent_at: Instant::now(),
+                    kind: CarrierWorkKind::OriginalData,
+                    owner_fallback_deadline: None,
+                    assignment_range: OffsetRange { start: offset, end },
+                    original_recovery_timing: None,
+                    evidence_eligible,
+                    qualification_receipt,
+                    reinjection_suppression_deadline: None,
+                },
+            );
         // Keep path counters and the exact range ledger in one published model
         // generation so a concurrent measurement plan cannot mix the views.
         self.response_model_generation
@@ -1608,37 +1770,18 @@ impl ResponseStreamBinding {
 
     #[cfg(test)]
     pub(in crate::runtime) fn age_reinjected_flights_for_test(&self, age: Duration) {
-        let sent_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-        let mut flights = self
-            .flights
+        self.flights
             .lock()
-            .expect("server reliable stream flight lock");
-        for path_flights in flights.values_mut() {
-            for flight in path_flights {
-                if flight.kind == CarrierWorkKind::ReinjectedData {
-                    flight.sent_at = sent_at;
-                    flight.reinjection_suppression_deadline = flight
-                        .reinjection_suppression_deadline
-                        .and_then(|deadline| deadline.checked_sub(age));
-                }
-            }
-        }
+            .expect("server reliable stream flight lock")
+            .age_reinjected_flights_for_test(age);
     }
 
     #[cfg(test)]
     pub(in crate::runtime) fn age_original_flights_for_test(&self, age: Duration) {
-        let sent_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-        let mut flights = self
-            .flights
+        self.flights
             .lock()
-            .expect("server reliable stream flight lock");
-        for path_flights in flights.values_mut() {
-            for flight in path_flights {
-                if flight.kind == CarrierWorkKind::OriginalData {
-                    flight.sent_at = sent_at;
-                }
-            }
-        }
+            .expect("server reliable stream flight lock")
+            .age_original_flights_for_test(age);
     }
 
     #[cfg(test)]
@@ -1884,23 +2027,26 @@ impl ResponseStreamBinding {
                 }
             }
         }
-        flights.entry(offset).or_default().push(CarrierPathFlight {
-            key,
-            output_incarnation: recorded_incarnation,
-            configured_slot: Some(configured_slot),
-            end,
-            bytes,
-            sent_at: reinjection_suppression
-                .map(|(accepted_at, _)| accepted_at)
-                .unwrap_or_else(Instant::now),
-            kind,
-            owner_fallback_deadline: None,
-            assignment_range: range,
-            original_recovery_timing: None,
-            evidence_eligible,
-            qualification_receipt,
-            reinjection_suppression_deadline,
-        });
+        flights.publish(
+            offset,
+            CarrierPathFlight {
+                key,
+                output_incarnation: recorded_incarnation,
+                configured_slot: Some(configured_slot),
+                end,
+                bytes,
+                sent_at: reinjection_suppression
+                    .map(|(accepted_at, _)| accepted_at)
+                    .unwrap_or_else(Instant::now),
+                kind,
+                owner_fallback_deadline: None,
+                assignment_range: range,
+                original_recovery_timing: None,
+                evidence_eligible,
+                qualification_receipt,
+                reinjection_suppression_deadline,
+            },
+        );
         // The generation becomes visible only after the matching exact range.
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
@@ -1916,13 +2062,7 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        for path_flights in flights.values_mut() {
-            for flight in path_flights.iter_mut().filter(|flight| {
-                flight.key == key && flight.output_incarnation == output_incarnation
-            }) {
-                flight.evidence_eligible = false;
-            }
-        }
+        flights.invalidate_evidence(key, output_incarnation);
         drop(flights);
         let mut ordering = self
             .ack_ordering
@@ -2162,21 +2302,13 @@ impl ResponseStreamBinding {
             if let Some(previous) = assignment.owner_fallback_deadline {
                 retained.fallback_at = retained.fallback_at.min(previous);
             }
-            for entries in flights
-                .range_mut(assignment.assignment_range.start..assignment.assignment_range.end)
-                .map(|(_, entries)| entries)
-            {
-                for sibling in entries.iter_mut().filter(|flight| {
-                    flight.kind.is_original_transmission()
-                        && flight.key == assignment.key
-                        && flight.output_incarnation == assignment.output_incarnation
-                        && flight.sent_at == assignment.sent_at
-                        && flight.assignment_range == assignment.assignment_range
-                }) {
-                    sibling.original_recovery_timing = Some(retained);
-                    sibling.owner_fallback_deadline = Some(retained.fallback_at);
-                }
-            }
+            flights.tighten_original_recovery_timing(
+                assignment.key,
+                assignment.output_incarnation,
+                assignment.sent_at,
+                assignment.assignment_range,
+                retained,
+            );
             aggregate = Some(match aggregate {
                 Some(previous) => ReliableDataAckGapTiming {
                     assignment_at: previous.assignment_at.max(retained.assignment_at),
@@ -2236,7 +2368,8 @@ impl ResponseStreamBinding {
         let mut spans = Vec::new();
         let mut head_deadline = None::<Instant>;
         let mut mature_end = range.end;
-        for (&start, path_flights) in flights.iter_mut() {
+        let mut fallback_deadline_updates = Vec::new();
+        for (&start, path_flights) in flights.iter() {
             for flight in path_flights {
                 let identity = ServerReinjectionOutputIdentity {
                     key: flight.key,
@@ -2253,7 +2386,15 @@ impl ResponseStreamBinding {
                     let deadline = flight
                         .owner_fallback_deadline
                         .map_or(observed_deadline, |current| current.min(observed_deadline));
-                    flight.owner_fallback_deadline = Some(deadline);
+                    if flight.owner_fallback_deadline != Some(deadline) {
+                        fallback_deadline_updates.push((
+                            start,
+                            flight.key,
+                            flight.output_incarnation,
+                            flight.sent_at,
+                            deadline,
+                        ));
+                    }
                     if overlaps {
                         if start <= range.start {
                             head_deadline = Some(
@@ -2279,6 +2420,9 @@ impl ResponseStreamBinding {
                     });
                 }
             }
+        }
+        for (start, key, incarnation, sent_at, deadline) in fallback_deadline_updates {
+            flights.tighten_owner_fallback_deadline(start, key, incarnation, sent_at, deadline);
         }
         drop(flights);
         drop(outputs);
@@ -2519,12 +2663,168 @@ impl ResponseStreamBinding {
     }
 }
 
-/// Releases exact Product flight ranges covered by normalized, ordered,
-/// half-open ACK ranges.
-/// Production ledgers contain only checked nonempty flights with
-/// `flight.end > start` and `flight.bytes == flight.end - start`; an optional
-/// qualification receipt is contained within that flight. The no-hit fast
-/// path relies on those producer invariants and leaves untouched records alone.
+/// Indexed Product ACK release. Every returned path-evidence segment uses the
+/// same pre-ACK ambiguous union, while U/M and exact interval identities are
+/// committed with retained fragment storage under the owner's lock.
+fn release_indexed_carrier_path_flight_ranges(
+    flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
+    overlap: &mut ProductFlightIndex,
+    ranges: &[OffsetRange],
+) -> Vec<(u64, CarrierPathReleasedFlight)> {
+    if ranges.is_empty() || flights.is_empty() {
+        return Vec::new();
+    }
+    let ambiguous_before_ack = overlap
+        .ambiguous_intersections_for_ack(ranges)
+        .into_iter()
+        .map(|range| (range.start, range.end))
+        .collect::<Vec<_>>();
+    let full_release = overlap.ack_covers_all(ranges);
+    let mut original = Vec::<(u64, usize, CarrierPathFlight)>::new();
+    let mut touched = BTreeMap::<u64, (usize, Vec<Option<CarrierPathFlight>>)>::new();
+    if full_release {
+        original = std::mem::take(flights)
+            .into_iter()
+            .flat_map(|(start, entries)| {
+                entries
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(order, flight)| (start, order, flight))
+            })
+            .collect();
+        overlap.clear();
+    } else {
+        let keys = overlap.intersecting(ranges);
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let mut by_start = BTreeMap::<u64, Vec<usize>>::new();
+        for key in keys {
+            by_start.entry(key.start).or_default().push(key.order);
+        }
+        for (start, orders) in by_start {
+            let bucket = flights
+                .remove(&start)
+                .expect("overlap-index identity has a response payload bucket");
+            let old_len = bucket.len();
+            let mut order_cursor = 0;
+            let mut slots = Vec::with_capacity(old_len);
+            for (order, flight) in bucket.into_iter().enumerate() {
+                if orders.get(order_cursor) == Some(&order) {
+                    original.push((start, order, flight));
+                    slots.push(None);
+                    order_cursor += 1;
+                } else {
+                    slots.push(Some(flight));
+                }
+            }
+            assert_eq!(
+                order_cursor,
+                orders.len(),
+                "response overlap bucket identities match payloads"
+            );
+            touched.insert(start, (old_len, slots));
+        }
+    }
+
+    let mut released = Vec::new();
+    let mut staged_right = BTreeMap::<u64, Vec<CarrierPathFlight>>::new();
+    for (start, order, original_flight) in original {
+        let split = split_flight_interval_by_ack(start, original_flight.end, ranges);
+        for (acked_start, acked_end, is_ambiguous) in
+            split.acked.into_iter().flat_map(|(part_start, part_end)| {
+                flight_evidence_segments(part_start, part_end, &ambiguous_before_ack)
+            })
+        {
+            let bytes = flight_interval_bytes(acked_start, acked_end);
+            if bytes == 0 {
+                continue;
+            }
+            let qualification_ambiguous_ranges = if is_ambiguous {
+                SmallVec::from_slice(&[OffsetRange {
+                    start: acked_start,
+                    end: acked_end,
+                }])
+            } else {
+                SmallVec::new()
+            };
+            released.push((
+                acked_start,
+                CarrierPathReleasedFlight {
+                    flight: CarrierPathFlight {
+                        end: acked_end,
+                        bytes,
+                        qualification_receipt: original_flight.qualification_receipt.and_then(
+                            |receipt| {
+                                receipt.intersect(OffsetRange {
+                                    start: acked_start,
+                                    end: acked_end,
+                                })
+                            },
+                        ),
+                        ..original_flight
+                    },
+                    path_proving: original_flight.evidence_eligible
+                        && original_flight.kind.is_original_transmission()
+                        && !is_ambiguous,
+                    qualification_ambiguous_ranges,
+                },
+            ));
+        }
+        for (retained_start, retained_end) in split.retained {
+            let bytes = flight_interval_bytes(retained_start, retained_end);
+            if bytes == 0 {
+                continue;
+            }
+            let fragment = CarrierPathFlight {
+                end: retained_end,
+                bytes,
+                qualification_receipt: original_flight.qualification_receipt.and_then(|receipt| {
+                    receipt.intersect(OffsetRange {
+                        start: retained_start,
+                        end: retained_end,
+                    })
+                }),
+                ..original_flight
+            };
+            if retained_start == start && !full_release {
+                touched
+                    .get_mut(&start)
+                    .expect("source response bucket was selected")
+                    .1[order] = Some(fragment);
+            } else {
+                staged_right
+                    .entry(retained_start)
+                    .or_default()
+                    .push(fragment);
+            }
+        }
+    }
+
+    for (start, (old_len, slots)) in touched {
+        let bucket = slots.into_iter().flatten().collect::<Vec<_>>();
+        overlap.rebuild_bucket(start, old_len, bucket.iter().map(|flight| flight.end));
+        if !bucket.is_empty() {
+            flights.insert(start, bucket);
+        }
+    }
+    // A right fragment from a lower source key precedes old destination
+    // siblings, even when that collision lies before a later ACK-mask range.
+    for (start, mut fragments) in staged_right {
+        let existing = flights.remove(&start).unwrap_or_default();
+        let old_len = existing.len();
+        fragments.extend(existing);
+        overlap.rebuild_bucket(start, old_len, fragments.iter().map(|flight| flight.end));
+        flights.insert(start, fragments);
+    }
+    if !full_release {
+        overlap.acknowledge(ranges);
+    }
+    released
+}
+
+/// Old ordered-map release retained as a differential oracle for tests.
+#[cfg(test)]
 pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
     flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
     ranges: &[OffsetRange],

@@ -10,7 +10,9 @@ use crate::model::capacity::{
 use crate::mux::MuxLimits;
 use crate::protocol::OffsetRange;
 use crate::scheduler::{PathSnapshot, TrafficClass};
-use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::Instant;
 
@@ -377,6 +379,7 @@ pub(crate) fn reliable_live_gap_reinjection_authority(
 
 /// ACK release must use identical range math in both product directions so
 /// request and response ledgers cannot disagree about path-proving bytes.
+#[cfg(test)]
 pub(crate) fn ambiguous_flight_intervals(
     flights: impl IntoIterator<Item = (u64, u64)>,
 ) -> Vec<(u64, u64)> {

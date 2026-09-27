@@ -1,8 +1,8 @@
 use super::feedback::StreamFeedbackPublication;
 use super::response::{
     CarrierPathFlight, ResponseDataAckRecoveryCandidate, ResponseDataAckRelease,
-    ResponseStreamBinding, product_flights_have_recent_reinjection_overlap,
-    release_carrier_path_flight_ranges,
+    ResponseProductFlightLedger, ResponseStreamBinding,
+    product_flights_have_recent_reinjection_overlap,
 };
 use crate::model::capacity::{
     PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS, ReliableOriginalDataOutput,
@@ -46,7 +46,7 @@ use crate::runtime::path::{CarrierNativeWindowSample, OpenedReliableCarrierStrea
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use smallvec::SmallVec;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -1041,7 +1041,7 @@ struct FixedReliablePathModel {
     product_rate_epoch: Option<FixedProductRateEpoch>,
     srtt_ms: Option<f64>,
     delivery_samples: u32,
-    flights: BTreeMap<u64, Vec<CarrierPathFlight>>,
+    flights: ResponseProductFlightLedger,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1670,18 +1670,15 @@ impl FixedReliablePathOutput {
         let accepted_copy_deadline = suppression_interval
             .and_then(|interval| accepted_at.checked_add(interval))
             .or(suppression_interval.map(|_| accepted_at));
-        model
-            .flights
-            .entry(offset)
-            .or_default()
-            .push(CarrierPathFlight::fixed_output(
-                self.key,
-                end,
-                bytes,
-                accepted_at,
-                kind,
-                suppression_interval,
-            ));
+        let flight = CarrierPathFlight::fixed_output(
+            self.key,
+            end,
+            bytes,
+            accepted_at,
+            kind,
+            suppression_interval,
+        );
+        model.flights.publish(offset, flight);
         accepted_copy_deadline
     }
 
@@ -1694,7 +1691,7 @@ impl FixedReliablePathOutput {
             return;
         }
         let mut model = self.model.lock().expect("fixed reliable path model lock");
-        let released = release_carrier_path_flight_ranges(&mut model.flights, ranges);
+        let released = model.flights.release(ranges);
         if released.is_empty() {
             return;
         }

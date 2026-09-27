@@ -181,6 +181,7 @@ fn assert_ack_release_matches_reference(
     let mut expected = initial.clone();
     let expected_released =
         super::release_carrier_path_flight_ranges_reference(&mut expected, ranges);
+    let indexed_initial = initial.clone();
     let mut actual = initial;
     let actual_released = release_carrier_path_flight_ranges(&mut actual, ranges);
     assert_eq!(
@@ -193,6 +194,260 @@ fn assert_ack_release_matches_reference(
         ledger_state(&expected),
         "retained ledger differs for {context}"
     );
+
+    let mut indexed = ResponseProductFlightLedger::default();
+    indexed.extend_for_test(indexed_initial);
+    let indexed_released = indexed.release(ranges);
+    assert_eq!(
+        release_state(&indexed_released),
+        release_state(&expected_released),
+        "indexed release differs for {context}"
+    );
+    assert_eq!(
+        ledger_state(&indexed),
+        ledger_state(&expected),
+        "indexed retained ledger differs for {context}"
+    );
+}
+
+fn lifecycle_records(
+    count: usize,
+    duplicate_each: bool,
+    long_crossing_flight: bool,
+    now: Instant,
+) -> Vec<(u64, CarrierPathFlight)> {
+    let end = (count as u64).saturating_mul(4).saturating_add(1);
+    let mut records = Vec::with_capacity(
+        count
+            .saturating_mul(1 + usize::from(duplicate_each))
+            .saturating_add(usize::from(long_crossing_flight)),
+    );
+    if long_crossing_flight {
+        let mut crossing = flight(
+            key(UnderlayProtocol::Tcp, 0),
+            end,
+            end as usize,
+            CarrierWorkKind::OriginalData,
+        );
+        crossing.sent_at = now;
+        crossing.assignment_range = range(0, end);
+        records.push((0, crossing));
+    }
+    for index in 0..count {
+        let start = (index as u64) * 4;
+        let mut original = flight(
+            key(UnderlayProtocol::Tcp, (index % 251) as u16),
+            start + 1,
+            1,
+            CarrierWorkKind::OriginalData,
+        );
+        original.sent_at = now;
+        original.assignment_range = range(start, start + 1);
+        records.push((start, original));
+        if duplicate_each {
+            let mut duplicate = flight(
+                key(UnderlayProtocol::Udp, (index % 251) as u16),
+                start + 1,
+                1,
+                CarrierWorkKind::ReinjectedData,
+            );
+            duplicate.sent_at = now;
+            duplicate.assignment_range = range(start, start + 1);
+            records.push((start, duplicate));
+        }
+    }
+    records
+}
+
+fn time_reference_lifecycle(
+    records: &[(u64, CarrierPathFlight)],
+    ranges: &[OffsetRange],
+    runs: usize,
+) -> Duration {
+    let started = Instant::now();
+    let mut result_bytes = 0usize;
+    for _ in 0..runs {
+        let mut flights = BTreeMap::<u64, Vec<CarrierPathFlight>>::new();
+        for &(start, flight) in records {
+            flights.entry(start).or_default().push(flight);
+        }
+        result_bytes = result_bytes.saturating_add(
+            black_box(release_carrier_path_flight_ranges(&mut flights, ranges))
+                .iter()
+                .map(|(_, release)| release.flight.bytes)
+                .sum::<usize>(),
+        );
+        black_box(flights);
+    }
+    black_box(result_bytes);
+    started.elapsed()
+}
+
+fn time_indexed_lifecycle(
+    records: &[(u64, CarrierPathFlight)],
+    ranges: &[OffsetRange],
+    runs: usize,
+) -> Duration {
+    let started = Instant::now();
+    let mut result_bytes = 0usize;
+    for _ in 0..runs {
+        let mut flights = ResponseProductFlightLedger::default();
+        for &(start, flight) in records {
+            flights.publish(start, flight);
+        }
+        result_bytes = result_bytes.saturating_add(
+            black_box(flights.release(ranges))
+                .iter()
+                .map(|(_, release)| release.flight.bytes)
+                .sum::<usize>(),
+        );
+        black_box(flights);
+    }
+    black_box(result_bytes);
+    started.elapsed()
+}
+
+fn time_reference_cumulative_refill(
+    records: &[(u64, CarrierPathFlight)],
+    retained: usize,
+    updates: usize,
+    runs: usize,
+) -> Duration {
+    let started = Instant::now();
+    let mut result_bytes = 0usize;
+    for _ in 0..runs {
+        let mut flights = BTreeMap::<u64, Vec<CarrierPathFlight>>::new();
+        for &(start, flight) in records.iter().take(retained) {
+            flights.entry(start).or_default().push(flight);
+        }
+        for (step, &(start, flight)) in records[retained..retained + updates].iter().enumerate() {
+            flights.entry(start).or_default().push(flight);
+            let ack_end = records[step].0 + 1;
+            result_bytes = result_bytes.saturating_add(
+                black_box(release_carrier_path_flight_ranges(
+                    &mut flights,
+                    &[range(0, ack_end)],
+                ))
+                .iter()
+                .map(|(_, release)| release.flight.bytes)
+                .sum::<usize>(),
+            );
+            debug_assert_eq!(flights.values().map(Vec::len).sum::<usize>(), retained);
+        }
+        black_box(flights);
+    }
+    black_box(result_bytes);
+    started.elapsed()
+}
+
+fn time_indexed_cumulative_refill(
+    records: &[(u64, CarrierPathFlight)],
+    retained: usize,
+    updates: usize,
+    runs: usize,
+) -> Duration {
+    let started = Instant::now();
+    let mut result_bytes = 0usize;
+    for _ in 0..runs {
+        let mut flights = ResponseProductFlightLedger::default();
+        for &(start, flight) in records.iter().take(retained) {
+            flights.publish(start, flight);
+        }
+        for (step, &(start, flight)) in records[retained..retained + updates].iter().enumerate() {
+            flights.publish(start, flight);
+            let ack_end = records[step].0 + 1;
+            result_bytes = result_bytes.saturating_add(
+                black_box(flights.release(&[range(0, ack_end)]))
+                    .iter()
+                    .map(|(_, release)| release.flight.bytes)
+                    .sum::<usize>(),
+            );
+            debug_assert_eq!(flights.values().map(Vec::len).sum::<usize>(), retained);
+        }
+        black_box(flights);
+    }
+    black_box(result_bytes);
+    started.elapsed()
+}
+
+fn benchmark_cumulative_refill(name: &str, retained: usize, updates: usize, runs: usize) {
+    let now = Instant::now();
+    let records = lifecycle_records(retained + updates, false, false, now);
+    for round in 0..3 {
+        let (reference, indexed, order) = if round % 2 == 0 {
+            let reference = time_reference_cumulative_refill(&records, retained, updates, runs);
+            let indexed = time_indexed_cumulative_refill(&records, retained, updates, runs);
+            (reference, indexed, "reference-first")
+        } else {
+            let indexed = time_indexed_cumulative_refill(&records, retained, updates, runs);
+            let reference = time_reference_cumulative_refill(&records, retained, updates, runs);
+            (reference, indexed, "indexed-first")
+        };
+        eprintln!(
+            "lifecycle: case={name} retained_tail={retained} cumulative_ack_refills={updates} runs={runs} order={order} reference_total_ms={:.3} indexed_total_ms={:.3} ratio={:.3}",
+            reference.as_secs_f64() * 1_000.0,
+            indexed.as_secs_f64() * 1_000.0,
+            indexed.as_secs_f64() / reference.as_secs_f64(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual append+release lifecycle and structural memory comparison"]
+fn product_flight_indexed_lifecycle_cost_and_memory() {
+    let (index_owner, index_node, union_header, key_bytes) =
+        ResponseProductFlightLedger::overlap_layout_for_test();
+    eprintln!(
+        "ledger-layout: flight_payload={}B btree_map_header={}B vec_header={}B index_owner={}B union_headers={}B index_key={}B avl_node={}B; one Box<Node> allocation per retained flight plus BTreeMap U/M nodes per disjoint run",
+        std::mem::size_of::<CarrierPathFlight>(),
+        std::mem::size_of::<BTreeMap<u64, Vec<CarrierPathFlight>>>(),
+        std::mem::size_of::<Vec<CarrierPathFlight>>(),
+        index_owner,
+        union_header,
+        key_bytes,
+        index_node,
+    );
+
+    let scenarios = [
+        ("small-full-1", 1, false, false, 20_000usize, true),
+        ("small-full-8", 8, false, false, 20_000, true),
+        ("all-copy-full-4096", 4_096, true, false, 8, true),
+        ("large-late-sparse-100k", 100_000, false, false, 3, false),
+        ("large-crossing-late-100k", 100_000, false, true, 3, false),
+    ];
+    for (name, count, copies, crossing, runs, full) in scenarios {
+        let now = Instant::now();
+        let records = lifecycle_records(count, copies, crossing, now);
+        let final_end = (count as u64).saturating_mul(4).saturating_add(1);
+        let ack = if full {
+            range(0, final_end)
+        } else {
+            let start = (count.saturating_sub(1) as u64) * 4;
+            range(start, start + 1)
+        };
+        let ranges = [ack];
+        for round in 0..3 {
+            let (reference, indexed, order) = if round % 2 == 0 {
+                let reference = time_reference_lifecycle(&records, &ranges, runs);
+                let indexed = time_indexed_lifecycle(&records, &ranges, runs);
+                (reference, indexed, "reference-first")
+            } else {
+                let indexed = time_indexed_lifecycle(&records, &ranges, runs);
+                let reference = time_reference_lifecycle(&records, &ranges, runs);
+                (reference, indexed, "indexed-first")
+            };
+            eprintln!(
+                "lifecycle: case={name} flights={} runs={runs} order={order} reference_total_ms={:.3} indexed_total_ms={:.3} ratio={:.3} indexed_extra_node_struct_bytes={}B",
+                records.len(),
+                reference.as_secs_f64() * 1_000.0,
+                indexed.as_secs_f64() * 1_000.0,
+                indexed.as_secs_f64() / reference.as_secs_f64(),
+                records.len().saturating_mul(index_node),
+            );
+        }
+    }
+    benchmark_cumulative_refill("steady-cumulative-retained-8", 8, 2_048, 2);
+    benchmark_cumulative_refill("steady-cumulative-retained-512", 512, 2_048, 2);
 }
 
 fn output_identity(
@@ -1892,15 +2147,19 @@ fn lower_debt_projection_matches_ordered_reference_for_owner_and_targets() {
     tied_flight.output_incarnation = first_incarnation;
     let mut reinjection_only = flight(third, 17, 17, CarrierWorkKind::ReinjectedData);
     reinjection_only.output_incarnation = third_incarnation;
-    binding.flights.lock().expect("test flights").extend([
-        (
-            0,
-            vec![first_original, latest_original, trailing_reinjection],
-        ),
-        (8, vec![same_key_replacement]),
-        (10, vec![tied_flight]),
-        (16, vec![reinjection_only]),
-    ]);
+    binding
+        .flights
+        .lock()
+        .expect("test flights")
+        .extend_for_test([
+            (
+                0,
+                vec![first_original, latest_original, trailing_reinjection],
+            ),
+            (8, vec![same_key_replacement]),
+            (10, vec![tied_flight]),
+            (16, vec![reinjection_only]),
+        ]);
 
     let tied_ack = CarrierPathAckedHole {
         key: third,
@@ -2066,7 +2325,7 @@ fn response_debt_projection_release_cost_fixture() {
                         CarrierWorkKind::OriginalData,
                     );
                     original.output_incarnation = incarnation;
-                    flights.insert(start, vec![original]);
+                    flights.publish(start, original);
                 } else {
                     ack_ordering.acked_holes.insert(
                         start,

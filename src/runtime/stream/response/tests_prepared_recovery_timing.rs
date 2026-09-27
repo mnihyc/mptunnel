@@ -98,13 +98,11 @@ fn completion_copy_opportunity_survives_expiry_detach_and_sparse_ack() {
         })
     );
     // Expiry restores normal recovery only. Detach does not erase wire debt.
-    for entries in binding.flights.lock().unwrap().values_mut() {
-        for flight in entries {
-            if flight.kind == CarrierWorkKind::ReinjectedData {
-                flight.reinjection_suppression_deadline = Some(Instant::now());
-            }
-        }
-    }
+    binding
+        .flights
+        .lock()
+        .unwrap()
+        .expire_reinjection_suppression_for_test();
     binding.detach(alternate, &commands);
     assert!(
         binding

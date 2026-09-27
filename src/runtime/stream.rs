@@ -5,6 +5,7 @@
 //! intents; carrier paths never own product byte ranges.
 
 mod feedback;
+mod flight_overlap;
 mod handle;
 mod registry;
 pub(in crate::runtime) mod request;

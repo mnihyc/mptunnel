@@ -38,10 +38,8 @@ pub(in crate::runtime) use attachment::{
 };
 use attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
 use delivery::ResponseAckOrderingState;
-pub(super) use delivery::{
-    CarrierPathFlight, product_flights_have_recent_reinjection_overlap,
-    release_carrier_path_flight_ranges,
-};
+pub(in crate::runtime::stream) use delivery::ResponseProductFlightLedger;
+pub(super) use delivery::{CarrierPathFlight, product_flights_have_recent_reinjection_overlap};
 pub(in crate::runtime) use delivery::{
     ResponseCreditFrontierProof, ResponseDataAckRecoveryCandidate, ResponseDataAckRelease,
 };
@@ -51,7 +49,6 @@ pub(in crate::runtime) use prepared::{ResponsePreparedNativeInputs, ResponsePrep
 pub(in crate::runtime) use session::{ServerSessionRegistration, ServerSessionTracker};
 pub(in crate::runtime) use startup::ResponseStartupFinalOutcome;
 pub(super) use startup::validate_return_plan_shape;
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
@@ -105,7 +102,7 @@ pub(in crate::runtime) struct ResponseStreamBinding {
     // return attachment without inheriting that ingress writer's head-of-line
     // delay.
     request_requalification_ack: Mutex<requalification::RequestRequalificationAckPublication>,
-    flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
+    flights: Mutex<ResponseProductFlightLedger>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
     version: watch::Sender<u64>,
 }
@@ -306,7 +303,7 @@ impl ResponseStreamBinding {
                 path_instance_id,
             })),
             request_requalification_ack: Mutex::new(Default::default()),
-            flights: Mutex::new(BTreeMap::new()),
+            flights: Mutex::new(ResponseProductFlightLedger::default()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
             version,
         }))

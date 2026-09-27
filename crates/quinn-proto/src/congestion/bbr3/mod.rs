@@ -132,6 +132,15 @@ const MAX_LONG_TERM_PROBE_UP_ROUNDS: u32 = 30;
 /// convergence <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.3.3.8.2>
 const RENO_ROUNDS_BOUNDS: [u64; 2] = [62, 63];
 
+/// Keep the original scan for small flights, where its simple contiguous pass is cheap. Once a
+/// store crosses this physical-record threshold, ACK retirement switches to packed epochs.
+const PACKET_EPOCH_UPGRADE_RECORDS: usize = 256;
+/// A byte epoch cannot distinguish a tombstone after a full wrap. Sweep before the same tag can
+/// be reused; 128 leaves a full half-range of separation for every logically dead tag.
+const PACKET_EPOCH_SWEEP_INTERVAL: u16 = 128;
+/// Bound interior tombstones to less than one eighth of each packet-number-space deque.
+const PACKET_EPOCH_DEAD_DENOMINATOR: usize = 8;
+
 /// minimum amount of time to wait before probing again <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.5.3-5>
 const MIN_PROBE_WAIT_MS: u64 = 2000;
 
@@ -238,8 +247,9 @@ struct BbrPacket {
     /// used to flag acknowledgement within our VecDeque, a packet can be flagged lost after having been flagged acknowledged
     /// hence the necessity of this flag being set before we remove it from packets.
     acknowledged: bool,
-    /// once a packet has been acknowledged on a given round it is marked for removal on the next round.
-    stale: bool,
+    /// Small mode uses 0/1 as the original stale flag. Packed mode uses this same byte as the ACK
+    /// epoch tag, preserving the packet record's size.
+    stale: u8,
     /// Logically absent after terminal loss; interior storage is compacted at loss-batch end.
     /// Unlike `stale`, this snapshot must not supply same-ACK ECN or other feedback evidence.
     retired: bool,
@@ -551,6 +561,22 @@ pub struct Bbr3 {
     packets: [VecDeque<BbrPacket>; 3],
     /// Spaces containing interior loss tombstones awaiting the existing batch-end callback.
     packet_retirement_pending: [bool; 3],
+    /// Large-flight ACK snapshot lifetime. `epoch` is global across all packet-number spaces;
+    /// tags equal to `epoch` or `epoch + 1` remain visible for ECN and current-ACK processing.
+    packet_epochs_enabled: bool,
+    packet_epoch: u8,
+    packet_epoch_since_sweep: u16,
+    packet_epoch_current: [usize; 3],
+    packet_epoch_previous: [usize; 3],
+    packet_epoch_dead: [usize; 3],
+    #[cfg(test)]
+    packet_epochs_disabled_for_test: bool,
+    #[cfg(test)]
+    packet_cleanup_reference_visits: usize,
+    #[cfg(test)]
+    packet_epoch_cleanup_visits: usize,
+    #[cfg(test)]
+    packet_epoch_migration_visits: usize,
     /// equivalent to RS: Per-ACK Rate Sample State <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.2>
     rs: Option<BbrRateSample>,
     /// True while per-packet delivery callbacks are accumulating the rate sample for one ACK.
@@ -835,6 +861,20 @@ impl Bbr3 {
             latest_completed_bandwidth_sample: None,
             packets: Default::default(),
             packet_retirement_pending: [false; 3],
+            packet_epochs_enabled: false,
+            packet_epoch: 0,
+            packet_epoch_since_sweep: 0,
+            packet_epoch_current: [0; 3],
+            packet_epoch_previous: [0; 3],
+            packet_epoch_dead: [0; 3],
+            #[cfg(test)]
+            packet_epochs_disabled_for_test: false,
+            #[cfg(test)]
+            packet_cleanup_reference_visits: 0,
+            #[cfg(test)]
+            packet_epoch_cleanup_visits: 0,
+            #[cfg(test)]
+            packet_epoch_migration_visits: 0,
             rounds_since_bw_probe: 0,
             bw_probe_wait: Duration::ZERO,
             bw_probe_up_rounds: 0,
@@ -2686,43 +2726,211 @@ impl Bbr3 {
         false
     }
 
-    /// Terminal loss makes a snapshot unavailable immediately, even while its physical slot
-    /// remains in the sorted deque until this synchronous loss batch finishes.
+    fn packet_epoch_next(&self) -> u8 {
+        self.packet_epoch.wrapping_add(1)
+    }
+
+    fn packet_is_visible(&self, packet: &BbrPacket) -> bool {
+        if packet.retired {
+            return false;
+        }
+        !self.packet_epochs_enabled
+            || !packet.acknowledged
+            || packet.stale == self.packet_epoch
+            || packet.stale == self.packet_epoch_next()
+    }
+
+    #[cfg(test)]
+    fn packet_is_stale_snapshot(&self, packet: &BbrPacket) -> bool {
+        if self.packet_epochs_enabled {
+            packet.acknowledged && packet.stale == self.packet_epoch
+        } else {
+            packet.stale != 0
+        }
+    }
+
     fn packet_index(&self, space: SpaceId, packet_number: u64) -> Option<usize> {
         let packets = &self.packets[space as usize];
         packets
             .binary_search_by_key(&packet_number, |packet| packet.packet_number)
             .ok()
-            .filter(|&index| !packets[index].retired)
+            .filter(|&index| self.packet_is_visible(&packets[index]))
+    }
+
+    /// Convert the existing queues in place. The byte formerly used as a bool becomes the tag;
+    /// no second packet store or per-packet metadata allocation is created.
+    fn upgrade_packet_epochs(&mut self) {
+        debug_assert!(!self.packet_epochs_enabled);
+        #[cfg(test)]
+        {
+            self.packet_epoch_migration_visits +=
+                self.packets.iter().map(VecDeque::len).sum::<usize>();
+        }
+        self.packet_epochs_enabled = true;
+        self.packet_epoch = 0;
+        self.packet_epoch_since_sweep = 0;
+        self.packet_epoch_current = [0; 3];
+        self.packet_epoch_previous = [0; 3];
+        self.packet_epoch_dead = [0; 3];
+
+        let next = self.packet_epoch_next();
+        for (space, packets) in self.packets.iter_mut().enumerate() {
+            for packet in packets {
+                if packet.acknowledged {
+                    if packet.stale != 0 {
+                        packet.stale = self.packet_epoch;
+                        if !packet.retired {
+                            self.packet_epoch_previous[space] += 1;
+                        }
+                    } else {
+                        packet.stale = next;
+                        if !packet.retired {
+                            self.packet_epoch_current[space] += 1;
+                        }
+                    }
+                } else {
+                    packet.stale = 0;
+                }
+                if packet.retired {
+                    self.packet_epoch_dead[space] += 1;
+                }
+            }
+        }
+
+        for space in 0..self.packets.len() {
+            self.compact_packet_epoch_space(space, false);
+        }
+    }
+
+    fn packet_epoch_remove_authority(&mut self, space: usize, packet: BbrPacket) {
+        if !self.packet_epochs_enabled || !packet.acknowledged || packet.retired {
+            return;
+        }
+        if packet.stale == self.packet_epoch_next() {
+            self.packet_epoch_current[space] = self.packet_epoch_current[space]
+                .checked_sub(1)
+                .expect("current ACK epoch count must include every visible tagged packet");
+        } else {
+            debug_assert_eq!(packet.stale, self.packet_epoch);
+            self.packet_epoch_previous[space] = self.packet_epoch_previous[space]
+                .checked_sub(1)
+                .expect("previous ACK epoch count must include every visible tagged packet");
+        }
+    }
+
+    fn packet_epoch_absent(packet: &BbrPacket, epoch: u8, next: u8) -> bool {
+        packet.retired || (packet.acknowledged && packet.stale != epoch && packet.stale != next)
+    }
+
+    fn compact_packet_epoch_space(&mut self, space: usize, force: bool) {
+        let epoch = self.packet_epoch;
+        let next = self.packet_epoch_next();
+        let packets = &mut self.packets[space];
+        let dead = &mut self.packet_epoch_dead[space];
+
+        while packets
+            .front()
+            .is_some_and(|packet| Self::packet_epoch_absent(packet, epoch, next))
+        {
+            let _ = packets.pop_front();
+            *dead = dead.checked_sub(1).expect("front tombstone counted as dead");
+        }
+        while packets
+            .back()
+            .is_some_and(|packet| Self::packet_epoch_absent(packet, epoch, next))
+        {
+            let _ = packets.pop_back();
+            *dead = dead.checked_sub(1).expect("back tombstone counted as dead");
+        }
+
+        let threshold = packets.len() / PACKET_EPOCH_DEAD_DENOMINATOR
+            + usize::from(packets.len() % PACKET_EPOCH_DEAD_DENOMINATOR != 0);
+        if *dead != 0 && (force || *dead >= threshold) {
+            #[cfg(test)]
+            {
+                self.packet_epoch_cleanup_visits += packets.len();
+            }
+            packets.retain(|packet| !Self::packet_epoch_absent(packet, epoch, next));
+            *dead = 0;
+        }
+    }
+
+    fn maybe_demote_empty_packet_epochs(&mut self) {
+        if self.packet_epochs_enabled && self.packets.iter().all(VecDeque::is_empty) {
+            debug_assert_eq!(self.packet_epoch_current, [0; 3]);
+            debug_assert_eq!(self.packet_epoch_previous, [0; 3]);
+            debug_assert_eq!(self.packet_epoch_dead, [0; 3]);
+            // A pending bit only requests storage compaction at loss-batch end. If terminal
+            // endpoints or a density-triggered compaction already emptied every queue, there is
+            // no remaining work for that later callback.
+            self.packet_retirement_pending = [false; 3];
+            self.packet_epochs_enabled = false;
+            self.packet_epoch = 0;
+            self.packet_epoch_since_sweep = 0;
+            self.packet_epoch_current = [0; 3];
+            self.packet_epoch_previous = [0; 3];
+            self.packet_epoch_dead = [0; 3];
+        }
     }
 
     fn retire_packet_snapshot(&mut self, space: SpaceId, index: usize, actual_loss: bool) {
-        let packets = &mut self.packets[space as usize];
-        if index == 0 {
-            packets.pop_front();
-        } else if index + 1 == packets.len() {
-            packets.pop_back();
-        } else if actual_loss {
-            // Repeated middle removals can move the same retained ACK prefix quadratically.
-            // Keep its ordering and evidence intact; compact these terminal slots once below.
-            packets[index].retired = true;
-            self.packet_retirement_pending[space as usize] = true;
+        let space_index = space as usize;
+        let packets_len = self.packets[space_index].len();
+        let packet = self.packets[space_index][index];
+
+        if self.packet_epochs_enabled {
+            self.packet_epoch_remove_authority(space_index, packet);
+            if index == 0 {
+                let _ = self.packets[space_index].pop_front();
+            } else if index + 1 == packets_len {
+                let _ = self.packets[space_index].pop_back();
+            } else {
+                // Logical absence is immediate. Physical movement is amortized by the 1/8 bound.
+                self.packets[space_index][index].retired = true;
+                self.packet_epoch_dead[space_index] += 1;
+                if actual_loss {
+                    self.packet_retirement_pending[space_index] = true;
+                }
+            }
+            self.compact_packet_epoch_space(space_index, false);
+            self.maybe_demote_empty_packet_epochs();
         } else {
-            // ECN names one snapshot and does not produce a per-packet actual-loss batch.
-            packets.remove(index);
+            let packets = &mut self.packets[space_index];
+            if index == 0 {
+                let _ = packets.pop_front();
+            } else if index + 1 == packets.len() {
+                let _ = packets.pop_back();
+            } else if actual_loss {
+                // Repeated middle removals can move the same retained ACK prefix quadratically.
+                // Keep its ordering and evidence intact; compact these terminal slots once below.
+                packets[index].retired = true;
+                self.packet_retirement_pending[space_index] = true;
+            } else {
+                // Preserve the original immediate ECN removal in the small-store path.
+                let _ = packets.remove(index);
+            }
         }
     }
 
     fn compact_retired_packet_snapshots(&mut self) {
-        for (packets, pending) in self
-            .packets
-            .iter_mut()
-            .zip(self.packet_retirement_pending.iter_mut())
-        {
-            if *pending {
-                // Keep this ACK's stale snapshots for the ECN callback following loss detection.
-                packets.retain(|packet| !packet.retired);
-                *pending = false;
+        if self.packet_epochs_enabled {
+            for space in 0..self.packets.len() {
+                if self.packet_retirement_pending[space] {
+                    self.compact_packet_epoch_space(space, false);
+                    self.packet_retirement_pending[space] = false;
+                }
+            }
+            self.maybe_demote_empty_packet_epochs();
+        } else {
+            for (packets, pending) in self
+                .packets
+                .iter_mut()
+                .zip(self.packet_retirement_pending.iter_mut())
+            {
+                if *pending {
+                    packets.retain(|packet| !packet.retired);
+                    *pending = false;
+                }
             }
         }
     }
@@ -2980,6 +3188,22 @@ impl Controller for Bbr3 {
         space: SpaceId,
         app_limited: bool,
     ) -> Option<crate::congestion::PacketDeliveryState> {
+        let space_index = space as usize;
+        if self.packet_epochs_enabled {
+            // Reclaim enough accounted tombstones before an allocation can increase the store's
+            // physical/live ratio. Empty lifetime boundaries safely return to the small path.
+            self.compact_packet_epoch_space(space_index, false);
+            // A sparse tombstone below the density threshold can still occupy the final slot in
+            // the deque. Remove it before VecDeque grows, avoiding a capacity increase caused only
+            // by dead metadata. This capacity boundary can require a full scan even when there
+            // are too few tombstones to amortize it under the density rule.
+            if self.packet_epoch_dead[space_index] != 0
+                && self.packets[space_index].len() == self.packets[space_index].capacity()
+            {
+                self.compact_packet_epoch_space(space_index, true);
+            }
+            self.maybe_demote_empty_packet_epochs();
+        }
         self.inflight = prior_in_flight;
         // Quinn's send-time signal is authoritative for whether this packet begins or extends an
         // application-limited epoch. Refresh the delivery watermark before idle-restart handling
@@ -3016,10 +3240,20 @@ impl Controller for Bbr3 {
             size: bytes,
             lost: self.lost,
             acknowledged: false,
-            stale: false,
+            stale: 0,
             retired: false,
             round_count: self.round_count,
         });
+        #[cfg(test)]
+        let epochs_disabled_for_test = self.packet_epochs_disabled_for_test;
+        #[cfg(not(test))]
+        let epochs_disabled_for_test = false;
+        if !self.packet_epochs_enabled && !epochs_disabled_for_test {
+            let physical_records: usize = self.packets.iter().map(VecDeque::len).sum();
+            if physical_records > PACKET_EPOCH_UPGRADE_RECORDS {
+                self.upgrade_packet_epochs();
+            }
+        }
         None
     }
 
@@ -3060,6 +3294,14 @@ impl Controller for Bbr3 {
         let is_newest_packet = self.is_newest_packet(sent, space, packet_number);
         let mut inflight_rtt_sample = None;
         if let Some(p_index) = p_index_result {
+            let space_index = space as usize;
+            if self.packet_epochs_enabled
+                && !self.packets[space_index][p_index].acknowledged
+            {
+                let next_epoch = self.packet_epoch_next();
+                self.packets[space_index][p_index].stale = next_epoch;
+                self.packet_epoch_current[space_index] += 1;
+            }
             if let Some(p) = self.packets[space as usize].get_mut(p_index) {
                 p.acknowledged = true;
                 if p.is_operational_rtt_evidence {
@@ -3134,26 +3376,46 @@ impl Controller for Bbr3 {
             if app_limited {
                 self.app_limited = Ord::max(self.delivered.saturating_add(self.inflight), 1);
             }
-            for packets in self.packets.iter_mut() {
-                // Old stale prefix entries need no tail compaction. Do not pop
-                // newly acknowledged entries: this ACK's ECN callback still
-                // needs their snapshots until the next ACK cleanup epoch.
-                while packets.front().is_some_and(|packet| packet.stale) {
-                    let _ = packets.pop_front();
+            if self.packet_epochs_enabled {
+                self.packet_epoch = self.packet_epoch_next();
+                self.packet_epoch_since_sweep += 1;
+                let force_sweep = self.packet_epoch_since_sweep >= PACKET_EPOCH_SWEEP_INTERVAL;
+                for space in 0..self.packets.len() {
+                    self.packet_epoch_dead[space] += self.packet_epoch_previous[space];
+                    self.packet_epoch_previous[space] = self.packet_epoch_current[space];
+                    self.packet_epoch_current[space] = 0;
+                    self.compact_packet_epoch_space(space, force_sweep);
                 }
-                packets.retain_mut(|p| {
-                    // Retire old evidence before marking this ACK's snapshots;
-                    // they must remain available for same-ACK ECN processing.
-                    if p.stale {
-                        return false;
+                if force_sweep {
+                    self.packet_epoch_since_sweep = 0;
+                }
+                self.maybe_demote_empty_packet_epochs();
+            } else {
+                for packets in self.packets.iter_mut() {
+                    // Old stale prefix entries need no tail compaction. Do not pop
+                    // newly acknowledged entries: this ACK's ECN callback still
+                    // needs their snapshots until the next ACK cleanup epoch.
+                    while packets.front().is_some_and(|packet| packet.stale != 0) {
+                        let _ = packets.pop_front();
                     }
-                    // Leave other survivors untouched before retain_mut moves
-                    // them across a removed entry during compaction.
-                    if p.acknowledged {
-                        p.stale = true;
+                    #[cfg(test)]
+                    {
+                        self.packet_cleanup_reference_visits += packets.len();
                     }
-                    true
-                });
+                    packets.retain_mut(|p| {
+                        // Retire old evidence before marking this ACK's snapshots;
+                        // they must remain available for same-ACK ECN processing.
+                        if p.stale != 0 {
+                            return false;
+                        }
+                        // Leave other survivors untouched before retain_mut moves
+                        // them across a removed entry during compaction.
+                        if p.acknowledged {
+                            p.stale = 1;
+                        }
+                        true
+                    });
+                }
             }
             if self.ack_epoch_open {
                 if let Some(mut rate_sample) = self.rs {
@@ -3303,7 +3565,7 @@ impl Controller for Bbr3 {
         if let Some(index) = self.packet_index(space, packet_number) {
             // A live storage-only terminal also applies to parked controller copies, which do
             // not receive a matching loss-batch callback. Already retired active losses are absent.
-            self.packets[space as usize].remove(index);
+            self.retire_packet_snapshot(space, index, false);
         }
     }
 
@@ -3957,7 +4219,7 @@ mod test {
             size: BASE_DATAGRAM_SIZE as u16,
             lost: 0,
             acknowledged: true,
-            stale: false,
+            stale: 0,
             retired: false,
             round_count: 0,
         };
@@ -4847,7 +5109,7 @@ mod test {
             size: BASE_DATAGRAM_SIZE as u16,
             lost: 0,
             acknowledged: true,
-            stale: false,
+            stale: 0,
             retired: false,
             round_count: 0,
         };
@@ -4905,7 +5167,7 @@ mod test {
             size: smss as u16,
             lost: 0,
             acknowledged: false,
-            stale: false,
+            stale: 0,
             retired: false,
             round_count: 0,
         };
@@ -4963,7 +5225,7 @@ mod test {
             size: smss as u16,
             lost: 0,
             acknowledged: false,
-            stale: false,
+            stale: 0,
             retired: false,
             round_count: 0,
         };
@@ -5069,7 +5331,7 @@ mod test {
             size: smss as u16,
             lost: 0,
             acknowledged: false,
-            stale: false,
+            stale: 0,
             retired: false,
             round_count: 0,
         };
@@ -5427,7 +5689,7 @@ mod test {
             size: smss as u16,
             lost: 0,
             acknowledged: true,
-            stale: false,
+            stale: 0,
             retired: false,
             round_count: 0,
         };
@@ -6483,7 +6745,7 @@ mod test {
             size: BASE_DATAGRAM_SIZE as u16,
             lost: 0,
             acknowledged: true,
-            stale: false,
+            stale: 0,
             retired: false,
             round_count: 0,
         };
@@ -6762,7 +7024,7 @@ mod test {
         let ecn_index = bbr
             .packet_index(SpaceId::Data, 8)
             .expect("same-ACK ECN snapshot");
-        assert!(bbr.packets[SpaceId::Data as usize][ecn_index].stale);
+        assert_ne!(bbr.packets[SpaceId::Data as usize][ecn_index].stale, 0);
         bbr.on_congestion_event(ack_at, base, false, true, 0, 8, SpaceId::Data);
         assert_eq!(bbr.packet_index(SpaceId::Data, 8), None);
         assert!(bbr.packet_index(SpaceId::Initial, 0).is_some());
@@ -10457,7 +10719,7 @@ mod test {
             size: smss as u16,
             lost: 0,
             acknowledged: true,
-            stale: false,
+            stale: 0,
             retired: false,
             round_count: 7,
         };

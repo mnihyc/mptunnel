@@ -10,13 +10,14 @@ use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::timing::{ReliableDataAckGapTiming, reliable_data_ack_gap_timing};
 use crate::model::work::{
     CarrierWorkKind, RangeRecoveryState, ReliableFlightSpan, ReliableLiveOwnerFrontier,
-    ambiguous_flight_intervals, flight_evidence_segments, flight_interval_bytes,
-    reliable_live_owner_uniform_frontier, split_flight_interval_by_ack,
+    flight_evidence_segments, flight_interval_bytes, reliable_live_owner_uniform_frontier,
+    split_flight_interval_by_ack,
 };
 use crate::protocol::frame::{
     normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_extent,
 };
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
+use crate::runtime::stream::flight_overlap::{FlightIndexKey, ProductFlightIndex};
 use crate::scheduler::PathSnapshot;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -63,6 +64,9 @@ pub(in crate::runtime) struct RequestFlightLedger {
     // OriginalData identifies the ordered path; ReinjectedData remains a duplicate.
     // Exact attachment instances fence ACK evidence across path replacement.
     flights: BTreeMap<u64, Vec<RequestFlight>>,
+    /// Product multiplicity and exact interval identities. Mutated only beside
+    /// `flights` by accepted publication, global Data ACK, and terminal drain.
+    overlap: ProductFlightIndex,
     // Only structural mutations invalidate a same-pass range index. Timing and
     // evidence updates remain live reads; they do not change bucket geometry.
     geometry_revision: u64,
@@ -665,7 +669,16 @@ impl RequestFlightLedger {
             .and_then(|interval| sent_at.checked_add(interval))
             .or(reinjection_suppression_interval.map(|_| sent_at));
         self.geometry_revision = self.geometry_revision.wrapping_add(1);
-        self.flights.entry(offset).or_default().push(RequestFlight {
+        let bucket = self.flights.entry(offset).or_default();
+        let order = bucket.len();
+        self.overlap.publish(
+            FlightIndexKey {
+                start: offset,
+                order,
+            },
+            end,
+        );
+        bucket.push(RequestFlight {
             instance,
             assignment_range: OffsetRange { start: offset, end },
             end,
@@ -720,44 +733,70 @@ impl RequestFlightLedger {
             return Vec::new();
         }
         self.geometry_revision = self.geometry_revision.wrapping_add(1);
-
-        // No flight starting at/after the largest normalized ACK end can
-        // cover an acknowledged byte or affect its pre-release ambiguity.
-        // Keep crossing flights in the snapshot, but leave the other suffix
-        // keys untouched. A full-horizon ACK retains the linear map drain.
-        let ack_end = ranges.last().expect("nonempty normalized ACK").end;
-        let original_flights = if self
-            .flights
-            .last_key_value()
-            .is_some_and(|(start, _)| *start < ack_end)
-        {
-            std::mem::take(&mut self.flights)
+        // Every released flight is classified against one immutable pre-ACK M
+        // snapshot. The ACK then subtracts the same global mask from both U/M.
+        let ambiguous_intervals = self
+            .overlap
+            .ambiguous_intersections_for_ack(ranges)
+            .into_iter()
+            .map(|range| (range.start, range.end))
+            .collect::<Vec<_>>();
+        let full_release = self.overlap.ack_covers_all(ranges);
+        // Full cumulative release remains O(F): drain the payload/index once.
+        // Partial ACKs query exact identities and do not scan the start prefix.
+        let mut original_flights = Vec::<(u64, usize, RequestFlight)>::new();
+        let mut touched = BTreeMap::<u64, (usize, Vec<Option<RequestFlight>>)>::new();
+        if full_release {
+            original_flights = std::mem::take(&mut self.flights)
                 .into_iter()
-                .flat_map(|(start, flights)| flights.into_iter().map(move |flight| (start, flight)))
-                .collect::<Vec<_>>()
+                .flat_map(|(start, flights)| {
+                    flights
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(order, flight)| (start, order, flight))
+                })
+                .collect();
+            self.overlap.clear();
         } else {
-            let mut prefix = Vec::new();
-            while self
-                .flights
-                .first_key_value()
-                .is_some_and(|(start, _)| *start < ack_end)
-            {
-                let (start, flights) = self.flights.pop_first().expect("observed first flight");
-                prefix.extend(flights.into_iter().map(|flight| (start, flight)));
+            let keys = self.overlap.intersecting(ranges);
+            if keys.is_empty() {
+                return Vec::new();
             }
-            prefix
-        };
+            let mut by_start = BTreeMap::<u64, Vec<usize>>::new();
+            for key in keys {
+                by_start.entry(key.start).or_default().push(key.order);
+            }
+            for (start, orders) in by_start {
+                let bucket = self
+                    .flights
+                    .remove(&start)
+                    .expect("overlap-index identity has a request payload bucket");
+                let old_len = bucket.len();
+                let mut order_cursor = 0;
+                let mut slots = Vec::with_capacity(old_len);
+                for (order, flight) in bucket.into_iter().enumerate() {
+                    if orders.get(order_cursor) == Some(&order) {
+                        original_flights.push((start, order, flight));
+                        slots.push(None);
+                        order_cursor += 1;
+                    } else {
+                        slots.push(Some(flight));
+                    }
+                }
+                assert_eq!(
+                    order_cursor,
+                    orders.len(),
+                    "request overlap bucket identities match payloads"
+                );
+                touched.insert(start, (old_len, slots));
+            }
+        }
         #[cfg(test)]
         ACK_RELEASE_FLIGHT_VISITS.with(|work| work.set(work.get() + original_flights.len()));
-        let ambiguous_intervals = ambiguous_flight_intervals(
-            original_flights
-                .iter()
-                .map(|(start, flight)| (*start, flight.end)),
-        );
         let now = Instant::now();
         let mut released = Vec::new();
-        let mut existing_boundary = None;
-        for (start, flight) in original_flights.iter().copied() {
+        let mut staged_right_fragments = BTreeMap::<u64, Vec<RequestFlight>>::new();
+        for (start, order, flight) in original_flights.iter().copied() {
             let split = split_flight_interval_by_ack(start, flight.end, ranges);
             for (acked_start, acked_end, is_ambiguous) in split
                 .acked
@@ -825,33 +864,52 @@ impl RequestFlightLedger {
                 if bytes == 0 {
                     continue;
                 }
-                // A crossing survivor can meet the untouched bucket at H.
-                // Earlier-key survivors preceded that bucket in the old full
-                // rebuild; preserve this order without rebuilding the suffix.
-                if retained_start == ack_end && existing_boundary.is_none() {
-                    existing_boundary = Some(self.flights.remove(&ack_end).unwrap_or_default());
+                let fragment = RequestFlight {
+                    end: retained_end,
+                    bytes,
+                    qualification: flight.qualification.and_then(|qualification| {
+                        qualification.intersect(OffsetRange {
+                            start: retained_start,
+                            end: retained_end,
+                        })
+                    }),
+                    ..flight
+                };
+                if retained_start == start && !full_release {
+                    touched
+                        .get_mut(&start)
+                        .expect("source request bucket was selected")
+                        .1[order] = Some(fragment);
+                } else {
+                    staged_right_fragments
+                        .entry(retained_start)
+                        .or_default()
+                        .push(fragment);
                 }
-                self.flights
-                    .entry(retained_start)
-                    .or_default()
-                    .push(RequestFlight {
-                        end: retained_end,
-                        bytes,
-                        qualification: flight.qualification.and_then(|qualification| {
-                            qualification.intersect(OffsetRange {
-                                start: retained_start,
-                                end: retained_end,
-                            })
-                        }),
-                        ..flight
-                    });
             }
         }
-        if let Some(existing_boundary) = existing_boundary {
-            self.flights
-                .entry(ack_end)
-                .or_default()
-                .extend(existing_boundary);
+
+        for (start, (old_len, slots)) in touched {
+            let bucket = slots.into_iter().flatten().collect::<Vec<_>>();
+            self.overlap
+                .rebuild_bucket(start, old_len, bucket.iter().map(|flight| flight.end));
+            if !bucket.is_empty() {
+                self.flights.insert(start, bucket);
+            }
+        }
+
+        // Right survivors from earlier source keys precede any destination
+        // siblings, for every collision (including intermediate ACK-mask holes).
+        for (start, mut fragments) in staged_right_fragments {
+            let existing = self.flights.remove(&start).unwrap_or_default();
+            let old_len = existing.len();
+            fragments.extend(existing);
+            self.overlap
+                .rebuild_bucket(start, old_len, fragments.iter().map(|flight| flight.end));
+            self.flights.insert(start, fragments);
+        }
+        if !full_release {
+            self.overlap.acknowledge(ranges);
         }
         released
     }
@@ -862,6 +920,7 @@ impl RequestFlightLedger {
         self.original_data_in_flight_bytes = 0;
         self.original_data_in_flight_bytes_by_instance.clear();
         self.reinjected_data_in_flight_bytes_by_instance.clear();
+        self.overlap.clear();
         for (start, flights) in std::mem::take(&mut self.flights) {
             for flight in flights {
                 released.push(RequestPathRelease {

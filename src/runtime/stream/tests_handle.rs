@@ -1007,6 +1007,66 @@ fn fixed_ambiguous_data_ack_releases_original_debt_without_minting_evidence() {
 }
 
 #[test]
+fn fixed_product_ledger_retains_partial_ack_fragments_until_final_ack() {
+    const TOTAL_BYTES: usize = 4096;
+    const COPY_BYTES: usize = 2048;
+
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let output = ReliablePathStreamOutput::fixed(
+        UnderlayProtocol::Tcp,
+        PathId(13),
+        commands,
+        MuxLimits::default(),
+    );
+    let ReliablePathStreamOutput::Fixed(fixed) = &output else {
+        panic!("expected fixed output");
+    };
+
+    fixed.record_original_flight(&stream_data_frame_at(0, TOTAL_BYTES));
+    fixed.record_reinjected_flight(&stream_data_frame_at(0, COPY_BYTES));
+
+    let partial_ack = OffsetRange {
+        start: 1024,
+        end: 3072,
+    };
+    output.release_normalized_acked_ranges(&[partial_ack]);
+
+    {
+        let model = fixed.model.lock().expect("fixed output model lock");
+        let retained = model.flights.retained_geometry_for_test();
+        assert_eq!(
+            retained,
+            vec![
+                (0, 1024, 1024, CarrierWorkKind::OriginalData),
+                (0, 1024, 1024, CarrierWorkKind::ReinjectedData),
+                (3072, 4096, 1024, CarrierWorkKind::OriginalData),
+            ],
+            "partial Product ACK retains exact left/right fragments and same-start order",
+        );
+        assert_eq!(model.original_data_in_flight_bytes, 2048);
+        assert_eq!(model.carrier_work_in_flight_bytes, 3072);
+        assert_eq!(
+            model.product_progress_bytes, 1024,
+            "only the unambiguous OriginalData portion of the partial ACK proves progress",
+        );
+    }
+
+    output.release_normalized_acked_ranges(&[OffsetRange {
+        start: 0,
+        end: TOTAL_BYTES as u64,
+    }]);
+
+    let model = fixed.model.lock().expect("fixed output model lock");
+    assert!(model.flights.is_empty());
+    assert_eq!(model.original_data_in_flight_bytes, 0);
+    assert_eq!(model.carrier_work_in_flight_bytes, 0);
+    assert_eq!(
+        model.product_progress_bytes, 2048,
+        "final ACK settles the remaining unique OriginalData range exactly once",
+    );
+}
+
+#[test]
 fn fixed_partial_copy_combined_ack_counts_one_rate_observation() {
     const TOTAL_BYTES: u64 = 4 * MIN_RATE_SAMPLE_BYTES;
     const COPY_BYTES: u64 = MIN_RATE_SAMPLE_BYTES;
